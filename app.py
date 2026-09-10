@@ -84614,6 +84614,226 @@ def tint_budget_left() -> float:
 TINT_DEEP_ROADS = ("banter", "banter_caller", "caller", "caller2", "deep")
 
 
+# --- 2026-09-10: THE RHYME LANE ------------------------------------------
+#
+#    "the tinting process isn't so much a process that results in rejections
+#     as much as it's a treatment that we do on a script for certain lines in
+#     order to have those lines have rhymes ... these system prompts should be
+#     relatively simple for how we interact with that particular LLM
+#     instance."
+#
+# WHY THE OLD SHAPE COSTS WHAT IT COSTS, measured over six hours of the live
+# station's own model ledger:
+#
+#   kind          calls   waiting   working   queue share
+#   tint turn       671     20.1s      1.1s      92%
+#   tint round      479     31.7s      7.0s      75%
+#   caller          153     12.5s     11.2s      45%
+#
+#   1,844 model calls, 82,255s of call time, 70% of it WAITING.
+#   Tint alone: 1,150 calls, 60,707s = 2.8x the wall clock, 74% of every
+#   second the station spends talking to a model.
+#
+# A tint turn does ONE SECOND of work and waits TWENTY for the lane. The
+# prompt is 5,960 tokens producing 33 - a hundred and forty-four to one - but
+# the runner serves that prefix out of its KV cache (#1081), so reading it
+# costs 0.3s and the SIZE is not the latency. The latency is that there is one
+# call per line and one lane to put them through. That is why tinting behaves
+# like a queue of refusals: the work is not refused on taste, it is deferred,
+# timed out, and then charged as a fault.
+#
+# So this lane does the one thing that actually helps: FEWER, BIGGER CALLS.
+# A whole script goes through in a single ask - the same cached preamble read
+# once instead of ten times, one queue wait instead of ten - and the model
+# writes every line in the knowledge of the ones around it, which is also how
+# you get bars that answer each other rather than ten bars written alone.
+#
+# AND IT IS A TREATMENT, NOT A CONTEST. No grader in the loop, no repair
+# round, no refusal. A line the model cannot rhyme comes back as it went in
+# and says so. What the grader is FOR is the bulk road nobody is watching;
+# here the operator is the grader and both versions go on screen.
+
+RHYME_LINES_MOST = 14           # lines in one ask; a round is about ten
+RHYME_LINE_CHARS = 600          # a line longer than this is left alone
+RHYME_OUT_PER_LINE = 90         # output budget, tokens, per line asked
+
+
+def rhyme_prompt(lines: list[str], world: str, kind: str = "") -> str:
+    """The whole instruction. Deliberately short.
+
+    Everything the old frame carries - the style world's own passages, the
+    source contract, retrieved word options, proven landings, the repair
+    evidence - exists to win an argument with a grader. There is no grader
+    here, so none of it is needed, and what is left is the job itself."""
+    voice = str(world or "").strip() or "the station's own voice"
+    out = [
+        "Rewrite each line below so it RHYMES, in this voice: " + voice
+        + ".\n\n"
+        "The rules, all of them:\n"
+        "1. Keep what the line SAYS. Every name, number, question and "
+        "refusal survives - you are changing the wording, not the facts.\n"
+        "2. Make it land on a rhyme. Internal rhyme is better than an end "
+        "rhyme; a surprising landing is better than an obvious one.\n"
+        "3. Keep it speakable. This is read out loud on a radio show, so "
+        "no line may need a second reading to parse.\n"
+        "4. Roughly the same length. A line that doubles in length breaks "
+        "the timing of the segment it sits in.\n"
+        "5. If a line cannot carry a rhyme without losing what it says, "
+        "return it EXACTLY as given. That is a valid answer and it is "
+        "better than a bad bar.\n\n"
+        "OUTPUT: one line per input line, each starting with its number "
+        "and a pipe, like `3| the rewritten bar`. Nothing else - no "
+        "commentary, no blank lines, no markdown, no speaker labels.\n\n"
+        "THE LINES:\n"]
+    for at, line in enumerate(lines, 1):
+        out.append("%d| %s\n" % (at, " ".join(str(line or "").split())))
+    return "".join(out)
+
+
+def rhyme_parse(said: str, count: int) -> dict[int, str]:
+    """`3| the bar` back into {index: text}, forgivingly.
+
+    Scanned as one blob rather than line by line. Measured on the first
+    live pass: the model was told "one line per input line" and returned
+    all nine on ONE physical line - `1| ... 2| ... 3| ...` - so a
+    splitlines() parse read the whole answer as line one, swallowed every
+    later marker into it, and reported eight lines unchanged. Markers are
+    found wherever they are and each bar is the text up to the next one,
+    which reads both shapes and does not care which the model chose.
+
+    A marker only counts at a line start or after whitespace, so a bar
+    that happens to contain "3|" mid-sentence cannot split itself."""
+    text = str(said or "").replace("`", " ")
+    marks = [m for m in re.finditer(
+        r"(?:^|(?<=\s))\(?(\d{1,3})\)?\s*[|.:)\-]\s", text)]
+    out: dict[int, str] = {}
+    for at, mark in enumerate(marks):
+        slot = int(mark.group(1))
+        if not 1 <= slot <= count:
+            continue
+        stop = marks[at + 1].start() if at + 1 < len(marks) else len(text)
+        # A bar is ONE line by contract, so it also ends at the first
+        # newline - which is what keeps a model's sign-off ("Hope that
+        # helps!") off the end of the last bar without having to guess
+        # which trailing sentences are commentary. In the all-on-one-line
+        # shape there is no newline and the next marker still stops it.
+        cut = text.find("\n", mark.end())
+        if 0 <= cut < stop:
+            stop = cut
+        body = " ".join(text[mark.end():stop].split()).strip()
+        body = body.strip('"').strip("'").strip()
+        # A model that numbers the same slot twice is corrected by the
+        # LAST one it wrote, which is the one it settled on.
+        if body:
+            out[slot - 1] = body
+    return out
+
+
+async def rhyme_treat(lines: list[str], kind: str = "", model: str = "",
+                      why: str = "") -> dict[str, Any]:
+    """Rhyme a batch of lines in ONE model call.
+
+    Returns every line back - treated where it could be, unchanged where it
+    could not - so a caller can splice the result without checking whether
+    the lane succeeded. Never raises: a lane that cannot be reached hands
+    back what it was given, because the script still has a show to do."""
+    rows = [" ".join(str(x or "").split()) for x in (lines or [])]
+    out: dict[str, Any] = {"lines": list(rows), "changed": [],
+                           "asked": 0, "ms": 0.0, "why": ""}
+    want = [at for at, text in enumerate(rows)
+            if len(text) >= TINT_TURN_FLOOR and len(text) <= RHYME_LINE_CHARS]
+    if not want:
+        out["why"] = "no line in this batch is long enough to hold a rhyme"
+        return out
+    want = want[:RHYME_LINES_MOST]
+    world = crystal_world_prompt()
+    prompt = rhyme_prompt([rows[at] for at in want], world, kind)
+    started = time.monotonic()
+    try:
+        said = await ask_model(
+            prompt,
+            limit=RHYME_OUT_PER_LINE * len(want),
+            model=str(model or "") or tint_fast_model(),
+            mark={"kind": "rhyme lane", "why": str(why or ""),
+                  "lines": len(want), "crystal": world})
+    except Exception as exc:                       # noqa: BLE001
+        out["why"] = "the rhyme lane could not be reached: %s" % type(exc).__name__
+        out["ms"] = round((time.monotonic() - started) * 1000, 1)
+        return out
+    out["ms"] = round((time.monotonic() - started) * 1000, 1)
+    out["asked"] = len(want)
+    got = rhyme_parse(said, len(want))
+    for slot, at in enumerate(want):
+        text = got.get(slot, "")
+        if not text or text == rows[at]:
+            continue
+        # A "rewrite" that only moved the punctuation is not a treatment,
+        # and counting it as one is how a road reports itself tinted while
+        # sounding exactly as it did.
+        if _rhyme_same(rows[at], text):
+            continue
+        out["lines"][at] = text
+        out["changed"].append(at)
+        lost = rhyme_facts_lost(rows[at], text)
+        if lost:
+            out.setdefault("lost", {})[str(at)] = lost
+    if not out["changed"] and not out["why"]:
+        out["why"] = ("the lane returned nothing it had not been given - "
+                      "these lines could not carry a rhyme without losing "
+                      "what they say")
+    return out
+
+
+# Words that look like names but are just how a sentence starts. Without
+# this every line beginning "The"/"And" reports a dropped name.
+_RHYME_OPENERS = frozenset((
+    "the", "a", "an", "and", "but", "so", "then", "now", "this", "that",
+    "these", "those", "there", "here", "what", "when", "where", "who",
+    "why", "how", "if", "it", "its", "he", "she", "they", "we", "you",
+    "i", "im", "well", "look", "listen", "okay", "ok", "yes", "no",
+    "hi", "hey", "hello", "right", "just", "one", "two", "three"))
+
+
+def rhyme_facts_lost(was: str, now: str) -> list[str]:
+    """Names and numbers that were in the line and are not any more.
+
+    THE TREATMENT HAS NO GRADER, and this is the price of that. Measured
+    on the first live pass over a plain caller script: seven of eleven
+    lines came back rhymed and good, and one of them turned "Hi, this is
+    Newark, calling from the bus shelter" into "From the bus shelter by
+    the courthouse" - the rhyme is fine and the caller's name is GONE.
+    A model told to keep every name will still drop one, and on a road
+    where nobody re-reads the line that is how a caller loses their name
+    on air.
+
+    Deliberately not another model call - that would put the queue back.
+    Capitalised words that are not sentence openers, and every number, are
+    checked for presence. It is a smoke alarm, not a contract: it reports,
+    the operator decides, and a road that ever runs this unattended has
+    something cheap to refuse on."""
+    def _tokens(text: str) -> set[str]:
+        out: set[str] = set()
+        for word in re.findall(r"[A-Za-z][\w'’-]*|\d[\d.,:/]*", str(text or "")):
+            flat = word.strip(".,;:!?'’-").lower()
+            if not flat:
+                continue
+            if word[:1].isdigit():
+                out.add(flat)
+            elif word[:1].isupper() and flat not in _RHYME_OPENERS:
+                out.add(flat)
+        return out
+    had, kept = _tokens(was), _tokens(now)
+    return sorted(had - kept)
+
+
+def _rhyme_same(was: str, now: str) -> bool:
+    """Same words in the same order, give or take punctuation and case."""
+    strip = str.maketrans("", "", ".,;:!?-—’'\"()")
+    a = " ".join(str(was or "").lower().translate(strip).split())
+    b = " ".join(str(now or "").lower().translate(strip).split())
+    return a == b
+
+
 def tint_fast_model() -> str:
     """The throughput model for schedule-critical tint work."""
     try:
@@ -98303,6 +98523,90 @@ async def api_director_script_tint_refuse(sid: str, payload: dict[str, Any]
         (payload or {}).get("faults"))
     return {"ok": True, "say": "left as it was, and the refusal is on the "
                                "record"}
+
+
+@app.post("/api/director/script/{sid}/rhyme")
+async def api_director_script_rhyme(sid: str,
+                                    payload: dict[str, Any] | None = None
+                                    ) -> dict[str, Any]:
+    """Rhyme a WHOLE script in one ask, and hand back both versions.
+
+    Nothing is applied. This is the treatment the operator described - the
+    script goes through the lane once, every line comes back, and taking
+    them is a separate decision made line by line on screen."""
+    only = [int(x) for x in ((payload or {}).get("indexes") or [])
+            if str(x).lstrip("-").isdigit()]
+    kind, row, _c = await asyncio.to_thread(director_resolve, "", sid)
+    entry = dialogue_entry(row) or {}
+    turns = _director_turns(entry)
+    if not turns:
+        raise HTTPException(409, "that script has no turns to treat")
+    want = [t for t in turns if not only or t["index"] in only]
+    got = await rhyme_treat([t["text"] for t in want], kind=str(kind),
+                            why="the director asked for this script")
+    rows = []
+    for at, turn in enumerate(want):
+        now = str((got.get("lines") or [])[at]
+                  if at < len(got.get("lines") or []) else turn["text"])
+        lost = (got.get("lost") or {}).get(str(at)) or []
+        rows.append({"index": turn["index"], "seat": turn["seat"],
+                     "who": turn["who"], "was": turn["text"],
+                     "rhymed": now if now != turn["text"] else "",
+                     "changed": now != turn["text"],
+                     "lost": lost})
+    changed = [r for r in rows if r["changed"]]
+    risky = [r for r in changed if r.get("lost")]
+    return {"ok": True, "sid": sid, "kind": kind, "rows": rows,
+            "changed": len(changed), "risky": len(risky),
+            "asked": got.get("asked") or 0,
+            "ms": got.get("ms") or 0, "why": got.get("why") or "",
+            "say": ("%d of %d lines came back with a rhyme in %.1fs - one "
+                    "ask for the whole script"
+                    % (len(changed), got.get("asked") or 0,
+                       float(got.get("ms") or 0) / 1000.0)
+                    if changed else (got.get("why")
+                                     or "nothing came back changed"))
+            + (" - %d dropped a name or a number, marked below"
+               % len(risky) if risky else "")}
+
+
+@app.post("/api/director/script/{sid}/rhyme/accept")
+async def api_director_script_rhyme_accept(sid: str, payload: dict[str, Any]
+                                           ) -> dict[str, Any]:
+    """Take some or all of a treated script into the words that will air.
+
+    Applied line by line through the ordinary turn edit, so each accepted
+    bar re-keys its own take and re-records one line. Applied HIGHEST INDEX
+    FIRST: every edit rebuilds the script, and working downwards means an
+    earlier acceptance cannot shift the position of a later one."""
+    rows = [r for r in ((payload or {}).get("rows") or [])
+            if isinstance(r, dict) and str(r.get("rhymed") or "").strip()]
+    if not rows:
+        raise HTTPException(400, "there are no treated lines to take")
+    rows.sort(key=lambda r: -int(r.get("index") or 0))
+    took, failed = 0, []
+    for row in rows:
+        at = int(row.get("index") or 0)
+        try:
+            await asyncio.to_thread(
+                director_edit_turn, "", at, str(row.get("rhymed") or ""),
+                str(row.get("was") or ""), sid)
+            await asyncio.to_thread(script_tint_note, sid, at,
+                                    str(row.get("was") or ""),
+                                    str(row.get("rhymed") or ""), True)
+            took += 1
+        except HTTPException as exc:
+            failed.append({"index": at, "why": str(exc.detail)[:200]})
+        except Exception as exc:                   # noqa: BLE001
+            failed.append({"index": at, "why": type(exc).__name__})
+    pipeline_log("action", "the director took %d rhymed line(s) into a "
+                 "script" % took)
+    return {"ok": True, "took": took, "failed": failed,
+            "state": script_queue_state(sid),
+            "say": ("%d line(s) taken; they re-record and the rest of the "
+                    "round stands" % took)
+                   + (" - %d could not be applied" % len(failed)
+                      if failed else "")}
 
 
 @app.post("/api/director/script/{sid}/record")
@@ -134462,6 +134766,32 @@ async function dirScriptOpen(sid) {
   /* WHAT CAN BE DONE TO THE WHOLE SCRIPT. */
   const foot = el("div", "dir-add", "");
   foot.style.marginTop = "10px";
+  /* 2026-09-10: THE WHOLE SCRIPT THROUGH THE RHYME LANE, IN ONE ASK.
+   * Measured on the station's own ledger: one call per line spends 20.1s
+   * waiting and 1.1s working - 92% queue - and tinting was 74% of every
+   * second the station spent talking to a model. This is the same work in
+   * a single call, so the cached preamble is read once and the queue is
+   * waited on once. Nothing is applied until you take it. */
+  const rhyme = el("button", "", "◆ Rhyme the whole script");
+  rhyme.title = "One pass through the rhyme lane. You see every line "
+    + "before anything changes.";
+  rhyme.onclick = async () => {
+    rhyme.disabled = true;
+    rhyme.textContent = "◆ treating the script…";
+    let out;
+    try {
+      out = await api("/api/director/script/" + encodeURIComponent(sid)
+        + "/rhyme", {method: "POST", body: JSON.stringify({})});
+    } catch (e) {
+      rhyme.disabled = false;
+      rhyme.textContent = "◆ Rhyme the whole script";
+      alert("The rhyme lane could not be reached: " + e);
+      return;
+    }
+    rhyme.textContent = "◆ Rhyme the whole script";
+    rhyme.disabled = false;
+    dirRhymeReview(sid, out);
+  };
   const ok = el("button", "", got.review.approved ? "✓ approved" : "Approve script");
   ok.disabled = !!got.review.approved;
   ok.onclick = async () => {
@@ -134484,7 +134814,7 @@ async function dirScriptOpen(sid) {
       + "It goes to the recording room exactly as it reads on screen.")) return;
     dirSend(sid, true, raw);
   };
-  [ok, send, raw].forEach((b) => foot.appendChild(b));
+  [rhyme, ok, send, raw].forEach((b) => foot.appendChild(b));
   body.appendChild(foot);
   if (got.review.sent_to_record) {
     const said = el("div", "dir-sub", "already released to the recording room"
@@ -134492,6 +134822,80 @@ async function dirScriptOpen(sid) {
     said.style.color = "#7ce8a9";
     body.appendChild(said);
   }
+}
+
+function dirRhymeReview(sid, out) {
+  /* Both versions, line by line, with a tick on each. Nothing has changed
+   * in the script yet - taking them is the second decision. */
+  const win = pineWin("rhymeReview", "◆ The rhyme lane's pass", {
+    minWidth: 520, minHeight: 400, width: 940, height: 720});
+  const host = win.host;
+  host.textContent = "";
+  host.style.display = "flex";
+  host.style.flexDirection = "column";
+  host.style.overflow = "hidden";
+  const bar = el("div", "dir-bar", "");
+  bar.appendChild(el("span", "dir-load", out.say || ""));
+  host.appendChild(bar);
+  const body = el("div", "dir-body", "");
+  host.appendChild(body);
+  const picked = new Map();
+  (out.rows || []).forEach((r) => {
+    if (!r.changed) return;
+    picked.set(r.index, r);
+    const card = el("div", "dir-row", "");
+    const head = el("div", "dir-head", "");
+    const risky = (r.lost || []).length > 0;
+    const tick = document.createElement("input");
+    tick.type = "checkbox";
+    /* A bar that dropped a name or a number is NOT ticked by default. The
+     * lane has no grader, so this is the one thing standing between a
+     * good rhyme and a caller losing their name on air - it should cost a
+     * deliberate click, not an absent-minded one. */
+    tick.checked = !risky;
+    if (risky) picked.delete(r.index);
+    tick.onchange = () => {
+      if (tick.checked) picked.set(r.index, r); else picked.delete(r.index);
+    };
+    head.appendChild(tick);
+    head.appendChild(el("span", "dir-name", r.who));
+    if (risky) {
+      const warn = el("span", "dir-chip warn",
+        "⚠ drops " + r.lost.join(", "));
+      warn.title = "This rhyme lost something the original said. Take it "
+        + "only if you meant to.";
+      head.appendChild(warn);
+      card.classList.add("bare");
+    }
+    card.appendChild(head);
+    const was = el("div", "dir-turn", r.was);
+    was.style.color = "#7f93a8";
+    const now = el("div", "dir-turn", r.rhymed);
+    now.style.color = "#a8e07c";
+    card.appendChild(was);
+    card.appendChild(now);
+    body.appendChild(card);
+  });
+  if (!picked.size) {
+    body.appendChild(el("div", "muted", out.why
+      || "Nothing came back with a rhyme in it."));
+    return;
+  }
+  const foot = el("div", "dir-add", "");
+  const take = el("button", "", "Take the ticked lines");
+  take.onclick = async () => {
+    take.disabled = true;
+    const rows = Array.from(picked.values());
+    try {
+      const got = await api("/api/director/script/" + encodeURIComponent(sid)
+        + "/rhyme/accept", {method: "POST", body: JSON.stringify({rows})});
+      alert(got.say || "taken");
+      win.close ? win.close() : null;
+      await dirScriptOpen(sid);
+    } catch (e) { take.disabled = false; alert("Not taken: " + e); }
+  };
+  foot.appendChild(take);
+  host.appendChild(foot);
 }
 
 async function dirSend(sid, bypass, btn) {
@@ -174437,7 +174841,7 @@ function libStyle() {
   .lb-reading{background:#8a6d1f}.lb-embedding{background:#1f6a8a}
   .lb-skipped{background:#5a4a5a}.lb-failed{background:#8a2f2f}
   .lb-body{flex:1;overflow:auto;min-height:0;padding:10px 12px;line-height:1.5}
-  .lb-body img{max-width:100%;height:auto}
+  .lb-body img{max-width:100%;height:auto;max-height:72vh;object-fit:contain}
   .lb-body h1,.lb-body h2,.lb-body h3{font-size:15px;margin:14px 0 6px}
   .lb-hit{padding:7px 9px;border-bottom:1px solid var(--line,#242424);
           cursor:pointer}

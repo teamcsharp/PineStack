@@ -565,6 +565,17 @@ DIRECTOR_BEAT_TYPES = {
     "caller": "the person on the line says their piece and the room "
               "answers them",
     "sfx": "the SFX guy puts something over the top of it",
+    # 2026-09-10: "also in the script, also script the songs being played
+    # and the dialogue around the tracks." A record is part of the running
+    # of a segment, not an absence of one, so the shape can say where it
+    # goes and the talk either side of it is written knowing that.
+    "track_in": "they take the record IN - name it, say why it is going on, "
+                "and hand over to it",
+    "track": "the record plays. Nobody talks over it",
+    "track_over": "they talk OVER the record while it runs, the way the "
+                  "pair do with the music underneath",
+    "track_out": "the record ends and they come back off the back of it, "
+                 "picking up on what it was",
     "close": "they land it and hand off",
 }
 DIRECTOR_BEATS_MOST = 12
