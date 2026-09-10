@@ -471,3 +471,182 @@ def script_candidate(occurrence: str) -> str:
     otherwise the room loses sight of the segment at exactly the moment
     they are working on it, which reads as the edit having deleted it."""
     return str((script_record(occurrence) or {}).get("candidate") or "")
+
+
+# --- 2026-09-10: WHAT THE STATION LEARNS FROM BEING EDITED ---------------
+#
+#    "...that feeds the main system that tells it how to react and behave.
+#     And from there it's able to take that stuff, internalize it, and
+#     expand on it going forward to understand what I'm going for with the
+#     station and to keep that going."
+#
+# A note is an instruction and a model obeys instructions unevenly. A PAIR -
+# what the station wrote, and what the person who owns it changed it to, in
+# the same seat of the same kind of segment - is a demonstration, and a small
+# model follows a demonstration far harder than a rule. That is the same
+# lesson #834 and #788 both learned in speakbox_quote: what is in its mouth
+# beats what is in its instructions.
+#
+# So the rewrites go back into the prompt as worked examples. They cost
+# nothing to collect - they are a by-product of the operator working - and
+# they are the only training signal here that nobody has to sit down and
+# author.
+#
+# Bounded hard. Four pairs is a house style; forty is a wall of text that
+# buries the segment's actual job, and the round still has to be written.
+
+DIRECTOR_LESSON_MOST = 4
+DIRECTOR_LESSON_CHARS = 240
+
+
+def _lesson_worth_showing(was: str, now: str) -> bool:
+    """A pair only teaches when the two halves genuinely differ.
+
+    Punctuation and case tidying is not direction, and showing it as
+    though it were trains the model to fiddle."""
+    a = " ".join(str(was or "").lower().split())
+    b = " ".join(str(now or "").lower().split())
+    if not a or not b or a == b:
+        return False
+    strip = str.maketrans("", "", ".,;:!?-—’'\"")
+    return a.translate(strip) != b.translate(strip)
+
+
+def director_lessons_clause(kind: str) -> str:
+    """The operator's own rewrites of this segment kind, as examples."""
+    try:
+        rows = [r for r in script_lessons(kind, most=DIRECTOR_LESSON_MOST * 4)
+                if _lesson_worth_showing(r.get("was"), r.get("now"))]
+        if not rows:
+            return ""
+        rows = rows[:DIRECTOR_LESSON_MOST]
+        out = ["\n\nHOW THE PERSON WHO RUNS THIS STATION REWRITES THIS "
+               "SEGMENT. Each pair below is a line this station wrote by "
+               "itself, and what they changed it to. Do not reuse these "
+               "lines and do not mention them - read them for what they "
+               "say about how this seat is meant to sound, and write in "
+               "that manner:"]
+        for at, row in enumerate(rows, 1):
+            out.append("\n  %d. it wrote: \"%s\"\n     they wanted: \"%s\""
+                       % (at,
+                          str(row.get("was") or "")[:DIRECTOR_LESSON_CHARS],
+                          str(row.get("now") or "")[:DIRECTOR_LESSON_CHARS]))
+        return "".join(out)
+    except Exception:                              # noqa: BLE001
+        return ""
+
+
+# --- 2026-09-10: THE WRITERS ROOM AS A FLOW CHART ------------------------
+#
+#    "So I want this to be some sort of interactive flow chart system where
+#     I'm able to have banter interject with other nodes that are things
+#     like manager messages or interruptions from outside."
+#
+# A segment is a SPINE with things dropped into it. The spine is the pair
+# talking; the interesting part is what interrupts them and where. So a
+# segment plan is an ordered list of beats, each beat one of a small set of
+# node types, and the plan compiles to a paragraph telling the writing room
+# the shape it is writing - which is the only way a graph can be real
+# rather than decorative. If it does not reach the prompt it is a drawing.
+#
+# Beats are held per KIND (every caller runs this shape) with an optional
+# override for one occurrence, exactly like the notes - the same two scopes,
+# because they answer the same question at two different distances.
+
+DIRECTOR_BEAT_TYPES = {
+    "seed": "the speakerbox is opened and a passage of the station's own "
+            "documents goes into somebody's mouth, which the others then "
+            "pick up",
+    "banter": "the pair talk it out between themselves",
+    "manager": "the intercom from upstairs cuts in with a memo, and they "
+               "have to deal with it live",
+    "outside": "something interrupts from outside the building - a caller, "
+               "a wrong number, somebody at the door",
+    "caller": "the person on the line says their piece and the room "
+              "answers them",
+    "sfx": "the SFX guy puts something over the top of it",
+    "close": "they land it and hand off",
+}
+DIRECTOR_BEATS_MOST = 12
+
+
+def _beats_book() -> dict[str, Any]:
+    book = director_read()
+    beats = book.get("beats")
+    if not isinstance(beats, dict):
+        beats = {}
+        book["beats"] = beats
+    return beats
+
+
+def director_beats(kind: str, occurrence: str = "") -> list[dict[str, Any]]:
+    """The shape this segment runs in. Occurrence overrides kind."""
+    beats = _beats_book()
+    if occurrence:
+        got = beats.get("occ:" + str(occurrence))
+        if isinstance(got, list) and got:
+            return [dict(b) for b in got if isinstance(b, dict)]
+    got = beats.get("kind:" + str(kind or ""))
+    if isinstance(got, list) and got:
+        return [dict(b) for b in got if isinstance(b, dict)]
+    return []
+
+
+def director_beats_set(kind: str, rows: Any, occurrence: str = ""
+                       ) -> list[dict[str, Any]]:
+    """Write a segment's shape. An empty list clears it back to default."""
+    clean: list[dict[str, Any]] = []
+    for row in (rows or [])[:DIRECTOR_BEATS_MOST]:
+        if not isinstance(row, dict):
+            continue
+        what = str(row.get("type") or "").strip()
+        if what not in DIRECTOR_BEAT_TYPES:
+            continue
+        clean.append({"type": what,
+                      "note": " ".join(str(row.get("note") or "").split())[:300]})
+    book = director_read()
+    beats = _beats_book()
+    key = ("occ:" + str(occurrence)) if occurrence else ("kind:" + str(kind))
+    if clean:
+        beats[key] = clean
+    else:
+        beats.pop(key, None)
+    director_write(book)
+    return clean
+
+
+def director_beats_clause(kind: str, occurrence: str = "") -> str:
+    """The shape, dressed as the instruction it is."""
+    try:
+        rows = director_beats(kind, occurrence)
+        if not rows:
+            return ""
+        out = ["\n\nTHE SHAPE OF THIS SEGMENT, which the station's owner "
+               "laid out. Run it in this order. Each beat is a real part "
+               "of the segment, not a heading - do not announce them, do "
+               "not number them out loud, and do not read this list:"]
+        for at, row in enumerate(rows, 1):
+            what = str(row.get("type") or "")
+            out.append("\n  %d. %s%s" % (
+                at, DIRECTOR_BEAT_TYPES.get(what, what),
+                (" - " + str(row["note"])) if row.get("note") else ""))
+        return "".join(out)
+    except Exception:                              # noqa: BLE001
+        return ""
+
+
+def director_graph() -> dict[str, Any]:
+    """Every shape the operator has laid out, for the flow chart."""
+    beats = _beats_book()
+    kinds: dict[str, Any] = {}
+    occurrences: dict[str, Any] = {}
+    for key, rows in beats.items():
+        if not isinstance(rows, list):
+            continue
+        if str(key).startswith("kind:"):
+            kinds[str(key)[5:]] = [dict(b) for b in rows]
+        elif str(key).startswith("occ:"):
+            occurrences[str(key)[4:]] = [dict(b) for b in rows]
+    return {"kinds": kinds, "occurrences": occurrences,
+            "types": dict(DIRECTOR_BEAT_TYPES),
+            "most": DIRECTOR_BEATS_MOST}

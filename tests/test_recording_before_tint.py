@@ -116,11 +116,19 @@ class RecordingBeforeTintTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_writing()
 
     async def test_single_round_fallback_skips_unaccepted_and_off_brief_rows_before_recording(self):
+        # 2026-09-10: this used `manager` for the unaccepted rows, and the
+        # manager road is now on `crystal_tint_must_flow` - the operator's
+        # rule that a memo from upstairs airs whether or not the crystal
+        # reached it, because a tint hold on a road that runs twice an hour
+        # is an off switch. The rule THIS test exists for - an untinted row
+        # is not recorded - is unchanged for every road that is not exempt,
+        # so it is asserted on one of those instead. The exemption has its
+        # own test below.
         self.shelf['ad'] = [self.raw('waiting-ad')]
         selected = self.dialogue('accepted-gallery')
-        self.shelf['manager'] = [
-            {'sid': 'waiting-manager', 'entry': self.dialogue('waiting-manager', accepted=False)},
-            {'sid': 'off-brief-manager', 'entry': self.dialogue('off-brief-manager', off_brief=True)},
+        self.shelf['news'] = [
+            {'sid': 'waiting-news', 'entry': self.dialogue('waiting-news', accepted=False)},
+            {'sid': 'off-brief-news', 'entry': self.dialogue('off-brief-news', off_brief=True)},
         ]
         self.shelf['gallery'] = [{'sid': selected['sid'], 'entry': selected}]
         await self.keeper_once()
@@ -128,6 +136,39 @@ class RecordingBeforeTintTests(unittest.IsolatedAsyncioTestCase):
         station.larder_prepare.assert_awaited_once_with(selected)
         self.assertEqual(station._PREP_DEADLINE[0], 0)
         self.assert_no_writing()
+
+    async def test_must_flow_road_is_recorded_without_its_tint(self):
+        """A memo from upstairs goes out whether or not the crystal landed.
+
+        The operator, 2026-09-10: "messages from the manager have to go
+        through. So it's nice if they were tinted, but if they aren't able
+        to, they need to still go through." The pass is still wanted and
+        still attempted; it simply stops being the reason the road is
+        silent."""
+        # Shaped like the accepted-rows test above: a sitting is convened
+        # for the ready rows of the hour, and the question here is only
+        # whether the UNTINTED memo is among them. On its own the memo
+        # takes the single-round fallback, which is a different branch and
+        # would answer a different question.
+        self.shelf['ad'] = [self.raw('waiting-ad')]
+        gallery = self.dialogue('accepted-gallery')
+        memo = self.dialogue('untinted-manager', accepted=False)
+        self.shelf['gallery'] = [{'sid': gallery['sid'], 'entry': gallery}]
+        self.shelf['manager'] = [{'sid': memo['sid'], 'entry': memo}]
+        await self.keeper_once()
+        station.recording_sitting.assert_awaited_once()
+        entries, _budget = station.recording_sitting.call_args.args
+        self.assertIn('untinted-manager',
+                      {entry['sid'] for entry in entries})
+        self.assert_no_writing()
+
+    async def test_must_flow_exemption_is_scoped_to_its_own_road(self):
+        """The exemption is a list, not a hole. An untinted round on a road
+        that is not on it still waits, which is what stops "the memo may
+        go" quietly becoming "anything may go"."""
+        self.assertTrue(station.tint_must_flow('manager'))
+        for road in ('gallery', 'caller', 'news', 'banter'):
+            self.assertFalse(station.tint_must_flow(road), road)
 
     async def test_banter_pass_reaches_accepted_round_after_blocked_and_off_brief_originals(self):
         self.shelf['ad'] = [self.raw('waiting-ad')]

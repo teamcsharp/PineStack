@@ -19,7 +19,7 @@ import wave
 from contextvars import ContextVar
 from contextlib import ExitStack
 from functools import wraps
-from html import unescape as html_unescape
+from html import escape as html_escape, unescape as html_unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from threading import BoundedSemaphore, RLock, Thread
@@ -49,17 +49,21 @@ from crystal_prompts import (turn_prompt as crystal_prompt_turn,
                              PROMPT_VERSION as CRYSTAL_PROMPT_VERSION)
 from crystal_source import clean_repair_prompt_echo, strip_repair_prompt_echo
 from segment_contract import ad_sale_evidence
-from director import (director_add, director_clause, director_notes,
-                      director_path, director_restore, director_retire,
-                      director_sheet, director_spend, director_touch,
-                      script_approve, script_candidate, script_lessons,
-                      script_mark_aired, script_note_edit, script_state)
+from director import (director_add, director_beats, director_beats_clause,
+                      director_beats_set, director_clause, director_graph,
+                      director_lessons_clause, director_notes, director_path,
+                      director_restore, director_retire, director_sheet,
+                      director_spend, director_touch, script_approve,
+                      script_candidate, script_lessons, script_mark_aired,
+                      script_note_edit, script_state)
 from crystal_acceptance import evaluate_acceptance as crystal_editorial_acceptance
 from prompt_learning import PromptLearningStore, _patterns as crystal_learning_patterns
 from response_bank import ResponseBank, add_listening_responses
 from rap_battle import (COMBATANTS as RAP_COMBATANTS, RapBattle,
                         SEAT_NAMES as RAP_SEAT_NAMES)
 from sfx_cadence import SfxCadence, due_after as sfx_due_after
+import library
+import library_extract
 from resource_guard import ResourceHistory, assess as assess_resources, available_gb, engine_busy, memory_snapshot, gpu_snapshot
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse,
@@ -98,6 +102,27 @@ DATA_DIR = Path(os.getenv("SPARK_AGENT_DATA_DIR", "/app/data")).expanduser()
 
 def data_path(*parts: str) -> Path:
     return DATA_DIR.joinpath(*parts)
+
+
+# #1158: the shelves the Library watches. Both are already mounted - compose
+# binds the WHOLE quickswap share read-only at /samples, so the operator's
+# //10.89.1.125/QuickSwap/Manuals is simply /samples/Manuals in here, and the
+# DJs' speakbox is bound at /app/data/speakbox. Nothing new to mount.
+LIBRARY_FOLDERS_DEFAULT = ["/samples/Manuals", "/app/data/speakbox"]
+
+
+def validate_library_folders(raw: Any) -> list[str]:
+    """Folder list off the panel. Absolute paths only, deduped and bounded:
+    a relative path here would resolve against the app's cwd and quietly
+    index the source tree."""
+    if not isinstance(raw, list):
+        return list(LIBRARY_FOLDERS_DEFAULT)
+    out: list[str] = []
+    for row in raw[:24]:
+        row = str(row or "").strip().rstrip("/")
+        if row.startswith("/") and row not in out:
+            out.append(row[:400])
+    return out or list(LIBRARY_FOLDERS_DEFAULT)
 
 
 _STATION_FLOW = FlowJournal(data_path("station_flow.sqlite3"))
@@ -917,6 +942,10 @@ DEFAULT_DJ = {
     # that the operator's own documents are never reworded.
     "speakbox_seat_spread": True,
     "speakbox_tint_passages": True,
+    # 2026-09-10: the roads the tint hold may never silence. The crystal
+    # still tries them; it just never becomes the reason they do not air.
+    # See tint_must_flow.
+    "crystal_tint_must_flow": ["manager"],
     # Which documents they may lift from. Empty means the whole folder, so a
     # file dropped in is in play without anyone ticking a box (#202).
     # How much each document is drawn on, by file name, 0 to 100. Anything
@@ -1437,6 +1466,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "web_search": True,
     "game_search": True,
     "gear_manuals": True,
+    # #1158: the Library - the operator's own documents, assimilated by a
+    # background service and answerable in ordinary conversation.
+    "library": True,
+    "library_folders": list(LIBRARY_FOLDERS_DEFAULT),
     "read_back_prompts": True,
     "conversation_memory": True,
     "long_term_memory": True,
@@ -1810,6 +1843,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "speakbox_tint_passages": bool(raw_dj.get(
             "speakbox_tint_passages",
             DEFAULT_DJ["speakbox_tint_passages"])),
+        "crystal_tint_must_flow": [
+            str(name)[:40] for name in
+            (raw_dj.get("crystal_tint_must_flow")
+             if isinstance(raw_dj.get("crystal_tint_must_flow"), list)
+             else DEFAULT_DJ["crystal_tint_must_flow"])
+            if str(name or "").strip()][:20],
         "speakbox_files": [
             str(name)[:120] for name in (raw_dj.get("speakbox_files") or [])
             if str(name or "").strip()
@@ -2187,6 +2226,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "web_search": bool(data.get("web_search", True)),
         "game_search": bool(data.get("game_search", True)),
         "gear_manuals": bool(data.get("gear_manuals", True)),
+        "library": bool(data.get("library", True)),
+        "library_folders": validate_library_folders(
+            data.get("library_folders")),
         "read_back_prompts": bool(data.get("read_back_prompts", True)),
         "conversation_memory": bool(data.get("conversation_memory", True)),
         "long_term_memory": bool(data.get("long_term_memory", True)),
@@ -4060,6 +4102,177 @@ def te_lookup(text: str) -> dict[str, Any] | None:
         "topic": " ".join(words[:6]),
         "pages": pages,
     }
+
+
+# --- The Library: the operator's own documents, read and remembered (#1158) -
+#
+# The gear corpus above is teenage engineering's own documentation, cached and
+# matched by the letters. The Library is the other half of the shelf: anything
+# dropped into a watched folder - PDF, EPUB, a zip of either, docx, plain text
+# - read into pages, cut into overlapping chunks, embedded through the same
+# local embedder the DJs use, and found again by MEANING and by LETTERS at
+# once. A document added to the folder is assimilated by a background service
+# within a couple of minutes; nothing is clicked and nothing is restarted.
+#
+# The engine is library.py, which knows nothing about this app. Everything
+# here is wiring: what it reads, what it must not sit in front of, and where
+# a passage it found is allowed to enter an answer.
+#
+# It is consulted AFTER the gear manuals by design, so an OP-XY question keeps
+# answering exactly the way it always has, and BEFORE the web, because the box
+# should read its own documents before it reaches outside for somebody else's.
+
+LIBRARY_DIR = data_path("library")
+LIBRARY_HITS = 6                # passages allowed into one answer
+LIBRARY_CONTEXT_CHARS = 7000    # the same budget the gear manuals get
+
+
+def library_on() -> bool:
+    return bool(load_settings().get("library", True))
+
+
+def library_folders() -> list[str]:
+    return validate_library_folders(load_settings().get("library_folders"))
+
+
+def library_busy() -> bool:
+    """True while the show is actually making something.
+
+    The box runs ONE Ollama lane (OLLAMA_LANES=1, matched to the host's
+    OLLAMA_NUM_PARALLEL). Embedding a 500-page manual is hundreds of calls
+    into that lane, so the shelf stands aside between batches whenever the
+    radio is on and anything is queued or writing: it reads slower, and the
+    air does not gap for it.
+    """
+    try:
+        return bool(_RADIO.get("on")) and bool(_OLLAMA_JOBS)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def library_boot() -> None:
+    """Hand the engine the app's own hands. Safe to call again after a
+    settings save, so a changed folder list lands without a restart."""
+    library.configure(
+        data_dir=LIBRARY_DIR,
+        embed=_embed_texts,          # the DJs' embedder, nomic-embed-text
+        busy=library_busy,
+        page_score=_te_page_score,   # and the gear corpus' own page ranker
+        topic_words=te_topic_words,
+        log=lambda line: print(f"[library] {line}", flush=True),
+    )
+
+
+def is_library_query(text: str) -> bool:
+    """Worth asking the shelf at all?
+
+    Deliberately cheap and permissive - the shelf itself is the real judge.
+    library.shelf_question refuses a question whose every word appears in
+    every document ("play some music" scored 0.63 against a book about music
+    production), and the search refuses anything under a measured cosine
+    floor. Both numbers were measured against this shelf, not guessed.
+    """
+    try:
+        return (library_on() and bool(library.index().get("docs"))
+                and library.shelf_question(text))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def library_named_document(text: str) -> str:
+    """The slug of a shelf document this question names outright, or "".
+
+    This is the ONE place the Library is allowed to outrank the gear manuals:
+    the operator asked for a book by name, so the book answers.
+    """
+    try:
+        return library.named_document(text) if library_on() else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def library_lookup(text: str) -> list[dict[str, Any]]:
+    """Ask the shelf. Never fatal to an answer: a cold embedder or a
+    half-written shard costs the citation, not the reply."""
+    try:
+        hits = await library.search(text, k=LIBRARY_HITS)
+        named = library_named_document(text)
+        if named:
+            # The named book first, then whatever else agreed with it.
+            hits.sort(key=lambda h: h.get("slug") != named)
+            if not hits:
+                hits = await library.search(text, k=LIBRARY_HITS, gate=False)
+                hits = [h for h in hits if h.get("slug") == named]
+        return hits
+    except Exception as exc:  # noqa: BLE001
+        print(f"[library] search failed: {type(exc).__name__}: {exc}",
+              flush=True)
+        return []
+
+
+def library_credits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What the panel prints under the answer: which document, which page,
+    and whether the meaning or the letters found it."""
+    out: list[dict[str, Any]] = []
+    for hit in hits:
+        row = library.doc_row(hit.get("slug", "")) or {}
+        out.append({"slug": hit.get("slug", ""),
+                    "title": hit.get("title", ""),
+                    "page": hit.get("page", 0),
+                    "kind": row.get("kind", ""),
+                    "heading": hit.get("heading", ""),
+                    "why": hit.get("why", ""),
+                    "score": round(float(hit.get("cosine") or 0), 3)})
+    return out
+
+
+def format_library_context(hits: list[dict[str, Any]]) -> str:
+    """The system message the passages arrive in. The same contract the gear
+    manuals carry: cite what you used, and say so plainly when it is not
+    covered rather than inventing a control that does not exist."""
+    budget = LIBRARY_CONTEXT_CHARS
+    blocks: list[str] = []
+    titles: list[str] = []
+    for hit in hits:
+        body = " ".join(str(hit.get("text") or "").split())
+        body = body[:max(500, budget // max(1, len(hits)))]
+        if not body:
+            continue
+        budget -= len(body)
+        kind = (library.doc_row(hit.get("slug", "")) or {}).get("kind", "")
+        label = (f"{hit.get('title')}, "
+                 f"{library.page_word(kind)} {hit.get('page')}")
+        if hit.get("heading"):
+            label += f" - {hit['heading']}"
+        blocks.append(f"[{label}]\n{body}")
+        if hit.get("title") and hit["title"] not in titles:
+            titles.append(hit["title"])
+        if budget <= 0:
+            break
+    return (
+        "THE LIBRARY - passages from documents kept on this machine ("
+        + ", ".join(titles[:4]) + ").\n"
+        "These are the operator's own documents, read and indexed on this "
+        "box, not anything from the web. Answer the question from them: name "
+        "the exact controls, menus, keys and steps, and give them in order. "
+        "Cite the document and the page you used. If these passages do not "
+        "cover it, say so plainly instead of inventing an answer.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+@app.on_event("startup")
+async def _startup_library() -> None:
+    """#1158: the shelf assimilates on its own.
+
+    Deliberately NOT registered in dj_start beside speakbox_index_clock and
+    the rest: those live and die with the show (radio_stop cancels every task
+    in _RADIO_TASK). A document dropped into the folder while the radio is
+    OFF must still be read - that is exactly when somebody is sitting here
+    asking questions about it.
+    """
+    library_boot()
+    fire_and_forget(library.ingest_clock(library_folders, library_on))
 
 
 def is_te_query(text: str) -> bool:
@@ -12669,6 +12882,30 @@ def crystal_line_selected(text: Any, salt: str = "") -> bool:
     return int(hashlib.sha1(raw).hexdigest()[:8], 16) % 100 < target
 
 
+def tint_must_flow(kind: str) -> bool:
+    """Roads that go out whether or not the crystal reached them.
+
+    2026-09-10, the operator: "messages from the manager have to go
+    through. So it's nice if they were tinted, but if they aren't able
+    to, they need to still go through."
+
+    The tint hold is a quality gate, and a quality gate on a road that
+    only runs twice an hour is an OFF switch: the memo waits for a permit
+    that never comes and the segment is simply never heard. The crystal
+    still tints these roads - the pass is wanted, attempted and recorded
+    exactly as before - it just stops being the reason they are silent.
+    Same principle as #1063's "tint yields to the air", applied per road
+    rather than to the whole station.
+    """
+    try:
+        rows = dj_settings().get("crystal_tint_must_flow")
+        if not isinstance(rows, (list, tuple)):
+            rows = DEFAULT_DJ["crystal_tint_must_flow"]
+        return str(kind or "") in {str(r) for r in rows}
+    except Exception:  # noqa: BLE001
+        return str(kind or "") == "manager"
+
+
 def dialogue_tint_ready(kind: str, row: Any) -> bool:
     """The active words have completed the second pass.
 
@@ -12679,6 +12916,8 @@ def dialogue_tint_ready(kind: str, row: Any) -> bool:
     """
     if not dialogue_tint_required():
         return True
+    if tint_must_flow(kind):
+        return True                     # 2026-09-10: it goes out either way
     if not isinstance(row, dict):
         return False
     entry = dialogue_entry(row)
@@ -44734,7 +44973,19 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
                 slot_id=str(slot.get("id") or ""),
                 occurrence=str(slot.get("occurrence")
                                or (_RADIO.get("sched_pos") or {}).get(
-                                   "occurrence") or "")))
+                                   "occurrence") or ""))
+            # 2026-09-10: the SHAPE the operator laid out for this segment,
+            # and the way they have rewritten this kind of segment before.
+            # Both ride here for the same reason the notes do - this clause
+            # is the one road every scheduled round passes through. The
+            # shape speaks before the examples: it says what to write, they
+            # say how it is meant to sound.
+            + director_beats_clause(
+                str(slot.get("kind") or ""),
+                occurrence=str(slot.get("occurrence")
+                               or (_RADIO.get("sched_pos") or {}).get(
+                                   "occurrence") or ""))
+            + director_lessons_clause(str(slot.get("kind") or "")))
 
 
 def rap_battle_clause(up_next: str = "") -> str:
@@ -79544,6 +79795,8 @@ async def generate_answer(
         "game_lookup_used": False,
         "gear_manual_used": False,
         "gear_device": "",
+        "library_used": False,      # #1158
+        "library_docs": [],
         "from_library": False,
         "system_status_used": False,
         "image_requested": False,
@@ -79759,6 +80012,8 @@ async def generate_answer(
         and not weather_used
         and is_song_query(user_text)
     )
+    # #1158: ...unless the question names a document on the shelf outright.
+    library_named = library_named_document(user_text)
     te_used = (
         not memory_command
         and not system_used
@@ -79768,7 +80023,22 @@ async def generate_answer(
         and not weather_used
         and not song_used
         and settings.get("gear_manuals", True)
+        and not library_named
         and is_te_query(user_text)
+    )
+    # #1158: the shelf. After the gear manuals by design - an OP-XY question
+    # keeps answering exactly the way it always has - and before the web,
+    # because the box should read its own documents before it reaches out.
+    library_used = (
+        not memory_command
+        and not system_used
+        and not tune_requested
+        and not video_requested
+        and not image_requested
+        and not weather_used
+        and not song_used
+        and not te_used
+        and (bool(library_named) or is_library_query(user_text))
     )
     # One named episode goes to the discussion threads; anything vaguer about
     # the show goes down the ordinary TV path.
@@ -79781,6 +80051,7 @@ async def generate_answer(
         and not weather_used
         and not song_used
         and not te_used
+        and not library_used
         and settings["web_search"]
         and is_episode_talk(user_text)
     )
@@ -79793,6 +80064,7 @@ async def generate_answer(
         and not weather_used
         and not song_used
         and not te_used
+        and not library_used
         and not episode_used
         and settings["web_search"]
         and is_tv_query(user_text)
@@ -79806,6 +80078,7 @@ async def generate_answer(
         and not weather_used
         and not song_used
         and not te_used
+        and not library_used
         and not episode_used
         and not tv_used
         and settings.get("game_search", True)
@@ -79820,6 +80093,7 @@ async def generate_answer(
         and not weather_used
         and not song_used
         and not te_used
+        and not library_used
         and not episode_used
         and not tv_used
         and not game_used
@@ -80164,19 +80438,50 @@ async def generate_answer(
                 except Exception:
                     pass  # The manual pages alone still answer the question.
         else:
-            # Device recognised but nothing cached: fall back to the web.
+            # Device recognised but nothing cached. #1158: ask the shelf
+            # before the web - the operator's own documents are already on
+            # this machine, and one of them may well be the guide for it.
             te_used = False
+            shelf = await library_lookup(user_text) if library_on() else []
+            if shelf:
+                feature_meta["library_used"] = True
+                feature_meta["library_docs"] = library_credits(shelf)
+                messages.append({"role": "system",
+                                 "content": format_library_context(shelf)})
+            else:
+                feature_meta["web_search_used"] = True
+                play_search_sound()
+                try:
+                    results = await search_searxng(
+                        clean_search_query(user_text))
+                    context = format_search_context(user_text, results)
+                except Exception as exc:
+                    context = (
+                        "The web search service failed. Tell the user gear "
+                        f"documentation is temporarily unavailable. "
+                        f"Error: {exc}"
+                    )
+                messages.append({"role": "system", "content": context})
+    elif library_used:
+        # #1158: the operator's own shelf. It answers or it says nothing -
+        # a passage under the measured floor is not an answer, it is the
+        # nearest thing on a shelf that had nothing.
+        shelf = await library_lookup(user_text)
+        if shelf:
+            feature_meta["library_used"] = True
+            feature_meta["library_docs"] = library_credits(shelf)
+            messages.append({"role": "system",
+                             "content": format_library_context(shelf)})
+        elif settings["web_search"] and needs_web_search(user_text):
             feature_meta["web_search_used"] = True
             play_search_sound()
             try:
                 results = await search_searxng(clean_search_query(user_text))
-                context = format_search_context(user_text, results)
-            except Exception as exc:
-                context = (
-                    "The web search service failed. Tell the user gear "
-                    f"documentation is temporarily unavailable. Error: {exc}"
-                )
-            messages.append({"role": "system", "content": context})
+                messages.append({
+                    "role": "system",
+                    "content": format_search_context(user_text, results)})
+            except Exception:  # noqa: BLE001
+                pass       # no shelf and no web is still an honest answer
     elif episode_used:
         feature_meta["episode_talk_used"] = True
         play_search_sound()
@@ -97059,7 +97364,7 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
     presented as the plan."""
     out: dict[str, Any] = {"turns": [], "seconds": 0.0, "state": "nothing",
                            "candidate": "", "source": "", "drafts": 0,
-                           "draft_head": ""}
+                           "draft_head": "", "tint": {}}
     try:
         allocations = list(slot.get("allocations") or [])
         drafts = list(slot.get("drafts") or [])
@@ -97117,6 +97422,26 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
                 if str(live_entry.get("script") or "").strip():
                     script = str(live_entry["script"])
                     out["live"] = True
+                # 2026-09-10: WHAT THE CRYSTAL DID, for the second gate.
+                # "I want to perfect the script before we even get to the
+                # tinting phase, and then we start perfecting the tint as
+                # well" - so the room has to be able to say whether the
+                # words on screen are the tinted ones or the plain ones,
+                # and how much of the round the crystal actually reached.
+                tinted = str(live_entry.get("script_tinted") or "").strip()
+                report = live_entry.get("tint")
+                cov = (report or {}).get("coverage") if isinstance(
+                    report, dict) else {}
+                out["tint"] = {
+                    "is_tinted": bool(tinted and tinted == script.strip()),
+                    "has_tinted_take": bool(tinted),
+                    "covered": int((cov or {}).get("covered") or 0),
+                    "eligible": int((cov or {}).get("eligible") or 0),
+                    "target": int((cov or {}).get("target") or 0),
+                    "met": bool((cov or {}).get("met")),
+                    "must_flow": bool(tint_must_flow(str(slot.get("kind")
+                                                        or ""))),
+                }
         except Exception:  # noqa: BLE001
             pass
         for marker, said in banter_turns(script):
@@ -97201,6 +97526,7 @@ def director_room(which: int = 0) -> dict[str, Any]:
                                "tint_approved": False,
                                "aired_unapproved": False,
                                "state": "unplanned"},
+                    "beats": director_beats(kind, str(slot.get("id") or "")),
                 })
                 at += owns
         except Exception as exc:  # noqa: BLE001
@@ -97251,6 +97577,7 @@ def director_room(which: int = 0) -> dict[str, Any]:
                 kind, str(slot.get("template_id") or ""),
                 str(slot.get("id") or "")),
             "review": script_state(str(slot.get("id") or "")),
+            "beats": director_beats(kind, str(slot.get("id") or "")),
         })
     # WHAT THE HOUR COSTS TO VOICE. The room says this out loud because it
     # is the reason the long-round roads starve: the marginal render term
@@ -97335,6 +97662,61 @@ def director_segment_row(occurrence: str) -> tuple[str, Any, str] | None:
     return None
 
 
+def director_fork_kept(kind: str, row: dict[str, Any],
+                       entry: dict[str, Any]) -> tuple[dict[str, Any],
+                                                       dict[str, Any]]:
+    """Copy a kept round into a fresh, writable one.
+
+    A frozen or already-aired round is SHARED material - the retirement
+    desk's standing rule is that finished work is not destroyed - and a
+    frozen row is restored from its kept copy, so an edit written into one
+    is accepted and then silently thrown away. That was measured: the
+    first live rewrite this desk ever took vanished within the hour.
+
+    So the kept round is left exactly as it is and the operator's rewrite
+    becomes a NEW take standing beside it. What the fork drops is every
+    mark that says "this one is finished": its identity, its innings, its
+    freeze and its keep. What it carries is the script, the cast, the
+    voices and the takes - so only the line that was actually changed has
+    to be recorded, which is the whole economy of editing here.
+
+    The fork does NOT capture the occurrence that was being looked at.
+    That airing is already rendered and bound; System2 picks the fork up
+    on its next sync and it stands for the next one. Saying so plainly is
+    better than pretending an edit can reach a segment that is already on
+    its way out of the door."""
+    fork_row = copy.deepcopy(row)
+    fork_entry = dialogue_entry(fork_row)
+    if fork_entry is None:                  # a row shape with no entry
+        fork_entry = fork_row
+    parent = alt_sid_of(kind, row)
+    now = time.time()
+    # Not the kept item any more: a new identity, no innings, no freeze.
+    for key in ("sid", "aired", "aired_at", "tinted_seen_at", "keep_until",
+                "carried", "stock_used_by", "review_ids",
+                "review_shelf_before", "review_shelf_pending"):
+        fork_row.pop(key, None)
+        fork_entry.pop(key, None)
+    fork_entry.pop("frozen", None)
+    fork_row["at"] = now
+    fork_entry["at"] = now
+    # The writing room has already been paid for - this is the operator's
+    # own wording, and nothing may hand it back to the model to reword.
+    fork_entry["freshened"] = True
+    fork_entry["director_fork_of"] = parent
+    fork_entry["director_forked_at"] = now
+    try:
+        fork_row["expires_at"] = stock_expires_at(kind, fork_row)
+    except Exception:                              # noqa: BLE001
+        fork_row.pop("expires_at", None)
+    _SHELF.setdefault(str(kind), []).append(fork_row)
+    try:
+        alt_sid(str(kind), fork_row)               # stamp its new identity
+    except Exception:                              # noqa: BLE001
+        pass
+    return fork_row, fork_entry
+
+
 def director_edit_turn(occurrence: str, index: int, said: str,
                        expect: str = "") -> dict[str, Any]:
     """Rewrite one turn of a bound segment, and its take with it.
@@ -97381,21 +97763,20 @@ def director_edit_turn(occurrence: str, index: int, said: str,
     #
     # A frozen or already-aired round is shared material - the retirement
     # desk's whole rule is that a finished round is not destroyed - so it
-    # is refused here rather than mutated. Fresh unaired rows exist on
-    # every dialogue road (measured: gallery 8, manager 6, caller 9,
-    # news 2 of the shelf at the time of writing) and those edit properly.
-    if entry.get("frozen"):
-        raise HTTPException(
-            409, "that round is kept material - it has aired before and is "
-                 "held for reuse, so an edit to it would be restored from "
-                 "the kept copy and lost. Edit a segment that has not gone "
-                 "out yet.")
-    if row.get("aired") or row.get("aired_at") or entry.get("aired_at"):
-        raise HTTPException(
-            409, "that round has already aired. Rewriting it now would "
-                 "change a recording of something the station has already "
-                 "said; direct the next one instead - a standing note on "
-                 "this segment kind is the way to do that.")
+    # is FORKED rather than mutated. The kept round stays exactly as it is
+    # and the rewrite becomes a new take standing beside it, which is the
+    # only way an edit can be both safe and always available: refusing
+    # here meant most bound segments could not be edited at all, because
+    # most of what the station airs is kept material on a second innings.
+    #
+    # The fork happens BEFORE the turn is located, so everything below -
+    # the turn list, the take match, the re-key - operates on the copy and
+    # the kept round is never touched at all.
+    forked = False
+    if (entry.get("frozen") or row.get("aired") or row.get("aired_at")
+            or entry.get("aired_at")):
+        row, entry = director_fork_kept(kind, row, entry)
+        forked = True
     caller_name = str(entry.get("caller_name") or "")
     turns = banter_turns(str(entry["script"]), caller_name)
     index = int(index)
@@ -97474,10 +97855,14 @@ def director_edit_turn(occurrence: str, index: int, said: str,
                            "re-records, the rest of the round stands" % kind,
                  extra="was: %s\nnow: %s" % (was[:300], said[:300]))
     return {"ok": True, "changed": True, "edit": edit,
-            "kind": kind, "seat": marker,
+            "kind": kind, "seat": marker, "forked": forked,
             "state": script_state(occurrence),
-            "say": "rewritten - that one line re-records, the round comes "
-                   "back as soon as it has"}
+            "say": ("that round had already aired, so your rewrite is a NEW "
+                    "take standing beside it - the kept one is untouched. "
+                    "One line records and it joins the rotation."
+                    if forked else
+                    "rewritten - that one line re-records, the round comes "
+                    "back as soon as it has")}
 
 
 @app.post("/api/director/segment/{occurrence}/turn")
@@ -97521,6 +97906,199 @@ async def api_director_lessons(kind: str = "", most: int = 40
     rows = await asyncio.to_thread(script_lessons, kind, int(most or 40))
     return {"at": time.time(), "kind": kind, "rows": rows,
             "say": "%d rewrite(s) on the book" % len(rows)}
+
+
+# --- 2026-09-10: MAKING THE HOUR FIT THE ENGINE --------------------------
+#
+#    "you have the right to experiment with however you have to in order to
+#     make sure all of the segments take place over the course of the entire
+#     hour."
+#
+# THE ARITHMETIC THAT DECIDES THIS. Rendering costs 2.97s of engine plus
+# 1.05x the finished audio, on one lane, measured on this box. The marginal
+# term is ABOVE ONE, so a minute of talk costs slightly more than a minute
+# to make. The canonical hour asks for 56 minutes of voiced talk out of 60,
+# which is ~60 minutes of engine against 60 minutes of clock: load 0.997,
+# no margin at all. At that load the hour cannot absorb a slow render, a
+# refused tint or a restart, and what actually happens is that the road with
+# the LONGEST rounds loses - measured, callers: 256 live candidates and
+# three ready, 251 of them written but never recorded.
+#
+# So the hour was not failing to run its segments because of a scheduling
+# fault. It was over-subscribed, and a plan that cannot be made is not a
+# plan. Every segment KIND stays - the ask is that they all happen, not that
+# there are fewer of them - and the minutes come down until the hour fits,
+# with the reclaimed time going to records, which cost no engine at all.
+#
+# Nothing here edits the running order in place. It writes a NEW preset and
+# leaves the original untouched, so the whole change is one click to undo.
+
+HEADROOM_TARGET = 0.78          # of the hour's engine; ~13 min of slack
+HEADROOM_FLOOR = 2.0            # minutes: shorter than this is not a segment
+# Roads whose minutes are not scaled. Ads are largely produced spots and
+# cached reads, so their airtime is not a fresh render; the memos from
+# upstairs are two minutes twice an hour and are the thing the operator
+# most wants to hear.
+HEADROOM_KEEP = ("ad", "manager", "station_id")
+
+
+def headroom_cost(slots: list[dict[str, Any]]) -> float:
+    """Engine seconds to voice one pass of this running order."""
+    talk = sum(max(0.0, float(s.get("minutes") or 0)) * 60.0
+               for s in slots
+               if s.get("enabled", True) and str(s.get("kind")) != "record")
+    return DIRECTOR_RENDER_FIXED * max(1, len(slots)) + DIRECTOR_RENDER_RATE * talk
+
+
+def headroom_plan(slots: list[dict[str, Any]],
+                  target: float = HEADROOM_TARGET) -> dict[str, Any]:
+    """Thin a running order until it can actually be voiced.
+
+    Proportional, not surgical: every scalable road gives up the same share
+    of its minutes, so the hour keeps its shape and its balance. Floors stop
+    a road being scaled into meaninglessness, and everything reclaimed goes
+    to the record entries."""
+    rows = [dict(s) for s in slots]
+    live = [s for s in rows if s.get("enabled", True)]
+    was = headroom_cost(live)
+    want = max(0.05, float(target)) * 3600.0
+    out = {"was_seconds": round(was, 1), "was_load": round(was / 3600.0, 3),
+           "target": target, "changed": [], "gave_back": 0.0}
+    if was <= want:
+        out["say"] = ("the hour already fits - %.0f min of engine against "
+                      "60 min of clock" % (was / 60.0))
+        out["slots"] = rows
+        return out
+    scalable = [s for s in live
+                if str(s.get("kind")) not in HEADROOM_KEEP
+                and str(s.get("kind")) != "record"
+                and float(s.get("minutes") or 0) > HEADROOM_FLOOR]
+    fixed = was - DIRECTOR_RENDER_RATE * sum(
+        float(s.get("minutes") or 0) * 60.0 for s in scalable)
+    room = max(0.0, want - fixed)
+    have = sum(float(s.get("minutes") or 0) * 60.0 for s in scalable)
+    if not scalable or have <= 0:
+        out["say"] = ("the hour is over-subscribed and nothing on it can be "
+                      "shortened without going under the floor")
+        out["slots"] = rows
+        return out
+    share = max(0.2, min(1.0, room / (DIRECTOR_RENDER_RATE * have)))
+    reclaimed = 0.0
+    for slot in scalable:
+        before = float(slot.get("minutes") or 0)
+        after = max(HEADROOM_FLOOR, round(before * share * 2) / 2.0)
+        if after >= before:
+            continue
+        slot["minutes"] = after
+        reclaimed += before - after
+        out["changed"].append({"id": slot.get("id"), "kind": slot.get("kind"),
+                               "label": slot.get("label"),
+                               "was": before, "now": after})
+    # Everything given up goes to the records, which cost no engine.
+    records = [s for s in live if str(s.get("kind")) == "record"]
+    if records and reclaimed > 0:
+        each = reclaimed / len(records)
+        for slot in records:
+            slot["minutes"] = round((float(slot.get("minutes") or 0) + each)
+                                    * 2) / 2.0
+    out["gave_back"] = round(reclaimed, 1)
+    now = headroom_cost(live)
+    out.update(now_seconds=round(now, 1), now_load=round(now / 3600.0, 3),
+               slots=rows)
+    out["say"] = ("%.0f min of talk moved to the records: the hour goes from "
+                  "%.0f to %.0f min of engine against 60 min of clock, "
+                  "load %.2f to %.2f"
+                  % (reclaimed, was / 60.0, now / 60.0,
+                     was / 3600.0, now / 3600.0))
+    return out
+
+
+@app.get("/api/director/headroom")
+async def api_director_headroom(target: float = HEADROOM_TARGET
+                                ) -> dict[str, Any]:
+    """Can this hour actually be voiced, and what would it take?"""
+    def work() -> dict[str, Any]:
+        store = schedule_read()
+        name = schedule_preset_now(store)
+        slots = list((store.get("presets") or {}).get(name) or [])
+        got = headroom_plan(slots, float(target))
+        got["preset"] = name
+        got.pop("slots", None)
+        return got
+    return await asyncio.to_thread(work)
+
+
+@app.post("/api/director/headroom/apply")
+async def api_director_headroom_apply(payload: dict[str, Any] | None = None
+                                      ) -> dict[str, Any]:
+    """Write the thinned hour as a NEW preset, and optionally run it.
+
+    The original is never edited, so going back is one click on the
+    scheduler - which matters, because how an hour sounds is the
+    operator's call and this is only arithmetic about whether it can be
+    made at all."""
+    target = float((payload or {}).get("target") or HEADROOM_TARGET)
+    activate = bool((payload or {}).get("activate", True))
+    into = str((payload or {}).get("name") or "").strip()
+
+    def work() -> dict[str, Any]:
+        store = schedule_read()
+        name = schedule_preset_now(store)
+        slots = list((store.get("presets") or {}).get(name) or [])
+        got = headroom_plan(slots, target)
+        rows = got.pop("slots", None) or []
+        if not got.get("changed"):
+            got["preset"] = name
+            got["applied"] = False
+            return got
+        made = into or (name + " (fits the engine)")
+        store.setdefault("presets", {})[made] = rows
+        if activate:
+            store["active"] = made
+            day = store.get("day")
+            if isinstance(day, dict):
+                for hour in list(day):
+                    if str(day.get(hour) or "") == name:
+                        day[hour] = made
+        schedule_write(store)
+        got.update(preset=made, from_preset=name, applied=True,
+                   active=bool(activate))
+        return got
+    got = await asyncio.to_thread(work)
+    if got.get("applied"):
+        pipeline_log("action", "the running order was thinned so the hour "
+                               "can actually be voiced - " + str(got.get("say")))
+    return got
+
+
+@app.get("/api/director/graph")
+async def api_director_graph() -> dict[str, Any]:
+    """Every segment shape the operator has laid out, and the node types."""
+    return await asyncio.to_thread(director_graph)
+
+
+@app.post("/api/director/beats")
+async def api_director_beats(payload: dict[str, Any]) -> dict[str, Any]:
+    """Lay out the beats of a segment.
+
+    Scoped to a KIND (every future segment of it runs this shape) or to one
+    OCCURRENCE, which overrides the kind for that airing only - the same
+    two distances the notes use, because they answer the same question."""
+    kind = str((payload or {}).get("kind") or "").strip()
+    if not kind:
+        raise HTTPException(400, "a shape has to belong to a segment kind")
+    occurrence = str((payload or {}).get("occurrence") or "")
+    rows = await asyncio.to_thread(
+        director_beats_set, kind, (payload or {}).get("beats") or [],
+        occurrence)
+    return {"ok": True, "kind": kind, "occurrence": occurrence,
+            "beats": rows,
+            "clause": director_beats_clause(kind, occurrence),
+            "say": ("cleared - this %s runs its ordinary shape again" % kind
+                    if not rows else
+                    "%d beats - every %s runs this shape now" % (len(rows), kind)
+                    if not occurrence else
+                    "%d beats, this airing only" % len(rows))}
 
 
 @app.get("/api/director/sheet")
@@ -105809,6 +106387,310 @@ async def phrase_set_delete(
     return {"deleted": name, "sets": list(sets)}
 
 
+# --- The Library's doors (#1158) ---------------------------------------------
+#
+# Auth follows the gear manuals' own precedent next door: the JSON roads want
+# a read key, while the raw page assets and the source file do not - an <img>
+# inside the reader and an <iframe> showing a PDF cannot set an Authorization
+# header, and te_asset / te_pdf have always been open for exactly that reason.
+
+
+def library_source_path(slug: str) -> Path:
+    """The original file for a shelf row, checked against the watched folders.
+
+    The index is a file on disk. If anything ever edits it, "path" must not
+    become a road to read any file on the box through an open route.
+    """
+    row = library.doc_row(safe_key(slug)) or {}
+    raw = str(row.get("path") or "")
+    if not raw:
+        raise HTTPException(status_code=404, detail="No such document")
+    path = Path(raw)
+    for folder in library_folders():
+        try:
+            if path.resolve().is_relative_to(Path(folder).resolve()):
+                return path
+        except OSError:
+            continue
+    raise HTTPException(status_code=404, detail="That document is not on a "
+                                                "watched shelf")
+
+
+MANUAL_READ_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+ :root{color-scheme:light dark}
+ body{margin:0;font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif}
+ .bar{position:sticky;top:0;display:flex;gap:10px;align-items:center;
+      padding:8px 14px;background:Canvas;border-bottom:1px solid #8884;
+      font-size:13px}
+ .bar b{font-weight:600}
+ .bar span{opacity:.6}
+ .bar a{text-decoration:none;padding:2px 8px;border:1px solid #8886;
+        border-radius:6px;color:inherit}
+ main{max-width:44rem;margin:0 auto;padding:18px 16px 80px}
+ img{max-width:100%;height:auto}
+ h1,h2,h3{line-height:1.25}
+ table{border-collapse:collapse}td,th{border:1px solid #8884;padding:4px 7px}
+</style></head><body>
+<div class="bar">__NAV__</div>
+<main>__BODY__</main>
+</body></html>"""
+
+
+@app.get("/manuals/read/{slug}/{page_n}", response_class=HTMLResponse)
+async def manuals_read_page(slug: str, page_n: int) -> str:
+    """One chapter, full width, on its own URL - what "Open the file" does
+    for an EPUB, where a PDF simply opens in the browser's viewer."""
+    slug = safe_key(slug)
+    doc = library.doc_pages(slug)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No such document")
+    pages = doc.get("pages") or []
+    page = next((p for p in pages if int(p.get("n") or 0) == int(page_n)),
+                None)
+    if page is None:
+        raise HTTPException(status_code=404, detail="No such page")
+    word = library.page_word(doc.get("kind", ""))
+    try:
+        body = (library.doc_dir(slug) / "pages"
+                / f"{int(page_n):04d}.html").read_text(encoding="utf-8")
+    except OSError:
+        body = ""
+    if body:
+        # The figures were written beside the chapter; point at the route
+        # that serves them. (The markup itself was sanitised on the way in.)
+        body = body.replace('src="img/',
+                            f'src="/api/manuals/asset/{slug}/')
+    else:
+        body = ("<pre style=\"white-space:pre-wrap\">"
+                + html_escape(str(page.get("text") or "")) + "</pre>")
+    ns = [int(p.get("n") or 0) for p in pages]
+    here = ns.index(int(page_n))
+    nav = [f"<b>{html_escape(str(doc.get('title') or slug))}</b>",
+           f"<span>{word} {page_n} of {len(ns)}"
+           + (f" &middot; {html_escape(str(page.get('heading')))}"
+              if page.get("heading") else "") + "</span>"]
+    if here > 0:
+        nav.append(f'<a href="/manuals/read/{slug}/{ns[here - 1]}">&larr; '
+                   f'previous</a>')
+    if here + 1 < len(ns):
+        nav.append(f'<a href="/manuals/read/{slug}/{ns[here + 1]}">next '
+                   f'&rarr;</a>')
+    nav.append(f'<a href="/api/manuals/file/{slug}">the original file</a>')
+    return (MANUAL_READ_HTML
+            .replace("__TITLE__", html_escape(
+                f"{doc.get('title') or slug} - {word} {page_n}"))
+            .replace("__NAV__", " ".join(nav))
+            .replace("__BODY__", body))
+
+
+@app.get("/api/manuals")
+async def manuals_index(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The whole shelf and what the assimilator is doing this second."""
+    require_read_auth(authorization)
+    return {"documents": library.docs(), "stats": library.stats(),
+            "folders": library_folders(), "on": library_on(),
+            "kinds": sorted(set(library_extract.KINDS.values()))}
+
+
+@app.get("/api/manuals/doc/{slug}")
+async def manuals_document(
+    slug: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """One document's pages. Headings and lengths only by default - a
+    543-page manual is a megabyte of text and the reader asks per page."""
+    require_read_auth(authorization)
+    slug = safe_key(slug)
+    doc = library.doc_pages(slug)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No such document")
+    row = library.doc_row(slug) or {}
+    return {
+        "slug": slug, "title": doc.get("title", ""),
+        "kind": doc.get("kind", ""), "figures": doc.get("figures", 0),
+        "reader": doc.get("reader", ""), "row": row,
+        "page_word": library.page_word(doc.get("kind", "")),
+        "pages": [{"n": p.get("n"), "heading": p.get("heading", ""),
+                   "chars": len(str(p.get("text") or ""))}
+                  for p in doc.get("pages") or []],
+    }
+
+
+@app.get("/api/manuals/page/{slug}/{page_n}")
+async def manuals_page(
+    slug: str,
+    page_n: int,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """One page to read. An EPUB or a website bundle hands back the chapter's
+    own sanitised markup; everything else hands back its text."""
+    require_read_auth(authorization)
+    slug = safe_key(slug)
+    doc = library.doc_pages(slug)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No such document")
+    page = next((p for p in doc.get("pages") or []
+                 if int(p.get("n") or 0) == int(page_n)), None)
+    if page is None:
+        raise HTTPException(status_code=404, detail="No such page")
+    body = ""
+    chapter = library.doc_dir(slug) / "pages" / f"{int(page_n):04d}.html"
+    try:
+        body = chapter.read_text(encoding="utf-8")
+    except OSError:
+        body = ""
+    return {"slug": slug, "n": page.get("n"), "heading": page.get("heading", ""),
+            "text": page.get("text", ""), "html": body,
+            "kind": doc.get("kind", ""),
+            "page_word": library.page_word(doc.get("kind", "")),
+            "pages": len(doc.get("pages") or [])}
+
+
+@app.get("/api/manuals/asset/{slug}/{name}")
+async def manuals_asset(slug: str, name: str) -> Response:
+    """A figure lifted out of an EPUB, for the reader pane."""
+    clean = re.sub(r"[^A-Za-z0-9._-]", "", name)
+    path = library.doc_dir(safe_key(slug)) / "pages" / "img" / clean
+    try:
+        data = path.read_bytes()
+    except OSError:
+        raise HTTPException(status_code=404, detail="No such figure")
+    kinds = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+             ".gif": "image/gif", ".svg": "image/svg+xml",
+             ".webp": "image/webp"}
+    return Response(
+        content=data,
+        media_type=kinds.get(path.suffix.lower(), "application/octet-stream"),
+        headers={"Cache-Control": "public, max-age=86400",
+                 "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.get("/api/manuals/file/{slug}")
+async def manuals_file(slug: str) -> Response:
+    """The document itself, streamed off the shelf.
+
+    This is what makes a PDF readable without rasterising a single page: the
+    browser renders it natively in an iframe, and #page=N takes it straight
+    to the page an answer cited. (The gear corpus spent 609 MB on page PNGs.)
+    """
+    path = library_source_path(slug)
+    kinds = {".pdf": "application/pdf", ".epub": "application/epub+zip",
+             ".zip": "application/zip", ".txt": "text/plain; charset=utf-8",
+             ".md": "text/plain; charset=utf-8",
+             ".html": "text/html; charset=utf-8"}
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="The file has gone")
+    return FileResponse(
+        path,
+        media_type=kinds.get(path.suffix.lower(), "application/octet-stream"),
+        headers={"Cache-Control": "private, max-age=3600",
+                 "Content-Disposition": f'inline; filename="{safe_key(slug)}'
+                                        f'{path.suffix.lower()}"'},
+    )
+
+
+@app.post("/api/manuals/search")
+async def manuals_search_route(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The console's search box. Ungated on purpose: somebody typing into the
+    shelf's own search means it, so it answers even for words the chat road
+    would refuse to open the shelf for."""
+    require_auth(authorization)
+    payload = await request.json()
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Enter something to find")
+    k = max(1, min(30, int(payload.get("k") or 10)))
+    began = time.time()
+    hits = await library.search(text, k=k, per_doc=int(payload.get("per_doc")
+                                                       or 3),
+                               gate=bool(payload.get("gate")))
+    return {"query": text, "hits": hits, "ms": int((time.time() - began) * 1000),
+            "would_answer": bool(await asyncio.to_thread(
+                library.shelf_question, text)) and bool(hits)}
+
+
+@app.post("/api/manuals/ask")
+async def manuals_ask(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Ask about the open document. The model reads the section around the
+    page, not one orphan page - the same courtesy the gear-manual chat gets."""
+    require_auth(authorization)
+    payload = await request.json()
+    slug = safe_key(str(payload.get("slug") or ""))
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Say something first")
+    doc = library.doc_pages(slug)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No such document")
+    page_n = int(payload.get("page") or 0)
+    context = await asyncio.to_thread(library.section, slug, page_n, text)
+    if not context:
+        raise HTTPException(status_code=404,
+                            detail="Nothing readable on that page")
+    word = library.page_word(doc.get("kind", ""))
+    settings = load_settings()
+    result = await call_ollama(
+        model=settings["model"],
+        messages=[
+            {"role": "system", "content": (
+                f"You are reading \"{doc.get('title')}\", a document kept on "
+                "this machine. Answer only from the passages below. Name the "
+                f"exact controls and steps in order, cite the {word} numbers "
+                "you used, and if the passages do not cover it say so plainly "
+                "instead of inventing an answer.\n\n" + context)},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.6, max_tokens=400, num_ctx=8192,
+        purpose="interactive",
+    )
+    answer = str((result.get("message") or {}).get("content") or "").strip()
+    if result.get("deferred"):
+        answer = ("The model has no free lane this second - the show is "
+                  "using it. Ask again in a moment.")
+    return {"slug": slug, "page": page_n, "answer": answer,
+            "title": doc.get("title", ""), "used": context[:4000]}
+
+
+@app.post("/api/manuals/ingest")
+async def manuals_ingest(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Make the assimilator come round now, re-read one document, or take one
+    off the shelf. The clock would get there on its own within two minutes;
+    this is for when somebody is standing over it."""
+    require_auth(authorization)
+    payload = await request.json()
+    slug = safe_key(str(payload.get("slug") or ""))
+    if slug and payload.get("forget"):
+        await asyncio.to_thread(library.forget, slug)
+        library.wake()
+        return {"forgotten": slug}
+    if slug:
+        row = library.doc_row(slug)
+        if row is None:
+            raise HTTPException(status_code=404, detail="No such document")
+        row.update({"state": "queued", "note": "", "mtime": 0})
+        library.wake()
+        return {"queued": slug}
+    library.wake()
+    return {"woken": True, "folders": library_folders(),
+            "stats": library.stats()}
+
+
 @app.get("/api/te/devices")
 async def te_device_list(
     authorization: str | None = Header(default=None),
@@ -106392,6 +107274,10 @@ async def services_census() -> dict[str, Any]:
             _installed = [str(m.get("name") or "")
                           for m in (_tj.get("models") or [])]
         _has_embed = any(EMBED_MODEL in m for m in _installed)
+        try:
+            _lib_stats = library.stats()
+        except Exception:  # noqa: BLE001
+            _lib_stats = {}
         services["vector guides"] = {
             "ok": _has_embed and bool(services.get("ollama", {}).get("ok")),
             "detail": (f"{EMBED_MODEL} installed" if _has_embed
@@ -106399,8 +107285,18 @@ async def services_census() -> dict[str, Any]:
                             "cannot be searched"),
             "url": f"{OLLAMA_URL} · {EMBED_MODEL}",
             "virtual": True,
-            "facts": [f"{len(te_devices())} manuals chunked and cached",
-                      "the crystal reads and chunks through this road"]}
+            "facts": [
+                # #1158: this line used to say "N manuals chunked and
+                # cached" and count te_devices(). Nothing in the gear corpus
+                # has ever been chunked or embedded - te_lookup scores pages
+                # by substring - so the census was reporting a vector index
+                # that did not exist. It counts the Library now, which is
+                # the thing on this box that really is chunked.
+                f"{_lib_stats.get('documents', 0)} documents on the shelf, "
+                f"{_lib_stats.get('chunks', 0)} chunks embedded",
+                f"{len(te_devices())} gear manuals cached (matched by "
+                "the letters, not embedded)",
+                "the crystal reads and chunks through this road"]}
     except Exception:  # noqa: BLE001
         pass
 
@@ -127972,6 +128868,8 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
             style="width:auto;max-width:150px;flex:0 1 auto;min-width:0;
                    padding:6px 10px;font-size:13px">
     </select>
+    <button id="manualsBtn" class="tray-btn" title="The Library — every document on the shelf, read and searchable (#1158)"
+            onclick="manualsOpen()" style="font-size:18px;line-height:1">📚</button>
     <button id="journalBtn" class="tray-btn" title="The request book — every request and its reply, page by page (#1079)"
             onclick="journalOpen()" style="font-size:18px;line-height:1">📖</button>
     <!-- 2026-09-10: the director's room - the hour entry by entry, the script
@@ -130146,6 +131044,7 @@ const PINE_3JS = [
            close: () => boothClose(), width: 760, height: 560}},
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
   {key: "rhymecloud", label: "🎤 Rhyme Cloud",  open: () => rhymeCloudWin()},
+  {key: "manuals",  label: "📚 The Library",     open: () => manualsOpen()},
   {key: "journal",  label: "📖 Request book",   open: () => journalOpen()},
   {key: "director", label: "🎬 Director",        open: () => directorOpen()},
   {key: "paper",    label: "📰 The Gazette",     open: () => paperOpen(),
@@ -132969,6 +133868,102 @@ function retireDeskOpen() {
  * notes govern every future segment of that kind; a "just this one" note is
  * pinned to the occurrence and is spent when that occurrence completes.
  */
+/* 2026-09-10: THE SEGMENT AS A FLOW CHART.
+ *
+ * "I want this to be some sort of interactive flow chart system where I'm
+ *  able to have banter interject with other nodes that are things like
+ *  manager messages or interruptions from outside."
+ *
+ * A segment is a spine of the pair talking with things dropped into it, so
+ * the chart is the ORDER of those things: seed, banter, an interruption
+ * from upstairs, banter again, land it. Drawn as nodes because that is how
+ * it is thought about, and compiled to a paragraph in the prompt because a
+ * graph that does not reach the writing room is a drawing.
+ *
+ * Two scopes, the same two the notes use: a shape set on the KIND runs every
+ * future segment of it, a shape set on THIS ONE overrides it for that airing.
+ */
+let dirTypes = null;
+
+function dirBeatChart(row, host) {
+  const beats = row.beats || [];
+  const wrap = el("div", "dir-flow", "");
+  const line = el("div", "dir-flow-line", "");
+  if (!beats.length) {
+    const none = el("span", "dir-sub", "no shape set — this "
+      + row.kind + " runs however it comes out");
+    line.appendChild(none);
+  }
+  beats.forEach((b, at) => {
+    if (at) {
+      const arrow = el("span", "dir-arrow", "→");
+      line.appendChild(arrow);
+    }
+    const node = el("span", "dir-node " + ("n-" + b.type), b.type);
+    node.title = ((dirTypes && dirTypes[b.type]) || b.type)
+      + (b.note ? "\n\nyour note: " + b.note : "")
+      + "\n\nClick to remove this beat";
+    if (b.note) node.appendChild(el("span", "dir-node-note", " ·"));
+    node.onclick = async () => {
+      const left = beats.filter((x, i) => i !== at)
+        .map((x) => ({type: x.type, note: x.note || ""}));
+      await dirBeatsSave(row, left);
+    };
+    line.appendChild(node);
+  });
+  wrap.appendChild(line);
+
+  const add = el("div", "dir-add", "");
+  const pick = document.createElement("select");
+  const blank = document.createElement("option");
+  blank.value = ""; blank.textContent = "+ add a beat…";
+  pick.appendChild(blank);
+  Object.keys(dirTypes || {}).forEach((t) => {
+    const o = document.createElement("option");
+    o.value = t; o.textContent = t;
+    o.title = dirTypes[t];
+    pick.appendChild(o);
+  });
+  const note = document.createElement("input");
+  note.type = "text";
+  note.placeholder = "what happens in that beat (optional)";
+  const scope = document.createElement("select");
+  [["kind", "every " + row.kind], ["occ", "just this one"]]
+    .forEach(([v, label]) => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = label;
+      scope.appendChild(o);
+    });
+  const put = el("button", "", "Add");
+  put.onclick = async () => {
+    if (!pick.value) return;
+    put.disabled = true;
+    const next = beats.map((x) => ({type: x.type, note: x.note || ""}));
+    next.push({type: pick.value, note: note.value.trim()});
+    try {
+      await dirBeatsSave(row, next, scope.value === "occ");
+    } finally { put.disabled = false; }
+  };
+  const wipe = el("button", "", "Clear");
+  wipe.title = "Back to no set shape";
+  wipe.onclick = async () => { await dirBeatsSave(row, []); };
+  [pick, note, scope, put, wipe].forEach((n) => add.appendChild(n));
+  wrap.appendChild(add);
+  host.appendChild(wrap);
+}
+
+async function dirBeatsSave(row, beats, thisOne) {
+  try {
+    await api("/api/director/beats", {method: "POST", body: JSON.stringify({
+      kind: row.kind, beats,
+      occurrence: thisOne ? (row.occurrence || "") : "",
+    })});
+    await directorPaint();
+  } catch (e) {
+    alert("The shape was not saved: " + e);
+  }
+}
+
 let dirBook = null;
 let dirHour = 0;
 
@@ -133005,6 +134000,19 @@ function dirStyle() {
     ".dir-add input{flex:1;min-width:200px;font-size:12px;padding:3px 6px}",
     ".dir-load{font-size:11px;color:#8fa6bd}",
     ".dir-load.hot{color:#e0a35c}",
+    ".dir-flow{margin:5px 0 2px}",
+    ".dir-flow-line{display:flex;gap:4px;align-items:center;flex-wrap:wrap;",
+    "padding:3px 0}",
+    ".dir-arrow{color:#5d7186}",
+    ".dir-node{font-size:10px;padding:2px 8px;border-radius:99px;cursor:pointer;",
+    "border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.05)}",
+    ".dir-node:hover{border-color:#e0a35c}",
+    ".dir-node.n-manager{border-color:#e8c07c;color:#e8c07c}",
+    ".dir-node.n-outside{border-color:#8fb7e8;color:#8fb7e8}",
+    ".dir-node.n-caller{border-color:#e8c07c;color:#e8c07c}",
+    ".dir-node.n-seed{border-color:#a8e07c;color:#a8e07c}",
+    ".dir-node.n-sfx{border-color:#c79ae8;color:#c79ae8}",
+    ".dir-node-note{opacity:.7}",
   ].join("");
   document.head.appendChild(css);
 }
@@ -133039,6 +134047,12 @@ async function directorOpen() {
   const body = el("div", "dir-body", "");
   host.appendChild(body);
   dirBook = {win, body, load, thisHour, nextHour};
+  if (!dirTypes) {
+    try {
+      const g = await api("/api/director/graph");
+      dirTypes = g.types || {};
+    } catch (e) { dirTypes = {}; }
+  }
   thisHour.onclick = () => { dirHour = 0; directorPaint(); };
   nextHour.onclick = () => { dirHour = 1; directorPaint(); };
   refresh.onclick = () => directorPaint();
@@ -133090,6 +134104,19 @@ function directorRow(row) {
   head.appendChild(el("span", "dir-kind", row.kind));
   const chip = el("span", "dir-chip", row.state);
   if (row.state === "on air") chip.classList.add("live");
+  const tn = (row.script && row.script.tint) || {};
+  if (tn.has_tinted_take || tn.eligible) {
+    const t = el("span", "dir-chip",
+      tn.is_tinted ? "◆ tinted" : "◇ plain");
+    if (tn.is_tinted) t.classList.add("ok");
+    t.title = "The crystal reached " + (tn.covered || 0) + " of "
+      + (tn.eligible || 0) + " eligible turns (target " + (tn.target || 0)
+      + "%)."
+      + (tn.must_flow ? "\n\nThis road airs whether or not the tint lands — "
+        + "the hold may never silence it." : "")
+      + (tn.is_tinted ? "" : "\n\nThe plain words are what is on air.");
+    head.appendChild(t);
+  }
   else if (row.state === "aired" || row.state === "planned") chip.classList.add("ok");
   else if (row.state.indexOf("nothing") >= 0) chip.classList.add("warn");
   head.appendChild(chip);
@@ -133120,6 +134147,25 @@ function directorRow(row) {
       + "approval — the air is never held.";
     head.appendChild(esc);
   }
+  if ((row.script && (row.script.turns || []).length)
+      && rev.approved && !rev.tint_approved) {
+    /* The second gate. The script is signed off; this is the tint. */
+    const at = el("button", "", "Approve tint");
+    at.style.cssText = "font-size:10px;padding:1px 7px;margin-left:auto";
+    at.onclick = async () => {
+      at.disabled = true;
+      try {
+        await api("/api/director/segment/"
+          + encodeURIComponent(row.occurrence) + "/approve",
+          {method: "POST", body: JSON.stringify({tint: true})});
+        await directorPaint();
+      } catch (e) { at.disabled = false; alert("Not approved: " + e); }
+    };
+    head.appendChild(at);
+  }
+  if (rev.tint_approved) {
+    head.appendChild(el("span", "dir-chip ok", "✓ tint approved"));
+  }
   if ((row.script && (row.script.turns || []).length) && !rev.approved) {
     const ap = el("button", "", "Approve script");
     ap.style.cssText = "font-size:10px;padding:1px 7px;margin-left:auto";
@@ -133135,6 +134181,7 @@ function directorRow(row) {
     head.appendChild(ap);
   }
   card.appendChild(head);
+  dirBeatChart(row, card);
 
   /* WHAT IT IS GOING TO BE — the bound script, turn by turn, with the seat
    * the listener will actually hear rather than the letter the model wrote. */
@@ -172674,6 +173721,330 @@ function el(tag, cls, text) {
   if (cls) node.className = cls;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+/* ---- 📚 The Library: the operator's own documents (#1158) ----------------
+   The shelf assimilates on its own; this is where you watch it happen, read
+   what it read, and ask it something. A PDF is shown by the browser's own
+   viewer in an iframe (#page=N jumps straight to a cited page), an EPUB by
+   the sanitised chapter markup the extractor wrote out beside it.          */
+let libWin = null, libTimer = 0, libDoc = null, libPageN = 1, libRows = [];
+
+function libStyle() {
+  if (document.getElementById("libStyle")) return;
+  const st = document.createElement("style");
+  st.id = "libStyle";
+  st.textContent = `
+  .lb-wrap{display:flex;height:100%;min-height:0;font-size:12px}
+  .lb-side{width:290px;flex:0 0 290px;display:flex;flex-direction:column;
+           border-right:1px solid var(--line,#2a2a2a);min-height:0}
+  .lb-main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+  .lb-bar{display:flex;gap:6px;align-items:center;padding:6px 8px;
+          border-bottom:1px solid var(--line,#2a2a2a);flex-wrap:wrap}
+  .lb-bar input[type=text]{flex:1;min-width:90px}
+  .lb-list{flex:1;overflow:auto;min-height:0}
+  .lb-doc{padding:6px 8px;border-bottom:1px solid var(--line,#242424);
+          cursor:pointer;line-height:1.35}
+  .lb-doc:hover{background:rgba(127,127,127,.12)}
+  .lb-doc.on{background:rgba(90,150,255,.18)}
+  .lb-name{display:block;overflow:hidden;text-overflow:ellipsis;
+           white-space:nowrap}
+  .lb-sub{opacity:.6;font-size:11px}
+  .lb-chip{display:inline-block;padding:0 5px;border-radius:8px;font-size:10px;
+           margin-right:4px;background:#444;color:#fff;vertical-align:1px}
+  .lb-ready{background:#2c6e3f}.lb-queued{background:#5a5a5a}
+  .lb-reading{background:#8a6d1f}.lb-embedding{background:#1f6a8a}
+  .lb-skipped{background:#5a4a5a}.lb-failed{background:#8a2f2f}
+  .lb-body{flex:1;overflow:auto;min-height:0;padding:10px 12px;line-height:1.5}
+  .lb-body img{max-width:100%;height:auto}
+  .lb-body h1,.lb-body h2,.lb-body h3{font-size:15px;margin:14px 0 6px}
+  .lb-hit{padding:7px 9px;border-bottom:1px solid var(--line,#242424);
+          cursor:pointer}
+  .lb-hit:hover{background:rgba(127,127,127,.12)}
+  .lb-hit b{font-weight:600}
+  .lb-why{float:right;opacity:.55;font-size:10px}
+  .lb-frame{flex:1;border:0;width:100%;min-height:0;background:#fff}
+  .lb-note{padding:10px 12px;opacity:.7}
+  .lb-prog{height:3px;background:#1f6a8a;width:0;transition:width .4s}
+  .lb-ask{display:flex;gap:6px;padding:6px 8px;
+          border-top:1px solid var(--line,#2a2a2a)}
+  .lb-ask input{flex:1}
+  .lb-ans{padding:8px 12px;border-top:1px solid var(--line,#2a2a2a);
+          max-height:34%;overflow:auto;white-space:pre-wrap}
+  `;
+  document.head.appendChild(st);
+}
+
+function libClose() {
+  if (libTimer) { clearInterval(libTimer); libTimer = 0; }
+  libWin = null; libDoc = null; libRows = [];
+}
+
+async function manualsOpen() {
+  libStyle();
+  const win = pineWin("manuals", "📚 The Library", {
+    minWidth: 720, minHeight: 460, width: 1180, height: 800,
+    onClose: libClose,
+  });
+  const host = win.host;
+  host.style.display = "flex";
+  host.style.flexDirection = "column";
+  host.style.overflow = "hidden";
+
+  const top = el("div", "lb-bar", "");
+  const find = document.createElement("input");
+  find.type = "text";
+  find.placeholder = "Search everything on the shelf…";
+  const findBtn = el("button", "", "Find");
+  const nowBtn = el("button", "", "Read new files now");
+  nowBtn.title = "The service comes round on its own every couple of "
+               + "minutes; this makes it come round this second.";
+  const stat = el("span", "lb-sub", "");
+  [find, findBtn, nowBtn, stat].forEach((n) => top.appendChild(n));
+  host.appendChild(top);
+  const prog = el("div", "lb-prog", "");
+  host.appendChild(prog);
+
+  const wrap = el("div", "lb-wrap", "");
+  const side = el("div", "lb-side", "");
+  const list = el("div", "lb-list", "");
+  side.appendChild(list);
+  const main = el("div", "lb-main", "");
+  wrap.appendChild(side); wrap.appendChild(main);
+  host.appendChild(wrap);
+
+  libWin = {win, list, main, stat, prog, find};
+  main.appendChild(el("div", "lb-note",
+    "Pick a document on the left, or search the whole shelf above."));
+
+  findBtn.onclick = () => libFind(find.value);
+  find.onkeydown = (e) => { if (e.key === "Enter") libFind(find.value); };
+  nowBtn.onclick = async () => {
+    nowBtn.disabled = true;
+    try { await api("/api/manuals/ingest", {now: true}); } catch (e) {}
+    nowBtn.disabled = false;
+    libRefresh();
+  };
+  await libRefresh();
+  libTimer = setInterval(libRefresh, 3000);
+}
+
+async function libRefresh() {
+  if (!libWin) return;
+  let data;
+  try { data = await api("/api/manuals"); }
+  catch (e) { libWin.stat.textContent = "the shelf could not be read: " + e;
+              return; }
+  if (!libWin) return;
+  libRows = data.documents || [];
+  const s = data.stats || {}, w = s.work || {};
+  libWin.stat.textContent =
+    s.ready + "/" + s.documents + " read · " + (s.chunks || 0)
+    + " chunks · " + (s.pages || 0) + " pages"
+    + (data.on ? "" : " · THE SHELF IS OFF");
+  if (w.running) {
+    libWin.stat.textContent += " · " + (w.phase || "working") + " "
+      + (w.doc || "") + (w.total ? " " + w.done + "/" + w.total : "");
+    libWin.prog.style.width =
+      (w.total ? Math.round(100 * w.done / w.total) : 6) + "%";
+  } else {
+    libWin.prog.style.width = "0";
+  }
+  const open = libDoc ? libDoc.slug : "";
+  libWin.list.textContent = "";
+  libRows.forEach((r) => {
+    const row = el("div", "lb-doc" + (r.slug === open ? " on" : ""), "");
+    const chip = el("span", "lb-chip lb-" + (r.state || "queued"),
+                    r.state || "queued");
+    const name = el("span", "lb-name", "");
+    name.appendChild(chip);
+    name.appendChild(document.createTextNode(r.title || r.name));
+    row.appendChild(name);
+    const bits = [];
+    if (r.kind) bits.push(r.kind);
+    if (r.pages) bits.push(r.pages + " " + (r.kind === "epub"
+                                            || r.kind === "zip"
+                                            ? "chapters" : "pages"));
+    if (r.chunks) bits.push(r.chunks + " chunks");
+    if (r.figures) bits.push(r.figures + " figures");
+    if (r.thin) bits.push("THIN — little text came out");
+    row.appendChild(el("span", "lb-sub", bits.join(" · ")));
+    if (r.note) {
+      row.appendChild(document.createElement("br"));
+      row.appendChild(el("span", "lb-sub", r.note));
+    }
+    row.onclick = () => libOpenDoc(r.slug, 1);
+    libWin.list.appendChild(row);
+  });
+}
+
+async function libFind(text) {
+  text = (text || "").trim();
+  if (!libWin || !text) return;
+  const main = libWin.main;
+  main.textContent = "";
+  main.appendChild(el("div", "lb-note", "Looking…"));
+  let got;
+  try { got = await api("/api/manuals/search", {text, k: 20}); }
+  catch (e) { main.textContent = "";
+              main.appendChild(el("div", "lb-note", "" + e)); return; }
+  if (!libWin) return;
+  main.textContent = "";
+  const head = el("div", "lb-bar", "");
+  head.appendChild(el("span", "lb-sub",
+    (got.hits || []).length + " passages for “" + text + "” · " + got.ms
+    + " ms · " + (got.would_answer
+      ? "this is what the LLM would read"
+      : "the chat road would leave the shelf shut for this one")));
+  main.appendChild(head);
+  const body = el("div", "lb-list", "");
+  (got.hits || []).forEach((h) => {
+    const hit = el("div", "lb-hit", "");
+    hit.appendChild(el("span", "lb-why", (h.why || "")
+      + (h.cosine ? " " + h.cosine.toFixed(2) : "")));
+    const t = el("b", "", h.title + " · p" + h.page
+      + (h.heading ? " · " + h.heading : ""));
+    hit.appendChild(t);
+    hit.appendChild(document.createElement("br"));
+    hit.appendChild(el("span", "", (h.text || "").slice(0, 320)));
+    hit.onclick = () => libOpenDoc(h.slug, h.page);
+    body.appendChild(hit);
+  });
+  if (!(got.hits || []).length) {
+    body.appendChild(el("div", "lb-note",
+      "Nothing on the shelf is about that."));
+  }
+  main.appendChild(body);
+}
+
+async function libOpenDoc(slug, page) {
+  if (!libWin) return;
+  const main = libWin.main;
+  main.textContent = "";
+  main.appendChild(el("div", "lb-note", "Opening…"));
+  let doc;
+  try { doc = await api("/api/manuals/doc/" + encodeURIComponent(slug)); }
+  catch (e) { main.textContent = "";
+              main.appendChild(el("div", "lb-note", "" + e)); return; }
+  if (!libWin) return;
+  libDoc = doc; libPageN = page || 1;
+  main.textContent = "";
+
+  const bar = el("div", "lb-bar", "");
+  const prev = el("button", "", "◀");
+  const pos = document.createElement("select");
+  pos.style.maxWidth = "320px";
+  (doc.pages || []).forEach((p) => {
+    const o = document.createElement("option");
+    o.value = String(p.n);
+    o.textContent = doc.page_word + " " + p.n
+      + (p.heading ? " · " + p.heading : "");
+    pos.appendChild(o);
+  });
+  const next = el("button", "", "▶");
+  const gap = el("span", "", ""); gap.style.flex = "1";
+  const orig = el("button", "", "Open the file");
+  orig.title = "The document itself, in the browser's own viewer";
+  const again = el("button", "", "Re-read");
+  const drop = el("button", "", "Forget");
+  [prev, pos, next, gap, orig, again, drop].forEach((n) => bar.appendChild(n));
+  main.appendChild(bar);
+
+  const body = el("div", "lb-body", "");
+  main.appendChild(body);
+
+  const ask = el("div", "lb-ask", "");
+  const q = document.createElement("input");
+  q.type = "text";
+  q.placeholder = "Ask about this document…";
+  const qb = el("button", "", "Ask");
+  ask.appendChild(q); ask.appendChild(qb);
+  main.appendChild(ask);
+  const ans = el("div", "lb-ans", "");
+  ans.style.display = "none";
+  main.appendChild(ans);
+
+  const fileUrl = "/api/manuals/file/" + encodeURIComponent(slug);
+  prev.onclick = () => libShowPage(libPageN - 1, body, pos);
+  next.onclick = () => libShowPage(libPageN + 1, body, pos);
+  pos.onchange = () => libShowPage(parseInt(pos.value, 10), body, pos);
+  orig.onclick = () => window.open(
+    doc.kind === "pdf" ? fileUrl + "#page=" + libPageN
+                       : "/manuals/read/" + encodeURIComponent(slug)
+                         + "/" + libPageN, "_blank");
+  again.onclick = async () => {
+    again.disabled = true;
+    try { await api("/api/manuals/ingest", {slug, again: true}); } catch (e) {}
+    again.disabled = false; libRefresh();
+  };
+  drop.onclick = async () => {
+    if (!confirm("Take “" + (doc.title || slug)
+                 + "” off the shelf? The file itself is not touched.")) return;
+    try { await api("/api/manuals/ingest", {slug, forget: true}); } catch (e) {}
+    libDoc = null; libWin.main.textContent = "";
+    libWin.main.appendChild(el("div", "lb-note", "Taken off the shelf."));
+    libRefresh();
+  };
+  qb.onclick = async () => {
+    const text = q.value.trim();
+    if (!text) return;
+    ans.style.display = "";
+    ans.textContent = "Reading " + doc.page_word + " " + libPageN + "…";
+    try {
+      const got = await api("/api/manuals/ask",
+                            {slug, page: libPageN, text});
+      ans.textContent = got.answer || "(no answer came back)";
+    } catch (e) { ans.textContent = "" + e; }
+  };
+  q.onkeydown = (e) => { if (e.key === "Enter") qb.onclick(); };
+
+  libRefresh();
+  await libShowPage(libPageN, body, pos);
+}
+
+async function libShowPage(n, body, pos) {
+  if (!libDoc) return;
+  const pages = libDoc.pages || [];
+  if (!pages.length) return;
+  const lo = pages[0].n, hi = pages[pages.length - 1].n;
+  n = Math.max(lo, Math.min(hi, n || lo));
+  libPageN = n;
+  if (pos) pos.value = String(n);
+  // A PDF is shown by the browser itself - no page was ever rasterised.
+  if (libDoc.kind === "pdf") {
+    body.textContent = "";
+    const f = document.createElement("iframe");
+    f.className = "lb-frame";
+    f.src = "/api/manuals/file/" + encodeURIComponent(libDoc.slug)
+          + "#page=" + n;
+    body.style.padding = "0";
+    body.appendChild(f);
+    return;
+  }
+  body.style.padding = "10px 12px";
+  body.textContent = "Reading…";
+  let got;
+  try {
+    got = await api("/api/manuals/page/" + encodeURIComponent(libDoc.slug)
+                    + "/" + n);
+  } catch (e) { body.textContent = "" + e; return; }
+  body.textContent = "";
+  if (got.html) {
+    const holder = document.createElement("div");
+    holder.innerHTML = got.html;      // written sanitised by library_extract
+    holder.querySelectorAll("img").forEach((img) => {
+      const src = img.getAttribute("src") || "";
+      if (src.startsWith("img/")) {
+        img.src = "/api/manuals/asset/" + encodeURIComponent(libDoc.slug)
+                + "/" + encodeURIComponent(src.slice(4));
+      }
+    });
+    body.appendChild(holder);
+  } else {
+    const pre = el("div", "", got.text || "(this page has no text)");
+    pre.style.whiteSpace = "pre-wrap";
+    body.appendChild(pre);
+  }
 }
 
 /* ---- Document browser (#23) + page viewer with research chat (#15/#17) ---- */
