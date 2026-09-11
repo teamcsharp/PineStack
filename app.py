@@ -8816,6 +8816,17 @@ _LEARNED_LOCK = RLock()
 # (fingerprint, cure, why) — the fingerprint is what the tree can SEE,
 # the cure is the rung that actually ended the silence.
 REPAIR_SEED = [
+    # #1200: the page road. Measured twice on 2026-09-11 with the station
+    # reporting on and unpaused and the listener polling every second:
+    # 16 clips waiting in `received`, nineteen "play() interrupted by a
+    # call to pause()" and eighteen "playback stalled", and a talk gap of
+    # 696s while the server went on making deliveries.
+    {"fp": "page:wedged", "cure": "page_flush",
+     "why": "the page holds clip after clip and starts none of them - "
+            "each retry's play() is cancelled by a pause() and nothing "
+            "on the page breaks the loop; the #1147 feed epoch makes it "
+            "drop the queue and start clean",
+     "wins": 1, "losses": 0},
     {"fp": "device:accepts|audio:none", "cure": "device_reboot",
      "why": "the Voice PE takes announces and plays nothing; only its "
             "own restart button clears it (measured three times)",
@@ -8907,6 +8918,15 @@ async def repair_fingerprint() -> str:
     outage produces the same string, which is what makes a memory of
     cures possible at all."""
     marks: list[str] = []
+    # #1200: THE PAGE IS A ROAD TOO. Every mark below describes the
+    # SPEAKER, so a show routed to a page fingerprinted as healthy while
+    # the page sat on clips it never started - and the ladder then
+    # checked a device the show was not using.
+    try:
+        if page_wedge_state().get("wedged"):
+            marks.append("page:wedged")
+    except Exception:  # noqa: BLE001
+        pass
     quiet = time.time() - _BOX_LAST_OK[0]
     if quiet > 120:
         marks.append("audio:none")
@@ -9028,6 +9048,109 @@ def repair_record(fingerprint: str, cure: str, worked: bool,
         repair_learned_save(rows)
 
 
+# #1200: how long the room may be quiet, with clips waiting on the page
+# and the owner still polling, before that is a wedge rather than a lull.
+PAGE_WEDGE_QUIET = 150.0
+PAGE_WEDGE_WAITING = 4
+_PAGE_WEDGE_AT = [0.0]
+PAGE_WEDGE_REST = 180.0
+
+
+def page_wedge_state() -> dict[str, Any]:
+    """#1200: is the page holding clips it never starts?
+
+    Three things at once, because each alone is ordinary: clips waiting
+    in `received`, the stall/interrupt error pair that marks the retry
+    loop, and a room quiet longer than PAGE_WEDGE_QUIET while the listener
+    that owns the air is still polling. A page that has gone away is not
+    wedged - it is gone, and #1008's lease already handles that."""
+    out: dict[str, Any] = {"wedged": False, "waiting": 0, "quiet": 0.0,
+                           "stalls": 0, "owner": "", "why": ""}
+    try:
+        out["owner"] = owner = audio_owner()
+        rows = list(_PAGE_DELIVERIES.values())
+        out["waiting"] = waiting = sum(
+            1 for r in rows if str(r.get("state") or "") == "received")
+        now = time.time()
+        stalls = 0
+        for ev in list(_PAGE_ACK_EVENTS[-80:]):
+            err = str(ev.get("error") or "")
+            if "stalled" in err or "interrupted by a call to pause" in err:
+                stalls += 1
+        out["stalls"] = stalls
+        quiet = now - max(float(_SPOKE_AT[0] or 0), 0.0)
+        out["quiet"] = round(quiet, 1)
+        if not owner:
+            out["why"] = "nobody holds the air"
+            return out
+        seen = float((_LISTENER_SEEN.get(owner) or {}).get("at") or 0)
+        if now - seen > 30:
+            out["why"] = "the page that holds the air stopped polling"
+            return out
+        if waiting < PAGE_WEDGE_WAITING:
+            out["why"] = "only %d clip(s) waiting" % waiting
+            return out
+        if not stalls:
+            out["why"] = "no stall or interrupt reported"
+            return out
+        if quiet < PAGE_WEDGE_QUIET:
+            out["why"] = "the room has only been quiet %ds" % int(quiet)
+            return out
+        out["wedged"] = True
+        out["why"] = ("%d clip(s) waiting on a page that is still polling, "
+                      "%d stall/interrupt report(s), and nothing has "
+                      "sounded for %ds" % (waiting, stalls, int(quiet)))
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = "could not tell: %s" % type(exc).__name__
+    return out
+
+
+async def page_wedge_clear(force: bool = False) -> dict[str, Any]:
+    """#1200: unstick a page that is holding clips it never starts.
+
+    Cheapest first. The feed epoch (#1147) makes every page flush its
+    queue and orphan the play promises still in flight; if the room is
+    still quiet after that, the exclusive itself is released, because a
+    gagged page is a page that has not wedged and #738's rule applies -
+    heard in the wrong room beats not heard at all."""
+    state = page_wedge_state()
+    if not (state["wedged"] or force):
+        return {"ran": False, "state": state,
+                "say": "the page is not wedged: " + str(state["why"])}
+    now = time.time()
+    if not force and now - _PAGE_WEDGE_AT[0] < PAGE_WEDGE_REST:
+        return {"ran": False, "state": state,
+                "say": "a flush ran %ds ago - giving it time"
+                       % int(now - _PAGE_WEDGE_AT[0])}
+    _PAGE_WEDGE_AT[0] = now
+    did: list[str] = []
+    try:
+        _RADIO["voice_cut_ms"] = int(time.time() * 1000)
+        _PAGE_AIR_UNTIL[0] = 0.0
+        did.append("flushed the page feed (#1147)")
+        pipeline_log("air", "the page was holding %d clip(s) it never "
+                     "started - the feed epoch was advanced so it drops "
+                     "them and starts clean (#1200)" % state["waiting"])
+    except Exception:  # noqa: BLE001
+        pass
+    await asyncio.sleep(12)
+    again = page_wedge_state()
+    if again["wedged"]:
+        try:
+            _AUDIO_OWNER.clear()
+            did.append("released the exclusive so every page may play")
+            pipeline_log("air", "the page holding the air stayed wedged "
+                         "through the flush - the exclusive is released "
+                         "so any other page in the house can sound "
+                         "(#738/#1200)")
+        except Exception:  # noqa: BLE001
+            pass
+    repair_note("the page player was holding clips it never started - "
+                + "; ".join(did))
+    return {"ran": True, "did": did, "state": state, "after": again,
+            "say": "; ".join(did) or "nothing to do"}
+
+
 async def _run_cure(cure: str) -> bool:
     """#881: perform one remembered cure. Returns whether it ran — not
     whether it worked; the verified-audio check afterwards decides that."""
@@ -9046,6 +9169,9 @@ async def _run_cure(cure: str) -> bool:
                 _F5_REVIVE_AT[0] = 0.0
                 await _director_post("/director/engine/f5/deploy")
             return True
+        if cure == "page_flush":
+            got = await page_wedge_clear(force=True)          # #1200
+            return bool(got.get("ran"))
         if cure == "lifeboat_director":
             return await _lifeboat_restart("voice-director")
         if cure == "restore_routing":
@@ -9138,6 +9264,13 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
         # no memory, not what you climb every time.
         fp = await repair_fingerprint()
         _REPAIR_LIVE["fingerprint"] = fp
+        # #1200: if the page is holding clips it never started, that is
+        # the fault and it costs a flush to end. Done before the speaker
+        # ladder because the speaker is usually not even in the path.
+        if "page:wedged" in fp:
+            got = await page_wedge_clear()
+            mark("the page player", "it was holding clips it never started",
+                 str(got.get("say") or "")[:160])
         if fp != "healthy":
             for row in repair_suggest(fp)[:3]:
                 cure = str(row.get("cure") or "")
@@ -76185,6 +76318,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     _extra_fields = {k: v for k, v in _sfx_meta.get(_row, {}).items()
                                      if k in ("voice", "sfx_sample_id", "sfxguy_reservation")}
                     entry.update(_extra_fields)
+                    # #1201: where this line sits in its script.
+                    entry.update({"sid": _round_sid, "turn": int(_ti),
+                                  "turns": len(transcript)})
                     _RADIO["chat"].append(entry)
                     _entries.append(entry)
                     # #778: the length this turn actually runs for INSIDE the
@@ -76554,6 +76690,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             pipeline_log("drop", f"{len(order)} scheduled turn(s) never "
                          "made it into a burst — airing the round's tail "
                          "in sequence (#767/#1146)")
+    # #1201: ONE ID FOR THIS CONVERSATION, so every line it airs can be
+    # tied back to it and read in script order.
+    _round_sid = uuid.uuid4().hex[:12]
     reached: set[int] = set()
     consumed = 0
     content_turns_spoken = 0
@@ -101139,6 +101278,91 @@ def director_aired_hours(back: int = 4, most: int = 1400
     return hours
 
 
+@app.get("/api/director/order")
+async def api_director_order(
+    hours: float = 2.0,
+    most: int = 40,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1201: did each conversation go out in the order it was written?
+
+    Groups the air log by SCRIPT (`sid`) and reads the turn numbers in
+    the order they actually sounded. A round is in order when its turns
+    ascend; anything else is named - a JUMP (a turn out of sequence), a
+    REPEAT (one heard twice) and a HOLE (one that never sounded at all).
+
+    Rounds written before #1201 carry no sid or turn and are reported as
+    `unmeasurable` rather than counted as healthy, because a surface that
+    silently scores missing data as a pass is how "everything aired" got
+    believed for a fortnight."""
+    require_read_auth(authorization)
+
+    def work() -> dict[str, Any]:
+        now = time.time()
+        since = now - max(0.1, float(hours or 2.0)) * 3600.0
+        try:
+            with _AIRLOG_LOCK:
+                live = list(_AIRLOG_INDEX.values())
+        except Exception:  # noqa: BLE001
+            live = []
+        rows = [r for r in live
+                if float(r.get("air_at") or 0) >= since
+                and str(r.get("aired") or "") in AIRLOG_AIRED]
+        rows.sort(key=lambda r: float(r.get("air_at") or 0))
+        by_sid: dict[str, list[dict[str, Any]]] = {}
+        loose = 0
+        for r in rows:
+            sid = str(r.get("sid") or "")
+            if not sid or r.get("turn") is None:
+                loose += 1
+                continue
+            by_sid.setdefault(sid, []).append(r)
+        out: list[dict[str, Any]] = []
+        tally = {"in_order": 0, "jumped": 0, "repeated": 0, "holed": 0}
+        for sid, got in by_sid.items():
+            turns = [int(r.get("turn") or 0) for r in got]
+            total = max([int(r.get("turns") or 0) for r in got] + [0])
+            jumps = [(turns[i - 1], turns[i]) for i in range(1, len(turns))
+                     if turns[i] <= turns[i - 1]]
+            repeats = sorted({t for t in turns if turns.count(t) > 1})
+            holes = ([t for t in range(total) if t not in set(turns)]
+                     if total else [])
+            if jumps:
+                tally["jumped"] += 1
+            elif repeats:
+                tally["repeated"] += 1
+            elif holes:
+                tally["holed"] += 1
+            else:
+                tally["in_order"] += 1
+            out.append({
+                "sid": sid, "road": str(got[0].get("round") or ""),
+                "at": round(float(got[0].get("air_at") or 0), 1),
+                "heard": len(got), "of": total,
+                "order": turns[:40],
+                "jumps": [{"after": a, "then": b} for a, b in jumps][:8],
+                "repeated": repeats[:8], "holes": holes[:12],
+                "verdict": ("jumped" if jumps else "repeated" if repeats
+                            else "holes" if holes else "in order"),
+            })
+        out.sort(key=lambda r: -float(r.get("at") or 0))
+        rounds = sum(tally.values())
+        return {
+            "at": now, "hours": hours, "rounds": rounds,
+            "tally": tally, "unmeasurable_lines": loose,
+            "rows": out[:max(0, int(most))],
+            "say": (("%d conversation(s) measured: %d in order, %d jumped, "
+                     "%d repeated a turn, %d had holes."
+                     % (rounds, tally["in_order"], tally["jumped"],
+                        tally["repeated"], tally["holed"]))
+                    + ((" %d aired line(s) carry no script position - they "
+                        "were written before #1201 and cannot be judged."
+                        % loose) if loose else "")),
+        }
+
+    return await asyncio.to_thread(work)
+
+
 @app.get("/api/director/aired")
 async def api_director_aired(back: int = 4, most: int = 1400
                              ) -> dict[str, Any]:
@@ -113740,6 +113964,16 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
                  or (kind if kind in AIRLOG_TURN_ROUNDS else "banter"),
         "text": " ".join(str(entry.get("text") or "").split())[:600],
         "aired": str(entry.get("aired") or ""),
+        # #1201: WHERE THIS LINE SITS IN ITS SCRIPT. Without these,
+        # "line 7 played before line 6" was not a checkable statement -
+        # `round` is the road, not the conversation, and nothing carried
+        # a turn number. A copy off the ring entry, not a new measure.
+        "sid": str(entry.get("sid") or entry.get("round_sid") or "")[:48],
+        "turn": (int(entry["turn"]) if str(entry.get("turn") or "").lstrip("-").isdigit()
+                 else (int(entry["i"]) if str(entry.get("i") or "").lstrip("-").isdigit()
+                       else None)),
+        "turns": (int(entry["turns"]) if str(entry.get("turns") or "").isdigit()
+                  else None),
         "voice": str(entry.get("voice") or ""),
         "engine": str(entry.get("engine") or ""),
         "caller": (str(entry.get("name") or "")
