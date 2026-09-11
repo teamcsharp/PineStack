@@ -3735,10 +3735,10 @@ def te_self_page_svg(doc: dict[str, Any], page: dict[str, Any]) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}"'
         f' width="{width}" height="{height}">'
         '<style>'
-        '.t{font:600 15px Georgia,serif;fill:#8a8578;letter-spacing:.09em}'
-        '.h{font:700 27px Georgia,serif;fill:#20242b}'
-        '.b{font:17px Georgia,serif;fill:#3b4048}'
-        '.p{font:13px Georgia,serif;fill:#8a8578}'
+        '.t{font:600 15px Georgia,serif,PineIcons;fill:#8a8578;letter-spacing:.09em}'
+        '.h{font:700 27px Georgia,serif,PineIcons;fill:#20242b}'
+        '.b{font:17px Georgia,serif,PineIcons;fill:#3b4048}'
+        '.p{font:13px Georgia,serif,PineIcons;fill:#8a8578}'
         '</style>'
         f'<rect width="{width}" height="{height}" fill="#f4f1ea"/>'
         f'<text x="46" y="58" class="t">'
@@ -99532,7 +99532,39 @@ def director_room(which: int = 0) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             out["why"] = f"the running order could not be read: {exc}"[:200]
         return out
-    which = max(0, min(len(plan_hours) - 1, int(which or 0)))
+    # #1179: THE HOUR ON AIR IS THE ONE THE CLOCK IS IN, not the first
+    # one still sitting in the plan. A finished hour stays in that list,
+    # so after the rollover `hour=0` was answering about the hour that had
+    # just ended - and every coverage check taken through this room was
+    # quietly about the past. See the note in the patch.
+    def _hour_span(row: Any) -> tuple[float, float]:
+        """When this planned hour opens and closes, off its own slots."""
+        try:
+            slots = list((row or {}).get("slots") or [])
+            opens = min(float(x.get("start") or 0) for x in slots
+                        if float(x.get("start") or 0) > 0)
+            shuts = max(float(x.get("deadline") or 0) for x in slots)
+            return opens, shuts
+        except Exception:  # noqa: BLE001
+            return 0.0, 0.0
+
+    _base = 0
+    try:
+        _spans = [(_hour_span(h), i) for i, h in enumerate(plan_hours)]
+        _live = [i for (opens, shuts), i in _spans
+                 if opens and opens <= now <= shuts]
+        if _live:
+            _base = _live[0]
+        else:
+            # Between plans, or ahead of one: the soonest hour that has
+            # not already ended.
+            _ahead = sorted(((shuts, i) for (opens, shuts), i in _spans
+                             if shuts and shuts > now))
+            if _ahead:
+                _base = _ahead[0][1]
+    except Exception:  # noqa: BLE001
+        _base = 0
+    which = max(0, min(len(plan_hours) - 1, _base + int(which or 0)))
     plan = plan_hours[which]
     out["hour"] = str(plan.get("id") or "")
     talk_seconds = 0.0
@@ -107785,7 +107817,7 @@ KIT_SETUP = """\
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin:0; background:#04060b; color:#dfe7f2; min-height:100vh;
-         font:15px/1.65 system-ui,-apple-system,Segoe UI,sans-serif; }
+         font:15px/1.65 system-ui,-apple-system,Segoe UI,sans-serif,PineIcons; }
   canvas#bg { position:fixed; inset:0; z-index:0; }
   .wrap { position:relative; z-index:1; max-width:720px; margin:0 auto;
           padding:40px 22px 80px; }
@@ -107803,7 +107835,7 @@ KIT_SETUP = """\
   .card.done .n { background:#2f7d52; color:#dfe; }
   p { margin:8px 0; color:#c2cede; }
   code, pre { background:#050810; border:1px solid #22304a; border-radius:8px;
-              font:13px ui-monospace,Consolas,monospace; color:#9fd0ff; }
+              font:13px ui-monospace,Consolas,monospace,PineIcons; color:#9fd0ff; }
   code { padding:2px 6px; } pre { padding:12px; overflow:auto; }
   a { color:#7fd1ff; }
   button { background:#123; color:#dfe7f2; border:1px solid #2b3a52;
@@ -108105,7 +108137,7 @@ KIT_BOOT = """\
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Pine Chat · booting</title>
 <style>
- body{margin:0;background:#02040a;color:#cfe3ff;font-family:system-ui;
+ body{margin:0;background:#02040a;color:#cfe3ff;font-family:system-ui,PineIcons;
       overflow:hidden}
  #hud{position:fixed;left:0;right:0;bottom:26px;text-align:center;
       font-size:13px;letter-spacing:.08em}
@@ -108220,7 +108252,7 @@ KIT_EXPORT_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin:0; background:#04060b; color:#dfe7f2; min-height:100vh;
-         font:14px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;
+         font:14px/1.6 system-ui,-apple-system,Segoe UI,sans-serif,PineIcons;
          display:flex; flex-direction:column; align-items:center;
          justify-content:center; padding:24px; }
   h1 { font-size:19px; letter-spacing:.18em; font-weight:600;
@@ -109457,6 +109489,29 @@ async def station_flow_asset(name: str) -> Response:
                              "X-Content-Type-Options": "nosniff"})
 
 
+@app.get("/icons/{name}")
+async def pine_icons_asset(name: str) -> Response:
+    """The single-colour icon set, built by tools/icons_build.py.
+
+    pineicons.css carries the web font inline as a data: URI, so one cached
+    request is the whole icon set - no font file to serve, no MIME type to
+    configure, and nothing to fetch from an internet the tablet does not
+    have. pine-icons.js is the SVG sprite, for markup that wants a real
+    <svg> element it can size and label.
+    """
+    if name not in {"pineicons.css", "pine-icons.js"}:
+        return Response(status_code=404)
+    path = Path(__file__).resolve().parent / "frontend" / name
+    if not path.is_file():
+        return Response(status_code=404)
+    return Response(
+        path.read_bytes(),
+        media_type=VENDOR_TYPES[path.suffix],
+        headers={"Cache-Control": "public, max-age=86400",
+                 "X-Content-Type-Options": "nosniff"},
+    )
+
+
 @app.get("/vendor/{name}")
 async def vendor_asset(name: str) -> Response:
     """Browser libraries from disk. Keeps the panel working with no CDN."""
@@ -109733,9 +109788,12 @@ MANUAL_READ_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
+<!-- Single-colour icons, not colour emoji. The stylesheet carries the
+     font inline and its unicode-range confines it to pictographs. -->
+<link rel="stylesheet" href="/icons/pineicons.css">
 <style>
  :root{color-scheme:light dark}
- body{margin:0;font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif}
+ body{margin:0;font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif,PineIcons}
  .bar{position:sticky;top:0;display:flex;gap:10px;align-items:center;
       padding:8px 14px;background:Canvas;border-bottom:1px solid #8884;
       font-size:13px}
@@ -121741,7 +121799,7 @@ svg.plexus .nlab{font-family:"Helvetica Neue",Arial,sans-serif;font-size:10px;fi
 .notice.paused{background:var(--red)}
 .pgtabs{display:none}
 /* #1047: the jump line and the continuation head. */
-.jump{margin:2px 0 0;text-align:right;font:italic 700 11.5px/1.3 Georgia,serif;color:var(--red);text-transform:none;break-before:avoid}
+.jump{margin:2px 0 0;text-align:right;font:italic 700 11.5px/1.3 Georgia,serif,PineIcons;color:var(--red);text-transform:none;break-before:avoid}
 .jump b{font-style:normal}
 .conthead{border-top:3px solid var(--ink);border-bottom:1px solid var(--ink);padding:3px 0;margin:0 0 7px;font:800 12px/1.25 "Helvetica Neue",Arial,sans-serif;text-transform:uppercase;letter-spacing:.08em;break-after:avoid}
 .conthead i{font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink2)}
@@ -121763,7 +121821,7 @@ article.cont .body p:first-of-type::first-letter{float:none;font-size:inherit;pa
 .filler.rule{border:0;border-top:2px solid var(--ink);border-bottom:2px solid var(--ink);text-align:center;font-weight:900;text-transform:uppercase;letter-spacing:.18em;padding:2px 0;font-size:9.5px}
 .filler.k-crime,.filler.k-wanted{border-width:2px}
 article.hint-obituary{border-top:6px solid var(--ink)}.hint-obituary figure.plate img{filter:grayscale(1) contrast(1.1)}
-.hint-obituary h2::before{content:"In memoriam";display:block;font-family:Georgia,serif;font-style:italic;font-weight:400;font-size:12px;letter-spacing:.08em;color:var(--ink2)}
+.hint-obituary h2::before{content:"In memoriam";display:block;font-family:Georgia,serif,PineIcons;font-style:italic;font-weight:400;font-size:12px;letter-spacing:.08em;color:var(--ink2)}
 article.hint-wanted,article.hint-crime{border:4px double var(--ink);padding:10px 12px 6px;background:var(--tint)}
 .hint-wanted .kicker,.hint-crime .kicker{display:block;text-align:center;font-size:26px;letter-spacing:.2em;color:var(--ink);margin:0 0 6px;line-height:1}
 .hint-crime .kicker{background:var(--red);color:#fff;font-size:18px;padding:5px 0}
@@ -124190,6 +124248,14 @@ def _paper_reference_css() -> str:
     """Bundled display type keeps HTML, clipboard captures and offline views consistent."""
     root = Path(__file__).resolve().parent
     css = (root / 'frontend' / 'paper-reference.css').read_text(encoding='utf-8')
+    try:
+        # The icon font travels with the paper for the same reason the
+        # blackletter does: an edition is captured to an image and read
+        # offline, and an icon that resolved to a colour emoji at capture
+        # time would be printed that way forever.
+        css = (root / 'frontend' / 'pineicons.css').read_text(encoding='utf-8') + css
+    except OSError:
+        pass  # Icons fall back to the system's own glyphs; the paper still sets.
     try:
         font = (root / 'frontend' / 'fonts' / 'UnifrakturMaguntia-Book.ttf').read_bytes()
         return ("@font-face{font-family:'Pine Gazette Blackletter';font-style:normal;font-weight:400;"
@@ -127027,7 +127093,7 @@ html,body{height:100%;margin:0;padding:0;overflow:hidden;background:#15130f;
 #notice{position:absolute;inset:0;z-index:6;display:none;
   flex-direction:column;align-items:center;justify-content:center;gap:8px;
   text-align:center;padding:24px;background:#15130f}
-#notice b{font:700 17px/1.3 Georgia,serif;color:#f0e9da}
+#notice b{font:700 17px/1.3 Georgia,serif,PineIcons;color:#f0e9da}
 #notice span{color:#8d8677;max-width:32em}
 </style>
 </head>
@@ -129206,11 +129272,15 @@ RETIRE_PAGE_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The retirement desk · Pine Box</title>
+<!-- Single-colour icons, not colour emoji. The stylesheet carries the
+     font inline and its unicode-range confines it to pictographs. -->
+<link rel="stylesheet" href="/icons/pineicons.css">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #04060b; color: #dbe7f5;
-         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif,
+               PineIcons; }
   header { position: sticky; top: 0; z-index: 3; background: #0b1220; border-bottom: 1px solid #1e2a3a;
            padding: 8px 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   button, select, input { font: inherit; font-size: 13px; padding: 4px 9px; background: #101a2a; color: #dbe7f5;
@@ -129976,6 +130046,12 @@ CONTROL_PANEL_HTML = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PineBoxAgent</title>
+<!-- Every icon in the panel is a single-colour vector, not a colour emoji.
+     The stylesheet carries the font inline, and its unicode-range confines
+     it to pictographs, so PineIcons can be appended to any font stack
+     below without changing how one letter of text looks. -->
+<link rel="stylesheet" href="/icons/pineicons.css">
+<script src="/icons/pine-icons.js"></script>
 <style>
 :root {
   color-scheme: dark;
@@ -130112,7 +130188,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, sans-serif;
+  font-family: system-ui, sans-serif, PineIcons;
   overflow-x: hidden;
 }
 header {
@@ -131063,7 +131139,7 @@ button.danger {
   display: inline-block; padding-left: 100%;
   animation: hp-scroll 30s linear infinite;
   color: #9fd0ff; font-size: 11px;
-  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-family: ui-monospace, Menlo, Consolas, monospace,PineIcons;
 }
 
 /* ---- Shared full-screen popup ---- */
@@ -131187,7 +131263,7 @@ button.danger {
 .hp-ok { color: #9df2b4; } .hp-bad { color: var(--danger); }
 .hp-term {
   background: #05070b; border-radius: 7px; padding: 7px 9px; margin-top: 8px;
-  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
+  font-family: ui-monospace, Menlo, Consolas, monospace,PineIcons; font-size: 11px;
   color: #9fb8a9; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
 }
 .hp-restart {
@@ -131376,12 +131452,12 @@ button.danger {
 }
 .gaz-count {
   position: absolute; top: 4px; right: 15px; z-index: 4; color: #05080d;
-  font: 700 11px/1 ui-monospace, Consolas, monospace; padding: 3px 7px;
+  font: 700 11px/1 ui-monospace, Consolas, monospace,PineIcons; padding: 3px 7px;
   border-radius: 999px; background: var(--accent); box-shadow: 0 1px 5px rgba(0,0,0,.6);
 }
 .gaz-lab {
   position: absolute; left: 0; right: 11px; bottom: 11px; z-index: 4; padding: 6px 6px 4px;
-  font: 700 10px/1.3 system-ui, sans-serif; color: #f4efe2; display: flex;
+  font: 700 10px/1.3 system-ui, sans-serif,PineIcons; color: #f4efe2; display: flex;
   justify-content: space-between; align-items: flex-end; gap: 4px;
   border-radius: 0 0 6px 6px;
   background: linear-gradient(transparent, rgba(3,5,9,.94) 62%);
@@ -131421,19 +131497,19 @@ button.danger {
 .gaz-page.zoom { width: min(1040px, 90vw); }
 .gaz-cap {
   flex: none; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
-  color: #e8eef7; font: 12px/1.45 system-ui, sans-serif;
+  color: #e8eef7; font: 12px/1.45 system-ui, sans-serif,PineIcons;
 }
 .gaz-cap b { font-size: 13px; font-variant-numeric: tabular-nums; }
 .gaz-kick {
   text-transform: uppercase; letter-spacing: .08em; color: #05080d;
-  font: 700 9px/1.7 system-ui, sans-serif; background: #c9b071;
+  font: 700 9px/1.7 system-ui, sans-serif,PineIcons; background: #c9b071;
   padding: 1px 6px; border-radius: 3px;
 }
 .gaz-kick.hourly { background: var(--accent); }
 .gaz-pause { color: #ffd479; font-size: 11px; }
 .gaz-headline { color: #cfd8e6; }
 .gaz-deck {
-  flex: none; color: #8e99aa; font: 11px/1.4 system-ui, sans-serif; max-width: 100%;
+  flex: none; color: #8e99aa; font: 11px/1.4 system-ui, sans-serif,PineIcons; max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 /* #1157: the sheet is as tall as the page it holds, no taller - flex:1
@@ -131445,7 +131521,7 @@ button.danger {
   border: 1px solid #3a4a63; border-radius: 6px; box-shadow: 0 18px 60px rgba(0,0,0,.65);
 }
 .gaz-page img { display: block; width: 100%; height: auto; }
-.gaz-empty { color: #9ba6b7; font: 13px system-ui, sans-serif; padding: 30px; }
+.gaz-empty { color: #9ba6b7; font: 13px system-ui, sans-serif,PineIcons; padding: 30px; }
 
 .conv-wrap {
   display: flex; gap: 10px; margin-top: 10px;
@@ -131529,7 +131605,7 @@ button.danger {
 .cx-marquee span {
   display: inline-block; padding-left: 100%;
   animation: hp-scroll 45s linear infinite;
-  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-family: ui-monospace, Menlo, Consolas, monospace,PineIcons;
   font-size: 12px; color: #9fd0ff;
 }
 .pb-collapsible:not(.collapsed) > .cx-marquee { display: none; }
@@ -131759,7 +131835,7 @@ h2 .film-size select { flex: 0 1 auto; min-width: 0; }
 }
 .tf-textpage {
   position: absolute; inset: 0; padding: 24px 18px 12px; overflow: hidden;
-  background: #f4f1ea; color: #20242b; font-family: Georgia, serif;
+  background: #f4f1ea; color: #20242b; font-family: Georgia, serif,PineIcons;
 }
 .tf-textpage .tp-head {
   font-size: 15px; font-weight: 700; margin-bottom: 7px;
@@ -131796,7 +131872,7 @@ h2 .film-size select { flex: 0 1 auto; min-width: 0; }
   max-height: 240px; overflow-y: auto;
   background: #05070b; border: 1px solid var(--border); border-radius: 10px;
   padding: 12px 14px; font-size: 13px; line-height: 1.5;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace,PineIcons;
 }
 .cx-entry {
   padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.05);
@@ -132357,7 +132433,7 @@ speaker and restart the agent."
             title="The writing desk - every call to the model, the exact
 prompt that went out and the script that came back"
             onclick="deskPanel(this)"
-            style="font-size:15px;line-height:1">\u270d</button>
+            style="font-size:15px;line-height:1">&#x270d;</button>
     <button id="roomBtn" class="pine-restart"
             title="The recording room - every take, who made it, what the
 engine charged for it, and how much work the pantry is saving"
@@ -132857,7 +132933,7 @@ then the tabloid, scrolling down the right half of the screen"
                     font-size:10.5px;line-height:1.5;color:#dfe;text-align:right;
                     background:#000a;padding:6px 9px;border-radius:8px;
                     border:1px solid #2b3a52;pointer-events:none;
-                    font-family:ui-monospace,monospace"></div>
+                    font-family:ui-monospace,monospace,PineIcons"></div>
         <div id="sparkShowNote"
              style="position:absolute;left:8px;bottom:34px;font-size:10px;
                     color:#9fe;background:#0009;padding:2px 7px;border-radius:6px;
@@ -132871,7 +132947,7 @@ then the tabloid, scrolling down the right half of the screen"
         <style>
           .sparkDeep{display:none;position:absolute;top:34px;bottom:64px;
             width:min(27%,360px);flex-direction:column;gap:8px;
-            pointer-events:none;font-family:ui-monospace,monospace;
+            pointer-events:none;font-family:ui-monospace,monospace,PineIcons;
             overflow:hidden}
           #sparkShowStage:fullscreen #sparkShowDeepL,
           #sparkShowStage:fullscreen #sparkShowDeepR{display:flex}
@@ -132890,7 +132966,7 @@ then the tabloid, scrolling down the right half of the screen"
              style="position:absolute;left:0;right:0;bottom:0;padding:8px 10px;
                     font-size:11px;line-height:1.5;color:#cfe;
                     background:linear-gradient(transparent,#000c);
-                    pointer-events:none;font-family:ui-monospace,monospace"></div>
+                    pointer-events:none;font-family:ui-monospace,monospace,PineIcons"></div>
       </div>
       <div class="muted" style="font-size:11px;margin-top:6px">
         Live from <b>~/ComfyUI/output</b> with the Spark's own vitals over it —
@@ -134803,7 +134879,7 @@ async function rhymeCloudWin() {
       const row = el("div", "", "");
       row.style.cssText = "margin-bottom:6px";
       const tail = el("span", "", f.tail);
-      tail.style.cssText = "font-family:ui-monospace,monospace;font-size:11px;opacity:.7";
+      tail.style.cssText = "font-family:ui-monospace,monospace,PineIcons;font-size:11px;opacity:.7";
       row.appendChild(tail);
       row.appendChild(el("div", "", f.words.map((x) => x.word + (x.count > 1 ? "×" + x.count : "")).join(" · ")));
       side.appendChild(row);
@@ -135073,7 +135149,7 @@ async function pine3JSMenu() {
     const name = el("div", "", "");
     name.style.cssText = "flex:1;min-width:0";
     const t = el("div", "", entry.label);
-    t.style.cssText = "font:600 12.5px system-ui;color:#dff6ff";
+    t.style.cssText = "font:600 12.5px system-ui,PineIcons;color:#dff6ff";
     const b = el("div", "muted", PINE_3JS_BLURB[entry.key] || "");
     b.style.cssText = "font-size:11px;color:#7f92a6";
     name.appendChild(t); name.appendChild(b);
@@ -135108,7 +135184,7 @@ function pine3JSInstall() {
     b.title = "every three.js experience the station has";
     b.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:300;"
       + "padding:7px 12px;border-radius:9px;border:1px solid #22304a;"
-      + "background:#0b1420;color:#9fd0e3;font:600 12px system-ui;cursor:pointer";
+      + "background:#0b1420;color:#9fd0e3;font:600 12px system-ui,PineIcons;cursor:pointer";
     b.onclick = () => pine3JSMenu();
     document.body.appendChild(b);
     const want = new URLSearchParams(location.search).get("view");
@@ -137321,7 +137397,7 @@ async function exportConversationPdf(g) {
   win.document.write(
     "<!doctype html><html><head><meta charset='utf-8'><title>" + esc(title) +
     "</title><style>" +
-    "body{font:14px/1.65 -apple-system,Segoe UI,Roboto,sans-serif;color:#111;" +
+    "body{font:14px/1.65 -apple-system,Segoe UI,Roboto,sans-serif,PineIcons;color:#111;" +
     "max-width:44em;margin:32px auto;padding:0 18px}" +
     "h1{font-size:22px;margin:0 0 4px}.meta{color:#666;font-size:12px;" +
     "margin-bottom:22px}.u{font-weight:700;color:#0b6b8a;margin-top:18px}" +
@@ -140484,7 +140560,7 @@ async function trackCard(id) {
     const row = el("div", "", "");
     row.style.cssText = "display:flex;gap:10px;padding:2px 0;font-size:12px";
     const name = el("span", "muted", key);
-    name.style.cssText = "flex:0 0 150px;font-family:ui-monospace,monospace";
+    name.style.cssText = "flex:0 0 150px;font-family:ui-monospace,monospace,PineIcons";
     const text = el("span", "", String(value));
     text.style.cssText = "flex:1;word-break:break-word";
     row.appendChild(name);
@@ -141509,7 +141585,7 @@ function usbConsole() {
   out.id = "usbOut";
   out.style.cssText = "flex:1;min-height:240px;max-height:44vh;overflow-y:auto;"
     + "background:#04070c;border:1px solid var(--border);border-radius:8px;"
-    + "padding:10px;margin:10px 0 0;font:12px/1.5 ui-monospace,monospace;"
+    + "padding:10px;margin:10px 0 0;font:12px/1.5 ui-monospace,monospace,PineIcons;"
     + "white-space:pre-wrap";
   card.appendChild(out);
 
@@ -142489,7 +142565,7 @@ async function stageSheet(track) {
       const row = el("div", "", "");
       row.style.cssText = "display:flex;gap:8px;padding:1px 0";
       const key = el("span", "muted", name);
-      key.style.cssText = "flex:0 0 116px;font-family:ui-monospace,monospace";
+      key.style.cssText = "flex:0 0 116px;font-family:ui-monospace,monospace,PineIcons";
       const text = el("span", "", String(value));
       text.style.cssText = "flex:1;word-break:break-word";
       row.appendChild(key);
@@ -149800,7 +149876,7 @@ function pineCodeChip(id) {
   chip.title = "Copy this message's code " + id + " — quote it back to give "
     + "a critique of this exact line";
   chip.style.cssText = "background:none;border:0;padding:0 0 0 5px;cursor:"
-    + "pointer;font-size:10px;opacity:.4;font-family:ui-monospace,monospace";
+    + "pointer;font-size:10px;opacity:.4;font-family:ui-monospace,monospace,PineIcons";
   chip.onclick = (ev) => {
     ev.stopPropagation();
     pineCopy(id).then(() => {
@@ -152879,7 +152955,7 @@ async function speakboxEdit(name, passage) {
   const editor = document.createElement("textarea");
   editor.spellcheck = false;
   editor.style.cssText = "flex:1;min-width:0;resize:none;"
-    + "font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace";
+    + "font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace,PineIcons";
   const preview = el("div", "", "");
   preview.style.cssText = "flex:1;min-width:0;overflow-y:auto;padding:0 10px;"
     + "border-left:1px solid var(--border);font-size:13px;line-height:1.6";
@@ -157131,7 +157207,7 @@ function djCutTheater(tray, running) {
     th.id = "djCutTheater";
     th.style.cssText = "margin-top:8px;background:#04070d;"
       + "border:1px solid #1d3a2a;border-radius:8px;padding:8px 10px;"
-      + "font:10.5px ui-monospace,Consolas,monospace;color:#7ce8a9;"
+      + "font:10.5px ui-monospace,Consolas,monospace,PineIcons;color:#7ce8a9;"
       + "line-height:1.5";
     const ico = el("pre", "", "");
     ico.style.cssText = "margin:0 0 6px;color:#3fd68f;font-size:9px;"
@@ -159361,7 +159437,7 @@ function deskPanel(anchor) {
             + "white-space:pre-wrap;max-height:30vh;overflow:auto;"
             + "padding:5px 7px;border-radius:6px;background:#05090f;"
             + "border:1px solid var(--border)"
-            + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
+            + (mono ? ";font-family:ui-monospace,Consolas,monospace,PineIcons" : "");
           b.appendChild(box);
         };
         put("GOVERNED BY", (c.armed ? "system prompt: " + c.armed : "")
@@ -162320,7 +162396,7 @@ async function cacheTranscript(base, r) {
       const chip = el("span", "", Math.floor(at / 60) + ":"
         + String(at % 60).padStart(2, "0"));
       chip.style.cssText = "color:var(--accent);font-size:10.5px;"
-        + "font-family:ui-monospace,monospace;margin-right:7px";
+        + "font-family:ui-monospace,monospace,PineIcons;margin-right:7px";
       row.appendChild(chip);
     }
     if (m) {
@@ -164491,7 +164567,7 @@ async function djCallersPanel() {
     names.value = (desk.names || []).join("\n");
     names.spellcheck = false;
     names.style.cssText = "width:100%;min-height:110px;font-size:11px;"
-      + "font-family:ui-monospace,Menlo,monospace";
+      + "font-family:ui-monospace,Menlo,monospace,PineIcons";
     names.onchange = async () => {
       try {
         await api("/api/dj/callers/names", {method: "POST",
@@ -165166,42 +165242,42 @@ async function stationFlowOpen() {
 //   metal/rough/emis/wire — how the surfaces read (glassy, matte, wireframe)
 const MIND_THEMES = {
   "default":     {bg: 0x02040a, fog: 0x02040a, a: 0x66aaff, b: 0x8fe388,
-                  lab: "rgba(200,224,255,.95)", font: "system-ui, sans-serif",
+                  lab: "rgba(200,224,255,.95)", font: "system-ui, sans-serif, PineIcons",
                   name: "Pine Box",
                   kit: {ring: "torus", core: "ico", packet: "octa",
                         field: "motes", metal: 0.5, rough: 0.4, wire: false}},
   "cyberpunk":   {bg: 0x0a0016, fog: 0x120026, a: 0xffe600, b: 0xff2e88,
-                  lab: "rgba(255,235,120,.98)", font: "'Courier New', monospace",
+                  lab: "rgba(255,235,120,.98)", font: "'Courier New', monospace, PineIcons",
                   name: "Cyberpunk",
                   kit: {ring: "neon", core: "cube", packet: "octa",
                         field: "grid", metal: 0.7, rough: 0.2, wire: false}},
   "teenage":     {bg: 0x14140f, fog: 0x1c1c14, a: 0xff6a3d, b: 0xf2f2f2,
-                  lab: "rgba(245,245,240,.96)", font: "'Helvetica Neue', sans-serif",
+                  lab: "rgba(245,245,240,.96)", font: "'Helvetica Neue', sans-serif, PineIcons",
                   name: "Teenage Engineering",
                   kit: {ring: "box", core: "cube", packet: "cube",
                         field: "dots", metal: 0.2, rough: 0.7, wire: false}},
   "kojima":      {bg: 0x02100e, fog: 0x02100e, a: 0x9ff0e6, b: 0xffd36b,
-                  lab: "rgba(190,240,232,.96)", font: "'Futura', system-ui, sans-serif",
+                  lab: "rgba(190,240,232,.96)", font: "'Futura', system-ui, sans-serif, PineIcons",
                   name: "Hideo Kojima",
                   kit: {ring: "knot", core: "sphere", packet: "octa",
                         field: "motes", metal: 0.4, rough: 0.35, wire: false}},
   "mgs":         {bg: 0x0a0d08, fog: 0x0a0d08, a: 0x8fd66b, b: 0xd0d8c0,
-                  lab: "rgba(200,220,180,.95)", font: "'Courier New', monospace",
+                  lab: "rgba(200,220,180,.95)", font: "'Courier New', monospace, PineIcons",
                   name: "Metal Gear Solid",
                   kit: {ring: "wire", core: "cube", packet: "tetra",
                         field: "scan", metal: 0.3, rough: 0.6, wire: true}},
   "deathstrand": {bg: 0x060a0d, fog: 0x08121a, a: 0x7fe3d6, b: 0xcfe8ff,
-                  lab: "rgba(200,232,255,.95)", font: "'Futura', system-ui, sans-serif",
+                  lab: "rgba(200,232,255,.95)", font: "'Futura', system-ui, sans-serif, PineIcons",
                   name: "Death Stranding",
                   kit: {ring: "thin", core: "ico", packet: "octa",
                         field: "rain", metal: 0.4, rough: 0.4, wire: false}},
   "halo":        {bg: 0x02060e, fog: 0x02070f, a: 0x3fd2ff, b: 0x9fffe0,
-                  lab: "rgba(180,232,255,.96)", font: "'Segoe UI', system-ui, sans-serif",
+                  lab: "rgba(180,232,255,.96)", font: "'Segoe UI', system-ui, sans-serif, PineIcons",
                   name: "Halo",
                   kit: {ring: "halo", core: "ico", packet: "sphere",
                         field: "stars", metal: 0.6, rough: 0.25, wire: false}},
   "gears":       {bg: 0x0d0a06, fog: 0x0d0a06, a: 0xd94f2a, b: 0xc0b090,
-                  lab: "rgba(224,196,150,.95)", font: "'Impact', system-ui, sans-serif",
+                  lab: "rgba(224,196,150,.95)", font: "'Impact', system-ui, sans-serif, PineIcons",
                   name: "Gears of War",
                   kit: {ring: "cog", core: "cog", packet: "cube",
                         field: "embers", metal: 0.55, rough: 0.85, wire: false}},
@@ -165324,7 +165400,7 @@ function mindFlowToggle(stage) {
       + '<div style="font-weight:700;color:#9fe">' + s.ic + ' ' + s.t + '</div>'
       + '<div style="color:#c3cfdd;margin:3px 0;line-height:1.4">' + s.d
       + '</div><div class="muted" style="font-size:10.5px;'
-      + 'font-family:ui-monospace,monospace">▸ ' + s.tool + '</div></div>';
+      + 'font-family:ui-monospace,monospace,PineIcons">▸ ' + s.tool + '</div></div>';
     if (i < MIND_FLOW.length - 1)
       html += '<div style="text-align:center;color:#4a6;font-size:15px;'
         + 'line-height:1.1">↓</div>';
@@ -165583,7 +165659,7 @@ function mindOpen(opts) {
   cap.style.cssText = "position:absolute;left:0;right:0;bottom:0;z-index:3;"
     + "padding:8px 14px;font-size:11px;color:#bcd;background:linear-gradient("
     + "transparent,#000c);pointer-events:none;max-height:26%;overflow:hidden;"
-    + "font-family:ui-monospace,monospace;line-height:1.5";
+    + "font-family:ui-monospace,monospace,PineIcons;line-height:1.5";
   stage.appendChild(cap);
 
   // the stack of sections pushed into the pair's heads (#482)
@@ -167493,7 +167569,7 @@ async function djBanterPanel() {
     fxFolders.value = (dj.sfx_folders || []).join("\n");
     fxFolders.spellcheck = false;
     fxFolders.style.cssText = "width:100%;min-height:52px;font-size:11px;"
-      + "font-family:ui-monospace,Menlo,monospace";
+      + "font-family:ui-monospace,Menlo,monospace,PineIcons";
     fxFolders.onchange = () => push({
       sfx_folders: fxFolders.value.split("\n")
         .map((s) => s.trim()).filter(Boolean),
@@ -168465,7 +168541,7 @@ function glassOpen() {
 
   const feed = el("div", "", "");
   feed.style.cssText = "flex:1;overflow-y:auto;font-size:11px;"
-    + "font-family:ui-monospace,Menlo,monospace;line-height:1.5";
+    + "font-family:ui-monospace,Menlo,monospace,PineIcons;line-height:1.5";
   box.appendChild(feed);
   document.body.appendChild(box);
 
@@ -169523,7 +169599,7 @@ async function comfyDoctorPanel() {
   box.appendChild(head);
   const term = el("div", "", "");
   term.style.cssText = "flex:1;overflow:auto;padding:12px 14px;"
-    + "font:12px/1.7 ui-monospace,Consolas,monospace;color:#9fd0a6;"
+    + "font:12px/1.7 ui-monospace,Consolas,monospace,PineIcons;color:#9fd0a6;"
     + "background:#04070b;white-space:pre-wrap;min-height:220px";
   term.textContent = "connecting to the doctor…";
   box.appendChild(term);
@@ -170937,7 +171013,7 @@ function paperReadOpen(url, label) {
     const st = document.createElement("style");
     st.id = "paperReadCss";
     st.textContent = "@keyframes pinespin{to{transform:rotate(360deg)}}"
-      + ".rdrcol h1{font:700 32px/1.12 Georgia,serif;margin:0 0 8px;letter-spacing:-.01em}"
+      + ".rdrcol h1{font:700 32px/1.12 Georgia,serif,PineIcons;margin:0 0 8px;letter-spacing:-.01em}"
       + ".rdrcol .rdrby{font:11px/1.4 'Helvetica Neue',Arial,sans-serif;text-transform:uppercase;"
       + "letter-spacing:.12em;color:#4a4741;margin:0 0 16px;padding:0 0 10px;border-bottom:1px solid #9c9686}"
       + ".rdrcol p{margin:0 0 15px}"
@@ -171102,7 +171178,7 @@ async function paperOpen() {
 
   paperConsole = el("div", "", "");
   paperConsole.style.cssText = "flex:none;max-height:96px;overflow:auto;padding:6px 12px;"
-    + "font:11px/1.6 ui-monospace,Consolas,monospace;color:#9fd0a6;"
+    + "font:11px/1.6 ui-monospace,Consolas,monospace,PineIcons;color:#9fd0a6;"
     + "background:#04070b;border-top:1px solid #1b2735;white-space:pre-wrap;display:none";
   box.appendChild(paperConsole);
 
@@ -171207,7 +171283,7 @@ async function paperRefresh(jumpLatest) {
   if (paperCur) await paperShow(paperCur);
   else if (paperFrame) {
     paperFrame.onload = null;
-    paperFrame.srcdoc = "<div style='font:15px Georgia,serif;padding:40px;max-width:640px'>"
+    paperFrame.srcdoc = "<div style='font:15px Georgia,serif,PineIcons;padding:40px;max-width:640px'>"
       + "<h2 style='font-size:34px;margin:0 0 8px'>Nothing on the shelf yet</h2>"
       + "<p>The press runs on the hour, every hour, and files the hour just gone. "
       + "Press <b>Print now</b> for an extra on the last sixty minutes, or say "
@@ -171328,12 +171404,12 @@ const SCRIPT_CSS = ""
   + ".sp-note.crit{border-left-color:#a33b2c;background:#f0dfd8}"
   + ".sp-ins{border-left:3px solid #2f6fb5;padding-left:8px;background:#e6ecf3}"
   + ".sp-char.sp-ins{background:none;color:#1d4a7d}"
-  + ".sp-drop{font:10px ui-monospace,Consolas,monospace;padding:1px 7px;"
+  + ".sp-drop{font:10px ui-monospace,Consolas,monospace,PineIcons;padding:1px 7px;"
   + "border:1px solid #a08243;background:#e3d3ab;color:#3a2f14;"
   + "border-radius:3px;cursor:pointer;margin-top:5px}"
   + ".sp-ctl{margin:2px 0 0 4ch;display:flex;gap:4px;align-items:center;"
-  + "flex-wrap:wrap;font:10px/1.4 ui-monospace,Consolas,monospace;color:#6a675c}"
-  + ".sp-ctl button,.sp-ctl a{font:10px/1 ui-monospace,Consolas,monospace;"
+  + "flex-wrap:wrap;font:10px/1.4 ui-monospace,Consolas,monospace,PineIcons;color:#6a675c}"
+  + ".sp-ctl button,.sp-ctl a{font:10px/1 ui-monospace,Consolas,monospace,PineIcons;"
   + "padding:2px 5px;border:1px solid #c3bba4;background:#e9e3d2;color:#2c2a22;"
   + "border-radius:4px;cursor:pointer;text-decoration:none}"
   + ".sp-ctl button:hover,.sp-ctl a:hover{background:#dcd4bd}"
@@ -171341,7 +171417,7 @@ const SCRIPT_CSS = ""
   + "border-radius:3px;padding:1px 5px;font-weight:700}"
   + ".sp-tree{margin:6px 0 12px 4ch;max-width:58ch;background:#ece6d6;"
   + "border:1px solid #cdc4ab;border-radius:5px;padding:8px 10px;"
-  + "font:11px/1.5 ui-monospace,Consolas,monospace;color:#2b2920;"
+  + "font:11px/1.5 ui-monospace,Consolas,monospace,PineIcons;color:#2b2920;"
   + "white-space:pre-wrap;word-break:break-word}"
   + ".sp-tree b{color:#101008}"
   + ".sp-tree .k{color:#6d6552}"
@@ -171357,11 +171433,11 @@ const SCRIPT_CSS = ""
   + "'Courier New',monospace;background:#f7f4ea;color:#14140f;"
   + "border:1px solid #c3bba4;border-radius:4px;padding:6px;box-sizing:border-box}"
   + ".sp-compose .row{display:flex;gap:6px;margin-top:6px;align-items:center;"
-  + "font:11px ui-monospace,monospace;color:#4a4638}"
-  + ".sp-compose select,.sp-compose input{font:11px ui-monospace,monospace;"
+  + "font:11px ui-monospace,monospace,PineIcons;color:#4a4638}"
+  + ".sp-compose select,.sp-compose input{font:11px ui-monospace,monospace,PineIcons;"
   + "background:#f7f4ea;color:#14140f;border:1px solid #c3bba4;"
   + "border-radius:4px;padding:3px 5px}"
-  + ".sp-compose button{font:11px ui-monospace,monospace;padding:3px 9px;"
+  + ".sp-compose button{font:11px ui-monospace,monospace,PineIcons;padding:3px 9px;"
   + "border:1px solid #c3bba4;background:#dcd4bd;color:#2c2a22;"
   + "border-radius:4px;cursor:pointer}";
 
@@ -171972,7 +172048,7 @@ async function stewardPanel() {
   box.appendChild(head);
   const term = el("div", "", "");
   term.style.cssText = "flex:1;overflow:auto;padding:12px 14px;"
-    + "font:12px/1.7 ui-monospace,Consolas,monospace;color:#9fd0a6;"
+    + "font:12px/1.7 ui-monospace,Consolas,monospace,PineIcons;color:#9fd0a6;"
     + "background:#04070b;white-space:pre-wrap;min-height:240px";
   term.textContent = "connecting to the steward…";
   box.appendChild(term);
@@ -172141,7 +172217,7 @@ async function phonePanel() {
   stage.appendChild(close);
   const title = el("div", "", "☎ Phone · a card off the deck to a call on the air");
   title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;"
-    + "font:600 13px system-ui;color:#9fd0e3";
+    + "font:600 13px system-ui,PineIcons;color:#9fd0e3";
   stage.appendChild(title);
 
   const scene = new THREE.Scene();
@@ -172261,7 +172337,7 @@ async function phonePanel() {
 
     rail.innerHTML = "";
     const h = el("div", "", "☎ The phone system");
-    h.style.cssText = "font:600 14px system-ui;color:#dff6ff;margin-bottom:8px";
+    h.style.cssText = "font:600 14px system-ui,PineIcons;color:#dff6ff;margin-bottom:8px";
     rail.appendChild(h);
     const say = el("div", "muted", String(d.say || ""));
     say.style.cssText = "font-size:11.5px;line-height:1.5;margin-bottom:12px";
@@ -172271,14 +172347,14 @@ async function phonePanel() {
       row.style.cssText = "margin:0 0 9px 0;padding-left:10px;"
         + "border-left:2px solid #22304a";
       const t = el("div", "", s.n + ". " + s.name);
-      t.style.cssText = "font:600 12px system-ui;color:#9fd0e3";
+      t.style.cssText = "font:600 12px system-ui,PineIcons;color:#9fd0e3";
       const w2 = el("div", "muted", s.what);
       w2.style.cssText = "font-size:11px;line-height:1.45";
       row.appendChild(t); row.appendChild(w2);
       rail.appendChild(row);
     });
     const dh = el("div", "", "The last cards off the deck");
-    dh.style.cssText = "font:600 12px system-ui;color:#dff6ff;margin:14px 0 6px";
+    dh.style.cssText = "font:600 12px system-ui,PineIcons;color:#dff6ff;margin:14px 0 6px";
     rail.appendChild(dh);
     (draws.slice().reverse()).forEach((row) => {
       const r2 = el("div", "", "");
@@ -173384,7 +173460,7 @@ async function orchPaint() {
       }
       const does = el("div", "muted", "\u2192 " + o.does);
       does.style.cssText = "font-size:9.5px;margin-top:2px;opacity:.6;"
-        + "font-family:ui-monospace,monospace";
+        + "font-family:ui-monospace,monospace,PineIcons";
       pick.appendChild(does);
       const mark = () => {
         orchPicks[String(qi)] = o.does;
@@ -173855,7 +173931,7 @@ async function sfxStatsOpen() {
       + (sample.banned ? ";opacity:.45" : "");
     const plays = el("span", "", String(sample.plays) + "×");
     plays.style.cssText = "flex:0 0 40px;color:var(--accent);"
-      + "font-family:ui-monospace,monospace";
+      + "font-family:ui-monospace,monospace,PineIcons";
     row.appendChild(plays);
     const name = el("span", "", sample.name);
     name.style.cssText = "flex:1;min-width:0;overflow:hidden;"
@@ -174672,7 +174748,7 @@ function studioConsolePaint(live) {
     html += '</div>';
   }
 
-  html += '<div style="font-family:ui-monospace,Menlo,Consolas,monospace;'
+  html += '<div style="font-family:ui-monospace,Menlo,Consolas,monospace,PineIcons;'
     + 'font-size:9.5px;line-height:1.5;max-height:132px;overflow:auto;'
     + 'background:#05090f;border:1px solid var(--border);border-radius:7px;'
     + 'padding:5px 7px">';
@@ -179914,9 +179990,13 @@ async function scanLocalFonts() {
 
 function applyFont(name) {
   localStorage.setItem("pineFont", name);
-  document.body.style.fontFamily = name === "system-ui"
+  /* PineIcons stays last in every stack the picker can build: this inline
+     style beats the body rule in the stylesheet, so without it the panel's
+     icons fall back to the system's colour emoji font. Its unicode-range
+     covers only pictographs, so the chosen text font is untouched. */
+  document.body.style.fontFamily = (name === "system-ui"
     ? "system-ui, sans-serif"
-    : '"' + name + '", system-ui, sans-serif';
+    : '"' + name + '", system-ui, sans-serif') + ", PineIcons";
 }
 
 function initFontPicker() {
@@ -181706,11 +181786,15 @@ JOURNAL_PAGE_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The request book · Pine Box</title>
+<!-- Single-colour icons, not colour emoji. The stylesheet carries the
+     font inline and its unicode-range confines it to pictographs. -->
+<link rel="stylesheet" href="/icons/pineicons.css">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #04060b; color: #dbe7f5;
-         font: 14px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+         font: 14px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif,
+               PineIcons; }
   header { position: sticky; top: 0; z-index: 3; background: #0b1220;
            border-bottom: 1px solid #1e2a3a; padding: 8px 14px; display: flex;
            gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -182088,13 +182172,17 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pine Box FM</title>
+<!-- Single-colour icons, not colour emoji. The stylesheet carries the
+     font inline and its unicode-range confines it to pictographs. -->
+<link rel="stylesheet" href="/icons/pineicons.css">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body {
     margin: 0; min-height: 100vh; display: flex; align-items: center;
     justify-content: center; background: #04060b; color: #e6edf5;
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif,
+          PineIcons;
     padding: 24px;
   }
   .set { width: min(560px, 100%); }
@@ -183293,13 +183381,17 @@ GUIDE_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pine Box — recovery guide</title>
+<!-- Single-colour icons, not colour emoji. The stylesheet carries the
+     font inline and its unicode-range confines it to pictographs. -->
+<link rel="stylesheet" href="/icons/pineicons.css">
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
   body {
     margin: 0 auto; max-width: 820px; padding: 40px 28px 80px;
     background: #fff; color: #16181d;
-    font: 15px/1.62 "Segoe UI", system-ui, -apple-system, sans-serif;
+    font: 15px/1.62 "Segoe UI", system-ui, -apple-system, sans-serif,
+          PineIcons;
   }
   h1 { font-size: 27px; margin: 0 0 4px; letter-spacing: -.01em; }
   h2 {
@@ -183325,7 +183417,7 @@ GUIDE_HTML = r"""<!doctype html>
   }
   pre {
     background: #0f1115; color: #e8eaf0; padding: 12px 14px; border-radius: 7px;
-    overflow-x: auto; font: 12.5px/1.55 ui-monospace, monospace;
+    overflow-x: auto; font: 12.5px/1.55 ui-monospace, monospace,PineIcons;
   }
   .note {
     background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px;
