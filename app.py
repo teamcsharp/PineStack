@@ -9078,7 +9078,25 @@ def page_wedge_state() -> dict[str, Any]:
             if "stalled" in err or "interrupted by a call to pause" in err:
                 stalls += 1
         out["stalls"] = stalls
-        quiet = now - max(float(_SPOKE_AT[0] or 0), 0.0)
+        # #1202: THE ROOM IS QUIET WHEN NOBODY HAS HEARD ANYTHING, not
+        # when the booth has not spoken. _SPOKE_AT marks the booth
+        # queueing a line; measured during the third occurrence of this
+        # fault the ladder itself said "the DJs talking normally - last
+        # aired line 24s ago" while fourteen clips sat unplayed and the
+        # operator heard silence. The page reports its own audible volume
+        # several times a clip and that is the honest clock.
+        heard_at = 0.0
+        for ev in list(_PAGE_ACK_EVENTS[-200:]):
+            try:
+                if float(ev.get("audible_volume") or 0) > 0:
+                    heard_at = max(heard_at, float(ev.get("at") or 0))
+            except Exception:  # noqa: BLE001
+                continue
+        out["heard_at"] = round(heard_at, 1)
+        # Nothing audible anywhere in the ring counts as quiet - but it
+        # can only ever matter alongside the two conditions below, which
+        # a freshly started station does not meet.
+        quiet = (now - heard_at) if heard_at else PAGE_WEDGE_QUIET * 2
         out["quiet"] = round(quiet, 1)
         if not owner:
             out["why"] = "nobody holds the air"
@@ -43122,6 +43140,18 @@ async def dead_air_watch() -> None:
             # is written down here and paid below when the floor frees.
             try:
                 entry_arrears_note()
+            except Exception:  # noqa: BLE001
+                pass
+            # #1202: AND ASK WHETHER THE PAGE HAS STUCK. #1200 put this
+            # behind the repair ladder, which is reached only when the
+            # watchdog strikes - and the watchdog resets on every pass
+            # while a record plays, which with voice on the page is
+            # nearly always. The rung was unreachable in ordinary
+            # running, which is why it never fired through three
+            # occurrences of the fault it was written for.
+            try:
+                if page_wedge_state().get("wedged"):
+                    await page_wedge_clear()
             except Exception:  # noqa: BLE001
                 pass
             if not (_SPEAKING[0] or _floor_busy()):
