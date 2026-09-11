@@ -111461,6 +111461,66 @@ NOTIFICATIONS_KEEP = 400
 PHRASE_SETS_PATH = data_path("phrase_sets.json")
 
 
+@app.get("/api/broadcast/health")
+async def api_broadcast_health(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1203: is the broadcast actually reaching anybody, and if not why.
+
+    Said in the operator's terms. Every other surface answers about the
+    STATION - on, unpaused, the booth talking - and all three of those
+    were true through every wedge. This one answers about the LISTENER."""
+    require_read_auth(authorization)
+    state = page_wedge_state()
+    now = time.time()
+    heard_at = float(state.get("heard_at") or 0)
+    try:
+        listeners = len(_listeners_live())
+    except Exception:  # noqa: BLE001
+        listeners = 0
+    stuck = bool(state.get("wedged"))
+    if stuck:
+        say = ("The broadcast is stuck. %d clip(s) are queued on the page "
+               "that is meant to be playing them and none has started; "
+               "nothing has been heard for %d second(s)."
+               % (int(state.get("waiting") or 0), int(state.get("quiet") or 0)))
+        offer = ["unstick it now", "leave it - the station retries on its own"]
+    elif heard_at:
+        say = ("Reaching %d listener(s); last heard %ds ago."
+               % (listeners, int(now - heard_at)))
+        offer = []
+    else:
+        say = ("Nobody has reported hearing anything yet - that is normal "
+               "for the first minute after a restart.")
+        offer = []
+    return {
+        "at": now, "stuck": stuck, "say": say, "offer": offer,
+        "listeners": listeners,
+        "heard_seconds_ago": (round(now - heard_at, 1) if heard_at else None),
+        "clips_waiting": int(state.get("waiting") or 0),
+        "stall_reports": int(state.get("stalls") or 0),
+        "holding_the_air": str(state.get("owner") or ""),
+        "detail": str(state.get("why") or ""),
+        "fix_with": "POST /api/broadcast/unwedge",
+    }
+
+
+@app.post("/api/broadcast/unwedge")
+async def api_broadcast_unwedge(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1203: do whatever it takes to get the broadcast moving again.
+
+    The #1147 feed epoch first, so the page drops the queue it is stuck
+    on and orphans the play promises still in flight; then, if that was
+    not enough, the exclusive is released so any other page in the house
+    can sound. Forced - the operator asking is not a guess."""
+    require_auth(authorization)
+    got = await page_wedge_clear(force=True)
+    note_action("you asked the station to unstick the broadcast")
+    return {**got, "health": (await api_broadcast_health(authorization))}
+
+
 @app.get("/api/notifications")
 async def notifications_list(
     limit: int = 60,
@@ -155958,6 +156018,9 @@ function djRender(state) {
   try { orchBell(); } catch (e) { /* the panel still reads */ }
   /* #1071: ...and the CARD, which is the one that can be seen. */
   try { orchToast(); } catch (e) { /* the panel still reads */ }
+  /* #1203: ...and the card that says the broadcast is stuck, which is the
+   * one thing every other surface reported as healthy. */
+  try { wedgeToast(); } catch (e) { /* the panel still reads */ }
   /* #1008: the overlap setting reaches the page on every poll now, not
    * only when the settings panel happens to be painted. */
   try {
@@ -171316,6 +171379,82 @@ let orchPlex = null;
 
 function orchCardHide() {
   if (orchCard) { orchCard.remove(); orchCard = null; }
+}
+
+
+/* --- #1203: the broadcast-is-stuck card -----------------------------------
+   "these wedge states are things that I'm not able to tell is happening."
+   The same shape as the orchestrator's toast (#1071) so it reads as the
+   station rather than an error dialog. Shown only while the broadcast is
+   genuinely stuck; it takes itself down the moment sound returns. */
+let wedgeCard = null;
+let wedgeSnooze = 0;
+
+function wedgeCardHide() {
+  if (!wedgeCard) return;
+  try { wedgeCard.remove(); } catch (e) {}
+  wedgeCard = null;
+}
+
+async function wedgeToast() {
+  let got;
+  try { got = await api("/api/broadcast/health"); }
+  catch (e) { return; }
+  if (!got || !got.stuck || Date.now() < wedgeSnooze) { wedgeCardHide(); return; }
+  if (wedgeCard) return;                       /* already up */
+
+  const tone = "#ff7a3c";
+  const card = el("div", "", "");
+  card.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:195;"
+    + "width:min(370px,92vw);border-radius:12px;padding:13px 15px;"
+    + "background:linear-gradient(150deg,rgba(24,16,14,.98),"
+    + "rgba(12,9,8,.98));border:1px solid " + tone + "66;"
+    + "border-left:4px solid " + tone + ";"
+    + "box-shadow:0 18px 50px rgba(0,0,0,.7),0 0 26px " + tone + "22";
+
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:6px";
+  const dot = el("span", "", "");
+  dot.style.cssText = "width:9px;height:9px;border-radius:50%;flex:none;background:" + tone;
+  dot.animate([{opacity: 1}, {opacity: .25}, {opacity: 1}],
+              {duration: 1200, iterations: Infinity});
+  head.appendChild(dot);
+  const who = el("b", "", "The broadcast is stuck");
+  who.style.cssText = "font-size:12.5px;flex:1";
+  head.appendChild(who);
+  card.appendChild(head);
+
+  const why = el("div", "", String(got.say || ""));
+  why.style.cssText = "font-size:11.5px;line-height:1.55;opacity:.9;margin-bottom:9px";
+  card.appendChild(why);
+
+  const foot = el("div", "", "");
+  foot.style.cssText = "display:flex;gap:7px;align-items:center";
+  const go = el("button", "", "Unstick it now");
+  go.style.cssText = "flex:1;padding:7px;border-radius:7px;border:none;"
+    + "font-weight:700;font-size:11.5px;cursor:pointer;background:" + tone
+    + ";color:#1a0d08";
+  go.onclick = async () => {
+    go.disabled = true; go.textContent = "working…";
+    try {
+      const out = await api("/api/broadcast/unwedge", {method: "POST"});
+      go.textContent = (out && out.say) ? String(out.say).slice(0, 40) : "done";
+      setTimeout(() => { wedgeCardHide(); wedgeToast(); }, 2200);
+    } catch (e) {
+      go.disabled = false;
+      go.textContent = "could not reach the station";
+    }
+  };
+  foot.appendChild(go);
+  const later = el("button", "", "Later");
+  later.style.cssText = "padding:7px 10px;border-radius:7px;cursor:pointer;"
+    + "background:#1b222d;color:#cfe0f0;border:1px solid #2a3a52;font-size:11.5px";
+  later.onclick = () => { wedgeSnooze = Date.now() + 10 * 60 * 1000; wedgeCardHide(); };
+  foot.appendChild(later);
+  card.appendChild(foot);
+
+  document.body.appendChild(card);
+  wedgeCard = card;
 }
 
 async function orchToast() {
