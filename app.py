@@ -98299,6 +98299,138 @@ def cupboard_view(cells: int = CUPBOARD_VIEW_CELLS) -> dict[str, Any]:
     return out
 
 
+def cupboard_worn(most: int = 40) -> dict[str, Any]:
+    """#1196: banked rounds carrying a phrase the station has worn out.
+
+    The same five-word runs and the same threshold the #1194 gate uses, so
+    what the gate refuses to write and what the desk offers to retire are
+    the same definition of "worn". Read-only: this finds and explains,
+    `cupboard_worn_review` is what puts anything up."""
+    try:
+        rows = line_prints()
+        book = phrase_book(rows)
+    except Exception:  # noqa: BLE001
+        return {"at": time.time(), "rounds": [], "phrases": [],
+                "say": "the print ledger could not be read"}
+    found: list[dict[str, Any]] = []
+    worst: dict[str, int] = {}
+    try:
+        piles: list[tuple[str, Any]] = [("banter", e) for e in list(_LARDER)]
+        for kind, held in list(_SHELF.items()):
+            piles += [(str(kind), r) for r in list(held or [])]
+    except Exception:  # noqa: BLE001
+        piles = []
+    for kind, row in piles:
+        try:
+            entry = dialogue_entry(row) or {}
+            script = str(entry.get("script") or "")
+            if not script.strip():
+                continue
+            hits: list[tuple[str, int]] = []
+            for run in _runs(script):
+                got = int(book.get(run) or 0)
+                if got >= PHRASE_ACROSS_LINES and not _phrase_is_furniture(run):
+                    hits.append((run, got))
+            if not hits:
+                continue
+            hits.sort(key=lambda p: -p[1])
+            phrase, said = hits[0]
+            worst[phrase] = max(worst.get(phrase, 0), said)
+            found.append({
+                "id": retire_id(kind, row),
+                "road": kind,
+                "label": SHELF_LABEL.get(kind, kind),
+                "phrase": phrase,
+                "said_in_lines": said,
+                "phrases": len(hits),
+                "aired": int(entry.get("aired") or 0),
+                "turns": script.count("\n") + 1,
+                "rhymed": bool(row_is_rhymed(kind, row)),
+                "head": script.strip().replace("\n", " / ")[:200],
+            })
+        except Exception:  # noqa: BLE001
+            continue
+    # The one the operator is most tired of first: airings, then how worn
+    # the phrase it carries is.
+    found.sort(key=lambda f: (-int(f["aired"]), -int(f["said_in_lines"])))
+    top = sorted(worst.items(), key=lambda kv: -kv[1])[:12]
+    return {
+        "at": time.time(),
+        "threshold": PHRASE_ACROSS_LINES,
+        "rounds": found[:max(0, int(most))],
+        "of": len(found),
+        "airings": sum(int(f["aired"]) for f in found),
+        "phrases": [{"phrase": p, "said_in_lines": c} for p, c in top],
+        "say": ("%d banked round(s) carry a phrase this station has already "
+                "said in %d or more separate lines; between them they have "
+                "aired %d time(s). Nothing is deleted - put them up and "
+                "decide."
+                % (len(found), PHRASE_ACROSS_LINES,
+                   sum(int(f["aired"]) for f in found))),
+    }
+
+
+@app.get("/api/cupboard/worn")
+async def api_cupboard_worn(
+    most: int = 40,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1196: which banked rounds carry a phrase the station has worn out."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(cupboard_worn, max(0, min(300, int(most or 0))))
+
+
+@app.post("/api/cupboard/worn/review")
+async def api_cupboard_worn_review(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1196: put the worn rounds up on the retirement desk for a decision.
+
+    NOTHING IS DELETED. `retire_may` marks each one PENDING with the reason
+    and returns False, which is the desk's way of saying "the operator has
+    not answered yet" - the round keeps airing until he does. Answer them
+    at /cupboard/retire or with POST /api/retire/decide.
+
+    `{"ids": [...]}` puts up named rounds; with no ids it puts up
+    everything the sweep found."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    want = {str(x) for x in (payload.get("ids") or []) if str(x)}
+    found = await asyncio.to_thread(cupboard_worn, 300)
+    put, spared = [], []
+    for row in (found.get("rounds") or []):
+        rid = str(row.get("id") or "")
+        if want and rid not in want:
+            continue
+        kind, live = _retire_find(rid)
+        if live is None:
+            spared.append(rid)
+            continue
+        why = ("it carries a phrase the station has already said in %d "
+               "separate lines: \u201c%s\u201d"
+               % (int(row.get("said_in_lines") or 0), row.get("phrase") or ""))
+        try:
+            retire_may(kind or str(row.get("road") or ""), live, why)
+            put.append({"id": rid, "road": row.get("road"),
+                        "phrase": row.get("phrase"), "aired": row.get("aired")})
+        except Exception:  # noqa: BLE001
+            spared.append(rid)
+    if put:
+        note_action("%d worn round(s) put up for your decision" % len(put))
+        pipeline_log("air", "%d banked round(s) carrying a worn phrase were "
+                     "put up on the retirement desk - nothing is deleted "
+                     "until you answer (#1196)" % len(put))
+    return {"put_up": put, "count": len(put), "skipped": spared,
+            "desk": "/cupboard/retire",
+            "say": ("%d round(s) are on the desk awaiting your decision - "
+                    "keep or remove, nothing goes on its own" % len(put))}
+
+
 @app.get("/api/cupboard/view")
 async def api_cupboard_view(
     cells: int = CUPBOARD_VIEW_CELLS,
