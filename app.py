@@ -36537,6 +36537,19 @@ def orch_apply(does: str) -> str:
                         f"{SHELF_LABEL.get(str(arg), str(arg))} for an hour")
             except Exception:  # noqa: BLE001
                 said = "noted"
+        elif verb == "floor":
+            # #1192: the orchestrator's first control over the AIR rather
+            # than the cupboard. "yield" lets the running order ask a
+            # cuttable round to end at its next turn boundary when the
+            # entry that is due has something ready and cannot get on;
+            # "hold" leaves the floor to whoever has it, which is the
+            # behaviour before this existed.
+            _want = str(arg or "yield") != "hold"
+            _ORCH["policy"]["floor_yield"] = {
+                "value": bool(_want), "at": time.time()}
+            said = ("a segment gives up the floor at its next turn when "
+                    "the entry due has something ready" if _want else
+                    "a segment keeps the floor until it is finished")
         elif verb == "thin":
             _ORCH["policy"]["thin_road"] = {
                 "value": str(arg), "at": time.time()}
@@ -42778,6 +42791,103 @@ def entry_window_now() -> tuple[str, float, float]:
         return "", 0.0, 0.0
 
 
+# #1189: entries of a rescue road that went by with none of their own
+# road on the air, and when. Small by construction - one stamp per road.
+_ENTRY_ARREARS: dict[str, float] = {}
+# #1192: the entry occurrence the floor was last asked for, so one entry
+# asks once rather than standing down every round that follows it.
+_FLOOR_ASKED: dict[str, str] = {}
+ARREARS_LIFE = float(os.getenv("PINE_ARREARS_LIFE", "2700"))   # 45 minutes
+
+
+def entry_arrears_note() -> str:
+    """#1189: write down an entry that is going by unanswered.
+
+    Runs whether or not the room is speaking - which is the whole point.
+    The floor is nearly always held by somebody when a short entry opens,
+    so noticing must not be gated on the room being free the way serving
+    has to be."""
+    kind, start, deadline = entry_window_now()
+    if not kind or kind not in RESCUE_ROADS_OPEN:
+        return ""
+    now = time.time()
+    if not (start < now < deadline):
+        return ""
+    # Past half its window and still nothing of its own: it is going by.
+    if now - start < max(20.0, (deadline - start) / 2.0):
+        return ""
+    if entry_own_aired(kind, start, deadline) > 1.0:
+        return ""
+    if kind not in _ENTRY_ARREARS:
+        pipeline_log("air", "the %s entry is going by with none of its own "
+                     "road on the air - noted as owed (#1189)"
+                     % SHELF_LABEL.get(kind, kind))
+    _ENTRY_ARREARS[kind] = now
+    # #1192: AND THE SHEET MAY ASK FOR THE FLOOR. Noting the debt does
+    # nothing while something else holds the air for six minutes at a
+    # time - measured, that is how a road with 26 recorded rounds airs
+    # nothing for four hours. _TALK_CUT ends a round at its next TURN
+    # BOUNDARY and `can_cut` already refuses to apply it to a live caller
+    # or to a memo, so nothing with a promised arc is ever stranded; and
+    # banter, which is what usually holds the floor, is reusable, so a
+    # round stood down is banked rather than lost.
+    #
+    # Once per entry occurrence: this hands the floor to the thing that is
+    # due, it does not chop at whatever follows.
+    try:
+        if not bool(orch_policy("floor_yield", True)):
+            return kind
+        if kind not in (dead_air_stock() or {}):
+            return kind                 # nothing ready - no point asking
+        if not _floor_busy():
+            return kind                 # the floor is free already
+        _pos = _RADIO.get("sched_pos") or {}
+        _occ = "%s|%s" % (kind, str(_pos.get("occurrence") or start))
+        if _FLOOR_ASKED.get("occ") != _occ:
+            _FLOOR_ASKED["occ"] = _occ
+            _TALK_CUT[0] += 1
+            pipeline_log(
+                "air", "the %s entry is due and has a finished round "
+                "waiting, so the round on the floor is asked to end at "
+                "its next turn - a live call and a memo are never cut "
+                "(#1192)" % SHELF_LABEL.get(kind, kind))
+    except Exception:  # noqa: BLE001
+        pass
+    return kind
+
+
+async def entry_arrears_serve() -> str:
+    """#1189: the floor is free - put out the oldest thing owed.
+
+    Out of turn on purpose. A memo heard three minutes after its slot is
+    the show running slightly late; a memo never heard at all is a road
+    the station has stopped having. Everything the rescue guards - its
+    rest timer, the paused and off-air checks, finished rounds only -
+    still applies."""
+    now = time.time()
+    for road in [k for k, at in _ENTRY_ARREARS.items()
+                 if now - float(at or 0) > ARREARS_LIFE]:
+        _ENTRY_ARREARS.pop(road, None)
+    if not _ENTRY_ARREARS:
+        return ""
+    if _SPEAKING[0] or _floor_busy() or radio_paused():
+        return ""
+    road = min(_ENTRY_ARREARS, key=lambda k: _ENTRY_ARREARS[k])
+    owed_for = now - float(_ENTRY_ARREARS.get(road) or now)
+    # Cleared either way: a road that cannot answer must not hold the
+    # queue against the road behind it.
+    _ENTRY_ARREARS.pop(road, None)
+    if road not in (dead_air_stock() or {}):
+        return ""
+    said = await dead_air_rescue(0)
+    if said:
+        pipeline_log(
+            "air", "%s was owed an entry %ds ago and the floor is free - a "
+            "finished %s round goes out of turn to pay it (#1189)"
+            % (SHELF_LABEL.get(road, road), int(owed_for), said))
+    return said
+
+
 async def entry_unanswered_fill() -> str:
     """#1186: the entry on air has had none of its own road - so serve it.
 
@@ -42868,9 +42978,17 @@ async def dead_air_watch() -> None:
             # rescue had never fired, while 7 of 14 talk entries in an
             # hour put out none of their own road and manager sat on
             # 2,076s of finished work. See the patch note.
+            # #1189: NOTICING IS NOT GATED ON THE ROOM BEING FREE. A short
+            # entry nearly always opens while somebody else holds the
+            # floor - that is exactly the case #1186 could not see, so it
+            # is written down here and paid below when the floor frees.
+            try:
+                entry_arrears_note()
+            except Exception:  # noqa: BLE001
+                pass
             if not (_SPEAKING[0] or _floor_busy()):
                 try:
-                    await entry_unanswered_fill()
+                    await entry_unanswered_fill() or await entry_arrears_serve()
                 except Exception:  # noqa: BLE001
                     pass
             if ((now_really_playing() and (_room_gets_music
@@ -101070,6 +101188,127 @@ def director_why(kind: str) -> dict[str, Any]:
                         "untinted, unrecorded or written for another cast)"
                         % pool["dropped"])
     out["say"] = "; ".join(said)
+    return out
+
+
+@app.post("/api/director/air-now/{kind}")
+async def api_director_air_now(
+    kind: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1190: put a finished round of this road on the air, now.
+
+    The operator asking for the thing he has not heard in four hours. It
+    goes through the SAME door the rescue uses - `_ready_shelf_air(...,
+    rescue=True)` - so it airs only a finished, recorded, intact round,
+    out of turn, and every guard that road already has still applies. No
+    new powers: this is the existing cupboard road with a handle on it.
+
+    Answers with the lines that went out, so "did it work" is a fact
+    rather than an inference."""
+    require_auth(authorization)
+    kind = str(kind or "")[:32]
+    if kind not in RESCUE_ROADS_OPEN:
+        raise HTTPException(
+            status_code=400,
+            detail="the cupboard road is open for %s"
+                   % ", ".join(RESCUE_ROADS_OPEN))
+    if radio_paused() or not _RADIO.get("on"):
+        raise HTTPException(status_code=409,
+                            detail="the station is not on air")
+    try:
+        said = await _ready_shelf_air(kind, _RADIO.get("now"), rescue=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500,
+                            detail="%s: %s" % (type(exc).__name__,
+                                               str(exc)[:160])) from exc
+    if said:
+        note_action("you put a finished %s round on the air" % kind)
+        pipeline_log("air", "OPERATOR: a finished %s round was put on the "
+                     "air by hand - %d line(s) (#1190)" % (kind, len(said)))
+    return {"kind": kind, "aired": bool(said), "lines": said,
+            "say": ("%d line(s) of a ready %s round went out" % (len(said), kind)
+                    if said else
+                    "the cupboard would not hand one over - ask "
+                    "/api/director/why-not/%s" % kind)}
+
+
+@app.get("/api/director/why-not/{kind}")
+async def api_director_why_not(
+    kind: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1188: why this road is not on the air, asked through the REAL door.
+
+    Peek only - nothing is reserved, nothing airs. Every other surface
+    counts the cupboard its own way; this one runs the selection the
+    rescue runs and says where it stops."""
+    require_read_auth(authorization)
+    kind = str(kind or "")[:32]
+    out: dict[str, Any] = {"kind": kind, "at": time.time()}
+    try:
+        src = list(road_source(kind) or [])
+    except Exception as exc:  # noqa: BLE001
+        src = []
+        out["source_error"] = str(exc)[:120]
+    try:
+        pile = list(shelf_rows(kind) or [])
+    except Exception:  # noqa: BLE001
+        pile = []
+    out["source_rows"] = len(src)
+    out["shelf_rows"] = len(pile)
+    # #1165/#1169: the two halves of the station disagreeing about which
+    # pile a road lives on is its own fault class, and one line finds it.
+    out["same_pile"] = len(src) == len(pile)
+    stops: dict[str, int] = {}
+    busy = withtakes = 0
+    for row in src:
+        try:
+            if id(row) in _READY_SHELF_BUSY:
+                busy += 1
+                stops["already in hand"] = stops.get("already in hand", 0) + 1
+                continue
+            if not _ready_round_takes(kind, row):
+                stops["no recorded takes"] = stops.get(
+                    "no recorded takes", 0) + 1
+                continue
+            withtakes += 1
+        except Exception as exc:  # noqa: BLE001
+            stops["errored: " + type(exc).__name__] = stops.get(
+                "errored: " + type(exc).__name__, 0) + 1
+    out["busy"] = busy
+    out["with_takes"] = withtakes
+    out["stops"] = stops
+    # THE ANSWER: what the air itself would get, right now.
+    try:
+        got = _ready_shelf_row(kind, True)
+        out["rescue_row"] = got is not None
+        if got is not None:
+            _t = _ready_round_takes(kind, got) or []
+            out["rescue_takes"] = len(_t)
+            out["rescue_seconds"] = round(
+                sum(float(t.get("seconds") or 0) for t in _t), 1)
+    except Exception as exc:  # noqa: BLE001
+        out["rescue_row"] = False
+        out["rescue_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:140])
+    try:
+        out["in_dead_air_stock"] = int((dead_air_stock() or {}).get(kind) or 0)
+        out["rescue_road_open"] = kind in RESCUE_ROADS_OPEN
+    except Exception:  # noqa: BLE001
+        pass
+    bits = ["%d row(s) on the %s pile" % (len(src), kind)]
+    if not out.get("same_pile"):
+        bits.append("BUT shelf_rows sees %d - the two halves of the station "
+                    "disagree about which pile this road lives on" % len(pile))
+    bits.append("%d carry recorded audio" % withtakes)
+    if not out.get("rescue_road_open"):
+        bits.append("this road is NOT one the rescue may open "
+                    "(RESCUE_ROADS_OPEN)")
+    bits.append("the air's own door would %s right now"
+                % ("take one" if out.get("rescue_row") else "take NOTHING"))
+    if out.get("rescue_error"):
+        bits.append("it raised " + str(out["rescue_error"]))
+    out["say"] = "; ".join(bits)
     return out
 
 
