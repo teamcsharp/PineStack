@@ -81,66 +81,32 @@ app = FastAPI(
 )
 
 
-# #1160: GZIP, FOR THE BIG TEXT ANSWERS ONLY.
+# #1160: GZIP WAS TRIED HERE AND TAKEN BACK OUT. Read this before adding it.
 #
-# The panel document is 2.19 MB and went out uncompressed - it is about
-# 3.6x smaller gzipped, and /api/dj/pending (2,192,619 bytes of JSON) far
-# more than that. On the tablet that uncompressed document was the whole
-# of the first-paint wait, and it costs every other client too.
+# The prize is real: this panel document is 2.19 MB uncompressed (about
+# 3.6x smaller gzipped) and /api/dj/pending is 2,192,619 bytes of JSON,
+# which compresses far harder than that. It costs every client, not just
+# the tablet.
 #
-# This is deliberately NOT starlette's GZipMiddleware. That one compresses
-# whatever it is handed, and this station serves audio: 206 Range replies
-# and FileResponse streams. Compressing a partial range corrupts it, and
-# compressing audio burns CPU on a box that is busy making the show.
+# What was tried: an @app.middleware("http") that compressed only a short
+# allow-list of text content types, skipping Range requests, non-200s and
+# already-encoded replies. It looked exactly right and it did NOTHING,
+# because `@app.middleware("http")` is starlette's BaseHTTPMiddleware and
+# that hands back a _StreamingResponse for EVERY route - even a plain
+# HTMLResponse. The `response.body` the filter tested for is never there,
+# so every request fell through the last guard uncompressed.
 #
-# So the rules are narrow and the default is to do nothing:
-#   - only these content types, only whole bodies already in memory
-#   - never a Range request, never a non-200, never an already-encoded one
-#   - StreamingResponse and FileResponse carry no `.body`, so they are
-#     skipped BY CONSTRUCTION rather than by a list someone has to keep
-#     in step with the routes
-_GZIP_TYPES = frozenset((
-    "text/html", "text/css", "text/plain", "text/javascript",
-    "application/javascript", "application/json", "image/svg+xml",
-))
-_GZIP_MIN_BYTES = 1500
-
-
-@app.middleware("http")
-async def gzip_text_responses(request: Request, call_next):
-    # Imported here rather than at the top of the file so this whole change
-    # is one contiguous block that can be lifted out in a single cut. The
-    # module is stdlib and already resident; the lookup is a dict hit.
-    import gzip
-
-    response = await call_next(request)
-    try:
-        if request.headers.get("range"):
-            return response
-        if response.status_code != 200:
-            return response
-        if response.headers.get("content-encoding"):
-            return response
-        if "gzip" not in (request.headers.get("accept-encoding") or "").lower():
-            return response
-        kind = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-        if kind not in _GZIP_TYPES:
-            return response
-        body = getattr(response, "body", None)
-        if not isinstance(body, (bytes, bytearray)) or len(body) < _GZIP_MIN_BYTES:
-            return response
-        packed = gzip.compress(bytes(body), 6)
-        if len(packed) >= len(body):
-            return response          # already dense - sending it would be a loss
-        response.body = packed
-        response.headers["content-encoding"] = "gzip"
-        response.headers["content-length"] = str(len(packed))
-        response.headers["vary"] = "Accept-Encoding"
-        return response
-    except Exception:
-        # A compression fault must never cost the caller its answer.
-        return response
-
+# Worse than useless: with that middleware installed, this station's audio
+# stalled. The tablet's musicPlayer sat at currentTime 77.26s against 28.8s
+# buffered, networkState 2, advancing 0.00s in three seconds - a Range
+# stream that never delivered. BaseHTTPMiddleware wraps the 206
+# StreamingResponse replies that /music and /media serve. Correlation, not
+# proof, but it was a live station and the change was returning no benefit
+# at all, so it came straight back out.
+#
+# If it is worth doing again, do it as PURE ASGI middleware (not
+# BaseHTTPMiddleware), keep the same content-type allow-list, and prove a
+# Range request still streams before leaving it in.
 
 OLLAMA_URL = os.getenv(
     "OLLAMA_URL",
@@ -1668,6 +1634,68 @@ def require_read_auth(authorization: str | None) -> None:
         require_auth(authorization)
 
 
+def validate_terminals(raw: Any) -> dict[str, Any]:
+    """#1161: what each LISTENING DEVICE does with the broadcast.
+
+    The station's own routes say where the show is SENT - box, a page,
+    both, off, the Nabu. That was never enough to answer "play it out loud
+    on the tablet while the desktop sits open and silent", because `here`
+    means *every* browser looking: open the app on the desk and it plays
+    too, at whatever volume that machine happens to remember.
+
+    So this is a row per device, held on the agent where every install can
+    see it - the same reasoning the Station drawer already states: "every
+    value lives on the agent, so all installs on the network share one
+    master configuration". A terminal reads its own row and obeys it, which
+    is what makes the levels settable from a different machine.
+
+        {"pinetab": {"name": "PineTab", "play": true,
+                     "music": 0.8, "voice": 1.0, "reply": 1.0}}
+
+    `play` is the out-loud switch; a device with play=false stays quiet
+    however the station is routed. The levels are that device's own, and
+    nobody else's.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, row in list(raw.items())[:16]:          # a household, not a fleet
+        name = str(key or "").strip().lower()[:40]
+        if not name or not re.fullmatch(r"[a-z0-9_.-]+", name):
+            continue
+        if not isinstance(row, dict):
+            continue
+        clean: dict[str, Any] = {
+            "name": str(row.get("name") or name).strip()[:60],
+            "play": bool(row.get("play", False)),
+            # How this device is recognised in the listener roster, which
+            # already records an addr per player. Presence is what lets the
+            # desktop take the air back when the tablet goes away, so it is
+            # the field the whole hand-over hangs on.
+            "addr": str(row.get("addr") or "").strip()[:60],
+            # An explicit ?listener= id, when the device sends one. Preferred
+            # over addr: DHCP moves an address, a chosen name does not.
+            "listener": str(row.get("listener") or "").strip()[:60],
+            # Is this the one that takes over when nothing else is playing?
+            "fallback": bool(row.get("fallback", False)),
+        }
+        for stream in ("music", "voice", "reply"):
+            try:
+                level = float(row.get(stream, 1.0))
+            except (TypeError, ValueError):
+                level = 1.0
+            if not math.isfinite(level):
+                level = 1.0
+            clean[stream] = max(0.0, min(1.0, level))
+        seen = row.get("at")
+        try:
+            clean["at"] = max(0, int(seen)) if seen is not None else 0
+        except (TypeError, ValueError):
+            clean["at"] = 0
+        out[name] = clean
+    return out
+
+
 def validate_settings(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Settings must be an object")
@@ -2338,6 +2366,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             data.get("gallery_paper_cap")
             or DEFAULT_SETTINGS["gallery_paper_cap"]))),
         "openwebui_logging": bool(data.get("openwebui_logging", True)),
+        # #1161: per-device audio. See validate_terminals.
+        "terminals": validate_terminals(data.get("terminals")),
         "wake": validate_wake(data.get("wake")),
         # #894/#832: gemma4 carries 131072; clamping the SETTING to
         # 32768 meant the operator could not give the writer more room
@@ -16856,6 +16886,21 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
         # definition and this is it: largest shortfall first, the sheet
         # as tiebreak, and a road the operator (or the orchestrator's
         # own judgment call) has said to DRIVE goes to the very front.
+        # #1181: THE DRIVE IS AN OVERRIDE, SO IT DOES NOT LAPSE ON AIR.
+        # The shortfall re-sort below is paused-only for the reason #1130
+        # gives - off air the clock is parked, so "nearest" is meaningless
+        # - and the driven road was carried along inside that guard. But
+        # "build this ahead of everything else until it is covered" is the
+        # operator overriding the running order, and an override that
+        # stops the moment the show starts is not an override. Hoisting is
+        # stable: it moves one road to the front and leaves every other
+        # road in the order it was already in.
+        try:
+            _driven = str(orch_policy("drive_road") or "")
+            if _driven and _driven != "none" and _driven in order:
+                order = [_driven] + [k for k in order if k != _driven]
+        except Exception:  # noqa: BLE001
+            pass
         if radio_paused():
             try:
                 _needs = hour_needs_now() or {}
@@ -33378,6 +33423,26 @@ CANNOT_PREPARE = {
              "guest's voice",
 }
 
+# #1181: ROADS THAT CANNOT BE STOCKED AHEAD, AND ARE NOT FAULTY FOR IT.
+#
+# These are preparable - they are not in CANNOT_PREPARE - but only inside
+# a narrow window before their entry, and they report themselves FULL the
+# rest of the time so the adaptive planner never picks work that would
+# only refuse itself. An empty shelf on one of these roads is the normal
+# resting state, not a shortage.
+#
+# This exists because the orchestrator was asking the operator to fix it.
+# "Should I build these ahead of everything else until they have stock?"
+# was raised about news, answered yes, applied, confirmed - and news went
+# on holding nothing, because one bulletin at a time is the rule (#925).
+# An instruction the station is built to refuse must not be offered as a
+# choice; the value here is the reason, said in the operator's terms.
+PREP_SHORT_HORIZON = {
+    "news": "a bulletin is written just before its entry and never "
+            "banked - one at a time, never a backlog - so this road "
+            "reads full the rest of the time (#925)",
+}
+
 
 def schedule_slots_now(store: dict[str, Any]) -> tuple[str, list]:
     """#963/#960: THE HOUR THAT IS ACTUALLY RUNNING, overrides and all.
@@ -34992,14 +35057,22 @@ def orch_scan() -> dict[str, Any]:
             empty = []
         if empty and not _orch_recent("road_empty", 21600.0):
             names = ", ".join(SHELF_LABEL.get(k, k) for k in empty[:4])
-            out = orch_raise(
-                "road_empty",
-                f"Nothing is ready on these roads: {names}. When the "
-                "running order reaches one of them it will be written "
-                "live, in front of the listener, or the entry will pass "
-                "with nothing in it.",
-                "soon",
-                [
+            # #1181: a short-horizon road being empty is its resting
+            # state, not a shortage - so it is reported as such and is
+            # never the subject of "build this ahead until it has stock",
+            # which it is built to refuse. See PREP_SHORT_HORIZON.
+            _buildable = [k for k in empty if k not in PREP_SHORT_HORIZON]
+            _normal = [k for k in empty if k in PREP_SHORT_HORIZON]
+            _why = (f"Nothing is ready on these roads: {names}. When the "
+                    "running order reaches one of them it will be written "
+                    "live, in front of the listener, or the entry will "
+                    "pass with nothing in it.")
+            if _normal:
+                _why += (" (" + "; ".join(
+                    f"{SHELF_LABEL.get(k, k)}: {PREP_SHORT_HORIZON[k]}"
+                    for k in _normal) + " - that one is not waiting on an "
+                    "answer.)")
+            _questions = [
                     {"ask": f"{names} have nothing ready. What should "
                             "happen when their entry comes round?",
                      "options": [
@@ -35010,16 +35083,26 @@ def orch_scan() -> dict[str, Any]:
                          _opt("Skip the entry and move on",
                               "skip:allow"),
                      ]},
+            ]
+            if _buildable:
+                # #1181: and it emits `drive`, the verb that actually
+                # orders the board. It used to emit `prefer`, which
+                # PROTECTS a road - so the question asked about building
+                # and the answer set a policy about keeping. "No" clears
+                # the pin rather than doing nothing, so the question that
+                # sets a standing drive is also the one that lifts it.
+                _questions.append(
                     {"ask": "Should I build these ahead of everything "
                             "else until they have stock?",
                      "options": [
                          _opt("Yes - empty roads first",
-                              "prefer:" + empty[0]),
+                              "drive:" + _buildable[0]),
                          _opt("No - keep the running order's order",
-                              "noop"),
+                              "drive:none"),
                          _opt("Only the ones the next hour wants",
                               "prefer:slot"),
-                     ]},
+                     ]})
+            _questions.append(
                     {"ask": "How deep should a road be stocked before I "
                             "move on to another?",
                      "options": [
@@ -35032,8 +35115,8 @@ def orch_scan() -> dict[str, Any]:
                          _opt("Fill it to eight", "stock:8"),
                          _opt("Four of each", "stock:4"),
                          _opt("Two of each, then move on", "stock:2"),
-                     ]},
-                ])
+                     ]})
+            out = orch_raise("road_empty", _why, "soon", _questions)
             return out
 
         # 4. NOTHING IS WRONG - but six hours is six hours.
@@ -36076,6 +36159,29 @@ def orch_routine_questions() -> list[dict[str, Any]]:
              _opt("Only what is owed", "stock:2"),
          ]},
     ]
+    # #1181: AND A STANDING PIN IS ALWAYS ANSWERABLE. `drive_road` is the
+    # strongest lever in the book - it moves one road to the front of the
+    # board ahead of the running order - and until #1178 it had no
+    # question attached, so one set at 19:44 was still pinning the board
+    # five hours later while the operator answered three other questions
+    # and watched none of them take. If a pin is standing, asking about it
+    # comes first; the six-hourly check keeps its random pair beneath.
+    try:
+        _pin = str(orch_policy("drive_road") or "")
+    except Exception:  # noqa: BLE001
+        _pin = ""
+    if _pin and _pin != "none":
+        _pinned = {"ask": f"{SHELF_LABEL.get(_pin, _pin)} is still being "
+                          "built ahead of everything else. Should it stay "
+                          "at the front?",
+                   "options": [
+                       _opt("No - back to the running order", "drive:none"),
+                       _opt("Yes - keep it at the front", "drive:" + _pin),
+                   ]}
+        try:
+            return [_pinned] + random.sample(bank, 2)
+        except Exception:  # noqa: BLE001
+            return [_pinned] + bank[:2]
     try:
         return random.sample(bank, 3)
     except Exception:  # noqa: BLE001
