@@ -98224,7 +98224,7 @@ def cupboard_view(cells: int = CUPBOARD_VIEW_CELLS) -> dict[str, Any]:
                 if not str(entry.get("script") or "").strip():
                     continue
                 state = cupboard_cell_state(road, entry)
-                aired = int(entry.get("aired") or 0)
+                aired = round_airings(row, entry)          # #1196
                 if aired and state == "ready":
                     state = "spent" if not row_unaired(row) and int(
                         entry.get("aired") or 0) >= SHELF_REUSE_MOST else "ready"
@@ -98299,6 +98299,21 @@ def cupboard_view(cells: int = CUPBOARD_VIEW_CELLS) -> dict[str, Any]:
     return out
 
 
+def round_airings(row: Any, entry: dict[str, Any] | None = None) -> int:
+    """#1196: how many times this cupboard round has been on the air.
+
+    On the OUTER row, not the entry. A larder round IS its own entry so
+    either read works there; a shelf round wraps its entry in a row and
+    the count lives on the wrapper - which is why the worn list reported
+    every nominated round as aired=0 and sorted "worst first" by nothing
+    at all."""
+    try:
+        got = int((row or {}).get("aired") or 0)
+        return got if got else int((entry or {}).get("aired") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def cupboard_worn(most: int = 40) -> dict[str, Any]:
     """#1196: banked rounds carrying a phrase the station has worn out.
 
@@ -98343,7 +98358,7 @@ def cupboard_worn(most: int = 40) -> dict[str, Any]:
                 "phrase": phrase,
                 "said_in_lines": said,
                 "phrases": len(hits),
-                "aired": int(entry.get("aired") or 0),
+                "aired": round_airings(row, entry),
                 "turns": script.count("\n") + 1,
                 "rhymed": bool(row_is_rhymed(kind, row)),
                 "head": script.strip().replace("\n", " / ")[:200],
@@ -100166,6 +100181,49 @@ async def api_orch_judgment(
     return {"ok": True, "said": said,
             "factor": coord_judgment_factor(road),
             "lesson": judgment_lesson(road)}
+
+
+@app.post("/api/orchestrator/notes")
+async def api_orch_note_write(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1197: write a standing order the WRITER will read.
+
+    `directive_record` puts the operator's own words into the policy
+    book, and `operator_lesson_clause` carries the newest per road into
+    every writing prompt - so this is the one channel that changes what
+    gets written rather than what gets kept. Until now it was reachable
+    only by SPEAKING to the station: `generate_answer` parsed a spoken
+    directive and nobody could type one. Same asymmetry #1178 removed
+    from the policy door.
+
+    `{"text": "...", "road": "news", "move": "more"}` - road and move are
+    optional; road="" is an order about the show as a whole, which the
+    host layer of every prompt carries."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400,
+                            detail="a standing order needs words")
+    road = str(payload.get("road") or "")
+    if road and road not in SHELF_LABEL and road not in PREP_BOARD:
+        raise HTTPException(
+            status_code=400,
+            detail="unknown road %r - leave it out for an order about the "
+                   "whole show" % road)
+    said = directive_record({"text": text, "road": road,
+                             "move": str(payload.get("move") or "")},
+                            source=str(payload.get("source") or "typed"))
+    return {"ok": True, "said": said, "road": road,
+            "standing": directive_notes(road=(road or None), limit=6),
+            "say": "written into the policy book; the next round of that "
+                   "road is written with it in the prompt"}
 
 
 @app.get("/api/orchestrator/notes")
