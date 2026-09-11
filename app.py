@@ -9102,8 +9102,24 @@ def page_wedge_state() -> dict[str, Any]:
             out["why"] = "nobody holds the air"
             return out
         seen = float((_LISTENER_SEEN.get(owner) or {}).get("at") or 0)
+        # #1208: A PAGE THAT HOLDS THE AIR AND ANSWERS NOBODY IS THE
+        # WEDGE, not a reason to say there isn't one. Measured live:
+        # 55 clips waiting, 32 stall reports, nothing heard for 139s -
+        # and this line answered "not wedged" because the page holding
+        # the exclusive had gone quiet, which gags every other player in
+        # the house. The cure is different (release before flush), so it
+        # is named rather than folded in.
         if now - seen > 30:
-            out["why"] = "the page that holds the air stopped polling"
+            out["gagged"] = True
+            if waiting >= PAGE_WEDGE_WAITING:
+                out["wedged"] = True
+                out["why"] = ("the page holding the air stopped polling "
+                              "%ds ago with %d clip(s) waiting - every "
+                              "other player in the house is gagged for it"
+                              % (int(now - seen), waiting))
+            else:
+                out["why"] = ("the page that holds the air stopped polling, "
+                              "but only %d clip(s) are waiting" % waiting)
             return out
         if waiting < PAGE_WEDGE_WAITING:
             out["why"] = "only %d clip(s) waiting" % waiting
@@ -25506,8 +25522,15 @@ def _ensure_chat_ids() -> None:
             _m["id"] = uuid.uuid4().hex[:6]
 
 
+# #1209: when THIS process started, in ms. It rides the state both pages
+# poll, and a page that sees it change knows the code it is running is no
+# longer the code on the box.
+_BUILD_MS = int(time.time() * 1000)
+
+
 def dj_state() -> dict[str, Any]:
     base = radio_state()
+    base["build"] = _BUILD_MS
     track = _RADIO.get("now") or {}
     elapsed = base.get("elapsed") or 0.0
     now = None
@@ -74650,6 +74673,109 @@ def concat_real_seconds(measured: float, beat: float) -> float:
     return max(0.25, measured - CONCAT_TAIL + CONCAT_KEEP + max(0.0, beat))
 
 
+# #1205: the mixer's own reading of "how much silence is on the end of
+# this". Named beside CONCAT_TAIL because that constant is the guess this
+# replaces, and the two must never drift apart again: this is the number
+# silenceremove is given in the graph below.
+SEG_TRIM_DB = -50.0
+SEG_TRIM_LOOK = 4.0                   # how far back to look for the tail
+_SEG_TRIM_CACHE: dict[str, float] = {}
+
+
+def _wav_tail_silence(path: str) -> float:
+    """How many seconds of silence sit on the END of a wav.
+
+    The same reading the mixer's silenceremove leg uses - RMS over 20 ms
+    windows against SEG_TRIM_DB - so the booth's arithmetic and the audio
+    cannot disagree. Walks backwards and stops at the first sound, so a
+    clip with a short tail costs a few dozen windows. Returns -1.0 when
+    the file cannot be read that way; the caller falls back."""
+    import array
+    import math as _math
+
+    with wave.open(str(path), "rb") as handle:
+        rate = handle.getframerate() or 24000
+        if handle.getsampwidth() != 2:
+            return -1.0
+        chans = handle.getnchannels() or 1
+        frames = handle.getnframes()
+        if frames <= 0:
+            return -1.0
+        look = min(frames, int(rate * SEG_TRIM_LOOK))
+        handle.setpos(frames - look)
+        raw = handle.readframes(look)
+    buf = array.array("h")
+    buf.frombytes(raw[:len(raw) - (len(raw) % 2)])
+    if chans > 1:
+        buf = buf[::chans]
+    if not buf:
+        return -1.0
+    step = max(1, int(rate * 0.02))
+    floor = 32768.0 * (10 ** (SEG_TRIM_DB / 20.0))
+    quiet, at = 0, len(buf)
+    while at - step >= 0:
+        window = buf[at - step:at]
+        total = 0
+        for sample in window:
+            total += sample * sample
+        if _math.sqrt(total / len(window)) > floor:
+            break
+        quiet += step
+        at -= step
+    return quiet / float(rate)
+
+
+def seg_tails_for(paths: list[str]) -> list[float]:
+    """#1205: the trailing silence of every segment of a round, in order.
+
+    Blocking on purpose - it reads files, so it is called through a
+    thread beside the concat that is already reading all of them. The
+    answer per file is a fact about that file's bytes, so it is memoed on
+    identity and mtime; a round replayed from the pantry pays nothing.
+
+    A file that is not a wav is answered from where it lives instead of
+    being measured: under voice_media it is a rendered take and really
+    does carry the welded BOX_TAIL_MS pad; anywhere else it came off the
+    sample shelf as it is and carries nothing. That second case is the
+    one the old constant got badly wrong."""
+    out: list[float] = []
+    for path in paths:
+        got = -1.0
+        try:
+            key = str(path)
+            stat = os.stat(key)
+            memo = "%s\x00%d\x00%d" % (key, stat.st_mtime_ns, stat.st_size)
+            if memo in _SEG_TRIM_CACHE:
+                got = _SEG_TRIM_CACHE[memo]
+            else:
+                if key.lower().endswith(".wav"):
+                    got = _wav_tail_silence(key)
+                if got < 0:
+                    got = (CONCAT_TAIL
+                           if key.startswith(str(VOICE_MEDIA_DIR))
+                           else 0.0)
+                if len(_SEG_TRIM_CACHE) > 800:
+                    _SEG_TRIM_CACHE.clear()
+                _SEG_TRIM_CACHE[memo] = got
+        except Exception:  # noqa: BLE001
+            got = -1.0
+        out.append(got)
+    return out
+
+
+def seg_real_seconds(measured: float, beat: float, tail: float) -> float:
+    """#1205: how long a segment ACTUALLY runs inside the welded round.
+
+    `tail` is what seg_tails_for read off the file. Below zero means it
+    could not be read at all, and then the old assumption stands - it is
+    wrong, but it is the wrong we had before and a round is not worth
+    dropping over it."""
+    if tail is None or tail < 0:
+        return concat_real_seconds(measured, beat)
+    return max(0.05, float(measured) - max(0.0, float(tail) - CONCAT_KEEP)
+               + max(0.0, float(beat)))
+
+
 def _call_concat_blocking(paths: list[str],
                           crackle: bool = False,
                           beats: list[float] | None = None) -> bytes | None:
@@ -76272,6 +76398,32 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # only thing that publishes "speaking_now", is never called.
                 # The clip's own timeline is the answer — each turn's measured
                 # length becomes a window, and the panel reads off the clock.
+                # #1205: ask this round's own segments what the mixer
+                # will take off the end of each of them, instead of
+                # assuming 0.9 for all of them - which is right for a
+                # rendered take, wrong for every sample, and wrong for
+                # the ring and the hang-up that anchor the arithmetic.
+                # One thread hop beside the concat that has already read
+                # all of these; the loop below then does arithmetic only.
+                # A single-segment round never goes through the mixer
+                # at all - it is handed over as it sits on disk, pad and
+                # all - so nothing is trimmed off it and its window is
+                # the whole file.
+                _welded = len(seg) >= 2
+                try:
+                    _seg_tails = (await asyncio.to_thread(seg_tails_for, seg)
+                                  if _welded else [])
+                except Exception:  # noqa: BLE001
+                    _seg_tails = []
+
+                def _tail_at(index: int) -> float:
+                    return (_seg_tails[index]
+                            if 0 <= index < len(_seg_tails) else -1.0)
+
+                def _beat_at(index: int) -> float:
+                    return (beats[index]
+                            if 0 <= index < len(beats) else 0.0)
+
                 rows = []
                 # #778: the turns do not start at zero when a ring opens the
                 # clip, and each one runs for its TRIMMED length plus the beat
@@ -76279,7 +76431,15 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # file on disk, which still had its 900 ms box tail on it.
                 # `seg` is [ring?] + one entry per aired turn + [hang-up?], so
                 # a turn's index in `beats` is its row plus the ring.
-                offset = ring_secs
+                # #1205: the ring is a SAMPLE, and it is trimmed and
+                # beaten into the stream like every other segment. Its
+                # length on disk is not where the first turn begins, and
+                # this number anchors the rescale below as well.
+                _ring_real = ring_secs
+                if ring_secs and _welded:
+                    _ring_real = seg_real_seconds(ring_secs, _beat_at(0),
+                                                  _tail_at(0))
+                offset = _ring_real
                 lead = 1 if ring_secs else 0
                 _est0 = time.time()
                 _entries: list[dict[str, Any]] = []
@@ -76368,10 +76528,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # coalesced clip.
                     _sx = (seg_ix[_row] if _row < len(seg_ix)
                            else _row + lead)
-                    _real = (concat_real_seconds(
-                                 secs, beats[_sx]
-                                 if _sx < len(beats) else 0.0)
-                             if mixed else max(0.4, secs))
+                    # #1205: measured, not assumed. The old road took
+                    # 0.9 off every segment because that is what a
+                    # rendered take carries - a sting off the shelf
+                    # carries nothing, and max(0.25, ...) then clamped
+                    # the negative result so the error was invisible.
+                    _real = (seg_real_seconds(secs, _beat_at(_sx),
+                                              _tail_at(_sx))
+                             if _welded else max(0.4, secs))
                     rows.append({"id": rid, "who": who, "kind": _kind,
                                  "text": chunk,
                                  # Only the first chunk of a turn owns its
@@ -76398,15 +76562,21 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # window to swallow them and pushed the marker later and later
                 # through a call. The residual this now corrects is the
                 # loudness pass, which is what the correction was always for.
-                _hang_real = (concat_real_seconds(hang_secs, 0.0)
-                              if hang_secs else 0.0)
-                _made = length - ring_secs - _hang_real
-                _ours = offset - ring_secs
+                # #1205: the hang-up is a generated wav with no welded
+                # pad either, and `length` carries the 900 ms the mixer
+                # glues onto the finished round - neither belongs in the
+                # span the turns are scaled to fit.
+                _hang_real = (seg_real_seconds(hang_secs, 0.0,
+                                               _tail_at(len(seg) - 1))
+                              if hang_secs and _welded else hang_secs)
+                _made = (length - _ring_real - _hang_real
+                         - (box_tail_seconds() if _welded else 0.0))
+                _ours = offset - _ring_real
                 if rows and _ours > 0.5 and _made > 0.5:
                     scale = _made / _ours
                     for r in rows:
-                        r["from"] = ring_secs + (r["from"] - ring_secs) * scale
-                        r["until"] = ring_secs + (r["until"] - ring_secs) * scale
+                        r["from"] = _ring_real + (r["from"] - _ring_real) * scale
+                        r["until"] = _ring_real + (r["until"] - _ring_real) * scale
                     # #830: page-routed bursts never get the box road's
                     # real correction — the estimate must at least agree
                     # with the SCALED timeline instead of the raw sums.
@@ -104492,6 +104662,168 @@ def _booth_row(line_id: str) -> dict[str, Any]:
     return airlog_row(want)     # #1023 (G1): the durable log after the ring
 
 
+# --- #1206: THE SAMPLER'S LEDGER ------------------------------------
+#
+# A pad is a moment the operator decided to keep. The station knows what
+# that moment was; the sampler only knows which button it landed on. So
+# the sampler says the line and the pad, and everything else is written
+# here, where the air log, the ring and the deck are all in reach.
+SAMPLER_GRABS_PATH = data_path("sampler_grabs.jsonl")
+SAMPLER_GRAB_KEEP = 90 * 86400.0      # a kept moment outlives the air log
+SAMPLER_GRAB_NEAR = 2                 # lines either side, for context
+
+
+def sampler_grab_row(line_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Everything the station knows about the line on this pad, now.
+
+    Blocking-free: the ring and the air-log index are both dicts in
+    memory. Anything missing is left empty rather than guessed - a pad
+    that cannot be traced should say so, not invent a provenance."""
+    row = _booth_row(line_id)
+    now = time.time()
+    air_at = float(row.get("air_at") or row.get("ts") or 0)
+    near: list[dict[str, Any]] = []
+    if air_at:
+        try:
+            with _AIRLOG_LOCK:
+                live = list(_AIRLOG_INDEX.values())
+        except Exception:  # noqa: BLE001
+            live = []
+        live = [r for r in live
+                if abs(float(r.get("air_at") or 0) - air_at) <= 90
+                and str(r.get("id") or "") != str(line_id)]
+        live.sort(key=lambda r: float(r.get("air_at") or 0))
+        before = [r for r in live if float(r.get("air_at") or 0) < air_at]
+        after = [r for r in live if float(r.get("air_at") or 0) >= air_at]
+        for r in (before[-SAMPLER_GRAB_NEAR:] + after[:SAMPLER_GRAB_NEAR]):
+            near.append({
+                "id": str(r.get("id") or ""),
+                "at": round(float(r.get("air_at") or 0), 3),
+                "gap": round(float(r.get("air_at") or 0) - air_at, 2),
+                "who": str(r.get("name") or r.get("who") or ""),
+                "turn": r.get("turn"),
+                "text": str(r.get("text") or "")[:180],
+            })
+    track = dict(_RADIO.get("now") or {})
+    try:
+        said = time.strftime("%Y-%m-%d %H:%M:%S",
+                             time.localtime(air_at)) if air_at else ""
+    except Exception:  # noqa: BLE001
+        said = ""
+    return {
+        "at": round(now, 3),
+        "kept_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+        # --- which pad
+        "bank": int(body.get("bank") or 0),
+        "pad": int(body.get("pad") or 0),
+        "label": str(body.get("label") or "")[:120],
+        # --- where it came from
+        "line": str(line_id or ""),
+        "who": str(row.get("who") or ""),
+        "name": str(row.get("name") or ""),
+        "kind": str(row.get("kind") or ""),
+        "round": str(row.get("round") or ""),
+        "caller": str(row.get("caller") or ""),
+        "voice": str(row.get("voice") or ""),
+        "engine": str(row.get("engine") or ""),
+        "source": str(row.get("source") or ""),
+        "text": " ".join(str(row.get("text") or "").split())[:600],
+        # --- where it sat in its script (#1201)
+        "sid": str(row.get("sid") or ""),
+        "turn": row.get("turn"),
+        "turns": row.get("turns"),
+        # --- the time step
+        "air_at": round(air_at, 3) if air_at else None,
+        "aired_at_local": said,
+        "aired": str(row.get("aired") or ""),
+        "ago_seconds": (round(now - air_at, 1) if air_at else None),
+        # --- the exact window inside the welded round (#908/#1205)
+        "clip_media": str(row.get("clip_media") or ""),
+        "clip_from": row.get("clip_from"),
+        "clip_until": row.get("clip_until"),
+        "clip_tail": row.get("clip_tail"),
+        "media": str(row.get("media") or ""),
+        "seconds": (round(float(body["seconds"]), 2)
+                    if str(body.get("seconds") or "").replace(".", "", 1)
+                    .isdigit() else row.get("seconds")),
+        # --- and what the cut road said about itself
+        "cut": str(body.get("cut") or "")[:200],
+        "exact": bool(body.get("exact")),
+        "source_kind": str(body.get("kind") or "")[:24],
+        # --- what else was going on
+        "under": {"title": str(track.get("title") or "")[:140],
+                  "id": str(track.get("id") or "")},
+        "near": near,
+        "traceable": bool(row),
+    }
+
+
+@app.post("/api/sampler/grab")
+async def sampler_grab_api(
+    body: dict[str, Any], authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1206: remember a moment that just went onto a pad."""
+    require_auth(authorization)
+    line = str(body.get("line") or body.get("srcId") or "").strip()
+    if not line:
+        raise HTTPException(status_code=400,
+                            detail="pass line=<the booth row's id>")
+    entry = sampler_grab_row(line, body if isinstance(body, dict) else {})
+
+    def write() -> None:
+        SAMPLER_GRABS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SAMPLER_GRABS_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        airlog_jsonl_trim(SAMPLER_GRABS_PATH, SAMPLER_GRAB_KEEP, "at")
+
+    await asyncio.to_thread(write)
+    return {"ok": True, "grab": entry,
+            "say": ("pad %d remembers %s from %s"
+                    % (int(entry["pad"]) + 1,
+                       (entry["name"] or entry["who"] or "the booth"),
+                       entry["aired_at_local"] or "an untraceable moment"))}
+
+
+@app.get("/api/sampler/grabs")
+async def sampler_grabs_api(
+    most: int = 60,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1206: the pads' provenance, newest first."""
+    require_read_auth(authorization)
+
+    def read() -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        try:
+            if not SAMPLER_GRABS_PATH.exists():
+                return out
+            with SAMPLER_GRABS_PATH.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        got = json.loads(line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if isinstance(got, dict):
+                        out.append(got)
+        except Exception:  # noqa: BLE001
+            return out
+        return out
+
+    rows = await asyncio.to_thread(read)
+    rows.sort(key=lambda r: -float(r.get("at") or 0))
+    kept = rows[:max(1, min(500, int(most)))]
+    lost = sum(1 for r in rows if not r.get("traceable"))
+    return {
+        "at": time.time(), "kept": len(rows), "rows": kept,
+        "untraceable": lost,
+        "say": ("%d moment(s) kept on pads"
+                % len(rows)) + (("; %d of them could not be traced back to "
+                                 "a line - they were grabbed before #1206 "
+                                 "or the row had already left the log"
+                                 % lost) if lost else ""),
+    }
+
+
 @app.get("/api/booth/clip")
 async def booth_clip_api(
     at: float = 0.0,
@@ -111541,6 +111873,307 @@ async def api_broadcast_unwedge(
     got = await page_wedge_clear(force=True)
     note_action("you asked the station to unstick the broadcast")
     return {**got, "health": (await api_broadcast_health(authorization))}
+
+
+# --- #1208: THE TROUBLESHOOTING STEPS -------------------------------
+#
+# Each is one thing, safe to press when nothing is wrong, and each says
+# what it DID rather than that it ran. The list is meant to grow: add a
+# row here and a handler below and the console shows it.
+BROADCAST_STEPS: list[dict[str, str]] = [
+    {"key": "look", "label": "Locate the problem",
+     "say": "Four checks - is the station making audio, is the page "
+            "taking it, is anything sounding, who holds the air. "
+            "Changes nothing.", "tone": "look"},
+    {"key": "flush", "label": "Drop what it is stuck on",
+     "say": "Advances the feed epoch so every page abandons the clip it "
+            "cannot start and takes the next one.", "tone": "do"},
+    {"key": "skip", "label": "Jump to the next line",
+     "say": "Drops ONLY the clip at the head of the queue and keeps "
+            "everything behind it.", "tone": "do"},
+    {"key": "release", "label": "Let every player sound",
+     "say": "Releases the exclusive. Heard in the wrong room beats not "
+            "heard at all (#738).", "tone": "do"},
+    {"key": "replay_last", "label": "Replay the last segment",
+     "say": "Puts the most recent round back on the air as a fresh "
+            "delivery.", "tone": "air"},
+    {"key": "replay_kind", "label": "Replay the last of that type",
+     "say": "The most recent round of the same road - a call, a bulletin, "
+            "the manager.", "tone": "air"},
+    {"key": "replay_hour", "label": "Go back the last hour",
+     "say": "Re-airs up to three rounds from the last hour, oldest "
+            "first, to refill a starved broadcast.", "tone": "air"},
+    {"key": "deep", "label": "Run the repair ladder",
+     "say": "The whole triage tree (#836) - engines, services, the box, "
+            "the wire. Slow.", "tone": "deep"},
+    {"key": "restart", "label": "Restart the station",
+     "say": "Last resort. The show stops for about twenty seconds and "
+            "every page reconnects to a clean feed.", "tone": "danger"},
+]
+
+
+def _broadcast_replayable(row: dict[str, Any]) -> dict[str, Any]:
+    """The welded round behind an aired row, ready to put back on the
+    feed - or {} when that audio is not ours to serve any more."""
+    key = str(row.get("clip_media") or "")
+    if not (key and MEDIA_KEY_SHAPE.match(key)):
+        return {}
+    if not (VOICE_MEDIA_DIR / key).is_file():
+        return {}
+    return {"key": key, "sig": str(row.get("clip_sig") or media_sign(key))}
+
+
+async def _broadcast_replay(rows: list[dict[str, Any]],
+                            pool: list[dict[str, Any]],
+                            said: list[str]) -> int:
+    """Put whole rounds back on the page feed, in order. Returns how
+    many went. Each round keeps its own per-turn windows so the booth's
+    marker follows the replay exactly as it followed the original.
+
+    `pool` is the air-log slice the caller already read - the turns of a
+    round are found in it rather than by scanning the log again on the
+    loop, which is the #826 trap."""
+    done = 0
+    seen: set[str] = set()
+    for row in rows:
+        got = _broadcast_replayable(row)
+        if not got or got["key"] in seen:
+            continue
+        seen.add(got["key"])
+        turns = [r for r in pool
+                 if str(r.get("clip_media") or "") == got["key"]]
+        turns.sort(key=lambda r: float(r.get("clip_from") or 0))
+        length = max([float(r.get("clip_until") or 0) for r in turns] + [0.0])
+        stream = {"length": length, "rows": [
+            {"id": str(r.get("id") or ""), "who": str(r.get("who") or ""),
+             "name": str(r.get("name") or ""),
+             "text": str(r.get("text") or "")[:400],
+             "from": float(r.get("clip_from") or 0),
+             "until": float(r.get("clip_until") or 0)} for r in turns]}
+        did = page_feed_append({
+            "url": "/media/%s?t=%s" % (got["key"], got["sig"]),
+            "text": ("\u21ba " + (str(row.get("round") or "a round"))
+                     + " - played again"),
+            "kind": "replay", "speech": True,
+            "seconds": length or None,
+            "stream": stream if turns else None,
+        })
+        if did:
+            done += 1
+            said.append("  put %s back on the air - %s, %d turn(s), %.0fs"
+                        % (got["key"][:8], row.get("round") or "a round",
+                           len(turns), length))
+        else:
+            said.append("  the feed refused %s" % got["key"][:8])
+    return done
+
+
+async def broadcast_step(step: str) -> dict[str, Any]:
+    """#1208: run one named troubleshooting step and say what it did."""
+    said: list[str] = []
+    state = page_wedge_state()
+    now = time.time()
+    changed = False
+
+    async def rows_back(seconds: float) -> tuple:
+        pool = await asyncio.to_thread(
+            airlog_rows, now - seconds, now + 60, None, None, None, True)
+        got = [r for r in pool if str(r.get("clip_media") or "")]
+        got.sort(key=lambda r: -float(r.get("air_at") or 0))
+        return got, pool
+
+    if step == "look":
+        said.append("$ locate")
+        said.append("station    on=%s paused=%s routed=%s"
+                    % (bool(_RADIO.get("on")), radio_paused(),
+                       _RADIO.get("voice_to") or "box"))
+        waiting = int(state.get("waiting") or 0)
+        said.append("page       %d clip(s) handed over and not started, "
+                    "%d stall/interrupt report(s)"
+                    % (waiting, int(state.get("stalls") or 0)))
+        heard = float(state.get("heard_at") or 0)
+        said.append("heard      %s"
+                    % (("%.0fs ago" % (now - heard)) if heard
+                       else "nobody has reported hearing anything"))
+        said.append("air        held by %s%s"
+                    % (state.get("owner") or "nobody",
+                       " (which has stopped polling)"
+                       if state.get("gagged") else ""))
+        oldest = sorted(
+            [r for r in _PAGE_DELIVERIES.values()
+             if str(r.get("state") or "") == "received"],
+            key=lambda r: float(r.get("at") or 0))
+        if oldest:
+            said.append("head       %s, handed over %.0fs ago"
+                        % (str(oldest[0].get("delivery_id") or "")[:10],
+                           now - float(oldest[0].get("at") or now)))
+        errs = [str(e.get("error") or "")
+                for e in list(_PAGE_ACK_EVENTS[-40:]) if e.get("error")]
+        for text in list(dict.fromkeys(errs))[-3:]:
+            said.append("error      " + text[:110])
+        said.append("")
+        said.append("verdict    " + str(state.get("why") or "nothing to say"))
+        if state.get("wedged"):
+            said.append("suggest    'Drop what it is stuck on', then "
+                        "'Jump to the next line' if it stays quiet")
+        elif waiting > 6:
+            said.append("suggest    the queue is deep but nothing has "
+                        "failed yet - give it a moment before pulling a "
+                        "lever")
+
+    elif step == "flush":
+        said.append("$ flush the page feed")
+        _RADIO["voice_cut_ms"] = int(now * 1000)
+        _PAGE_AIR_UNTIL[0] = 0.0
+        changed = True
+        said.append("  feed epoch advanced to %d" % _RADIO["voice_cut_ms"])
+        said.append("  every page drops what it banked before that moment")
+
+    elif step == "skip":
+        said.append("$ jump to the next line")
+        waiting = sorted(
+            [r for r in _PAGE_DELIVERIES.values()
+             if str(r.get("state") or "") in ("received", "published",
+                                              "error")],
+            key=lambda r: float((r.get("clip") or {}).get("ts") or 0))
+        if not waiting:
+            said.append("  nothing is waiting - there is no head to skip")
+        else:
+            head = waiting[0]
+            stamp = int((head.get("clip") or {}).get("ts") or 0)
+            _RADIO["voice_cut_ms"] = max(
+                int(_RADIO.get("voice_cut_ms") or 0), stamp)
+            head["state"] = "error"
+            changed = True
+            said.append("  head was %s, handed over %.0fs ago"
+                        % (str(head.get("delivery_id") or "")[:10],
+                           now - float(head.get("at") or now)))
+            said.append("  cut set to %d - that clip and anything older "
+                        "goes, the rest stands" % _RADIO["voice_cut_ms"])
+
+    elif step == "release":
+        said.append("$ release the exclusive")
+        was = str(state.get("owner") or "")
+        _AUDIO_OWNER.clear()
+        changed = True
+        said.append("  %s no longer holds the air"
+                    % (was or "nobody"))
+        said.append("  every player in the house may sound (#738)")
+
+    elif step in ("replay_last", "replay_kind", "replay_hour"):
+        said.append("$ " + step.replace("_", " "))
+        recent, pool = await rows_back(
+            3600.0 if step == "replay_hour" else 7200.0)
+        if not recent:
+            said.append("  nothing in the log carries audio we can replay")
+        elif step == "replay_last":
+            changed = bool(await _broadcast_replay(recent[:1], pool, said))
+        elif step == "replay_kind":
+            road = str(recent[0].get("round") or "")
+            said.append("  the last road on the air was '%s'" % road)
+            same = [r for r in recent[1:]
+                    if str(r.get("round") or "") == road]
+            if not same:
+                said.append("  nothing else of that road is in reach - "
+                            "replaying the last round instead")
+                same = recent[:1]
+            changed = bool(await _broadcast_replay(same[:1], pool, said))
+        else:
+            back = list(reversed(recent))[:3]
+            changed = bool(await _broadcast_replay(back, pool, said))
+        if changed:
+            said.append("  the page will start it at its next poll")
+
+    elif step == "deep":
+        said.append("$ repair ladder")
+        got = await _deep_repair("the operator asked from the wedge console")
+        changed = True
+        if got.get("busy"):
+            said.append("  the ladder is already running - watch the "
+                        "repair log")
+        for row in (got.get("steps") or [])[:14]:
+            said.append("  %-22s %s"
+                        % (str(row.get("name") or "")[:22],
+                           str(row.get("finding") or "")[:90]))
+        said.append("  verdict    " + str(got.get("verdict") or ""))
+
+    elif step == "restart":
+        said.append("$ restart the station")
+        said.append("  the show stops for about twenty seconds")
+        asyncio.create_task(broadcast_restart_task())
+        changed = True
+        said.append("  restart asked for - this page will reconnect on "
+                    "its own")
+
+    else:
+        raise HTTPException(status_code=400,
+                            detail="unknown step: " + str(step)[:40])
+
+    if changed:
+        note_action("wedge console: " + step)
+    after = page_wedge_state()
+    return {
+        "ok": True, "step": step, "changed": changed,
+        "lines": said,
+        "stuck": bool(after.get("wedged")),
+        "why": str(after.get("why") or ""),
+        "clips_waiting": int(after.get("waiting") or 0),
+    }
+
+
+async def broadcast_restart_task() -> None:
+    """#1208: the restart, off the request, so the transcript gets out
+    first. The same road /api/service/restart takes for this process -
+    exit, and docker's restart policy revives us."""
+    await asyncio.sleep(1.2)
+    os._exit(3)
+
+
+@app.get("/api/broadcast/console")
+async def broadcast_console_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1208: what is wrong, and every lever there is, with what it does."""
+    require_read_auth(authorization)
+    state = page_wedge_state()
+    now = time.time()
+    heard = float(state.get("heard_at") or 0)
+    tail = []
+    for row in list(_RADIO.get("pipeline") or [])[-40:]:
+        if str(row.get("kind") or "") in ("air", "repair", "drop", "action"):
+            tail.append("%s  %s"
+                        % (time.strftime("%H:%M:%S",
+                                         time.localtime(
+                                             float(row.get("ts") or 0) / 1000.0)),
+                           str(row.get("text") or "")[:150]))
+    return {
+        "at": now,
+        "stuck": bool(state.get("wedged")),
+        "why": str(state.get("why") or ""),
+        "clips_waiting": int(state.get("waiting") or 0),
+        "stalls": int(state.get("stalls") or 0),
+        "heard_seconds_ago": (round(now - heard, 1) if heard else None),
+        "owner": str(state.get("owner") or ""),
+        "gagged": bool(state.get("gagged")),
+        "on": bool(_RADIO.get("on")), "paused": radio_paused(),
+        "steps": BROADCAST_STEPS,
+        "log": tail[-14:],
+        "say": (("The broadcast is stuck: " + str(state.get("why") or ""))
+                if state.get("wedged") else
+                ("Nothing is reporting a wedge. %d clip(s) waiting, "
+                 "last heard %s."
+                 % (int(state.get("waiting") or 0),
+                    ("%.0fs ago" % (now - heard)) if heard else "never"))),
+    }
+
+
+@app.post("/api/broadcast/fix/{step}")
+async def broadcast_fix_api(
+    step: str, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1208: fire one troubleshooting step and hand back its transcript."""
+    require_auth(authorization)
+    return await broadcast_step(str(step or "")[:32])
 
 
 @app.get("/api/notifications")
@@ -136574,6 +137207,9 @@ const PINE_3JS = [
    frame: {shade: () => rapAssembly && rapAssembly.shade, card: null,
            close: () => rapAssemblyClose(),
            onResize: () => { if (rapAssembly && rapAssembly.resize) rapAssembly.resize(); }}},
+  {key: "wedge",    label: "⚠ Broadcast Fixer",  open: () => wedgeConsoleOpen(),
+   frame: {shade: () => wedgeConsole, close: () => wedgeConsoleClose(),
+           width: 720, height: 620}},
   {key: "sfxdesk",  label: "🔊 SFX Desk",        open: () => sfxDeskPanel(),
    frame: {shade: () => sfxDesk, close: () => sfxDeskClose(),
            width: 860, height: 640}},
@@ -156046,6 +156682,8 @@ function djRender(state) {
   /* #1203: ...and the card that says the broadcast is stuck, which is the
    * one thing every other surface reported as healthy. */
   try { wedgeToast(); } catch (e) { /* the panel still reads */ }
+  /* #1207: ...and the one that does not need the operator at all. */
+  try { djVoiceUnstick(); } catch (e) { /* the panel still reads */ }
   /* #1008: the overlap setting reaches the page on every poll now, not
    * only when the settings panel happens to be painted. */
   try {
@@ -156190,6 +156828,8 @@ async function pollDJ() {
   try {
     const state = await api("/api/dj");
     djStateAt = Date.now();             // when this truth arrived (#631)
+    /* #1209: is this panel still the box's own code? */
+    try { panelBuildWatch(state); } catch (e) { /* the panel still reads */ }
     djRender(state);
     if (typeof state.monitor !== "undefined"
         && djMonitorAir !== !!state.monitor) {
@@ -157443,6 +158083,45 @@ let djVoicePollLive = 0;                 // #1146: one poll in flight
                                          // (timestamp: a hung fetch may
                                          // block the feed 20s, not forever)
 let djVoiceTimer = null;                 // #1147: ONE deduped hold timer
+/* #1207: no clip is immortal. A round holds the head of the queue for
+   this many tries so its turns cannot air out of order, and is then let
+   go - a hole reads better than a dead station. GIVE_UP is the far
+   backstop for a clip whose air moment is simply gone. */
+const VOICE_HEAD_TRIES = 6;
+const VOICE_GIVE_UP_MS = 120000;
+let djVoiceBusyUntil = 0;               // #1207: when the slot must be free
+
+/* #1207: THE WATCHDOG. Busy past the point where the clip it holds could
+   still be sounding, and nothing sounding - the player is stuck, and the
+   reason does not matter. Tear the slot down and take the next clip. */
+function djVoiceUnstick() {
+  if (!djVoiceBusy || !djVoiceBusyUntil) return false;
+  if (Date.now() < djVoiceBusyUntil) return false;
+  const sounding = (djVoiceEls || []).some(
+    (a) => a && a.src && !a.paused && Number(a.currentTime || 0) > 0);
+  if (sounding) { djVoiceBusyUntil = Date.now() + 20000; return false; }
+  djVoiceEpoch += 1;                    /* orphan every armed closure */
+  (djVoiceEls || []).forEach((a) => {
+    if (a) { try { a.pause(); a.removeAttribute("src"); a.load(); } catch (e) {} }
+  });
+  if (djVoiceNow) {
+    try {
+      djVoiceAck(djVoiceNow, "error", null,
+                 "the page was stuck on this clip - abandoned so the "
+                 + "broadcast continues (#1207)");
+    } catch (e) { /* the unstick matters more than the receipt */ }
+  }
+  djVoiceBusy = false;
+  djVoiceLive = 0;
+  djVoiceNow = null;
+  djStreamNow = null;
+  djStreamLiveId = "";
+  djVoiceBusyUntil = 0;
+  try { djApplyGain(); } catch (e) {}
+  setTimeout(djVoiceNext, 40);
+  return true;
+}
+
 let djVoiceCut = 0;                      // #1147: server feed epoch - clips
                                          // older than this are history
 /* #1147 review: the PLAYER epoch. A cut flush (or FM-off) silences the
@@ -157762,6 +158441,37 @@ function djTalkKey(text) {
     .replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
+/* #1210: THE PANEL TAKES THE SMALL ROAD TOO.
+ *
+ * Measured on this box, the same clip both ways:
+ *     raw wav  1,002,108 bytes  7.87s  127 KB/s
+ *     br=96      251,468 bytes  0.49s  512 KB/s
+ * and 41.5s for one clip on the tablet's wire, which is why the booth
+ * went silent while the music played on. #999 built this road for the
+ * listener page and the panel - the screen the operator listens on - was
+ * left pulling uncompressed PCM.
+ *
+ * 0 means the original. Per browser, because it is a property of the
+ * WIRE, not of the station. */
+let djVoiceRate = 96;
+try {
+  /* Number(null) is ZERO, not NaN - reading an absent key straight into
+   * Number() set the rate to 0 (the original) on every fresh browser and
+   * made this whole road a no-op. Measured that way once; never again. */
+  const _kept = localStorage.getItem("pineVoiceRate");
+  if (_kept !== null && _kept !== "") {
+    const _n = Number(_kept);
+    if (Number.isFinite(_n) && _n >= 0) djVoiceRate = _n;
+  }
+} catch (e) { /* private browsing - the default stands */ }
+
+function djClipUrl(url) {
+  const u = String(url || "");
+  if (!u || !djVoiceRate) return u;
+  if (u.indexOf("br=") >= 0) return u;
+  return u + (u.indexOf("?") >= 0 ? "&" : "?") + "br=" + djVoiceRate;
+}
+
 function djVoiceEl(slot) {
   if (!djVoiceEls[slot]) {
     const a = document.createElement("audio");
@@ -157808,10 +158518,16 @@ function djVoiceNext() {
   while (clip) {
     const lateNow = (Date.now() - Number(clip.broadcastAt || Date.now())) / 1000;
     const streamLen = clip.stream ? Number(clip.stream.length || 0) : 0;
-    const hopeless = !clip.keepWhole && (
-      (streamLen > 0 && lateNow >= streamLen)
-      || (clip.sting && lateNow > 3)
-      || (!clip.stream && !clip.sting && lateNow > 15));
+    /* #1207: a round is no longer exempt from dying of old age. It is
+     * given far longer than anything else - its own length plus two
+     * minutes - because holding a conversation together is worth waiting
+     * for; it is not worth waiting forever for. */
+    const hopeless = (clip.keepWhole
+      ? lateNow > 120 + streamLen
+      : ((streamLen > 0 && lateNow >= streamLen)
+         || (clip.sting && lateNow > 3)
+         || (!clip.stream && !clip.sting && lateNow > 15)))
+      || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= djVoiceCut);
     if (!hopeless) break;
     djVoiceAck(clip, "error", null, "clip became stale before playback");
     djVoiceQueue.shift();
@@ -157847,6 +158563,10 @@ function djVoiceNext() {
   } catch (e) { /* the clip still plays */ }
   djVoiceSlot = 1 - djVoiceSlot;
   djVoiceBusy = true;
+  /* #1207: the moment after which holding this slot is not playing a
+   * clip, it is being stuck on one. */
+  djVoiceBusyUntil = Date.now() + Math.max(20000,
+    Number((clip.stream || {}).length || clip.seconds || 15) * 1000 + 25000);
 
   let handed = false;
   let started = false;
@@ -157895,6 +158615,20 @@ function djVoiceNext() {
      * tries at the head, then the round moves on without it: a hole
      * reads better than a scramble. Single lines keep the old
      * behind-ready-work behaviour, where order matters less than flow. */
+    /* #1207: the three ways a clip has run out of road - too many tries
+     * at the head, the operator flushed the feed under it, or its air
+     * moment is two minutes gone. Any of them and the round moves on. */
+    const spent = clip.retry >= VOICE_HEAD_TRIES
+      || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= djVoiceCut)
+      || Date.now() - Number(clip.broadcastAt || 0) > VOICE_GIVE_UP_MS;
+    if (spent) {
+      djVoiceAck(clip, "error", null,
+                 "abandoned after " + clip.retry + " tries - the "
+                 + "broadcast moves on (#1207)");
+      setTimeout(djVoiceNext, 120);
+      djTalkMarkLive();
+      return;
+    }
     if (clip.stream || clip.keepWhole) {
       if (clip.keepWhole || clip.retry <= 4) {
         /* Head NOW, synchronously - during the old timer-armed backoff
@@ -158033,7 +158767,10 @@ function djVoiceNext() {
   // own pace — so the booth was showing text that had not been said yet.
   // What is sounding out of this element is the only honest answer, and it
   // is right here.
-  player.src = clip.url;
+  /* #1210: the small copy when this browser wants one. media_sign()
+   * HMACs the KEY only and the route reads no query parameter but `t`,
+   * so &br= can neither alter nor invalidate the signature. */
+  player.src = djClipUrl(clip.url);
   player.play().catch((e) => {
     djVoiceAck(clip, "error", player, e);
     // Autoplay blocked (no user gesture yet) — surface a one-tap unlock so
@@ -158116,7 +158853,13 @@ async function djVoicePoll(immediate) {
   if (djVoicePollLive && Date.now() - djVoicePollLive < 20000) return;
   djVoicePollLive = Date.now();
   try {
-    const data = await api("/api/dj/voice?since=" + djVoiceSeen);
+    /* #1210: naming the rate HERE is what keeps the encode off the hot
+     * path - this is the moment the server learns the clip exists, and
+     * its broadcast instant is a lead away, so the derivative is written
+     * before anything asks for it (#999). A miss costs bytes, never
+     * delay: the route serves the original and encodes for next time. */
+    const data = await api("/api/dj/voice?since=" + djVoiceSeen
+                           + (djVoiceRate ? "&br=" + djVoiceRate : ""));
     const clips = data.clips || [];
     const serverMs = Number(data.server_ms || Date.now());
     djVoiceRetime(data.reservation_updates, serverMs);
@@ -171425,6 +172168,11 @@ async function wedgeToast() {
   let got;
   try { got = await api("/api/broadcast/health"); }
   catch (e) { return; }
+  /* #1208: the ICON is not snoozeable - it is the notification, and a
+   * stuck broadcast must stay visible until it is not stuck. The card
+   * below is the interruption, and that one the operator may dismiss. */
+  try { wedgeIcon(!!(got && got.stuck), Number((got || {}).clips_waiting || 0)); }
+  catch (e) { /* the card still works */ }
   if (!got || !got.stuck || Date.now() < wedgeSnooze) { wedgeCardHide(); return; }
   if (wedgeCard) return;                       /* already up */
 
@@ -171455,6 +172203,12 @@ async function wedgeToast() {
 
   const foot = el("div", "", "");
   foot.style.cssText = "display:flex;gap:7px;align-items:center";
+  /* #1208: and a way into the console from the card, because "unstick
+   * it now" is one cure and the operator asked for a shelf of them. */
+  const more = el("button", "", "Troubleshoot…");
+  more.style.cssText = "padding:7px 10px;border-radius:7px;cursor:pointer;"
+    + "background:#241a12;color:#ffce9e;border:1px solid #5a3a22;font-size:11.5px";
+  more.onclick = () => { wedgeCardHide(); wedgeConsoleOpen(); };
   const go = el("button", "", "Unstick it now");
   go.style.cssText = "flex:1;padding:7px;border-radius:7px;border:none;"
     + "font-weight:700;font-size:11.5px;cursor:pointer;background:" + tone
@@ -171471,6 +172225,7 @@ async function wedgeToast() {
     }
   };
   foot.appendChild(go);
+  foot.appendChild(more);
   const later = el("button", "", "Later");
   later.style.cssText = "padding:7px 10px;border-radius:7px;cursor:pointer;"
     + "background:#1b222d;color:#cfe0f0;border:1px solid #2a3a52;font-size:11.5px";
@@ -171480,6 +172235,199 @@ async function wedgeToast() {
 
   document.body.appendChild(card);
   wedgeCard = card;
+}
+
+
+/* --- #1208: the wedge icon and the troubleshooting console --------------
+   "a notification icon... showing a wedge icon. And then when I tap on
+    it, it shows... options that I can press that will basically fire off
+    commands and show a small terminal output of what's going on."
+
+   The icon appears only while the broadcast is genuinely stuck. The
+   console is opened by the operator, never by itself. */
+let wedgeIconEl = null;
+let wedgeConsole = null;
+let wedgeLines = [];
+let wedgeSteps = [];
+let wedgeBusy = false;
+
+function wedgeConsoleClose() {
+  if (!wedgeConsole) return;
+  try { wedgeConsole.remove(); } catch (e) {}
+  wedgeConsole = null;
+}
+
+function wedgeTermPaint() {
+  if (!wedgeConsole) return;
+  const term = wedgeConsole.querySelector(".pb-wedge-term");
+  if (!term) return;
+  term.textContent = wedgeLines.length
+    ? wedgeLines.join("\n")
+    : "Nothing run yet. Start with “Locate the problem” - it changes nothing.";
+  term.scrollTop = term.scrollHeight;
+}
+
+async function wedgeRun(step, button) {
+  if (wedgeBusy) return;
+  wedgeBusy = true;
+  const was = button ? button.textContent : "";
+  if (button) { button.disabled = true; button.textContent = "working…"; }
+  wedgeLines.push("");
+  wedgeTermPaint();
+  try {
+    const got = await api("/api/broadcast/fix/" + encodeURIComponent(step),
+                          {method: "POST"});
+    (got.lines || []).forEach((line) => wedgeLines.push(String(line)));
+    wedgeLines.push(got.stuck
+      ? "… still stuck: " + String(got.why || "")
+      : "… the broadcast is not reporting a wedge now"
+        + (got.clips_waiting ? " (" + got.clips_waiting + " clip(s) waiting)" : ""));
+  } catch (e) {
+    wedgeLines.push("$ " + step);
+    wedgeLines.push("  the station would not answer: " + (e.message || e));
+  } finally {
+    if (wedgeLines.length > 400) wedgeLines = wedgeLines.slice(-400);
+    wedgeTermPaint();
+    wedgeBusy = false;
+    if (button) { button.disabled = false; button.textContent = was; }
+  }
+}
+
+async function wedgeConsoleOpen() {
+  if (wedgeConsole) { wedgeConsoleClose(); return; }
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:360;display:flex;"
+    + "align-items:center;justify-content:center;background:rgba(2,4,9,.82)";
+  shade.onclick = (ev) => { if (ev.target === shade) wedgeConsoleClose(); };
+  const box = el("div", "", "");
+  box.style.cssText = "width:min(720px,95vw);max-height:88vh;display:flex;"
+    + "flex-direction:column;background:#080b11;border:1px solid #3a2a1e;"
+    + "border-radius:13px;box-shadow:0 26px 90px rgba(0,0,0,.75);overflow:hidden";
+
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:10px;"
+    + "padding:11px 15px;border-bottom:1px solid #2a1f18;background:#0d1017";
+  const mark = el("span", "", "⚠");
+  mark.style.cssText = "font-size:17px;color:#ff9d4d";
+  head.appendChild(mark);
+  const title = el("b", "", "Broadcast troubleshooting");
+  title.style.cssText = "font-size:13px";
+  head.appendChild(title);
+  const say = el("span", "muted", "reading the station…");
+  say.style.cssText = "flex:1;font-size:11px;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  head.appendChild(say);
+  const shut = el("button", "", "✕");
+  shut.style.cssText = "background:#16202e;color:#cfe0f0;border:1px solid #2a3a52;"
+    + "border-radius:6px;padding:3px 9px;cursor:pointer";
+  shut.onclick = wedgeConsoleClose;
+  head.appendChild(shut);
+  box.appendChild(head);
+
+  const steps = el("div", "", "");
+  steps.style.cssText = "padding:10px 12px;display:grid;gap:7px;"
+    + "grid-template-columns:repeat(auto-fill,minmax(210px,1fr));"
+    + "max-height:38vh;overflow:auto";
+  box.appendChild(steps);
+
+  const term = el("pre", "pb-wedge-term", "");
+  term.style.cssText = "flex:1;min-height:150px;margin:0;padding:11px 13px;"
+    + "background:#04060a;border-top:1px solid #1b2735;color:#9fe6b0;"
+    + "font:11.5px/1.55 ui-monospace,Menlo,Consolas,monospace;"
+    + "white-space:pre-wrap;overflow:auto";
+  box.appendChild(term);
+
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+  wedgeConsole = shade;
+  wedgeTermPaint();
+
+  const TONE = {look: "#7fb8ff", do: "#ffc46b", air: "#8fe6a8",
+                deep: "#c9a8ff", danger: "#ff8080"};
+
+  function paintSteps() {
+    steps.innerHTML = "";
+    wedgeSteps.forEach((row) => {
+      const tone = TONE[row.tone] || "#cfe0f0";
+      const card = el("button", "", "");
+      card.style.cssText = "text-align:left;padding:9px 11px;cursor:pointer;"
+        + "border-radius:9px;background:#101722;border:1px solid " + tone + "44;"
+        + "border-left:3px solid " + tone + ";color:#dce8f5";
+      const name = el("div", "", String(row.label || row.key));
+      name.style.cssText = "font-weight:700;font-size:12px;color:" + tone;
+      card.appendChild(name);
+      const what = el("div", "", String(row.say || ""));
+      what.style.cssText = "font-size:10.5px;line-height:1.45;opacity:.78;"
+        + "margin-top:3px";
+      card.appendChild(what);
+      card.onclick = () => wedgeRun(String(row.key), name);
+      steps.appendChild(card);
+    });
+  }
+
+  try {
+    const got = await api("/api/broadcast/console");
+    wedgeSteps = got.steps || [];
+    say.textContent = String(got.say || "");
+    paintSteps();
+    if (!wedgeLines.length && (got.log || []).length) {
+      wedgeLines.push("$ the station's own log");
+      (got.log || []).forEach((line) => wedgeLines.push("  " + String(line)));
+      wedgeTermPaint();
+    }
+  } catch (e) {
+    say.textContent = "the station would not answer: " + (e.message || e);
+  }
+}
+
+/* The icon itself. Pinned bottom-left so it cannot sit under the
+   orchestrator's toast (bottom-right), and only while it is true. */
+function wedgeIcon(stuck, waiting) {
+  if (!stuck) {
+    if (wedgeIconEl) { try { wedgeIconEl.remove(); } catch (e) {} wedgeIconEl = null; }
+    return;
+  }
+  if (!wedgeIconEl) {
+    const dot = el("div", "", "");
+    dot.title = "The broadcast is stuck - tap for troubleshooting";
+    dot.style.cssText = "position:fixed;left:18px;bottom:18px;z-index:200;"
+      + "width:56px;height:56px;border-radius:50%;cursor:pointer;"
+      + "display:flex;flex-direction:column;align-items:center;"
+      + "justify-content:center;gap:1px;background:#2a1408;"
+      + "border:2px solid #ff7a3c;color:#ffb37a;"
+      + "box-shadow:0 0 26px rgba(255,122,60,.45)";
+    const glyph = el("span", "", "⚠");
+    glyph.style.cssText = "font-size:19px;line-height:1";
+    dot.appendChild(glyph);
+    const count = el("span", "pb-wedge-count", "");
+    count.style.cssText = "font-size:9.5px;font-weight:700;line-height:1";
+    dot.appendChild(count);
+    dot.animate([{opacity: 1}, {opacity: .45}, {opacity: 1}],
+                {duration: 1600, iterations: Infinity});
+    dot.onclick = wedgeConsoleOpen;
+    document.body.appendChild(dot);
+    wedgeIconEl = dot;
+  }
+  const count = wedgeIconEl.querySelector(".pb-wedge-count");
+  if (count) count.textContent = waiting ? String(waiting) + " held" : "stuck";
+}
+
+
+/* #1209: see the note on the listener page - the panel has exactly the
+   same problem and the same cure, read off the poll it already runs. */
+let panelBuildSeen = 0;
+const panelBuildUp = Date.now();
+let panelBuildGoing = false;
+
+function panelBuildWatch(state) {
+  const build = Number((state || {}).build || 0);
+  if (!build) return;
+  if (!panelBuildSeen) { panelBuildSeen = build; return; }
+  if (build === panelBuildSeen || panelBuildGoing) return;
+  if (Date.now() - panelBuildUp < 60000) { panelBuildSeen = build; return; }
+  panelBuildGoing = true;
+  setTimeout(() => { try { location.reload(); } catch (e) {} },
+             1500 + Math.floor(Math.random() * 6000));
 }
 
 async function orchToast() {
@@ -185127,7 +186075,31 @@ function clock(s) {
 // The whole point of a station: everyone is at the same second of the same
 // track. The server owns the clock, so a joining listener seeks to it and
 // anyone who drifts gets nudged back.
+
+/* #1209: the code on the glass follows the code on the box. The stamp is
+   this station process's start time; when it changes, this page is
+   running a player the box has already replaced. Reload - but only once
+   a stamp has been seen, only after a minute up, and after a short
+   random wait so a houseful of tablets does not stampede. */
+let pineBuildSeen = 0;
+const pineBuildUp = Date.now();
+let pineBuildGoing = false;
+
+function pineBuildWatch(state) {
+  const build = Number((state || {}).build || 0);
+  if (!build) return;
+  if (!pineBuildSeen) { pineBuildSeen = build; return; }
+  if (build === pineBuildSeen || pineBuildGoing) return;
+  if (Date.now() - pineBuildUp < 60000) { pineBuildSeen = build; return; }
+  pineBuildGoing = true;
+  setTimeout(() => { try { location.reload(); } catch (e) {} },
+             1500 + Math.floor(Math.random() * 6000));
+}
+
 function sync(state) {
+  /* #1209: first thing, before anything on this page is painted by a
+   * build that may no longer exist. */
+  try { pineBuildWatch(state); } catch (e) { /* the page still paints */ }
   const now = state.now || {};
   document.getElementById("dot").className = "dot" + (state.on ? " live" : "");
   document.getElementById("title").textContent =
@@ -185383,6 +186355,43 @@ function patter(state) {
  * with the same `since`; their overlapping answers doubled and reordered
  * the queue, which is dialogue playing out of sequence. */
 let pollLive = 0;    // timestamp: a hung fetch stalls 20s, not forever
+/* #1207: see the panel player - the same three faults, the same cure.
+   A round holds the head for this many tries and is then let go. */
+const VOICE_HEAD_TRIES = 6;
+const VOICE_GIVE_UP_MS = 120000;
+let voiceBusyUntil = 0;
+
+/* #1207: THE WATCHDOG. Busy past the point where the clip it holds could
+   still be sounding, and nothing sounding - unstick it, whatever the
+   reason was. This is what "the broadcast continues no matter what"
+   actually costs: one comparison on a poll that already runs. */
+function voiceUnstick() {
+  if (!voiceBusy || !voiceBusyUntil) return false;
+  if (Date.now() < voiceBusyUntil) return false;
+  if (voice && voice.src && !voice.paused
+      && Number(voice.currentTime || 0) > 0) {
+    voiceBusyUntil = Date.now() + 20000;
+    return false;
+  }
+  voiceEpoch += 1;
+  try { voice.pause(); voice.removeAttribute("src"); voice.load(); } catch (e) {}
+  if (voiceCurrentClip) {
+    try {
+      voiceAck(voiceCurrentClip, "error",
+               "the page was stuck on this clip - abandoned so the "
+               + "broadcast continues (#1207)");
+      voiceRelease(voiceCurrentClip.url);
+    } catch (e) { /* the unstick matters more than the receipt */ }
+  }
+  voiceBusy = false;
+  voiceNowTs = 0;
+  voiceCurrentClip = null;
+  voiceBusyUntil = 0;
+  if (ducking) { ducking = false; applyLevels(); }
+  setTimeout(voiceNext, 40);
+  return true;
+}
+
 let voiceCut = 0;    // #1147: server feed epoch - older clips are history
 let voiceNowTs = 0;  // #1147: ts of the clip sounding right now (0 = none)
 let stationPaused = false;   // #1147: mirrors the clock's paused flag
@@ -185432,6 +186441,8 @@ async function pollOnce() {
   try {
     // #1000: lean=1 - the nine keys this page actually reads, and the
     // tail of the chat ring rather than all 240 rows of it.
+    /* #1207: before anything else - is the player stuck? */
+    try { voiceUnstick(); } catch (error) { /* the poll still runs */ }
     const state = await api("/api/dj?lean=1&listener=" + ME);
     stateAt = Date.now();
     sync(state);
@@ -185589,10 +186600,13 @@ function voiceNext() {
   while (clip) {
     const lateNow = (Date.now() - Number(clip.broadcastAt || Date.now())) / 1000;
     const streamLen = clip.stream ? Number(clip.stream.length || 0) : 0;
-    const hopeless = !clip.keepWhole && (
-      (streamLen > 0 && lateNow >= streamLen)
-      || (clip.sting && lateNow > 3)
-      || (!clip.stream && !clip.sting && lateNow > 15));
+    /* #1207: a round may die of old age too - generously, but it may. */
+    const hopeless = (clip.keepWhole
+      ? lateNow > 120 + streamLen
+      : ((streamLen > 0 && lateNow >= streamLen)
+         || (clip.sting && lateNow > 3)
+         || (!clip.stream && !clip.sting && lateNow > 15)))
+      || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= voiceCut);
     if (!hopeless) break;
     voiceAck(clip, "error", new Error("clip became stale before playback"));
     voiceQueue.shift();
@@ -185624,6 +186638,10 @@ function voiceNext() {
   }
   voiceQueue.shift();
   voiceBusy = true;
+  /* #1207: past this moment, holding the slot is being stuck, not
+   * playing. The watchdog reads it on the 3s poll. */
+  voiceBusyUntil = Date.now() + Math.max(20000,
+    Number((clip.stream || {}).length || clip.seconds || 15) * 1000 + 25000);
   voiceCurrentClip = clip;
   voiceNowTs = Number(clip.ts || 0);     // #1147: for the cut flush
   // Duck the music under the DJ, exactly like a real one talking over it.
@@ -185669,7 +186687,18 @@ function voiceNext() {
     clip.retry = Math.min(8, Number(clip.retry || 0) + 1);
     clip.retryAt = Date.now() + Math.min(15000, 750 * (2 ** (clip.retry - 1)));
     try { voice.pause(); voice.removeAttribute("src"); voice.load(); } catch (e) {}
-    if (clip.keepWhole || clip.retry <= 4) voiceQueue.unshift(clip);
+    /* #1207: too many tries at the head, a flush under it, or an air
+     * moment two minutes gone - any of them and the show moves on. */
+    const spent = clip.retry >= VOICE_HEAD_TRIES
+      || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= voiceCut)
+      || Date.now() - Number(clip.broadcastAt || 0) > VOICE_GIVE_UP_MS;
+    if (!spent && (clip.keepWhole || clip.retry <= 4)) {
+      voiceQueue.unshift(clip);
+    } else {
+      voiceAck(clip, "error", "abandoned after " + clip.retry
+               + " tries - the broadcast moves on (#1207)");
+      voiceRelease(clip.url);
+    }
     finish();
   };
   const armProgressGuard = () => {
