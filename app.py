@@ -62810,6 +62810,58 @@ def repeat_window() -> float:
                min(REPEAT_WINDOW_MAX_HOURS, want)) * 3600.0
 
 
+# #1194: how many SEPARATE aired lines must already carry a phrase
+# before a new line carrying it is a habit rather than a coincidence.
+PHRASE_ACROSS_LINES = int(os.getenv("PINE_PHRASE_ACROSS_LINES", "12"))
+PHRASE_RUN_WORDS = 5
+# #1194: runs the station is SUPPOSED to repeat. A sign-off and the phone
+# opener are the show's furniture, not a habit - measured, "stay with pine
+# box fm" had 29 prints and blocking it would be the gate eating the
+# station's own name. Tuned against the ledger: at a threshold of 12 with
+# these spared, 16% of recent lines would be held for a rewrite, which
+# sits well under the 35% BLOCK_RATE_CAP the fuzzy legs share.
+PHRASE_BOILERPLATE = ("pine box", "the station", "request line",
+                      "line is ringing", "stay with")
+
+
+def _phrase_is_furniture(run: str) -> bool:
+    """#1194: is this run the show's own furniture rather than a habit?"""
+    return any(bit in run for bit in PHRASE_BOILERPLATE)
+_PHRASE_BOOK: dict[str, Any] = {"at": -1.0, "runs": {}}
+
+
+def _runs(text: str, span: int = PHRASE_RUN_WORDS) -> set[str]:
+    """#1194: the N-word runs of a line, for the phrase leg."""
+    words = _bin_key(text).split()
+    if len(words) < span:
+        return set()
+    return {" ".join(words[i:i + span])
+            for i in range(len(words) - span + 1)}
+
+
+def phrase_book(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """#1194: how many DIFFERENT aired lines carry each 5-word run.
+
+    Built off the same ledger the fuzzy leg walks and cached against its
+    length, because this is asked once per candidate line and the ledger
+    runs to thousands of rows. Adverts and station IDs are left out for
+    the reason #901 gives - they are meant to come round again."""
+    try:
+        stamp = float(len(rows))
+        if _PHRASE_BOOK["at"] == stamp:
+            return _PHRASE_BOOK["runs"]
+        book: dict[str, int] = {}
+        for row in rows:
+            if str(row.get("kind") or "") in ("station_id", "ad"):
+                continue
+            for run in _runs(str(row.get("key") or "")):
+                book[run] = book.get(run, 0) + 1
+        _PHRASE_BOOK.update({"at": stamp, "runs": book})
+        return book
+    except Exception:  # noqa: BLE001
+        return dict(_PHRASE_BOOK.get("runs") or {})
+
+
 def _shingles(text: str) -> set[str]:
     """The 4-word runs of a line. Two lines sharing most of their runs are
     the same line wearing different punctuation."""
@@ -63156,6 +63208,32 @@ def rerun_check(text: str, who: str = "", kind: str = "",
                                 "why": "contains a line already said, whole",
                                 "hit": str(row.get("key") or "")})
                 return _repeat_flow_verdict(text, who, kind, verdict, "exact and fuzzy", "phrase containment")
+    # #1194: THE PHRASE LEG. Both legs above compare WHOLE LINES, so a run
+    # of words the station says over and over inside lines that are each
+    # genuinely different scores far below either bar and goes straight
+    # through. Measured over six hours: "what you actually wanted us to"
+    # in fourteen separate lines, "is the part i cannot shake" in
+    # thirteen, and the pencil trick carried by 9 of the 68 banked banter
+    # rounds. Asking whether a PHRASE is a habit is a different question
+    # from whether a LINE is a repeat, and nothing was asking it.
+    try:
+        _runs_mine = _runs(text)
+        if _runs_mine:
+            _book = phrase_book(rows)
+            _worn = [(r, _book.get(r, 0)) for r in _runs_mine
+                     if _book.get(r, 0) >= PHRASE_ACROSS_LINES
+                     and not _phrase_is_furniture(r)]
+            if _worn:
+                _worst, _count = max(_worn, key=lambda p: p[1])
+                verdict.update({
+                    "block": True,
+                    "why": ("a phrase the station has already said in %d "
+                            "separate lines: “%s”" % (_count, _worst)),
+                    "hit": _worst})
+                return _repeat_flow_verdict(text, who, kind, verdict,
+                                            "exact and fuzzy", "worn phrase")
+    except Exception:  # noqa: BLE001
+        pass                            # a gate that cannot answer never blocks
     return _repeat_flow_verdict(text, who, kind, verdict, "exact and fuzzy")
 
 
@@ -98071,6 +98149,170 @@ async def api_glyphy(
     the coordinator and the rooms are carrying out."""
     require_read_auth(authorization)
     return glyphy_state()
+
+
+CUPBOARD_VIEW_CELLS = 60
+CUPBOARD_VIEW_REST = 12.0
+_CUPBOARD_VIEW_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def cupboard_cell_state(kind: str, entry: dict[str, Any]) -> str:
+    """#1195: which stage of the line this round has reached.
+
+    The same ladder cupboard_state() reads for the LCD, named once here so
+    the bubble view and the LCD cannot drift apart."""
+    try:
+        tint = entry.get("tint") or {}
+        cov = tint.get("coverage") or {}
+        if entry.get("tinting"):
+            return "tinting"
+        if entry.get("preparing"):
+            return "recording"
+        if dialogue_row_ready(kind, entry):
+            return "ready"
+        if tint.get("ok") and cov.get("met"):
+            return "tinted"
+        return "written"
+    except Exception:  # noqa: BLE001
+        return "written"
+
+
+def cupboard_view(cells: int = CUPBOARD_VIEW_CELLS) -> dict[str, Any]:
+    """#1195: the whole cupboard, one section per road. See the patch note."""
+    now = time.time()
+    memo = _CUPBOARD_VIEW_MEMO
+    if memo["value"] is not None and now - float(memo["at"] or 0) < CUPBOARD_VIEW_REST:
+        return memo["value"]
+    try:
+        needs = hour_needs_now() or {}
+    except Exception:  # noqa: BLE001
+        needs = {}
+    # What the running order has BOOKED for each road, off the same plan
+    # the director room draws.
+    booked: dict[str, list[dict[str, Any]]] = {}
+    try:
+        _s2 = globals().get("_system2")
+        _hours = (list(_s2().status().get("hours") or [])
+                  if _s2 and _s2() and _s2().enabled else [])
+        for plan in _hours[:4]:
+            for slot in list((plan or {}).get("slots") or []):
+                road = str(slot.get("kind") or "")
+                start = float(slot.get("start") or 0)
+                if not road or start <= 0:
+                    continue
+                booked.setdefault(road, []).append(
+                    {"at": start, "minutes": float(slot.get("minutes") or 0),
+                     "ahead": round(start - now, 1)})
+    except Exception:  # noqa: BLE001
+        booked = {}
+    roads = list(dict.fromkeys(
+        list(PREP_BOARD) + ["banter"] + list(needs.keys())))
+    sections: list[dict[str, Any]] = []
+    totals: dict[str, int] = {}
+    for road in roads:
+        try:
+            rows = list(road_source(road) or [])
+        except Exception:  # noqa: BLE001
+            rows = []
+        stages: dict[str, int] = {}
+        secs = 0.0
+        ready_n = 0
+        out_cells: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                entry = dialogue_entry(row) or {}
+                if not str(entry.get("script") or "").strip():
+                    continue
+                state = cupboard_cell_state(road, entry)
+                aired = int(entry.get("aired") or 0)
+                if aired and state == "ready":
+                    state = "spent" if not row_unaired(row) and int(
+                        entry.get("aired") or 0) >= SHELF_REUSE_MOST else "ready"
+                stages[state] = stages.get(state, 0) + 1
+                totals[state] = totals.get(state, 0) + 1
+                takes = _ready_round_takes(road, row) or []
+                one_s = sum(float(t.get("seconds") or 0) for t in takes)
+                secs += one_s
+                if state == "ready":
+                    ready_n += 1
+                if len(out_cells) < max(0, int(cells)):
+                    tint = entry.get("tint") or {}
+                    script = str(entry.get("script") or "")
+                    out_cells.append({
+                        "id": str(entry.get("sid") or entry.get("id") or "")[:40],
+                        "state": state,
+                        "turns": script.count("\n") + 1,
+                        "seconds": round(one_s, 1),
+                        "aired": aired,
+                        "made": int(entry.get("made") or 0),
+                        "chunks": int(entry.get("chunks") or 0),
+                        "grade": str(entry.get("grade") or ""),
+                        "tinted": bool(tint.get("ok")),
+                        "approved": bool((entry.get("review") or {}).get("approved")),
+                        "at": round(float(entry.get("at") or 0), 1),
+                        "head": script.strip().replace("\n", " / ")[:160],
+                    })
+            except Exception:  # noqa: BLE001
+                continue
+        row_need = needs.get(road) or {}
+        mine = sorted(booked.get(road) or [], key=lambda b: b["at"])
+        ahead = [b for b in mine if b["ahead"] > -60]
+        sections.append({
+            "road": road,
+            "label": SHELF_LABEL.get(road, road),
+            "rows": len(rows),
+            "ready": ready_n,
+            "seconds": round(secs, 1),
+            "stages": stages,
+            "owed": round(float(row_need.get("owed") or 0), 1),
+            "held": round(float(row_need.get("held") or 0), 1),
+            "uncovered": round(max(0.0, float(row_need.get("owed") or 0)
+                                   - float(row_need.get("held") or 0)), 1),
+            "booked": len(ahead),
+            "next_at": (ahead[0]["at"] if ahead else 0),
+            "next_in": (ahead[0]["ahead"] if ahead else None),
+            "reusable": road in SHELF_REUSABLE,
+            "rescue_open": road in RESCUE_ROADS_OPEN,
+            "cells_of": len(rows),
+            "cells": out_cells,
+        })
+    sections.sort(key=lambda sec: -float(sec.get("seconds") or 0))
+    out = {
+        "at": now,
+        "sections": sections,
+        "totals": totals,
+        "stock_seconds": round(sum(float(s_.get("seconds") or 0)
+                                   for s_ in sections), 1),
+        "rounds": sum(int(s_.get("rows") or 0) for s_ in sections),
+        "booked": sum(int(s_.get("booked") or 0) for s_ in sections),
+        "cells_capped_at": int(cells),
+        "say": ("%d round(s) on %d shelves, %d ready, about %d minute(s) of "
+                "finished audio, %d entr(y/ies) booked for them in the "
+                "coming hours"
+                % (sum(int(s_.get("rows") or 0) for s_ in sections),
+                   len([s_ for s_ in sections if s_.get("rows")]),
+                   sum(int(s_.get("ready") or 0) for s_ in sections),
+                   sum(float(s_.get("seconds") or 0) for s_ in sections) // 60,
+                   sum(int(s_.get("booked") or 0) for s_ in sections))),
+    }
+    memo.update({"at": now, "value": out})
+    return out
+
+
+@app.get("/api/cupboard/view")
+async def api_cupboard_view(
+    cells: int = CUPBOARD_VIEW_CELLS,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1195: the whole cupboard for the 🗄 Cupboard View - every shelf,
+    what is on it, what stage each round has reached, and what the running
+    order has booked for that road in the coming hours."""
+    require_read_auth(authorization)
+    # #1195: OFF THE EVENT LOOP. This walks every shelf on the station and
+    # measures each round's takes, which on the loop is the stall shape
+    # #1156 measured. The memo keeps a polling view cheap.
+    return await asyncio.to_thread(
+        cupboard_view, max(0, min(400, int(cells or 0))))
 
 
 @app.get("/api/cupboard")
@@ -135522,6 +135764,10 @@ const PINE_3JS = [
    frame: {shade: () => phoneView && phoneView.shade, card: null,
            close: () => phoneClose(),
            onResize: () => { if (phoneView && phoneView.resize) phoneView.resize(); }}},
+  {key: "cupboardview", label: "🗄 Cupboard View", open: () => cupboardPanel(),
+   frame: {shade: () => cupView && cupView.shade, card: null,
+           close: () => cupboardClose(),
+           onResize: () => { if (cupView && cupView.resize) cupView.resize(); }}},
   {key: "rapassembly", label: "🎛 RapAssembly",  open: () => rapAssemblyPanel(),
    frame: {shade: () => rapAssembly && rapAssembly.shade, card: null,
            close: () => rapAssemblyClose(),
@@ -173002,6 +173248,335 @@ function orchLogicClose() {
   try { orchLogic.stop(); } catch (e) {}
   try { orchLogic.host.remove(); } catch (e) {}
   orchLogic = null;
+}
+
+
+/* --- 🗄 Cupboard View (#1195): the shelves as bubbles --------------------
+   "a full breakdown of the cupboard, what is contained, what channels we
+   have and the conversations / moments we have booked... then i can go
+   into the cells of those bubbles and see the details".
+
+   A bubble per shelf: radius from its finished SECONDS, colour from the
+   share of it that is ready. Open one and its rounds orbit it as cells,
+   each lit by its own stage. The rail says the rest in words. */
+let cupView = null;
+
+function cupboardClose() {
+  if (!cupView) return;
+  try { cupView.stop = true; } catch (e) {}
+  try { clearInterval(cupView.timer); } catch (e) {}
+  try { cupView.renderer.dispose(); } catch (e) {}
+  try { cupView.shade.remove(); } catch (e) {}
+  cupView = null;
+}
+
+const CUP_STAGE_TONE = {
+  ready:     0x53d07a, tinted:   0x4ec9c9, recording: 0xe8b54f,
+  tinting:   0x9a7bd8, written:  0x6b7f99, spent:     0x44506a,
+};
+
+function cupLabel(text, sub) {
+  const c = document.createElement("canvas");
+  c.width = 512; c.height = 160;
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, 512, 160);
+  g.fillStyle = "#eaf2ff";
+  g.font = "600 46px system-ui,sans-serif";
+  g.textAlign = "center";
+  g.fillText(String(text || "").slice(0, 22), 256, 62);
+  if (sub) {
+    g.fillStyle = "#8fa6c0";
+    g.font = "400 30px system-ui,sans-serif";
+    g.fillText(String(sub).slice(0, 30), 256, 110);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+async function cupboardPanel() {
+  if (cupView) { cupboardClose(); return; }
+  /* #1195: one opening at a time. three.min.js is 600 kB, so a second
+     click while it loads used to append a second tag and race two opens
+     through the toggle above - the first would open and the second would
+     close it again. */
+  if (window.__cupOpening) return;
+  try { rapAssemblyClose(); } catch (e) {}
+  try { phoneClose(); } catch (e) {}
+  if (!window.THREE) {
+    window.__cupOpening = true;
+    const tag = document.createElement("script");
+    tag.src = "/vendor/three.min.js";
+    tag.onload = () => { window.__cupOpening = false; cupboardPanel(); };
+    tag.onerror = () => { window.__cupOpening = false;
+      setStatus("three.js did not load - the cupboard view needs it", true); };
+    document.head.appendChild(tag);
+    return;
+  }
+  let data = null;
+  try { data = await api("/api/cupboard/view"); }
+  catch (e) { setStatus("the cupboard did not answer: " + e.message, true); return; }
+
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:340;display:flex;"
+    + "background:rgba(2,4,9,.96)";
+  const stage = el("div", "", "");
+  stage.style.cssText = "flex:1;min-width:0;position:relative";
+  const rail = el("div", "", "");
+  rail.style.cssText = "flex:0 0 clamp(300px,32%,420px);overflow:auto;"
+    + "padding:14px 16px;background:#0a0f16;border-left:1px solid #22304a;"
+    + "font-size:12px;line-height:1.55;color:#c9d6e3";
+  shade.appendChild(stage); shade.appendChild(rail);
+  document.body.appendChild(shade);
+
+  const close = el("button", "", "✕");
+  close.style.cssText = "position:absolute;top:10px;right:12px;z-index:3;"
+    + "background:#16202e;color:#cfe0f0;border:1px solid #2a3a52;"
+    + "border-radius:6px;padding:4px 9px;cursor:pointer";
+  close.onclick = cupboardClose;
+  stage.appendChild(close);
+  const title = el("div", "", "🗄 Cupboard View · every shelf, what is on it, and what is booked for it");
+  title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;"
+    + "font:600 13px system-ui,PineIcons;color:#9fd0e3";
+  stage.appendChild(title);
+  const hint = el("div", "", "drag to turn · click a shelf to open it · click a cell for the round");
+  hint.style.cssText = "position:absolute;bottom:10px;left:16px;z-index:2;"
+    + "font:400 11px system-ui;color:#5d7590";
+  stage.appendChild(hint);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x04070b);
+  const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 400);
+  camera.position.set(0, 2.5, 26);
+  const renderer = new THREE.WebGLRenderer({antialias: true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  stage.appendChild(renderer.domElement);
+  scene.add(new THREE.AmbientLight(0xffffff, 1));
+
+  const world = new THREE.Group();
+  scene.add(world);
+  const bubbles = [];
+  const cells = [];
+  let open = null;
+
+  function clearCells() {
+    cells.forEach((c) => { world.remove(c.mesh); });
+    cells.length = 0;
+  }
+
+  function buildBubbles(rows) {
+    bubbles.forEach((b) => { world.remove(b.mesh); world.remove(b.tag); });
+    bubbles.length = 0;
+    const live = rows.filter((r) => (r.rows || 0) > 0 || (r.booked || 0) > 0);
+    const most = Math.max(1, ...live.map((r) => Number(r.seconds) || 0));
+    live.forEach((sec, i) => {
+      const ang = (i / Math.max(1, live.length)) * Math.PI * 2;
+      const ring = 9.5;
+      const secs = Number(sec.seconds) || 0;
+      const rad = 0.9 + 2.5 * Math.sqrt(secs / most);
+      const readyShare = (sec.rows ? (sec.ready || 0) / sec.rows : 0);
+      const tone = new THREE.Color().setHSL(0.33 * readyShare + 0.02, 0.55,
+                                            0.32 + 0.18 * readyShare);
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(rad, 30, 24),
+        new THREE.MeshBasicMaterial({color: tone, transparent: true,
+                                     opacity: 0.82}));
+      mesh.position.set(Math.cos(ang) * ring, Math.sin(ang) * ring * 0.55, 0);
+      world.add(mesh);
+      const tag = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: cupLabel(sec.label || sec.road,
+                      (sec.rows || 0) + " rounds · " + Math.round(secs / 60) + "m"),
+        transparent: true}));
+      tag.scale.set(6.4, 2.0, 1);
+      tag.position.set(mesh.position.x, mesh.position.y - rad - 1.1, 0);
+      world.add(tag);
+      bubbles.push({mesh: mesh, tag: tag, sec: sec, rad: rad});
+    });
+  }
+
+  function openShelf(b) {
+    open = b;
+    clearCells();
+    const list = b.sec.cells || [];
+    list.slice(0, 60).forEach((cell, i) => {
+      const ang = (i / Math.max(1, Math.min(60, list.length))) * Math.PI * 2;
+      const r = b.rad + 1.8 + (i % 3) * 0.55;
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(0.26, 12, 10),
+        new THREE.MeshBasicMaterial({
+          color: CUP_STAGE_TONE[cell.state] || 0x6b7f99}));
+      m.position.set(b.mesh.position.x + Math.cos(ang) * r,
+                     b.mesh.position.y + Math.sin(ang) * r * 0.72, 0.4);
+      world.add(m);
+      cells.push({mesh: m, cell: cell, sec: b.sec});
+    });
+    railShelf(b.sec);
+  }
+
+  function line(k, v) {
+    const row = el("div", "", "");
+    row.style.cssText = "display:flex;justify-content:space-between;gap:10px;"
+      + "padding:2px 0;border-bottom:1px solid #16202e";
+    const a = el("span", "", k); a.style.color = "#8fa6c0";
+    const b = el("span", "", String(v));
+    row.appendChild(a); row.appendChild(b);
+    return row;
+  }
+
+  function railHome(d) {
+    rail.textContent = "";
+    const h = el("div", "", "the cupboard");
+    h.style.cssText = "font:600 13px system-ui;color:#eaf2ff;margin-bottom:6px";
+    rail.appendChild(h);
+    const say = el("div", "", d.say || "");
+    say.style.cssText = "color:#9fb3c8;margin-bottom:10px";
+    rail.appendChild(say);
+    rail.appendChild(line("rounds stored", d.rounds || 0));
+    rail.appendChild(line("finished audio", Math.round((d.stock_seconds || 0) / 60) + " min"));
+    rail.appendChild(line("entries booked", d.booked || 0));
+    const t = el("div", "", "by stage");
+    t.style.cssText = "margin:12px 0 4px;color:#8fa6c0;font-weight:600";
+    rail.appendChild(t);
+    Object.keys(d.totals || {}).sort().forEach((k) => {
+      rail.appendChild(line(k, d.totals[k]));
+    });
+    const note = el("div", "", "click a shelf to open it");
+    note.style.cssText = "margin-top:12px;color:#5d7590";
+    rail.appendChild(note);
+  }
+
+  function railShelf(sec) {
+    rail.textContent = "";
+    const back = el("button", "", "← all shelves");
+    back.style.cssText = "background:#16202e;color:#cfe0f0;border:1px solid #2a3a52;"
+      + "border-radius:6px;padding:3px 8px;cursor:pointer;margin-bottom:8px";
+    back.onclick = () => { open = null; clearCells(); railHome(cupView.data); };
+    rail.appendChild(back);
+    const h = el("div", "", sec.label || sec.road);
+    h.style.cssText = "font:600 14px system-ui;color:#eaf2ff;margin:4px 0 8px";
+    rail.appendChild(h);
+    rail.appendChild(line("rounds on the shelf", sec.rows));
+    rail.appendChild(line("ready to air", sec.ready));
+    rail.appendChild(line("finished audio", Math.round((sec.seconds || 0) / 60) + " min"));
+    rail.appendChild(line("the hours owe it", Math.round(sec.owed) + "s"));
+    rail.appendChild(line("it is holding", Math.round(sec.held) + "s"));
+    rail.appendChild(line("uncovered", Math.round(sec.uncovered) + "s"));
+    rail.appendChild(line("entries booked", sec.booked));
+    if (sec.next_in != null) {
+      rail.appendChild(line("next entry in", Math.round(sec.next_in / 60) + " min"));
+    }
+    rail.appendChild(line("re-airable", sec.reusable ? "yes" : "no"));
+    rail.appendChild(line("cupboard may cover a hole", sec.rescue_open ? "yes" : "no"));
+    const t = el("div", "", "by stage");
+    t.style.cssText = "margin:12px 0 4px;color:#8fa6c0;font-weight:600";
+    rail.appendChild(t);
+    Object.keys(sec.stages || {}).sort().forEach((k) => {
+      rail.appendChild(line(k, sec.stages[k]));
+    });
+    const c = el("div", "", "showing " + (sec.cells || []).length
+                 + " of " + sec.cells_of + " rounds · click a cell");
+    c.style.cssText = "margin-top:12px;color:#5d7590";
+    rail.appendChild(c);
+  }
+
+  function railCell(cell, sec) {
+    rail.textContent = "";
+    const back = el("button", "", "← " + (sec.label || sec.road));
+    back.style.cssText = "background:#16202e;color:#cfe0f0;border:1px solid #2a3a52;"
+      + "border-radius:6px;padding:3px 8px;cursor:pointer;margin-bottom:8px";
+    back.onclick = () => railShelf(sec);
+    rail.appendChild(back);
+    const h = el("div", "", cell.state);
+    h.style.cssText = "font:600 14px system-ui;margin:4px 0 8px;color:#"
+      + (CUP_STAGE_TONE[cell.state] || 0x6b7f99).toString(16).padStart(6, "0");
+    rail.appendChild(h);
+    rail.appendChild(line("turns", cell.turns));
+    rail.appendChild(line("recorded audio", (cell.seconds || 0) + "s"));
+    rail.appendChild(line("takes made", cell.made + " / " + cell.chunks));
+    rail.appendChild(line("times aired", cell.aired));
+    rail.appendChild(line("tinted", cell.tinted ? "yes" : "no"));
+    rail.appendChild(line("approved", cell.approved ? "yes" : "not reviewed"));
+    if (cell.grade) rail.appendChild(line("grade", cell.grade));
+    if (cell.id) rail.appendChild(line("id", cell.id));
+    const t = el("div", "", "the script");
+    t.style.cssText = "margin:12px 0 4px;color:#8fa6c0;font-weight:600";
+    rail.appendChild(t);
+    const body = el("div", "", cell.head || "(nothing written)");
+    body.style.cssText = "color:#c9d6e3;white-space:pre-wrap";
+    rail.appendChild(body);
+  }
+
+  buildBubbles(data.sections || []);
+  railHome(data);
+
+  /* Drag to turn, click to open. A small move is a click. */
+  let drag = null, moved = 0;
+  renderer.domElement.addEventListener("pointerdown", (e) => {
+    drag = {x: e.clientX, y: e.clientY}; moved = 0;
+  });
+  window.addEventListener("pointerup", () => { drag = null; });
+  renderer.domElement.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    moved += Math.abs(dx) + Math.abs(dy);
+    world.rotation.y += dx * 0.005;
+    world.rotation.x = Math.max(-0.7, Math.min(0.7, world.rotation.x + dy * 0.003));
+    drag = {x: e.clientX, y: e.clientY};
+  });
+  const ray = new THREE.Raycaster();
+  renderer.domElement.addEventListener("click", (e) => {
+    if (moved > 6) return;
+    const r = renderer.domElement.getBoundingClientRect();
+    const pt = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1,
+                                -((e.clientY - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(pt, camera);
+    const hitCell = ray.intersectObjects(cells.map((c) => c.mesh), false)[0];
+    if (hitCell) {
+      const got = cells.find((c) => c.mesh === hitCell.object);
+      if (got) { railCell(got.cell, got.sec); return; }
+    }
+    const hit = ray.intersectObjects(bubbles.map((b) => b.mesh), false)[0];
+    if (hit) {
+      const got = bubbles.find((b) => b.mesh === hit.object);
+      if (got) openShelf(got);
+    }
+  });
+
+  function size() {
+    const w = stage.clientWidth || 1, h = stage.clientHeight || 1;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  size();
+
+  cupView = {shade: shade, renderer: renderer, data: data, stop: false,
+             resize: size, timer: null};
+
+  (function spin() {
+    if (!cupView || cupView.stop) return;
+    bubbles.forEach((b, i) => {
+      b.mesh.rotation.y += 0.002 + i * 0.0002;
+      const s = 1 + 0.02 * Math.sin(Date.now() / 900 + i);
+      b.mesh.scale.set(s, s, s);
+    });
+    renderer.render(scene, camera);
+    requestAnimationFrame(spin);
+  })();
+
+  cupView.timer = setInterval(async () => {
+    if (!cupView) return;
+    try {
+      const fresh = await api("/api/cupboard/view");
+      cupView.data = fresh;
+      const wasOpen = open && open.sec && open.sec.road;
+      buildBubbles(fresh.sections || []);
+      if (wasOpen) {
+        const again = bubbles.find((b) => b.sec.road === wasOpen);
+        if (again) { openShelf(again); } else { open = null; clearCells(); railHome(fresh); }
+      } else if (!open) { railHome(fresh); }
+    } catch (e) { /* the next poll tries again */ }
+  }, 8000);
 }
 
 /* --- 🎛 RapAssembly (2026-09-08): the assembly line, live ----------------
