@@ -56353,12 +56353,68 @@ def speakbox_files(rid: str = "") -> list[Path]:
             if speakbox_weight(p.name, weights, rid) > 0]
 
 
+# #1193: how sharply a well-mined document is pushed down the list.
+# draws-per-kilobyte divided by this is the penalty, so a document read
+# once per kilobyte keeps most of its weight and one read ninety times
+# per kilobyte keeps almost none.
+HUNGER_SOFTEN = float(os.getenv("PINE_SPEAKBOX_HUNGER", "3.0"))
+_HUNGER_CACHE: dict[str, Any] = {"at": 0.0, "rid": None, "uses": {}}
+HUNGER_TTL = 120.0
+
+
+def speakbox_uses(rid: str = "") -> dict[str, int]:
+    """#1193: draws per document, off the said-memory. Cached two minutes -
+    this is asked once per document per draw and the ring is long."""
+    try:
+        now = time.time()
+        if (_HUNGER_CACHE["rid"] == rid
+                and now - float(_HUNGER_CACHE["at"] or 0) <= HUNGER_TTL):
+            return dict(_HUNGER_CACHE["uses"] or {})
+        tally: dict[str, int] = {}
+        for row in speakbox_heard(rid):
+            got = str((row or {}).get("file") or "")
+            if got:
+                tally[got] = tally.get(got, 0) + int(row.get("used") or 1)
+        _HUNGER_CACHE.update({"at": now, "rid": rid, "uses": tally})
+        return dict(tally)
+    except Exception:  # noqa: BLE001
+        return dict(_HUNGER_CACHE.get("uses") or {})
+
+
+def speakbox_hunger(name: str, rid: str = "",
+                    uses: dict[str, int] | None = None) -> float:
+    """#1193: 1.0 for a document nobody has opened, falling as it is mined.
+
+    Relative to SIZE, because a big document has more to give before it
+    starts repeating itself. Measured on the live shelf: ias2.md at 10 KB
+    had been drawn 916 times (87 per KB) while com8.md at 585 KB had been
+    drawn 470 (0.8 per KB), and 93 of 322 documents had never been opened
+    at all. Never returns zero - a well-read document still comes round,
+    it just waits behind the ones that have never been heard."""
+    try:
+        drawn = int((uses if uses is not None
+                     else speakbox_uses(rid)).get(name) or 0)
+        if drawn <= 0:
+            return 1.0
+        size_kb = max(1.0, (speakbox_dir(rid) / name).stat().st_size / 1024.0)
+        per_kb = drawn / size_kb
+        return 1.0 / (1.0 + per_kb / max(0.1, HUNGER_SOFTEN))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
 def speakbox_weight(name: str, weights: dict[str, int] | None = None,
-                    rid: str = "") -> int:
+                    rid: str = "", uses: dict[str, int] | None = None) -> int:
     """How hard this document is leaned on. Unnamed means ordinary. A
     document dropped in recently gets a propensity boost (#478) — the pair
     have an appetite for fresh material — decaying over about a week back to
-    its base weight."""
+    its base weight.
+
+    #1193: ...and a document already mined goes DOWN the list, in
+    proportion to how hard it has been mined for its size. There was no
+    usage term here at all, so a file read a thousand times weighed the
+    same as one never opened, and 93 of 322 documents had never been
+    heard while a 10 KB file was drawn 916 times. See speakbox_hunger."""
     if weights is None:
         weights = mind_weights(rid)
     value = weights.get(name)
@@ -56370,7 +56426,14 @@ def speakbox_weight(name: str, weights: dict[str, int] | None = None,
             base = int(base * (1.0 + max(0.0, 1.0 - age / (7 * 86400))))
     except OSError:
         pass
-    return base
+    # A weight of ZERO is the operator switching a document off, and
+    # speakbox_files() filters on `> 0` - so hunger must never lift one
+    # off the floor. It only ever pushes a document DOWN.
+    if base <= 0:
+        return 0
+    # Otherwise the floor is 1: pushed to the back of the queue, never
+    # struck off it, and random.choices refuses an all-zero weighting.
+    return max(1, int(round(base * speakbox_hunger(name, rid, uses))))
 
 
 def _speakbox_runs(said: str, words: int = 16) -> list[str]:
@@ -58557,9 +58620,10 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     # because plain weighted chance on three documents repeats a third of the
     # time and it stops sounding like a folder.
     weights = mind_weights(key)
+    _uses = speakbox_uses(key)                                   # #1193
     first = unrepeated(
         random.choices([p.name for p in files],
-                       weights=[speakbox_weight(p.name, weights, key)
+                       weights=[speakbox_weight(p.name, weights, key, _uses)
                                 for p in files], k=len(files)),
         # Six documents wait their turn before one comes round again
         # (#360) — three still let a big folder sound like a small one.
