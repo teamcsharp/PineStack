@@ -1472,6 +1472,7 @@ DEFAULT_DJ = {
     "records_first": True,
     # #704: no sample of this length or longer ever goes out.
     "sfx_max_seconds": 5.0,
+    "sfx_min_seconds": 0.45,                                        # #1198
     # #699: what share of callers ring in on a voice from YOUR library
     # rather than the stock Piper bank. Was a hardcoded 45.
     "clone_caller_pct": 70,
@@ -2270,6 +2271,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "records_first": bool(raw_dj.get("records_first", True)),   # #689
         "sfx_max_seconds": max(0.5, min(30.0, float(                # #704
             raw_dj.get("sfx_max_seconds", 5.0) or 5.0))),
+        # #1198: and the shortest. Below this a sample is a click rather
+        # than a sting - see sfx_floor_seconds.
+        "sfx_min_seconds": max(0.0, min(3.0, float(
+            raw_dj.get("sfx_min_seconds", 0.45) or 0.0))),
         "clone_caller_pct": max(0, min(100, int(                    # #699
             raw_dj.get("clone_caller_pct", 70) or 0))),
         "ad_bed_pct": max(2, min(100, int(                          # #700
@@ -43157,6 +43162,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
     _RADIO_TASK.append(asyncio.create_task(sfx_arrivals_keeper()))  # #1062
+    _RADIO_TASK.append(asyncio.create_task(sfx_levels_keeper()))    # #1199
     _RADIO_TASK.append(asyncio.create_task(storage_keeper()))   # #836
     _RADIO_TASK.append(asyncio.create_task(switchboard_keeper()))   # #884
     _RADIO_TASK.append(asyncio.create_task(pantry_keeper()))        # #886
@@ -60121,6 +60127,108 @@ def sfx_list(folder: Path) -> list[Path]:
     return random.sample(found, SFX_MAX_FILES)
 
 
+# #1198: the SHORTEST a sample may be and still be worth playing. There
+# has only ever been a ceiling; measured, 333 of 742 stings that went out
+# in six hours were under half a second and the shortest was 0.07s - a
+# click, which is why the operator reports the stings as "skipped" while
+# the ledger records them as played.
+SFX_MIN_SECONDS = 0.45
+
+
+# #1199: below this a clip is digital black, or close enough that the
+# listener hears the gap rather than the sting.
+SFX_SILENT_DB = -50.0
+SFX_LEVEL_PATH = data_path("sfx_levels.json")
+_SFX_LEVEL: dict[str, Any] = {}
+_SFX_LEVEL_DIRTY = [0]
+
+
+def _sfx_level_load() -> None:
+    if _SFX_LEVEL:
+        return
+    try:
+        got = json.loads(SFX_LEVEL_PATH.read_text())
+        if isinstance(got, dict):
+            _SFX_LEVEL.update(got)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sfx_level_save() -> None:
+    try:
+        tmp = SFX_LEVEL_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_SFX_LEVEL))
+        tmp.replace(SFX_LEVEL_PATH)
+        _SFX_LEVEL_DIRTY[0] = 0
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def sfx_level(path: Path, measure: bool = True) -> Any:
+    """#1199: the loudest this sample gets, in dBFS. None = not measured.
+
+    Cached on path+mtime like the length. WAV is read with audioop, which
+    costs no subprocess; anything else goes to ffmpeg's volumedetect. A
+    file that cannot be measured stays None and is OFFERED to the
+    operator rather than condemned - a gate that guesses would quietly
+    bin half a library."""
+    try:
+        key = "%s:%s" % (path, path.stat().st_mtime_ns)
+    except OSError:
+        return None
+    _sfx_level_load()
+    if key in _SFX_LEVEL:
+        got = _SFX_LEVEL[key]
+        return None if got is None else float(got)
+    if not measure:
+        return None
+    peak: Any = None
+    try:
+        if path.suffix.lower() == ".wav":
+            import wave
+            import audioop
+            with wave.open(str(path), "rb") as handle:
+                width = handle.getsampwidth()
+                frames = handle.readframes(min(handle.getnframes(), 4_000_000))
+            if frames and width:
+                top = float(audioop.max(frames, width))
+                full = float(1 << (8 * width - 1))
+                peak = (20.0 * math.log10(top / full)) if top > 0 else -120.0
+        else:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            out = subprocess.run(
+                [exe, "-hide_banner", "-nostats", "-i", str(path),
+                 "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-"],
+                capture_output=True, timeout=20, text=True, errors="replace")
+            for line in (out.stderr or "").splitlines():
+                if "max_volume:" in line:
+                    peak = float(line.split("max_volume:")[1].split("dB")[0])
+                    break
+    except Exception:  # noqa: BLE001
+        peak = None
+    _SFX_LEVEL[key] = peak
+    _SFX_LEVEL_DIRTY[0] += 1
+    if _SFX_LEVEL_DIRTY[0] >= 25:
+        _sfx_level_save()
+    return peak
+
+
+def sfx_is_silent(path: Path) -> bool:
+    """#1199: measured, and too quiet to be a sting. Unmeasured is not."""
+    got = sfx_level(path, measure=False)
+    return got is not None and float(got) <= SFX_SILENT_DB
+
+
+def sfx_floor_seconds() -> float:
+    """The shortest a sample may be and still go out (#1198)."""
+    try:
+        got = float(dj_settings().get("sfx_min_seconds", SFX_MIN_SECONDS))
+        return max(0.0, min(3.0, got))
+    except Exception:  # noqa: BLE001
+        return SFX_MIN_SECONDS
+
+
 def sfx_cap_seconds() -> float:
     """The longest a sample may be and still go out (#704)."""
     try:
@@ -60215,7 +60323,17 @@ def sfx_short(path: Path) -> bool:
     cap = sfx_cap_seconds()
     secs = sfx_seconds(path)
     if secs > 0:
-        return secs <= cap
+        # #1198: ...AND LONG ENOUGH TO HEAR. A seventieth-of-a-second
+        # fragment out of the grab library is a click, not punctuation;
+        # it plays, the ledger says it played, and the operator hears
+        # nothing. The floor is the other half of the same question the
+        # ceiling asks.
+        if not (sfx_floor_seconds() <= secs <= cap):
+            return False
+        # #1199: ...and it has to make a SOUND. Only a measured silence
+        # refuses; a file nobody has measured yet still plays and is
+        # offered to the operator on the SFX desk instead.
+        return not sfx_is_silent(path)
     try:
         return SFX_MADE_DIR in path.parents
     except Exception:
@@ -61486,6 +61604,70 @@ def sfx_fresh_paths(pool: list[Path]) -> list[Path]:
         return out
     except Exception:  # noqa: BLE001
         return []
+
+
+SFX_REVIEW_REST = 90.0
+_SFX_REVIEW_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def sfx_pool_cached() -> list[Path]:
+    """#1199: the sample pool WITHOUT walking the share.
+
+    sfx_all() globs a CIFS folder of thousands of files, which is the
+    #826 trap - the SFX desk answered in over 100 seconds because of it,
+    even in a thread. sting_due() reads _SFX_POOL_CACHE for the same
+    reason and the cache refreshes off-loop once a minute; the desk and
+    the level sweep read it too."""
+    try:
+        if time.time() - _SFX_POOL_AT[0] > 60:
+            fire_and_forget(_sfx_pool_refresh())
+        return [Path(p) for p in _SFX_POOL_CACHE]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def sfx_levels_keeper() -> None:
+    """#1199: measure the sample library's loudness, a few files a minute.
+
+    Measuring an mp3 is an ffmpeg subprocess - 2.3s a clip measured, and
+    the pool holds five thousand. Done inside the request the SFX desk
+    took 139 seconds to answer; done here it costs nothing anybody is
+    waiting on, and the desk reads the cache.
+
+    Off the loop in a thread, small batches, and only while the show is
+    on and samples are enabled - the same conditions #1062's arrivals
+    walk keeps."""
+    while True:
+        try:
+            await asyncio.sleep(45)
+            if not (_RADIO.get("on") and dj_settings().get("sfx")):
+                continue
+
+            def batch() -> int:
+                done = 0
+                for path in sfx_pool_cached():
+                    if done >= 8:
+                        break
+                    try:
+                        if sfx_level(path, measure=False) is None:
+                            sfx_level(path, measure=True)
+                            done += 1
+                    except Exception:  # noqa: BLE001
+                        continue
+                if done:
+                    _sfx_level_save()
+                return done
+
+            got = await asyncio.to_thread(batch)
+            if got:
+                _SFX_LEVELS_DONE[0] += got
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(30)
+
+
+_SFX_LEVELS_DONE = [0]
 
 
 async def sfx_arrivals_keeper() -> None:
@@ -108546,6 +108728,90 @@ async def sfx_delete_api(
     sfx_ban_set(sid, True)          # so nothing re-picks it this session
     pipeline_log("air", f"sample deleted from the shelf — {name} (#703)")
     return {"deleted": sid, "name": name}
+
+
+@app.get("/api/sfx/review")
+async def api_sfx_review(
+    scan: int = 0,
+    most: int = 200,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1199: the questionable clips, for the operator to keep or bin.
+
+    SILENT is measured digital black; TOO SHORT is under the #1198 floor,
+    a click rather than a sting; UNMEASURABLE is a file nothing could
+    read. `scan` measures that many unmeasured files per call so the desk
+    fills over a few refreshes instead of walking the whole library in
+    one request. Nothing is deleted here - POST /api/sfx/delete (#703)
+    is the door, and it is the operator's to open."""
+    require_read_auth(authorization)
+    # #1199: MEMOISED. Every sfx_seconds() lookup stats its file to key the
+    # cache and there are six thousand of them on a CIFS share, so one
+    # honest answer costs 45s of SMB round trips. The panel polls.
+    memo = _SFX_REVIEW_MEMO
+    if (memo.get("value") is not None and not int(scan or 0)
+            and time.time() - float(memo.get("at") or 0) < SFX_REVIEW_REST):
+        return memo["value"]
+
+    def work() -> dict[str, Any]:
+        floor = sfx_floor_seconds()
+        pool = sfx_pool_cached()
+        done = 0
+        for path in pool:
+            if done >= max(0, int(scan)):
+                break
+            if sfx_level(path, measure=False) is None:
+                sfx_level(path, measure=True)
+                done += 1
+        _sfx_level_save()
+        rows: list[dict[str, Any]] = []
+        counts = {"silent": 0, "short": 0, "unmeasurable": 0,
+                  "measured": 0, "pool": len(pool)}
+        for path in pool:
+            try:
+                secs = sfx_seconds(path)
+                lvl = sfx_level(path, measure=False)
+                if lvl is not None:
+                    counts["measured"] += 1
+                if lvl is not None and float(lvl) <= SFX_SILENT_DB:
+                    why, bucket = "silent", "silent"
+                elif 0 < secs < floor:
+                    why, bucket = "too short", "short"
+                elif secs <= 0 and lvl is None:
+                    why, bucket = "unmeasurable", "unmeasurable"
+                else:
+                    continue
+                counts[bucket] += 1
+                if len(rows) < max(0, int(most)):
+                    rows.append({"id": sfx_id(path), "name": path.stem,
+                                 "seconds": round(float(secs), 2),
+                                 "peak_db": (None if lvl is None
+                                             else round(float(lvl), 1)),
+                                 "why": why, "folder": path.parent.name})
+            except Exception:  # noqa: BLE001
+                continue
+        rows.sort(key=lambda r: (r["why"], r["seconds"]))
+        flagged = counts["silent"] + counts["short"] + counts["unmeasurable"]
+        return {
+            "at": time.time(), "rows": rows, "counts": counts,
+            "floor_seconds": floor, "silent_db": SFX_SILENT_DB,
+            "unmeasured_left": max(0, counts["pool"] - counts["measured"]),
+            "delete_with": "POST /api/sfx/delete {\"id\": \"...\"}",
+            "say": ("%d clip(s) worth a look: %d silent, %d too short, %d "
+                    "unreadable - out of %d in the pool, %d measured so "
+                    "far. Nothing is deleted unless you say so."
+                    % (flagged, counts["silent"], counts["short"],
+                       counts["unmeasurable"], counts["pool"],
+                       counts["measured"])),
+        }
+
+    got = await asyncio.to_thread(work)
+    # #1199: never memoise a COLD answer. _SFX_POOL_CACHE is empty for the
+    # first minute after a restart, and caching "0 clips in the pool" for
+    # ninety seconds told the operator his library was gone.
+    if int((got.get("counts") or {}).get("pool") or 0) > 0:
+        _SFX_REVIEW_MEMO.update({"at": time.time(), "value": got})
+    return got
 
 
 @app.get("/api/sfx/history")
