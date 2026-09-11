@@ -80,6 +80,68 @@ app = FastAPI(
     version="5.5.0",
 )
 
+
+# #1160: GZIP, FOR THE BIG TEXT ANSWERS ONLY.
+#
+# The panel document is 2.19 MB and went out uncompressed - it is about
+# 3.6x smaller gzipped, and /api/dj/pending (2,192,619 bytes of JSON) far
+# more than that. On the tablet that uncompressed document was the whole
+# of the first-paint wait, and it costs every other client too.
+#
+# This is deliberately NOT starlette's GZipMiddleware. That one compresses
+# whatever it is handed, and this station serves audio: 206 Range replies
+# and FileResponse streams. Compressing a partial range corrupts it, and
+# compressing audio burns CPU on a box that is busy making the show.
+#
+# So the rules are narrow and the default is to do nothing:
+#   - only these content types, only whole bodies already in memory
+#   - never a Range request, never a non-200, never an already-encoded one
+#   - StreamingResponse and FileResponse carry no `.body`, so they are
+#     skipped BY CONSTRUCTION rather than by a list someone has to keep
+#     in step with the routes
+_GZIP_TYPES = frozenset((
+    "text/html", "text/css", "text/plain", "text/javascript",
+    "application/javascript", "application/json", "image/svg+xml",
+))
+_GZIP_MIN_BYTES = 1500
+
+
+@app.middleware("http")
+async def gzip_text_responses(request: Request, call_next):
+    # Imported here rather than at the top of the file so this whole change
+    # is one contiguous block that can be lifted out in a single cut. The
+    # module is stdlib and already resident; the lookup is a dict hit.
+    import gzip
+
+    response = await call_next(request)
+    try:
+        if request.headers.get("range"):
+            return response
+        if response.status_code != 200:
+            return response
+        if response.headers.get("content-encoding"):
+            return response
+        if "gzip" not in (request.headers.get("accept-encoding") or "").lower():
+            return response
+        kind = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if kind not in _GZIP_TYPES:
+            return response
+        body = getattr(response, "body", None)
+        if not isinstance(body, (bytes, bytearray)) or len(body) < _GZIP_MIN_BYTES:
+            return response
+        packed = gzip.compress(bytes(body), 6)
+        if len(packed) >= len(body):
+            return response          # already dense - sending it would be a loss
+        response.body = packed
+        response.headers["content-encoding"] = "gzip"
+        response.headers["content-length"] = str(len(packed))
+        response.headers["vary"] = "Accept-Encoding"
+        return response
+    except Exception:
+        # A compression fault must never cost the caller its answer.
+        return response
+
+
 OLLAMA_URL = os.getenv(
     "OLLAMA_URL",
     "http://127.0.0.1:11434",
@@ -14810,11 +14872,28 @@ def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
         kept_until = tinted_keep_until(kind, row)
         if row.get("aired_at") and shelf_is_repeat(kind, row):
             return max(at + REPEAT_KEEP_SECONDS, kept_until)
-        # #1074: a verified round nobody has heard yet is the station's best
-        # stock, not its oldest rubbish - the 24-hour burn made 6,400 s of
-        # recorded gallery and manager rounds invisible to the planner on
-        # the first night. An unheard row lives the keep window (three days);
-        # the burn horizon still governs the pantry's clips.
+        # #1180: AND IT DOES NOT EXPIRE AT ALL UNTIL IT HAS BEEN HEARD.
+        #
+        # #1074 moved this horizon from 24 hours to three days for exactly
+        # the reason the operator gives - "a verified round nobody has
+        # heard yet is the station's best stock, not its oldest rubbish",
+        # measured at 6,400s of recorded gallery and manager rounds made
+        # invisible to the planner on the first night. The principle does
+        # not stop at three days. Photographed on the retirement desk:
+        # rows reading 0/18 AIRINGS with 2h 52m and 12h 2m left to live.
+        #
+        # AIRINGS ARE THE METER. Time starts counting when the thing has
+        # actually been on the air; before that there is nothing to go
+        # stale. News is the exception and keeps its own short life above
+        # - a bulletin nobody read is not best stock, it is wrong.
+        #
+        # The shelf is still bounded: shelf_cap per road, alt_shelf_trim's
+        # ceiling at twice it, and the retirement desk. And the audio
+        # rides with the row, because pantry_spoken_for protects the clips
+        # of any viable row and an unaired row is viable.
+        if not float(row.get("aired_at") or 0) and not int(
+                row.get("aired") or 0):
+            return 0.0                  # never heard: no clock on it
         return max(at + max(PANTRY_BURN_SECONDS, REPEAT_KEEP_SECONDS), kept_until)
     except Exception:  # noqa: BLE001
         return 0.0
@@ -121582,7 +121661,7 @@ _PAPER_READER_JS = r"""
       + '<span class="host">' + esc(host(url) || 'The wire') + '</span>'
       + '<span class="when">' + esc(label || url) + '</span>'
       + '<a class="out" target="_blank" rel="noopener" href="' + esc(url) + '">The original &#8599;</a>'
-      + '<button type="button" class="shut" title="Close (Esc)">&#10005;</button>'
+      + '<button aria-label="Close (Esc)" type="button" class="shut" title="Close (Esc)">&#10005;</button>'
       + '</div><div class="col"><div class="wait"><i></i><span>Fetching the story from '
       + esc(host(url) || 'the wire') + '&hellip;</span></div></div></div>';
     wrap.addEventListener('click', function(e){ if(e.target === wrap) shut(); });
@@ -123831,7 +123910,7 @@ def _paper_quotes_html(quotes: Any, style: str, title: str = "") -> str:
         ctl = ""
         if url:
             ctl = ('<span class="ctl">'
-                   f'<button type="button" data-clip="{_paper_esc(url)}" data-label="&#9654;" '
+                   f'<button aria-label="Play this line" type="button" data-clip="{_paper_esc(url)}" data-label="&#9654;" '
                    'title="Play this line">&#9654;</button>'
                    f'<a href="{_paper_esc(url)}" download title="Download this line">&#11015;</a></span>')
         out.append('<div class="quote">'
@@ -132287,13 +132366,13 @@ body.pine-slides-drag #pineSlidesFrame { pointer-events: none; }
      wrap as UNITS, so the player keeps its shape at any window size. -->
 <div id="djBar" class="dj-deck" style="display:none">
   <span class="deck-group deck-transport">
-    <button class="act-refresh" title="Previous track"
+    <button aria-label="Previous track" class="act-refresh" title="Previous track"
             onclick="djCall('prev')">⏮</button>
-    <button class="act-refresh" id="djMiniPlay" title="Pause"
+    <button aria-label="Pause" class="act-refresh" id="djMiniPlay" title="Pause"
             onclick="djMiniPlayPause()">⏸</button>
-    <button class="act-refresh" title="Next track"
+    <button aria-label="Next track" class="act-refresh" title="Next track"
             onclick="djCall('next')">⏭</button>
-    <button class="act-refresh" title="Playback settings — output routing
+    <button aria-label="Playback settings" class="act-refresh" title="Playback settings — output routing
 and levels, properly labelled (#405)"
             onclick="pineMediaSettings()">⚙</button>
   </span>
@@ -132307,19 +132386,19 @@ and levels, properly labelled (#405)"
     </span>
   </span>
   <span class="deck-group deck-actions">
-    <button class="act-refresh" title="More like this"
+    <button aria-label="More like this" class="act-refresh" title="More like this"
             onclick="voteNowPlaying(1)">👍</button>
-    <button class="act-refresh" title="Never play this again"
+    <button aria-label="Never play this again" class="act-refresh" title="Never play this again"
             onclick="voteNowPlaying(-1)">👎</button>
-    <button class="act-refresh" title="Have the DJ say something"
+    <button aria-label="Have the DJ say something" class="act-refresh" title="Have the DJ say something"
             onclick="djSayMenu(event)">🗣</button>
     <button class="act-refresh" title="Play that last line again"
             onclick="djReplay()">⟲</button>
     <button class="act-refresh" title="Up next"
             onclick="djPanel('djQueue')">▤</button>
-    <button class="act-refresh" title="Talk to the DJ"
+    <button aria-label="Talk to the DJ" class="act-refresh" title="Talk to the DJ"
             onclick="djPanel('djChat')">💬</button>
-    <button class="act-refresh" title="What has been on — play it again"
+    <button aria-label="What has been on" class="act-refresh" title="What has been on — play it again"
             onclick="djPanel('djPlayed')">🕘</button>
     <button class="act-refresh" title="Send the DJ home"
             onclick="djToggleSession()">✕</button>
@@ -132328,16 +132407,16 @@ and levels, properly labelled (#405)"
 
 <header>
   <div style="display:contents">
-    <button id="pineDoctor" class="pine-restart"
+    <button aria-label="Pine Box not answering" id="pineDoctor" class="pine-restart"
             title="Pine Box not answering? Diagnose it and open the guide."
             onclick="pineDoctor()"
             style="font-size:15px;line-height:1">🩺</button>
-    <button id="stackReconnect" class="pine-restart"
+    <button aria-label="Services down" id="stackReconnect" class="pine-restart"
             title="Services down? Probe everything, reload the Home Assistant
 links and restart the agent."
             onclick="stackReconnect()"
             style="font-size:15px;line-height:1">🛠</button>
-    <button id="pineRestart" class="pine-restart"
+    <button aria-label="Clean restart Spark agent" id="pineRestart" class="pine-restart"
             title="Clean restart Spark agent — clears only unplayed DJ/booth dialogue, then reinitializes"
             onclick="pineRestartAgent()">🌲</button>
     <div id="appTitle" style="cursor:pointer;user-select:none;min-width:0"
@@ -132381,7 +132460,7 @@ height:7px;border-radius:50%;background:#764"></span></button>
             style="font-size:10px;opacity:.8;white-space:nowrap;
                    max-width:38vw;overflow:hidden;text-overflow:ellipsis"></span>
     </button>
-    <button id="onAirOut" onclick="onAirLaunch(event)"
+    <button aria-label="Open the station the way a listener hears it" id="onAirOut" onclick="onAirLaunch(event)"
             title="Open the station the way a listener hears it — over the
 public link if it is up, so it plays anywhere"
             style="border:0;border-left:1px solid var(--border);
@@ -132399,26 +132478,26 @@ when the station does.">
     </label>
     <!-- #757: beside the switch that caused the trouble. Works down the
          chain, fixes what it can, and ends by making the box speak. -->
-    <button id="pineInitBtn" class="pine-restart"
+    <button aria-label="Bring the Pine Box up: switch it on, point" id="pineInitBtn" class="pine-restart"
             title="Bring the Pine Box up: switch it on, point the show at
 it, reload the link if Home Assistant has lost it, close the breaker — then
 make it say something and confirm it actually came out."
             onclick="pineboxInitialize()"
             style="font-size:15px;line-height:1">🛠</button>
-    <button id="pineStatusBtn" class="pine-restart"
+    <button aria-label="How the Pine Box is doing" id="pineStatusBtn" class="pine-restart"
             title="How the Pine Box is doing — the connection, what it has
 actually played, and anything in the way"
             onclick="pineboxStatus()"
             style="font-size:15px;line-height:1">📦</button>
-    <button id="voiceTestBtn" class="pine-restart"
+    <button aria-label="Test the current speech settings" id="voiceTestBtn" class="pine-restart"
             title="Test the current speech settings"
             onclick="voiceTestOpen()"
             style="font-size:15px;line-height:1">🎙</button>
-    <button id="boothBtn" class="pine-restart"
+    <button aria-label="The DJ booth" id="boothBtn" class="pine-restart"
             title="The DJ booth — turntable, records, requests"
             onclick="boothOpen()"
             style="font-size:15px;line-height:1">🎛</button>
-    <button id="pineRecover" class="pine-restart"
+    <button aria-label="Pine Box stuck or flashing" id="pineRecover" class="pine-restart"
             title="Pine Box stuck or flashing? Stop the show, unstick the
 speaker and restart the agent."
             onclick="pineRecover()"
@@ -132429,17 +132508,17 @@ speaker and restart the agent."
     <!-- #900: the recording room. Who has been in, what they said,
          what it cost, and how much the shelf is saving. -->
     <!-- #861: the writing desk — every prompt sent and script returned. -->
-    <button id="deskBtn" class="pine-restart"
+    <button aria-label="The writing desk" id="deskBtn" class="pine-restart"
             title="The writing desk - every call to the model, the exact
 prompt that went out and the script that came back"
             onclick="deskPanel(this)"
             style="font-size:15px;line-height:1">&#x270d;</button>
-    <button id="roomBtn" class="pine-restart"
+    <button aria-label="The recording room" id="roomBtn" class="pine-restart"
             title="The recording room - every take, who made it, what the
 engine charged for it, and how much work the pantry is saving"
             onclick="roomPanel(this)"
             style="font-size:15px;line-height:1">🎙</button>
-    <button id="storeRoomBtn" class="pine-restart"
+    <button aria-label="The store room" id="storeRoomBtn" class="pine-restart"
             title="The store room — every place the station saves
 to: broadcasts, ads, spoken spots, clips, samples, gallery. Look
 inside, play or save anything, read the transcripts, cap each area."
@@ -132448,13 +132527,13 @@ inside, play or save anything, read the transcripts, cap each area."
     <!-- #843: the DJ scheduler. How the hour flows — every entry
          in the order it airs, what is on air right now, and the same
          window pulled back to 6h, 12h, a day, a month. -->
-    <button id="schedBtn" class="pine-restart"
+    <button aria-label="The DJ scheduler" id="schedBtn" class="pine-restart"
             title="The DJ scheduler — how the hour flows. Every entry in
 order: drag to reorder, switch one out of the hour, edit its minutes and
 its system prompt. Pull back to 6 hours, 12, a day, or a month."
             onclick="schedulePanel(this)"
             style="font-size:15px;line-height:1">🗓</button>
-    <button id="cloudHeadBtn" class="pine-restart"
+    <button aria-label="Word cloud" id="cloudHeadBtn" class="pine-restart"
             title="Word cloud — closed, half, full"
             onclick="cloudCycle()"
             style="font-size:15px;line-height:1">☁</button>
@@ -132481,14 +132560,14 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
             style="width:auto;max-width:150px;flex:0 1 auto;min-width:0;
                    padding:6px 10px;font-size:13px">
     </select>
-    <button id="manualsBtn" class="tray-btn" title="The Library — every document on the shelf, read and searchable (#1158)"
+    <button aria-label="The Library" id="manualsBtn" class="tray-btn" title="The Library — every document on the shelf, read and searchable (#1158)"
             onclick="manualsOpen()" style="font-size:18px;line-height:1">📚</button>
-    <button id="journalBtn" class="tray-btn" title="The request book — every request and its reply, page by page (#1079)"
+    <button aria-label="The request book" id="journalBtn" class="tray-btn" title="The request book — every request and its reply, page by page (#1079)"
             onclick="journalOpen()" style="font-size:18px;line-height:1">📖</button>
     <!-- 2026-09-10: the director's room - the hour entry by entry, the script
          bound to each one, what actually aired in its window, and the notes
          that govern how the next segment of that kind gets written. -->
-    <button id="directorBtn" class="tray-btn" title="The director's room — the hour segment by segment: what each one is planned to be, what it turned out to be, and your notes on how the next one of that kind gets written"
+    <button aria-label="The director's room" id="directorBtn" class="tray-btn" title="The director's room — the hour segment by segment: what each one is planned to be, what it turned out to be, and your notes on how the next one of that kind gets written"
             onclick="directorOpen()" style="font-size:18px;line-height:1">🎬</button>
     <!-- 2026-09-10: every script written for the show waits here to be read,
          rewritten, tinted line by line, or sent straight to the recording
@@ -132514,7 +132593,7 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
 
 <div id="perfHud" class="perf-hud" onclick="openHealthPopup()"
      title="Click for full service details">
-  <button id="cloudDockBtn" class="act-refresh"
+  <button aria-label="Word cloud" id="cloudDockBtn" class="act-refresh"
           title="Word cloud — live, beside the gallery"
           onclick="event.stopPropagation();cloudDockToggle()"
           style="margin-left:auto;font-size:15px">☁</button>
@@ -132578,9 +132657,9 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
   <div class="act-head">
     <span class="live-dot"></span>
     <span class="act-title">Pine Box · Live</span>
-    <button class="act-refresh" title="Documentation library"
+    <button aria-label="Documentation library" class="act-refresh" title="Documentation library"
             onclick="openDocBrowser(null, 0, true)">📚</button>
-    <button class="act-refresh" title="Show the last rendered image"
+    <button aria-label="Show the last rendered image" class="act-refresh" title="Show the last rendered image"
             onclick="showLastRender()">🖼</button>
     <span id="actStatus" class="act-status">Idle</span>
     <button class="act-refresh" title="Good reply — more like this"
@@ -132595,17 +132674,17 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
     <button id="livePineConsole" class="act-refresh pine-live-console"
             title="Detect a USB-connected Pine Box and open its live serial console"
             onclick="usbConsole()">Open USB Console</button>
-    <button id="paperBarBtn" class="act-refresh"
+    <button aria-label="The Pine Box Gazette" id="paperBarBtn" class="act-refresh"
             title="The Pine Box Gazette — the hour's newspaper, printed on the hour"
             onclick="paperOpen()">📰</button>
-    <button id="slidesBarBtn" class="act-refresh"
+    <button aria-label="The endless press" id="slidesBarBtn" class="act-refresh"
             title="The endless press — every Gazette issue, the newspaper
 then the tabloid, scrolling down the right half of the screen"
             onclick="pineSlidesToggle()">🗞</button>
-    <button id="scriptBarBtn" class="act-refresh"
+    <button aria-label="The Screenplay" id="scriptBarBtn" class="act-refresh"
             title="The Screenplay — the hour as a script, line by line, with the audio"
             onclick="screenplayOpen()">📝</button>
-    <button id="cloudBarBtn" class="act-refresh"
+    <button aria-label="Word cloud" id="cloudBarBtn" class="act-refresh"
             title="Word cloud — half the gallery, live"
             onclick="cloudDockToggle()">☁</button>
     <button id="gzPileBtn" class="act-refresh"
@@ -132618,7 +132697,7 @@ then the tabloid, scrolling down the right half of the screen"
       <input id="gzCapInput" type="number" min="1" max="40" step="1"
              onchange="gzCapSet(this.value)">
     </label>
-    <button id="djIcon" class="act-refresh"
+    <button aria-label="Start a Pine Box FM session" id="djIcon" class="act-refresh"
             title="Start a Pine Box FM session"
             onclick="djToggleSession()">🎧</button>
     <label class="film-size">Size
@@ -132725,7 +132804,7 @@ then the tabloid, scrolling down the right half of the screen"
               onclick="showLeftTab('radio-prompts')">Radio prompts</button>
       <button id="tabConvs"
               onclick="showLeftTab('convs')">Conversations</button>
-      <button id="keyToggle" class="key-chip" title="API key"
+      <button aria-label="API key" id="keyToggle" class="key-chip" title="API key"
               onclick="toggleKeyRow()">🔑</button>
     </div>
 
@@ -132747,9 +132826,9 @@ then the tabloid, scrolling down the right half of the screen"
     <div id="promptBody">
     <label>Stored system prompt</label>
     <div class="row arrows">
-      <button onclick="previousPrompt()" title="Previous">◀</button>
+      <button aria-label="Previous" onclick="previousPrompt()" title="Previous">◀</button>
       <select id="promptSelect" onchange="selectPrompt()"></select>
-      <button onclick="nextPrompt()" title="Next">▶</button>
+      <button aria-label="Next" onclick="nextPrompt()" title="Next">▶</button>
     </div>
 
     <label>Prompt name</label>
@@ -133206,7 +133285,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
         <label>Voice</label>
         <div class="row">
           <select id="voiceName"></select>
-          <button onclick="previewVoice()" title="Hear it">▶</button>
+          <button aria-label="Hear it" onclick="previewVoice()" title="Hear it">▶</button>
         </div>
 
         <label>Personality — said before every line</label>
@@ -133234,7 +133313,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
     <section class="panel" style="margin-top:20px">
       <h2 style="display:flex;align-items:center;gap:8px">
         Pine Box FM · the DJ
-        <button id="boothOpenBtn" onclick="djBoothReopen()"
+        <button aria-label="Open the In the booth window" id="boothOpenBtn" onclick="djBoothReopen()"
                 title="Open the In the booth window — every line as it airs, with play and download on each"
                 style="margin-left:auto;font-size:15px;padding:2px 10px">🎙</button>
       </h2>
@@ -133250,7 +133329,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
                title="The voice the host speaks in.">
           🎙 Host
           <select id="djVoice" onchange="djSetVoices()"></select>
-          <button onclick="djTestVoice('djVoice')"
+          <button aria-label="Hear this voice on the Pine Box" onclick="djTestVoice('djVoice')"
                   title="Hear this voice on the Pine Box">▶</button>
           <button id="djVoiceStar" onclick="djStarVoice('djVoice')"
                   title="Keep this voice at the top of the list">☆</button>
@@ -133259,7 +133338,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
                title="The voice the co-host speaks in.">
           🎙 Co-host
           <select id="djCohostVoice" onchange="djSetVoices()"></select>
-          <button onclick="djTestVoice('djCohostVoice')"
+          <button aria-label="Hear this voice on the Pine Box" onclick="djTestVoice('djCohostVoice')"
                   title="Hear this voice on the Pine Box">▶</button>
           <button id="djCohostVoiceStar" onclick="djStarVoice('djCohostVoice')"
                   title="Keep this voice at the top of the list">☆</button>
@@ -133437,7 +133516,7 @@ it truly carries, and sets this automatically — watch the glass.">
           <input id="djSayMax" type="range" min="4" max="60" value="18"
                  oninput="djSayMaxShow()" onchange="djSetSayMax()">
           <span id="djSayMaxVal" class="val">18s</span>
-          <button onclick="djProbeBox()"
+          <button aria-label="Probe the box's real ceiling" onclick="djProbeBox()"
                   title="Probe the box's real ceiling">📏</button>
         </label>
         <label class="film-size" style="flex:1;min-width:280px"
@@ -133503,7 +133582,7 @@ voice, layer it up and save it for the DJs to run">
                 title="Get the two of them talking">🎙🎙 Banter</button>
         <button onclick="djCallIn()"
                 title="Put a caller on air with a topic">☎ Call-in</button>
-        <button id="djMicBtn" onclick="djMicCall()"
+        <button aria-label="Call in by voice" id="djMicBtn" onclick="djMicCall()"
                 title="Call in by voice — click to record, click again to send"
                 >🎤</button>
         <button onclick="djMixtapeNow()"
@@ -133521,7 +133600,7 @@ zip, or empty it.">🗂 Staging</button>
         <button onclick="calOpen()"
                 title="A calendar at a glance — every recorded section by hour,
 day, week and month; play them in the browser and stack playlists">🗓 Calendar</button>
-        <button onclick="djDiceRoll()"
+        <button aria-label="Roll the dice" onclick="djDiceRoll()"
                 title="Roll the dice — one of them performs a whole section
 from the speakbox as a dramatic monologue, and the other reacts">🎲</button>
         <button onclick="djTopicsPanel()"
@@ -134026,7 +134105,7 @@ is banked for when you come back. This is not the FM switch."
              border:1px solid var(--border);border-radius:0 0 10px 10px;
              box-shadow:0 16px 40px rgba(0,0,0,.5)"></div>
         <button class="primary" onclick="musicSearch()">Find</button>
-        <button onclick="musicHistoryOpen()" title="Everything you have
+        <button aria-label="Everything you have searched for, newest" onclick="musicHistoryOpen()" title="Everything you have
 searched for, newest first — click one to run it again">🕘</button>
         <button onclick="musicReindex()" title="Rescan the library">↻</button>
       </div>
@@ -134053,10 +134132,10 @@ searched for, newest first — click one to run it again">🕘</button>
              onto its own line in a narrow panel. -->
         <div style="flex:0 1 96px;min-width:64px;min-height:96px;
              display:flex;flex-direction:column;gap:10px">
-          <button class="act-refresh" onclick="voteNowPlaying(1)"
+          <button aria-label="I like this one" class="act-refresh" onclick="voteNowPlaying(1)"
                   title="I like this one — play it more often"
                   style="flex:1;font-size:28px">👍</button>
-          <button class="act-refresh" onclick="voteNowPlaying(-1)"
+          <button aria-label="Never play this again" class="act-refresh" onclick="voteNowPlaying(-1)"
                   title="Never play this again"
                   style="flex:1;font-size:28px">👎</button>
         </div>
@@ -134076,12 +134155,12 @@ searched for, newest first — click one to run it again">🕘</button>
       <div class="player-strip">
         <span id="musicNowArt" class="sleeve-now"
               title="What is playing"></span>
-        <button class="tbtn" onclick="djCall('prev')"
+        <button aria-label="Previous song" class="tbtn" onclick="djCall('prev')"
                 title="Previous song">⏮</button>
         <audio id="musicPlayer" data-pine-live="music" controls playsinline></audio>
         <button class="tbtn" id="musicDownload" onclick="downloadTrack()"
                 title="Download the track that is playing">⤓</button>
-        <button class="tbtn" onclick="djCall('next')"
+        <button aria-label="Next song" class="tbtn" onclick="djCall('next')"
                 title="Next song">⏭</button>
       </div>
       <canvas id="musicScope" height="74"
@@ -134109,8 +134188,8 @@ searched for, newest first — click one to run it again">🕘</button>
         <div class="row" style="margin-top:8px">
           <input id="voteAdd" placeholder="Add a track by name…"
                  onkeydown="if(event.key==='Enter')voteAddTrack(-1)">
-          <button onclick="voteAddTrack(1)" title="Add as a thumbs up">👍</button>
-          <button onclick="voteAddTrack(-1)" title="Add as a thumbs down">👎</button>
+          <button aria-label="Add as a thumbs up" onclick="voteAddTrack(1)" title="Add as a thumbs up">👍</button>
+          <button aria-label="Add as a thumbs down" onclick="voteAddTrack(-1)" title="Add as a thumbs down">👎</button>
           <button onclick="loadVotes()" title="Refresh">↻</button>
         </div>
         <div id="votesOutput" style="margin-top:10px;max-height:260px;
@@ -147548,6 +147627,8 @@ function pvServerLines(box, ctx, pick, want) {
  * area simply hides and the booth is exactly as it was. */
 var djPendTimer = null;
 var djPendFrame = 0;
+/* #1160: one request at a time. See djPendingTick below. */
+var djPendBusy = false;
 const DJ_SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 function djPendingStyle() {
@@ -147573,9 +147654,24 @@ async function djPendingTick(force) {
   const host = document.getElementById("djPendingBox");
   if (!host) { if (djPendTimer) { clearInterval(djPendTimer); djPendTimer = null; } return; }
   djPendFrame = (djPendFrame + 1) % DJ_SPIN.length;
+  /* #1160: THIS TICK IS EVERY 1.6 SECONDS AND THE ANSWER IS 2.19 MB.
+   *
+   * Measured on the box: /api/dj/pending returns 2,192,619 bytes and takes
+   * 4.3s to build. At a 1.6s interval with no guard the calls simply
+   * stacked - four copies in flight at once, 8.8 MB of the station's own
+   * output racing itself, on the same uvicorn loop that has to write and
+   * record the show. On a tablet it saturated the connection pool and
+   * everything else queued behind it.
+   *
+   * pvPending() above has carried exactly this guard all along; this is
+   * the same one. Skipping a tick costs nothing - the next is 1.6s away
+   * and repaints from fresher data than the one we dropped. */
+  if (djPendBusy) return;
+  djPendBusy = true;
   let got = null;
   try { got = await api("/api/dj/pending"); }
   catch (e) { host.style.display = "none"; return; }
+  finally { djPendBusy = false; }
   const rows = (got && got.pending) || [];
   if (!rows.length) { host.style.display = "none"; host.textContent = ""; return; }
   host.style.display = "block";
@@ -182319,8 +182415,8 @@ the library files untouched">📶 quality</label>
 
   <div class="row" style="margin-top:12px">
     <button onclick="save()" title="Download this track">⤓</button>
-    <button onclick="vote(1)" title="More like this">👍</button>
-    <button onclick="vote(-1)" title="Never play this again">👎</button>
+    <button aria-label="More like this" onclick="vote(1)" title="More like this">👍</button>
+    <button aria-label="Never play this again" onclick="vote(-1)" title="Never play this again">👎</button>
     <input id="req" placeholder="Request a song…"
            onkeydown="if(event.key==='Enter')request()">
     <button onclick="request()">Request</button>
@@ -182333,11 +182429,11 @@ the library files untouched">📶 quality</label>
     <button onclick="shout()">Say it</button>
   </div>
   <div class="row" style="margin-top:6px;gap:4px">
-    <button onclick="shout('👏')" title="Applause">👏</button>
-    <button onclick="shout('🔥')" title="This one is hot">🔥</button>
-    <button onclick="shout('😂')" title="They are being funny">😂</button>
-    <button onclick="shout('😱')" title="What was that">😱</button>
-    <button onclick="shout('💀')" title="They have killed it">💀</button>
+    <button aria-label="Applause" onclick="shout('👏')" title="Applause">👏</button>
+    <button aria-label="This one is hot" onclick="shout('🔥')" title="This one is hot">🔥</button>
+    <button aria-label="They are being funny" onclick="shout('😂')" title="They are being funny">😂</button>
+    <button aria-label="What was that" onclick="shout('😱')" title="What was that">😱</button>
+    <button aria-label="They have killed it" onclick="shout('💀')" title="They have killed it">💀</button>
     <button onclick="shout('❤️')" title="Love">❤️</button>
   </div>
 
