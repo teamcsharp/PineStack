@@ -35121,12 +35121,19 @@ def orch_scan() -> dict[str, Any]:
 
         # 4. NOTHING IS WRONG - but six hours is six hours.
         if now - float(_ORCH.get("last") or 0) >= ORCH_ASK_EVERY:
+            # #1182: ...and it is not raised empty. If every question in
+            # the bank is one this hour has already answered for itself,
+            # there is nothing here worth the operator's attention, and
+            # the right thing for the orchestrator to do is say nothing.
+            _questions = orch_routine_questions()
+            if not _questions:
+                return out
             out = orch_raise(
                 "routine",
                 "Nothing is falling behind. This is the standing "
                 "six-hourly check - the answers become policy and shape "
                 "how I run the studio between now and the next one.",
-                "routine", orch_routine_questions())
+                "routine", _questions)
             return out
     except Exception:  # noqa: BLE001
         pass
@@ -36117,11 +36124,67 @@ async def reel_open() -> None:
         pass
 
 
+def orch_behind_roads(most: int = 3) -> list[str]:
+    """#1182: the roads genuinely short of what the hours owe them.
+
+    Deepest shortfall first. Roads that cannot be built ahead are left
+    out - CANNOT_PREPARE because nothing can be banked for them at all,
+    PREP_SHORT_HORIZON because an empty shelf there is the resting state
+    and not a shortage (#1181). What comes back is the set of roads for
+    which "build me more of this" is a sentence that means something."""
+    try:
+        needs = hour_needs_now() or {}
+    except Exception:  # noqa: BLE001
+        return []
+    rows = []
+    for road, row in needs.items():
+        if road in CANNOT_PREPARE or road in PREP_SHORT_HORIZON:
+            continue
+        if road not in PREP_BOARD:
+            continue
+        try:
+            short = float((row or {}).get("owed") or 0) - float(
+                (row or {}).get("held") or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        if short > 0:
+            rows.append((short, str(road)))
+    rows.sort(reverse=True)
+    return [road for _short, road in rows[:max(0, int(most))]]
+
+
 def orch_routine_questions() -> list[dict[str, Any]]:
     """#1056: the six-hourly check. Drawn at random so it is not the
-    same three every time, and every option is still a real action."""
+    same three every time, and every option is still a real action.
+
+    #1182: ...and only from the questions that MATTER RIGHT NOW. Each
+    entry carries a `when` - the condition under which its answer would
+    change something - because `random.sample(bank, 3)` drew three of six
+    whatever the hour looked like, so the check asked how often a repeat
+    may return while nothing was repeating, and how deep to build ahead
+    with no idle studio to build in. An orchestrator that asks questions
+    its own state has already answered teaches the operator that the
+    answers do not matter."""
+    _behind = orch_behind_roads(3)
+    try:
+        _paused = bool(radio_paused())
+    except Exception:  # noqa: BLE001
+        _paused = False
+    try:
+        _idle = _paused or prepared_seconds() < prepare_target_seconds()
+    except Exception:  # noqa: BLE001
+        _idle = _paused
+    try:
+        _leans_on_cupboard = bool(orch_policy("repeats_hard")) or bool(_behind)
+    except Exception:  # noqa: BLE001
+        _leans_on_cupboard = bool(_behind)
     bank = [
+        # The sound of the show and the crystal's second pass are live
+        # dials whatever the hour is doing, so they carry no condition -
+        # and they are what keeps the check from ever coming up empty
+        # while it still has something real to ask.
         {"ask": "How should the show sound for the next stretch?",
+         "when": True,
          "options": [
              _opt("More talk, fewer records", "ballast:-3"),
              _opt("As it is", "noop"),
@@ -36129,36 +36192,59 @@ def orch_routine_questions() -> list[dict[str, Any]]:
          ]},
         {"ask": "The crystal's second pass rewrites every line into its "
                 "world. It is the most expensive thing on the station.",
+         "when": True,
          "options": [
              _opt("Keep it on everything", "tint:full"),
              _opt("Only when the reserve is deep", "tint:easy"),
              _opt("Off for now", "tint:off"),
          ]},
+        # Only worth asking while the cupboard is actually carrying the
+        # hour - either repeats are already allowed under-rested, or some
+        # road is short enough that they are about to be needed.
         {"ask": "How often should a repeat be allowed back on air?",
+         "when": _leans_on_cupboard,
          "options": [
              _opt("Every ninety minutes", "rest:5400"),
              _opt("Every three hours", "rest:10800"),
              _opt("Every six hours", "rest:21600"),
          ]},
-        {"ask": "When a phone call is due and none is prepared?",
+        # #1182: SAID AT THE SCOPE IT ACTUALLY HAS. These three options
+        # write `repeats_hard` and `when_empty`, which are station-wide
+        # rules - so asking them about phone calls meant an answer given
+        # for one road silently governed every road. Only asked when
+        # something really is short, since otherwise no entry is going to
+        # arrive with nothing behind it.
+        {"ask": "When an entry is due and nothing is prepared for it - "
+                "on any road - what should happen?",
+         "when": bool(_behind),
          "options": [
              _opt("Re-run an old one", "repeats:hard"),
              _opt("Write one live", "live:allow"),
              _opt("Let the record run instead", "skip:allow"),
          ]},
+        # #1182: "more of" is BUILD ORDER, so it emits `drive`, not
+        # `prefer` - which only protects a road from being stood down and
+        # bought the named road no extra airtime at all. The roads
+        # offered are the ones actually behind; the fixed three used to
+        # offer banter and callers, which tonight held 8,053s and 9,367s
+        # against 1,440s and 4,500s owed.
         {"ask": "Which road would you like more of?",
+         "when": bool(_behind),
          "options": [
-             _opt("Banter between the pair", "prefer:banter"),
-             _opt("Phone calls", "prefer:caller"),
-             _opt("Memos from upstairs", "prefer:manager"),
-         ]},
+             _opt(SHELF_LABEL.get(r, r), "drive:" + r) for r in _behind
+         ] + [_opt("No road in particular", "drive:none")]},
+        # Building ahead is only a question while there is room to build.
         {"ask": "How much should I build ahead when the studio is idle?",
+         "when": _idle,
          "options": [
              _opt("As deep as the shelves go", "stock:8"),
              _opt("An hour or two", "stock:4"),
              _opt("Only what is owed", "stock:2"),
          ]},
     ]
+    bank = [dict(q) for q in bank if q.get("when")]
+    for q in bank:
+        q.pop("when", None)
     # #1181: AND A STANDING PIN IS ALWAYS ANSWERABLE. `drive_road` is the
     # strongest lever in the book - it moves one road to the front of the
     # board ahead of the running order - and until #1178 it had no
@@ -36179,11 +36265,11 @@ def orch_routine_questions() -> list[dict[str, Any]]:
                        _opt("Yes - keep it at the front", "drive:" + _pin),
                    ]}
         try:
-            return [_pinned] + random.sample(bank, 2)
+            return [_pinned] + random.sample(bank, min(2, len(bank)))
         except Exception:  # noqa: BLE001
             return [_pinned] + bank[:2]
     try:
-        return random.sample(bank, 3)
+        return random.sample(bank, min(3, len(bank)))
     except Exception:  # noqa: BLE001
         return bank[:3]
 
