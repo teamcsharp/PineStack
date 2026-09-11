@@ -98991,6 +98991,58 @@ async def api_orch_logic(
     }
 
 
+@app.post("/api/orchestrator/policy")
+async def api_orch_policy(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1178: revise a standing answer.
+
+    `{"does": "drive:none"}` - the same vocabulary `orch_apply` already
+    accepts when an ask is answered, and nothing beyond it. Until now
+    that function was reachable from one place, which needed an OPEN ask
+    to answer, so a policy could be set and never taken back: a drive
+    given when a road was genuinely empty outlived the emptiness and kept
+    the preparer on the deepest shelf on the station.
+
+    Returns what was done in the station's own words, and the whole
+    policy book after it, so the change is visible rather than implied."""
+    require_auth(authorization)
+    payload = await request.json()
+    does = str((payload or {}).get("does") or "").strip()
+    if not does:
+        raise HTTPException(
+            status_code=400,
+            detail='a policy change needs a "does", e.g. "drive:none"')
+    verb = does.partition(":")[0]
+    # The same small vocabulary, named here so a typo is a 400 rather than
+    # a silent no-op that reads as success.
+    known = ("noop", "ballast", "innings", "rest", "stock", "prefer",
+             "postpone", "repeats", "live", "skip", "tint", "drive",
+             "piperok")
+    if verb not in known:
+        raise HTTPException(
+            status_code=400,
+            detail="%s is not something the orchestrator knows how to do "
+                   "(%s)" % (verb, ", ".join(known)))
+    before = copy.deepcopy(_ORCH.get("policy") or {})
+    try:
+        said = orch_apply(does)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)[:200]) from exc
+    try:
+        orch_save()
+    except Exception:  # noqa: BLE001
+        pass
+    note_action("the policy book was revised by hand: %s" % (said or does))
+    pipeline_log("action", "standing policy revised - %s (#1178)"
+                 % (said or does))
+    return {"ok": True, "said": said or "left as it is", "does": does,
+            "was": {k: (v or {}).get("value") for k, v in before.items()},
+            "policy": {k: (v or {}).get("value")
+                       for k, v in (_ORCH.get("policy") or {}).items()}}
+
+
 @app.post("/api/orchestrator/judgment")
 async def api_orch_judgment(
     request: Request,
