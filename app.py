@@ -61350,6 +61350,17 @@ def sfx_id(path: Path) -> str:
 
 
 def sfx_by_id(wanted: str) -> Path | None:
+    # #1204: the CACHED pool first. sfx_id hashes str(path), and the
+    # cached pool and sfx_all() do not always spell the same file the
+    # same way - so an id minted from one could not be looked up through
+    # the other, and the SFX desk's play button served a 404 on a clip
+    # sitting right there. Cheap, and it spares the CIFS walk besides.
+    try:
+        for path in sfx_pool_cached():
+            if sfx_id(path) == wanted:
+                return path
+    except Exception:  # noqa: BLE001
+        pass
     made = (list(SFX_MADE_DIR.glob("*.wav"))
             if SFX_MADE_DIR.is_dir() else [])
     for path in sfx_all() + made:
@@ -109037,7 +109048,18 @@ async def api_sfx_review(
                     continue
                 counts[bucket] += 1
                 if len(rows) < max(0, int(most)):
-                    rows.append({"id": sfx_id(path), "name": path.stem,
+                    _sid = sfx_id(path)
+                    # #1204: a SIGNED url, because an <audio> element sends
+                    # no Authorization header - the route takes a signature
+                    # or a bearer, and a bare /sfx/<id> is a 404 the panel
+                    # would show as "it would not play".
+                    try:
+                        _sig = media_sign(_sid)
+                    except Exception:  # noqa: BLE001
+                        _sig = ""
+                    rows.append({"id": _sid, "name": path.stem,
+                                 "url": ("/sfx/%s?t=%s" % (_sid, _sig)
+                                         if _sig else ""),
                                  "seconds": round(float(secs), 2),
                                  "peak_db": (None if lvl is None
                                              else round(float(lvl), 1)),
@@ -136552,6 +136574,9 @@ const PINE_3JS = [
    frame: {shade: () => rapAssembly && rapAssembly.shade, card: null,
            close: () => rapAssemblyClose(),
            onResize: () => { if (rapAssembly && rapAssembly.resize) rapAssembly.resize(); }}},
+  {key: "sfxdesk",  label: "🔊 SFX Desk",        open: () => sfxDeskPanel(),
+   frame: {shade: () => sfxDesk, close: () => sfxDeskClose(),
+           width: 860, height: 640}},
   {key: "comfydoc", label: "🩺 Comfy Doctor",    open: () => comfyDoctorPanel(),
    frame: {shade: () => comfyDoc, close: () => comfyDoctorClose(),
            width: 820, height: 600}},
@@ -171571,6 +171596,166 @@ function comfyDoctorWatch(state) {
       if (!comfyDoc) comfyDoctorPanel();
     }
   } catch (e) { /* the panel works without it */ }
+}
+
+
+/* --- 🔊 SFX Desk (#1204): the questionable clips, to hear and to bin ------
+   "clips that are questionable are offered to me to rm rf and delete them
+   if they do not contain data suitable for the radio."
+
+   Play before delete, always. One at a time through POST /api/sfx/delete
+   (#703), which also bans the id so nothing re-picks it this session. */
+let sfxDesk = null;
+let sfxDeskWhy = "too short";
+let sfxDeskPick = null;
+
+function sfxDeskClose() {
+  if (!sfxDesk) return;
+  try { if (sfxDeskPick) { sfxDeskPick.pause(); sfxDeskPick = null; } } catch (e) {}
+  try { sfxDesk.remove(); } catch (e) {}
+  sfxDesk = null;
+}
+
+async function sfxDeskPanel() {
+  if (sfxDesk) { sfxDeskClose(); return; }
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:350;display:flex;"
+    + "align-items:center;justify-content:center;background:rgba(2,4,9,.8)";
+  const box = el("div", "", "");
+  box.style.cssText = "width:min(860px,94vw);max-height:86vh;display:flex;"
+    + "flex-direction:column;background:#05080d;border:1px solid #22304a;"
+    + "border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden";
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:9px;"
+    + "padding:10px 14px;border-bottom:1px solid #1b2735";
+  head.appendChild(el("b", "", "🔊 SFX Desk"));
+  const say = el("span", "muted", "reading the shelf…");
+  say.style.cssText = "font-size:11px;flex:1;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  head.appendChild(say);
+  const shut = el("button", "", "✕");
+  shut.style.cssText = "background:#16202e;color:#cfe0f0;border:1px solid #2a3a52;"
+    + "border-radius:6px;padding:3px 9px;cursor:pointer";
+  shut.onclick = sfxDeskClose;
+  head.appendChild(shut);
+  box.appendChild(head);
+
+  const tabs = el("div", "", "");
+  tabs.style.cssText = "display:flex;gap:6px;padding:9px 14px;"
+    + "border-bottom:1px solid #1b2735";
+  box.appendChild(tabs);
+
+  const body = el("div", "", "");
+  body.style.cssText = "flex:1;overflow:auto;padding:6px 8px";
+  box.appendChild(body);
+
+  const foot = el("div", "muted", "nothing is deleted unless you press it");
+  foot.style.cssText = "padding:8px 14px;border-top:1px solid #1b2735;font-size:11px";
+  box.appendChild(foot);
+
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+  sfxDesk = shade;
+
+  let data = null;
+
+  function tabBtn(key, label, count) {
+    const b = el("button", "", label + " (" + count + ")");
+    const on = key === sfxDeskWhy;
+    b.style.cssText = "padding:5px 11px;border-radius:7px;cursor:pointer;"
+      + "font-size:11.5px;border:1px solid " + (on ? "#4ec9c9" : "#2a3a52")
+      + ";background:" + (on ? "#12313a" : "#16202e")
+      + ";color:" + (on ? "#bfeff0" : "#cfe0f0");
+    b.onclick = () => { sfxDeskWhy = key; paint(); };
+    return b;
+  }
+
+  function row(r) {
+    const line = el("div", "", "");
+    line.style.cssText = "display:flex;align-items:center;gap:9px;"
+      + "padding:6px 7px;border-bottom:1px solid #121c28;font-size:11.5px";
+    const play = el("button", "", "▶");
+    play.title = "hear it";
+    play.style.cssText = "width:28px;padding:4px;border-radius:6px;cursor:pointer;"
+      + "background:#16202e;color:#cfe0f0;border:1px solid #2a3a52";
+    play.onclick = () => {
+      try { if (sfxDeskPick) sfxDeskPick.pause(); } catch (e) {}
+      sfxDeskPick = new Audio(r.url || ("/sfx/" + encodeURIComponent(r.id)));
+      sfxDeskPick.play().catch(() => {
+        play.textContent = "✕"; play.title = "it would not play";
+      });
+    };
+    line.appendChild(play);
+    const name = el("span", "", String(r.name || r.id));
+    name.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;"
+      + "white-space:nowrap";
+    name.title = String(r.folder || "");
+    line.appendChild(name);
+    const secs = el("span", "muted", (r.seconds != null ? r.seconds + "s" : "?"));
+    secs.style.cssText = "width:52px;text-align:right";
+    line.appendChild(secs);
+    const db = el("span", "muted", (r.peak_db != null ? r.peak_db + " dB" : "—"));
+    db.style.cssText = "width:70px;text-align:right";
+    line.appendChild(db);
+    const bin = el("button", "", "Delete");
+    bin.style.cssText = "padding:4px 9px;border-radius:6px;cursor:pointer;"
+      + "background:#2a1417;color:#ffd0cc;border:1px solid #5a2630";
+    bin.onclick = async () => {
+      bin.disabled = true; bin.textContent = "…";
+      try {
+        await api("/api/sfx/delete", {method: "POST",
+                                      body: JSON.stringify({id: r.id})});
+        bin.textContent = "gone";
+        line.style.opacity = ".45";
+        name.style.textDecoration = "line-through";
+      } catch (e) {
+        bin.disabled = false; bin.textContent = "failed";
+      }
+    };
+    line.appendChild(bin);
+    return line;
+  }
+
+  function paint() {
+    if (!data) return;
+    const c = data.counts || {};
+    tabs.innerHTML = "";
+    tabs.appendChild(tabBtn("too short", "too short", c.short || 0));
+    tabs.appendChild(tabBtn("silent", "silent", c.silent || 0));
+    tabs.appendChild(tabBtn("unmeasurable", "unreadable", c.unmeasurable || 0));
+    const again = el("button", "", "refresh");
+    again.style.cssText = "margin-left:auto;padding:5px 11px;border-radius:7px;"
+      + "cursor:pointer;background:#16202e;color:#cfe0f0;border:1px solid #2a3a52;"
+      + "font-size:11.5px";
+    again.onclick = () => load(true);
+    tabs.appendChild(again);
+
+    body.innerHTML = "";
+    const rows = (data.rows || []).filter((r) => r.why === sfxDeskWhy);
+    if (!rows.length) {
+      const none = el("div", "muted", "nothing in this list");
+      none.style.cssText = "padding:18px";
+      body.appendChild(none);
+    } else {
+      rows.forEach((r) => body.appendChild(row(r)));
+    }
+    say.textContent = String(data.say || "");
+    const left = Number(data.unmeasured_left || 0);
+    foot.textContent = "nothing is deleted unless you press it"
+      + (left ? " · " + left + " clip(s) still to be measured for silence"
+                + " (the station measures them as it runs)" : "");
+  }
+
+  async function load(quiet) {
+    if (!quiet) say.textContent = "reading the shelf…";
+    try {
+      data = await api("/api/sfx/review");
+      paint();
+    } catch (e) {
+      say.textContent = "the shelf would not answer: " + (e.message || e);
+    }
+  }
+  load();
 }
 
 async function comfyDoctorPanel() {
