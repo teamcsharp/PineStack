@@ -25023,21 +25023,141 @@ _AUDIO_OWNER: dict[str, Any] = {}
 AUDIO_OWNER_LIFE = 90.0                 # an owner that stops polling frees it
 
 
+_TERMINALS_CACHE: dict[str, Any] = {"at": 0.0, "rows": {}}
+TERMINALS_TTL = 5.0
+
+
+def terminal_rows() -> dict[str, dict[str, Any]]:
+    """#1185: the per-device table #1161 stored and nobody ever read.
+
+    Cached for five seconds. audio_owner() is on the CLOCK path - every
+    open page polls it about once a second, and listener_roster() asks it
+    once per listener - so an uncached settings read here would be a
+    json.load per poll per page on the event loop. That is the shape of
+    the stall #1156 measured, and five seconds is far finer than anything
+    in this table moves."""
+    try:
+        now = time.time()
+        if now - float(_TERMINALS_CACHE.get("at") or 0) <= TERMINALS_TTL:
+            return dict(_TERMINALS_CACHE.get("rows") or {})
+        rows = (load_settings().get("terminals") or {})
+        rows = rows if isinstance(rows, dict) else {}
+        _TERMINALS_CACHE.update({"at": now, "rows": rows})
+        return dict(rows)
+    except Exception:  # noqa: BLE001
+        return dict(_TERMINALS_CACHE.get("rows") or {})
+
+
+def terminal_for_listener(who: str) -> dict[str, Any]:
+    """Which device row a live listener belongs to, by id then address."""
+    if not who:
+        return {}
+    try:
+        seen = _LISTENER_SEEN.get(who) or {}
+        addr = str(seen.get("addr") or "")
+        for row in terminal_rows().values():
+            if str((row or {}).get("listener") or "") == who:
+                return dict(row)
+        if addr:
+            for row in terminal_rows().values():
+                if str((row or {}).get("addr") or "") == addr:
+                    return dict(row)
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _listener_live(who: str) -> bool:
+    try:
+        seen = float((_LISTENER_SEEN.get(who) or {}).get("at") or 0)
+        return bool(who) and time.time() - seen <= AUDIO_OWNER_LIFE
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _listeners_live() -> list[str]:
+    try:
+        return [w for w in list(_LISTENER_SEEN) if _listener_live(w)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _listener_for_terminal(row: dict[str, Any]) -> str:
+    """A live listener sitting at this device, if one is."""
+    try:
+        want_id = str((row or {}).get("listener") or "")
+        if want_id and _listener_live(want_id):
+            return want_id
+        addr = str((row or {}).get("addr") or "")
+        if not addr:
+            return ""
+        best, best_at = "", 0.0
+        for who in _listeners_live():
+            seen = _LISTENER_SEEN.get(who) or {}
+            if str(seen.get("addr") or "") != addr:
+                continue
+            at = float(seen.get("at") or 0)
+            if at >= best_at:
+                best, best_at = who, at
+        return best
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def audio_owner() -> str:
-    """The listener that owns the air, or "" when everybody may play."""
+    """The listener that owns the air, or "" when everybody may play.
+
+    #1185: RESOLVED, not merely remembered. The owner used to be a bare
+    listener id, and a listener id is minted fresh on every page load -
+    so a reload of the nominated device left `_AUDIO_OWNER` pointing at
+    nobody, `owner != me` true for every page in the house, and the whole
+    house gagged until the lease expired. Measured: three of six samples
+    with no page making a sound anywhere.
+
+    The device table #1161 stores (and nothing read until now) says which
+    device is meant to play out loud, keyed by address rather than by an
+    id that evaporates. So the air follows the DEVICE."""
     try:
         who = str(_AUDIO_OWNER.get("who") or "")
-        if not who:
-            return ""
-        # An owner who has gone away must never gag the rest of the house.
-        seen = float((_LISTENER_SEEN.get(who) or {}).get("at") or 0)
-        if time.time() - seen > AUDIO_OWNER_LIFE:
+        if who and _listener_live(who):
+            return who
+        if who:
+            # The nominated listener has gone. Before releasing the air,
+            # look for the same DEVICE back under a new id - a reload
+            # should not cost the tablet the exclusive it was given.
+            again = _listener_for_terminal(terminal_for_listener(who))
+            if again:
+                _AUDIO_OWNER.update({"who": again, "at": time.time()})
+                pipeline_log("air", f"the device holding the air came back "
+                             f"as {again} - it keeps it (#1185)")
+                return again
+        # Nobody nominated, or the nomination is gone for good: the
+        # operator's own table decides. "Exclusively when it is present
+        # and on" is a row with play set and a listener at its address.
+        rows = terminal_rows()
+        for want_fallback in (False, True):
+            for name, row in rows.items():
+                if not (row or {}).get("play"):
+                    continue
+                if bool((row or {}).get("fallback")) != want_fallback:
+                    continue
+                got = _listener_for_terminal(row)
+                if got:
+                    if got != who:
+                        _AUDIO_OWNER.clear()
+                        _AUDIO_OWNER.update({"who": got, "at": time.time()})
+                        pipeline_log(
+                            "air", f"{(row or {}).get('name') or name} is "
+                            f"present and set to play - it has the air "
+                            f"({got}) (#1185)")
+                    return got
+        if who:
             _AUDIO_OWNER.clear()
             pipeline_log("air", f"the listener holding the air ({who}) "
-                         "stopped polling - every player is unmuted again "
-                         "(#1008)")
-            return ""
-        return who
+                         "stopped polling and no device on the list is "
+                         "present to take it - every player is unmuted "
+                         "again (#1008/#1185)")
+        return ""
     except Exception:  # noqa: BLE001
         return ""
 
@@ -35099,8 +35219,17 @@ def orch_scan() -> dict[str, Any]:
                               "drive:" + _buildable[0]),
                          _opt("No - keep the running order's order",
                               "drive:none"),
-                         _opt("Only the ones the next hour wants",
-                              "prefer:slot"),
+                         # #1183: "Only the ones the next hour wants" used
+                         # to sit here as `prefer:slot`. `prefer` writes
+                         # prefer_road, every reader of which compares it
+                         # to a ROAD NAME - so "slot" matched nothing and
+                         # quietly cleared whatever real preference was
+                         # standing, while the panel read it back as a
+                         # policy in force. What it promised is already
+                         # the standing behaviour: slot_needs() puts the
+                         # hour's arrears and owed entries first
+                         # (#1073/#1085). The honest question is the
+                         # binary it always was.
                      ]})
             _questions.append(
                     {"ask": "How deep should a road be stocked before I "
@@ -36272,6 +36401,32 @@ def orch_routine_questions() -> list[dict[str, Any]]:
         return random.sample(bank, min(3, len(bank)))
     except Exception:  # noqa: BLE001
         return bank[:3]
+
+
+def orch_verbs() -> tuple[str, ...]:
+    """#1183: every verb orch_apply implements, read off its own source.
+
+    The #1178 door listed these by hand and was two short. A list of
+    actions kept beside the code that performs them drifts; one read from
+    that code cannot. Falls back to the literal set if introspection is
+    unavailable (a frozen build, say), so a missing source file costs the
+    extra verbs rather than the whole endpoint."""
+    try:
+        import inspect
+        body = inspect.getsource(orch_apply)
+        found = set(re.findall(r'verb == "([a-z]+)"', body))
+        for group in re.findall(r'verb in \(([^)]*)\)', body):
+            for piece in group.split(","):
+                piece = piece.strip().strip('"').strip("'")
+                if piece:
+                    found.add(piece)
+        if found:
+            return tuple(sorted(found))
+    except Exception:  # noqa: BLE001
+        pass
+    return ("noop", "ballast", "innings", "rest", "stock", "prefer",
+            "postpone", "repeats", "live", "skip", "tint", "drive",
+            "piperok", "thin", "judgment")
 
 
 def orch_apply(does: str) -> str:
@@ -99288,9 +99443,12 @@ async def api_orch_policy(
     verb = does.partition(":")[0]
     # The same small vocabulary, named here so a typo is a 400 rather than
     # a silent no-op that reads as success.
-    known = ("noop", "ballast", "innings", "rest", "stock", "prefer",
-             "postpone", "repeats", "live", "skip", "tint", "drive",
-             "piperok")
+    # #1183: READ OFF orch_apply ITSELF. Restated by hand, this list had
+    # drifted two verbs short - `thin` and `judgment` are implemented and
+    # were refused here, which is exactly the asymmetry #1178 exists to
+    # remove. ORCH_VERBS is derived from the function that does the work,
+    # so the door and the action cannot disagree again.
+    known = orch_verbs()
     if verb not in known:
         raise HTTPException(
             status_code=400,
@@ -99845,11 +100003,46 @@ def director_room(which: int = 0) -> dict[str, Any]:
         deadline = float(slot.get("deadline") or 0)
         aired = _director_aired(start, deadline)
         heard = sum(r["seconds"] for r in aired)
+        # #1184: WHOSE AIR WAS IT. _director_aired filters on time and on
+        # the aired state, never on the road, so "heard" counts the
+        # previous segment running long just as readily as this entry's
+        # own material - and one second of anything marked the entry
+        # aired. See the patch note: the manager window took 92s of
+        # track talk and ad tail, reported "aired", and put out none of
+        # its own 25 bindable rounds.
+        own = sum(r["seconds"] for r in aired
+                  if kind in (str(r.get("round") or ""), str(r.get("kind") or "")))
+        # A record window airs MUSIC, which carries no round in the air
+        # log, so the per-road test cannot speak for it - it keeps the
+        # old verdict.
+        _own_counts = kind not in ("record",)
         script = _director_script(slot)
         if start <= now < deadline:
             state = "on air"
         elif deadline <= now:
-            state = "aired" if heard > 1.0 else "went by with nothing"
+            if not _own_counts:
+                state = "aired" if heard > 1.0 else "went by with nothing"
+            elif own > 1.0:
+                state = "aired"
+            elif heard > 1.0:
+                _took: dict[str, float] = {}
+                for _r in aired:
+                    _rd = str(_r.get("round") or _r.get("kind") or "")
+                    if _rd and _rd != kind:
+                        _took[_rd] = _took.get(_rd, 0.0) + float(
+                            _r.get("seconds") or 0)
+                if _took:
+                    _worst = max(_took, key=lambda k: _took[k])
+                    state = ("went by - %s aired instead"
+                             % SHELF_LABEL.get(_worst, _worst))
+                else:
+                    state = "went by with nothing of its own"
+            else:
+                # EVERY branch must leave `state` set: `state` is reused
+                # across loop iterations, so falling through here does not
+                # raise on the second slot - it silently reports the
+                # PREVIOUS entry's verdict, which is worse than a crash.
+                state = "went by with nothing"
         elif script["state"] == "bound":
             state = "planned"
         elif script["state"] == "re-recording an edited line":
@@ -99865,6 +100058,9 @@ def director_room(which: int = 0) -> dict[str, Any]:
         out["entries"].append({
             "ordinal": int(slot.get("ordinal") or 0),
             "kind": kind,
+            # #1184: what this entry ITSELF put on the air, beside the
+            # aired_seconds that counts everything overlapping it.
+            "own_seconds": round(own, 1),
             "label": str(slot.get("label") or kind),
             "slot_id": str(slot.get("template_id") or slot.get("id") or ""),
             "occurrence": str(slot.get("id") or ""),
