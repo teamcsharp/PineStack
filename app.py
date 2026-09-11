@@ -25120,12 +25120,33 @@ def audio_owner() -> str:
     try:
         who = str(_AUDIO_OWNER.get("who") or "")
         if who and _listener_live(who):
-            return who
+            # #1187: ...UNLESS ITS OWN ROW SAYS IT DOES NOT PLAY OUT LOUD.
+            # Measured: the air was held by `desktop-jvi6zk3h` while the
+            # table read `desktop play=false`, so the one device set to
+            # sound - the tablet - was gagged in favour of one that then
+            # stayed silent, and the house heard nothing at all. Holding
+            # the exclusive and refusing to play is the one combination
+            # that guarantees silence, so it is not allowed to stand.
+            # A device with NO row is left alone: an explicit hand-over to
+            # something the table has never heard of still works.
+            _row = terminal_for_listener(who)
+            if not (_row and not _row.get("play")):
+                return who
+            pipeline_log("air", f"{who} holds the air but its row is set "
+                         "not to play out loud - passing it to a device "
+                         "that will (#1187)")
         if who:
             # The nominated listener has gone. Before releasing the air,
             # look for the same DEVICE back under a new id - a reload
             # should not cost the tablet the exclusive it was given.
-            again = _listener_for_terminal(terminal_for_listener(who))
+            #
+            # #1187: but not if that device is the one set NOT to play.
+            # Following it back is how a play=false row kept the air and
+            # the whole house stayed quiet - the branch above declines to
+            # hold it and this one handed it straight back.
+            _again_row = terminal_for_listener(who)
+            again = ("" if (_again_row and not _again_row.get("play"))
+                     else _listener_for_terminal(_again_row))
             if again:
                 _AUDIO_OWNER.update({"who": again, "at": time.time()})
                 pipeline_log("air", f"the device holding the air came back "
@@ -42725,6 +42746,74 @@ async def dead_air_rescue(quiet: float) -> str:
     return ""
 
 
+def entry_own_aired(kind: str, start: float, deadline: float) -> float:
+    """#1186: seconds of THIS entry's own road inside its own window."""
+    try:
+        if not kind or deadline <= start:
+            return 0.0
+        return sum(float(r.get("seconds") or 0)
+                   for r in _director_aired(start, deadline)
+                   if kind in (str(r.get("round") or ""),
+                               str(r.get("kind") or "")))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def entry_window_now() -> tuple[str, float, float]:
+    """The entry on air: its road, when it opened and when it closes."""
+    try:
+        slot = schedule_take() or {}
+        kind = str(slot.get("kind") or "")
+        if not kind:
+            return "", 0.0, 0.0
+        pos = _RADIO.get("sched_pos") or {}
+        start = float(pos.get("started") or 0)
+        if start <= 0:
+            return "", 0.0, 0.0
+        minutes = float(slot.get("minutes") or 0)
+        if minutes <= 0:
+            return "", 0.0, 0.0
+        return kind, start, start + minutes * 60.0
+    except Exception:  # noqa: BLE001
+        return "", 0.0, 0.0
+
+
+async def entry_unanswered_fill() -> str:
+    """#1186: the entry on air has had none of its own road - so serve it.
+
+    A record playing answers "is the room silent"; it does not answer "did
+    the thing on the running order happen". Only the first question was
+    ever asked, which is why a road holding 2,076s of finished work aired
+    28 seconds in five hours.
+
+    Deliberately narrow. It asks only for the road whose entry is ACTUALLY
+    ON AIR, only once that entry is a third of the way through - so the
+    ordinary path has had its turn first - and only through
+    dead_air_rescue, which keeps its own rest timer, its own paused and
+    off-air guards, and airs finished rounds alone."""
+    kind, start, deadline = entry_window_now()
+    if not kind or kind not in RESCUE_ROADS_OPEN:
+        return ""
+    now = time.time()
+    if not (start < now < deadline):
+        return ""
+    # Give the entry's own road a fair run at it before reaching past.
+    if now - start < max(20.0, (deadline - start) / 3.0):
+        return ""
+    if entry_own_aired(kind, start, deadline) > 1.0:
+        return ""                       # it answered for itself
+    if kind not in (dead_air_stock() or {}):
+        return ""
+    said = await dead_air_rescue(0)
+    if said:
+        pipeline_log(
+            "air", "the %s entry was %ds old with none of its own road on "
+            "the air - a finished %s round came out of the cupboard to "
+            "answer it (#1186)"
+            % (SHELF_LABEL.get(kind, kind), int(now - start), said))
+    return said
+
+
 async def dead_air_watch() -> None:
     """The silence ceiling (#338, #340). Nothing playing and nobody
     talking for longer than the slider allows → kick the show forward.
@@ -42771,6 +42860,19 @@ async def dead_air_watch() -> None:
             # A render still means the room is not dead, so it still holds
             # off a STRIKE; it no longer holds off the cupboard.
             _rendering = time.time() - _LAST_SYNTH[0] < 45.0
+            # #1186: ...AND WAS THE ENTRY ANSWERED? The reset below is
+            # right about SILENCE - a record is playing, the room is not
+            # dead - but it made the cupboard unreachable in ordinary
+            # running, because with voice on the page `not _voice_boxed`
+            # is true and a record is nearly always on. Measured: the
+            # rescue had never fired, while 7 of 14 talk entries in an
+            # hour put out none of their own road and manager sat on
+            # 2,076s of finished work. See the patch note.
+            if not (_SPEAKING[0] or _floor_busy()):
+                try:
+                    await entry_unanswered_fill()
+                except Exception:  # noqa: BLE001
+                    pass
             if ((now_really_playing() and (_room_gets_music
                                            or not _voice_boxed))
                     or _SPEAKING[0] or _floor_busy()):          # #1146
@@ -93585,6 +93687,24 @@ async def radio_solo_api(
     if not who:
         raise HTTPException(status_code=400,
                             detail="name a listener, or pass clear")
+    # #1187: A DEVICE SET NOT TO PLAY OUT LOUD MAY NOT TAKE THE EXCLUSIVE.
+    # Holding the air and refusing to sound is the one combination that
+    # guarantees silence everywhere: every other page gags itself for a
+    # device that then plays nothing. Measured live - the desktop panel
+    # re-claimed the air every few seconds while its own row read
+    # play=false, so the tablet was gagged and the house heard nothing.
+    # `play` is the out-loud switch; the exclusive only decides WHICH
+    # out-loud device wins. To give the air to this one, turn its play on.
+    _row = terminal_for_listener(who)
+    if _row and not _row.get("play"):
+        name = str(_row.get("name") or who)
+        pipeline_log("air", f"{name} asked for the air but is set not to "
+                     "play out loud - refused, so the device that does "
+                     "play keeps it (#1187)")
+        return {"audio_owner": audio_owner(), "listeners": listener_roster(),
+                "refused": who,
+                "why": f"{name} is set not to play out loud, so it cannot "
+                       "hold the exclusive - turn its play switch on first"}
     _AUDIO_OWNER.clear()
     _AUDIO_OWNER.update({"who": who, "at": time.time()})
     pipeline_log("air", f"{who} has the air - every other player mutes "
