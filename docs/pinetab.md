@@ -946,7 +946,108 @@ complete on the tablet itself. Until both are done the second and third roads
 cannot answer, and the terminal simply stays on the LAN — which is the correct
 behaviour when it is at home anyway.
 
-## 12. What comes next
+## 12. DGX Terminal
+
+"I want to be able to SSH into the Spark. I want to be able to access the
+console. I want to be able to type in commands and be able to work through a
+terminal in a separate app called DGX Terminal."
+
+A third launcher activity in the same APK, following SparkActivity's shape:
+its own label, its own taskAffinity, no HOME filter and no lock task. The
+terminal is a thing you open, use and leave; the one screen that must never go
+blank is the radio.
+
+### No keys, and that is the whole point
+
+Measured from the tablet before any of it was written:
+
+    100.74.95.59:22   ->  SSH-2.0-Tailscale
+    10.89.1.246:22    ->  SSH-2.0-OpenSSH_9.6p1
+
+Tailscale SSH intercepts port 22 for tailnet peers, so the WireGuard tunnel
+has already proved who the device is before an SSH packet is sent and the
+server authorises on tailnet identity. No private key on the tablet, no
+passphrase to type on a nine-inch screen, no `authorized_keys` to maintain,
+and nothing to steal if the tablet is lost — revoking the device in the
+Tailscale console revokes the shell with it.
+
+The LAN address is deliberately NOT offered as a fallback here, although
+everything else in this terminal falls back to it happily: sshd on `:22` would
+demand a password, and putting a password box on a kiosk for a road nobody
+asked to take is how credentials end up typed into the wrong thing. The app
+reads the banner first and refuses anything that is not Tailscale answering.
+
+`com.github.mwiede:jsch` rather than `com.jcraft:jsch` (last released 2018,
+cannot negotiate with a 2024 OpenSSH) or sshj (drags in BouncyCastle at
+several megabytes).
+
+### Three bugs, and only the third was found by looking
+
+Typing did nothing, and two plausible readings of that were shipped before
+either was tested:
+
+1. **the composing region** — a soft keyboard types into an underlined
+   composing region and only commits at a space, so overriding `commitText`
+   without `setComposingText` loses everything. This was real and is fixed:
+   composing text is forwarded as it changes, with what has already gone out
+   remembered so a correction rubs it out rather than sending the word twice.
+2. **the input connection generally** — guessed at, not the cause.
+3. **the actual cause**, found by adding one log point:
+
+        onKeyDown 37 unicode=105 wired=true
+        send failed: android.os.NetworkOnMainThreadException
+
+   `send()` wrote to the socket straight from the key callback, which is the
+   main thread, and Android forbids network I/O there. Worse than the refusal:
+   the failed write left JSch's stream closed, so every keystroke after the
+   first said "Already closed" — dead from the first letter with no sign why.
+
+Writes now go through a **single-threaded** executor. Single on purpose:
+keystrokes are ordered, and `ls` typed quickly must not arrive as `lsl`.
+`resize()` goes the same way — it is also a network write, and it fires every
+time the keyboard opens.
+
+The lesson is the ordering: the log point cost one build and settled in
+minutes what two readings of the symptom had got wrong.
+
+### The keystroke logging was removed with the bug
+
+While this was being chased every callback logged the character it received.
+That would have written any password typed at that prompt into logcat, where
+anything holding READ_LOGS can read it. A debugging aid that records what a
+person types is a keylogger with good intentions. What is left logs only
+whether the keyboard attached and whether the shell was wired.
+
+### The emulator
+
+`DgxScreen` is a character grid with enough VT100 to make `TERM=xterm`
+honest — printable text, the control characters, cursor movement, the erase
+family, scrolling regions and SGR colour, which covers ls, git, grep, tail -f,
+python, nvidia-smi, docker and journalctl. Not the alternate screen buffer's
+finer points, DEC line drawing or mouse reporting: vim and htop run and mostly
+look right, and are not the reason it exists.
+
+Plain arrays rather than a cell class: a 100x30 screen is 3,000 cells redrawn
+on every frame of a `tail -f`, and this tablet has had an ANR from the console
+before.
+
+### Staying signed in
+
+Two things were set on the tablet so the tunnel does not need re-establishing:
+
+    dumpsys deviceidle whitelist +com.tailscale.ipn
+    settings put global always_on_vpn_app com.tailscale.ipn
+    settings put global always_on_vpn_lockdown 0
+
+Lockdown is deliberately OFF. On it blocks all traffic whenever the tunnel is
+down, which would break the LAN road and leave the kiosk dead at home during
+any Tailscale hiccup.
+
+**Still needs the admin console:** the tablet's node key expires on the
+tailnet default. Machines → `trebledroid-vanilla` → Disable key expiry, or it
+will ask to be signed in again when the key runs out.
+
+## 13. What comes next
 
 1. **Unlock** — through the app, past the gate above, with the tablet confirming
    on its own screen.
@@ -967,7 +1068,7 @@ behaviour when it is at home anyway.
 
 ---
 
-## 13. Things that cost time, recorded so they do not again
+## 14. Things that cost time, recorded so they do not again
 
 - No adb on the machine means **no RSA prompt ever appears**. The empty device
   list is the symptom; the missing tool is the cause.
