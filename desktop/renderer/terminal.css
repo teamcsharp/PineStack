@@ -1,0 +1,142 @@
+/* The Terminal panel.
+ *
+ * A checklist, not a dashboard. Green means a gate is passed; red means
+ * something is in the way and the words beside it say what. The unlock
+ * card is deliberately the only red-bordered thing in the app.
+ */
+
+.view.tm-view.active { display: block; overflow: auto; }
+
+.tm-wrap {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  max-width: 980px;
+}
+
+.tm-head { display: flex; align-items: center; gap: 12px; }
+.tm-head h2 { margin: 0; font-size: 18px; }
+.tm-tools {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--muted); font-size: 11.5px;
+}
+.tm-tools.bad { color: var(--red); }
+
+.tm-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+}
+.tm-card h3 {
+  margin: 0 0 8px; font-size: 14px;
+  display: flex; align-items: center; gap: 10px;
+}
+.tm-card.danger { border-color: rgba(228, 107, 107, .5); }
+.tm-hint { margin: 0 0 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+
+.tm-state { font-size: 11px; font-weight: 600; color: var(--muted); }
+.tm-state.good { color: var(--green); }
+.tm-state.bad { color: var(--red); }
+
+.tm-facts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.tm-chip {
+  display: grid; gap: 1px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  min-width: 92px;
+}
+.tm-chip span { font-size: 10px; color: var(--muted); text-transform: lowercase; }
+.tm-chip b { font-size: 12.5px; }
+.tm-chip.good { border-color: rgba(84, 209, 139, .45); }
+.tm-chip.good b { color: var(--green); }
+.tm-chip.warn { border-color: rgba(227, 190, 99, .45); }
+.tm-chip.warn b { color: var(--amber); }
+.tm-chip.bad { border-color: rgba(228, 107, 107, .45); }
+.tm-chip.bad b { color: var(--red); }
+
+/* A blocker and a warning must never look alike - one stops the work and
+   the other does not, and blurring them teaches the operator to skim both. */
+.tm-verdict { display: grid; gap: 6px; }
+.tm-verdict p { margin: 0; font-size: 12px; line-height: 1.5; padding-left: 16px; position: relative; }
+.tm-blocker { color: var(--red); }
+.tm-blocker::before { content: "\2716"; position: absolute; left: 0; }
+.tm-warning { color: var(--amber); }
+.tm-warning::before { content: "\26A0"; position: absolute; left: 0; }
+
+.tm-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.tm-input {
+  flex: 1; min-width: 220px;
+  background: #0e141a; color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px;
+  padding: 7px 10px; font-size: 12px;
+}
+.tm-input:disabled { opacity: .45; }
+
+.tm-btn {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px;
+  padding: 7px 13px; font-size: 12px; cursor: pointer;
+}
+.tm-btn:hover:not(:disabled) { border-color: var(--cyan); }
+.tm-btn:disabled { opacity: .4; cursor: not-allowed; }
+.tm-btn.danger { border-color: rgba(228, 107, 107, .55); color: #ffb3b3; }
+.tm-btn.danger:hover:not(:disabled) { background: rgba(228, 107, 107, .18); border-color: var(--red); }
+
+.tm-note { color: var(--muted); font-size: 12px; min-height: 18px; }
+.tm-note.bad { color: var(--red); }
+
+.tm-out {
+  margin: 0; padding: 10px;
+  background: #0b1014; border: 1px solid var(--line); border-radius: 8px;
+  color: #9fd8b5; font-size: 11px; line-height: 1.5;
+  max-height: 280px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+}
+.tm-out:empty { display: none; }
+
+/* Discovered terminals. A row is clickable when it has an address to fill in. */
+.tm-found { display: grid; gap: 6px; margin-top: 10px; }
+.tm-found:empty { display: none; }
+.tm-found-row {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) 1fr auto;
+  gap: 10px; align-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+.tm-found-row:hover { border-color: var(--cyan); }
+.tm-found-row b { color: var(--cyan); }
+.tm-found-row span { color: var(--text); font-variant-numeric: tabular-nums; }
+.tm-found-row em { color: var(--muted); font-style: normal; font-size: 10.5px; }
+
+/* The chosen broadcast destination reads as a pressed key, not a label. */
+.tm-btn.on { background: var(--cyan); border-color: var(--cyan); color: #05131a; }
+
+/* The routing table: one card per device, its switch and its own volumes.
+ * Laid out so the device that is actually making noise is obvious at a
+ * glance from across the room - that is the question this card answers. */
+.tm-mix { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.tm-dev {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px;
+  background: rgba(255, 255, 255, .02);
+}
+.tm-dev.playing { border-color: var(--green); background: rgba(80, 200, 120, .06); }
+.tm-dev-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.tm-dev-head b { font-size: 13px; }
+.tm-dev-seen { font-size: 11px; color: var(--red); }
+.tm-dev-seen.here { color: var(--muted); }
+.tm-dev-why { font-size: 11px; color: var(--muted); flex: 1 1 120px; }
+.tm-dev-level {
+  display: flex; align-items: center; gap: 9px; margin-top: 6px; font-size: 11px;
+}
+.tm-dev-level span { width: 52px; color: var(--muted); }
+.tm-dev-level input[type="range"] { flex: 1 1 auto; accent-color: var(--green); }
+.tm-dev-level i { width: 38px; text-align: right; font-style: normal; color: var(--muted); }
+.tm-btn.small { padding: 3px 8px; font-size: 11px; }

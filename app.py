@@ -1197,6 +1197,14 @@ DEFAULT_DJ = {
     # three can land inside one exchange — spliced through the banter rather
     # than one punchline per round (#225).
     "sfx_gap": 12,
+    # #1232: HOW ANXIOUS THE SFX GUY IS. One dial over every clock he
+    # obeys - how long silence runs before he calls it dead air, how
+    # long he rests between clips, how many he plays in a row, and how
+    # readily he lands one on top of the talk. 0 leaves the numbers
+    # above exactly as they were; 100 is a man who cannot bear a pause.
+    # Default high on purpose: "the clips are funny and are a major part
+    # of the show, so I want him punctuating the dead air often."
+    "sfx_anxiety": 70,
     # --- Conversation Director: the performance layer (plan §7-9, §28-30).
     # Master switch and strength: 0 reads every line flat, 1 is the full
     # send. Identity vectors skip all the machinery, so plain stays plain.
@@ -2134,6 +2142,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         **_dj_range(raw_dj, "fx_min", "fx_max", 0, 100),
         "sfx_gap": max(0, min(600, int(
             raw_dj.get("sfx_gap", DEFAULT_DJ["sfx_gap"]) or 0))),
+        "sfx_anxiety": max(0, min(100, int(
+            raw_dj.get("sfx_anxiety", DEFAULT_DJ["sfx_anxiety"]) or 0))),
         # #835: the drop roots, and how often they are re-read. Same
         # leading-slash scrub as sfx_folders - the real containment
         # check still happens where the folder is opened (#208).
@@ -8835,7 +8845,8 @@ REPAIR_SEED = [
     # reporting on and unpaused and the listener polling every second:
     # 16 clips waiting in `received`, nineteen "play() interrupted by a
     # call to pause()" and eighteen "playback stalled", and a talk gap of
-    # 696s while the server went on making deliveries.
+    # 696s while the server went on making deliveries. A flush of the
+    # feed epoch ends it; the speaker ladder cannot see it at all.
     {"fp": "page:wedged", "cure": "page_flush",
      "why": "the page holds clip after clip and starts none of them - "
             "each retry's play() is cancelled by a pause() and nothing "
@@ -9124,6 +9135,18 @@ def page_wedge_state() -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 continue
         out["heard_at"] = round(heard_at, 1)
+        # #1239: the clock above needs to know somebody is out there to
+        # have heard anything - "never heard" is only a fault when
+        # there is somebody who would have reported it. _listeners_live
+        # is the same source api_broadcast_health counts.
+        try:
+            if not _LISTENERS_SEEN[0] and len(_listeners_live()) > 0:
+                _LISTENERS_SEEN[0] = time.time()
+        except Exception:  # noqa: BLE001
+            pass
+        # #1231: and when the pair were last HEARD, which is a different
+        # question from whether anything at all is sounding.
+        out["dialogue_quiet"] = round(dialogue_quiet_for(), 1)
         # Nothing audible anywhere in the ring counts as quiet - but it
         # can only ever matter alongside the two conditions below, which
         # a freshly started station does not meet.
@@ -13808,6 +13831,15 @@ SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 8, "caller": 8,
 # pantry_seconds() against prepare_target_seconds(), and the six-gigabyte
 # allowance below that.
 SHELF_ROW_CEILING = 3
+# #1237: what the FILLER roads are called when a verdict has to name
+# the thing that took an entry's window. Separate from SHELF_LABEL,
+# which lists prepared roads that have a shelf - none of these do.
+ROUND_LABEL = {
+    "gold": "the rhyme bank",
+    "cover": "a live cover line",
+    "sfxguy": "the SFX Guy",
+    "banter": "unnamed conversation",
+}
 SHELF_LABEL = {"ad": "an advert", "station_id": "a station ID",
                "manager": "a message from upstairs",
                "caller": "a phone call",
@@ -14099,7 +14131,41 @@ async def news_retop(text: str) -> str:
     return said
 
 
+# #1230: repeat_safe is a regex over up to 4,000 characters and it is
+# asked of every caller and manager row on every cupboard sweep - 128
+# of them since #1229 freed the shelf, against 12 before. The answer
+# turns on the WORDS and the HOUR and nothing else, so it is remembered
+# on exactly those two.
+_REPEAT_SAFE_MEMO: dict[tuple[int, str], bool] = {}
+
+
 def repeat_safe(kind: str, row: dict[str, Any]) -> bool:
+    try:
+        if str(kind) not in ("caller", "manager"):
+            return True                 # evergreen by nature - no work at all
+        said = str(row.get("text") or "")
+        if not said:
+            entry = row.get("entry")
+            if isinstance(entry, dict):
+                said = str(entry.get("script")
+                           or entry.get("script_plain") or "")
+        if not said:
+            return True
+        memo = (time.localtime().tm_hour,
+                hashlib.sha1(said[:4000].encode("utf-8", "ignore")).hexdigest())
+        held = _REPEAT_SAFE_MEMO.get(memo)
+        if held is not None:
+            return held
+        got = _repeat_safe_read(kind, row)
+        if len(_REPEAT_SAFE_MEMO) > 4000:
+            _REPEAT_SAFE_MEMO.clear()   # the hour turned, or the shelf did
+        _REPEAT_SAFE_MEMO[memo] = got
+        return got
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _repeat_safe_read(kind: str, row: dict[str, Any]) -> bool:
     """#1055: may this segment be heard again in three hours?
 
     An advert names a product and a painting read names a picture -
@@ -21852,6 +21918,51 @@ def _acknowledge_delivery_lines(delivery_id: str, clip: dict[str, Any],
     return speech
 
 
+# #1231: WHEN A LISTENER LAST HEARD THE PAIR TALK.
+#
+# Three clocks, and only two of them existed. _SPOKE_AT is the booth
+# queueing a line (#822 - not the room). air_quiet_for is a listener
+# hearing SOMETHING, and music answers that one. This is the third:
+# a listener hearing DIALOGUE, which is the only one the operator was
+# ever asking about. _DIALOGUE_AT looks like it and is stamped when a
+# round is handed OVER, which is the two-clocks mistake this file has
+# now made four times.
+_DIALOGUE_HEARD = [0.0]
+DIALOGUE_QUIET_ALARM = 300.0           # five minutes without a word
+# #1239: and how long a station that has NEVER been heard is given
+# before that counts. A page has to load, fetch a clip and start it,
+# and a listener can arrive at a genuinely silent moment - but this
+# ends, which is the whole defect it was written for.
+DIALOGUE_FIRST_GRACE = 90.0
+_LISTENERS_SEEN = [0.0]                # when listeners were first noticed
+
+
+def dialogue_quiet_for() -> float:
+    """Seconds since a listener last reported hearing the pair talk.
+
+    -1 when nobody has reported one yet AND there is nobody to report -
+    a station that has just started, or one with no listeners, is not a
+    silent one.
+
+    #1239: but with listeners connected and the process up past
+    DIALOGUE_FIRST_GRACE, "never heard" stops being an exemption and
+    becomes the WORST reading this can take - measured from the later
+    of process start and the moment listeners were first seen. That is
+    the exact state the operator found: on, unpaused, three listeners,
+    clips going out, not one acknowledged, and health reassuring him
+    about the first minute after a restart for a hundred seconds."""
+    now = time.time()
+    at = float(_DIALOGUE_HEARD[0] or 0)
+    if at:
+        return now - at
+    seen = float(_LISTENERS_SEEN[0] or 0)
+    if not seen:
+        return -1.0
+    began = max(seen, _BUILD_MS / 1000.0)
+    waited = now - began
+    return waited if waited >= DIALOGUE_FIRST_GRACE else -1.0
+
+
 def page_playback_ack(payload: Any, addr: str = "",
                       agent: str = "") -> dict[str, Any]:
     """Record one browser media event and promote only audible `playing`.
@@ -21886,6 +21997,12 @@ def page_playback_ack(payload: Any, addr: str = "",
         sequence = max(0, int(body.get("sequence") or 0))
     except (TypeError, ValueError):
         raise ValueError("invalid media position or sequence")
+    # #1231: the pair were HEARD. Only a delivery the feed marked as
+    # speech counts - page_feed_append excludes replies and stings - so
+    # a record cannot answer for the DJs.
+    if audible > 0 and event in ("playing", "ended") \
+            and bool(delivery.get("speech")):
+        _DIALOGUE_HEARD[0] = now
     listeners = delivery.setdefault("listeners", {})
     previous = listeners.get(listener) or {}
     if sequence and sequence <= int(previous.get("sequence") or 0):
@@ -23360,6 +23477,11 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                    ("speech_rate", "Speech rate", "range", 75, 125, 1)],
         "third": [("third_name", "Third-seat name", "text", 0, 0, 0),
                   ("sfxguy_rate", "SFX Guy interjections", "range", 0, 100, 1),
+                  # #1232: the one dial over every clock he obeys - how
+                  # soon he calls silence dead, how long he rests, how
+                  # many clips go out in a row, how readily he cuts in.
+                  ("sfx_anxiety", "SFX Guy anxiety (dead-air filling)",
+                   "range", 0, 100, 1),
                   ("sfxguy_warp", "SFX Guy invention", "range", 0, 100, 1)],
         "caller": [("callin_per_hour", "Calls per hour", "range", 0, 20, 1),
                    # #839: the request-line quota. Distinct from the line
@@ -24224,7 +24346,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    name: str = "", source_text: str = "",
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
-                   checked: bool = False, remember_text: str = "") -> str:
+                   checked: bool = False, remember_text: str = "",
+                   round_as: str = "") -> str:
     """#1146: the floor door for single lines. A cover, a news line or an
     interjection waits for the round that has the air instead of landing
     in the middle of it. Re-entrant: the recovery road inside a round is
@@ -24236,14 +24359,14 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             kind, track, extra=extra, line=line, who=who, voice=voice,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
-            checked=checked, remember_text=remember_text)
+            checked=checked, remember_text=remember_text, round_as=round_as)
     _owned = await _floor_take(f"a {kind} line from {who}")
     try:
         return await _dj_speak_floorless(
             kind, track, extra=extra, line=line, who=who, voice=voice,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
-            checked=checked, remember_text=remember_text)
+            checked=checked, remember_text=remember_text, round_as=round_as)
     finally:
         _floor_drop(_owned)
 
@@ -24256,7 +24379,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                    name: str = "", source_text: str = "",
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
-                   checked: bool = False, remember_text: str = "") -> str:
+                   checked: bool = False, remember_text: str = "",
+                   round_as: str = "") -> str:
     """Say it, log it to the chat channel so the panel can show the patter.
     `who` is "dj" or "cohost" — the co-host has his own voice so the two are
     told apart by ear, not only by the transcript. `source` is the speakbox
@@ -24967,7 +25091,12 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         "id": line_id,                                            # #742
         "ts": int(time.time()), "who": who, "kind": kind, "text": spoken,
         "air_at": _air_at or time.time(),                          # #770
-        "round": airlog_round_for(kind, who, name),              # #1023 (G1)
+        # #1237: the dispatching road may NAME itself. `interject` is
+        # the kind airlog_round_for refuses to name - it defers to the
+        # stale hint, or to "banter", which is the residue bucket
+        # wearing a real road's name. A filler that says what it is
+        # cannot be read back as the road whose window it filled.
+        "round": (str(round_as) or airlog_round_for(kind, who, name)),
         "name": booth_actor_name(who, name),
         # Who said it and what wrote it, on the line itself (#226). Sixty
         # voices and a settable model mean "that one — do that again" is
@@ -38722,8 +38851,14 @@ def surplus_topic() -> dict[str, Any]:
         got = surplus()
         if got <= 0.02:
             return {}
-        # From a coin flip up to nearly always, as the room allows.
-        if random.random() > (0.35 + 0.6 * got):
+        # #1226: THE FLOOR COMES UP. This was a coin flip at the bottom
+        # of the range, which was mercy while the bank held 87 topics
+        # all sprung a dozen times each - reaching for it more often
+        # would only have repeated them faster. With the cooker keeping
+        # fresh material in it, restraint is just silence: above a small
+        # surplus the bank is always in the draw and the chance climbs
+        # from there.
+        if random.random() > (0.60 + 0.4 * got):
             return {}
         return drop_bombshell() or {}
     except Exception:  # noqa: BLE001
@@ -42884,7 +43019,15 @@ DEAD_AIR_RESCUE_REST = 45.0
 # the deepest shelf on the station and needs a transport of its own,
 # because a call is an intro, a conversation and a sign-off rather than
 # one round that can be handed to _banter_air.
-RESCUE_ROADS_OPEN = ("manager", "gallery", "news")
+# #1238: AND CALLS. 127 of the 144 rows on the caller pile carried
+# recorded audio while in_dead_air_stock read 0 and the road reported
+# "NOT one the rescue may open" - the operator's most important road,
+# finished and unreachable, while holes were filled with emergency_host
+# and with banter that was 66/68 spent. The order below already listed
+# caller third and dead_air_rescue already promotes the road the sheet
+# is ON, so this changes which roads may be reached and nothing about
+# which is preferred.
+RESCUE_ROADS_OPEN = ("manager", "gallery", "news", "caller")
 # #1221: THE ARREARS BOOK IS WIDER THAN THE RESCUE.
 #
 # RESCUE_ROADS_OPEN answers "what may interrupt a silence". This answers
@@ -42912,6 +43055,16 @@ def dead_air_stock() -> dict[str, int]:
             rows = [r for r in road_source(kind)
                     if id(r) not in _READY_SHELF_BUSY
                     and _ready_round_takes(kind, r)]
+            # #1238c: ...AND THE DOOR WOULD ACTUALLY OPEN. The takes test
+            # says a round is finished; it does not say the road's own
+            # door will serve it. The caller road is a switchboard
+            # (#1033) - unaired in strict FIFO, then only calls inside a
+            # 6..10 hour re-air window - and with 18 unaired rows that
+            # fail the takes test and 126 aired a median of 20 hours ago,
+            # it reported 126 available while shelf_take would serve
+            # none. That is precisely the over-report #1165 removed.
+            if rows and _ready_shelf_row(kind, rescue=True) is None:
+                continue
             if rows:
                 out[kind] = len(rows)
         except Exception:  # noqa: BLE001
@@ -43248,6 +43401,17 @@ async def dead_air_watch() -> None:
                     await entry_unanswered_fill() or await entry_arrears_serve()
                 except Exception:  # noqa: BLE001
                     pass
+            # #1235: ASK THE SFX GUY FIRST. The reset below is right
+            # that a record is sound in the room - and it ends the pass,
+            # so everything under it has been unreachable for as long as
+            # there is music on, which is nearly always. Measured: 42
+            # seconds of nobody saying a word, gap filler never called.
+            # The operator's dead air is the PAIR being silent, not the
+            # room, and #1231 built the clock that tells them apart.
+            try:
+                await sfx_fill_over_music()
+            except Exception:  # noqa: BLE001
+                pass        # the watchdog never dies of its own cure
             if ((now_really_playing() and (_room_gets_music
                                            or not _voice_boxed))
                     or _SPEAKING[0] or _floor_busy()):          # #1146
@@ -43293,7 +43457,10 @@ async def dead_air_watch() -> None:
                     pass        # the watchdog never dies of its own cure
             # 2026-09-08: silence is PUNCTUATED long before it is a strike
             # - a clip that exists, every tick the room stays quiet.
-            if quiet > min(float(limit), 12.0):
+            # #1232: and HOW LONG it must be silent first is the dial's,
+            # not a hard twelve seconds. This was the shortest hole the
+            # SFX Guy could ever hear.
+            if quiet > sfx_gap_notice(limit):
                 try:
                     await sfx_fill_gap(f"the room has been silent {int(quiet)}s",
                                        under_floor=True)
@@ -59958,6 +60125,17 @@ async def sfxguy_ready_prepare(limit: int = 1) -> dict[str, Any]:
         profile = _sfxguy_ready_profile()
         sources = [{"text": text, "generic": True} for text in REACTION_SOURCES]
         sources += [{"text": text, "generic": False} for text in sfxguy_quips(voice)[:16]]
+        # #1233: AND THE TOPICS BOARD. Everything above is a reply to
+        # somebody else talking - eight back-channels and his quips - so
+        # dropped into a silence he had nothing to say that was not
+        # addressed to a line that was not there. The board is 127 things
+        # the operator wants heard and he was never given one.
+        #
+        # generic=True on purpose: pick() only serves a generic row when
+        # there is no line to answer, and a topic blurted into dead air
+        # is not an answer to anything.
+        sources += [{"text": text, "generic": True}
+                    for text in sfx_topic_sources(SFXGUY_TOPIC_SEED)]
         _SFX_READY_BANK.seed(voice, profile, sources)
         for row in _SFX_READY_BANK.due(voice, profile):
             if _sfxguy_ready_valid(row, voice):
@@ -61509,7 +61687,8 @@ def sfx_by_id(wanted: str) -> Path | None:
     # cached pool and sfx_all() do not always spell the same file the
     # same way - so an id minted from one could not be looked up through
     # the other, and the SFX desk's play button served a 404 on a clip
-    # sitting right there. Cheap, and it spares the CIFS walk besides.
+    # that was sitting right there. Cheap, and it also spares the CIFS
+    # walk on the common case.
     try:
         for path in sfx_pool_cached():
             if sfx_id(path) == wanted:
@@ -62412,7 +62591,12 @@ def sting_due() -> Path | None:
     # inside" slider did NOTHING below forty-five seconds and the desk's own
     # default of 12 was unreachable — which is why the show sounded bare.
     # A floor of three keeps one sting from landing on top of the last.
-    if time.time() - _STING_AT[0] < max(3.0, float(dj["sfx_gap"])):
+    # #1232: anxiety pulls this one too. sfx_gap was doing two unrelated
+    # jobs - the rest between dead-air fills AND the lockout on landing a
+    # sting over live talk - so the dial moves both: an anxious SFX Guy
+    # interrupts as well as fills.
+    _sting_rest = max(3.0, float(dj["sfx_gap"]) * (1.0 - 0.8 * sfx_anxiety()))
+    if time.time() - _STING_AT[0] < _sting_rest:
         return None
     if random.random() >= dj["sfx_rate"]:
         return None
@@ -62591,9 +62775,230 @@ _SFX_GAP: dict[str, Any] = {"at": 0.0, "turn": 0, "count": 0, "why": "", "went":
 # afford it - 400 gold bars at a five-minute rest serve 300 an hour
 # against the 174 the rule needs.
 SFX_GAP_REST = float(os.getenv("SFX_GAP_REST", "6"))
+# #1232: and what anxiety pulls those clocks down TO. The floors are
+# what the page road can actually carry back to back without the runs
+# overlapping each other; below them the extra clips would only be
+# refused by the cursor test above.
+SFX_ANXIOUS_REST = 1.5           # the shortest rest between clips
+SFX_ANXIOUS_NOTICE = 3.0         # the shortest silence he will call dead
+SFX_ANXIOUS_BURST = 4            # the most clips in one go
 
 
-async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
+SFXGUY_TOPIC_SEED = 24           # topics handed to his bank per sitting
+_SFX_TOPIC_CACHE: dict[str, Any] = {"at": 0.0, "rows": []}
+
+
+def _sfx_topic_rows() -> list[str]:
+    """The topics board as plain lines, re-read at most once a minute.
+
+    sfx_fill_gap runs on the event loop every couple of seconds at any
+    anxiety worth the name, and reading a file per fill is the mistake
+    #1216, #1218 and #1230 were each about. A minute is finer resolution
+    than a board of 127 topics has ever needed."""
+    try:
+        now = time.time()
+        if (now - float(_SFX_TOPIC_CACHE.get("at") or 0) > 60.0
+                or not _SFX_TOPIC_CACHE.get("rows")):
+            rows = []
+            for row in (read_bombshells() or []):
+                text = str((row or {}).get("text") or "").strip()
+                if 12 <= len(text) <= 400:
+                    rows.append(text)
+            _SFX_TOPIC_CACHE["rows"] = rows
+            _SFX_TOPIC_CACHE["at"] = now
+        return list(_SFX_TOPIC_CACHE.get("rows") or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def sfx_topic_sources(most: int = 24) -> list[str]:
+    """Topics to hand his bank, least-sprung first.
+
+    Read straight off the board rather than through the cache above:
+    this is called from the bounded preparation job, not the air road,
+    and it wants the freshest ordering it can get."""
+    try:
+        rows = [r for r in (read_bombshells() or [])
+                if 12 <= len(str((r or {}).get("text") or "").strip()) <= 400]
+        rows.sort(key=lambda r: int(r.get("used") or 0))
+        return [str(r.get("text")).strip() for r in rows[:max(0, int(most))]]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def sfx_topic_line() -> str:
+    """One topic for him to be thinking about while he fills a hole."""
+    pool = _sfx_topic_rows()
+    return random.choice(pool) if pool else ""
+
+
+def sfx_anxiety() -> float:
+    """The SFX Guy's anxiety, 0.0 (patient) to 1.0 (cannot bear a pause).
+
+    Read wherever one of his clocks is computed rather than stored, so
+    the dial takes effect on the next tick and never at a restart."""
+    try:
+        return max(0.0, min(1.0,
+                            float(dj_settings().get("sfx_anxiety") or 0) / 100.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def sfx_gap_rest() -> float:
+    """How long he waits between clips.
+
+    The old number was max(SFX_GAP_REST, sfx_gap), which put a six-second
+    FLOOR under the operator's own dial - turning sfx_gap down past six
+    did nothing at all. Anxiety pulls the whole thing down through that
+    floor, which is the point: "playing a clip every few moments is not
+    cutting it"."""
+    rest = SFX_GAP_REST
+    try:
+        rest = max(rest, float(dj_settings().get("sfx_gap") or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    anx = sfx_anxiety()
+    if anx <= 0:
+        return rest
+    return max(SFX_ANXIOUS_REST, rest * (1.0 - 0.92 * anx))
+
+
+def sfx_gap_notice(limit: float = 12.0) -> float:
+    """How long silence runs before he calls it dead air.
+
+    The watchdog punctuates at min(limit, 12) seconds of quiet, so the
+    shortest hole he could ever hear was twelve seconds of nothing. At
+    full anxiety he hears three."""
+    base = min(float(limit or 12.0), 12.0)
+    anx = sfx_anxiety()
+    if anx <= 0:
+        return base
+    return max(SFX_ANXIOUS_NOTICE, base * (1.0 - 0.75 * anx))
+
+
+def sfx_music_notice() -> float:
+    """#1235: how long the PAIR must be silent before he starts working
+    over a record. Longer than sfx_gap_notice on purpose - the room is
+    not dead, the show just is."""
+    anx = sfx_anxiety()
+    return max(10.0, 60.0 * (1.0 - 0.8 * anx))
+
+
+def sfx_music_rest() -> float:
+    """#1235: and how long between goes while the record plays."""
+    anx = sfx_anxiety()
+    return max(6.0, 30.0 * (1.0 - 0.9 * anx))
+
+
+async def sfx_fill_over_music() -> str:
+    """#1235: the pair have gone quiet under a record. Punctuate it.
+
+    Called from the dead-air watchdog BEFORE the pass resets on "a
+    record is playing", which is why the filler was never reached in
+    ordinary running: 42 seconds of nobody talking, and the gap filler
+    had not been called once.
+
+    Its own rest clock, so a run over a record cannot inherit the
+    two-second cadence meant for a hole in the talk. Everything that
+    protects a live voice is still inside sfx_fill_gap."""
+    try:
+        if radio_paused() or not _RADIO.get("on") or _SPEAKING[0]:
+            return ""
+        mute = dialogue_quiet_for()
+        if mute < sfx_music_notice():
+            return ""
+        if time.time() - float(_SFX_GAP.get("music_at") or 0) < sfx_music_rest():
+            return ""
+        _SFX_GAP["music_at"] = time.time()
+        went = await sfx_fill_gap(
+            "the pair have not been heard for %ds and a record is playing"
+            % int(mute), under_floor=True,
+            # The soundboard and his own voice - the two things the
+            # operator named - and this road's own rest clock rather
+            # than a write into the one the hole road reads.
+            clips_only=True, ignore_rest=True)
+        if went:
+            _SFX_GAP["over_music"] = int(_SFX_GAP.get("over_music") or 0) + 1
+        return went
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def sfx_gap_burst() -> int:
+    """How many clips go out in one fill - the operator's "how many".
+
+    One at rest. At full anxiety four in a row, which on the page road
+    means four queued back to back over the next several seconds, not
+    four at once: the run behaves like any other and the cursor test
+    stands the filler down the moment real material is ready."""
+    return max(1, min(SFX_ANXIOUS_BURST,
+                      1 + int(sfx_anxiety() * (SFX_ANXIOUS_BURST - 1) + 0.5)))
+
+
+async def sfxguy_gap_talk(why: str = "", floorless: bool = False) -> str:
+    """#1233: the SFX Guy TALKS into the hole - a whole line already
+    recorded in his voice, chosen against a topic off the board.
+
+    His bank has always existed and has only ever been read from the
+    cadence planner, which appends an interjection inside a round that
+    is already speaking - so the one moment the station had nothing to
+    say was the one moment he was not asked. Nothing renders here: the
+    take is on disk, the same as a gold bar.
+
+    The topic is the PICK CONTEXT, not the words: pick() ranks by how
+    many terms a prepared line shares with the context, so drawing a
+    topic off the board is how he chooses which of his lines to say -
+    the one that best answers the thing he is thinking about."""
+    def _no(reason: str) -> str:
+        _SFX_GAP["talk_why"] = reason
+        return ""
+    try:
+        voice = str(dj_settings().get("drop_voice") or "")
+        if not voice:
+            return _no("no SFX speaker voice is configured (drop_voice)")
+        take = sfxguy_ready_pick(sfx_topic_line(), voice)
+        if not take:
+            return _no("nothing in his bank is recorded, rested and free")
+        token = str(take.get("id") or "")
+        name = str((take.get("clip") or {}).get("path")
+                   or "").split("?", 1)[0].rsplit("/", 1)[-1]
+        text = str(take.get("text") or "").strip()
+        if not name or not text:
+            if token:
+                sfxguy_ready_release(token)
+            return _no("the reserved line has no take on disk")
+        clip = {"path": "/media/" + name, "sig": media_sign(name),
+                "seconds": float(take.get("seconds") or 0)}
+        door = _dj_speak_floorless if floorless else dj_speak
+        try:
+            out = await door("interject", None, line=text, who="drop",
+                             voice=voice, name="The SFX Guy",
+                             checked=True, sting=False, clip=clip,
+                             round_as="sfxguy")          # #1237
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("air", "the SFX Guy could not fill the air: "
+                         + f"{type(exc).__name__}: {exc}"[:140])
+            out = ""
+        if not out:
+            if token:
+                sfxguy_ready_release(token)
+            return _no("the air road refused the line - "
+                       + ("somebody is talking" if _SPEAKING[0] else
+                          "the floor is held" if _floor_busy() else
+                          "the air is sold ahead"))
+        if token:
+            sfxguy_ready_commit(token)
+        _SFX_GAP["talk_why"] = "talked"
+        pipeline_log("air", "the SFX Guy talks into the dead air"
+                     + (f" - {why}" if why else "") + f": {text[:70]}")
+        return "talk"
+    except Exception as exc:  # noqa: BLE001
+        return _no("raised " + type(exc).__name__)
+
+
+async def sfx_fill_gap(why: str = "", under_floor: bool = False,
+                       clips_only: bool = False,
+                       ignore_rest: bool = False) -> str:
     """Punctuate dead air with a clip that already exists - the SFX Guy's
     prepared station liner off its shelf when he has one (the pantry
     serves it; nothing renders), else a short sample off the pool - and
@@ -62630,12 +63035,9 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
                 return ""
         except Exception:  # noqa: BLE001
             pass
-        rest = SFX_GAP_REST
-        try:
-            rest = max(rest, float(dj_settings().get("sfx_gap") or 0))
-        except Exception:  # noqa: BLE001
-            pass
-        if time.time() - float(_SFX_GAP.get("at") or 0) < rest:
+        rest = sfx_gap_rest()                      # #1232: the dial
+        if (not ignore_rest
+                and time.time() - float(_SFX_GAP.get("at") or 0) < rest):
             return ""
         _SFX_GAP["at"] = time.time()
         _SFX_GAP["turn"] = int(_SFX_GAP.get("turn") or 0) + 1
@@ -62658,10 +63060,16 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
         # on the floorless road, because it is a clip that already exists.
         # Only the liner still waits for the floor - a liner is written and
         # rendered, and would queue behind the round it is covering for.
-        went = await gold_fill_gap(
+        # #1235b: ...unless this is a record being punctuated. The run
+        # lays up to twelve bars and three minutes of rhymed speech
+        # because a HOLE should be filled until it closes; a record is
+        # not a hole, and burying it under verse every eleven seconds is
+        # the opposite of punctuating it.
+        went = "" if clips_only else await gold_fill_gap(
             why, floorless=floor_held,
             ahead=GOLD_RUN_AHEAD_HELD if floor_held else GOLD_RUN_AHEAD)
-        if not went and drop_voice and not floor_held and _SFX_GAP["turn"] % 2 == 0:
+        if (not went and not clips_only and drop_voice and not floor_held
+                and _SFX_GAP["turn"] % 2 == 0):
             # A liner written and recorded for this voice earlier (#842):
             # the same road dj_sting's drop branch takes.
             _prep = None
@@ -62681,11 +63089,52 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
                 went = "sample" if await dj_sting(to_box, who="gap", force=True) else ""
             except Exception:  # noqa: BLE001
                 went = ""
+        if not went:
+            # #1233: "either clips or him incessantly talking about
+            # topics from the topics board." When the board has no sample
+            # to give - every clip rested, or the pool empty - he says
+            # something instead of the hole staying open.
+            went = await sfxguy_gap_talk(why, floorless=floor_held)
+        # #1232: AND HOW MANY. One clip and twelve seconds of nothing is
+        # the "every few moments" the operator says is not cutting it.
+        # Samples only - the soundboard is what he is asking for, and
+        # gold bars and liners are written material with their own worth
+        # and their own rest. Each extra queues behind the last on the
+        # page road; the cursor test at the top of this function is what
+        # stops the pile growing once real material is ready.
+        extra = 0
         if went:
-            _SFX_GAP["count"] = int(_SFX_GAP.get("count") or 0) + 1
+            # #1233: the burst ALTERNATES. Samples alone were the whole
+            # burst, and the operator's SFX Guy does two jobs - "either
+            # clips or him incessantly talking about topics from the
+            # topics board" - so every other clip in the run is him
+            # saying something off the board instead.
+            for _step in range(sfx_gap_burst() - 1):
+                laid = ""
+                if _step % 2 == 1:
+                    laid = await sfxguy_gap_talk(why, floorless=floor_held)
+                if not laid:
+                    try:
+                        laid = ("sample" if await dj_sting(
+                            to_box, who="gap", force=True) else "")
+                    except Exception:  # noqa: BLE001
+                        laid = ""
+                if not laid and _step % 2 == 0:
+                    laid = await sfxguy_gap_talk(why, floorless=floor_held)
+                if not laid:
+                    break
+                if laid == "talk":
+                    _SFX_GAP["talked"] = int(_SFX_GAP.get("talked") or 0) + 1
+                extra += 1
+        if went == "talk":
+            _SFX_GAP["talked"] = int(_SFX_GAP.get("talked") or 0) + 1
+        if went:
+            _SFX_GAP["count"] = int(_SFX_GAP.get("count") or 0) + 1 + extra
+            _SFX_GAP["burst"] = 1 + extra
             _SFX_GAP["why"] = str(why)[:120]
             _SFX_GAP["went"] = went
             pipeline_log("air", f"dead air punctuated with a {went}"
+                                + (f" and {extra} more clip(s)" if extra else "")
                                 + (f" - {why}" if why else "")
                                 + (" (under the floor)" if floor_held else ""))
         return went
@@ -62696,7 +63145,19 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
 
 
 def sfx_gap_status() -> dict[str, Any]:
-    return {**_SFX_GAP, "rest": SFX_GAP_REST}
+    # #1232: the numbers the dial is actually producing, not the constant
+    # it used to report - which was never the rest in force anyway.
+    anx = sfx_anxiety()
+    return {**_SFX_GAP, "rest": round(sfx_gap_rest(), 2),
+            "anxiety": int(round(anx * 100)),
+            "notices_after": round(sfx_gap_notice(), 1),
+            "notices_over_music_after": round(sfx_music_notice(), 1),
+            "rest_over_music": round(sfx_music_rest(), 1),
+            "clips_per_fill": sfx_gap_burst(),
+            "rest_floor": SFX_GAP_REST,
+            "say": ("the SFX Guy calls it dead air after %.0fs, plays %d "
+                    "clip(s) a go and rests %.1fs between them"
+                    % (sfx_gap_notice(), sfx_gap_burst(), sfx_gap_rest()))}
 
 
 async def dj_sting(to_box: bool, after: str = "", who: str = "",
@@ -62961,12 +63422,25 @@ def _bin_key(text: str) -> str:
 _BINNED_MEMO: dict[str, Any] = {"sig": None, "rows": [], "keys": frozenset()}
 
 
+_BINNED_LOOKED = [0.0]
+
+
 def _binned_memo() -> dict[str, Any]:
     """The bin list and its lookup set, memoised on (mtime, size).
 
     A memo keyed on the file's own stamp answers exactly what a fresh
-    read would - bin_line() writes the file, which moves both."""
+    read would - bin_line() writes the file, which moves both.
+
+    #1230: and the STAT is only taken once a second. #1216 made the
+    parse cheap; the syscall behind it is still paid on every call, and
+    this is called once per take, per row, per road, per sweep -
+    thousands of times a minute since #1229 freed the shelf. A bin list
+    does not need finer resolution than a second."""
     try:
+        if time.time() - _BINNED_LOOKED[0] < 1.0 \
+                and _BINNED_MEMO.get("sig") is not None:
+            return _BINNED_MEMO
+        _BINNED_LOOKED[0] = time.time()
         st = BINNED_PATH.stat()
         sig = (st.st_mtime_ns, st.st_size)
     except Exception:  # noqa: BLE001
@@ -63278,9 +63752,12 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
         text = str(bar.get("text") or "")
         _door = _dj_speak_floorless if floorless else dj_speak
         try:
+            # #1237: a bar off the bank is the BANK filling a hole, not
+            # the round whose window the hole is in.
             out = await _door("interject", None, line=text,
                               who=str(bar.get("who") or "dj"),
-                              checked=True, sting=False, clip=clip)
+                              checked=True, sting=False, clip=clip,
+                              round_as="gold")
         except Exception as exc:  # noqa: BLE001
             pipeline_log("air", "a gold bar could not fill the air: "
                          f"{type(exc).__name__}: {exc}"[:160])
@@ -65409,26 +65886,85 @@ def media_present(name: str) -> bool:
     return there
 
 
+# #1228: WHY A FINISHED ROUND IS NOT READY, said by the function that
+# decides it. There are eight ways out of _ready_round_takes and nothing
+# recorded which one fired, so "144 written and 8 airable" could only be
+# guessed at - and the guess was wrong once already (#1225, reverted).
+#
+# A counter, not a log: this runs for every row of every road on every
+# sweep, and #1216/#1218 were both about exactly that path, so nothing
+# here may allocate or format. One dict increment.
+_TAKES_WHY: dict[str, dict[str, int]] = {}
+
+
+def _takes_no(kind: str, why: str) -> list[dict[str, Any]]:
+    """Record why this row cannot air, and refuse it."""
+    try:
+        book = _TAKES_WHY.setdefault(str(kind), {})
+        book[why] = book.get(why, 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
+def takes_why(kind: str = "") -> dict[str, Any]:
+    """#1228: the refusal census, per road, since the last restart."""
+    if kind:
+        return dict(_TAKES_WHY.get(str(kind)) or {})
+    return {road: dict(book) for road, book in _TAKES_WHY.items()}
+
+
 def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
     """Validate saved performances without rebuilding voices or speech text."""
     try:
         if not dialogue_row_ready(kind, row):
-            return []
+            return _takes_no(kind, "the row itself is not ready")
         entry = dialogue_entry(row)
-        if not entry or not _larder_current(entry):
-            return []
+        if not entry:
+            return _takes_no(kind, "no dialogue entry on the row")
+        if not _larder_current(entry):
+            # The #1160 trap: the writing contract carries the crystal
+            # and the plot's act, so an act rolling over orphans every
+            # plain round written under the old one.
+            return _takes_no(kind, "written under an older writing "
+                                   "contract (_larder_current)")
         takes = sorted(list(entry.get("takes") or []), key=lambda t: int(t.get("i", -1)))
         count = int(entry.get("chunks") or 0)
         if not count or len(takes) != count or [int(t.get("i", -1)) for t in takes] != list(range(count)):
-            return []
+            return _takes_no(kind, "the takes do not match the script's "
+                                   "chunk count or order")
         if kind == "news" and time.time() - float(entry.get("prep_news_at") or 0) > NEWS_PREP_LIFE:
-            return []
+            return _takes_no(kind, "the bulletin is past its life")
         ready = []
         for take in takes:
             text, voice, who, key = (str(take.get(k) or "") for k in ("text", "voice", "who", "key"))
             saved = _PANTRY.get(key) or {}
             clip = saved.get("clip") or {}
             name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
+            # #1229: THE STATION-NAME VETO IS GONE FROM HERE.
+            #
+            # It read `station_name_scrub(text) != text`, and that
+            # function is RANDOM by design (#459): "roughly one line in
+            # four that names it keeps the full name", implemented as
+            # `if random.random() < 0.25: return text`. Used as a purity
+            # test it therefore refused a round on a coin flip, per
+            # line, re-rolled on every sweep - so a round naming the
+            # station passed only when every one of its eleven lines
+            # won the toss, which is never.
+            #
+            # Measured by the census this was added alongside: of 144
+            # caller rounds refused, 96 were refused for this and
+            # nothing else. All of them written, tinted, recorded, with
+            # their clips on disk. Meanwhile _larder_current - the
+            # writing-contract check I twice predicted was the cause -
+            # fired ZERO times.
+            #
+            # The governor's place is prep_air_text, at WRITING time,
+            # where it already is and where it loops up to eight times
+            # precisely to defeat that randomness. Finished audio that
+            # says the station's name is not a defect worth binning a
+            # hundred rounds for, and #459 already allows the pair to
+            # say it.
             if (not text.strip() or not voice or who not in ("dj", "cohost", "third", "caller", "caller2")
                     # #1218: one cached answer instead of two stats per
                     # take, per row, per sweep. Same verdict - a missing
@@ -65438,8 +65974,26 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
                     or str(saved.get("voice") or "") != voice[:64]
                     or key not in {pantry_key(text, voice, engine) for engine in
                                    ("piper", "xtts", "f5", "voxtral")}
-                    or is_binned(text) or station_name_scrub(text) != text):
-                return []
+                    or is_binned(text)):
+                # Which of them, so a whole road is not written off for
+                # one missing clip or one stale pantry row.
+                return _takes_no(kind, (
+                    "a take has no text" if not text.strip() else
+                    "a take has no voice" if not voice else
+                    "a take is on a seat that cannot air" if who not in
+                    ("dj", "cohost", "third", "caller", "caller2") else
+                    "a take has no clip name" if not name else
+                    "a take's clip is missing from disk" if not media_present(name)
+                    else "the pantry's text does not match the take"
+                    if str(saved.get("text") or "") != text[:600] else
+                    "the pantry's voice does not match the take"
+                    if str(saved.get("voice") or "") != voice[:64] else
+                    "a line is binned" if is_binned(text) else
+                    # Deliberately NOT recomputed: the key test builds
+                    # four pantry keys, and this path is hot for exactly
+                    # the rows that fail it. #1216 and #1218 were both
+                    # about work like that on this sweep.
+                    "the take's key is not a pantry key for any engine"))
             ready.append({**dict(take), "clip": dict(clip)})
 
         def runs(parts: Any) -> list[tuple[str, list[str]]]:
@@ -65461,7 +66015,8 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
                          str(entry.get("caller_name") or "")))
         recorded = runs((take["who"], take["text"]) for take in ready)
         if not source or [s[0] for s in source] != [s[0] for s in recorded]:
-            return []
+            return _takes_no(kind, "the recorded speaker order does not "
+                                   "match the script")
         for (_, expected), (_, actual) in zip(source, recorded):
             # Saved breath/stutter words may surround the complete original
             # words, but no source turn may vanish or cross another speaker.
@@ -65471,17 +66026,22 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
             if (len(actual) > len(expected) * 1.5 + 8
                     or any(word not in extra_words for word in actual)
                     or not all(any(word == got for got in cursor) for word in expected)):
-                return []
+                return _takes_no(kind, "a turn's words drifted from the "
+                                       "script")
         return ready
-    except (KeyError, TypeError, ValueError, OSError):
-        return []
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        return _takes_no(kind, "raised " + type(exc).__name__)
 
 
 def _ready_slot_window(kind: str) -> dict[str, Any] | None:
     """Read the running occurrence without advancing or consuming its clock."""
     system2 = globals().get("_system2")
     if system2 and system2().enabled:
-        slot = system2().current_clock()
+        # #1224: the BRIEF read. This is asked on every cupboard check
+        # for every road, and it read a clock that deep-copied the whole
+        # slot - prompt, allocations, candidates and all - twice, to
+        # answer four fields.
+        slot = system2().current_slot_brief()
         # A missing System2 occurrence is unavailable, not unrestricted.
         road = str(slot.get("kind") or "")
         return {"occurrence": str(slot.get("occurrence") or ""),
@@ -65613,8 +66173,14 @@ def _ready_shelf_row(kind: str, rescue: bool = False
     The rescue never once selected a round.
 
     A rescue may air a FINISHED round out of turn. It may not air an
-    unfinished one, so the takes test stands either way."""
-    if kind not in ("gallery", "news", "manager"):
+    unfinished one, so the takes test stands either way.
+
+    #1238b: and WHICH roads is RESCUE_ROADS_OPEN's question, not a
+    fourth copy of the answer. This read ("gallery", "news", "manager")
+    of its own, so opening that list to caller changed the count and
+    nothing else - dead_air_rescue tried the road, came through here,
+    and got None."""
+    if kind not in RESCUE_ROADS_OPEN:
         return None
     window = None if rescue else _ready_slot_window(kind)
 
@@ -65864,7 +66430,10 @@ def gap_kind_policy(kind: str, dj: dict[str, Any] | None = None,
         # rooms; it just cannot make the listener wait while it is written.
         if (talk_is_incessant(dj)
                 and kind not in ("banter", "caller")):
-            if kind in ("gallery", "news", "manager") and _ready_shelf_row(kind):
+            # #1238b: the same list a third time. A road with a
+            # finished round of its OWN is not improved by being
+            # replaced with banked banter, whichever road it is.
+            if kind in RESCUE_ROADS_OPEN and _ready_shelf_row(kind):
                 return kind, ""
             # At the absolute top stop, "a script exists" is not enough.
             # A shelf road can invalidate its own takes while freshening or
@@ -66707,8 +67276,12 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
                         f"rendering{(' - ' + why) if why else ''} (#784)",
                  extra=text[:300])
     try:
+        # #1237: the live cover is the COVER road, not the round
+        # whose window it is covering. This line is the largest single
+        # contributor to the residue the verdict reads as "banter".
         out = await dj_speak("interject", _RADIO.get("now"), line=text,
-                             who=who, voice=voice or None)
+                             who=who, voice=voice or None,
+                             round_as="cover")
     except Exception:
         return bool(punctuated)
     if out and line.get("file"):
@@ -67251,6 +67824,136 @@ def use_bombshell(topic_id: str, shape: str = "") -> None:
                     row["shapes"] = (had + [shape])[-len(BANTER_SHAPES):]
                     row["shape"] = shape
         write_bombshells(rows)
+
+
+# #1226: THE COOKER. The bank was 87 topics, every one sprung 13 or 14
+# times, and nothing in the station had ever written one.
+TOPIC_COOK_REST = 420.0          # at most one sitting every seven minutes
+TOPIC_COOK_BATCH = 5             # asked for per sitting
+TOPIC_COOK_DEEP = 40             # stop once the least-used has this many peers
+_TOPIC_COOK = {"at": 0.0, "made": 0, "why": "not started"}
+
+
+def topic_bank_state() -> dict[str, Any]:
+    """How fresh the things-to-spring-on-them bank is."""
+    rows = read_bombshells()
+    used = sorted(int(r.get("used") or 0) for r in rows) or [0]
+    fresh = sum(1 for u in used if u <= 0)
+    return {"topics": len(rows), "never_used": fresh,
+            "least_used": used[0], "most_used": used[-1],
+            "median_used": used[len(used) // 2],
+            "made_tonight": int(_TOPIC_COOK.get("made") or 0),
+            "why": str(_TOPIC_COOK.get("why") or "")}
+
+
+async def topic_cook_once() -> int:
+    """Write a few new things to spring on them, off the speakbox.
+
+    Returns how many went into the bank. Everything that guards the
+    other preparation roads guards this one, and it asks for nothing at
+    all unless the room is genuinely spare."""
+    if not _RADIO.get("on") or radio_paused():
+        _TOPIC_COOK["why"] = "the station is off air"
+        return 0
+    if time.time() - float(_TOPIC_COOK.get("at") or 0) < TOPIC_COOK_REST:
+        return 0
+    if prep_should_stop() or not pantry_window():
+        _TOPIC_COOK["why"] = "the room is wanted by the live road"
+        return 0
+    # "When idle" - the cupboard is at or past what the operator asked
+    # to keep standing by, so the writing room has nothing else to do.
+    try:
+        if prepared_seconds() < prepare_target_seconds():
+            _TOPIC_COOK["why"] = ("the cupboard is still filling - topics "
+                                  "wait until the rounds are banked")
+            return 0
+    except Exception:  # noqa: BLE001
+        pass
+    state = topic_bank_state()
+    if state["never_used"] >= TOPIC_COOK_DEEP:
+        _TOPIC_COOK["why"] = ("%d unused topic(s) already waiting - the "
+                              "bank is deep enough" % state["never_used"])
+        return 0
+    if state["topics"] >= BOMBSHELL_MAX:
+        _TOPIC_COOK["why"] = "the bank is full"
+        return 0
+    _TOPIC_COOK["at"] = time.time()
+    try:
+        swath = await speakbox_quote(most=3, cap=900) or {}
+    except Exception:  # noqa: BLE001
+        swath = {}
+    seed = str(swath.get("text") or "").strip()
+    if not seed:
+        _TOPIC_COOK["why"] = "the speakbox had nothing to read"
+        return 0
+    ask = (
+        "Below is a passage from one of the station's own documents.\n\n"
+        + seed[:900]
+        + "\n\nWrite %d THINGS TO SPRING ON THEM: each one a single "
+        "sentence that one presenter could drop on the other cold, "
+        "mid-show, with no warning - a confession, an accusation, a piece "
+        "of news, something they have done. Take the flavour of the "
+        "passage but do not quote it and do not explain it. First person, "
+        "spoken out loud, plain and blunt. No preamble, no numbering, no "
+        "quotation marks. One per line." % TOPIC_COOK_BATCH)
+    try:
+        got = await ask_model(ask, limit=700, spice=0.9,
+                              mark={"kind": "topic_cook"})
+    except Exception as exc:  # noqa: BLE001
+        _TOPIC_COOK["why"] = "the model would not answer: " + type(exc).__name__
+        return 0
+    made = 0
+    seen = {str(r.get("text") or "").strip().lower()
+            for r in read_bombshells()}
+    # #1226: ONE SENTENCE EACH, however it comes back. Asked for one
+    # per line, the model returns a paragraph about half the time -
+    # measured, the first cook stored "I took the case to protect
+    # someone I love. They buried the evidence deep in the basement.
+    # The money disappeared right after the ceremony. I saw the..." as
+    # a SINGLE topic: four bombshells welded together and then cut off
+    # at the ceiling. A thing to spring on somebody is one sentence, so
+    # every line is split again on sentence ends.
+    pieces: list[str] = []
+    for raw in str(got or "").splitlines():
+        head = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", raw).strip()
+        pieces.extend(re.split(r'(?<=[.!?])\s+(?=["“A-Z])', head))
+    for raw in pieces:
+        line = raw.strip().strip('"“” ')
+        # A bombshell is a sentence, not a paragraph and not a fragment.
+        if not (12 <= len(line) <= 240):
+            continue
+        if not looks_english(line) or _looks_meta(line):
+            continue
+        if line.lower() in seen:
+            continue
+        seen.add(line.lower())
+        add_bombshell(line, "topic")
+        made += 1
+        if made >= TOPIC_COOK_BATCH:
+            break
+    _TOPIC_COOK["made"] = int(_TOPIC_COOK.get("made") or 0) + made
+    _TOPIC_COOK["why"] = ("wrote %d off %s" % (made, str(swath.get("file")
+                          or "the speakbox")[:40]) if made
+                          else "nothing usable came back")
+    if made:
+        pipeline_log("speakbox", "%d new thing(s) to spring on them, written "
+                     "off %s - the bank was %d topics all sprung %d times "
+                     "(#1226)" % (made, str(swath.get("file") or "a document")[:40],
+                                  state["topics"], state["median_used"]))
+    return made
+
+
+async def topic_cooker() -> None:
+    """#1226: keep the bank stocked while the room is idle."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await topic_cook_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(120)
 
 
 def drop_bombshell() -> dict[str, Any]:
@@ -98076,6 +98779,295 @@ async def stack_reconnect_api(
     return await stack_reconnect(restart_agent=bool(payload.get("restart", True)))
 
 
+async def whisper_transcribe(wav: bytes, timeout: float = 30.0) -> dict[str, Any]:
+    """Speak Wyoming at wyoming-whisper and come back with the words.
+
+    The protocol is one JSON header per line, optionally followed by a
+    binary payload whose length the header declares. Four messages are
+    enough for a transcription:
+
+        {"type": "transcribe"}                  what we want
+        {"type": "audio-start", "data": {...}}  the format that follows
+        {"type": "audio-chunk", ...} + bytes    the PCM itself
+        {"type": "audio-stop"}                  and we are done
+
+    and the service answers with a {"type": "transcript"} carrying the text.
+
+    THE WAV HEADER IS STRIPPED rather than sent. Wyoming wants raw PCM with
+    the rate, width and channel count declared in the header; handing it a
+    RIFF header would put 44 bytes of "RIFF....WAVEfmt " through the model
+    as if it were sound.
+    """
+    # 127.0.0.1, not the container name. BOTH containers run with
+    # `network_mode: host` (compose.yaml), so there is no Docker DNS to
+    # resolve "wyoming-whisper" - the first attempt failed with
+    # "[Errno -3] Temporary failure in name resolution". Host networking
+    # means the service is simply on this machine's loopback.
+    host = os.getenv("WHISPER_HOST", "127.0.0.1")
+    port = int(os.getenv("WHISPER_PORT", "10300"))
+
+    rate, width, channels, pcm = 16000, 2, 1, wav
+    try:
+        with wave.open(io.BytesIO(wav), "rb") as src:
+            rate = src.getframerate()
+            width = src.getsampwidth()
+            channels = src.getnchannels()
+            pcm = src.readframes(src.getnframes())
+        # 16 kHz MONO, because that is what the model wants.
+        #
+        # Measured: a 24 kHz clip went through the protocol cleanly - the
+        # container logged "Processing audio with duration" for it - and came
+        # back with an EMPTY transcript every time, while the station's own
+        # submissions of the same speech transcribed perfectly. Whisper does
+        # not resample for us; handing it 24 kHz and declaring 24 kHz means it
+        # hears the words at two-thirds speed and makes nothing of them.
+        import audioop
+        if channels > 1:
+            pcm = audioop.tomono(pcm, width, 0.5, 0.5)
+            channels = 1
+        if width != 2:
+            pcm = audioop.lin2lin(pcm, width, 2)
+            width = 2
+        if rate != 16000:
+            pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 16000, None)
+            rate = 16000
+    except Exception:  # noqa: BLE001
+        # Not a WAV. Send it as-is and let the service judge; saying so
+        # beats guessing at a format we were not given.
+        pass
+
+    def line(obj: dict[str, Any], payload: bytes = b"") -> bytes:
+        head = dict(obj)
+        if payload:
+            head["payload_length"] = len(payload)
+        return (json.dumps(head) + "\n").encode("utf-8") + payload
+
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(host, port), timeout=timeout)
+    try:
+        writer.write(line({"type": "transcribe", "data": {"language": "en"}}))
+        writer.write(line({"type": "audio-start", "data": {
+            "rate": rate, "width": width, "channels": channels}}))
+        # Chunked, because one very large write can outrun the socket buffer
+        # and a partial frame is heard as a click.
+        step = 16000 * width * channels
+        for at in range(0, len(pcm), step):
+            piece = pcm[at:at + step]
+            writer.write(line({"type": "audio-chunk", "data": {
+                "rate": rate, "width": width, "channels": channels}}, piece))
+        writer.write(line({"type": "audio-stop"}))
+        await writer.drain()
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            raw = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if not raw:
+                break
+            try:
+                head = json.loads(raw.decode("utf-8").strip() or "{}")
+            except Exception:  # noqa: BLE001
+                continue
+            # THE WORDS ARE NOT IN THE HEADER LINE.
+            #
+            # Measured by hand against wyoming 1.10.0 on 2026-09-11 - one
+            # socket, one eight-second clip of real speech, the reply
+            # printed raw:
+            #
+            #   {"type": "transcript", "version": "1.10.0", "data_length": 190}
+            #   {"text": " I don't know about that.  It smells like rotten
+            #    desperation. ..."}
+            #
+            # There is NO `data` key in that header at all - it reads back
+            # as None - and the sentence arrives in the `data_length` blob
+            # on the following 190 bytes. This loop looked only at
+            # head["data"], so it answered {"text": ""} for a clip the
+            # model had transcribed perfectly: the container's own log
+            # carried the sentence in the same second. That is the whole of
+            # the tablet's "Nothing was made out of that" - the operator
+            # spoke, whisper heard him, and the reader threw the answer
+            # away, three takes in a row.
+            #
+            # Why only the READ was wrong: wyoming's reader falls back to
+            # an inline `data` field when `data_length` is absent, so the
+            # sends above are accepted exactly as written. Its WRITER
+            # always declares the length. Both shapes are honoured here so
+            # this keeps working if either side changes its mind.
+            #
+            # The blob is consumed EVEN WHEN this is not the event we
+            # want. It sits between this header and the next one, so
+            # leaving it in the socket puts every later readline half way
+            # through a JSON document.
+            data: dict[str, Any] = head.get("data") or {}
+            declared = int(head.get("data_length") or 0)
+            if declared:
+                blob = await reader.readexactly(declared)
+                try:
+                    data = json.loads(blob.decode("utf-8")) or {}
+                except Exception:  # noqa: BLE001
+                    data = {}
+            extra = int(head.get("payload_length") or 0)
+            if extra:
+                await reader.readexactly(extra)
+            if head.get("type") == "transcript":
+                text = str(data.get("text") or "").strip()
+                if text:
+                    return {"ok": True, "text": text}
+                # An empty transcript is an ANSWER - "nothing was said" -
+                # not a failure to answer. Treating it as a timeout turned a
+                # quiet room into a 504 and hid the real fault. It carries
+                # its reason now, so a terminal can say something TRUE
+                # instead of the one catch-all sentence that hid the bug
+                # above for three takes running.
+                return {"ok": True, "text": "",
+                        "detail": "whisper listened to the whole clip and "
+                                  "found no words in it"}
+        return {"ok": False, "text": "", "detail": "whisper did not answer in time"}
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.get("/api/slideshow")
+async def slideshow_state_api(limit: int = 24) -> dict[str, Any]:
+    """What the media-slideshow is showing, for the terminal's lock screen.
+
+    `~/bin/media-slideshow` is a 25,000-line PySide6 app that puts the
+    ComfyUI output up full screen on the box.
+
+    TWO THINGS THIS ROUTE CANNOT DO, both measured rather than assumed,
+    because the first version of it claimed both and was quietly wrong:
+
+      - IT CANNOT READ THE SLIDESHOW'S DIAGNOSTIC. That file is at
+        /home/ehm_eckx/bin/media_slideshow_diagnostic.md on the HOST. This
+        process runs in a container whose HOME is /root and whose mounts
+        are /music, /app, /samples, /comfy-output and a few device paths -
+        /home/ehm_eckx/bin is not among them. An `os.path.expanduser("~")`
+        here resolves inside the container and finds nothing, for ever.
+      - IT CANNOT SEE WHETHER THE SLIDESHOW IS RUNNING. `docker inspect`
+        reports PidMode empty: no shared PID namespace, so `pgrep` in here
+        cannot see a host process. The honest answer is "cannot tell from
+        in here", not False.
+
+    WHAT IT CAN DO, and what the lock screen actually wants: report the
+    slideshow's MATERIAL. /comfy-output is bind-mounted and is the very
+    directory the slideshow plays from - the app's own diagnostic names
+    `root dir /home/ehm_eckx/ComfyUI/output`, which is the host side of
+    that same mount. So the newest pictures, the size of the playlist and
+    how fast it is growing are all real and all live, and they are the part
+    a terminal can put on a screen.
+    """
+    out: dict[str, Any] = {"at": time.time()}
+
+    out["can_see_process"] = False
+    out["can_see_diagnostic"] = False
+    out["why"] = (
+        "the station runs in a container with no shared PID namespace and "
+        "without /home/ehm_eckx/bin mounted, so neither the slideshow "
+        "process nor its diagnostic file is visible from here")
+
+    root = Path("/comfy-output")
+    if not root.is_dir():
+        out["ok"] = False
+        out["say"] = "the ComfyUI output directory is not mounted"
+        return out
+
+    want = max(1, min(int(limit or 24), 200))
+    kinds = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm")
+    rows: list[dict[str, Any]] = []
+    total = 0
+    newest = 0.0
+    try:
+        with os.scandir(root) as scan:
+            for entry in scan:
+                if not entry.is_file():
+                    continue
+                if not entry.name.lower().endswith(kinds):
+                    continue
+                total += 1
+                try:
+                    stamp = entry.stat().st_mtime
+                    size = entry.stat().st_size
+                except OSError:
+                    continue
+                if stamp > newest:
+                    newest = stamp
+                rows.append({"file": entry.name, "at": stamp, "bytes": size})
+    except Exception as exc:  # noqa: BLE001
+        out["ok"] = False
+        out["say"] = f"the output directory could not be read: {exc}"
+        return out
+
+    rows.sort(key=lambda r: r["at"], reverse=True)
+    out["playlist"] = total
+    out["newest_at"] = newest
+    out["newest_age"] = max(0.0, time.time() - newest) if newest else None
+    out["rows"] = rows[:want]
+    # Everything in /comfy-output is served by /api/generations/image/{name},
+    # which the terminal already uses for the wall - so the lock screen has
+    # a URL for every row without this route inventing one.
+    out["url"] = "/api/generations/image/"
+    out["ok"] = True
+    out["say"] = (
+        f"{total} pictures in the slideshow's folder; newest "
+        f"{rows[0]['file']}" if rows else "the folder is empty")
+    return out
+
+
+@app.post("/api/listen/transcribe")
+async def listen_transcribe_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Turn a spoken clip into words, for a terminal that cannot.
+
+    #1008-era terminals do the hearing themselves; this tablet cannot -
+    measured on the device, a GApps-less GSI declares NO
+    android.speech.RecognitionService at all, so there is nothing on it to
+    ask. The station has whisper; this is the door to it.
+
+    The body is the audio (a WAV from the browser's MediaRecorder, or raw
+    PCM). It answers with the words and does nothing else with them: what a
+    sentence MEANS is the caller's business, which is what lets one door
+    serve a song request, a chat line and whatever is built next.
+    """
+    require_auth(authorization)
+    blob = await request.body()
+    if len(blob) < 2000:
+        raise HTTPException(status_code=400, detail="Too little audio to hear")
+    if len(blob) > 12_000_000:
+        raise HTTPException(status_code=413, detail="That clip is too long")
+    try:
+        got = await whisper_transcribe(blob)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail="whisper is not answering - is the wyoming-whisper "
+                   "container up? (" + str(exc)[:120] + ")",
+        ) from exc
+    if not got.get("ok"):
+        raise HTTPException(status_code=504,
+                            detail=str(got.get("detail") or "no transcript"))
+    text = str(got.get("text") or "")
+    out: dict[str, Any] = {"text": text, "heard": bool(text)}
+    if not text:
+        # AN EMPTY ANSWER MUST CARRY ITS REASON.
+        #
+        # For three takes running the tablet showed the operator "Nothing
+        # was made out of that" while whisper's own container log held his
+        # exact sentences - because this route answered {"text": ""} and a
+        # bare empty string is indistinguishable from every other way of
+        # coming back with nothing. The transcriber knows which of them it
+        # was; it is passed on here so the terminal can repeat something
+        # true rather than guess.
+        out["detail"] = str(got.get("detail")
+                            or "the transcriber answered with no words in it")
+        out["bytes"] = len(blob)
+    return out
+
+
 @app.post("/api/pinebox/listen")
 async def pinebox_listen_api(
     request: Request,
@@ -99242,8 +100234,9 @@ async def api_cupboard_view(
     order has booked for that road in the coming hours."""
     require_read_auth(authorization)
     # #1195: OFF THE EVENT LOOP. This walks every shelf on the station and
-    # measures each round's takes, which on the loop is the stall shape
-    # #1156 measured. The memo keeps a polling view cheap.
+    # measures each round's takes - 9.6s on a 326-round cupboard, which on
+    # the loop is the stall shape #1156 measured. The memo keeps a polling
+    # view cheap; the first open pays it in a thread.
     return await asyncio.to_thread(
         cupboard_view, max(0, min(400, int(cells or 0))))
 
@@ -101553,8 +102546,13 @@ def director_room(which: int = 0) -> dict[str, Any]:
                             _r.get("seconds") or 0)
                 if _took:
                     _worst = max(_took, key=lambda k: _took[k])
+                    # #1237: a filler road names itself now, so this can
+                    # say the bank or the cover took the window rather
+                    # than blaming "banter", which was the residue
+                    # bucket wearing a real road's name.
                     state = ("went by - %s aired instead"
-                             % SHELF_LABEL.get(_worst, _worst))
+                             % ROUND_LABEL.get(
+                                 _worst, SHELF_LABEL.get(_worst, _worst)))
                 else:
                     state = "went by with nothing of its own"
             else:
@@ -102660,6 +103658,7 @@ async def api_director_why_not(
         out["rescue_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:140])
     try:
         out["in_dead_air_stock"] = int((dead_air_stock() or {}).get(kind) or 0)
+        out["not_ready_because"] = takes_why(kind)          # #1228
         out["rescue_road_open"] = kind in RESCUE_ROADS_OPEN
     except Exception:  # noqa: BLE001
         pass
@@ -104169,10 +105168,42 @@ async def response_bank_play_api(
 
 @app.get("/api/dj/pending")
 async def dj_pending(
+    full: int = 0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """#887: the rounds waiting to go on air, and how ready each one is."""
+    """#887: the rounds waiting to go on air, and how ready each one is.
+
+    MEASURED, and the reason `full` exists. The panel polls this every 1.6s
+    (djPendingTick). On the tablet, at idle and untouched:
+
+        /api/dj/pending   25.5 requests/min   2,117.6 kB each   52.9 MB/min
+
+    Taken apart, 68 rows at 31,823 bytes each:
+
+        tint          1,086,987 bytes   50.3%   (tint.prompt is 8,146/row)
+        desk            473,388 bytes   21.9%   (desk.prompt is 6,130/row)
+        script_plain    174,818 bytes    8.1%
+        lines           127,347 bytes    5.9%
+
+    `desk` and `tint.prompt`/`tint.armed` are the full LLM prompt text for
+    every row, sent 37.5 times a minute - and NOTHING reads them. There is
+    no `.desk` member read anywhere in this file; the renderer touches only
+    `r.lines`, and the signature that decides whether to repaint at all
+    reads id/state/made/chunks/turns/progress, which is 1,808 bytes - 0.1%
+    of the payload.
+
+    That mattered because of the connection pool, not the bandwidth.
+    HTTP/1.1 allows six connections per origin, and with these polls in
+    flight the measured queueing was a p90 of 5,389ms and a p99 of
+    10,803ms: a 346-byte /api/radio/clock request was seen waiting 12.5
+    SECONDS behind them, and media on the tablet took 46 seconds to deliver
+    its first 64 kB, which is why the tablet played nothing at all.
+
+    So the list omits them and `?full=1` brings them back, for a detail
+    view that wants one round's paperwork. Nothing in the panel asks for
+    full=1 today, so nothing that works now changes."""
     require_read_auth(authorization)
+    want_full = bool(full)
     rows: list[dict[str, Any]] = []
     for at, entry in enumerate(list(_LARDER)):
         try:
@@ -104248,7 +105279,9 @@ async def dj_pending(
             # #987/#992: the paperwork - the prompt as sent, the system
             # prompt governing it, the schedule's instruction, the model
             # and what it cost.
-            "desk": entry.get("desk") or {},
+            # The whole prompt as sent. 6,130 bytes a row and read by
+            # nothing - see the docstring. ?full=1 brings it back.
+            **({"desk": entry.get("desk") or {}} if want_full else {}),
             "edited": bool(entry.get("edited")),
             # #1006/#1016: BOTH VERSIONS, and which one is going out.
             # `use` is "" for a round that was never tinted, which is how
@@ -104261,10 +105294,12 @@ async def dj_pending(
                 "why": str((entry.get("tint") or {}).get("why") or ""),
                 "world": str((entry.get("tint") or {}).get("world") or ""),
                 "ms": int((entry.get("tint") or {}).get("ms") or 0),
-                "armed": str((entry.get("tint") or {}).get("armed")
-                             or "")[:6000],
-                "prompt": str((entry.get("tint") or {}).get("prompt")
-                              or "")[:8000],
+                # Half the payload lived in these two. Same reasoning
+                # as `desk` above; ?full=1 brings them back.
+                **({"armed": str((entry.get("tint") or {}).get("armed")
+                                 or "")[:6000],
+                    "prompt": str((entry.get("tint") or {}).get("prompt")
+                                  or "")[:8000]} if want_full else {}),
                 "chunks": list((entry.get("tint") or {}).get("chunks")
                                or [])[:12],
             } if entry.get("tint") else {},
@@ -109596,9 +110631,10 @@ async def api_sfx_review(
     one request. Nothing is deleted here - POST /api/sfx/delete (#703)
     is the door, and it is the operator's to open."""
     require_read_auth(authorization)
-    # #1199: MEMOISED. Every sfx_seconds() lookup stats its file to key the
-    # cache and there are six thousand of them on a CIFS share, so one
-    # honest answer costs 45s of SMB round trips. The panel polls.
+    # #1199: MEMOISED. The walk is cheap per file and there are six and a
+    # half thousand of them on a CIFS share - every sfx_seconds() lookup
+    # stats the file to key its cache, so one honest answer costs 45s of
+    # SMB round trips. The panel polls; it must not pay that twice.
     memo = _SFX_REVIEW_MEMO
     if (memo.get("value") is not None and not int(scan or 0)
             and time.time() - float(memo.get("at") or 0) < SFX_REVIEW_REST):
@@ -112105,6 +113141,32 @@ async def api_broadcast_health(
             "fix_with": "POST /api/radio/pause with paused false",
         }
     stuck = bool(state.get("wedged"))
+    # #1231: THE PAIR HAVE STOPPED TALKING. The operator's actual
+    # complaint, and none of the wedge conditions had to be true for it:
+    # measured at "reaching 3 listener(s); last heard 9s ago, stuck
+    # False, waiting 1" while nobody had said a word in minutes. The
+    # music answers "is anything sounding"; this answers "is the show
+    # happening".
+    mute = float(state.get("dialogue_quiet") or -1)
+    if (not stuck and bool(_RADIO.get("on")) and not radio_paused()
+            and mute >= DIALOGUE_QUIET_ALARM):
+        return {
+            "at": now, "stuck": True, "dialogue_quiet": mute,
+            "say": ("Nobody has heard the DJs say anything for %d minute(s). "
+                    "The station is on and something is sounding, so this is "
+                    "not a dead broadcast - the dialogue is not reaching the "
+                    "air." % int(mute / 60)),
+            "offer": ["let the orchestrator work the ladder",
+                      "open the troubleshooting console"],
+            "listeners": listeners,
+            "heard_seconds_ago": (round(now - heard_at, 1)
+                                  if heard_at else None),
+            "clips_waiting": int(state.get("waiting") or 0),
+            "stall_reports": int(state.get("stalls") or 0),
+            "holding_the_air": str(state.get("owner") or ""),
+            "detail": str(state.get("why") or ""),
+            "fix_with": "POST /api/broadcast/fix/{step}",
+        }
     if stuck:
         say = ("The broadcast is stuck. %d clip(s) are queued on the page "
                "that is meant to be playing them and none has started; "
@@ -112114,13 +113176,34 @@ async def api_broadcast_health(
     elif heard_at:
         say = ("Reaching %d listener(s); last heard %ds ago."
                % (listeners, int(now - heard_at)))
+        if mute >= 60:
+            say += (" The DJs have not been heard for %d minute(s)."
+                    % int(mute / 60))
         offer = []
+    elif mute >= DIALOGUE_FIRST_GRACE:
+        # #1239: THE GRACE PERIOD ENDS. This branch had no upper bound,
+        # so a station nobody has ever heard sat in it forever telling
+        # the operator, in the present tense, about the first minute
+        # after a restart. Measured at 100+ seconds with three
+        # listeners connected and not one delivery acknowledged; one
+        # call to reload-pages cured it.
+        say = ("Reaching %d listener(s), but not one of them has "
+               "acknowledged a single clip in %d second(s). The station "
+               "is on and sending; the pages are taking clips and not "
+               "starting them. Reloading the pages is the cure."
+               % (listeners, int(mute)))
+        offer = ["reload the pages", "open the troubleshooting console"]
+        stuck = True
     else:
         say = ("Nobody has reported hearing anything yet - that is normal "
                "for the first minute after a restart.")
         offer = []
     return {
         "at": now, "stuck": stuck, "say": say, "offer": offer,
+        # #1231: always visible, not only when it has gone wrong - "is
+        # dialogue happening" is the question the operator asks, and a
+        # number he can watch is worth more than an alarm he cannot.
+        "dialogue_quiet": (round(mute, 1) if mute >= 0 else None),
         "listeners": listeners,
         "heard_seconds_ago": (round(now - heard_at, 1) if heard_at else None),
         "clips_waiting": int(state.get("waiting") or 0),
@@ -112578,7 +113661,14 @@ async def air_watch() -> None:
                          "Nothing here will undo that; press play."
                          % (radio_paused_for() / 60.0)))
                 continue
+            # #1231: THE PAIR, not merely "any sound". A record keeps
+            # air_quiet_for at zero while the DJs say nothing for ten
+            # minutes, which is exactly the hour the operator sat
+            # through. The ladder works whichever clock has stopped.
             quiet = air_quiet_for()
+            mute = dialogue_quiet_for()
+            if mute >= DIALOGUE_QUIET_ALARM and (quiet < 0 or mute > quiet):
+                quiet = mute
             _AIR_WATCH["quiet"] = round(quiet, 1)
             if quiet < 0:
                 _AIR_WATCH.update(rung=-1,
@@ -112674,6 +113764,11 @@ async def air_watch() -> None:
 @app.on_event("startup")
 async def _startup_air_watch() -> None:
     fire_and_forget(air_watch())
+
+
+@app.on_event("startup")
+async def _startup_topic_cooker() -> None:
+    fire_and_forget(topic_cooker())
 
 
 async def air_relieve_hold(seconds: float = 60.0) -> None:
@@ -112843,6 +113938,125 @@ async def broadcast_fix_api(
     """#1208: fire one troubleshooting step and hand back its transcript."""
     require_auth(authorization)
     return await broadcast_step(str(step or "")[:32])
+
+
+@app.get("/api/topics/bank")
+async def topics_bank_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1226: how fresh the things-to-spring-on-them bank is."""
+    require_read_auth(authorization)
+    state = topic_bank_state()
+    return {**state, "say": (
+        "%d topic(s); the least-used has been sprung %d time(s), the "
+        "most-used %d. %d have never gone out. %s"
+        % (state["topics"], state["least_used"], state["most_used"],
+           state["never_used"], state["why"]))}
+
+
+@app.post("/api/topics/cook")
+async def topics_cook_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1226: write some now, whatever the room is doing."""
+    require_auth(authorization)
+    _TOPIC_COOK["at"] = 0.0                    # the operator asking beats the rest
+    made = await topic_cook_once()
+    return {"made": made, **topic_bank_state()}
+
+
+@app.get("/api/cupboard/why-not-ready")
+async def cupboard_why_not_ready_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1228: why finished rounds are not airable, said by the function
+    that decides it rather than by a second opinion about it."""
+    require_read_auth(authorization)
+    census = takes_why()
+    worst = ""
+    top = 0
+    for road, book in census.items():
+        for why, count in book.items():
+            if count > top:
+                top, worst = count, "%s: %s (%d)" % (road, why, count)
+    return {
+        "at": time.time(), "roads": census,
+        "say": ("the commonest refusal since this process started is "
+                + worst) if worst else
+               "nothing has been refused since this process started",
+    }
+
+
+@app.post("/api/sfx/fill")
+async def sfx_fill_now_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1234: punctuate the air NOW - the operator's hand, or the
+    orchestrator's, on the roads #1232 and #1233 built.
+
+    `road` picks which: "talk" is the SFX Guy saying something off the
+    topics board, "clip" is the soundboard, "any" (the default) is the
+    whole ladder - gold bar, liner, sample, then him talking."""
+    require_auth(authorization)
+    body = payload or {}
+    road = str(body.get("road") or "any").strip().lower()
+    why = str(body.get("why") or "asked for by hand")[:120]
+    _SFX_GAP["at"] = 0.0                   # the operator asking beats the rest
+    if road == "talk":
+        went = await sfxguy_gap_talk(why, floorless=_floor_busy())
+    elif road == "clip":
+        try:
+            went = "sample" if await dj_sting(
+                _RADIO.get("voice_to") in ("box", "both"),
+                who="gap", force=True) else ""
+        except Exception as exc:  # noqa: BLE001
+            return {**sfx_gap_status(), "went": "",
+                    "say": "the soundboard refused: " + type(exc).__name__}
+    else:
+        went = await sfx_fill_gap(why, under_floor=True)
+    return {**sfx_gap_status(), "went": went, "road": road, "say": (
+        "%s went out" % went if went else
+        "nothing went out - " + (
+            "the station is off air or paused" if (
+                not _RADIO.get("on") or radio_paused()) else
+            "somebody is talking" if _SPEAKING[0] else
+            "the air is already sold ahead" if float(
+                _PAGE_AIR_UNTIL[0] or 0) - time.time() > 1.5 else
+            str(_SFX_GAP.get("talk_why") or "")
+            or "no clip or prepared line was free"))}
+
+
+@app.get("/api/sfx/anxiety")
+async def sfx_anxiety_get_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1232: what the SFX Guy's dial is set to and what it produces."""
+    require_read_auth(authorization)
+    return sfx_gap_status()
+
+
+@app.post("/api/sfx/anxiety")
+async def sfx_anxiety_set_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1232: turn it, from the panel or from the orchestrator.
+
+    The standing rule is that every cure becomes a tool the orchestrator
+    can work, and dead air is the one it is most often looking at: this
+    is the knob that answers it without writing a line or rendering a
+    voice."""
+    require_auth(authorization)
+    body = payload or {}
+    want = body.get("anxiety", body.get("value"))
+    settings = load_settings()
+    dj = dict(settings.get("dj") or {})
+    dj["sfx_anxiety"] = max(0, min(100, int(float(want or 0))))
+    save_settings({**settings, "dj": dj})
+    pipeline_log("air", "the SFX Guy's anxiety set to %d (#1232)"
+                 % dj["sfx_anxiety"])
+    return sfx_gap_status()
 
 
 @app.get("/api/notifications")
@@ -137931,6 +139145,18 @@ const PINE_3JS = [
   {key: "off",      label: "⬛ All off",         open: () => {}},
 ];
 
+/* THE REGISTER, PUBLISHED.
+ *
+ * PINE_3JS is a module const, so a terminal script cannot see it - and the
+ * Pine Box tablet needs to: it lists every scene in its own chooser and
+ * promotes the panel's own modal to the whole glass ("every three JS
+ * experience in the sidebar... as a full screen interface"). Without this
+ * the terminal would have to carry its own copy of thirty-two entries, and
+ * a copy is the thing that goes stale the next time a scene is added here.
+ *
+ * Published, not duplicated. The panel's own code still uses the const. */
+window.PINE_3JS = PINE_3JS;
+
 // #786: the word cloud in the gallery opens as a FORMAL window like its
 // siblings — the standard frame with a title bar and a close — rather than
 // the ragged half-gallery overlay dock. #1072: that frame is pineWin.
@@ -148632,41 +149858,81 @@ function djStreamCurrentId() {
  * held is the only state that does not come off the clock: a line the box
  * accepted and never played is not "coming up", it is a line nobody heard,
  * and saying so is the whole point of the window. */
+/* #1002, and the measurement that changed how it writes.
+ *
+ * This runs for EVERY row of the booth log, four times a second
+ * (djBoothTick, setInterval 250ms). Measured on the tablet with 256 rows:
+ *
+ *     rowsChangedPerTick:   0
+ *     rowsUnchangedPerTick: 256
+ *
+ * It wrote textContent, style.color and title unconditionally - 768 style-
+ * and layout-invalidating writes per tick, 3,072 a second, none of which
+ * changed a pixel. On a 12,015-node document that 21ms/s of JS bought about
+ * 150ms/s of browser style and layout, and it grew with the log, which is
+ * why the panel got worse the longer the station ran.
+ *
+ * A/B on the real tablet against a restored control, 20s per phase:
+ *
+ *     unconditional writes    35.5 fps   190 ms/s layout   86 long tasks
+ *     write only on a change  53.0 fps    20 ms/s layout    1 long task
+ *
+ * and the wait before the browser could hand back a frame went from a p90
+ * of 71.9ms (max 1,028ms) to 18.3ms (max 182ms).
+ *
+ * So: decide the three values, then write only what differs. Reading
+ * textContent is cheap - it forces no layout - and that comparison buys all
+ * of the above. Behaviour is unchanged by construction: the same values are
+ * reached by the same branches. */
+function djRowPaint(st, text, color, title) {
+  if (st.textContent !== text) st.textContent = text;
+  /* COMPARE AGAINST WHAT WE LAST SET, NOT AGAINST THE ELEMENT.
+   *
+   * style.color reads back normalised - set "#7ce8a9" and it returns
+   * "rgb(124, 232, 169)" - so comparing the two is never equal and the
+   * write always went through. Measured on the tablet: 2,648 calls in 12s
+   * suppressed 57 text writes and 57 title writes, and NONE of the 2,648
+   * colour writes. Remembering the last value we wrote is exact, because
+   * it is the same string both times. */
+  if (color !== null && st.__pineColor !== color) {
+    st.style.color = color;
+    st.__pineColor = color;
+  }
+  if (title !== null && st.title !== title) st.title = title;
+}
+
 function djRowState(row, line) {
   try {
     const st = row.querySelector("[data-state]");
     if (!st) return;
     if (line && ["published", "prepared", "page"].includes(line.aired)) {
-      st.textContent = line.aired === "prepared" ? "recorded / waiting" : "awaiting playback";
-      st.style.color = "#d6b777";
-      st.title = "The station has not received an audible playing acknowledgment for this line.";
+      djRowPaint(st,
+        line.aired === "prepared" ? "recorded / waiting" : "awaiting playback",
+        "#d6b777",
+        "The station has not received an audible playing acknowledgment for this line.");
       return;
     }
     if (line && line.aired === "held") {
-      st.textContent = "\u26a0 not heard";
-      st.style.color = "#e0a35c";
-      st.title = "The box accepted this line and played none of it. It is "
-        + "held and will go out when the box answers.";
+      djRowPaint(st, "\u26a0 not heard", "#e0a35c",
+        "The box accepted this line and played none of it. It is "
+        + "held and will go out when the box answers.");
       return;
     }
     const at = Number(row.getAttribute("data-airat") || 0);
-    if (!at) { st.textContent = ""; return; }
+    if (!at) { djRowPaint(st, "", null, null); return; }
     const now = djStreamAt();
     const live = window.djSpeakingEid
       && row.getAttribute("data-eid") === window.djSpeakingEid;
     if (live) {
-      st.textContent = "\u25cf on air";
-      st.style.color = "#7ce8a9";
-      st.title = "This is the line sounding right now";
+      djRowPaint(st, "\u25cf on air", "#7ce8a9",
+        "This is the line sounding right now");
     } else if (at > now + 0.6) {
       const wait = Math.round(at - now);
-      st.textContent = "\u25f7 in " + (wait > 99 ? "99+" : wait) + "s";
-      st.style.color = "#6d8199";
-      st.title = "Written and recorded; it has not been heard yet";
+      djRowPaint(st, "\u25f7 in " + (wait > 99 ? "99+" : wait) + "s", "#6d8199",
+        "Written and recorded; it has not been heard yet");
     } else {
-      st.textContent = "\u2713 played";
-      st.style.color = "#5d7189";
-      st.title = "This line has gone out";
+      djRowPaint(st, "\u2713 played", "#5d7189",
+        "This line has gone out");
     }
   } catch (e) { /* the row still reads */ }
 }
@@ -157408,6 +158674,17 @@ function djRender(state) {
   // it goes off — always there while the DJs are playing. Unless the user
   // hid it (mindInline="0") or has it open full-screen/docked already.
   const host = document.getElementById("mindInlineHost");
+  /* HIDDEN MUST LOOK HIDDEN. The button's markup default is "Hide" and the
+   * host is a 420px near-black box, so a terminal whose mindInline is "0"
+   * showed a large black rectangle under a header claiming it was visible -
+   * which is exactly the "blank simulation" reported from the tablet.
+   * mindInlineToggle writes this placeholder on a click; boot never did. */
+  if (host && localStorage.mindInline === "0" && !host.firstElementChild) {
+    const btn = document.getElementById("mindInlineToggle");
+    if (btn) btn.textContent = "Show";
+    host.innerHTML = "<div class='muted' style='padding:20px;font-size:12px'>"
+      + "The Dialogue Mind is hidden — click Show to bring it back.</div>";
+  }
   if (host && localStorage.mindInline !== "0") {
     const haveMind = (typeof djMind !== "undefined" && djMind);
     if (djOn && (!haveMind || (djMind.mode !== "inline" && djMind.mode
@@ -157707,14 +158984,36 @@ function djResync(clock) {
   }
 }
 
+var radioClockIdleTick = 0;
 async function radioClockPoll() {
-  if (djOutputExternal() && !djMonitorAir) return;   // #825
+  /* #825 RETURNED HERE, AND IT MADE THE TABLET UNREACHABLE.
+   *
+   * Skipping the poll when the audio is elsewhere is right about the
+   * playhead - there is nothing to keep in step - but /api/radio/clock is
+   * also the ONLY route that registers a listener, and #1008 can only hand
+   * the air to a listener that is in the roster. So:
+   *
+   *   route the show to the Nabu
+   *     -> every page stops polling the clock
+   *     -> the PineTab falls out of the roster ("PineTab - not open")
+   *     -> nothing can give the tablet the air
+   *     -> you can never route back to the tablet
+   *
+   * A deadlock, and the reason the operator could not send the broadcast
+   * to his own terminal. A page must always say it is there.
+   *
+   * The load #825 was protecting is respected by slowing down rather than
+   * stopping: the clock is 346 bytes, and one every six seconds is nothing
+   * beside the 2 MB polls it sits next to. */
+  const external = djOutputExternal() && !djMonitorAir;
+  if (external && (radioClockIdleTick++ % 4) !== 0) return;
   try {
     const clock = await api("/api/radio/clock?listener="
       + encodeURIComponent(pineListenerId()));
     djStateAt = Date.now();
     pineSoloGate(clock);                                    // #1008
-    djResync(clock);
+    /* The playhead is only ours to follow when the show is on this page. */
+    if (!external) djResync(clock);
   } catch (error) { /* the panel works without it */ }
 }
 
@@ -168888,7 +170187,7 @@ async function mindTopologyOpen() {
     // #786: setSize ran UNCONDITIONALLY here — a drawing-buffer realloc
     // every frame, which dragged the whole page and froze the scene solid
     // (the #737 bug class). Only when the stage actually changed.
-    if(w!==_tw||h!==_th){_tw=w;_th=h;renderer.setSize(w,h,false);camera.aspect=w/Math.max(1,h);camera.updateProjectionMatrix();}
+    if(w!==_tw||h!==_th){_tw=w;_th=h;renderer.setSize(w,h);camera.aspect=w/Math.max(1,h);camera.updateProjectionMatrix();}
     const t=performance.now()*.001;
     // The topology BREATHES now: a slow idle spin the drag overrides, each
     // world bobbing on its own phase, orbs orbiting their person.
@@ -176861,7 +178160,12 @@ async function phonePanel() {
 
   const fit = () => {
     const w = stage.clientWidth || 900, h = stage.clientHeight || 600;
-    renderer.setSize(w, h, false);
+    /* No `false`. setSize(w, h, false) leaves the canvas with NO css size,
+     * so it lays out at its device-pixel attribute size - and with
+     * setPixelRatio(1.25) on this tablet that is 39% wider than its host,
+     * putting the outer cards off the edge. Invisible at dpr 1.0, which is
+     * why it survived on the desktop. */
+    renderer.setSize(w, h);
     camera.aspect = w / h; camera.updateProjectionMatrix();
   };
   fit();

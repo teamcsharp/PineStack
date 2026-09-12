@@ -24,10 +24,17 @@
       }
     }
     const live = current || station.speaking_now;
-    if (live?.id && live.text) {
+    if (live?.id) {
       const before = rows.get(String(live.id)) || {};
       rows.delete(String(live.id)); // the current speaker stays visible last
-      absorb({...before, ...live, aired: 'airing'}, 'Playing');
+      /* A stream_now turn carries ONLY {id, from, until} - app.py:25295
+       * serialises no text for it. So `current` never has any, the old
+       * `live.text` guard failed, and absorb() (which drops a row with no
+       * text) threw it away: on the coalesced road, which is most of the
+       * show, nothing was ever marked Playing. The text is on the chat row
+       * of the same id, so take it from there. */
+      absorb({...before, ...live, text: live.text || before.text,
+        aired: 'airing'}, 'Playing');
     }
     return [...rows.values()];
   }

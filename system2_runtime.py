@@ -103,6 +103,7 @@ class System2Runtime:
         self._files = {}
         self._rows = {}
         self._candidates = []
+        self._clock_seen = None        # #1224: last published occurrence
         self._plans = []
         self._refresh_lock = asyncio.Lock()
         # #1084: one preparation per model lane. With OLLAMA_LANES=2 a
@@ -376,7 +377,8 @@ class System2Runtime:
                 plan = await asyncio.to_thread(self.store.plan_hour, hour, templates,
                                                config_revision=digest(templates))
                 plans.append(plan)
-            events = self.store.events(states=["pending", "working"], limit=100)
+            events = await asyncio.to_thread(                      # #1224
+                self.store.events, states=["pending", "working"], limit=100)
             event_plans = []
             for event in events:
                 if event["kind"] == "music_request" or event["deadline"] <= time.time():
@@ -506,7 +508,9 @@ class System2Runtime:
             # renewer keeps a long sitting alive either way; what the shorter
             # lease bounds is the time a slot stays unclaimable when an
             # attempt dies without completing (see reclaim_jobs for restarts).
-            job = self.store.claim_job("system2-preparer", kinds=kinds, lease_seconds=900)
+            job = await asyncio.to_thread(                         # #1224
+                self.store.claim_job, "system2-preparer", kinds=kinds,
+                lease_seconds=900)
             if not job:
                 return
             kind = job["kind"]
@@ -527,7 +531,10 @@ class System2Runtime:
                 while True:
                     await asyncio.sleep(300)
                     try:
-                        self.store.renew_job(job["id"], "system2-preparer", job["token"], lease_seconds=900)
+                        await asyncio.to_thread(                   # #1224
+                            self.store.renew_job, job["id"],
+                            "system2-preparer", job["token"],
+                            lease_seconds=900)
                     except System2Conflict:
                         return
             renewer = asyncio.create_task(renew())
@@ -742,6 +749,39 @@ class System2Runtime:
                         if slot["start"] <= now < slot["deadline"]), None)
         return self._publish_clock(current)
 
+    def current_slot_brief(self):
+        """#1224: the running occurrence, WITHOUT the deep copies.
+
+        _publish_clock deep-copies the slot twice - and a slot carries
+        its prompt and every allocation, and an allocation carries the
+        whole candidate. _ready_slot_window asks this question on every
+        cupboard check for every road, and reads four fields of the
+        answer. Measured: `outside app.py` (which is copy.py) was 115s
+        of a 185s freeze in ten minutes.
+
+        The _RADIO side effect is kept, but paid only when the
+        occurrence actually changes rather than on every read. An active
+        event slot falls through to the full road - events are rare and
+        need the reservation check.
+        """
+        if not self.enabled:
+            return {}
+        now = time.time()
+        if any(slot["start"] <= now < slot["deadline"]
+               for hour in self._event_plans for slot in hour["slots"]):
+            return self.current_clock()
+        slot = next((s for hour in self._plans for s in hour["slots"]
+                     if s["start"] <= now < s["deadline"]), None)
+        ident = (slot or {}).get("id") or ""
+        if ident != self._clock_seen:
+            self._clock_seen = ident
+            self._publish_clock(slot)
+        if not slot:
+            return {}
+        return {"occurrence": slot["id"], "id": slot["template_id"],
+                "kind": slot["kind"], "deadline": slot["deadline"],
+                "start": slot["start"], "revision": slot.get("revision")}
+
     def _track_position(self):
         """Actual record clock; short links belong only to its opening or ending."""
         h = self.host
@@ -794,7 +834,10 @@ class System2Runtime:
                 selected = None
                 for candidate in sorted(matching, key=lambda c: (c["seconds"], c["id"])):
                     try:
-                        selected = self.store.allocate_current(slot["id"], candidate["id"], expected_revision=slot["revision"])
+                        selected = await asyncio.to_thread(    # #1224
+                            self.store.allocate_current, slot["id"],
+                            candidate["id"],
+                            expected_revision=slot["revision"])
                         break
                     except System2Conflict:
                         continue
@@ -1228,7 +1271,9 @@ def install(app, namespace):
                     break
         if not identity:
             raise HTTPException(404, "No hour on air")
-        got = await asyncio.to_thread(rt.store.explain_hour, identity)
+        live = next((h["slots"] for h in rt._plans
+                     if str(h.get("id")) == identity), None)
+        got = await asyncio.to_thread(rt.store.explain_hour, identity, live)
         if not got:
             raise HTTPException(404, "No retained hour")
         empty = [s for s in got["slots"] if not s["allocations"]]

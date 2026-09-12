@@ -33,6 +33,14 @@ class CrystalLearningParentIdentityTests(unittest.IsolatedAsyncioTestCase):
             "line_review_capture": mock.Mock(), "pipeline_log": mock.Mock(),
             "tint_seen": mock.Mock(), "_tint_flow": mock.Mock(),
             "_tint_output_note": mock.Mock(),
+            # 2026-09-09: the ledger cases here count the FIRST-PASS ladder's
+            # asks and its lineage. The one revision pass runs on a bar the
+            # grader has already accepted and is deliberately never noted to
+            # this ledger, because an outcome measured from an accepted start
+            # is not comparable with a first attempt or a repair; it is proved
+            # in test_crystal_revision instead. Left on here it would only add
+            # a third model call to every count.
+            "crystal_revision_skip": lambda kind="": "these cases isolate the first-pass ladder",
         }.items():
             self.stack.enter_context(mock.patch.object(app, name, value))
         for context, value in ((app._LINE_REVIEW_CONTEXT, {}),

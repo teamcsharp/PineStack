@@ -1,0 +1,400 @@
+/* THE PRESENTATION VIEW CARRIES ITS OWN PALETTE.
+ *
+ * The same trap the Sampler hit and documented (sampler.css:1): these were
+ * var(--cyan), var(--panel) and friends, which exist in the Pine Box
+ * desktop's stylesheet and NOWHERE ELSE. Injected into the station panel
+ * on the tablet they resolve to nothing, so a lit control becomes
+ * near-black text on a transparent ground and looks like it vanished when
+ * tapped. Defining them on the host means this screen looks the same
+ * wherever it is mounted; the var() fallbacks let the desktop's own theme
+ * win where it does define them.
+ */
+#presentation, .pv-view {
+  --bg: #0e1216;
+  --panel: #1a222a;
+  --panel-2: #212b34;
+  --text: #edf3f5;
+  --muted: #8fa0ad;
+  --line: #313d47;
+  --green: #54d18b;
+  --amber: #e3be63;
+  --red: #e46b6b;
+  --cyan: #65c7da;
+}
+
+/* A wall is looked at from across a room and poked with a thumb. Nothing
+   here is a text document, so nothing here selects. */
+.pv-view, .pv-view * {
+  -webkit-tap-highlight-color: transparent;
+}
+.pv-mini, .pv-slot, .pv-track, .pv-chip {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* TWO SELECTORS, BECAUSE THE TABLET'S ELEMENT IS NOT THE DESKTOP'S.
+ *
+ * `.view.pv-view.active` is Electron's element - its switcher owns `.view`
+ * and toggles `.active`. rail.js builds `<section class="pine-view-host
+ * pv-view open">` instead, which carries neither, so this rule never
+ * matched on the tablet: measured there as `display:block` with `padding`
+ * reading 0 on three sides, and .pv-grid sitting flush against the left and
+ * top edges of the glass. It only looked close to right because the host is
+ * `position:fixed; inset:0` and .pv-grid asks for `height: calc(100% - 22px)`.
+ *
+ * THREE classes on the host selector, not two: rail.js writes
+ * `.pine-view-host.open{display:block}` and its stylesheet is concatenated
+ * AFTER this one, so two classes tie and lose (script-page.css carries the
+ * same note). And the padding is written per host rather than shared,
+ * because rail.js's `padding-right:34px` for the rail and view-chrome.css's
+ * `padding-bottom:26px` for the console strip are both one-selector rules
+ * that a three-class shorthand would erase. */
+.view.pv-view.active,
+.pine-view-host.open.pv-view {
+  display: block;
+  height: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  background: var(--bg, #0e1216);
+  color: var(--text, #edf3f5);
+}
+.view.pv-view.active { padding: 10px; }
+/* 10px of margin INSIDE the 34px rail gutter and the 26px console strip. */
+.pine-view-host.open.pv-view { padding: 10px 44px 36px 10px; }
+
+/* THE SHAPE OF THE SCREEN. The transport runs the full width because the
+   thing playing is the one fact everything else is about; underneath, the
+   three reading panes; underneath those, the feed you act on and the wall
+   you watch. On anything narrower than a laptop the columns fold rather
+   than shrinking to unreadable slivers - the tablet in landscape gives
+   roughly 1000x600 CSS px (docs/pinetab.md), which keeps three columns. */
+.pv-grid {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) minmax(200px, 1fr) minmax(240px, 1.15fr);
+  grid-template-rows: auto minmax(0, 1fr) minmax(0, 1.15fr);
+  grid-template-areas:
+    "player  player   player"
+    "list    sched    script"
+    "feed    feed     wall";
+  gap: 10px;
+  height: calc(100% - 22px);
+}
+@media (max-width: 900px) {
+  .pv-grid {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "player player"
+      "list   sched"
+      "script wall"
+      "feed   feed";
+    grid-template-rows: auto minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.2fr);
+  }
+}
+
+.pv-pane {
+  background: var(--panel, #1a222a);
+  border: 1px solid var(--line, #313d47);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+}
+.pv-pane h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--muted, #8fa0ad);
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.pv-dim { color: var(--muted, #8fa0ad); font-size: 11px; letter-spacing: 0; text-transform: none; }
+
+.pv-playlist { grid-area: list; grid-template-rows: auto minmax(0, 1fr) auto auto; }
+.pv-schedule { grid-area: sched; }
+.pv-scriptpane { grid-area: script; }
+.pv-feedpane { grid-area: feed; }
+.pv-wallpane { grid-area: wall; grid-template-rows: auto auto minmax(0, 1fr); }
+
+/* -------------------------------------------------------------- player */
+
+.pv-player {
+  grid-area: player;
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 10px;
+  align-items: center;
+  background: var(--panel-2, #212b34);
+  border: 1px solid var(--line, #313d47);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.pv-art {
+  width: 64px; height: 64px;
+  object-fit: cover;
+  border-radius: 5px;
+  background: #000;
+  visibility: hidden;
+}
+.pv-nowbox { min-width: 0; display: grid; gap: 3px; }
+.pv-nowbox b { font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-nowbox > span { color: var(--muted, #8fa0ad); font-size: 12px; }
+
+.pv-barwrap { height: 4px; background: #0b0f13; border-radius: 2px; overflow: hidden; }
+.pv-barwrap u { display: block; height: 100%; width: 0; background: var(--cyan, #65c7da); }
+
+.pv-transport { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pv-clock, .pv-cast, .pv-budget { color: var(--muted, #8fa0ad); font-size: 11px; }
+.pv-budget { margin-left: auto; }
+
+/* --------------------------------------------------------------- lists */
+
+.pv-queue, .pv-script, .pv-feed, .pv-hours { overflow-y: auto; min-height: 0; }
+
+.pv-sub {
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--muted, #8fa0ad);
+  margin: 6px 0 3px;
+}
+.pv-empty { color: var(--muted, #8fa0ad); font-size: 12px; margin: 2px 0; }
+
+.pv-track {
+  display: grid;
+  grid-template-columns: 28px 1fr auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 3px 2px;
+  border-radius: 5px;
+}
+.pv-track i { width: 28px; height: 28px; border-radius: 3px; background: #000 center/cover no-repeat; }
+.pv-track div { min-width: 0; display: grid; }
+.pv-track b { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-track span { font-size: 11px; color: var(--muted, #8fa0ad); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-track.played { opacity: .55; }
+.pv-track.next { background: rgba(101, 199, 218, .12); }
+
+.pv-libhead { display: flex; justify-content: space-between; font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--muted, #8fa0ad); margin-top: 6px; }
+.pv-library { display: flex; flex-wrap: wrap; gap: 4px; max-height: 62px; overflow: hidden; }
+.pv-chip {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 9px;
+  background: #0b0f13;
+  color: var(--muted, #8fa0ad);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ------------------------------------------------------------ schedule */
+
+.pv-hour { margin-bottom: 8px; }
+.pv-hour-head { display: flex; gap: 8px; align-items: baseline; font-size: 11px; }
+.pv-hour-head b { font-size: 13px; }
+.pv-hour-head span { color: var(--muted, #8fa0ad); }
+.pv-hour.now .pv-hour-head b { color: var(--cyan, #65c7da); }
+
+.pv-slot {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  margin: 2px 0;
+  padding: 4px 6px;
+  border: 1px solid var(--line, #313d47);
+  border-radius: 5px;
+  background: var(--panel-2, #212b34);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+.pv-slot i { font-style: normal; font-size: 11px; color: var(--muted, #8fa0ad); }
+.pv-slot b { font-size: 12px; font-weight: 500; }
+/* The one that is actually on air, and the ones the booth has passed.
+   `inert` is a fact off the booth's own position, not off arithmetic -
+   #963 greyed a whole screenful of live tiles by computing it. */
+.pv-slot.on-air { border-color: var(--cyan, #65c7da); }
+.pv-slot.done, .pv-slot.inert { opacity: .45; }
+.pv-slot.off { opacity: .3; text-decoration: line-through; }
+.pv-slot u {
+  position: absolute;
+  left: 0; bottom: 0; height: 2px;
+  background: var(--amber, #e3be63);
+}
+.pv-slot u.covered { background: var(--green, #54d18b); }
+.pv-slot u.bare { background: var(--red, #e46b6b); }
+
+/* -------------------------------------------------------------- script */
+
+.pv-script { font-size: 13px; line-height: 1.45; }
+.pv-line { margin: 0 0 5px; display: grid; grid-template-columns: auto 1fr; gap: 6px; opacity: .6; }
+.pv-line b { color: var(--muted, #8fa0ad); font-weight: 600; white-space: nowrap; }
+/* The line SOUNDING RIGHT NOW. Worked out locally from stream_now between
+   polls, so it moves at 250ms rather than every four seconds. */
+.pv-line.live { opacity: 1; }
+.pv-line.live b { color: var(--cyan, #65c7da); }
+.pv-line.live span { color: var(--text, #edf3f5); }
+.pv-line.waiting b { color: var(--amber, #e3be63); }
+
+/* ---------------------------------------------------------------- feed */
+
+.pv-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 92px;
+  gap: 6px;
+  align-items: baseline;
+  padding: 4px 2px;
+  border-bottom: 1px solid rgba(49, 61, 71, .5);
+  font-size: 12px;
+}
+.pv-row b { color: var(--muted, #8fa0ad); overflow: hidden; text-overflow: ellipsis; }
+.pv-row em { font-style: normal; font-size: 10px; color: var(--muted, #8fa0ad); text-align: right; }
+.pv-row.playing { background: rgba(101, 199, 218, .1); }
+.pv-row.playing b { color: var(--cyan, #65c7da); }
+/* A line that was CUT once has a review record behind it, so its vote
+   goes down a different road - and the operator should be able to see
+   that before pressing, not after. */
+.pv-row.cut { border-left: 2px solid var(--amber, #e3be63); padding-left: 4px; }
+.pv-tools { grid-column: 1 / -1; display: flex; gap: 4px; }
+.pv-notebox { grid-column: 1 / -1; display: flex; gap: 4px; margin: 3px 0 5px; }
+.pv-notebox input {
+  flex: 1;
+  min-width: 0;
+  background: #0b0f13;
+  border: 1px solid var(--line, #313d47);
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  padding: 2px 6px;
+}
+
+/* ---------------------------------------------------------- the wall */
+
+.pv-wallbox { position: relative; border-radius: 6px; overflow: hidden; background: #000; }
+/* Fixed aspect so the pane does not jump every time a clip of a different
+   shape comes up. object-fit contain, because a video wall that crops the
+   station's own work is showing the wrong thing. */
+.pv-video { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #000; display: block; cursor: pointer; }
+.pv-wallsay {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  padding: 3px 6px;
+  font-size: 11px;
+  color: var(--text, #edf3f5);
+  background: linear-gradient(transparent, rgba(0, 0, 0, .75));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pv-wallsay.bad { color: var(--red, #e46b6b); }
+
+.pv-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(52px, 1fr));
+  gap: 3px;
+  overflow-y: auto;
+  min-height: 0;
+  margin-top: 6px;
+}
+.pv-gallery img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 3px; background: #000; }
+
+/* ------------------------------------------------------------ controls */
+
+.pv-mini {
+  background: var(--panel-2, #212b34);
+  border: 1px solid var(--line, #313d47);
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 7px;
+  cursor: pointer;
+}
+.pv-mini:hover { border-color: var(--cyan, #65c7da); }
+.pv-mini:disabled { opacity: .4; cursor: default; }
+.pv-mini.on { background: var(--cyan, #65c7da); color: #05131a; border-color: var(--cyan, #65c7da); }
+.pv-mini.good:hover { border-color: var(--green, #54d18b); color: var(--green, #54d18b); }
+.pv-mini.bad:hover { border-color: var(--red, #e46b6b); color: var(--red, #e46b6b); }
+
+.pv-note { height: 18px; font-size: 11px; color: var(--muted, #8fa0ad); white-space: pre-line; overflow: hidden; }
+.pv-note.bad { color: var(--red, #e46b6b); }
+.pv-hint { color: var(--muted, #8fa0ad); font-size: 12px; margin: 4px 0; }
+.pv-blocker { color: var(--red, #e46b6b); font-size: 12px; margin: 4px 0; }
+
+/* --------------------------------------------------------------- popup */
+
+.pv-popup {
+  position: fixed;
+  inset: 8% 12%;
+  z-index: 60;
+  background: var(--panel, #1a222a);
+  border: 1px solid var(--cyan, #65c7da);
+  border-radius: 8px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .6);
+  color: var(--text, #edf3f5);
+}
+.pv-popup-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line, #313d47);
+}
+.pv-popup-body { padding: 8px 10px; overflow-y: auto; min-height: 0; }
+.pv-cand {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(49, 61, 71, .5);
+  font-size: 12px;
+}
+.pv-cand em { font-style: normal; font-size: 11px; color: var(--muted, #8fa0ad); white-space: nowrap; }
+.pv-cand.pinned { border-left: 2px solid var(--cyan, #65c7da); padding-left: 5px; }
+.pv-cand.ready em { color: var(--green, #54d18b); }
+
+/* The transition that stands in for an empty video element.
+ *
+ * The browser paints its own round play badge into a <video> with no
+ * decodable frame, stretched to fill the box and immune to object-fit -
+ * the "oblong circle". The element is hidden until it holds a frame and
+ * this sits in the gap. Same box, same rounding, so nothing jumps. */
+.pv-wallfx {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: none;
+  background: #000;
+  border-radius: 6px;
+}
+/* Which slideshow the wall is running. Small and out of the way: the
+   picture is the subject, this is a label on it. */
+.pv-wallmode {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, .55);
+  color: var(--muted, #8fa0ad);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: .05em;
+  cursor: pointer;
+}

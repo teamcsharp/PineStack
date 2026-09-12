@@ -337,13 +337,37 @@ class System2Store:
             self._sync(db, normalized)
             catalogue = [json.loads(raw[0]) for raw in db.execute('SELECT body FROM s2_candidates')]
             bookings = []
+            # #1227: WHAT WAS ACTUALLY HEARD, not what was merely planned.
+            # A booking exists to stop the same material going out twice
+            # inside REPEAT_SECONDS, and that is right for material that
+            # WENT OUT. Applied to every allocation ever made, it meant a
+            # slot which passed in silence reserved its round against the
+            # following hour for an hour afterwards - the round nobody
+            # heard, the freshest thing the station owns, and the one
+            # thing the next hour was not allowed to use.
+            heard_pairs = set()
+            for raw in db.execute(
+                    "SELECT body FROM s2_reservations WHERE state IN "
+                    "('playing','suspended','completed')"):
+                try:
+                    row = json.loads(raw[0])
+                    heard_pairs.add((row['slot_id'], row['candidate_id']))
+                except Exception:
+                    continue
             for raw in db.execute('SELECT body FROM s2_slots WHERE hour_id<>?', (hour_id,)):
                 other = json.loads(raw[0])
                 for allocation in other.get('allocations') or []:
                     at = allocation['planned_start']
                     candidate = allocation['candidate']
-                    if at + candidate['seconds'] + REPEAT_SECONDS > self.now():
-                        bookings.append((at, candidate))
+                    if at + candidate['seconds'] + REPEAT_SECONDS <= self.now():
+                        continue
+                    # Its moment has passed and nobody heard it: the
+                    # material is unspent, so it carries to this hour
+                    # instead of being held against it.
+                    if (at + candidate['seconds'] < self.now()
+                            and (other['id'], candidate['id']) not in heard_pairs):
+                        continue
+                    bookings.append((at, candidate))
             slots = []
             for i, template in enumerate(enabled):
                 identity = hour_id + ':' + template['id']
@@ -438,7 +462,7 @@ class System2Store:
         hour['all_segments_present'] = all(s.get('coverage_seconds', s['ready_seconds']) > .001 or s['target_seconds'] == 0 for s in hour['slots'])
         return hour
 
-    def explain_hour(self, identity):
+    def explain_hour(self, identity, live_slots=None):
         """#1222: why each slot of an hour is bound, or is not.
 
         Read-only, and deliberately a REPLAY of plan_hour's own filters
@@ -450,6 +474,16 @@ class System2Store:
             hour = self._hour(db, identity)
             if not hour:
                 return {}
+            # #1224: READ WHAT THE DISPATCHER READS. The first cut of this
+            # walked s2_slots, while dispatch() and status() both work off
+            # the runtime's IN-MEMORY plans - so the view reported "0 of 18
+            # bound" for an hour the planner had 1,018s allocated in, and
+            # an explanation that disagrees with the thing it explains is
+            # worse than none. The caller hands in the live slots.
+            if live_slots:
+                by_id = {str(s.get('id')): s for s in live_slots}
+                hour['slots'] = [by_id.get(str(slot.get('id')), slot)
+                                 for slot in hour['slots']]
             catalogue = [json.loads(raw[0]) for raw in
                          db.execute('SELECT body FROM s2_candidates')]
             bookings = []

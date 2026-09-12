@@ -35,7 +35,11 @@ class CrystalPromptTests(unittest.TestCase):
     def test_turn_keeps_exact_source_and_one_unambiguous_bar_shape(self):
         text = self.turn()
         self.assertIn(json.dumps(self.source), text)
-        self.assertIn("two or more short spoken bars separated by ' / '", text)
+        self.assertIn("two or more spoken bars separated by ' / '", text)
+        # 2026-09-09: and no word count on a bar - it runs as long as the
+        # content and the chain need it to.
+        self.assertIn("A BAR RUNS AS LONG AS IT NEEDS TO", text)
+        self.assertNotIn("at most twelve words per bar", text)
         self.assertIn("No speaker label, numbering", text)
         self.assertIn("not answer", text)
         self.assertNotIn("Keep every word", text)
@@ -54,7 +58,7 @@ class CrystalPromptTests(unittest.TestCase):
         self.assertIn('"value":"12"', text)
         self.assertIn('"negation":false', text)
         self.assertIn("Fix the reported faults", text)
-        self.assertIn("two or more short spoken bars", text)
+        self.assertIn("two or more spoken bars", text)
         self.assertIn("Keep the original refusal.", text)
 
     def test_meta_and_unchanged_repairs_keep_the_same_source_contract_and_rhyme_rules(self):

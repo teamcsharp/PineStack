@@ -1,0 +1,430 @@
+/* THE SCRIPT VIEW, LAID OUT TO THE SKETCH.
+ *
+ * The operator numbered seven regions; script-page.js marks them 1..7 and so
+ * does this file. The shape he drew:
+ *
+ *   +----------------+---------------------------+
+ *   | 1 2 3          |                           |
+ *   | 4  tree        |   7  THE SCRIPT           |
+ *   | 5  player      |      (the right HALF)     |
+ *   | 6  feed        |                           |
+ *   +----------------+---------------------------+
+ *
+ * THE RIGHT SIDE IS HALF THE SCREEN, because he said so twice: "this one
+ * takes up the second half of the screen". So the grid is 1fr 1fr rather
+ * than a sidebar and a remainder.
+ *
+ * THE PALETTE IS DEFINED HERE. On the tablet these views are injected into
+ * the station's own panel, where the desktop's tokens do not exist -
+ * `var(--cyan)` resolves to nothing and a control goes near-black on
+ * transparent. sampler.css learned that by having its mode buttons vanish.
+ * Every var() below carries its own fallback.
+ */
+/* THE SELECTOR CARRIES THE HOST CLASS ON PURPOSE.
+ *
+ * rail.js styles every view host with `.pine-view-host.open{display:block}`,
+ * which is two classes and lands LATER in the cascade than this file. A bare
+ * `.sp-page{display:grid}` lost to it silently: measured on the tablet as
+ * display "block" with grid-template-columns still reading "1fr 1fr" - the
+ * columns were declared and never applied, so the whole view stacked. */
+/* THREE classes, and that is not paranoia - it is arithmetic.
+ * rail.js writes `.pine-view-host.open{display:block}` and concatenates its
+ * stylesheet AFTER this one, so a two-class selector TIES and loses. The
+ * open state has to be named as well to win. Measured twice on the tablet:
+ * display "block" with grid-template-columns reading "1fr 1fr" - declared,
+ * never applied. */
+.pine-view-host.open.sp-page,
+.sp-page {
+  --sp-bg: #101419;
+  --sp-panel: #1c242c;
+  --sp-panel-2: #222b35;
+  --sp-text: #edf3f5;
+  --sp-muted: #8fa0ad;
+  --sp-line: #35414c;
+  --sp-on: #65c7da;
+  --sp-green: #54d18b;
+  --sp-amber: #e3be63;
+
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  /* THE RIGHT GUTTER IS 46px, NOT 12px, AND THAT IS ARITHMETIC TOO.
+     rail.js gives every host `padding-right:34px` so the view rail stays
+     reachable - but that is a ONE-selector rule and this padding shorthand
+     is a THREE-class one, so the shorthand silently erased it. Measured on
+     the tablet in all three orientations: .sp-right, .sp-scripthead and
+     #spScript each ran 22px (34 - 12) underneath the rail. 12 of breathing
+     room INSIDE the 34 of rail, then, rather than instead of it. The 30 at
+     the bottom already covers the 26px console strip the same way. */
+  padding: 12px 46px 30px 12px;
+  height: 100%;
+  box-sizing: border-box;
+  background: var(--sp-bg);
+  color: var(--sp-text);
+  font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+  overflow: hidden;
+}
+/* The one declaration that must out-specify the rail. */
+.pine-view-host.open.sp-page { display: grid; }
+
+.sp-left {
+  display: grid;
+  /* bar, tree, player, feed-head, feed. Only the feed grows. */
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+.sp-right {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ---------------------------------------------------------------- 1 2 3 */
+
+.sp-bar { display: flex; gap: 6px; align-items: center; }
+.sp-btn {
+  flex: 0 0 auto;
+  min-width: 38px; min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--sp-line);
+  border-radius: 8px;
+  background: var(--sp-panel);
+  color: var(--sp-text);
+  font: inherit; font-size: 13px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.sp-btn.wide { flex: 1 1 auto; font-size: 11px; min-height: 36px; }
+.sp-btn:active { border-color: var(--sp-on); }
+/* 2 - the view menu. Grows to fill, since it is the one with words in it. */
+.sp-pick {
+  flex: 1 1 auto; min-width: 0;
+  min-height: 34px;
+  padding: 0 8px;
+  border: 1px solid var(--sp-line);
+  border-radius: 8px;
+  background: var(--sp-panel);
+  color: var(--sp-text);
+  font: inherit; font-size: 12px;
+}
+
+/* ------------------------------------------------------------------- 4 */
+
+.sp-treerow { display: flex; align-items: center; gap: 10px; }
+.sp-tree {
+  display: grid; place-items: center;
+  width: 54px; height: 54px; padding: 0;
+  border: 1px solid var(--sp-line);
+  border-radius: 10px;
+  background: var(--sp-panel);
+  color: var(--sp-text);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.sp-tree svg { width: 30px; height: 30px; fill: currentColor; }
+.sp-panel {
+  position: absolute; z-index: 30;
+  margin-top: 4px;
+  width: min(300px, 70vw);
+  padding: 10px;
+  border: 1px solid var(--sp-line);
+  border-radius: 10px;
+  background: var(--sp-bg);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, .55);
+}
+.sp-panel h4 { margin: 0 0 8px; font-size: 12px; }
+.sp-panel-row {
+  display: block; width: 100%; min-height: 38px;
+  margin-bottom: 4px; padding: 0 10px;
+  border: 1px solid var(--sp-line); border-radius: 8px;
+  background: var(--sp-panel); color: var(--sp-text);
+  font: inherit; font-size: 12px; text-align: left; cursor: pointer;
+}
+.sp-panel-why { margin: 6px 0 0; font-size: 10px; line-height: 1.5; color: var(--sp-muted); }
+
+/* ------------------------------------------------------------------- 5 */
+
+.sp-player {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--sp-line);
+  border-radius: 10px;
+  background: var(--sp-panel);
+}
+/* THE ART IS A FIXED SQUARE. Without this the <img> takes its intrinsic
+   size and fills the screen - which is exactly what it did before this file
+   existed. */
+.sp-art {
+  width: 64px; height: 64px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: var(--sp-panel-2);
+  border: 1px solid var(--sp-line);
+}
+.sp-playmid { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.sp-title {
+  font-size: 13px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sp-who {
+  font-size: 10px; color: var(--sp-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The spectrum and the meter. Fixed heights: a canvas has no intrinsic size
+   and collapses to nothing in a flex column without one. */
+.sp-spectrum, .sp-voicemeter {
+  width: 100%; display: block;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .04);
+}
+.sp-spectrum { height: 22px; }
+.sp-voicemeter { height: 12px; }
+
+.sp-seekrow { display: flex; align-items: center; gap: 7px; }
+.sp-seek { flex: 1 1 auto; min-width: 0; }
+.sp-time {
+  flex: 0 0 auto; font-style: normal; font-size: 10px;
+  color: var(--sp-muted); font-variant-numeric: tabular-nums;
+}
+.sp-transport { display: flex; flex-direction: column; gap: 5px; }
+.sp-tbtn {
+  width: 36px; height: 30px; padding: 0;
+  border: 1px solid var(--sp-line); border-radius: 7px;
+  background: var(--sp-panel-2); color: var(--sp-text);
+  font-size: 12px; cursor: pointer;
+}
+
+/* ------------------------------------------------------------------- 6 */
+
+.sp-feedhead {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--sp-muted);
+}
+.sp-feedwhy { font-style: normal; text-transform: none; letter-spacing: 0; font-size: 10px; }
+/* The correspondence. Scrolls, and rows are appended at the bottom. */
+.sp-feed {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  border: 1px solid var(--sp-line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .25);
+  padding: 6px;
+}
+.sp-msg {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.sp-msg + .sp-msg { margin-top: 2px; }
+.sp-msg:hover { background: rgba(255, 255, 255, .04); }
+.sp-msg.airing { background: rgba(84, 209, 138, .1); }
+.sp-msg-who {
+  font-size: 10px; color: var(--sp-on);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sp-msg-text { font-size: 12px; min-width: 0; word-break: break-word; }
+/* Things the station DID rather than said. */
+.sp-msg-ev { opacity: .62; }
+.sp-msg-ev .sp-msg-who { color: var(--sp-muted); }
+.sp-msg-ev .sp-msg-text { font-size: 11px; color: var(--sp-muted); }
+
+/* ------------------------------------------------------------------- 7 */
+
+.sp-scripthead {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--sp-muted);
+}
+.sp-scriptwhy { font-style: normal; text-transform: none; letter-spacing: 0; font-size: 10px; }
+
+/* THE PAGE. A screenplay is a typewriter document: one monospaced measure,
+   and meaning carried by INDENT rather than by weight or colour. Keeping
+   that is the whole point of asking for a Hollywood script instead of a
+   list of lines. */
+.sp-script {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding: 18px 20px 24px;
+  border: 1px solid var(--sp-line);
+  border-radius: 10px;
+  background: #0d1116;
+  font-family: "Courier New", Courier, ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+/* pre-wrap KEEPS the typewriter's own line breaks; `overflow-wrap: anywhere`
+   is what stops a line it cannot break from walking off the right edge.
+   The screenplay column is only 78% of a 632px pane in portrait and the
+   element clips rather than scrolls, so an unbreakable run - a filename, a
+   URL, a long hyphenless compound - would take the rest of the line with it
+   and leave no sign that anything was missing. Measured during an
+   orientation sweep as 68 .sp-dialogue elements each losing 116px of text;
+   at rest the same page clips none, which is precisely why this is worth a
+   declaration rather than a shrug: the fault is real but only shows while
+   the page is still laying itself out, and a reader cannot tell the
+   difference from a sentence that simply ends. */
+.sp-el { white-space: pre-wrap; overflow-wrap: anywhere; }
+.sp-el.picked { background: rgba(101, 199, 218, .14); border-radius: 4px; }
+.sp-el.flash { animation: spFlash 1.2s ease-out; }
+@keyframes spFlash {
+  0% { background: rgba(227, 190, 99, .5); }
+  100% { background: transparent; }
+}
+
+/* The standard measures, in the standard places. */
+.sp-scene {
+  margin: 18px 0 8px;
+  text-transform: uppercase;
+  font-weight: 700;
+  letter-spacing: .04em;
+}
+.sp-subheader {
+  margin: 0 0 10px;
+  text-transform: uppercase;
+  color: var(--sp-muted);
+  font-size: 11px;
+}
+.sp-action { margin: 0 0 10px; }
+.sp-character {
+  margin: 10px 0 0 34%;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.sp-parenthetical { margin: 0 0 0 26%; color: var(--sp-muted); }
+.sp-dialogue {
+  margin: 0 0 8px 18%;
+  max-width: 62%;
+  cursor: pointer;
+}
+.sp-transition {
+  margin: 12px 0;
+  text-align: right;
+  text-transform: uppercase;
+  color: var(--sp-muted);
+}
+
+/* A line that has not aired yet can still be changed - which is the one
+   state worth marking, because it is the only one where a note can still
+   reach the room before the audience does. */
+/* NOT YET SAID. A quiet marker, not a highlight - there can be a dozen of
+   these on screen and only one line is actually being spoken. */
+.sp-el.pending { border-left: 2px dotted var(--sp-amber); padding-left: 6px; opacity: .82; }
+
+/* THE LINE BEING SAID, RIGHT NOW.
+   One at a time, and unmistakable: the eye should find it without reading.
+   The bar on the left pulses at roughly the pace of speech so a still
+   screenshot and a live screen look different. */
+.sp-el.sp-now {
+  background: linear-gradient(90deg,
+    rgba(101, 199, 218, .22), rgba(101, 199, 218, .05));
+  border-left: 3px solid var(--sp-on, #65c7da);
+  border-radius: 4px;
+  padding-left: 7px;
+  color: var(--sp-text, #edf3f5);
+  box-shadow: 0 0 0 1px rgba(101, 199, 218, .18) inset;
+  scroll-margin: 40vh 0;
+}
+.sp-el.sp-now::after {
+  content: '';
+  position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--sp-on, #65c7da);
+  animation: spNowPulse 1.8s ease-in-out infinite;
+}
+.sp-el.sp-now { position: relative; }
+@keyframes spNowPulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+
+/* The one-line readout under the heading: what is happening with it. */
+.sp-now-line {
+  flex: 0 0 auto;
+  margin: 0 0 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--sp-line, #35414c);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, .28);
+  font-size: 11px; line-height: 1.4;
+  letter-spacing: .02em;
+  color: var(--sp-muted, #8fa0ad);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.sp-now-line[data-state="air"] { color: var(--sp-text, #edf3f5); border-left-color: var(--sp-on, #65c7da); }
+.sp-now-line[data-state="work"] { border-left-color: var(--sp-amber, #d8a657); }
+.sp-now-line[data-state="wait"] { border-left-color: var(--sp-amber, #d8a657); opacity: .9; }
+.sp-now-line[data-state="paused"] { border-left-color: #d86b57; color: #e9b5aa; }
+/* Scrolled away from the live line: say so, and offer the way back. */
+.sp-now-line.adrift::before { content: '↩ '; color: var(--sp-on, #65c7da); }
+.sp-now-line.adrift::after { content: '  · tap to follow'; opacity: .7; }
+.sp-el.tinted { }
+
+.sp-empty { color: var(--sp-muted); font-family: inherit; }
+
+/* The line detail, over the page. */
+.sp-detail {
+  position: absolute;
+  left: 10px; right: 10px; bottom: 10px;
+  z-index: 20;
+  padding: 12px 14px;
+  border: 1px solid var(--sp-line);
+  border-radius: 12px;
+  background: var(--sp-bg);
+  box-shadow: 0 -10px 40px rgba(0, 0, 0, .6);
+}
+.sp-detail-who { font-size: 11px; color: var(--sp-on); text-transform: uppercase; }
+.sp-detail-text { margin: 6px 0; font-size: 13px; line-height: 1.5; }
+.sp-detail-facts { display: block; font-style: normal; font-size: 10px; color: var(--sp-muted); }
+.sp-note {
+  width: 100%; min-height: 54px; margin: 8px 0;
+  padding: 8px; box-sizing: border-box;
+  border: 1px solid var(--sp-line); border-radius: 8px;
+  background: rgba(0, 0, 0, .35); color: var(--sp-text);
+  font: inherit; font-size: 12px; resize: vertical;
+}
+.sp-detail-row { display: flex; gap: 6px; }
+.sp-detail-close {
+  position: absolute; top: 8px; right: 10px;
+  width: 28px; height: 28px; padding: 0;
+  border: 1px solid var(--sp-line); border-radius: 50%;
+  background: var(--sp-panel); color: var(--sp-muted);
+  cursor: pointer;
+}
+
+/* Portrait, and anything narrow: the script goes UNDER the left column
+   rather than beside it. Two 50% columns on a 690px-wide screen would give
+   the screenplay 340px, which is narrower than one line of dialogue. */
+/* THIS QUERY HAD NEVER RUN. A ONE-CLASS `.sp-page` inside it was being
+   beaten by the THREE-CLASS `.pine-view-host.open.sp-page` above - the very
+   trap this file already carries two comments about, repeated in its own
+   footer. Measured on the tablet at 690x1154: grid-template-columns still
+   read "327.2px 327.2px", two half-width columns on a portrait screen, and
+   overflow stayed `hidden` instead of becoming a scroll. The screenplay was
+   getting a 327px column - narrower than one line of dialogue - which is
+   exactly what the query was written to prevent, and it showed up as 28
+   .sp-dialogue elements each clipping 184px of text horizontally.
+   So the host class is named here as well. */
+@media (max-width: 900px) {
+  .pine-view-host.open.sp-page,
+  .sp-page {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(240px, 1fr);
+    overflow-y: auto;
+  }
+  .sp-left { grid-template-rows: auto auto auto auto minmax(160px, 30vh); }
+  .sp-dialogue { margin-left: 12%; max-width: 78%; }
+  .sp-character { margin-left: 28%; }
+}

@@ -32,3 +32,15 @@ pillow==11.3.0
 # screenplay's .pdf answers 501, and the panel's PDF button falls back to
 # the browser's print dialogue - which is what it did before #1048.
 fpdf2==2.8.8
+# The Library's PDF reader (#1158). The shelf at //10.89.1.125/QuickSwap/Manuals
+# is mostly PDF, and this image has no poppler - pdftotext lives on the HOST,
+# not in python:3.12-slim - so without this line every PDF on the shelf is
+# unreadable and library_extract raises "no pdf reader on this box".
+# Measured against poppler on all seven manuals before it was chosen: word
+# recall is 100% (the raw CHARACTER counts look half as big only because
+# `pdftotext -layout` pads with spaces to hold the page geometry), and pypdf
+# actually finds MORE unique words - it picks up diagram labels poppler drops.
+# Pure python, py3-none-any, no compiler and no system libraries, which is
+# what makes it the right answer on aarch64. EPUB, zip, docx and plain text
+# need nothing at all beyond the stdlib.
+pypdf==6.18.0

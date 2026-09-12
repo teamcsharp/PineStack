@@ -431,8 +431,9 @@ class SourceResponseDraftTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await app.response_bank_draft(), 2)
             self.assertEqual(await app.response_bank_draft(), 0)
             self.assertEqual(app.call_ollama.await_count, 1)
-            self.assertEqual(len(bank.missing("alice", "piper")), 10)
-            self.assertEqual(len(bank.missing("bob", "xtts")), 10)
+            # The base phrases plus the two grounded drafts, for each voice.
+            self.assertEqual(len(bank.missing("alice", "piper")), len(PHRASES) + 2)
+            self.assertEqual(len(bank.missing("bob", "xtts")), len(PHRASES) + 2)
             self.assertEqual(bank.catalog()[0]["source"]["file"], "gardens.md")
 
     async def test_source_failure_preserves_existing_recordings_and_catalogue(self):
@@ -444,7 +445,7 @@ class SourceResponseDraftTests(unittest.IsolatedAsyncioTestCase):
             for name, value in replacements.items():
                 stack.enter_context(mock.patch.object(app, name, value))
             self.assertEqual(await app.response_bank_draft(), 0)
-            self.assertEqual(len(bank.missing("alice", "piper")), 8)
+            self.assertEqual(len(bank.missing("alice", "piper")), len(PHRASES))
             self.assertIn("retry", app._RESPONSE_DRAFT_STATE["why"])
 
     def test_reference_draw_needs_no_model_or_unused_gems(self):

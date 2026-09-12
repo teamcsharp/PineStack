@@ -62,7 +62,14 @@ class CrystalBatchFairnessTests(unittest.IsolatedAsyncioTestCase):
             rows = evidence_rows(call.args[0])
             self.assertEqual([(row["speaker"], row["source"]) for row in rows], turns)
             selected = [row for row in rows if row["requested"]]
-            self.assertLessEqual(call.kwargs["limit"], min(1800, self.settings["reply_max_chars"]))
+            # 2026-09-09: the CAP, not the number it happened to hold. The
+            # invariant is that a group is bounded by the station's group
+            # cap and the operator's reply budget, whichever is smaller -
+            # pinning the literal made a tuning change look like a broken
+            # contract.
+            self.assertLessEqual(call.kwargs["limit"],
+                                 min(app.CRYSTAL_GROUP_OUTPUT_CHARS,
+                                     self.settings["reply_max_chars"]))
             self.assertEqual(call.kwargs["model"], "fixture-model")
             self.assertIn(self.WORLD, call.args[0])
             self.assertIn(self.CHUNKS[0]["text"], call.args[0])
@@ -133,7 +140,7 @@ class CrystalBatchFairnessTests(unittest.IsolatedAsyncioTestCase):
         self.assert_group_evidence(turns, [i for i in range(20) if i not in accepted])
 
     async def test_oversized_repair_turn_keeps_full_user_ceiling_and_words(self):
-        source = ("Mara cannot return twelve copper plates before midnight. " * 22).strip()
+        source = ("Mara cannot return twelve copper plates before midnight. " * 26).strip()
         turns = [("A", source), ("B", self.SOURCE)]
         failed = self.BAD + " Full retained failure. " * 50
         rows = [{"marker": "A", "source": hashlib.sha1(source.encode()).hexdigest(),
@@ -153,7 +160,7 @@ class CrystalBatchFairnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[1]["text"], self.GOOD)
 
     async def test_oversized_first_pass_position_remains_pending_for_full_ceiling_repair(self):
-        source = ("Mara cannot return twelve copper plates before midnight. " * 22).strip()
+        source = ("Mara cannot return twelve copper plates before midnight. " * 26).strip()
         turns = [("A", self.SOURCE), ("B", source), ("A", self.SOURCE)]
         requested = self.answering_batches()
         rows = await self.first_pass(turns)

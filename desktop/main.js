@@ -6,6 +6,7 @@ const { LcdAgent, deviceRequest } = require("./lcd-agent.cjs");
 const { LcdSerial, usbDisplays } = require("./lcd-serial.cjs");
 const { LcdFirmware } = require("./lcd-firmware.cjs");
 const { saveLcdSample } = require("./lcd-samples.cjs");
+const { TerminalHost } = require("./terminal-host.cjs");
 
 let win;
 let backend = null;
@@ -795,6 +796,12 @@ ipcMain.handle("desktop:build", () => {
         : "running the newest source on the share",
   };
 });
+
+/* The terminal provisioner: discovery, the restore image, the GSI and
+ * the unlock. It owns where adb and fastboot live; every decision it
+ * makes lives in terminal.cjs / firmware.cjs / gsi.cjs, which are
+ * tested without hardware. */
+new TerminalHost({ readConfig, writeConfig }).install(ipcMain);
 
 ipcMain.handle("desktop:reconstitute", () => reconstituteDesktop());
 ipcMain.handle("backend:log", () => backendLog);

@@ -159,14 +159,17 @@ class WorkbenchTests(unittest.IsolatedAsyncioTestCase):
         prompt = call['messages'][-1]['content']
         for evidence in (self.source, self.candidate, 'meaning drift',
                          'Exact production contract for the red door',
-                         'two or more short spoken bars', 'Output budget:'):
+                         'two or more spoken bars', 'Output budget:'):
             self.assertIn(evidence, prompt)
         self.assertEqual(call['temperature'], .3)
         operation = self.store.get_operation(response.json()['operation']['id'])
         self.assertEqual(operation['status'], 'completed')
         trial = self.store.get_trial(operation['trial_id'])
         self.assertEqual(trial['baseline']['grader_version'], 9)
-        self.assertEqual(trial['provenance']['prompt_version'], 5)
+        # 2026-09-09: the craft priority, the revision ask and the lifted
+        # word count on a bar changed the words every road shares, so the
+        # shared frame is version 7.
+        self.assertEqual(trial['provenance']['prompt_version'], 8)
         self.host['line_review_recover'].assert_not_called()
 
     async def test_reasoning_trial_is_explicit_bounded_and_does_not_change_production(self):
