@@ -119,6 +119,7 @@
   var sheet = null;
 
   function close() {
+    stopPlaying();
     if (sheet) { sheet.remove(); sheet = null; }
   }
 
@@ -132,6 +133,12 @@
     sheet.appendChild(head);
 
     var list = make('div', 'la-list');
+    /* PLAY IT FIRST, because it is the only one that answers "which line is
+     * this?" - and on a screen of six near-identical rap couplets that is
+     * the question the hand is usually asking. It is also the only choice
+     * here that changes nothing. */
+    choice(list, 'Play it',
+      'hear this line, here', function (say) { playIt(line, say); });
     choice(list, 'Put it on a sampler pad',
       'the next free pad, ready to fire', function (say, bar) { toPad(line, say, bar); });
     choice(list, 'Download it to the tablet',
@@ -190,6 +197,72 @@
   }
 
   /* --------------------------------------------------------- the actions */
+
+  /* HEAR IT, WITHOUT PUTTING IT ANYWHERE.
+   *
+   * Through the sampler's own sourceFor, so this asks the same question the
+   * pad grab asks and cannot disagree with it about which line has audio -
+   * the mistake that once offered 7 takeable moments out of about 220.
+   *
+   * The broadcast is DUCKED while it plays, the same as a pad: the operator
+   * pressed this to hear one line, and hearing it under a record is not
+   * hearing it. The element is marked as the sampler's own so the air tap
+   * does not record this audition back into its own ring. */
+  var playing = null;
+
+  function stopPlaying() {
+    if (!playing) return;
+    try { playing.pause(); } catch (err) { /* already gone */ }
+    playing = null;
+    if (root.PineAir) root.PineAir.release('audition');
+  }
+
+  function playIt(line, say) {
+    stopPlaying();
+    var sampler = root.PineSampler;
+    var source = sampler && typeof sampler.sourceFor === 'function'
+      ? sampler.sourceFor({id: line.id, text: line.said}) : null;
+    if (!source) {
+      /* sourceFor needs the ROW, not a stub - it reads aired/media/sig. Fall
+       * back to the clip route, which is what the row would have resolved to
+       * anyway for a line that aired. */
+      source = {url: '/api/booth/clip?line=' + encodeURIComponent(line.id)};
+    }
+    say('playing…');
+    var audio = new Audio(source.url);
+    if (root.PineAir && root.PineAir.mine) root.PineAir.mine(audio);
+    /* EVERY ROAD OUT RELEASES, not just the happy one. `ended` is the road
+     * that was wired first and it is the one that did not fire: measured,
+     * the clip finished, no event arrived, and the radio stayed muted with
+     * nothing playing. `pause` and `emptied` catch a stalled or replaced
+     * element, and PineAir's own ceiling catches whatever is left. */
+    ['ended', 'pause', 'emptied'].forEach(function (when) {
+      audio.addEventListener(when, function () {
+        if (playing !== audio) return;
+        stopPlaying();
+        say(when === 'ended' ? 'played' : '');
+      });
+    });
+    audio.addEventListener('error', function () {
+      stopPlaying();
+      say('there is no audio behind that line', true);
+    });
+    /* Ducked for as long as the clip lasts once its length is known, and no
+     * longer. Until then PineAir's ceiling is the backstop. */
+    audio.addEventListener('loadedmetadata', function () {
+      if (playing === audio && root.PineAir) {
+        root.PineAir.duck('audition', audio.duration);
+      }
+    });
+    if (root.PineAir) root.PineAir.duck('audition');
+    playing = audio;
+    audio.play().then(function () {
+      say('playing…');
+    }, function (err) {
+      stopPlaying();
+      say(String((err && err.message) || err), true);
+    });
+  }
 
   /* THE SAMPLER'S OWN SEAM, not a second way in. sourceFor and takeable
    * are published precisely so another view can ask the same question this

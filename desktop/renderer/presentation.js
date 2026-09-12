@@ -496,6 +496,12 @@
       const live = speaking && String(row.id) === String(speaking.id);
       line.className = "pv-line" + (live ? " live" : "")
         + (row.lcdStatus === "Recorded / waiting" ? " waiting" : "");
+      /* THE HOLD WORKS ON ANYTHING WEARING THIS. line-actions.js binds one
+       * handler on the document and finds its target with
+       * closest('[data-line]'), so a screen joins in by labelling its lines
+       * and not by wiring anything. This pane never did, which is why a hold
+       * on the Present view's script did nothing at all. */
+      if (row.id) line.dataset.line = String(row.id);
       const who = document.createElement("b");
       who.textContent = (row.name || row.who || "booth") + ":";
       const text = document.createElement("span");
@@ -676,6 +682,9 @@
   function feedRow(row) {
     const item = document.createElement("div");
     item.dataset.row = String(row.id || "");
+    /* The feed rows too - they are lines that were said, same as the script
+     * pane's, and the hold should not care which pane you reached for. */
+    if (row.id) item.dataset.line = String(row.id);
     item.className = "pv-row" + (row.lcdStatus === "Playing" ? " playing" : "")
       + (row.review_id ? " cut" : "");
     const who = document.createElement("b");

@@ -391,15 +391,57 @@
   /* REFERENCE COUNTED, because more than one thing ducks. A pad is held while
    * a clip is auditioned in the grab window; whichever finishes first must not
    * bring the broadcast back under the other. */
-  function duck(who) {
+  /* A DUCK MUST NEVER OUTLIVE ITS REASON.
+   *
+   * Every holder gets a deadline. A caller that forgets to release - an
+   * audition whose `ended` never fires, a pad whose voice count never
+   * reaches zero, a sheet closed by a route nobody thought about - silently
+   * leaves the radio muted, and a silent radio reads as a broken station
+   * rather than as a stuck flag. Measured exactly that: musicGain 0,
+   * padMuted true, nothing playing, and no way for the operator to know why.
+   *
+   * Ninety seconds is longer than any single thing that ducks here (the
+   * longest welded round measured on this station is 107 s, and an audition
+   * of one is the outlier the ceiling is FOR), and short enough that a
+   * forgotten hold is a hiccup rather than an evening. */
+  var DUCK_CEILING_MS = 90000;
+  var deadlines = Object.create(null);
+
+  function duck(who, seconds) {
     if (!duckOn) return;
-    holders[who || 'pad'] = true;
+    var key = who || 'pad';
+    holders[key] = true;
+    if (deadlines[key]) clearTimeout(deadlines[key]);
+    var wait = Number(seconds) > 0
+      ? Math.min(DUCK_CEILING_MS, Number(seconds) * 1000 + 2000)
+      : DUCK_CEILING_MS;
+    deadlines[key] = setTimeout(function () {
+      if (!holders[key]) return;
+      if (root.console) {
+        root.console.warn('pine air: "' + key + '" held the duck for '
+          + Math.round(wait / 1000) + 's and never let go - giving the radio back');
+      }
+      release(key);
+    }, wait);
     lower(true);
   }
 
   function release(who) {
-    delete holders[who || 'pad'];
-    for (var key in holders) if (holders[key]) return;
+    var key = who || 'pad';
+    if (deadlines[key]) { clearTimeout(deadlines[key]); delete deadlines[key]; }
+    delete holders[key];
+    for (var held in holders) if (holders[held]) return;
+    lower(false);
+  }
+
+  /* Hand the radio back whatever is holding it. For a view tearing down, and
+   * for the operator who just wants the sound to come back. */
+  function releaseAll() {
+    for (var key in holders) {
+      if (deadlines[key]) clearTimeout(deadlines[key]);
+      delete deadlines[key];
+      delete holders[key];
+    }
     lower(false);
   }
 
@@ -765,7 +807,7 @@
               musicGain: (musicGain() || {node: {gain: {value: null}}}).node.gain.value,
               talking: somethingElseTalking()};
     },
-    duck: duck, release: release,
+    duck: duck, release: release, releaseAll: releaseAll,
     setDuckEnabled: setDuckEnabled, duckEnabled: duckEnabled,
     /* Marks a player as the sampler's own, so auditioning a clip in the grab
      * window is not itself recorded into the ring. */

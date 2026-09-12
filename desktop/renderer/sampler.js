@@ -2031,6 +2031,11 @@
       const item = document.createElement("div");
       item.className = "pb-row" + (source ? " grabbable" : " quiet");
       item.dataset.rowId = row.id;
+      /* And the hold, which reads data-line - see line-actions.js. A drag
+       * puts this row on a pad; a HOLD offers the rest of what can be done
+       * with it, and there is no reason the sampler's feed should be the one
+       * list where that does not work. */
+      if (row.id) item.dataset.line = String(row.id);
       if (row.lcdStatus === "Playing") item.classList.add("playing");
       const who = document.createElement("b");
       who.textContent = row.name || row.who || row.kind || "booth";
