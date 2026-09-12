@@ -73,10 +73,44 @@ function paintTrim() {
     + '   — ' + (outAt - inAt).toFixed(2) + 's of ' + duration.toFixed(2) + 's';
 }
 
-function paintHead() {
+function paintHead(at) {
   if (!duration) return;
-  head.style.left = ((film.currentTime / duration) * 100) + '%';
+  const when = at == null ? film.currentTime : at;
+  head.style.left = ((when / duration) * 100) + '%';
+  const said = document.getElementById('headSaid');
+  if (said) said.textContent = clock(when);
 }
+
+/* SCRUBBING WITHOUT QUEUEING SEEKS.
+ *
+ * Assigning `currentTime` faster than the decoder can answer does not queue -
+ * Chromium drops the positions in between - so during a drag the picture
+ * lands on whichever seek happened to finish and then sits there, which reads
+ * as the display not updating at all. The latest wanted position is kept and
+ * re-applied when the outstanding seek lands, so the picture chases the
+ * handle and always ends where the handle stopped. */
+let wantAt = null;
+let seeking = false;
+
+function showAt(when) {
+  if (!duration) return;
+  wantAt = Math.min(Math.max(0, when), duration);
+  paintHead(wantAt);
+  if (seeking) return;
+  seeking = true;
+  film.currentTime = wantAt;
+}
+
+film.addEventListener('seeked', () => {
+  seeking = false;
+  if (wantAt != null && Math.abs(film.currentTime - wantAt) > 0.02) {
+    seeking = true;
+    film.currentTime = wantAt;
+    return;
+  }
+  wantAt = null;
+  paintHead();
+});
 
 function timeAt(event) {
   const box = track.getBoundingClientRect();
@@ -108,8 +142,10 @@ function moveEdge(edge, when) {
   else outAt = Math.max(Math.min(duration, when), inAt + 0.1);
   paintTrim();
   if (playing) stop();
-  film.currentTime = edge === 'in' ? inAt : Math.max(inAt, outAt - 0.4);
-  paintHead();
+  /* THE FRAME THE HANDLE IS ON, both handles. The out point used to show
+   * `outAt - 0.4` - meant as "the last bit you keep" and in practice a
+   * picture of somewhere other than the cut being made. */
+  showAt(edge === 'in' ? inAt : outAt);
 }
 
 /* Clicking the strip scrubs; it does not move a handle. Handles are dragged,
@@ -119,8 +155,17 @@ track.addEventListener('pointerdown', (event) => {
   if (dragging) return;
   const when = timeAt(event);
   if (playing) stop();
-  film.currentTime = Math.min(Math.max(when, 0), duration);
-  paintHead();
+  showAt(when);
+});
+
+/* Dragging across the strip scrubs too - pointer capture keeps it coming
+ * once the finger has left the track. */
+track.addEventListener('pointermove', (event) => {
+  if (dragging || !(event.buttons & 1)) return;
+  showAt(timeAt(event));
+});
+track.addEventListener('pointerdown', (event) => {
+  try { track.setPointerCapture(event.pointerId); } catch (error) { /* fine */ }
 });
 
 document.getElementById('setIn').addEventListener('click',

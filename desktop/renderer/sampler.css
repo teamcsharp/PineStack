@@ -73,7 +73,12 @@
 
 .view.pb-sampler.active {
   display: grid;
-  grid-template-columns: minmax(240px, 22%) 1fr;
+  /* minmax(0, …) ON BOTH TRACKS. A bare `1fr` still refuses to go below
+     its content's min-content width, so a wide thing in either column
+     pushes the other one off the glass instead of scrolling inside itself.
+     30% rather than 22% because the feed is where the words are - measured,
+     the pad side had 838px for a 468px grid. */
+  grid-template-columns: minmax(240px, 30%) minmax(0, 1fr);
   gap: 14px;
   padding: 14px;
   height: 100%;
@@ -101,6 +106,13 @@
 
 .pb-left {
   display: grid;
+  /* THE ONE THAT WAS CUTTING THE FEED OFF. With rows declared and no
+     columns, the single implicit column is `auto`, and an `auto` track never
+     shrinks below its min-content - so when the head grew past the column
+     the TRACK grew with it and every row was laid out 320px wide inside a
+     240px box that clips. Measured before this line: width 240,
+     scrollWidth 320. */
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto 1fr auto;
   min-height: 0;
   min-width: 0;
@@ -114,7 +126,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  /* IT WRAPS RATHER THAN CLIPS. Four controls and a count do not fit a
+     240px rail at every font size, and a head that cannot wrap is a head
+     that decides how wide the whole column is. */
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  min-width: 0;
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
 }
@@ -135,7 +152,9 @@
 
 .pb-row {
   display: grid;
-  grid-template-columns: 1fr auto;
+  /* Same trap one level down: a long speaker name would otherwise set the
+     row's width and push the status off the edge. */
+  grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas: "who tag" "text text";
   gap: 2px 8px;
   padding: 7px 9px;
@@ -415,7 +434,10 @@
  * one that gives way, because it is the only one whose meaning survives
  * being cut short - the buttons must stay whole and stay tappable. */
 .pb-tally {
-  flex: 1 1 auto;
+  /* `1 1 0` rather than `1 1 auto`: from a zero basis it is the first thing
+     to give up room, which is what should happen - "38 of 38" cut short
+     still reads, and half a button does not. */
+  flex: 1 1 0;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

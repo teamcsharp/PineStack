@@ -97,6 +97,15 @@ video { max-width: 100%; max-height: 100%; display: block; }
 }
 
 .trimRow { display: flex; align-items: center; gap: 6px; }
+/* The playhead's own time, in the playhead's own colour, so it is read as
+ * "where you are" rather than as another part of the trim. A frame of a
+ * tablet screen is often a still panel and says nothing about when it is. */
+.head-said {
+  color: var(--amber);
+  min-width: 62px;
+  padding: 0 6px;
+  border-left: 1px solid var(--line);
+}
 
 /* --------------------------------------------------------------- tracks */
 
