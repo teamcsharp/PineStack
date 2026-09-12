@@ -69,6 +69,9 @@ from rap_battle import (COMBATANTS as RAP_COMBATANTS, RapBattle,
 from sfx_cadence import SfxCadence, due_after as sfx_due_after
 import library
 import library_extract
+# #1241: the detail behind the overlays' top and bottom panels —
+# what ComfyUI is rendering right now, and OpenWebUI's whole rolodex.
+import spark_overlays
 from resource_guard import ResourceHistory, assess as assess_resources, available_gb, engine_busy, memory_snapshot, gpu_snapshot
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse,
@@ -56858,12 +56861,74 @@ def mind_dir_ok(raw: str, rid: str) -> Path:
 _SPEAKBOX_STAMP = re.compile(r"^\s*[\[(]?\d{1,3}:\d{2}(?::\d{2})?[\])]?\s*")
 
 
+# #1250: ONE WALK OF THE FOLDER, OFF THE LOOP, WITH EVERY MTIME.
+#
+# speakbox_all globbed a CIFS share and speakbox_weight stat'd a file
+# per document, and speakbox_files does both for all 322 of them every
+# time a round goes looking for something to talk about. Measured at
+# 6.5s in one frame, against a host watchdog that restarts the station
+# when /healthz is deaf for 8. The SFX pool settled this in #826 -
+# "never walk the share here - the cache refreshes off-loop once a
+# minute" - and this road never got the message.
+_SPEAKBOX_DIR: dict[str, dict[str, Any]] = {}
+SPEAKBOX_DIR_TTL = 60.0
+
+
+def _speakbox_scan(rid: str) -> dict[str, Any]:
+    """The walk itself. Blocking on purpose - only ever called in a
+    thread, or once on a cold cache."""
+    out: dict[str, Any] = {"at": time.time(), "files": [], "mtime": {}}
+    try:
+        for p in sorted(speakbox_dir(rid).glob("*.md")):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if (st.st_mode & 0o170000) != 0o100000:
+                continue                  # S_ISREG, without the import
+            out["files"].append(p)
+            out["mtime"][p.name] = st.st_mtime
+    except OSError:
+        pass
+    return out
+
+
+def speakbox_scan_cache(rid: str = "") -> dict[str, Any]:
+    """The folder as it was at most a minute ago.
+
+    #221's promise - a document dropped in the folder is in play
+    without anyone ticking a box - is kept to within a minute, which is
+    exactly what the SFX pool has promised since #826."""
+    key = str(rid or "")
+    now = time.time()
+    held = _SPEAKBOX_DIR.get(key)
+    if held is not None:
+        if now - float(held.get("at") or 0) >= SPEAKBOX_DIR_TTL \
+                and not held.get("scanning"):
+            held["scanning"] = True
+
+            async def _again() -> None:
+                try:
+                    got = await asyncio.to_thread(_speakbox_scan, key)
+                    _SPEAKBOX_DIR[key] = got
+                except Exception:  # noqa: BLE001
+                    held["at"] = now      # try again next minute
+                    held["scanning"] = False
+            try:
+                fire_and_forget(_again())
+            except Exception:  # noqa: BLE001
+                held["scanning"] = False
+        return held
+    got = _speakbox_scan(key)             # cold: this one pays for it
+    _SPEAKBOX_DIR[key] = got
+    return got
+
+
 def speakbox_all(rid: str = "") -> list[Path]:
     """Every document in the folder, in play or not."""
     try:
-        return sorted(p for p in speakbox_dir(rid).glob("*.md")
-                      if p.is_file())
-    except OSError:
+        return list(speakbox_scan_cache(rid).get("files") or [])
+    except Exception:  # noqa: BLE001
         return []
 
 
@@ -56948,7 +57013,12 @@ def speakbox_weight(name: str, weights: dict[str, int] | None = None,
     value = weights.get(name)
     base = 50 if value is None else max(0, min(100, int(value)))
     try:
-        age = time.time() - (speakbox_dir(rid) / name).stat().st_mtime
+        # #1250: the mtime the scan already has. This was a stat per
+        # document per draw, over a share, on the event loop.
+        _mt = (speakbox_scan_cache(rid).get("mtime") or {}).get(name)
+        if _mt is None:
+            raise OSError("not in the scan")
+        age = time.time() - float(_mt)
         if age < 7 * 86400:
             # +100% at zero age, fading linearly to +0% at a week old.
             base = int(base * (1.0 + max(0.0, 1.0 - age / (7 * 86400))))
@@ -100464,6 +100534,11 @@ def _slideshow_comfy_read(prompt: Any) -> dict[str, Any]:
 
 
 async def _slideshow_comfy_activity() -> dict[str, Any]:
+    """#1241: superseded by spark_overlays.comfy_activity, which tracks a
+    render ACROSS polls — its elapsed time, its model and sampler and steps,
+    the prompt it is working from, and how far through it is against the
+    last render of the same shape. Kept only as the fallback for a box
+    without that module."""
     """What ComfyUI is doing RIGHT NOW — the TopActivityBanner's subject.
 
     The desktop banner watches a render node by node. ComfyUI publishes that
@@ -100506,12 +100581,35 @@ async def _slideshow_comfy_activity() -> dict[str, Any]:
     return out
 
 
+_SLIDESHOW_SLOW: dict[str, Any] = {"census": False, "owui": False}
+
+
 async def _slideshow_services() -> dict[str, Any]:
-    """The census, on its own slower clock. See the header for why this
-    stands in for the desktop's `docker logs` tailers."""
-    if (time.time() - float(_SLIDESHOW_CENSUS.get("at") or 0.0)
-            < _SLIDESHOW_CENSUS_TTL):
-        return dict(_SLIDESHOW_CENSUS.get("services") or {})
+    """The census, on its own slower clock.
+
+    IT NEVER BLOCKS THE ANSWER. MEASURED on the tablet: the first poll after
+    a restart timed out, because this route was waiting on a cold census
+    (five services AND a real searxng query) plus a twelve-endpoint
+    OpenWebUI sweep — comfortably past the terminal's twenty-second read
+    timeout, so the overlays drew nothing at all and said the station was
+    down. It was not down; it was being asked one very slow question.
+
+    So a stale answer is handed straight back and the refresh runs BEHIND
+    it. The first poll after a restart gets nothing here and the second
+    gets the lot, which is the right trade for a panel that rotates every
+    six seconds."""
+    held = dict(_SLIDESHOW_CENSUS.get("services") or {})
+    fresh = (time.time() - float(_SLIDESHOW_CENSUS.get("at") or 0.0)
+             < _SLIDESHOW_CENSUS_TTL)
+    if fresh:
+        return held
+    if not _SLIDESHOW_SLOW["census"]:
+        _SLIDESHOW_SLOW["census"] = True
+        asyncio.create_task(_slideshow_census_refresh())
+    return held
+
+
+async def _slideshow_census_refresh() -> None:
     try:
         got = await services_census() or {}
         # It carries more than the service rows: `ops` is the station's own
@@ -100532,7 +100630,42 @@ async def _slideshow_services() -> dict[str, Any]:
             "services": {"census": {"ok": False, "detail": str(exc)[:120],
                                     "facts": []}}}
         _SLIDESHOW_CENSUS["at"] = time.time()
-    return dict(_SLIDESHOW_CENSUS.get("services") or {})
+    finally:
+        _SLIDESHOW_SLOW["census"] = False
+
+
+_SLIDESHOW_OWUI: dict[str, Any] = {"at": 0.0, "payload": {}}
+_SLIDESHOW_OWUI_TTL = 20.0
+
+
+async def _slideshow_owui() -> dict[str, Any]:
+    """OpenWebUI's rolodex, on the census's clock and behind the answer.
+
+    A dozen HTTP calls is not something to do every two seconds for a panel
+    that rotates every six — and, as the census learned, not something to
+    make a terminal wait for either."""
+    held = dict(_SLIDESHOW_OWUI.get("payload") or {})
+    fresh = (time.time() - float(_SLIDESHOW_OWUI.get("at") or 0.0)
+             < _SLIDESHOW_OWUI_TTL)
+    if fresh and held:
+        return held
+    if not _SLIDESHOW_SLOW["owui"]:
+        _SLIDESHOW_SLOW["owui"] = True
+        asyncio.create_task(_slideshow_owui_refresh())
+    return held
+
+
+async def _slideshow_owui_refresh() -> None:
+    try:
+        payload = await spark_overlays.openwebui_rolodex(
+            OPENWEBUI_URL, OPENWEBUI_API_KEY or "")
+        _SLIDESHOW_OWUI["payload"] = payload
+        _SLIDESHOW_OWUI["at"] = time.time()
+    except Exception as exc:  # noqa: BLE001
+        _SLIDESHOW_OWUI["payload"] = {"up": False, "why": str(exc)[:120]}
+        _SLIDESHOW_OWUI["at"] = time.time()
+    finally:
+        _SLIDESHOW_SLOW["owui"] = False
 
 
 @app.get("/api/slideshow/backend")
@@ -100585,7 +100718,12 @@ async def slideshow_backend_api(
         out["disk"] = disk
 
         out["gpu"] = await asyncio.to_thread(_slideshow_gpu_blocking)
-        out["comfy"] = await _slideshow_comfy_activity()
+        try:
+            out["comfy"] = await spark_overlays.comfy_activity(COMFYUI_URL)
+        except Exception as exc:  # noqa: BLE001
+            out["comfy"] = await _slideshow_comfy_activity()
+            out["comfy"]["why"] = (out["comfy"].get("why")
+                                   or f"detail unavailable: {exc}")
 
         try:
             uptime = float(Path("/proc/uptime").read_text().split()[0])
@@ -100620,6 +100758,10 @@ async def slideshow_backend_api(
         }
 
         if census:
+            try:
+                out["owui"] = await _slideshow_owui()
+            except Exception as exc:  # noqa: BLE001
+                out["owui"] = {"up": False, "why": str(exc)[:120]}
             got = await _slideshow_services()
             out["services"] = got.get("services") or {}
             out["ops"] = got.get("ops") or {}
@@ -100743,7 +100885,11 @@ _SPARK_PAGE = """<!doctype html>
   /* WITH PICTURES BEHIND IT (?pictures=1): the slideshow view fills the
      screen and the overlays float at their own corners on top, which is the
      desktop application's arrangement exactly. */
-  body.pictures #sparkHost { position: fixed; inset: 0; }
+  /* BELOW THE BAR, not under it. The overlay layer is inset:0 of its host,
+     and a host pinned to the whole viewport put the widget switchboard
+     underneath this page's own fixed title bar — visible enough to look
+     like a rendering fault, and not reachable at all. */
+  body.pictures #sparkHost { position: fixed; inset: 40px 0 0 0; }
   #sparkPictures { position: fixed; inset: 0; z-index: 0; }
   body.pictures .so { z-index: 5; }
   #sparkFallback { padding: 70px 20px 20px; max-width: 620px; line-height: 1.7; color: #8fa0ad; }
@@ -100767,6 +100913,7 @@ _SPARK_PAGE = """<!doctype html>
   'use strict';
   var params = new URLSearchParams(location.search);
   var pictures = params.get('pictures') === '1';
+  var slideshow = null;
   var fallback = document.getElementById('sparkFallback');
 
   if (!window.SparkOverlays) {
@@ -100786,19 +100933,42 @@ _SPARK_PAGE = """<!doctype html>
     var stage = document.getElementById('sparkPictures');
     stage.hidden = false;
     if (window.PineSlideshow) {
-      try { window.PineSlideshow.mount(stage); } catch (err) { stage.hidden = true; }
+      try { slideshow = window.PineSlideshow.mount(stage); }
+      catch (err) { stage.hidden = true; }
     }
   }
 
-  var live = window.SparkOverlays.mount(
-    document.getElementById('sparkHost'),
-    {mode: pictures ? 'overlay' : 'dashboard'});
+  /* ONE LAYER, NEVER TWO.
+   *
+   * MEASURED by tools/overlay-fit-probe.cjs: with `?pictures=1` this page
+   * drew FOURTEEN widgets instead of seven and every one of them overlapped
+   * its twin. The slideshow view mounts the overlays itself — that is the
+   * whole arrangement on the tablet, and it is the arrangement this mode is
+   * imitating — so mounting a second layer on top of it duplicated the lot.
+   *
+   * With pictures, the slideshow owns the overlays and this page just reads
+   * its handle for the clock below. Without pictures there is no slideshow,
+   * so the page mounts them itself as a dashboard. */
+  var live = null;
+  if (pictures && slideshow && slideshow.overlays) {
+    live = slideshow.overlays();
+  } else if (!pictures) {
+    live = window.SparkOverlays.mount(
+      document.getElementById('sparkHost'), {mode: 'dashboard'});
+  }
+  if (!live) {
+    /* The slideshow mounted but its overlay layer is off (it is remembered
+     * per glass). Give this page one rather than a blank monitor. */
+    live = window.SparkOverlays.mount(
+      document.getElementById('sparkHost'),
+      {mode: pictures ? 'overlay' : 'dashboard'});
+  }
 
   /* The clock in the bar is the honest "is this live" signal: it is the
      timestamp the STATION put on the reading, not this page's own clock,
      so a frozen number means the answers stopped rather than the page did. */
   setInterval(function () {
-    var data = live.data();
+    var data = live && live.data ? live.data() : null;
     var when = document.getElementById('sparkWhen');
     if (!data || !data.at) { when.textContent = 'connecting…'; return; }
     var age = Math.max(0, (Date.now() / 1000) - data.at);
