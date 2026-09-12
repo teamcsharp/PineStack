@@ -2,7 +2,14 @@
   function stationRows(station, now = Date.now()) {
     const rows = new Map();
     const absorb = (row, status = '') => {
-      if (!row?.id || !row.text || /^(seen|tick|ping|heartbeat)$/.test(row.kind || '')) return;
+      /* A ROW WITH AUDIO AND NO WORDS IS STILL A THING YOU CAN SAMPLE.
+       * This dropped anything textless, which is exactly the shape a sting
+       * or an audio-only cue arrives in - invisible in the feed and so
+       * impossible to drag onto a pad. Words OR audio is enough now. */
+      const hasAudio = !!(row && (row.url || row.audio_url || row.clip_url
+        || row.media || row.clip_media));
+      if (!row?.id || (!row.text && !hasAudio)
+        || /^(seen|tick|ping|heartbeat)$/.test(row.kind || '')) return;
       const previous = rows.get(String(row.id)) || {};
       const aired = row.aired || previous.aired;
       const audio = ['box', 'stream', 'both', 'airing'].includes(aired)
@@ -36,6 +43,42 @@
       absorb({...before, ...live, text: live.text || before.text,
         aired: 'airing'}, 'Playing');
     }
+    /* THE RECORDS, TOO.
+     *
+     * "Show everything in the feed, including clips that are played. I want
+     *  to be able to put any audio that is played on the radio on the
+     *  sampler, but I want to see it in the feed."
+     *
+     * `chat` is the BOOTH - what was said. A record turning is not a chat
+     * row, so the music never appeared here at all and could not be dragged
+     * onto a pad. The station publishes both halves already: `now` is what
+     * is turning and `played` is the ones before it, each carrying its own
+     * signed url.
+     *
+     * They are marked `kind: 'music'` rather than dressed up as booth rows,
+     * because sourceFor has to be able to tell them apart: a record is taken
+     * whole from its own file, not cut out of the booth ring.
+     *
+     * NEWEST LAST, to match `chat` - the sampler's feed reverses the whole
+     * list to put the newest at the top, so anything that arrives here out
+     * of order arrives on screen out of order too. */
+    const record = (track, status) => {
+      if (!track || !track.url) return;
+      const id = 'music:' + String(track.id || track.url);
+      if (rows.has(id)) return;
+      const artist = track.artist ? ' · ' + track.artist : '';
+      rows.set(id, {
+        id, kind: 'music', who: 'Record', name: track.artist || 'Record',
+        text: (track.title || 'a record') + artist,
+        url: track.url, seconds: Number(track.seconds) || 0,
+        lcdStatus: status, lcdAudio: true, music: true
+      });
+    };
+    /* Oldest first: `played` is newest-first from the station. */
+    const before = (station.played || []).slice().reverse();
+    for (const track of before) record(track, 'Aired');
+    record(station.now, station.playing ? 'Playing' : 'Aired');
+
     return [...rows.values()];
   }
   if (typeof module !== 'undefined' && module.exports) module.exports = {stationRows};

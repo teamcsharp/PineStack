@@ -32,7 +32,7 @@
   let grabWhole = false;        /* the line, or the whole welded round */
 
   const modes = {
-    poly: true, gate: false, full: false,
+    poly: false, gate: false, full: false,
     sixteen: false, repeat: false, division: 4, bpm: 90,
     /* 16 LEVEL, beyond one chromatic run. "I want options to adjust the
      * octave, the chord, the progression."
@@ -43,6 +43,51 @@
      *            walk a progression rather than one scale */
     octave: 0, chord: 'chromatic', progress: 'none'
   };
+
+  /* WHAT THIS PAGE WAS LEFT SET TO.
+   *
+   * "Have POLY off by default. In fact, remember what settings I have on on
+   *  this page and have them on by default when I go back to this page."
+   *
+   * POLY was on at boot because that was somebody's idea of a sensible
+   * default, and a default is exactly the wrong shape for this: an
+   * instrument should open the way you left it, not the way it shipped. So
+   * every switch and dial is remembered, and the "default" is only what a
+   * terminal that has never been touched starts with. POLY starts OFF there,
+   * as asked. */
+  const MODES_KEY = "pineSamplerModes";
+
+  function rememberModes() {
+    try {
+      root.localStorage.setItem(MODES_KEY, JSON.stringify({
+        poly: modes.poly, gate: modes.gate, full: modes.full,
+        sixteen: modes.sixteen, repeat: modes.repeat,
+        division: modes.division, bpm: modes.bpm,
+        octave: modes.octave, chord: modes.chord, progress: modes.progress
+      }));
+    } catch (err) { /* a preference is not worth an exception */ }
+  }
+
+  function restoreModes() {
+    let saved = null;
+    try { saved = JSON.parse(root.localStorage.getItem(MODES_KEY) || "null"); }
+    catch (err) { saved = null; }
+    /* Never touched: POLY off, and everything else as declared above. */
+    modes.poly = saved ? !!saved.poly : false;
+    if (!saved) return;
+    modes.gate = !!saved.gate;
+    modes.full = !!saved.full;
+    modes.sixteen = !!saved.sixteen;
+    modes.repeat = !!saved.repeat;
+    if (CHORDS[saved.chord]) modes.chord = saved.chord;
+    if (PROGRESSIONS[saved.progress]) modes.progress = saved.progress;
+    const octave = Number(saved.octave);
+    if (isFinite(octave) && octave >= -2 && octave <= 2) modes.octave = octave;
+    const division = Number(saved.division);
+    if ([4, 6, 8, 12, 16, 24, 32].indexOf(division) >= 0) modes.division = division;
+    const bpm = Number(saved.bpm);
+    if (isFinite(bpm) && bpm >= 20 && bpm <= 300) modes.bpm = bpm;
+  }
 
   /* THE SHAPES 16 LEVEL CAN TAKE.
    *
@@ -218,6 +263,15 @@
   function sourceFor(row) {
     if (!row) return null;
     if (row.sfx && row.url) return { url: row.url, kind: "sfx", exactish: true };
+    /* A RECORD IS TAKEN WHOLE FROM ITS OWN FILE, never cut out of the booth
+     * ring - the clip route knows nothing about music. Marked by the feed
+     * model (see lcd-dialogue.js) rather than guessed at from the shape of
+     * the row, because `{url, text}` is also what an advert looks like.
+     *
+     * It is BIG, and the footprint line under the pads is where that shows:
+     * four minutes decodes to roughly 45 MB. The operator asked for whole
+     * records on pads, so it is offered - and counted honestly. */
+    if (row.music && row.url) return { url: row.url, kind: "music", exactish: true };
     if (row.url && !row.text) return { url: row.url, kind: "media", exactish: true };
 
     const line = "/api/booth/clip?line=" + encodeURIComponent(row.id)
@@ -755,9 +809,22 @@
   let carry = null;
 
   function carryGhost(row) {
+    /* A TILE, NOT A STRIP OF TEXT.
+     *
+     * "When I drag it I want it converted into a sampler tile so I can drag
+     *  it over to the sampler instead of it being a strip of text."
+     *
+     * It is built to the same shape as a pad - square, numbered corner,
+     * label at the foot - so what the hand is carrying looks like the thing
+     * it is about to become. */
     const ghost = document.createElement("div");
     ghost.className = "pb-ghost";
-    ghost.textContent = (row.text || row.name || row.who || "take").slice(0, 60);
+    const who = document.createElement("i");
+    who.textContent = row.name || row.who || row.kind || "take";
+    const said = document.createElement("span");
+    said.textContent = (row.text || row.name || "take").slice(0, 70);
+    ghost.appendChild(who);
+    ghost.appendChild(said);
     document.body.appendChild(ghost);
     return ghost;
   }
@@ -1380,7 +1447,13 @@
   async function dropOnBin(index, event) {
     const hit = overBin(event);
     if (bin) { bin.remove(); bin = null; }
-    if (hit) await clearPad(index);
+    if (hit) {
+      /* Silence the page before the pad goes - see clearBank. */
+      try { engine().stopAll(); } catch (err) { /* nothing playing */ }
+      sounding.clear();
+      if (root.PineAir) root.PineAir.release("pad");
+      await clearPad(index);
+    }
   }
 
   /* Clearing is a real deletion - the bytes go too, or the bank keeps paying
@@ -1427,6 +1500,65 @@
       note("Pad " + (back.pad + 1) + " is back.");
     });
     foot.appendChild(button);
+  }
+
+  /* ------------------------------------------------------ clearing a bank */
+
+  async function clearBank() {
+    const held = layout[bank].filter(Boolean).length;
+    if (!held) { note("This bank is already empty."); return; }
+
+    /* SILENCE FIRST. "If I clear a pad, stop playback of pads on that page."
+     * Clearing while a one-shot is still sounding leaves a voice playing
+     * from a pad that no longer exists, which is a sound with nothing to
+     * stop it. */
+    try { engine().stopAll(); } catch (err) { /* nothing playing */ }
+    sounding.clear();
+    if (root.PineAir) root.PineAir.release("pad");
+
+    const keep = root.confirm(
+      "Clear all " + held + " pads on bank " + (bank + 1) + "?\n\n"
+      + "The audio lives on this tablet - the station keeps references, not "
+      + "recordings - so this cannot be undone.\n\n"
+      + "OK to clear. Cancel to keep them.");
+    if (!keep) { note("Nothing cleared."); return; }
+
+    /* AND THE OFFER TO SAVE IT, at the only moment it can still be taken. */
+    if (root.PineSamplerKits && root.confirm(
+      "Save this bank out first, so it can be used on the MPC?\n\n"
+      + "OK writes a kit - a folder of WAVs beside an .xpm program - to "
+      + "Downloads. Cancel clears without saving.")) {
+      const name = root.prompt("Name this kit",
+        "Pine Box bank " + (bank + 1)) || ("Pine Box bank " + (bank + 1));
+      note("Writing the kit\u2026");
+      try {
+        const got = await root.PineSamplerKits.exportMpc(bank, name, (where) => {
+          note("kit: " + where);
+        });
+        if (!got.ok) {
+          note("The kit could not be written, so nothing was cleared: "
+            + (got.detail || "unknown"), true);
+          return;                       /* refuse to clear what we could not keep */
+        }
+        note("Kit written to Downloads/" + got.folder);
+      } catch (err) {
+        note("The kit failed, so nothing was cleared: "
+          + ((err && err.message) || err), true);
+        return;
+      }
+    }
+
+    for (let p = 0; p < PADS; p += 1) {
+      if (!layout[bank][p]) continue;
+      const key = padKey(bank, p);
+      try { await dbDelete(key); } catch (err) { /* may never have landed */ }
+      try { if (engine().unload) engine().unload(key); } catch (err) { /* older */ }
+      layout[bank][p] = null;
+    }
+    binUndo = null;                     /* nothing here to put back any more */
+    saveLayout();
+    paintPads();
+    note("Bank " + (bank + 1) + " cleared.");
   }
 
   /* ------------------------------------------------- sampling the air */
@@ -1629,6 +1761,44 @@
 
   let feedPrint = "";
 
+  /* ONE rAF LOOP FOR THE SPECTRUM, and only while a canvas is on screen.
+   *
+   * The feed is rebuilt whenever it changes, so the canvas is a new element
+   * each time; the loop follows whichever one is current and stops itself
+   * the moment that canvas leaves the document. A loop per row would leak
+   * one per repaint, which on a four-second feed is fifteen a minute. */
+  let specCanvas = null;
+  let specTimer = 0;
+
+  function startSpectrum(canvas) {
+    specCanvas = canvas;
+    if (specTimer) return;
+    const draw = () => {
+      const target = specCanvas;
+      if (!target || !target.isConnected) {
+        specTimer = 0;
+        return;
+      }
+      const air = root.PineAir;
+      const bars = air && air.spectrum ? air.spectrum() : null;
+      const pen = target.getContext("2d");
+      pen.clearRect(0, 0, target.width, target.height);
+      if (bars && bars.length) {
+        /* The low half only: speech and stings live there, and the top of
+         * the range is empty air that would make every clip look quiet. */
+        const use = Math.max(8, Math.floor(bars.length / 2));
+        const width = target.width / use;
+        for (let i = 0; i < use; i += 1) {
+          const height = Math.max(1, bars[i] * target.height);
+          pen.fillStyle = "rgba(159, 224, 143, " + (0.35 + bars[i] * 0.65).toFixed(2) + ")";
+          pen.fillRect(i * width, target.height - height, Math.max(1, width - 1), height);
+        }
+      }
+      specTimer = requestAnimationFrame(draw);
+    };
+    specTimer = requestAnimationFrame(draw);
+  }
+
   function paintFeed(rows) {
     const list = el("pbFeed");
     if (!list) return;
@@ -1661,6 +1831,7 @@
      * moments from the operator. The list grows as the broadcast runs and
      * rolls off the bottom when the station's own ring does. */
     const newestFirst = rows.slice().reverse();
+    let drawnSpectrum = false;
     for (const row of newestFirst) {
       const source = sourceFor(row);
       const item = document.createElement("div");
@@ -1674,6 +1845,30 @@
       const tag = document.createElement("em");
       tag.textContent = row.lcdStatus || "";
       item.appendChild(who);
+      /* WHICH CLIP IS ACTUALLY SOUNDING, drawn rather than asserted.
+       *
+       * "For the actively playing sound effect, put an audio spectrogram
+       *  showing the actively playing sound effect playing so we know
+       *  exactly which clip is currently being played."
+       *
+       * Only on the row that says Playing - a spectrum beside a row that is
+       * not making a sound is decoration, and worse, it would make every row
+       * look live. */
+      /* ONLY THE NEWEST PLAYING ROW gets one. The feed can carry more than
+       * one row marked Playing - the coalesced road marks the live turn and
+       * a chat row of the same moment can arrive carrying the status too -
+       * and two spectra means two canvases of which only the later is
+       * driven, so the other sits there black and looks broken. Measured:
+       * two canvases, 1305 lit pixels in one and 0 in the other. */
+      if (row.lcdStatus === "Playing" && !drawnSpectrum) {
+        drawnSpectrum = true;
+        const bars = document.createElement("canvas");
+        bars.className = "pb-spec";
+        bars.width = 128;
+        bars.height = 22;
+        item.appendChild(bars);
+        startSpectrum(bars);
+      }
       item.appendChild(text);
       item.appendChild(tag);
       if (source) {
@@ -1815,7 +2010,21 @@
         if (gesture.timer) { clearTimeout(gesture.timer); gesture.timer = 0; }
         if (hasContent(p) && !gesture.dragging) {
           gesture.dragging = true;
-          lift(p);                     /* it is being carried, not played */
+          /* IT IS BEING CARRIED, NOT PLAYED - so it stops making a noise.
+           *
+           * "Do not play the pad that I am deleting when I press delete to
+           *  remove the pad."
+           *
+           * The hit still fires the instant the finger lands, because that
+           * latency is the whole of what makes a sampler feel like one; what
+           * changes is that the moment the gesture turns out to be a CARRY,
+           * the sound it started is cut. lift() alone only released a gated
+           * voice, so a one-shot carried on playing all the way to the bin. */
+          lift(p);
+          try { engine().stopPad(padKey(bank, p)); } catch (err) { /* older */ }
+          for (const [id, voice] of sounding) {
+            if (voice.padId === p) sounding.delete(id);
+          }
           showBin(p);
         }
         if (gesture.dragging) moveBin(event);
@@ -1881,12 +2090,17 @@
         button.classList.toggle("on", spec[3]());
         paintDials();
         paintSixteen();
+        rememberModes();
       });
       controls.appendChild(button);
     }
-    /* POLY is on at boot, so its light is on at boot - and so is SOLO PAD,
-     * which remembers the operator's last answer across reloads. */
-    controls.querySelector("#pbPoly").classList.add("on");
+    /* EVERY LIGHT FROM THE REMEMBERED STATE, none of them hardcoded. This
+     * used to switch POLY's light on unconditionally, which was fine while
+     * POLY was always on at boot and a lie the moment it was not. */
+    for (const spec of toggles) {
+      const light = controls.querySelector("#" + spec[0]);
+      if (light) light.classList.toggle("on", !!spec[3]());
+    }
     /* THE LIGHT MUST MATCH THE STATE, both ways.
      *
      * This only ever ADDED the class, so a terminal whose stored preference
@@ -1915,6 +2129,7 @@
         const gaps = tapTimes.slice(1).map((t, i) => t - tapTimes[i]);
         const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
         modes.bpm = Math.round(60000 / mean);
+        rememberModes();
         note("Tempo " + modes.bpm + " bpm");
       }
     });
@@ -1927,6 +2142,25 @@
     chopBtn.title = "Slice the selected pad across all sixteen pads";
     chopBtn.addEventListener("click", chop);
     controls.appendChild(chopBtn);
+
+    /* CLEAR THE WHOLE PAGE, and ask first - and offer the way out.
+     *
+     * "Offer a button to clear all the pads on the page, and offer to confirm
+     *  if I want to clear all the pads. Also ask me if I want to save it out
+     *  under a preset that I can reuse on another device like the MPC."
+     *
+     * The offer to keep it is the point. Sixteen pads is real work and the
+     * bytes live only on this device - the station holds references, not
+     * audio - so a cleared bank that was never exported is gone for good.
+     * Asking at the moment of deletion is the only moment the operator can
+     * still act on it. */
+    const wipe = document.createElement("button");
+    wipe.id = "pbWipe";
+    wipe.className = "pb-mode pb-act danger";
+    wipe.textContent = "CLEAR";
+    wipe.title = "Clear every pad on this bank";
+    wipe.addEventListener("click", clearBank);
+    controls.appendChild(wipe);
 
     const stop = document.createElement("button");
     stop.className = "pb-mode pb-act danger";
@@ -1973,13 +2207,15 @@
     rptSlider.min = "0";
     rptSlider.max = String(DIVISIONS.length - 1);
     rptSlider.step = "1";
-    rptSlider.value = "0";
+    rptSlider.value = String(Math.max(0,
+      DIVISIONS.findIndex((pair) => pair[0] === modes.division)));
     const rptSaid = document.createElement("b");
     rptSaid.className = "pb-dial-said";
-    rptSaid.textContent = "1/4";
+    rptSaid.textContent = (DIVISIONS[Number(rptSlider.value)] || DIVISIONS[0])[1];
     rptSlider.addEventListener("input", () => {
       const pick = DIVISIONS[Number(rptSlider.value)] || DIVISIONS[0];
       modes.division = pick[0];
+      rememberModes();
       rptSaid.textContent = pick[1];
       note("Repeat " + pick[1] + " at " + modes.bpm + " bpm");
     });
@@ -2005,6 +2241,7 @@
       select.value = String(get());
       select.addEventListener("change", () => {
         set(select.value);
+        rememberModes();
         paintSixteen();
         note(name.toLowerCase() + ": " + select.options[select.selectedIndex].textContent);
       });
@@ -2072,6 +2309,11 @@
   async function mount(host) {
     if (!host || mounted) return;
     layout = loadLayout();
+    /* BEFORE build(), not after. The toggles draw their lights from `modes`,
+     * so restoring the operator's settings afterwards left every light
+     * showing the default while the behaviour was already the remembered
+     * one - a control panel disagreeing with the instrument behind it. */
+    restoreModes();
     config = await api().readConfig();
     build(host);
     engine().warm();

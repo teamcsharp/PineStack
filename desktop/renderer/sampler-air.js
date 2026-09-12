@@ -91,6 +91,17 @@
   var loudest = 0;          /* peak since the last level() read        */
 
   var taps = new WeakMap(); /* element -> {joined}                     */
+  /* A SPECTRUM OF THE VOICES ONLY, for the feed's playing row.
+   *
+   * "For the actively playing sound effect, put an audio spectrogram showing
+   * the actively playing sound effect so we know exactly which clip is being
+   * played."
+   *
+   * Fed by every player EXCEPT the record, so the bars are the clip and not
+   * the music under it - which is the whole point of putting them on the row
+   * that says Playing. */
+  var speechAnalyser = null;
+  var speechBins = null;
   /* Declared up here because tap() reads them: a player that starts while
    * the broadcast is ducked has to be caught on arrival. */
   var ducked = false;
@@ -202,6 +213,7 @@
         if (scope.context === context() && ensureRing()) {
           try {
             scope.analyser.connect(capture);
+            listenForSpectrum(element, scope.analyser);
             taps.set(element, {joined: true});
             live = true;
             reason = 'listening';
@@ -487,6 +499,29 @@
     }, 250);
   }
 
+  /* The record is deliberately left out - see speechAnalyser. */
+  function listenForSpectrum(element, from) {
+    if (element === musicPlayer()) return;
+    var c = context();
+    if (!c) return;
+    if (!speechAnalyser) {
+      speechAnalyser = c.createAnalyser();
+      speechAnalyser.fftSize = 128;
+      speechAnalyser.smoothingTimeConstant = 0.72;
+      speechBins = new Uint8Array(speechAnalyser.frequencyBinCount);
+    }
+    try { from.connect(speechAnalyser); } catch (err) { /* already, or refused */ }
+  }
+
+  /** The current spectrum as 0..1 bars, or null when nothing is listening. */
+  function spectrum() {
+    if (!speechAnalyser || !speechBins) return null;
+    try { speechAnalyser.getByteFrequencyData(speechBins); } catch (err) { return null; }
+    var out = new Array(speechBins.length);
+    for (var i = 0; i < speechBins.length; i += 1) out[i] = speechBins[i] / 255;
+    return out;
+  }
+
   /* ------------------------------------------------------------ reading out */
 
   function seconds() {
@@ -650,7 +685,7 @@
 
   var api = {
     start: start, ready: ready, why: why, seconds: seconds, level: level,
-    sliceWav: sliceWav, measure: measure, quiet: quiet,
+    sliceWav: sliceWav, measure: measure, quiet: quiet, spectrum: spectrum,
     /* Visible so the behaviour can be checked rather than believed. */
     duckState: function () {
       return {clipDucked: clipDucked, padMuted: ducked,

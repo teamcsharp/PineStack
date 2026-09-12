@@ -26,6 +26,35 @@
 /* A pad is struck, never selected. Long-press was raising the text
    selection handles and the context menu over the grid, which is the
    opposite of an instrument. */
+/* NOTHING ON THIS PAGE IS TEXT TO BE SELECTED.
+ *
+ * "Whenever I am dragging and dropping a pad to the sampler, I do not want
+ *  to select text accidentally. Selecting text should be blocked on this
+ *  page because this page is about selecting the tiles and dragging them."
+ *
+ * It was scoped to the pads and the mode buttons, which left the FEED - the
+ * one part of this view you actually drag from - selectable. So a carry
+ * across the feed painted half the column blue and handed the browser its
+ * own text drag, which is what the operator was fighting. The whole host is
+ * now unselectable and undraggable; the carry is pointer-driven and wants
+ * neither. */
+#sampler, .pb-sampler, #sampler *, .pb-sampler * {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+/* The one exception: a field you are meant to type into. */
+#sampler input[type="text"], #sampler input[type="search"], #sampler textarea,
+.pb-sampler input[type="text"], .pb-sampler input[type="search"],
+.pb-sampler textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 .pb-pad, .pb-mode, .pb-bank, .pb-toggle, .pb-pad * {
   -webkit-user-select: none;
   user-select: none;
@@ -826,4 +855,59 @@
   border-left: 1px dashed rgba(227, 190, 99, .5);
   border-right: 1px dashed rgba(227, 190, 99, .5);
   pointer-events: none;
+}
+
+/* THE CARRIED TILE.
+ *
+ * What the hand carries should look like what it is about to become, so the
+ * ghost is a PAD - square, the label at the foot, the speaker's name where a
+ * pad puts its number. It used to be a strip of text, which read as a
+ * selection being dragged rather than a sample being placed. */
+.pb-ghost {
+  position: fixed;
+  left: 0; top: 0;
+  z-index: 2147483031;
+  width: 132px;
+  height: 132px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 3px;
+  padding: 9px;
+  border-radius: 10px;
+  background: #222b35;
+  border: 1px solid #65c7da;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .6);
+  color: #edf3f5;
+  pointer-events: none;
+  opacity: .95;
+  transform-origin: top left;
+}
+.pb-ghost i {
+  position: absolute;
+  top: 7px; left: 9px;
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: #65c7da;
+}
+.pb-ghost span {
+  font-size: 11px;
+  line-height: 1.3;
+  color: #c6d2d8;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* The spectrum on the row that is actually sounding. */
+.pb-spec {
+  display: block;
+  width: 100%;
+  height: 22px;
+  margin: 4px 0 2px;
+  border-radius: 4px;
+  background: rgba(20, 27, 33, .75);
 }
