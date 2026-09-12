@@ -21961,12 +21961,31 @@ def _acknowledge_delivery_lines(delivery_id: str, clip: dict[str, Any],
                 else str((live or row).get("text") or ""))
         if who == "board" and float(row.get("until") or 0) <= position:
             delivery.setdefault("played_rows", set()).add(rid)
+        # #1258: AN INTERJECTION SOUNDS WHERE IT SOUNDS. Every row of a
+        # burst is a byte range in one welded wav with strictly
+        # increasing offsets, so the ORDER is already physically fixed -
+        # but `air_at` starts as a render-time estimate (_est0 +
+        # offset) and only speech ever had it corrected. The guard
+        # below skips "board", so stings, gold bars and quips kept
+        # their guess for ever, measured 47-62 SECONDS early.
+        #
+        # The screenplay is ordered by air_at, so those stale stings sat
+        # twenty to forty elements up the page and the playhead was
+        # thrown up to one and back down to the next spoken line, over
+        # and over. The audio was in order the whole time; the document
+        # describing it was not.
+        #
+        # Corrected here, before the speech guard, because a board row
+        # has the same `from` offset the correction is built on - and
+        # WITHOUT marking it speech, which is a different question and
+        # the one the dialogue clock (#1231) asks.
+        if live is not None and float(row.get("from") or 0) >= 0:
+            live["air_at"] = time.time() - max(
+                0.0, position - float(row.get("from") or 0))
         if who not in ("dj", "cohost", "third", "caller", "caller2", "drop"):
             continue
         speech = True
         delivery.setdefault("played_rows", set()).add(rid)
-        if live is not None:
-            live["air_at"] = time.time() - max(0, position - float(row.get("from") or 0))
         key = rid or f"{delivery_id}:{hashlib.sha1(text.encode('utf-8', 'ignore')).hexdigest()[:10]}"
         if key in _PAGE_ACKED_LINES:
             continue
@@ -105072,13 +105091,57 @@ async def api_director_order(
         out: list[dict[str, Any]] = []
         tally = {"in_order": 0, "jumped": 0, "repeated": 0, "holed": 0}
         for sid, got in by_sid.items():
-            turns = [int(r.get("turn") or 0) for r in got]
+            # #1257: ...and turn 0 is a turn here too.
+            turns = [int(r["turn"]) if r.get("turn") is not None else -1
+                     for r in got]
+            # #1257: BOARD AUDIO IS NOT A TURN OF THE SCRIPT. A sting,
+            # a gold bar, a cadence sample and an SFX-guy quip are all
+            # stamped turn = -1 beside the round's real sid, and were
+            # then compared arithmetically - so any of them following a
+            # real turn satisfied -1 <= 1 and was recorded as a jump.
+            # 458 of 1158 entries are -1 and 95 of 96 jump pairs
+            # involved one, which is why `in order` had never once been
+            # reached. They are counted, not compared.
+            board = sum(1 for t in turns if t < 0)
+            script_turns = [t for t in turns if t >= 0]
             total = max([int(r.get("turns") or 0) for r in got] + [0])
-            jumps = [(turns[i - 1], turns[i]) for i in range(1, len(turns))
-                     if turns[i] <= turns[i - 1]]
-            repeats = sorted({t for t in turns if turns.count(t) > 1})
-            holes = ([t for t in range(total) if t not in set(turns)]
-                     if total else [])
+            # #1257: ...and a descent to the START of the run is a new
+            # BURST, not a jump backwards. transcript/turn_ix/
+            # aired_items are re-initialised per burst while the sid is
+            # minted once per round, so a three-burst round honestly
+            # reads 1,2,3 ... 1,2 ... 1,2,3. Sixteen of twenty-four
+            # observed descents were this and nothing else.
+            jumps = []
+            bursts = 0
+            _low = min(script_turns) if script_turns else 0
+            for i in range(1, len(script_turns)):
+                _a, _b = script_turns[i - 1], script_turns[i]
+                if _b > _a:
+                    continue
+                if _b <= _low:
+                    bursts += 1          # the next burst opening
+                    continue
+                jumps.append((_a, _b))
+            repeats = sorted({t for t in script_turns
+                              if script_turns.count(t) > 1})
+            # #1257d: ...AND THE TOTAL COUNTED BOARD AUDIO. `total` is
+            # len(transcript), which includes every sting, gold bar and
+            # quip, while the turns are indices into aired_items -
+            # script rows only. So a round of five lines with five
+            # stings reported five phantom trailing holes, and `holes`
+            # was as unreachable-to-clear as `jumped` was. Live: every
+            # round of 111 reported holes.
+            #
+            # A hole is a gap INSIDE what was heard: a turn missing
+            # between the first and the last that actually aired. What
+            # has not been reached yet is not a hole, it is the rest of
+            # the round.
+            if script_turns:
+                _seen = set(script_turns)
+                holes = [t for t in range(min(_seen), max(_seen) + 1)
+                         if t not in _seen]
+            else:
+                holes = []
             if jumps:
                 tally["jumped"] += 1
             elif repeats:
@@ -105092,6 +105155,9 @@ async def api_director_order(
                 "at": round(float(got[0].get("air_at") or 0), 1),
                 "heard": len(got), "of": total,
                 "order": turns[:40],
+                "script_order": script_turns[:40],       # #1257
+                "board_elements": board,                 # stings, gold, quips
+                "bursts": bursts + 1 if script_turns else 0,
                 "jumps": [{"after": a, "then": b} for a, b in jumps][:8],
                 "repeated": repeats[:8], "holes": holes[:12],
                 "verdict": ("jumped" if jumps else "repeated" if repeats
@@ -111207,6 +111273,32 @@ def _stream_snapshot() -> dict[str, Any]:
 
 
 STATION_STREAM = StationStream(_stream_snapshot, bitrate=STREAM_BITRATE)
+
+
+STREAM_KEEP_WARM = os.getenv("STREAM_KEEP_WARM", "true").lower() in (
+    "1", "true", "yes", "on")
+
+
+@app.on_event("startup")
+async def _startup_stream_warm() -> None:
+    """Keep the mix turning whether or not anybody is on it.
+
+    Not for the audio - a cold mixer produces its first frame in about
+    twenty milliseconds. It is for the BACKLOG behind the audio: thirty
+    seconds of PCM that a newly-spawned encoder is primed with, so the
+    first person to open the stream is handed half a minute of
+    read-ahead instead of having to earn it in real time. That
+    read-ahead is the entire defence against this box stalling, and the
+    minute after a restart is when it stalls most.
+    """
+    if not STREAM_KEEP_WARM:
+        return
+    try:
+        STATION_STREAM.ensure_running()
+        print("[stream] mixer warm - burst ready for the first listener",
+              flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[stream] mixer did not start: {exc}", flush=True)
 
 
 @app.get("/stream.mp3")
@@ -119644,7 +119736,15 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
         # `round` is the road, not the conversation, and nothing carried
         # a turn number. A copy off the ring entry, not a new measure.
         "sid": str(entry.get("sid") or entry.get("round_sid") or "")[:48],
-        "turn": (int(entry["turn"]) if str(entry.get("turn") or "").lstrip("-").isdigit()
+        # #1257: `entry["turn"] or ""` makes turn ZERO falsy, so the
+        # first turn of every burst was deleted on its way to the
+        # ledger while -1 survived ("-1".lstrip("-") is "1"). Measured:
+        # 0 of 111 rounds contained turn 0 and 111 of 111 reported it
+        # as a hole. Test for None, never for falsy - the same cure as
+        # #1240b's Number(null) and the page's `volume || 0`.
+        "turn": (int(entry["turn"]) if str(
+            entry["turn"] if entry.get("turn") is not None else ""
+        ).lstrip("-").isdigit()
                  else (int(entry["i"]) if str(entry.get("i") or "").lstrip("-").isdigit()
                        else None)),
         "turns": (int(entry["turns"]) if str(entry.get("turns") or "").isdigit()
