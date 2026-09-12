@@ -622,6 +622,13 @@
       + '<div class="pl-shade"></div>'
       + '<div class="pl-face">'
       + '<div class="pl-top"><b id="plStation">Pine Box FM</b>'
+      /* THE GRAB PAD LIVES UP HERE, beside the clock, which is where the
+       * operator pointed at it. Not in the transport row: it does not change
+       * what is playing, it keeps it - and the top right is the one corner
+       * of this view that is never covered by the artwork or the headline. */
+      + '<button id="plPad" class="pl-pad" title="Tap: keep the whole of '
+      + 'what is playing. Double tap: the last twenty seconds.">'
+      + '<i></i><b>grab</b><span id="plPadSay"></span></button>'
       + '<i id="plClock" class="pl-clock">--:--</i></div>'
 
       + '<div id="plNow" class="pl-now">'
@@ -712,14 +719,20 @@
        * answer nine times out of ten, and three is the right answer when it
        * is not. */
       + '<div id="plDesk" class="pl-desk" hidden>'
+      /* 0-200%, not 0-100. These drive the panel's own gains, whose unity
+       * is 100 and whose voice bus sits at 160 by default - a 0-100 knob
+       * could not even represent where the desk already was, let alone
+       * reach it. */
       + '<label class="pl-deskrow"><span>music</span>'
-      + '<input id="plDeskMusic" type="range" min="0" max="100" step="1">'
+      + '<input id="plDeskMusic" type="range" min="0" max="200" step="1">'
       + '<i id="plDeskMusicVal"></i></label>'
       + '<label class="pl-deskrow"><span>djs</span>'
-      + '<input id="plDeskVoice" type="range" min="0" max="100" step="1">'
+      + '<input id="plDeskVoice" type="range" min="0" max="200" step="1">'
       + '<i id="plDeskVoiceVal"></i></label>'
-      + '<label class="pl-deskrow"><span>replies</span>'
-      + '<input id="plDeskReply" type="range" min="0" max="100" step="1">'
+      + '<label class="pl-deskrow" title="How far the music dips while a '
+      + 'voice is talking. This is the one that decides whether you can '
+      + 'hear them over a record."><span>duck</span>'
+      + '<input id="plDeskReply" type="range" min="0" max="90" step="1">'
       + '<i id="plDeskReplyVal"></i></label>'
       + '<label class="pl-deskrow"><span>here</span>'
       + '<input id="plDeskLocal" type="range" min="0" max="100" step="1">'
@@ -850,6 +863,51 @@
     ["pointerup", "pointercancel", "pointerleave", "input"]
       .forEach((name) => vol.addEventListener(name, cancel));
 
+    /* ---- the grab pad -------------------------------------------------
+     *
+     * "Offer a sampler pad on the listen view that if I tap on it, it places
+     *  the currently playing sound on a pad. And if I double tap it, it
+     *  places the last twenty seconds on a pad. And anytime I tap it, it
+     *  places that currently playing audio in full, the full clip, on a pad.
+     *  And then if it is full, it increments over to the next series of pads."
+     *
+     * ONE TAP AND TWO TAPS ARE DIFFERENT RECORDINGS, not two ways to the
+     * same one: the full thing is a FILE off the station, the twenty seconds
+     * is the ring in this page. So a tap has to wait long enough to know
+     * which it is. 260 ms is the usual double-tap window and it is short
+     * enough that the single tap still feels immediate.
+     */
+    const pad = el("plPad");
+    if (pad) {
+      let taps = 0;
+      let tapTimer = 0;
+      const say = (words, bad) => {
+        const out = el("plPadSay");
+        if (out) {
+          out.textContent = words || "";
+          out.classList.toggle("bad", !!bad);
+        }
+        if (words) setTimeout(() => { if (out && out.textContent === words) out.textContent = ""; }, 6000);
+      };
+      pad.addEventListener("click", (event) => {
+        event.stopPropagation();
+        taps += 1;
+        if (tapTimer) return;
+        tapTimer = setTimeout(async () => {
+          const many = taps;
+          taps = 0;
+          tapTimer = 0;
+          pad.classList.add("busy");
+          try {
+            if (many >= 2) await grabLastSeconds(say);
+            else await grabWholeOfNow(say);
+          } finally {
+            pad.classList.remove("busy");
+          }
+        }, 260);
+      });
+    }
+
     /* Talk only: a STATION route, not a level. */
     const talk = el("plTalkOnly");
     if (talk) talk.addEventListener("click", async () => {
@@ -857,7 +915,8 @@
       talk.textContent = "...";
       try {
         const law = root.PineAudioLaw;
-        const state = root.PineStationFeed ? root.PineStationFeed.station() : {};
+        const state = root.PineStationFeed && root.PineStationFeed.state
+      ? (root.PineStationFeed.state() || {}) : {};
         await law.talkOnly(!law.isTalkOnly(state), state);
         paintDesk();
       } catch (err) {
@@ -877,20 +936,39 @@
     const rows = [
       ["plDeskMusic", "music", "plDeskMusicVal"],
       ["plDeskVoice", "voice", "plDeskVoiceVal"],
-      ["plDeskReply", "reply", "plDeskReplyVal"]
+      ["plDeskReply", "duck", "plDeskReplyVal"]
     ];
     for (const [id, stream, out] of rows) {
       const input = el(id);
       if (!input) continue;
-      /* On `change`, not `input`: each one is a station write heard by
-       * everybody, and a drag would post one per pixel. */
+      /* ON `input`, AND IT MOVES THE SOUND AS IT MOVES.
+       *
+       * This used to write the STATION's level on `change` - a broadcast
+       * decision for every listener - while wearing a label that said "this
+       * terminal only". On a tablet the station never publishes those levels
+       * back, so the knob read "not set", sat at 50, and appeared dead.
+       *
+       * A monitoring balance has to answer under the thumb, so it is driven
+       * live. There is no per-pixel cost to pay: this writes a gain node in
+       * this page, not a request. */
       input.addEventListener("input", () => {
+        const law = root.PineAudioLaw;
         const label = el(out);
-        if (label) label.textContent = input.value + "%";
+        const moved = law && law.setLocalMix
+          ? law.setLocalMix(stream, Number(input.value)) : false;
+        if (label) {
+          label.textContent = input.value + "%" + (moved ? "" : " (no desk here)");
+        }
       });
+      /* The desktop renderer has no panel gains of its own, so there the
+       * knob still means the station - which is the only desk it can reach.
+       * Kept on `change` there for the reason it always was: a drag would
+       * post one write per pixel. */
       input.addEventListener("change", async () => {
         const law = root.PineAudioLaw;
         if (!law) return;
+        if (law.localMix && law.localMix(stream) !== null) return;
+        if (stream === "duck") return;
         try {
           await law.setLevel(stream, Number(input.value) / 100);
           note("");
@@ -916,18 +994,126 @@
     }
   }
 
+  /* THE WHOLE OF WHAT IS PLAYING.
+   *
+   * Whatever is actually making a sound: a voice if one is on air, otherwise
+   * the record. The voice wins because if someone is talking over a record,
+   * the thing worth keeping is what they said.
+   *
+   * A RECORD IS BIG AND THAT IS SAID OUT LOUD. listen-model.js refuses to
+   * put a record on a pad through "keep this", for a good reason it writes
+   * down: a four-minute track decodes to roughly 45 MB of PCM. But this
+   * button was asked for explicitly and in those words - "the full clip" -
+   * so it does it, and tells the operator what it just cost rather than
+   * quietly declining or quietly filling the bank.
+   */
+  async function grabWholeOfNow(say) {
+    const sampler = root.PineSampler;
+    if (!sampler || typeof sampler.grab !== "function") {
+      say("no sampler here", true);
+      return;
+    }
+    const feed = root.PineStationFeed;
+    const state = feed && feed.state ? (feed.state() || {}) : {};
+    const speaking = feed && feed.now ? feed.now() : null;
+    const rows = feed && feed.rows ? feed.rows() : [];
+
+    /* A line on air first - the model already knows how to choose one and
+     * how to refuse a row whose media has been swept. */
+    let row = null;
+    if (root.PineListenModel && root.PineListenModel.grabTarget) {
+      const pick = root.PineListenModel.grabTarget(
+        rows, speaking, sampler.takeable, Date.now());
+      row = pick.row;
+    }
+    /* Otherwise the record. `{url}` with no text is what sourceFor calls
+     * "media" and takes whole. */
+    let whatFor = "the line on air";
+    if (!row) {
+      const now = state.now || {};
+      if (!now.url) { say("nothing is playing to keep", true); return; }
+      row = {id: "now:" + (now.id || now.title || ""), url: now.url,
+             name: now.title || "the record"};
+      whatFor = now.title || "the record";
+    }
+    say("keeping it…");
+    const got = await sampler.grab(row);
+    say(got.ok
+      ? "bank " + (got.bank + 1) + ", pad " + (got.pad + 1) + " · " + whatFor
+      : got.why, !got.ok);
+  }
+
+  /* THE LAST TWENTY SECONDS, off the ring rather than off a file - so it is
+   * the mix as it sounded, and it can catch a moment that was never a file
+   * at all. */
+  const PAD_SECONDS = 20;
+
+  async function grabLastSeconds(say) {
+    const air = root.PineAir;
+    const sampler = root.PineSampler;
+    if (!air || !air.ready()) {
+      say(air ? air.why() : "no air tap here", true);
+      return;
+    }
+    if (!sampler || typeof sampler.putBytes !== "function") {
+      say("no sampler here", true);
+      return;
+    }
+    const take = Math.min(PAD_SECONDS, air.seconds());
+    if (take < 0.4) { say("nothing held yet", true); return; }
+    if (air.quiet && air.quiet(take, 0)) {
+      say("those seconds were silent", true);
+      return;
+    }
+    const bytes = air.sliceWav(take, 0);
+    if (!bytes) { say("the buffer would not give it up", true); return; }
+    const placed = await sampler.putBytes(bytes, {
+      label: "air · " + take.toFixed(1) + "s",
+      who: "broadcast", kind: "air",
+      cut: "the last " + take.toFixed(1) + " seconds as it played",
+      air: {from: take, to: 0, at: Date.now()}
+    });
+    say(placed
+      ? "bank " + (placed.bank + 1) + ", pad " + (placed.pad + 1)
+        + " · last " + take.toFixed(0) + "s"
+      : "every pad is full", !placed);
+  }
+
   /* Read the desk back rather than remembering it: the panel's own sliders
    * are the truth, and the drawer or the desktop may have moved them. */
   function paintDesk() {
     const law = root.PineAudioLaw;
     if (!law) return;
-    const state = root.PineStationFeed ? root.PineStationFeed.station() : {};
+    /* `.state()`, NOT `.station()`. PineStationFeed publishes subscribe,
+     * refresh, state, rows, now, clock and subscribers - there has never
+     * been a `station`. So this line threw a TypeError on EVERY call, which
+     * is why the desk could never paint itself: every knob sat at its
+     * default with a blank label beside it, and the operator read that as
+     * "the sliders do not work".
+     *
+     * It threw silently because the panel serves this file cross-origin to
+     * the page that hosts it, so window.onerror reports only "Script
+     * error." with no line - the failure was invisible from both sides. */
+    const state = root.PineStationFeed && root.PineStationFeed.state
+      ? (root.PineStationFeed.state() || {}) : {};
     for (const [id, stream, out] of [["plDeskMusic", "music", "plDeskMusicVal"],
       ["plDeskVoice", "voice", "plDeskVoiceVal"],
-      ["plDeskReply", "reply", "plDeskReplyVal"]]) {
+      ["plDeskReply", "duck", "plDeskReplyVal"]]) {
       const input = el(id);
       const label = el(out);
       if (!input) continue;
+      /* THIS TERMINAL'S MIX FIRST, because that is what these knobs move.
+       * Reading the station's level here is what put every knob at 50 with
+       * "not set" beside it while the real mix was 100 / 160 / 70. */
+      const mine = law.localMix ? law.localMix(stream) : null;
+      if (mine !== null) {
+        const range = law.localMixRange(stream);
+        input.min = String(range.min);
+        input.max = String(Math.min(range.max, stream === "duck" ? 90 : 200));
+        input.value = String(Math.round(mine));
+        if (label) label.textContent = Math.round(mine) + "%";
+        continue;
+      }
       const read = law.levelOf(state, stream);
       if (read.level === null) {
         /* Not sent from here and not published by the station. Leave the

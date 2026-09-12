@@ -832,3 +832,68 @@
 @media (prefers-reduced-motion: reduce) {
   .pl-back[class*="pl-drift-"] { animation: none; transform: none; }
 }
+
+/* THE GRAB PAD, top right of the Listen view.
+ *
+ * Square, because it is a PAD - the same object as the sixteen in the
+ * sampler, and the hand should recognise it as one. It sits away from the
+ * transport on purpose: it does not change what is playing, it keeps it. */
+.pl-pad {
+  position: relative;
+  width: 54px;
+  height: 54px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  border-radius: 10px;
+  background: #1c242c;
+  border: 1px solid #3d4b57;
+  color: #cfe0e6;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.pl-pad i {
+  display: block;
+  width: 16px; height: 16px;
+  border-radius: 3px;
+  background: linear-gradient(140deg, #54d18b, #65c7da);
+}
+.pl-pad b {
+  font-size: 9px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #8fa0ad;
+}
+.pl-pad:hover { border-color: #65c7da; }
+.pl-pad:active { transform: scale(.95); }
+.pl-pad.busy { border-color: #e3be63; }
+.pl-pad.busy i { animation: pl-pad-work .8s linear infinite; }
+@keyframes pl-pad-work {
+  50% { opacity: .35; transform: scale(.82); }
+}
+/* What it just did, beside the pad rather than inside it - the pad stays a
+ * pad, and a sentence never changes its size. */
+/* The top strip holds the station name, the pad and the clock. */
+.pl-top { display: flex; align-items: center; gap: 12px; }
+.pl-top .pl-pad { margin-left: auto; }
+
+#plPadSay {
+  position: absolute;
+  right: 60px;
+  top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
+  font-size: 11px;
+  color: #9fe08f;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0,0,0,.8);
+}
+#plPadSay.bad { color: #e46b6b; }
+@media (prefers-reduced-motion: reduce) {
+  .pl-pad.busy i { animation: none; }
+}

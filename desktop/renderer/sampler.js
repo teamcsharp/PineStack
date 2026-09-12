@@ -1517,6 +1517,32 @@
     return meta;
   }
 
+  /* BYTES ONTO THE NEXT FREE PAD, WHEREVER IT IS.
+   *
+   * putBytesOnPad places into a pad you name on the bank you are looking at.
+   * This is the other question - "just put it somewhere" - and it is the one
+   * the Listen view asks: "if it is full, it increments over to the next
+   * series of pads where it begins placing elements on the pads."
+   *
+   * firstFreePad already walks bank to bank, so the roll across banks is its
+   * answer and not a second copy of the same logic. The bank in view FOLLOWS
+   * the placement, because a pad you cannot see landing silently is how a
+   * sampler starts feeling broken. */
+  async function putBytesAnywhere(bytes, extra) {
+    const free = root.PineListenModel
+      ? root.PineListenModel.firstFreePad(layout, bank) : null;
+    if (!free) {
+      note("Every pad in every bank is full - clear one first.");
+      return null;
+    }
+    if (free.bank !== bank) {
+      bank = free.bank;
+      paintBanks();
+    }
+    const meta = await putBytesOnPad(free.pad, bytes, extra);
+    return {bank: free.bank, pad: free.pad, meta};
+  }
+
   /* TAP AN EMPTY PAD: the grab window - scrub back through what just played,
    * or pick one of the clips listed beside it. Lives in sampler-grab.js. */
   function openGrab(index, widen) {
@@ -2119,6 +2145,9 @@
     /* The kit loader writes whole banks back; it needs the same door the
      * sampler's own imports use rather than a second store of its own. */
     put: dbPut,
+    /* "Put this somewhere" - used by the Listen view's grab pad, which has
+     * no bank or pad in mind and wants the roll across banks for free. */
+    putBytes: putBytesAnywhere,
     forget: async (b, p) => {
       await dbDelete(padKey(b, p));
       engine().unload(padKey(b, p));

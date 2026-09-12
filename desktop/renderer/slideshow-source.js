@@ -37,6 +37,18 @@
 (function (root) {
   'use strict';
 
+  /* The widest the picture can usefully be on THIS screen, in real device
+   * pixels, rounded to a 320-pixel step so terminals of a similar size share
+   * one cached copy. Capped at 1920: past that the wire cost grows and
+   * nothing in this house has a bigger panel. */
+  function screenWidth() {
+    var css = Math.max(320, (root.screen && root.screen.width) || 1280);
+    var real = css * Math.min(2, root.devicePixelRatio || 1);
+    var step = Math.ceil(Math.min(1920, real) / 320) * 320;
+    return Math.max(640, step);
+  }
+
+
   /* How stale an answer may be before a caller's ask actually costs a
    * request. Chosen against how fast each thing can really change: the
    * folder gains a picture when a render finishes and a render on this box
@@ -238,8 +250,25 @@
 
     /* The bytes doors. Built here so no caller assembles a URL by hand and
      * so the thumbnail width is the one the station actually caches. */
-    url: function (file) {
-      return '/api/slideshow/media/' + encodeURIComponent(file);
+    url: function (file, width) {
+      /* ASK FOR THE SIZE THE SCREEN CAN ACTUALLY SHOW.
+       *
+       * This used to hand back the bare route, which serves the original
+       * render - and ComfyUI renders are big. Measured on the tablet over
+       * thirty seconds of ordinary slideshow: 6.7 MB of PNG out of 10 MB of
+       * total panel traffic, on a link that delivers about 400 kB/s. Single
+       * files of 3.7 MB and 1.7 MB for a picture being displayed at 1340
+       * CSS pixels wide.
+       *
+       * The station already had the answer - `?w=` on this very route, added
+       * for the filmstrip - so the full-size door simply was not using it.
+       *
+       * ONE WIDTH PER SCREEN, ROUNDED. The route caches per width, so asking
+       * for 1341 on one device and 1343 on another would fill the cache with
+       * near-identical copies and hit it on neither. Rounding to a step
+       * keeps every terminal of a given size sharing one cached image. */
+      return '/api/slideshow/media/' + encodeURIComponent(file)
+        + '?w=' + (width || screenWidth());
     },
     thumb: function (file, width) {
       return '/api/slideshow/media/' + encodeURIComponent(file)

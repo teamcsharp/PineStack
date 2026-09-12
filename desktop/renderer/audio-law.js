@@ -174,7 +174,88 @@
     return touched;
   }
 
+  /* ---------------------------------------------------------------------
+     THIS TERMINAL'S OWN MIX - music against voices, in this room only.
+
+     "I am trying to adjust the volume of just the music so that way I can
+      hear the DJs better or hear the clips more and it is not letting me."
+
+     There are TWO desks in this house and they are not the same desk:
+
+       THE STATION'S   <stream>_level, written through /api/dj/output and
+                       heard by every listener. That is a broadcast decision.
+       THIS BROWSER'S  djGainMusic / djGainVoice / djDuck, read by djLevels()
+                       and applied by djApplyGain(). A monitoring decision -
+                       it changes what comes out of THIS device and nothing
+                       else.
+
+     "So I can hear the DJs better" is the second one. The Listen desk said
+     so on its own face - "This terminal only" - and then called setLevel,
+     which is the first one. Worse, the station only publishes per-stream
+     levels when the broadcast device is the Nabu, so on this tablet the read
+     came back null, every knob sat at 50 marked "not set", and moving one
+     appeared to do nothing. Measured: the desk reading 50/50/50 while the
+     real mix was music 100%, djs 160%.
+
+     These are PERCENTAGES, not fractions, because that is what the panel's
+     own sliders are and what its label shows. 100 is unity. */
+
+  var LOCAL_GAIN = {
+    music: {id: 'djGainMusic', fallback: 100},
+    voice: {id: 'djGainVoice', fallback: 160},
+    reply: {id: 'djGainVoice', fallback: 160},   /* replies ride the voice bus */
+    duck: {id: 'djDuck', fallback: 70}
+  };
+
+  function gainNode(stream) {
+    var spec = LOCAL_GAIN[stream];
+    if (!spec || typeof document === 'undefined') return null;
+    return document.getElementById(spec.id);
+  }
+
+  /** The panel's own gain for a stream, as a percentage, or null when this
+   *  page has no panel behind it - the desktop renderer, which runs from
+   *  file:// and has no djGain sliders of its own. */
+  function localMix(stream) {
+    var node = gainNode(stream);
+    if (!node) return null;
+    var value = Number(node.value);
+    return isFinite(value) ? value : (LOCAL_GAIN[stream] || {}).fallback;
+  }
+
+  function localMixRange(stream) {
+    var node = gainNode(stream);
+    if (!node) return {min: 0, max: 200};
+    return {min: Number(node.min) || 0, max: Number(node.max) || 200};
+  }
+
+  /**
+   * Move this terminal's mix and make it audible NOW.
+   *
+   * The panel applies gain from these sliders through djApplyGain, so the
+   * value is written AND the event fired - a value set without the event is
+   * a slider that moved and a sound that did not.
+   */
+  function setLocalMix(stream, percent) {
+    var node = gainNode(stream);
+    if (!node) return false;
+    var range = localMixRange(stream);
+    var want = Math.max(range.min, Math.min(range.max, Math.round(Number(percent) || 0)));
+    node.value = String(want);
+    try { node.dispatchEvent(new Event('input', {bubbles: true})); } catch (err) { /* old */ }
+    try { node.dispatchEvent(new Event('change', {bubbles: true})); } catch (err) { /* old */ }
+    /* Belt and braces: the panel wires these, but if a build ever stops
+     * listening the mix must still move. djApplyGain is idempotent. */
+    if (typeof root.djApplyGain === 'function') {
+      try { root.djApplyGain(); } catch (err) { /* not fatal */ }
+    }
+    return true;
+  }
+
   root.PineAudioLaw = {
+    localMix: localMix,
+    setLocalMix: setLocalMix,
+    localMixRange: localMixRange,
     STREAMS: STREAMS,
     LOCAL_WHY: LOCAL_WHY,
     levelOf: levelOf, routeOf: routeOf,

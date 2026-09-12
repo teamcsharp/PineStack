@@ -524,7 +524,23 @@ SFX_DEFAULT_FOLDER = SFX_DEFAULT_FOLDERS[0]     # what the panel offers first
 # had stopped paying for itself. High enough to mean "all of them", and
 # a dial rather than a constant so it can be pulled back without a
 # deploy.
-SFX_MAX_FILES = int(os.getenv("SFX_MAX_FILES", "20000"))
+# #1251b: REVERTED TO 400 AFTER IT TOOK THE HOST DOWN.
+#
+# #1251 raised this to 20,000 to put the whole library in play. Within
+# minutes the host stopped answering SSH and HTTP while still serving
+# SMB - kernel networking fine, userspace unable to get scheduled,
+# which is a machine thrashing on I/O. This is why: sfx_list is called
+# PER FOLDER, there are up to SFX_DROP_SUBS (60) drop subfolders over a
+# pack tree of 23,000 files, and the pool refreshes every 60 seconds.
+# At 400 that is a bounded sample per folder; uncapped it is a full
+# CIFS walk and stat of the whole tree, once a minute, for ever.
+#
+# The operator's goal is met a different way and always was: #817 draws
+# a FRESH random 400 per walk, so the whole library rotates through the
+# pool over time, and #1251's unheard-first road then picks up each new
+# arrival and spends it. Coverage comes from the rotation plus the
+# ledger, not from holding every path in memory at once.
+SFX_MAX_FILES = int(os.getenv("SFX_MAX_FILES", "400"))
 # #835: the DROP folders. New cuts land on the quickswap share while
 # the show is running - often in a subfolder that did not exist an hour
 # ago - and the operator wants them "showing up as I am adding them".
@@ -1220,6 +1236,13 @@ DEFAULT_DJ = {
     # Default high on purpose: "the clips are funny and are a major part
     # of the show, so I want him punctuating the dead air often."
     "sfx_anxiety": 70,
+    # #1252: what share of topics are SAID OUT LOUD and opened on,
+    # rather than arriving sideways. The operator has asked twice why
+    # he never hears one: thirteen of the fourteen shapes forbid
+    # announcing the topic, which is what stops the bank sounding like
+    # a list being read - and is also why its subject is never heard.
+    # Half and half. 0 is the station exactly as it was.
+    "topic_aloud": 50,
     # --- Conversation Director: the performance layer (plan §7-9, §28-30).
     # Master switch and strength: 0 reads every line flat, 1 is the full
     # send. Identity vectors skip all the machinery, so plain stays plain.
@@ -2159,6 +2182,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("sfx_gap", DEFAULT_DJ["sfx_gap"]) or 0))),
         "sfx_anxiety": max(0, min(100, int(
             raw_dj.get("sfx_anxiety", DEFAULT_DJ["sfx_anxiety"]) or 0))),
+        "topic_aloud": max(0, min(100, int(
+            raw_dj.get("topic_aloud", DEFAULT_DJ["topic_aloud"]) or 0))),
         # #835: the drop roots, and how often they are re-read. Same
         # leading-slash scrub as sfx_folders - the real containment
         # check still happens where the folder is opened (#208).
@@ -23510,6 +23535,9 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                   # many clips go out in a row, how readily he cuts in.
                   ("sfx_anxiety", "SFX Guy anxiety (dead-air filling)",
                    "range", 0, 100, 1),
+                  # #1252: how many topics are SAID rather than felt.
+                  ("topic_aloud", "Topics said out loud (vs. sideways)",
+                   "range", 0, 100, 1),
                   ("sfxguy_warp", "SFX Guy invention", "range", 0, 100, 1)],
         "caller": [("callin_per_hour", "Calls per hour", "range", 0, 20, 1),
                    # #839: the request-line quota. Distinct from the line
@@ -41710,9 +41738,19 @@ def coordinator_state() -> dict[str, Any]:
             # queued behind them - a 2.4 kB /api/orchestrator/asks waited
             # a measured 19 s, a 650-byte /api/radio/clock 21 s. That
             # queue is what the operator feels as "the popup is slow".
-            # The newest closed hour stays, so anything asking "how did
-            # the last hour score" is answered without the archive.
-            "hourly": _coordinator_hourly_brief(),
+            # The newest closed hour stayed at first, so anything asking
+            # "how did the last hour score" would be answered without the
+            # archive. Measured again on 2026-09-12 it was 21.8 kB of the
+            # route's 187 kB - because ONE scorecard is itself that big -
+            # and still read by nobody: djDialogueFlowPaint touches only
+            # ad_cover, blockers, delivery_waiting, ready, render_waiting,
+            # target and writing, and neither the desktop renderer nor the
+            # kiosk views mention `.coordinator` at all.
+            #
+            # So it is gone from the poll entirely. /api/coordinator/hourly
+            # is the door, and it was always the door - this was a copy
+            # riding 15 times a minute beside it.
+            "hourly_at": "/api/coordinator/hourly",
             # #911: what is COMING and whether anything is ready for it.
             "upcoming": coord_upcoming()[:10],
             "bare_arrivals": dict(_BARE_ARRIVALS),
@@ -60950,6 +60988,7 @@ SFX_LEN_CACHE_MAX = 32000
 # replaced file is re-measured and a renamed one simply misses.
 SFX_LEN_PATH = data_path("sfx_lengths.json")
 _SFX_LEN_DIRTY = [0]
+_SFX_LEN_SAVED = [0.0]      # #1251c: last write of the ledger
 
 
 def _sfx_len_load() -> None:
@@ -61006,7 +61045,20 @@ def sfx_seconds(path: Path) -> float:
     # #863: written back in batches — one decode saved is one fewer
     # minute of a station with no stings after a restart.
     _SFX_LEN_DIRTY[0] += 1
-    if _SFX_LEN_DIRTY[0] >= 50:
+    # #1251c: ...AND NEVER MORE THAN ONCE A MINUTE. The batch of fifty
+    # was sized for a pool of four hundred. With the pool uncapped
+    # (#1251, reverted) this file - THREE MEGABYTES - was rewritten to
+    # a CIFS share every eighteen seconds while the station measured
+    # its way through the whole library, and the host stopped answering
+    # SSH and HTTP while still serving SMB: userspace unable to get
+    # scheduled, a machine thrashing on I/O.
+    #
+    # The cap is back, so the storm cannot start the same way again.
+    # This is the second lock on the same door: however many clips want
+    # measuring, the LEDGER is written at most once a minute, and a
+    # crash costs a minute of re-measurement rather than the host.
+    if _SFX_LEN_DIRTY[0] >= 50             and time.time() - float(_SFX_LEN_SAVED[0] or 0) >= 60.0:
+        _SFX_LEN_SAVED[0] = time.time()
         _sfx_len_save()
     return secs
 
@@ -68327,8 +68379,20 @@ def bombshell_shape_for(row: Any) -> str:
     with extra steps. The book remembers which shapes a line has already
     played and the draw prefers a fresh one."""
     try:
+        # #1252: SAID OUT LOUD, on the operator's dial. The shape memory
+        # below is about not wearing the same sideways shape twice; it
+        # has nothing to say about whether the topic is ANNOUNCED, and
+        # left to the deck that happened one time in fourteen. This
+        # decides that first, and the memory still orders the rest.
+        try:
+            aloud = int(dj_settings().get("topic_aloud", 50) or 0)
+        except Exception:  # noqa: BLE001
+            aloud = 50
+        if aloud > 0 and random.random() < aloud / 100.0:
+            return TOPIC_STARTER_SHAPE
         had = {str(x) for x in (row or {}).get("shapes") or []}
-        fresh = [name for name, _ in BANTER_SHAPES if name not in had]
+        fresh = [name for name, _ in BANTER_SHAPES
+                 if name not in had and name != TOPIC_STARTER_SHAPE]
         return random.choice(fresh) if fresh else ""
     except Exception:  # noqa: BLE001
         return ""
@@ -100265,7 +100329,12 @@ async def slideshow_stack_api(
                 "stalls": pulse.get("stalls"),
                 "worst_s": pulse.get("worst_s"),
                 "stalled_s": pulse.get("stalled_s"),
-                "stalling_now": pulse.get("stalling_now"),
+                # FLATTENED. `stalling_now` is a whole stall record when
+                # the loop is wedged and None when it is not, and a panel
+                # that printed it straight showed "[object Object]" at
+                # exactly the moment it mattered most.
+                "stalling_now": _slideshow_stall_line(
+                    pulse.get("stalling_now")),
                 "window_s": pulse.get("window_s"),
                 "top": [row.get("frame") for row in (pulse.get("top") or [])[:3]],
             }
@@ -100349,6 +100418,26 @@ async def slideshow_stack_api(
 #   and board, searxng's live engine count. For a readout that is better
 #   than a log tail, not worse.
 # ---------------------------------------------------------------------------
+
+def _slideshow_stall_line(stall: Any) -> str:
+    """One line for a stall in progress, or "" for a loop that is fine."""
+    if not isinstance(stall, dict):
+        return ""
+    seconds = stall.get("seconds")
+    where = (stall.get("top") or stall.get("frame")
+             or (stall.get("frames") or [""])[0] or "")
+    if seconds is None and not where:
+        return "yes"
+    parts = []
+    if seconds is not None:
+        try:
+            parts.append(f"{float(seconds):.1f}s")
+        except (TypeError, ValueError):
+            pass
+    if where:
+        parts.append("in " + str(where))
+    return " ".join(parts) or "yes"
+
 
 _SLIDESHOW_GPU: dict[str, Any] = {"at": 0.0, "rows": []}
 _SLIDESHOW_GPU_TTL = 6.0
@@ -100818,7 +100907,12 @@ async def slideshow_backend_api(
                 "stalls": pulse.get("stalls"),
                 "worst_s": pulse.get("worst_s"),
                 "stalled_s": pulse.get("stalled_s"),
-                "stalling_now": pulse.get("stalling_now"),
+                # FLATTENED. `stalling_now` is a whole stall record when
+                # the loop is wedged and None when it is not, and a panel
+                # that printed it straight showed "[object Object]" at
+                # exactly the moment it mattered most.
+                "stalling_now": _slideshow_stall_line(
+                    pulse.get("stalling_now")),
                 "window_s": pulse.get("window_s"),
                 "top": [r.get("frame") for r in (pulse.get("top") or [])[:3]],
             }
@@ -101041,6 +101135,12 @@ _SPARK_PAGE = """<!doctype html>
       document.getElementById('sparkHost'),
       {mode: pictures ? 'overlay' : 'dashboard'});
   }
+
+  /* Where a probe can find it. tools/overlay-fit-probe.cjs asserts that
+     this stops polling when the page is hidden, which is a promise about
+     behaviour and therefore needs a handle to check rather than a comment
+     saying it is so. */
+  window.__sparkMonitor = live;
 
   /* The clock in the bar is the honest "is this live" signal: it is the
      timestamp the STATION put on the reading, not this page's own clock,
@@ -116362,6 +116462,10 @@ async def topics_bank_api(
     """#1226: how fresh the things-to-spring-on-them bank is."""
     require_read_auth(authorization)
     state = topic_bank_state()
+    try:
+        state["said_aloud_pct"] = int(dj_settings().get("topic_aloud", 50) or 0)
+    except Exception:  # noqa: BLE001
+        pass
     return {**state, "say": (
         "%d topic(s); the least-used has been sprung %d time(s), the "
         "most-used %d. %d have never gone out. %s"
@@ -161537,6 +161641,66 @@ async function radioClockPoll() {
  * until it is released, and an owner that stops polling releases it on
  * its own, so this can never leave the house silent. With no owner set,
  * which is the default, nothing here does anything. */
+/* A TOUCH OUTRANKS AN ANIMATION FRAME (#1251).
+ *
+ * Measured on the tablet, on an idle panel: touch to handler start 89-231 ms,
+ * touch to the next paint 64-137 ms - while the handler ITSELF runs in 0-4 ms.
+ * The delay is not the work, it is the queue in front of the work. Counted on
+ * the same page: THIRTEEN live canvases, four of them actually on screen and
+ * six alive but scrolled out of view, three of those WebGL. They all keep
+ * requestAnimationFrame turning, so a finger landing on the glass waits for
+ * whichever frame is already in flight and for the ones queued behind it.
+ *
+ * The obvious cure - stop the off-screen ones - needs every one of the
+ * sixty-odd rAF loops in this file to cooperate, and a loop that forgets to
+ * restart is a dead panel. This does something smaller and general instead:
+ * for a moment after a touch, animation frames YIELD. Nothing is cancelled;
+ * each held callback simply asks for the next frame instead of running, so
+ * every loop stays alive and no scene has to know this exists.
+ *
+ * A SIXTH OF A SECOND, and it is chosen not guessed: long enough to cover the
+ * handler and the paint that follows it, short enough that no eye can see an
+ * animation pause. Anything longer would be visible on the meters.
+ *
+ * This is deliberately NOT tied to the canvases being off screen. An
+ * IntersectionObserver would tell us which ones are wasted, but it cannot
+ * stop them without the loops cooperating - and the one thing every loop DOES
+ * go through is rAF itself.
+ */
+(function (win) {
+  'use strict';
+  var HOLD_MS = 160;
+  var original = win.requestAnimationFrame;
+  if (!original || original.__pineYield) return;
+  var holdUntil = 0;
+
+  var wrapped = function (callback) {
+    if (typeof callback !== 'function') return original.call(win, callback);
+    var run = function (stamp) {
+      /* performance.now() and the rAF stamp share an origin, so they are
+       * directly comparable - no second clock is involved. */
+      if (stamp < holdUntil) { original.call(win, run); return; }
+      callback(stamp);
+    };
+    return original.call(win, run);
+  };
+  wrapped.__pineYield = true;
+  win.requestAnimationFrame = wrapped;
+
+  /* CAPTURE PHASE, so the hold is in place before any handler runs - and on
+   * pointerdown rather than click, because the whole point is to clear the
+   * road for the handler that a press is about to start. */
+  var press = function () { holdUntil = win.performance.now() + HOLD_MS; };
+  ['pointerdown', 'keydown', 'wheel'].forEach(function (kind) {
+    win.document.addEventListener(kind, press, {capture: true, passive: true});
+  });
+
+  /* Visible, because a knob nobody can read is a knob nobody can trust. */
+  win.pineYieldState = function () {
+    return {holdMs: HOLD_MS, holding: win.performance.now() < holdUntil};
+  };
+})(window);
+
 function pineSoloGate(clock) {
   try {
     const owner = String((clock && clock.audio_owner) || "");
