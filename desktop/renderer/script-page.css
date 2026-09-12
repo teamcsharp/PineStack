@@ -276,7 +276,18 @@
    declaration rather than a shrug: the fault is real but only shows while
    the page is still laying itself out, and a reader cannot tell the
    difference from a sentence that simply ends. */
-.sp-el { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* #1273b: THE BOX DOES NOT CHANGE SHAPE WHEN ITS STATE DOES.
+   `pending` and `sp-now` each used to ADD a left border and padding,
+   narrowing the content box by 8-10px. At 12px in a 62% measure that is
+   enough to re-wrap a line and gain or lose a whole 17.4px row - so
+   every time the highlight moved, two elements changed height and
+   everything below them shifted, under the thumb of an operator tapping
+   lines onto sampler pads. The room is reserved in every state now and
+   only the colour changes. */
+.sp-el {
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  border-left: 3px solid transparent; padding-left: 7px;
+}
 .sp-el.picked { background: rgba(101, 199, 218, .14); border-radius: 4px; }
 .sp-el.flash { animation: spFlash 1.2s ease-out; }
 @keyframes spFlash {
@@ -321,7 +332,7 @@
    reach the room before the audience does. */
 /* NOT YET SAID. A quiet marker, not a highlight - there can be a dozen of
    these on screen and only one line is actually being spoken. */
-.sp-el.pending { border-left: 2px dotted var(--sp-amber); padding-left: 6px; opacity: .82; }
+.sp-el.pending { border-left-style: dotted; border-left-color: var(--sp-amber); opacity: .82; }
 
 /* THE LINE BEING SAID, RIGHT NOW.
    One at a time, and unmistakable: the eye should find it without reading.

@@ -44,7 +44,8 @@
   var stop = null;
   var elements = [];
   var hourKey = '';
-  var painted = [];                 /* #1269: what is already on the page */
+  var scriptNodes = new Map();      /* #1273: element id -> its live node */
+  var paintedIn = null;             /* #1273: the box those nodes hang in */
   var chasedAt = 0;                 /* #1271: last re-read chased by a mark */
   /* #1269: the join between an element's id and its text. A character no
      id or text can contain, written as an ESCAPE - an earlier patch put a
@@ -381,6 +382,13 @@
     var now = Date.now();
     if (fetching) return;
     if (!force && now - fetchedAt < SCREENPLAY_REST_MS) return;
+    /* #1273b: a FORCED read is one the page asked for because the line
+       it needs is missing (#1271). Asking for the cached copy would
+       hand back the very page that just failed to contain it - measured
+       16.1s old, against 2.1s with `fresh`. The rest poll stays cached,
+       and so does the hour before: it is closed, 238 kB, and the server
+       holds it for fifteen minutes. */
+    var live = force ? '?fresh=1' : '';
     fetching = true;
     api().get('/api/screenplay').then(function (index) {
       var hours = (index && index.hours) || [];
@@ -405,7 +413,8 @@
        */
       var before = hours[1] && Number(hours[1].lines || 0) > 0
         ? String(hours[1].key || '') : '';
-      var want = [api().get('/api/screenplay/' + encodeURIComponent(hourKey))];
+      var want = [api().get('/api/screenplay/'
+        + encodeURIComponent(hourKey) + live)];
       if (before) {
         want.push(api().get('/api/screenplay/' + encodeURIComponent(before))
           .then(null, function () { return null; }));  /* its loss is survivable */
@@ -472,45 +481,119 @@
      * cleared just below, unconditionally), so the page re-seated
      * itself three times a minute whether anything had changed or not.
      *
-     * A script only ever grows at the END. So the painted list is
-     * compared with the new one, element by element, and everything
-     * that still matches is LEFT ALONE - the same DOM nodes, the same
-     * scroll, the same highlight. Only from the first real difference
-     * down is anything touched.
-     *
-     * The comparison carries the text as well as the id, because an
-     * element can be revised in place without changing its id: the
-     * scene heading gains its "- N MIN" as the hour runs on, and that
-     * one really does have to be repainted.
+     * #1269 answered that with a longest-common-PREFIX compare, on the
+     * reasoning that a script only ever grows at the end. It does not,
+     * and #1273 below replaces it - see there for what moves the page
+     * and what it measured. This note is kept only because the fault it
+     * describes is still the right one to have been chasing.
      */
-    var fresh = [];
+    /* #1273: KEPT, NOT REBUILT. The prefix match this replaces assumed
+     * the script only grows at the end; measured on air it destroyed 240
+     * nodes over eight polls, 238 of them identical content that had
+     * merely moved. See the patch note for the three things that move
+     * it. Nodes are keyed by the server's element id and kept. */
+    if (paintedIn !== box) { scriptNodes.clear(); paintedIn = box; }
+    var anchor = scriptAnchor(box);
+    var order = [];
+    var wanted = Object.create(null);
     for (var i = 0; i < elements.length; i += 1) {
-      fresh.push(String(elements[i].id || i) + SEP
-        + String(elements[i].text || ''));
+      var item = elements[i];
+      var key = String(item.id || '') || ('ix:' + i);
+      wanted[key] = 1;
+      /* Everything the node's APPEARANCE depends on, so a line revised
+         in place is re-dressed rather than rebuilt. */
+      var print = String(item.text || '') + SEP + String(item.type || '')
+        + SEP + String(item.aired || '') + SEP + (item.tinted ? '1' : '0');
+      var node = scriptNodes.get(key);
+      if (node && node.pinePrint !== print) {
+        var lit = node.classList.contains('sp-now');
+        var picked = node.classList.contains('picked');
+        node.textContent = String(item.text || '');
+        node.className = 'sp-el sp-' + String(item.type || 'action')
+          + (item.aired === 'prepared' ? ' pending' : '')
+          + (item.tinted ? ' tinted' : '')
+          + (lit ? ' sp-now' : '') + (picked ? ' picked' : '');
+        node.pinePrint = print;
+      }
+      if (!node) {
+        node = scriptBlock(item);
+        node.pinePrint = print;
+        scriptNodes.set(key, node);
+      }
+      order.push(node);
     }
-    var keep = 0;
-    while (keep < painted.length && keep < fresh.length
-        && painted[keep] === fresh[keep]) keep += 1;
-    while (box.childNodes.length > keep) box.removeChild(box.lastChild);
-    painted.length = keep;
-    for (var k = keep; k < elements.length; k += 1) {
-      box.appendChild(scriptBlock(elements[k]));
-      painted.push(fresh[k]);
-    }
+    scriptNodes.forEach(function (held, key) {
+      if (wanted[key]) return;
+      if (held.parentNode === box) held.remove();
+      scriptNodes.delete(key);
+    });
+    stitchScript(box, order);
+    scriptRestore(box, anchor);
     /* FOLLOWING BEATS STICKING TO THE END.
      * The live line sits wherever the conversation has got to, and the end
      * of the hour is usually well past it; scrolling to the bottom after
      * every repaint would drag the operator away from the line being said
      * twenty seconds after it arrived. */
     if (stick && atEnd && !(follow && nowLineId)) box.scrollTop = box.scrollHeight;
-    /* #1269: the mark is only forgotten if its node actually went. It
-       usually survives now, and forgetting it unconditionally was what
-       made the highlight re-seat on every poll. */
-    if (nowLineId
-        && !box.querySelector('.sp-el[data-line="' + nowLineId + '"]')) {
-      nowLineId = '';
+    /* #1273: THE MARK IS RE-ASSERTED, NOT MERELY REMEMBERED.
+       #1269 asked whether a node with this id existed - not whether it
+       still CARRIED the mark. A rebuilt node exists without .sp-now, so
+       nowLineId stayed set, markNow returned at `id === nowLineId`, and
+       the page showed no highlight at all until the station moved on.
+       That is the operator's "highlighting incorrect segments". Keyed
+       nodes make it rare; asking the right question makes it
+       impossible. */
+    if (nowLineId) {
+      var held = box.querySelector('.sp-el[data-line="' + nowLineId + '"]');
+      if (!held) nowLineId = '';
+      else if (!held.classList.contains('sp-now')) held.classList.add('sp-now');
     }
     tick();
+  }
+
+  /* #1273: HOLD THE READER'S PLACE ACROSS A REPAINT. Measure one row
+     that is actually on screen before, find the SAME element after, and
+     move the scroll by the difference - so an element inserted above the
+     reader does not drag the page out from under them. Deliberately not
+     derived from offsetTop; the sampler's commit records why that
+     failed. */
+  function scriptAnchor(box) {
+    if (!box || box.scrollTop <= 4) return {pinned: true};
+    var lip = box.getBoundingClientRect();
+    for (var i = 0; i < box.children.length; i += 1) {
+      var seat = box.children[i].getBoundingClientRect();
+      if (seat.bottom <= lip.top + 1) continue;      /* scrolled off the top */
+      return {node: box.children[i], was: seat.top};
+    }
+    return {pinned: true};
+  }
+
+  function scriptRestore(box, anchor) {
+    if (!box || !anchor || anchor.pinned) return;
+    var node = anchor.node;
+    /* It left the page while it was being read. Leave the scroll alone:
+       the browser's own anchoring has already chosen a neighbour. */
+    if (!node || node.parentNode !== box) return;
+    var drift = node.getBoundingClientRect().top - anchor.was;
+    if (Math.abs(drift) > 0.5) {
+      box.scrollTop = Math.max(0, box.scrollTop + drift);
+    }
+  }
+
+  /* Put `order` into `box`, in that order, moving as little as possible.
+     A node already in the right place costs one comparison; anything
+     else is one insertBefore. */
+  function stitchScript(box, order) {
+    var cursor = box.firstChild;
+    for (var i = 0; i < order.length; i += 1) {
+      if (order[i] === cursor) { cursor = cursor.nextSibling; continue; }
+      box.insertBefore(order[i], cursor);
+    }
+    while (cursor) {                    /* not asked for any more */
+      var next = cursor.nextSibling;
+      cursor.remove();
+      cursor = next;
+    }
   }
 
   function scriptBlock(item) {
