@@ -20,6 +20,50 @@
       rows.set(String(row.id), {...previous, ...row, id: String(row.id), lcdStatus: label, lcdAudio: audio});
     };
     for (const row of station.chat || []) absorb(row);
+    /* THE RECORDS, TOO.
+     *
+     * "Show everything in the feed, including clips that are played. I want
+     *  to be able to put any audio that is played on the radio on the
+     *  sampler, but I want to see it in the feed."
+     *
+     * `chat` is the BOOTH - what was said. A record turning is not a chat
+     * row, so the music never appeared here at all and could not be dragged
+     * onto a pad. `now` is what is turning, and it carries its own signed
+     * url.
+     *
+     * ONE RECORD, AND ONLY THE ONE THAT IS PLAYING. This used to fold in
+     * `played` as well - the last ten - and the feed came back with a
+     * column of songs at the top before any dialogue. "I only need it to
+     * show just the active playing song. I do not need it to show more than
+     * one song in the feed." The history is not lost: the Music view lists
+     * what has played and can put any of it on a pad.
+     *
+     * It is marked `kind: 'music'` rather than dressed up as a booth row,
+     * because sourceFor has to be able to tell them apart: a record is taken
+     * whole from its own file, not cut out of the booth ring. */
+    const record = (track, status) => {
+      if (!track || !track.url) return;
+      const id = 'music:' + String(track.id || track.url);
+      if (rows.has(id)) return;
+      const artist = track.artist ? ' · ' + track.artist : '';
+      rows.set(id, {
+        id, kind: 'music', who: 'Record', name: track.artist || 'Record',
+        text: (track.title || 'a record') + artist,
+        url: track.url, seconds: Number(track.seconds) || 0,
+        lcdStatus: status, lcdAudio: true, music: true
+      });
+    };
+
+    /* THE RECORD GOES IN BEFORE THE LIVE SPEAKER, not after.
+     *
+     * The feed reverses this list to put the newest at the top, so whatever
+     * is added LAST appears FIRST. Adding the record after the live speaker
+     * therefore pushed the song above the line being spoken - which is how
+     * the screenshot came to show a track title where the talking should be.
+     * The thing currently being SAID is the latest thing playing; the record
+     * is the bed under it and sits just below. */
+    record(station.now, station.playing ? 'Playing' : 'Aired');
+
     const stream = station.stream_now;
     const offset = now / 1000 - Number(stream?.at || 0);
     let current;
@@ -43,42 +87,6 @@
       absorb({...before, ...live, text: live.text || before.text,
         aired: 'airing'}, 'Playing');
     }
-    /* THE RECORDS, TOO.
-     *
-     * "Show everything in the feed, including clips that are played. I want
-     *  to be able to put any audio that is played on the radio on the
-     *  sampler, but I want to see it in the feed."
-     *
-     * `chat` is the BOOTH - what was said. A record turning is not a chat
-     * row, so the music never appeared here at all and could not be dragged
-     * onto a pad. The station publishes both halves already: `now` is what
-     * is turning and `played` is the ones before it, each carrying its own
-     * signed url.
-     *
-     * They are marked `kind: 'music'` rather than dressed up as booth rows,
-     * because sourceFor has to be able to tell them apart: a record is taken
-     * whole from its own file, not cut out of the booth ring.
-     *
-     * NEWEST LAST, to match `chat` - the sampler's feed reverses the whole
-     * list to put the newest at the top, so anything that arrives here out
-     * of order arrives on screen out of order too. */
-    const record = (track, status) => {
-      if (!track || !track.url) return;
-      const id = 'music:' + String(track.id || track.url);
-      if (rows.has(id)) return;
-      const artist = track.artist ? ' · ' + track.artist : '';
-      rows.set(id, {
-        id, kind: 'music', who: 'Record', name: track.artist || 'Record',
-        text: (track.title || 'a record') + artist,
-        url: track.url, seconds: Number(track.seconds) || 0,
-        lcdStatus: status, lcdAudio: true, music: true
-      });
-    };
-    /* Oldest first: `played` is newest-first from the station. */
-    const before = (station.played || []).slice().reverse();
-    for (const track of before) record(track, 'Aired');
-    record(station.now, station.playing ? 'Playing' : 'Aired');
-
     return [...rows.values()];
   }
   if (typeof module !== 'undefined' && module.exports) module.exports = {stationRows};
