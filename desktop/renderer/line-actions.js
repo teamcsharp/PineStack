@@ -118,6 +118,9 @@
 
   var sheet = null;
 
+  /* Closing the SHEET. The toast is deliberately not touched: it belongs to
+   * work that is still running, and taking it down with the menu would hide
+   * the answer to the very thing that was just asked for. */
   function close() {
     stopPlaying();
     if (sheet) { sheet.remove(); sheet = null; }
@@ -137,21 +140,20 @@
      * this?" - and on a screen of six near-identical rap couplets that is
      * the question the hand is usually asking. It is also the only choice
      * here that changes nothing. */
-    choice(list, 'Play it',
+    choice(list, '\u25B6\uFE0F', 'Play it',
       'hear this line, here', function (say) { playIt(line, say); });
-    choice(list, 'Put it on a sampler pad',
+    choice(list, '\uD83C\uDF9B\uFE0F', 'Put it on a sampler pad',
       'the next free pad, ready to fire', function (say, bar) { toPad(line, say, bar); });
-    choice(list, 'Download it to the tablet',
+    choice(list, '\uD83D\uDCF1', 'Download it to the tablet',
       'into Downloads / Pine Box', function (say, bar) {
         keep(line, 'downloads', say, bar);
       });
-    choice(list, 'Download it to the recording folder',
+    choice(list, '\uD83D\uDCC1', 'Download it to the recording folder',
       'the working folder you extract into', function (say, bar) {
         keep(line, 'recordings', say, bar);
       });
-    choice(list, 'Examine it in depth',
+    choice(list, '\uD83D\uDD0E', 'Examine it in depth',
       'where it came from, how often it airs, and why', function () {
-        close();
         if (root.PineLineDeep) root.PineLineDeep.open(line);
       });
     sheet.appendChild(list);
@@ -165,33 +167,59 @@
     if (root.PineDismiss) root.PineDismiss.watch(sheet, close, []);
   }
 
-  function choice(into, title, why, run) {
-    /* `run` is handed a `say` and, where it can use one, the bar itself -
-     * a download can report real bytes and a pad cut cannot. */
+  /* WHERE THE WORK REPORTS FROM ONCE THE MENU HAS GONE.
+   *
+   * One line at the foot of the screen, outliving the sheet that started it.
+   * A cut can run ninety seconds and the operator should be able to watch it
+   * without the menu they already dismissed sitting over the script.
+   *
+   * It carries the same shape the row bar did - say/finish - so the actions
+   * below did not have to learn anything new. */
+  var toast = null;
+  var toastGone = 0;
+
+  function laToast(text, bad) {
+    if (!toast) {
+      toast = make('div', 'la-toast');
+      document.body.appendChild(toast);
+    }
+    toast.textContent = String(text || '');
+    toast.classList.toggle('bad', !!bad);
+    toast.classList.add('up');
+    clearTimeout(toastGone);
+    /* Still working: leave it. A refusal is worth longer than a success,
+     * because a success is usually visible somewhere else - on a pad, in a
+     * folder - and a refusal is only ever here. */
+    if (/\u2026$/.test(String(text || ''))) return;
+    toastGone = setTimeout(function () {
+      if (!toast) return;
+      toast.classList.remove('up');
+      setTimeout(function () { if (toast) { toast.remove(); toast = null; } }, 260);
+    }, bad ? 6000 : 3200);
+  }
+
+  function choice(into, mark, title, why, run) {
     var row = make('button', 'la-choice');
     row.type = 'button';
+    /* THE MARK. Emoji rather than geometric glyphs: this is pressed with a
+     * thumb on a nine-inch screen, where ▦ and ▤ are the same shape and a
+     * mixing desk and a folder are not. */
+    row.appendChild(make('span', 'la-ico', mark));
     row.appendChild(make('b', '', title));
     row.appendChild(make('i', '', why));
-    var said = make('span', 'la-note');
-    row.appendChild(said);
     row.addEventListener('click', function (event) {
       event.stopPropagation();
-      row.disabled = true;
-      /* THE BAR GOES ON THE ROW HE PRESSED. A cut can take ninety seconds
-       * - the sampler's own ceiling, because the station is writing and
-       * recording audio and a cut queues behind that work - and without
-       * this the row simply sat there and invited a second press. */
-      var bar = root.PineBusy ? root.PineBusy.attach(row, 'working…') : null;
-      var settle = function (ok) { if (bar) bar.finish(ok); row.disabled = false; };
-      run(function (text, bad) {
-        said.textContent = String(text || '');
-        said.classList.toggle('bad', !!bad);
-        if (bar) bar.say(String(text || ''));
-        /* A message that is not an error but is not the end either -
-         * "cutting it…", "fetching the clip…" - leaves the bar running. */
-        if (bad) settle(false);
-        else if (!/…$/.test(String(text || ''))) settle(true);
-      }, bar);
+      /* THE MENU GOES AT ONCE. It is dismissed BY being chosen from; one
+       * that stays reads as not having heard you, and the old version then
+       * reported refusals into a sheet the operator had already finished
+       * with. The work carries on and speaks from the foot of the screen. */
+      var held = sheet;
+      sheet = null;
+      if (held) held.remove();
+      run(laToast, {
+        say: function (text) { laToast(text); },
+        finish: function (ok) { if (!ok) return; }
+      });
     });
     into.appendChild(row);
   }

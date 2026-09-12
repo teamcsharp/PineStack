@@ -30,8 +30,51 @@
   overflow-wrap: anywhere;
 }
 .la-list { display: grid; gap: 8px; }
+/* The mark itself. */
+.la-ico {
+  grid-area: ico;
+  align-self: center;
+  font-size: 19px;
+  line-height: 1;
+  text-align: center;
+}
+
+/* THE WORD FROM THE WORK, after the menu has gone. Fixed to the foot of the
+ * screen so it is in the same place whichever script view raised it, and
+ * above everything, because it is the answer to something just asked. */
+.la-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translate(-50%, 12px);
+  z-index: 2147483046;
+  max-width: min(560px, 88vw);
+  padding: 10px 16px;
+  border-radius: 10px;
+  background: #18241d;
+  color: #eaf0eb;
+  border: 1px solid #799066;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, .55);
+  font-size: 13px;
+  line-height: 1.4;
+  opacity: 0;
+  transition: opacity .18s linear, transform .18s ease-out;
+  pointer-events: none;
+}
+.la-toast.up { opacity: 1; transform: translate(-50%, 0); }
+.la-toast.bad { border-color: #a8563f; color: #ffcdbc; }
+
 .la-choice {
-  display: block; width: 100%;
+  /* A COLUMN FOR THE MARK. This was `display: block` with the title and the
+     why simply stacked; the icon needs a column of its own beside both of
+     them, spanning the two rows, or it sits above the title and the row
+     grows by a line. */
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  grid-template-areas: "ico title" "ico why";
+  align-items: center;
+  column-gap: 10px;
+  width: 100%;
   padding: 11px 12px;
   border: 1px solid var(--line, #35414c);
   border-radius: 10px;
@@ -40,8 +83,9 @@
   font: inherit; text-align: left; cursor: pointer;
 }
 .la-choice:disabled { opacity: .55; cursor: default; }
-.la-choice b { display: block; font-size: 13px; }
+.la-choice b { grid-area: title; display: block; font-size: 13px; }
 .la-choice i {
+  grid-area: why;
   display: block; font-style: normal; font-size: 11px;
   color: var(--muted, #8fa0ad); margin-top: 2px;
 }
