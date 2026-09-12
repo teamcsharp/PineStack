@@ -43334,6 +43334,17 @@ async def dead_air_watch() -> None:
                     await entry_unanswered_fill() or await entry_arrears_serve()
                 except Exception:  # noqa: BLE001
                     pass
+            # #1235: ASK THE SFX GUY FIRST. The reset below is right
+            # that a record is sound in the room - and it ends the pass,
+            # so everything under it has been unreachable for as long as
+            # there is music on, which is nearly always. Measured: 42
+            # seconds of nobody saying a word, gap filler never called.
+            # The operator's dead air is the PAIR being silent, not the
+            # room, and #1231 built the clock that tells them apart.
+            try:
+                await sfx_fill_over_music()
+            except Exception:  # noqa: BLE001
+                pass        # the watchdog never dies of its own cure
             if ((now_really_playing() and (_room_gets_music
                                            or not _voice_boxed))
                     or _SPEAKING[0] or _floor_busy()):          # #1146
@@ -62797,6 +62808,54 @@ def sfx_gap_notice(limit: float = 12.0) -> float:
     return max(SFX_ANXIOUS_NOTICE, base * (1.0 - 0.75 * anx))
 
 
+def sfx_music_notice() -> float:
+    """#1235: how long the PAIR must be silent before he starts working
+    over a record. Longer than sfx_gap_notice on purpose - the room is
+    not dead, the show just is."""
+    anx = sfx_anxiety()
+    return max(10.0, 60.0 * (1.0 - 0.8 * anx))
+
+
+def sfx_music_rest() -> float:
+    """#1235: and how long between goes while the record plays."""
+    anx = sfx_anxiety()
+    return max(6.0, 30.0 * (1.0 - 0.9 * anx))
+
+
+async def sfx_fill_over_music() -> str:
+    """#1235: the pair have gone quiet under a record. Punctuate it.
+
+    Called from the dead-air watchdog BEFORE the pass resets on "a
+    record is playing", which is why the filler was never reached in
+    ordinary running: 42 seconds of nobody talking, and the gap filler
+    had not been called once.
+
+    Its own rest clock, so a run over a record cannot inherit the
+    two-second cadence meant for a hole in the talk. Everything that
+    protects a live voice is still inside sfx_fill_gap."""
+    try:
+        if radio_paused() or not _RADIO.get("on") or _SPEAKING[0]:
+            return ""
+        mute = dialogue_quiet_for()
+        if mute < sfx_music_notice():
+            return ""
+        if time.time() - float(_SFX_GAP.get("music_at") or 0) < sfx_music_rest():
+            return ""
+        _SFX_GAP["music_at"] = time.time()
+        went = await sfx_fill_gap(
+            "the pair have not been heard for %ds and a record is playing"
+            % int(mute), under_floor=True,
+            # The soundboard and his own voice - the two things the
+            # operator named - and this road's own rest clock rather
+            # than a write into the one the hole road reads.
+            clips_only=True, ignore_rest=True)
+        if went:
+            _SFX_GAP["over_music"] = int(_SFX_GAP.get("over_music") or 0) + 1
+        return went
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def sfx_gap_burst() -> int:
     """How many clips go out in one fill - the operator's "how many".
 
@@ -62868,7 +62927,9 @@ async def sfxguy_gap_talk(why: str = "", floorless: bool = False) -> str:
         return _no("raised " + type(exc).__name__)
 
 
-async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
+async def sfx_fill_gap(why: str = "", under_floor: bool = False,
+                       clips_only: bool = False,
+                       ignore_rest: bool = False) -> str:
     """Punctuate dead air with a clip that already exists - the SFX Guy's
     prepared station liner off its shelf when he has one (the pantry
     serves it; nothing renders), else a short sample off the pool - and
@@ -62906,7 +62967,8 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
         except Exception:  # noqa: BLE001
             pass
         rest = sfx_gap_rest()                      # #1232: the dial
-        if time.time() - float(_SFX_GAP.get("at") or 0) < rest:
+        if (not ignore_rest
+                and time.time() - float(_SFX_GAP.get("at") or 0) < rest):
             return ""
         _SFX_GAP["at"] = time.time()
         _SFX_GAP["turn"] = int(_SFX_GAP.get("turn") or 0) + 1
@@ -62929,10 +62991,16 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
         # on the floorless road, because it is a clip that already exists.
         # Only the liner still waits for the floor - a liner is written and
         # rendered, and would queue behind the round it is covering for.
-        went = await gold_fill_gap(
+        # #1235b: ...unless this is a record being punctuated. The run
+        # lays up to twelve bars and three minutes of rhymed speech
+        # because a HOLE should be filled until it closes; a record is
+        # not a hole, and burying it under verse every eleven seconds is
+        # the opposite of punctuating it.
+        went = "" if clips_only else await gold_fill_gap(
             why, floorless=floor_held,
             ahead=GOLD_RUN_AHEAD_HELD if floor_held else GOLD_RUN_AHEAD)
-        if not went and drop_voice and not floor_held and _SFX_GAP["turn"] % 2 == 0:
+        if (not went and not clips_only and drop_voice and not floor_held
+                and _SFX_GAP["turn"] % 2 == 0):
             # A liner written and recorded for this voice earlier (#842):
             # the same road dj_sting's drop branch takes.
             _prep = None
@@ -63014,6 +63082,8 @@ def sfx_gap_status() -> dict[str, Any]:
     return {**_SFX_GAP, "rest": round(sfx_gap_rest(), 2),
             "anxiety": int(round(anx * 100)),
             "notices_after": round(sfx_gap_notice(), 1),
+            "notices_over_music_after": round(sfx_music_notice(), 1),
+            "rest_over_music": round(sfx_music_rest(), 1),
             "clips_per_fill": sfx_gap_burst(),
             "rest_floor": SFX_GAP_REST,
             "say": ("the SFX Guy calls it dead air after %.0fs, plays %d "
