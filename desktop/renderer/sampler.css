@@ -185,13 +185,30 @@
 
 /* ------------------------------------------------------ the instrument */
 
+/* A COLUMN WHERE ONLY THE PAD GRID GROWS.
+ *
+ * This was `grid-template-rows: auto 1fr auto`, which assigns the free space
+ * BY POSITION - and the column has gained children since it was written: the
+ * dial row, the playing timeline, and then the knob row. Each addition shifts
+ * whatever lands in slot two into the 1fr and pushes the pads out of it. The
+ * knob row was the one that finally showed it: the pads collapsed to a sliver
+ * behind the mode buttons while an empty band sat where they should be.
+ *
+ * A flex column says the thing that was meant all along - everything takes
+ * the height it needs and THE GRID TAKES THE REST - and it does not care how
+ * many children arrive later or which of them are hidden. */
 .pb-right {
-  display: grid;
-  grid-template-rows: auto 1fr auto;
+  display: flex;
+  flex-direction: column;
   gap: 10px;
   min-height: 0;
   min-width: 0;
 }
+.pb-right > * { flex: 0 0 auto; }
+/* min-height:0 so it can be SMALLER than its content: without it a flex item
+ * refuses to shrink below its intrinsic size and the pads push the controls
+ * off the bottom instead of scaling down. */
+.pb-right > .pb-padwrap { flex: 1 1 auto; min-height: 0; }
 
 .pb-banks { display: flex; gap: 8px; }
 .pb-bank {
@@ -243,7 +260,20 @@
 
 .pb-grid {
   display: grid;
-  width: min(100%, 100cqh);
+  /* A FLOOR UNDER THE CONTAINER QUERY.
+   *
+   * `container-type: size` on .pb-padwrap forces `contain: size`, which means
+   * the wrap sizes itself AS IF EMPTY - it takes no height from the pads at
+   * all. So 100cqh is only meaningful when something OUTSIDE has given the
+   * wrap a height, and when nothing has, this whole grid computes to zero and
+   * sixteen pads collapse into a row of dots behind the mode buttons. That is
+   * exactly what happened on both screens when a new child took the free row
+   * out of the column.
+   *
+   * The column now hands the wrap its height (see .pb-right), so the query
+   * works - but a grid that can silently become zero is a trap waiting for
+   * the next child, and max() costs nothing. */
+  width: min(100%, max(240px, 100cqh));
   aspect-ratio: 1;
   grid-template-columns: repeat(4, 1fr);
   grid-template-rows: repeat(4, 1fr);
@@ -939,6 +969,21 @@
   background-position: center;
   background-attachment: local;
   background-repeat: no-repeat;
+}
+/* POSITION ONLY WHEN IT IS NOT THE RAIL'S OVERLAY, and this `:not` is the
+ * whole of a bug that made the SAMPLER TAB STOP OPENING.
+ *
+ * The kiosk rail gives every view `.pine-view-host { position: fixed; inset: 0 }`
+ * so it covers the screen. This rule is `#sampler.pb-skinned` - an id AND a
+ * class - which out-specifies that bare class, so a plain `position: relative`
+ * here knocked the host out of `fixed` and dropped it back into the document
+ * flow. Measured: the tab lit up, the host reported display:grid, and its box
+ * was at y=11558 in a page 11238 tall - open, correct, and far below the fold.
+ *
+ * The wash below needs a positioned ancestor, but `fixed` is one, so the host
+ * only needs `relative` where it is NOT the overlay - the desktop renderer,
+ * where the sampler is an ordinary section. */
+#sampler.pb-skinned:not(.open), .pb-sampler.pb-skinned:not(.open) {
   position: relative;
 }
 #sampler.pb-skinned::before, .pb-sampler.pb-skinned::before {
@@ -994,8 +1039,8 @@
   display: flex;
   align-items: center;
   gap: 14px;
-  margin: 4px 0 8px;
-  padding: 8px 10px;
+  margin: 0;
+  padding: 6px 10px;
   border-radius: 12px;
   background: rgba(16, 20, 25, .66);
   border: 1px solid var(--line);
@@ -1007,15 +1052,15 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
-  width: 64px;
+  gap: 1px;
+  width: 56px;
   touch-action: none;
   cursor: ns-resize;
 }
 .pb-knob-dial {
   position: relative;
-  width: 46px;
-  height: 46px;
+  width: 38px;
+  height: 38px;
   border-radius: 50%;
   background: radial-gradient(circle at 38% 32%, #fdfdfd, #d8dee2 62%, #b9c2c8);
   box-shadow: 0 2px 6px rgba(0, 0, 0, .5), inset 0 -2px 5px rgba(0, 0, 0, .18);
@@ -1050,15 +1095,18 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The three buttons sit in a ROW beside the knobs, not a column above them:
+ * stacked they made the bar three buttons tall and stole the height the pads
+ * needed. */
 .pb-face-acts {
   margin-left: auto;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   gap: 5px;
 }
 .pb-face-act {
-  min-width: 108px;
-  padding: 7px 12px;
+  min-width: 84px;
+  padding: 8px 10px;
   border-radius: 8px;
   background: #f2f5f6;
   color: #c4444f;
