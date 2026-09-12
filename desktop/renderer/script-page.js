@@ -516,10 +516,22 @@
    * get walked four times a second. */
   function markNow(id) {
     if (id === nowLineId) return;
-    if (nowLineId) {
-      var was = document.querySelector('.sp-el.sp-now[data-line="' + nowLineId + '"]');
-      if (was) was.classList.remove('sp-now');
-    }
+    /* #1263: CLEAR EVERY MARK, not the one we remember.
+     *
+     * "it's highlighting multiple lines at the same time when it's
+     *  broadcasting. When really I need it to highlight a single line."
+     *
+     * This used to un-mark only the node matching `nowLineId`, so any
+     * path that cleared that variable WITHOUT repainting left its line
+     * lit for ever and the next tick lit another beside it. There are
+     * three such paths - the live chip, and the two view gestures added
+     * in #1260 - and each tap stranded one more highlight.
+     *
+     * Only one line is ever being said, so only one may ever be marked.
+     * Asking the document rather than trusting a remembered id makes
+     * that true by construction, whatever else clears what. */
+    var lit = document.querySelectorAll('.sp-el.sp-now');
+    for (var i = 0; i < lit.length; i += 1) lit[i].classList.remove('sp-now');
     nowLineId = id || '';
     if (!nowLineId) return;
     var node = document.querySelector('.sp-el[data-line="' + nowLineId + '"]');
