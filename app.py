@@ -47882,7 +47882,20 @@ async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
             return False
     if kind == "recap":
         try:
-            if talk_is_incessant(dj):
+            # #1262: ...UNLESS THE ROOM CAN PLAINLY AFFORD IT. A recap is
+            # live-only by design (CANNOT_PREPARE: "it reads the hour
+            # that just happened"), and at the top talk stop a live
+            # write makes the listener wait - which is why this stood
+            # down. But the station has been pinned at 100% talk for its
+            # whole life, so the recap entry has NEVER once been filled:
+            # 0 lines in fourteen hours against a sheet that asks for
+            # two minutes an hour.
+            #
+            # Above the surplus line there is no waiting to protect the
+            # listener from: the cupboard is hours deep and a two-minute
+            # recap once an hour is affordable out of it. Below it, the
+            # old rule stands exactly as it was.
+            if talk_is_incessant(dj) and surplus() <= 0.25:
                 return None
             return bool(await dj_recap_round(track))
         except Exception as exc:               # noqa: BLE001
