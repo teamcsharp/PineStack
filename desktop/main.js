@@ -718,6 +718,170 @@ function createWindow() {
   win.on("resize", rememberBounds);
   win.on("move", rememberBounds);
   win.loadFile(path.join(__dirname, "renderer", "index.html"));
+  win.webContents.once("did-finish-load", () => watchTheShare());
+}
+
+/* ===========================================================================
+   HOT RELOAD: the share is the truth, and the app follows it while running.
+
+   "I want that to be hot reloading and capable of showing changes made
+    immediately."
+
+   WHY THIS IS NEEDED AT ALL. The app does not run the share - SMB is far too
+   slow for that, which is why pine_box.exe mirrors desktop/ into
+   %LOCALAPPDATA%\PineBoxDesktop\runner and runs the copy. The mirror is
+   made ONCE, at launch. So every renderer change is invisible until the next
+   relaunch, and not even F5 helps: reloading re-reads the same stale mirror.
+   That is the documented stale-runner trap (#1148), and it cost an afternoon
+   when a fixed sampler layout kept rendering as a black box on this desktop
+   while the tablet - which gets a fresh APK every deploy - was already right.
+
+   SO THE MIRROR IS KEPT FRESH WHILE THE APP RUNS. Poll the source renderer
+   directory, copy anything newer into the mirror, and then tell the window.
+
+   CSS IS SWAPPED, NOT RELOADED. A stylesheet can be re-applied by bumping
+   its href, which repaints without touching the page - so a colour or a
+   layout fix lands with the sampler still mounted, the feed still scrolled
+   and the pads still loaded. Reloading for a CSS change would throw all of
+   that away several times a minute while someone is working on a stylesheet,
+   which is precisely when they can least afford it.
+
+   EVERYTHING ELSE RELOADS, because it has to. Script already evaluated
+   cannot be taken back: modules here hold listeners, timers, feed
+   subscriptions and an audio graph, and re-running a file over the top would
+   leave two of each. A reload is the only honest way to load new JavaScript,
+   and it is what F5 would have done if the mirror were fresh.
+
+   MAIN.JS AND PRELOAD.JS ARE NOT HOT. They are this process; changing them
+   needs a relaunch, and pretending otherwise is how you get an app running
+   half of one version. They are watched only so the log can SAY so.
+   =========================================================================== */
+
+const HOT_EVERY_MS = 1500;      /* brisk enough to feel immediate           */
+const HOT_SLOW_MS = 5000;       /* when the share is being slow, back off   */
+let hotTimer = null;
+let hotSeen = null;             /* name -> "mtime:size" of what is mirrored */
+const hotSelf = new Map();      /* main.js / preload.js, which are not hot   */
+let hotSaidRelaunch = 0;
+
+function hotSourceDir() {
+  const root = process.env.PINE_AGENT_ROOT || agentRoot();
+  return path.join(root, "desktop", "renderer");
+}
+
+/* One cheap fingerprint per file. Content hashing over SMB would be honest
+ * and far too slow; mtime AND size together miss only an edit that changes
+ * neither, which a save cannot do. */
+function hotScan(dir) {
+  const out = new Map();
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    if (!/\.(js|css|html)$/i.test(entry.name)) continue;
+    try {
+      const info = fs.statSync(path.join(dir, entry.name));
+      out.set(entry.name, Math.round(info.mtimeMs) + ":" + info.size);
+    } catch {}
+  }
+  return out;
+}
+
+function watchTheShare() {
+  if (hotTimer) return;
+  let source;
+  try {
+    source = hotSourceDir();
+    if (!fs.existsSync(source)) {
+      console.log("[hot] no source renderer at " + source + " - not watching");
+      return;
+    }
+    hotSeen = hotScan(source);
+    console.log("[hot] watching " + source + " (" + hotSeen.size + " files)");
+  } catch (error) {
+    console.log("[hot] could not read the share: " + error.message);
+    return;
+  }
+
+  const tick = () => {
+    hotTimer = null;
+    let wait = HOT_EVERY_MS;
+    try {
+      const began = Date.now();
+      const now = hotScan(source);
+      const changed = [];
+      for (const [name, stamp] of now) {
+        if (hotSeen.get(name) !== stamp) changed.push(name);
+      }
+      /* A scan that takes a noticeable slice of the interval means the share
+       * is busy; asking again immediately makes it worse. */
+      if (Date.now() - began > 500) wait = HOT_SLOW_MS;
+      hotSeen = now;
+      if (changed.length) applyHot(source, changed);
+      /* This process's own two files. Not hot - see the header - but the
+       * operator should hear about it rather than wonder why a main.js
+       * change did nothing. */
+      for (const name of ["main.js", "preload.js"]) {
+        try {
+          const at = path.join(source, "..", name);
+          const stamp = Math.round(fs.statSync(at).mtimeMs) + ":" + fs.statSync(at).size;
+          const key = "^" + name;
+          if (hotSelf.has(key) && hotSelf.get(key) !== stamp) hotSayRelaunch(name);
+          hotSelf.set(key, stamp);
+        } catch {}
+      }
+    } catch (error) {
+      /* The share going away must never stop the app - it just stops being
+       * watched until it comes back. */
+      wait = HOT_SLOW_MS;
+    }
+    hotTimer = setTimeout(tick, wait);
+  };
+  hotTimer = setTimeout(tick, HOT_EVERY_MS);
+}
+
+function applyHot(source, changed) {
+  const mirror = path.join(__dirname, "renderer");
+  const landed = [];
+  for (const name of changed) {
+    try {
+      fs.copyFileSync(path.join(source, name), path.join(mirror, name));
+      landed.push(name);
+    } catch (error) {
+      console.log("[hot] could not copy " + name + ": " + error.message);
+    }
+  }
+  if (!landed.length) return;
+  if (!win || win.isDestroyed()) return;
+
+  const onlyCss = landed.every((name) => /\.css$/i.test(name));
+  console.log("[hot] " + landed.join(", ") + (onlyCss ? " - swapped" : " - reloading"));
+  if (onlyCss) {
+    /* Bump the href of each stylesheet whose file changed. The browser
+     * re-fetches and re-applies it; nothing else on the page moves. */
+    const list = JSON.stringify(landed);
+    win.webContents.executeJavaScript(
+      "(function(names){try{" +
+      "  names.forEach(function(name){" +
+      "    var links=[].slice.call(document.querySelectorAll('link[rel=stylesheet]'));" +
+      "    links.forEach(function(link){" +
+      "      var href=String(link.getAttribute('href')||'');" +
+      "      if(href.split('?')[0].split('/').pop()!==name) return;" +
+      "      link.setAttribute('href', href.split('?')[0] + '?hot=' + Date.now());" +
+      "    });" +
+      "  });" +
+      "}catch(e){}})(" + list + ");", true
+    ).catch(() => {});
+    return;
+  }
+  win.webContents.reloadIgnoringCache();
+}
+
+/* main.js and preload.js are THIS process. Said once a minute at most, so a
+ * long editing session does not become a wall of the same line. */
+function hotSayRelaunch(name) {
+  const now = Date.now();
+  if (now - hotSaidRelaunch < 60000) return;
+  hotSaidRelaunch = now;
+  console.log("[hot] " + name + " changed - that one needs a relaunch");
 }
 
 ipcMain.handle("config:read", () => readConfig());
@@ -750,9 +914,28 @@ ipcMain.handle("backend:setup", () => createVenvAndInstall());
  * quietly serving an old bridge until somebody happened to relaunch.
  */
 function treeStamp(root) {
-  const wanted = ["main.js", "preload.js", "renderer/renderer.js",
-                  "renderer/index.html", "renderer/webview-preload.js",
-                  "renderer/styles.css"];
+  /* EVERY RENDERER FILE, not a hand-picked six.
+   *
+   * This list was written when the renderer was renderer.js and a
+   * stylesheet. It has since grown views of its own - the sampler, listen,
+   * script, presentation, the slideshow - and none of them were stamped, so
+   * a build could differ from the share in a dozen files and still report
+   * "running the newest source". The mark was telling the truth about six
+   * files and being read as the truth about the app. */
+  const wanted = ["main.js", "preload.js"];
+  try {
+    for (const entry of fs.readdirSync(path.join(root, "renderer"),
+                                       { withFileTypes: true })) {
+      if (entry.isFile() && /\.(js|css|html)$/i.test(entry.name)) {
+        wanted.push("renderer/" + entry.name);
+      }
+    }
+  } catch {
+    /* Unreadable renderer folder: fall back to the originals so the mark
+     * still answers something rather than throwing. */
+    wanted.push("renderer/renderer.js", "renderer/index.html",
+                "renderer/webview-preload.js", "renderer/styles.css");
+  }
   let newest = 0;
   let bytes = 0;
   const missing = [];
