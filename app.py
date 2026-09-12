@@ -57722,6 +57722,63 @@ async def _embed_texts(texts: list[str]) -> list[list[float]]:
         return []
 
 
+# #1220: which minds are being warmed right now, so a run of searches
+# against a cold store asks for the parse once rather than once each.
+_VEC_WARMING: set[str] = set()
+
+
+def vectors_warm(rid: str = "") -> dict[str, Any] | None:
+    """The store IF IT IS ALREADY IN MEMORY, else None. Never parses.
+
+    The live search road uses this: data/minds/doom/vectors.json is 625
+    MB, json.loads holds the GIL for the whole parse, and a cold load is
+    every restart. Reading the cache costs nothing and a miss has a
+    documented fallback (#566)."""
+    # NO LOCK. _load_vectors holds _VEC_LOCK for the WHOLE parse, so a
+    # reader that takes it waits out the very 625 MB json.loads this
+    # exists to dodge - measured: `vectors_warm` appeared in the stall
+    # list the moment the background warm started, which is the fault
+    # this function was written to remove, moved one inch sideways.
+    #
+    # A bare dict read is safe here: _VEC_CACHE[key] is assigned AFTER
+    # data["loaded"] = True, so an entry is either absent or complete,
+    # and CPython's dict get is atomic. A read that races a write sees
+    # the old value or the new one, never half of either.
+    try:
+        held = _VEC_CACHE.get(mind_id(rid))
+        return held if isinstance(held, dict) and held.get("loaded") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def vectors_warm_soon(rid: str = "") -> None:
+    """Ask for a cold store to be parsed in the background, once.
+
+    It is still a GIL-holding parse - nothing can make 625 MB of JSON
+    cheap - but it happens once, off the request that wanted it, instead
+    of inside the show's own loop every time."""
+    try:
+        key = mind_id(rid)
+    except Exception:  # noqa: BLE001
+        return
+    if key in _VEC_WARMING or vectors_warm(key) is not None:
+        return
+    _VEC_WARMING.add(key)
+
+    def work() -> None:
+        try:
+            _load_vectors(key)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _VEC_WARMING.discard(key)
+
+    try:
+        Thread(target=work, name="vectors-warm", daemon=True).start()
+    except Exception:  # noqa: BLE001
+        _VEC_WARMING.discard(key)
+
+
 def _load_vectors(rid: str = "") -> dict[str, Any]:
     """One warm store PER MIND (#627). A single shared cache meant the
     reindex pass for one folder deleted the other folder's vectors, because
@@ -58260,7 +58317,16 @@ async def speakbox_search(query: str, k: int = 5, exclude: str = "",
     """The k swaths most semantically similar to `query`, ONE per document for
     variety (#566). Empty when the index or the embedder is cold — the caller
     then falls back to the random-swath mining that has always worked."""
-    store = _load_vectors(rid)
+    # #1220: THE CACHE, NEVER THE PARSE. This road is documented as
+    # tolerating a cold index - the caller falls back to random-swath
+    # mining - and it already runs its cosine scan in a thread "so a
+    # search never stalls the show". It then stalled the show one line
+    # earlier by parsing 625 MB of JSON on the event loop. A miss warms
+    # the store in the background and takes the fallback this time.
+    store = vectors_warm(rid)
+    if store is None:
+        vectors_warm_soon(rid)
+        return []
     chunks = [c for c in (store.get("chunks") or [])
               if c.get("vec") and c.get("file") != exclude]
     if not chunks:
