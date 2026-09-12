@@ -1,0 +1,163 @@
+/* The mark-up window. Pine Box's colours, ShareX's shape: one dense tool bar
+ * across the top and the picture filling everything underneath, because the
+ * picture is the work and the bar is how you touch it. */
+
+:root {
+  --ink: #dbe7ef;
+  --muted: #8fa0ad;
+  --panel: #141b22;
+  --panel-2: #1b242d;
+  --line: #2b3a46;
+  --cyan: #65c7da;
+  --red: #e46b6b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #0d1217;
+  color: var(--ink);
+  font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ------------------------------------------------------------------ bar */
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.tools { display: flex; gap: 2px; flex-wrap: wrap; }
+
+.tool {
+  width: 32px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  line-height: 1;
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.tool:hover { border-color: var(--cyan); }
+/* The armed tool has to be obvious at a glance - reaching for the arrow and
+ * getting a rectangle is the single most annoying thing an editor can do. */
+.tool.on {
+  background: var(--cyan);
+  border-color: var(--cyan);
+  color: #06171c;
+}
+
+.sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
+.grow { flex: 1 1 auto; }
+
+.swatchWrap { display: grid; place-items: center; }
+#colour {
+  width: 34px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: none;
+  cursor: pointer;
+}
+
+.stack { display: flex; align-items: center; gap: 4px; }
+.stack input[type=range] { width: 84px; accent-color: var(--cyan); }
+.said {
+  min-width: 20px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.act, .toggle, .go {
+  height: 30px;
+  padding: 0 10px;
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.act:hover, .toggle:hover, .go:hover { border-color: var(--cyan); }
+.act:disabled { opacity: .35; cursor: default; border-color: var(--line); }
+.toggle.on { background: var(--cyan); border-color: var(--cyan); color: #06171c; }
+.go { background: var(--cyan); border-color: var(--cyan); color: #06171c; font-weight: 600; }
+
+/* ---------------------------------------------------------------- stage */
+
+.stage {
+  position: absolute;
+  inset: 43px 0 22px;
+  overflow: auto;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  /* The chequerboard says where the picture ends, which matters the moment
+   * anything is cropped. */
+  background-color: #0d1217;
+  background-image:
+    linear-gradient(45deg, #121920 25%, transparent 25%),
+    linear-gradient(-45deg, #121920 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #121920 75%),
+    linear-gradient(-45deg, transparent 75%, #121920 75%);
+  background-size: 18px 18px;
+  background-position: 0 0, 0 9px, 9px -9px, -9px 0;
+}
+
+.holder { position: relative; line-height: 0; }
+
+canvas {
+  display: block;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .6);
+  cursor: crosshair;
+}
+canvas.picking { cursor: default; }
+canvas.moving { cursor: move; }
+
+/* The live text box, sitting exactly where its mark will be drawn. It is
+ * deliberately transparent with no border: what you type is what you get,
+ * in place, rather than in a dialog you then have to position. */
+.typing {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  border: 1px dashed rgba(255, 255, 255, .55);
+  background: rgba(0, 0, 0, .25);
+  color: #fff;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  white-space: pre;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  user-select: text;
+}
+
+.say {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  margin: 0;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.say.err { color: var(--red); }

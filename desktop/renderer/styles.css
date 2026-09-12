@@ -197,6 +197,61 @@ body.resizing-rail .rail-resizer::before {
   line-height: 1.4;
 }
 
+/* ---- the tablet's glass: still, clip, report -------------------------- */
+
+.glass-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) 52px;
+  gap: 4px;
+  margin: 6px 0 2px;
+}
+/* While adb is busy the row cannot be pressed again - but it stays legible,
+ * because the note underneath it is the thing to read at that moment. */
+.glass-row.busy { pointer-events: none; opacity: .55; }
+
+.glass-btn {
+  padding: 7px 0;
+  font-size: 15px;
+  line-height: 1;
+  background: var(--panel-2, #17222b);
+  color: var(--text, #dbe7ef);
+  border: 1px solid var(--line, #2b3a46);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.glass-btn:hover { border-color: var(--cyan, #65c7da); }
+.glass-btn:active { background: var(--cyan, #65c7da); }
+
+.glass-secs {
+  min-width: 0;
+  padding: 6px 4px;
+  text-align: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  background: var(--panel-2, #17222b);
+  color: var(--text, #dbe7ef);
+  border: 1px solid var(--line, #2b3a46);
+  border-radius: 6px;
+}
+
+.glass-note {
+  margin: 0 0 6px;
+  min-height: 13px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--muted, #8fa0ad);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.glass-note.err { color: var(--red, #e46b6b); }
+
+/* Narrow rail: the seconds field is the first thing to go, because 10 is
+ * the answer most of the time and the three pictures are not guessable
+ * from a number. */
+body.rail-compact .glass-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+body.rail-compact .glass-secs { display: none; }
+body.rail-compact .glass-note { font-size: 9px; }
+
 /* #984 */
 .now-cell { cursor: pointer; min-width: 0; max-width: 30%; }
 .now-cell:hover { background: rgba(159, 216, 255, .06); }

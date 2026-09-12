@@ -59,6 +59,16 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   pinetabWhere: () => ipcRenderer.invoke("pinetab:where"),
   pinetabSend: (key) => ipcRenderer.invoke("pinetab:send", key),
   /* Who is making the noise, and how loud on each device. */
+  /* The tablet's glass: a still on the clipboard, a clip on disk, and a
+   * written account of what the terminal is doing. */
+  glassStill: (options) => ipcRenderer.invoke("glass:still", options),
+  /* The mark-up window asks for the picture it was opened with, and hands
+   * back a marked-up one to be saved. Copying is copyImage, below. */
+  shotImage: () => ipcRenderer.invoke("shot:image"),
+  shotSave: (dataUrl) => ipcRenderer.invoke("shot:save", dataUrl),
+  glassClip: (seconds) => ipcRenderer.invoke("glass:clip", seconds),
+  glassReport: () => ipcRenderer.invoke("glass:report"),
+
   terminalAudioTable: () => ipcRenderer.invoke("terminal-audio:table"),
   terminalAudioSet: (id, patch) => ipcRenderer.invoke("terminal-audio:set", id, patch),
   /* #990: THE COPY BUTTON DID NOTHING.

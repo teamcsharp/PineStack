@@ -874,6 +874,126 @@ function wireFrame(frame) {
   });
 }
 
+/* THE TABLET'S GLASS, FROM THE SIDEBAR.
+ *
+ * "The first takes a picture of what is being displayed on the Pine Box
+ *  tablet and copies it to the clipboard. The second makes an MP4... And the
+ *  last allows me to copy diagnostics information... so I can paste it in
+ *  conversation about what is going on on the screen currently."
+ *
+ * All three are slow by nature - a still is a second of Wi-Fi, a clip is
+ * however long it was asked for - so each says what it is doing while it
+ * does it, and the row locks so two of them cannot be talking to adb at
+ * once. adb serialises anyway; it just does it without telling anybody. */
+
+const GLASS_SECONDS_KEY = "pineDesktopGlassSeconds";
+const GLASS_MIN = 3, GLASS_MAX = 30, GLASS_DEFAULT = 10;
+
+function glassSay(text, bad) {
+  const note = $("glassNote");
+  if (!note) return;
+  note.textContent = text || "";
+  note.classList.toggle("err", !!bad);
+}
+
+/* How many seconds the clip should run, clamped and remembered. The field is
+ * the operator's, so it is corrected in place rather than silently ignored -
+ * typing 45 and getting 30 without being shown 30 is how you end up believing
+ * you recorded 45 seconds. */
+function glassSeconds() {
+  const field = $("glassSeconds");
+  const asked = Math.round(Number(field && field.value));
+  const want = isFinite(asked) && asked > 0
+    ? Math.max(GLASS_MIN, Math.min(GLASS_MAX, asked)) : GLASS_DEFAULT;
+  if (field && String(want) !== field.value) field.value = String(want);
+  try { localStorage.setItem(GLASS_SECONDS_KEY, String(want)); } catch (err) { /* fine */ }
+  return want;
+}
+
+let glassBusy = false;
+async function glassDo(saying, work) {
+  if (glassBusy) return;
+  glassBusy = true;
+  const row = $("glassRow");
+  if (row) row.classList.add("busy");
+  glassSay(saying);
+  try {
+    await work();
+  } catch (error) {
+    glassSay(error && error.message ? error.message : String(error), true);
+  } finally {
+    glassBusy = false;
+    if (row) row.classList.remove("busy");
+  }
+}
+
+/* CTRL+CLICK MARKS IT UP. Plain click is the fast road - picture, clipboard,
+ * done - and holding Ctrl adds the editor on top of it without taking the
+ * clipboard copy away. */
+$("glassStill")?.addEventListener("click", (event) => {
+  const edit = !!(event.ctrlKey || event.metaKey);
+  glassDo(edit ? "Taking the picture to mark up\u2026" : "Taking the tablet's picture\u2026",
+    async () => {
+      const shot = await api.glassStill({ edit });
+      if (!shot || !shot.ok) {
+        return glassSay(shot && shot.why ? shot.why : "the picture did not come back", true);
+      }
+      glassSay(`On the clipboard \u2014 ${shot.width}\u00d7${shot.height}.`
+        + (edit ? (shot.edited ? " Marking-up window opened."
+          : " The mark-up window would not open.") : ""));
+    });
+});
+
+$("glassClip")?.addEventListener("click", () => {
+  const seconds = glassSeconds();
+  glassDo(`Recording ${seconds}s\u2026`, async () => {
+    /* The tablet is filming and will not answer until it has finished, so
+     * the countdown is run here. Without it the app looks hung for exactly
+     * as long as the operator asked it to be. */
+    let left = seconds;
+    const tick = setInterval(() => {
+      left -= 1;
+      glassSay(left > 0
+        ? `Recording \u2014 ${left}s left`
+        : "Fetching the clip from the tablet\u2026");
+    }, 1000);
+    try {
+      const made = await api.glassClip(seconds);
+      if (made && made.canceled) return glassSay("Recorded, but not saved.");
+      if (!made || !made.ok) {
+        return glassSay(made && made.why ? made.why : "the clip did not come back", true);
+      }
+      glassSay(`Saved ${made.seconds}s \u2014 ${Math.round(made.bytes / 1024)} kB.`);
+    } finally {
+      clearInterval(tick);
+    }
+  });
+});
+
+$("glassReport")?.addEventListener("click", () => glassDo(
+  "Asking the tablet what it is doing\u2026", async () => {
+    const said = await api.glassReport();
+    if (!said || !said.ok) {
+      return glassSay(said && said.why ? said.why : "the tablet did not answer", true);
+    }
+    /* Said plainly when the WebView could not be reached: the report is
+     * still worth pasting, but the half that says what is ON the screen is
+     * missing from it, and that is the half that was asked for. */
+    glassSay(`On the clipboard \u2014 ${said.lines} lines`
+      + (said.page ? "." : ", but the page itself could not be read."));
+  }));
+
+$("glassSeconds")?.addEventListener("change", () => glassSeconds());
+(() => {
+  const field = $("glassSeconds");
+  if (!field) return;
+  let saved = null;
+  try { saved = Number(localStorage.getItem(GLASS_SECONDS_KEY)); } catch (err) { saved = null; }
+  if (isFinite(saved) && saved >= GLASS_MIN && saved <= GLASS_MAX) {
+    field.value = String(Math.round(saved));
+  }
+})();
+
 for (const [id, muted] of [["nabuMuteBtn", true], ["nabuUnmuteBtn", false]]) {
   $(id)?.addEventListener("click", async () => {
     const control = $(id); control.disabled = true;

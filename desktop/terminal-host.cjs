@@ -19,7 +19,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 
-const { Terminal, readiness, parseProps } = require('./terminal.cjs');
+const { Terminal, readiness, parseProps, parseDevices } = require('./terminal.cjs');
+const { Glass } = require('./terminal-glass.cjs');
 const firmware = require('./firmware.cjs');
 const gsi = require('./gsi.cjs');
 const { AndroidBuild } = require('./android-build.cjs');
@@ -72,6 +73,45 @@ function runner(exe, timeout) {
   });
 }
 
+/* The same idea as runner(), with two differences that the glass needs and
+ * the provisioner does not.
+ *
+ * A TIMEOUT PER CALL. Provisioning steps all take about as long as each
+ * other; a screen recording takes exactly as long as the operator asked for,
+ * and a fixed ceiling would either cut a thirty-second clip short or leave a
+ * wedged adb hanging for minutes.
+ *
+ * ROOM FOR A SCREEN. A 1340x800 PNG is a couple of megabytes and a
+ * thirty-second recording is tens; the 64 MB of runner() is enough for the
+ * picture and not obviously enough for the clip, and an overrun here would
+ * arrive as a truncated file rather than an error. */
+function flexRunner(exe, fallback) {
+  return (args, timeout) => new Promise((resolve, reject) => {
+    execFile(exe, args,
+      {maxBuffer: 256 * 1024 * 1024, timeout: timeout || fallback || 180000},
+      (error, stdout, stderr) => {
+        const text = String(stdout || '') + String(stderr || '');
+        if (error && !text) return reject(error);
+        resolve(text);
+      });
+  });
+}
+
+/* BYTES STAY BYTES. execFile decodes to utf8 by default, which turns a PNG
+ * into a string of replacement characters that still has a length and still
+ * looks like it worked. */
+function binaryRunner(exe, fallback) {
+  return (args, timeout) => new Promise((resolve, reject) => {
+    execFile(exe, args,
+      {encoding: 'buffer', maxBuffer: 256 * 1024 * 1024,
+       timeout: timeout || fallback || 60000},
+      (error, stdout) => {
+        if (error && (!stdout || !stdout.length)) return reject(error);
+        resolve(stdout);
+      });
+  });
+}
+
 class TerminalHost {
   constructor({readConfig, writeConfig} = {}) {
     this.readConfig = readConfig || (() => ({}));
@@ -89,6 +129,32 @@ class TerminalHost {
     return new Terminal({
       run: runner(tools.adb, 120000),
       runFastboot: runner(tools.fastboot, 300000)
+    });
+  }
+
+  /* WHICH TABLET, CHEAPLY. identify() is the thorough answer and costs a
+   * getprop and a battery dump every time; the glass buttons only need to
+   * know which serial to address, and the first one is meant to feel like a
+   * camera shutter. */
+  async glassSerial() {
+    const tools = this.tools();
+    try {
+      const list = parseDevices(await runner(tools.adb, 20000)(['devices', '-l'])) || [];
+      const ready = list.find((entry) => entry.authorized);
+      return ready ? ready.serial : '';
+    } catch (error) {
+      return '';
+    }
+  }
+
+  /* The tablet's screen, its last few seconds, and its account of itself.
+   * See terminal-glass.cjs - this hands it adb and stays out of the way. */
+  async glass() {
+    const tools = this.tools();
+    return new Glass({
+      run: flexRunner(tools.adb),
+      runBinary: binaryRunner(tools.adb),
+      serial: await this.glassSerial()
     });
   }
 
@@ -386,4 +452,4 @@ class TerminalHost {
   }
 }
 
-module.exports = {TerminalHost, findTools, runner, LIKELY};
+module.exports = {TerminalHost, findTools, runner, flexRunner, binaryRunner, LIKELY};

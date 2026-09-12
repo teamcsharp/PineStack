@@ -984,7 +984,159 @@ ipcMain.handle("desktop:build", () => {
  * the unlock. It owns where adb and fastboot live; every decision it
  * makes lives in terminal.cjs / firmware.cjs / gsi.cjs, which are
  * tested without hardware. */
-new TerminalHost({ readConfig, writeConfig }).install(ipcMain);
+const terminalHost = new TerminalHost({ readConfig, writeConfig }).install(ipcMain);
+
+/* THREE BUTTONS THAT REACH THE TABLET'S GLASS.
+ *
+ * "The first takes a picture of what is being displayed on the Pine Box
+ *  tablet and copies it to the clipboard. The second makes an MP4... a
+ *  default of up to 10 seconds, but expandable up to 30. And the last
+ *  allows me to copy diagnostics information... so I can paste it in
+ *  conversation about what is going on on the screen currently."
+ *
+ * The adb work is terminal-glass.cjs's; what is here is the part that can
+ * only happen in the main process - the clipboard and the save dialog.
+ *
+ * EACH ONE CHECKS THAT IT WORKED. A clipboard write that silently does
+ * nothing is worse than a failure, because the operator pastes and gets
+ * whatever was there before - so the still is read back out of the
+ * clipboard, and the clip is not called saved until the file is on disk. */
+/* THE MARK-UP WINDOW, and the picture it is waiting for.
+ *
+ * "If I control click this icon, also copy it to clipboard, but also pop it
+ *  up in a window that allows me to do a draw over."
+ *
+ * The bytes are handed over through this map rather than through the URL or
+ * a temp file: a 250 kB data URL does not belong in a query string, and a
+ * temp file would need cleaning up after a window someone might leave open
+ * all afternoon. The entry is dropped when the window closes. */
+const shotWaiting = new Map();
+
+function openShotEditor(png) {
+  const editor = new BrowserWindow({
+    width: 1280,
+    height: 860,
+    minWidth: 620,
+    minHeight: 460,
+    title: "Mark up the tablet's screen",
+    icon: path.join(__dirname, "assets", "pinebox.ico"),
+    backgroundColor: "#0d1217",
+    /* Its own window, not a child: the operator marks up a screenshot while
+     * reading the panel behind it, and a child window that always floats
+     * over its parent makes that impossible. */
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+  editor.setMenuBarVisibility(false);
+  shotWaiting.set(editor.webContents.id, png);
+  editor.on("closed", () => shotWaiting.delete(editor.webContents.id));
+  editor.loadFile(path.join(__dirname, "renderer", "shot-editor.html"));
+  return editor;
+}
+
+ipcMain.handle("shot:image", (event) => {
+  const png = shotWaiting.get(event.sender.id);
+  if (!png) return { ok: false, why: "there is no picture waiting for this window" };
+  return { ok: true, dataUrl: "data:image/png;base64," + png.toString("base64") };
+});
+
+ipcMain.handle("shot:save", async (event, dataUrl) => {
+  const { dialog } = require("electron");
+  try {
+    const body = String(dataUrl || "").split(",")[1] || "";
+    if (!body) return { ok: false, why: "there was nothing to save" };
+    const when = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    let folder = app.getPath("pictures");
+    try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
+    catch { folder = app.getPath("downloads"); }
+    const picked = await dialog.showSaveDialog(
+      BrowserWindow.fromWebContents(event.sender), {
+        title: "Save the marked-up picture",
+        defaultPath: path.join(folder, `pinetab-${when}.png`),
+        filters: [{ name: "PNG image", extensions: ["png"] }]
+      });
+    if (picked.canceled || !picked.filePath) return { ok: false, canceled: true };
+    fs.writeFileSync(picked.filePath, Buffer.from(body, "base64"));
+    return { ok: true, path: picked.filePath };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("glass:still", async (_event, options) => {
+  const { clipboard, nativeImage } = require("electron");
+  try {
+    const shot = await (await terminalHost.glass()).still();
+    if (!shot.ok) return shot;
+    const image = nativeImage.createFromBuffer(shot.png);
+    if (!image || image.isEmpty()) {
+      return { ok: false, why: "the tablet sent a picture this machine could not decode" };
+    }
+    clipboard.writeImage(image);
+    if (clipboard.readImage().isEmpty()) {
+      return { ok: false, why: "the clipboard would not take the picture" };
+    }
+    const size = shot.size || image.getSize();
+    /* The clipboard copy happens either way. The editor is an ADDITION to
+     * it, not an alternative - "also copy it to clipboard, but also pop it
+     * up in a window" - so a Ctrl+click that never gets marked up has still
+     * done what a plain click would have done. */
+    let edited = false;
+    if (options && options.edit) {
+      try { openShotEditor(shot.png); edited = true; }
+      catch (error) { edited = false; }
+    }
+    return { ok: true, width: size.width, height: size.height,
+      bytes: shot.bytes, how: shot.how, edited };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("glass:clip", async (_event, seconds) => {
+  const { dialog } = require("electron");
+  try {
+    const made = await (await terminalHost.glass()).clip(seconds);
+    if (!made.ok) return made;
+    /* Asked for AFTER the recording, not before: a save dialog open across
+     * the ten seconds being filmed is a modal window over the thing the
+     * operator is trying to watch, and on Windows it steals the focus the
+     * tablet's screen is being recorded to show. */
+    const when = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    let folder = app.getPath("videos");
+    try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
+    catch { folder = app.getPath("downloads"); }
+    const picked = await dialog.showSaveDialog(win, {
+      title: "Save the tablet clip",
+      defaultPath: path.join(folder, `pinetab-${when}.mp4`),
+      filters: [{ name: "MP4 video", extensions: ["mp4"] }]
+    });
+    if (picked.canceled || !picked.filePath) {
+      return { ok: false, canceled: true, why: "not saved", seconds: made.seconds };
+    }
+    fs.writeFileSync(picked.filePath, made.mp4);
+    return { ok: true, path: picked.filePath, bytes: made.bytes, seconds: made.seconds };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("glass:report", async () => {
+  const { clipboard } = require("electron");
+  try {
+    const said = await (await terminalHost.glass()).report();
+    if (!said.ok) return said;
+    clipboard.writeText(said.text);
+    return { ok: true, lines: said.text.split("\n").length,
+      bytes: said.text.length, page: said.page, pid: said.pid };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
 
 ipcMain.handle("desktop:reconstitute", () => reconstituteDesktop());
 ipcMain.handle("backend:log", () => backendLog);

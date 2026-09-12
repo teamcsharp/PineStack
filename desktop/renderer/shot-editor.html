@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Mark up the tablet's screen</title>
+  <link rel="stylesheet" href="shot-editor.css">
+</head>
+<body>
+  <!-- THE MARK-UP WINDOW.
+
+       "Pop it up in a window that allows me to do a draw over where I'm able
+        to click and drag and draw things on it and make arrows and indicators
+        and do overlays of text overlays that I'm able to scale and adjust in
+        real time... and allow me to then copy that modified image to
+        clipboard after modifying it. Offer the same tools that I have in
+        ShareX."
+
+       EVERYTHING DRAWN IS AN OBJECT, not paint. An arrow put down ten marks
+       ago can still be moved, restyled, resized or deleted, which is the only
+       way "adjust in real time" can mean anything - a painted stroke can only
+       be undone, and only if it was the last thing you did. -->
+
+  <div id="bar" class="bar">
+    <div class="tools" id="tools"></div>
+    <div class="sep"></div>
+
+    <label class="swatchWrap" title="Colour of the next mark, and of whatever is selected">
+      <input id="colour" type="color" value="#ff3b30">
+    </label>
+    <div class="stack" title="How thick the line is">
+      <input id="weight" type="range" min="1" max="24" step="1" value="4">
+      <span id="weightSaid" class="said">4</span>
+    </div>
+    <button id="fillBtn" class="toggle" title="Draw shapes filled instead of outlined">fill</button>
+    <div class="stack" title="Text size">
+      <input id="fontSize" type="range" min="10" max="96" step="1" value="28">
+      <span id="fontSaid" class="said">28</span>
+    </div>
+
+    <div class="sep"></div>
+    <button id="undoBtn" class="act" title="Undo (Ctrl+Z)">&#8630;</button>
+    <button id="redoBtn" class="act" title="Redo (Ctrl+Shift+Z)">&#8631;</button>
+    <button id="deleteBtn" class="act" title="Delete what is selected (Del)">&#128465;</button>
+    <button id="clearBtn" class="act" title="Remove every mark">clear</button>
+
+    <div class="grow"></div>
+    <button id="copyBtn" class="go" title="Copy the marked-up picture to the clipboard (Ctrl+C)">Copy</button>
+    <button id="saveBtn" class="act" title="Save it as a PNG (Ctrl+S)">Save</button>
+  </div>
+
+  <div id="stage" class="stage">
+    <div id="holder" class="holder">
+      <canvas id="canvas"></canvas>
+      <!-- Text is typed into a real input sitting exactly over the mark, so
+           the caret, selection and IME all behave the way they do everywhere
+           else. It is drawn on the canvas the moment it is committed. -->
+      <textarea id="typing" class="typing" spellcheck="false" hidden></textarea>
+    </div>
+  </div>
+
+  <p id="say" class="say"></p>
+  <script src="shot-editor.js"></script>
+</body>
+</html>
