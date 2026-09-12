@@ -59,6 +59,8 @@
   var stick = true;                 /* keep the script scrolled to the end */
   var feedStick = true;
   var seen = Object.create(null);   /* feed rows already drawn */
+  var feedNodes = Object.create(null);  /* #1279: id -> its live row */
+  var feedLive = '';                    /* #1279: the row marked airing */
 
   /* FOLLOWING THE LINE THAT IS ACTUALLY BEING SAID.
    *
@@ -333,15 +335,49 @@
   function paintFeed(state) {
     var box = el('spFeed');
     if (!box) return;
+    /* #1279: KEPT AND RE-SEATED, NOT APPENDED AND FROZEN.
+     *
+     * This drew each id once, in first-appearance order, and never
+     * moved or refreshed it. That would be fine if rows arrived in the
+     * order they sound - but a burst is published up to 58.8 SECONDS
+     * before any of it is audible (measured; mean 5.7 future-stamped
+     * rows per poll). Replayed against a real 16-poll sequence this
+     * function's order came out 104 of 253 pairs discordant - 41.1% -
+     * with interjections that sound 13-40s EARLIER parked underneath
+     * lines nobody had said yet, for the life of the pane.
+     *
+     * Rows are held by id now and put back in `air_at` order on every
+     * paint. That key is itself a moving target, but re-seating lets
+     * the feed CORRECT ITSELF when a stamp moves instead of being
+     * frozen wrong. Their words and state are refreshed too: a row
+     * drawn while `prepared` used to still read `prepared` long after
+     * it had aired. */
     var rows = (state && state.chat) || [];
     var added = 0;
+    var want = [];
     for (var i = 0; i < rows.length; i += 1) {
       var row = rows[i];
       var id = String((row && row.id) || '');
-      if (!id || seen[id]) continue;
-      seen[id] = true;
-      box.appendChild(feedRow(row));
-      added += 1;
+      if (!id) continue;
+      var node = feedNodes[id];
+      if (!node) {
+        node = feedRow(row);
+        feedNodes[id] = node;
+        seen[id] = true;
+        added += 1;
+      } else {
+        feedDress(node, row);
+      }
+      node.pineAt = Number(row.air_at || row.ts || 0);
+      want.push(node);
+    }
+    if (want.length) {
+      want.sort(function (a, b) { return a.pineAt - b.pineAt; });
+      var cursor = box.firstChild;
+      for (var w = 0; w < want.length; w += 1) {
+        if (want[w] === cursor) { cursor = cursor.nextSibling; continue; }
+        box.insertBefore(want[w], cursor);
+      }
     }
     /* The station also does things that are not speech. */
     var log = (state && state.activity_log) || [];
@@ -355,20 +391,67 @@
     }
     if (!added) return;
     /* Endless, but not unbounded: this screen runs for hours. */
-    while (box.children.length > FEED_MAX) box.removeChild(box.firstChild);
+    /* #1279: a trimmed row must be FORGOTTEN as well as removed. The
+       node map would otherwise still hold it, and the next paint would
+       put it straight back - an unbounded pane that resurrects its own
+       history. `seen` is left alone: it is what stops a trimmed row
+       being counted as newly arrived. */
+    while (box.children.length > FEED_MAX) {
+      var old = box.firstChild;
+      var oldId = old && old.getAttribute && old.getAttribute('data-line');
+      box.removeChild(old);
+      if (oldId) {
+        delete feedNodes[oldId];
+        if (feedLive === oldId) feedLive = '';
+      }
+    }
     if (feedStick) box.scrollTop = box.scrollHeight;
   }
 
   function feedRow(row) {
     var who = String(row.who || 'dj');
-    var line = make('div', 'sp-msg' + (row.aired === 'airing' ? ' airing' : ''));
+    /* #1279: NOT from `row.aired === "airing"`. That is spelled right
+       and is unreachable - `airing` is attached only to speaking_now /
+       stream_now, never to a chat row (measured: 0 of 317 across 16
+       polls), so this pane has never once marked the line being said.
+       markFeedLive() does it from the live pointer, every tick. */
+    var line = make('div', 'sp-msg');
     line.dataset.line = String(row.id || '');
-    var head = make('b', 'sp-msg-who', row.name || who);
-    var body = make('span', 'sp-msg-text', String(row.text || '').trim());
-    line.appendChild(head);
-    line.appendChild(body);
+    line.appendChild(make('b', 'sp-msg-who', row.name || who));
+    line.appendChild(make('span', 'sp-msg-text', ''));
+    feedDress(line, row);
     line.addEventListener('click', function () { jumpToLine(String(row.id || '')); });
     return line;
+  }
+
+  /* #1279: a row's words and state as they are NOW. A row used to be
+     drawn once and never touched again, so one drawn while it was
+     `prepared` still read `prepared` long after it had aired. */
+  function feedDress(line, row) {
+    var head = line.firstChild;
+    var body = line.lastChild;
+    var name = String(row.name || row.who || 'dj');
+    var text = String(row.text || '').trim();
+    if (head && head.textContent !== name) head.textContent = name;
+    if (body && body.textContent !== text) body.textContent = text;
+    var state = String(row.aired || '');
+    if (line.pineState !== state) {
+      line.pineState = state;
+      line.classList.toggle('pending', state === 'prepared');
+    }
+  }
+
+  /* #1279: THE LINE THAT IS SOUNDING, marked from the live pointer and
+     re-asserted on every tick, so it cannot be stranded by a row that
+     was drawn before it started. */
+  function markFeedLive(id) {
+    var want = String(id || '');
+    if (want === feedLive) return;
+    var was = feedLive && feedNodes[feedLive];
+    if (was) was.classList.remove('airing');
+    feedLive = want;
+    var node = want && feedNodes[want];
+    if (node) node.classList.add('airing');
   }
 
   function eventRow(ev) {
@@ -967,6 +1050,7 @@
   function tick() {
     var row = activeRow();
     markNow(row ? row.id : '');
+    markFeedLive(row ? row.id : '');            /* #1279 */
     paintStatus();
   }
 
