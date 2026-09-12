@@ -5173,18 +5173,33 @@ def _tags_are_sane(tags: str) -> bool:
 _generations_lock = asyncio.Lock()
 
 
+# #1216: 165 kB of JSONL, re-read and re-parsed line by line on every
+# call, named by the pulse among the loop's blockers. Same memo, same
+# rule: keyed on the file's own (mtime, size), so an append moves it.
+_GENERATIONS_MEMO: dict[str, Any] = {"sig": None, "rows": []}
+
+
 def _read_all_generations() -> list[dict[str, Any]]:
-    if not GENERATIONS_PATH.exists():
+    try:
+        st = GENERATIONS_PATH.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except Exception:  # noqa: BLE001
         return []
+    if _GENERATIONS_MEMO.get("sig") == sig:
+        return list(_GENERATIONS_MEMO["rows"])
     records: list[dict[str, Any]] = []
-    for line in GENERATIONS_PATH.read_text().splitlines():
-        try:
-            rec = json.loads(line)
-        except Exception:
-            continue
-        if isinstance(rec, dict):
-            records.append(rec)
-    return records
+    try:
+        for line in GENERATIONS_PATH.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(rec, dict):
+                records.append(rec)
+    except Exception:  # noqa: BLE001
+        return []
+    _GENERATIONS_MEMO.update(sig=sig, rows=records)
+    return list(records)
 
 
 def read_generations(limit: int = 100) -> list[dict[str, Any]]:
@@ -62840,12 +62855,40 @@ def _bin_key(text: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", str(text or "").lower()).split())
 
 
-def read_binned() -> list[str]:
+# #1216: the bin list, parsed once per CHANGE instead of once per line.
+# _ready_round_takes asks is_binned() for every take of every prepared
+# round, and this opened, read and json.loads-ed the file each time -
+# several hundred whole-file reads per cupboard sweep, on the loop,
+# holding the GIL. The file is 988 bytes with five rows in it; the cost
+# was never the file, it was the count.
+_BINNED_MEMO: dict[str, Any] = {"sig": None, "rows": [], "keys": frozenset()}
+
+
+def _binned_memo() -> dict[str, Any]:
+    """The bin list and its lookup set, memoised on (mtime, size).
+
+    A memo keyed on the file's own stamp answers exactly what a fresh
+    read would - bin_line() writes the file, which moves both."""
     try:
-        rows = json.loads(BINNED_PATH.read_text())
-        return [str(r) for r in rows] if isinstance(rows, list) else []
-    except Exception:
-        return []
+        st = BINNED_PATH.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except Exception:  # noqa: BLE001
+        if _BINNED_MEMO.get("sig") is not None:
+            _BINNED_MEMO.update(sig=None, rows=[], keys=frozenset())
+        return _BINNED_MEMO
+    if _BINNED_MEMO.get("sig") == sig:
+        return _BINNED_MEMO
+    try:
+        parsed = json.loads(BINNED_PATH.read_text())
+        rows = [str(r) for r in parsed] if isinstance(parsed, list) else []
+    except Exception:  # noqa: BLE001
+        rows = []
+    _BINNED_MEMO.update(sig=sig, rows=rows, keys=frozenset(rows))
+    return _BINNED_MEMO
+
+
+def read_binned() -> list[str]:
+    return list(_binned_memo()["rows"])
 
 
 def bin_line(text: str) -> None:
@@ -62867,7 +62910,10 @@ def bin_line(text: str) -> None:
 
 
 def is_binned(text: str) -> bool:
-    return _bin_key(text) in set(read_binned())
+    # #1216: the SET too. This was `in set(read_binned())`, so every call
+    # built a fresh set of the same five strings on top of re-reading
+    # them - and it is called once per take, per round, per sweep.
+    return _bin_key(text) in _binned_memo()["keys"]
 
 
 # --- The unique-dialogue engine (#752) --------------------------------------
