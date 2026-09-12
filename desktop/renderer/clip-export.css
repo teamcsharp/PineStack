@@ -1,0 +1,176 @@
+/* The export dialog. Pine Box's colours; the film gets the room and the
+ * decisions sit under it in the order they are made - where it starts and
+ * ends, then what you hear, then where it goes. */
+
+:root {
+  --ink: #dbe7ef;
+  --muted: #8fa0ad;
+  --panel: #141b22;
+  --panel-2: #1b242d;
+  --line: #2b3a46;
+  --cyan: #65c7da;
+  --amber: #e3b341;
+  --red: #e46b6b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #0d1217;
+  color: var(--ink);
+  font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+.wrap {
+  height: 100%;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto auto auto;
+  gap: 10px;
+  padding: 10px;
+}
+
+.stage {
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  background: #080b0e;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+video { max-width: 100%; max-height: 100%; display: block; }
+
+/* ---------------------------------------------------------------- trim */
+
+.trim { display: grid; gap: 6px; }
+
+.track {
+  position: relative;
+  height: 26px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  touch-action: none;
+}
+/* What will be written, lit against what will not. */
+.band {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: rgba(101, 199, 218, .16);
+  border-left: 1px solid var(--cyan);
+  border-right: 1px solid var(--cyan);
+  pointer-events: none;
+}
+.mark {
+  position: absolute;
+  top: -3px; bottom: -3px;
+  width: 11px;
+  margin-left: -5px;
+  border-radius: 3px;
+  background: var(--cyan);
+  cursor: ew-resize;
+  touch-action: none;
+}
+.mark::after {
+  content: "";
+  position: absolute;
+  left: 4px; top: 8px;
+  width: 3px; height: 10px;
+  border-left: 1px solid rgba(0, 0, 0, .5);
+  border-right: 1px solid rgba(0, 0, 0, .5);
+}
+/* The playhead is deliberately thin and a different colour from the handles:
+ * three things on one strip, and two of them must never be mistaken for each
+ * other while dragging. */
+.head {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--amber);
+  pointer-events: none;
+}
+
+.trimRow { display: flex; align-items: center; gap: 6px; }
+
+/* --------------------------------------------------------------- tracks */
+
+.tracks { display: grid; gap: 6px; }
+
+.trk {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr) 150px;
+  grid-template-areas: "on wave gain" "on detail gain";
+  align-items: center;
+  gap: 2px 10px;
+  padding: 6px 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+/* A channel that is not going in must look like it is not going in. */
+.trk.off { opacity: .42; }
+.trk.missing { opacity: .42; }
+.trk.missing .db, .trk.missing .use { pointer-events: none; }
+
+.trk .on { grid-area: on; display: flex; align-items: center; gap: 7px; cursor: pointer; }
+.trk .on b { font-size: 12.5px; }
+.trk .use { accent-color: var(--cyan); width: 15px; height: 15px; }
+
+.wave {
+  grid-area: wave;
+  width: 100%;
+  height: 34px;
+  display: block;
+  background: #0f151b;
+  border-radius: 4px;
+}
+.detail { grid-area: detail; font-size: 10.5px; color: var(--muted); }
+
+.gain { grid-area: gain; display: flex; align-items: center; gap: 6px; }
+.gain .db { width: 96px; accent-color: var(--cyan); }
+.dbSaid {
+  min-width: 46px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* ------------------------------------------------------------------ bar */
+
+.bar { display: flex; align-items: center; gap: 8px; }
+.grow { flex: 1 1 auto; }
+
+.act, .toggle, .go {
+  height: 30px;
+  padding: 0 12px;
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.act.wide { min-width: 104px; }
+.act:hover, .toggle:hover, .go:hover { border-color: var(--cyan); }
+.act:disabled, .go:disabled { opacity: .4; cursor: default; border-color: var(--line); }
+.toggle.on { background: var(--cyan); border-color: var(--cyan); color: #06171c; }
+.go { background: var(--cyan); border-color: var(--cyan); color: #06171c; font-weight: 600; }
+
+.said, .note {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.note { white-space: normal; max-width: 46ch; }
+.note.err { color: var(--red); }
+.note.good { color: var(--cyan); }

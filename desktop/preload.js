@@ -66,7 +66,11 @@ contextBridge.exposeInMainWorld("pineDesktop", {
    * back a marked-up one to be saved. Copying is copyImage, below. */
   shotImage: () => ipcRenderer.invoke("shot:image"),
   shotSave: (dataUrl) => ipcRenderer.invoke("shot:save", dataUrl),
-  glassClip: (seconds) => ipcRenderer.invoke("glass:clip", seconds),
+  glassClip: (seconds, options) => ipcRenderer.invoke("glass:clip", seconds, options),
+  /* The export window: what is waiting, and what to make of it. */
+  clipPending: () => ipcRenderer.invoke("clip:pending"),
+  clipExport: (choices) => ipcRenderer.invoke("clip:export", choices),
+  clipDone: () => ipcRenderer.invoke("clip:done"),
   glassReport: () => ipcRenderer.invoke("glass:report"),
 
   terminalAudioTable: () => ipcRenderer.invoke("terminal-audio:table"),

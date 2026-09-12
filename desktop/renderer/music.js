@@ -612,9 +612,47 @@
       : "no running order");
   }
 
+  /* FOLDING THE REQUEST BOOK AWAY.
+   *
+   * Remembered, because someone who folded this to read the running order
+   * wants it folded the next time they come to read the running order. */
+  const BOOK_FOLD_KEY = "pineMusicBookFolded";
+  let bookFolded = false;
+  try { bookFolded = localStorage.getItem(BOOK_FOLD_KEY) === "1"; }
+  catch (err) { bookFolded = false; }
+
+  function foldBook(folded) {
+    bookFolded = !!folded;
+    const head = el("muBookHead");
+    const list = el("muBook");
+    if (head) {
+      head.classList.toggle("folded", bookFolded);
+      head.setAttribute("aria-expanded", bookFolded ? "false" : "true");
+      head.title = bookFolded
+        ? "Tap to open the request book again"
+        : "Tap to fold this away - the running order gets the room";
+    }
+    if (list) list.hidden = bookFolded;
+    try { localStorage.setItem(BOOK_FOLD_KEY, bookFolded ? "1" : "0"); }
+    catch (err) { /* a preference is not worth an exception */ }
+    paintBookHead();
+  }
+
+  /* The count lives in the head rather than only in the list, so the folded
+   * bar still answers "is there anything in there" without being opened. */
+  function paintBookHead() {
+    const said = el("muBookHeadSaid");
+    if (!said) return;
+    const many = book ? book.length : 0;
+    said.textContent = many
+      ? many + (many === 1 ? " asked" : " asked")
+      : (bookFolded ? "none" : "");
+  }
+
   function paintBook() {
     const list = el("muBook");
     if (!list) return;
+    paintBookHead();
     const frame = document.createDocumentFragment();
     for (const entry of book.slice(0, 20)) {
       const node = row("mu-row take", entry.title, entry.artist,
@@ -744,7 +782,14 @@
       + '<button id="muOrderAgain" class="mu-btn" title="Read the hour '
       + 'sheet again. This view does not poll it.">↻</button></div>'
       + '<div id="muOrder" class="mu-list grow"></div>'
-      + '<div class="mu-head"><b>Asked for</b>'
+      /* FOLDABLE, because these two lists share one column and the
+         running order is the one being read. See foldBook. */
+      + '<div id="muBookHead" class="mu-head mu-fold" role="button" '
+      + 'tabindex="0" title="Tap to fold this away - the running order '
+      + 'gets the room">'
+      + '<span class="mu-caret" aria-hidden="true">\u25be</span>'
+      + '<b>Asked for</b>'
+      + '<span id="muBookHeadSaid" class="mu-sub"></span>'
       + '<button id="muBookAgain" class="mu-btn" title="Read the request '
       + 'book again">↻</button></div>'
       + '<div id="muBook" class="mu-list"></div>'
@@ -759,6 +804,22 @@
     if (again) again.addEventListener("click", loadOrder);
     const bookAgain = el("muBookAgain");
     if (bookAgain) bookAgain.addEventListener("click", loadBook);
+    const bookHead = el("muBookHead");
+    if (bookHead) {
+      bookHead.addEventListener("click", (event) => {
+        /* The refresh button lives INSIDE the head. Without this, reading
+         * the book again folds it away in the same gesture. */
+        if (event.target.closest && event.target.closest("#muBookAgain")) return;
+        foldBook(!bookFolded);
+      });
+      bookHead.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        foldBook(!bookFolded);
+      });
+    }
+    /* Apply whatever was remembered, now that the nodes exist. */
+    foldBook(bookFolded);
     const askBtn = el("muAskBtn");
     const askBox = el("muAsk");
     const fire = () => {

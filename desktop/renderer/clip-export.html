@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Export the tablet clip</title>
+  <link rel="stylesheet" href="clip-export.css">
+</head>
+<body>
+  <!-- WHAT GETS EXPORTED, decided before anything is written.
+
+       "Offer a popup where I choose what channels are used for the export and
+        if the channels are mixed into mono and if I need to gain one of the
+        channels."
+       "Also when extracting a video allow me to set the in and out points of
+        the video that's being exported."
+
+       The recording arrives as three separate pieces - a silent video, the
+       broadcast, and the tablet's ear - and they are only committed to one
+       file when Export is pressed. Until then every choice here is reversible
+       and audible: the preview plays the video with exactly the mix the
+       export will have, so a gain is set by listening rather than by guessing
+       and running ffmpeg twice. -->
+
+  <div class="wrap">
+    <div class="stage">
+      <video id="film" playsinline></video>
+    </div>
+
+    <!-- The in and out points. The scrubber is the film's own length; the
+         two handles are what will actually be written. -->
+    <div class="trim">
+      <div id="track" class="track">
+        <div id="band" class="band"></div>
+        <div id="inMark" class="mark in" data-edge="in" title="Where the export starts"></div>
+        <div id="outMark" class="mark out" data-edge="out" title="Where the export ends"></div>
+        <div id="head" class="head"></div>
+      </div>
+      <div class="trimRow">
+        <button id="playBtn" class="act wide" title="Play the trimmed clip with the mix below (Space)">&#9654; Preview</button>
+        <button id="setIn" class="act" title="Put the in point where the playhead is (I)">Set in</button>
+        <button id="setOut" class="act" title="Put the out point where the playhead is (O)">Set out</button>
+        <button id="resetTrim" class="act" title="Use the whole recording">Whole</button>
+        <span id="trimSaid" class="said"></span>
+      </div>
+    </div>
+
+    <div class="tracks">
+      <div class="trk" id="trkBroadcast" data-track="broadcast">
+        <label class="on"><input type="checkbox" class="use" checked> <b>Broadcast</b></label>
+        <canvas class="wave" width="600" height="34"></canvas>
+        <div class="gain">
+          <input type="range" class="db" min="-24" max="24" step="1" value="0"
+                 title="Gain for this channel, in decibels">
+          <span class="dbSaid">0 dB</span>
+        </div>
+        <span class="detail"></span>
+      </div>
+      <div class="trk" id="trkMic" data-track="mic">
+        <label class="on"><input type="checkbox" class="use" checked> <b>Microphone</b></label>
+        <canvas class="wave" width="600" height="34"></canvas>
+        <div class="gain">
+          <input type="range" class="db" min="-24" max="24" step="1" value="0"
+                 title="Gain for this channel, in decibels">
+          <span class="dbSaid">0 dB</span>
+        </div>
+        <span class="detail"></span>
+      </div>
+    </div>
+
+    <div class="bar">
+      <button id="monoBtn" class="toggle" title="Sum both channels into one. Off keeps them apart — broadcast left, microphone right — so they can be separated again later.">mix to mono</button>
+      <span id="note" class="note"></span>
+      <div class="grow"></div>
+      <button id="cancelBtn" class="act">Cancel</button>
+      <button id="exportBtn" class="go">Export MP4&hellip;</button>
+    </div>
+  </div>
+  <script src="clip-export.js"></script>
+</body>
+</html>

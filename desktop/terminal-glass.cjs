@@ -248,6 +248,178 @@ function evaluate(wsUrl, expression, timeoutMs) {
   });
 }
 
+/* ONE DOOR, HELD OPEN. Every evaluate over the same socket, and the adb
+ * forward removed exactly once. */
+class PageSession {
+  constructor(run, target, port) {
+    this.run = run;
+    this.target = target;
+    this.port = port;
+    this.socket = null;
+    this.next = 1;
+    this.forwarded = false;
+  }
+
+  async open(pid) {
+    const forward = 'tcp:' + this.port;
+    await this.run(this.target(['forward', forward, 'localabstract:webview_devtools_remote_' + pid]), 20000);
+    this.forwarded = true;
+    const response = await fetch('http://127.0.0.1:' + this.port + '/json',
+      { signal: AbortSignal.timeout(8000) });
+    const targets = await response.json();
+    const page = (targets || []).find(
+      (t) => t && t.webSocketDebuggerUrl && t.type === 'page') || (targets || [])[0];
+    if (!page || !page.webSocketDebuggerUrl) {
+      throw new Error('the app is running but has no debuggable page');
+    }
+    this.socket = await openSocket(page.webSocketDebuggerUrl);
+    this.page = { title: page.title, url: page.url };
+    return this;
+  }
+
+  ask(expression, timeoutMs) {
+    return send(this.socket, this.next++, expression, timeoutMs);
+  }
+
+  /* Same, but the answer is expected to be JSON and a broken answer is not
+   * worth taking down a recording for. */
+  async askJson(expression, timeoutMs) {
+    try {
+      const raw = await this.ask(expression, timeoutMs);
+      return raw == null ? null : JSON.parse(String(raw));
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async close() {
+    try { if (this.socket) this.socket.close(); } catch (error) { /* gone */ }
+    if (this.forwarded) {
+      await this.run(this.target(['forward', '--remove', 'tcp:' + this.port]), 15000)
+        .catch(() => {});
+    }
+  }
+}
+
+function openSocket(url) {
+  return new Promise((resolve, reject) => {
+    if (typeof WebSocket !== 'function') {
+      return reject(new Error('this build has no WebSocket, so the page cannot be asked'));
+    }
+    let socket;
+    try { socket = new WebSocket(url); } catch (error) { return reject(error); }
+    const timer = setTimeout(() => {
+      try { socket.close(); } catch (e) {}
+      reject(new Error('DevTools did not open in time'));
+    }, 9000);
+    socket.addEventListener('open', () => { clearTimeout(timer); resolve(socket); });
+    socket.addEventListener('error', () => {
+      clearTimeout(timer);
+      reject(new Error('DevTools refused the connection'));
+    });
+  });
+}
+
+function send(socket, id, expression, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const done = (fn, value) => {
+      clearTimeout(timer);
+      socket.removeEventListener('message', onMessage);
+      fn(value);
+    };
+    const onMessage = (event) => {
+      let message;
+      try { message = JSON.parse(String(event.data)); } catch (error) { return; }
+      if (message.id !== id) return;
+      const result = message.result || {};
+      if (result.exceptionDetails) {
+        return done(reject, new Error('the page threw while answering'));
+      }
+      done(resolve, result.result ? result.result.value : null);
+    };
+    const timer = setTimeout(
+      () => done(reject, new Error('the page did not answer in time')), timeoutMs || 9000);
+    socket.addEventListener('message', onMessage);
+    socket.send(JSON.stringify({
+      id,
+      method: 'Runtime.evaluate',
+      params: { expression, returnByValue: true, awaitPromise: true }
+    }));
+  });
+}
+
+/* ------------------------------------------------------- audio, on the page */
+
+/* The broadcast, straight out of PineAir's rolling ring. `fromAgo`/`toAgo`
+ * are seconds before NOW, which is the ring's own coordinate system - so the
+ * caller converts wall clock to "ago" at the moment of asking and the window
+ * lands exactly on the video. */
+function broadcastQuestion(fromAgo, toAgo) {
+  return `(function () {
+    try {
+      var air = window.PineAir;
+      if (!air || !air.sliceWav) return JSON.stringify({ok:false, why:'the air tap is not running on this terminal'});
+      var have = air.seconds(false);
+      var wav = air.sliceWav(${fromAgo}, ${toAgo}, false);
+      if (!wav) return JSON.stringify({ok:false, why:'the ring held no audio for that window', have:have});
+      var bytes = new Uint8Array(wav);
+      var out = '';
+      for (var i = 0; i < bytes.length; i += 0x8000) {
+        out += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }
+      return JSON.stringify({ok:true, have:have, bytes:bytes.length, b64: btoa(out)});
+    } catch (err) {
+      return JSON.stringify({ok:false, why:String(err && err.message || err)});
+    }
+  })()`;
+}
+
+const MIC_START = `(async function () {
+  try {
+    var b = window.pineDesktop;
+    if (!b || !b.micTake) return JSON.stringify({ok:false, why:'this terminal has no native ear'});
+    var was = await b.micState();
+    /* SOMEONE ELSE IS LISTENING. The talk dot and the wake word share this
+     * microphone; stealing it mid-sentence would lose their take, and a
+     * recording is never worth that. */
+    if (was && was.running) return JSON.stringify({ok:false, why:'the microphone was already in use'});
+    var said = await b.micStart({});
+    return JSON.stringify(said && said.ok
+      ? {ok:true, rate:said.rate, source:said.source, effects:said.effects}
+      : {ok:false, why:(said && said.detail) || 'the microphone would not open'});
+  } catch (err) {
+    return JSON.stringify({ok:false, why:String(err && err.message || err)});
+  }
+})()`;
+
+const MIC_TAKE = `(async function () {
+  try {
+    var b = window.pineDesktop;
+    var took = await b.micTake();
+    if (!took || !took.ok) return JSON.stringify({ok:false, why:(took && took.detail) || 'the take came back empty'});
+    var out = '';
+    for (var at = 0; at < took.bytes;) {
+      var part = await b.micChunk({at: at, much: 1048576});
+      if (!part || !part.ok) return JSON.stringify({ok:false, why:(part && part.detail) || 'the take could not be read out'});
+      out += part.b64;
+      at = part.at + part.sent;
+      if (part.done) break;
+    }
+    return JSON.stringify({ok:true, bytes:took.bytes, rate:took.rate,
+      seconds:took.seconds, wall:took.wall, level:took.level, quiet:took.quiet, b64:out});
+  } catch (err) {
+    return JSON.stringify({ok:false, why:String(err && err.message || err)});
+  }
+})()`;
+
+/* Base64 arrives in pieces of whole CHUNKS, each of which is itself valid
+ * base64 - so they concatenate only because every chunk but the last is a
+ * multiple of three source bytes. A megabyte is, which is why the chunk size
+ * on the Kotlin side is what it is and not a round number of kilobytes off. */
+function fromB64(text) {
+  return Buffer.from(String(text || ''), 'base64');
+}
+
 /* -------------------------------------------------------------- formatting */
 
 function humanBytes(n) {
@@ -395,12 +567,42 @@ class Glass {
 
   /* -------------------------------------------------------------- the clip */
 
-  async clip(seconds) {
+  async clip(seconds, options) {
     const want = clampSeconds(seconds);
+    const wants = options || {};
+    const wantBroadcast = wants.broadcast !== false;
+    const wantMic = wants.mic !== false;
     const local = tempFile('.mp4');
     await this.maybe('rm -f ' + DEVICE_CLIP, 15000);
 
+    /* The page is opened before anything is recorded, so a terminal that
+     * cannot be asked for audio is known about NOW rather than after
+     * thirty seconds of filming. */
+    const notes = [];
+    let page = null;
+    const pid = await this.pid();
+    if ((wantBroadcast || wantMic) && pid) {
+      try {
+        page = await new PageSession(this.run, (a) => this.target(a), GLASS_PORT).open(pid);
+      } catch (error) {
+        notes.push('no audio: ' + error.message);
+        page = null;
+      }
+    } else if (wantBroadcast || wantMic) {
+      notes.push('no audio: the kiosk app is not running');
+    }
+
+    let micStartedAt = 0;
+    let micOpen = false;
+    if (page && wantMic) {
+      const started = await page.askJson(MIC_START, 15000);
+      micStartedAt = Date.now();
+      if (started && started.ok) micOpen = true;
+      else notes.push('no microphone: ' + ((started && started.why) || 'it did not answer'));
+    }
+
     let said = '';
+    const videoStartedAt = Date.now();
     try {
       /* screenrecord holds the shell for the whole recording, so the timeout
        * has to outlast the clip with room for the encoder to finish writing
@@ -411,8 +613,53 @@ class Glass {
         + ' ' + DEVICE_CLIP,
         (want + 40) * 1000);
     } catch (error) {
+      if (page) { if (micOpen) await page.askJson(MIC_TAKE, 30000); await page.close(); }
       return { ok: false, why: 'the tablet could not record: ' + error.message };
     }
+    const videoEndedAt = Date.now();
+
+    /* THE SOUND IS COLLECTED BEFORE ANYTHING ELSE, because the broadcast
+     * ring is a rolling window: every second spent pulling the video is a
+     * second of the take ageing out of reach at the far end. */
+    const audio = { broadcast: null, mic: null };
+    if (page) {
+      try {
+        if (micOpen) {
+          const took = await page.askJson(MIC_TAKE, 60000);
+          if (took && took.ok) {
+            audio.mic = {
+              wav: fromB64(took.b64),
+              rate: took.rate,
+              seconds: took.seconds,
+              level: took.level,
+              /* NEGATIVE means the ear started before the camera, which it
+               * always should - the muxer trims that head off rather than
+               * assuming the two began together. */
+              offset: (micStartedAt - videoStartedAt) / 1000,
+              quiet: !!took.quiet
+            };
+            if (took.quiet) notes.push('the microphone heard almost nothing');
+          } else {
+            notes.push('no microphone: ' + ((took && took.why) || 'the take did not come back'));
+          }
+        }
+        if (wantBroadcast) {
+          const askedAt = Date.now();
+          const fromAgo = (askedAt - videoStartedAt) / 1000;
+          const toAgo = Math.max(0, (askedAt - videoEndedAt) / 1000);
+          const got = await page.askJson(broadcastQuestion(fromAgo.toFixed(3), toAgo.toFixed(3)), 30000);
+          if (got && got.ok) {
+            audio.broadcast = { wav: fromB64(got.b64), rate: 0, offset: 0,
+              seconds: (got.bytes - 44) / 2 / 48000 };
+          } else {
+            notes.push('no broadcast audio: ' + ((got && got.why) || 'the ring did not answer'));
+          }
+        }
+      } finally {
+        await page.close();
+      }
+    }
+
     /* screenrecord reports its refusals on stdout and still exits zero. */
     if (/error|denied|not supported|failed/i.test(said || '')) {
       return { ok: false, why: 'the tablet refused to record: ' + said.trim().slice(0, 200) };
@@ -424,7 +671,8 @@ class Glass {
       if (!mp4 || mp4.length < 1024) {
         return { ok: false, why: 'the recording came back empty' };
       }
-      return { ok: true, mp4, bytes: mp4.length, seconds: want, at: this.now() };
+      return { ok: true, mp4, bytes: mp4.length, seconds: want, at: this.now(),
+        audio, notes };
     } catch (error) {
       return { ok: false, why: 'the recording could not be fetched: ' + error.message };
     } finally {

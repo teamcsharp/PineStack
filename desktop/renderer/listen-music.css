@@ -422,6 +422,32 @@
 }
 .mu-list.grow { max-height: none; }
 
+/* A HIDDEN LIST MUST ACTUALLY GO. `.mu-list` sets `display: grid`, and that
+ * beats the user-agent's `[hidden] { display: none }` on specificity - so
+ * without this the folded book stays exactly where it was and the fold looks
+ * broken rather than absent. */
+.mu-list[hidden] { display: none; }
+
+/* The foldable head. It already looked like a bar; this makes it behave like
+ * one, and says so on touch by not selecting its own words when held. */
+.mu-fold {
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.mu-fold:hover { border-bottom-color: var(--cyan); }
+.mu-caret {
+  display: inline-block;
+  width: 10px;
+  font-size: 10px;
+  color: var(--muted);
+  transform-origin: 50% 50%;
+}
+.mu-fold.folded .mu-caret { transform: rotate(-90deg); }
+/* Folded, the bar is the whole section, so it carries the section's weight
+ * rather than sitting under a gap that leads nowhere. */
+.mu-fold.folded { border-bottom-color: var(--line); opacity: .82; }
+
 .mu-row {
   display: grid;
   grid-template-columns: 1fr auto;

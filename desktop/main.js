@@ -7,6 +7,7 @@ const { LcdSerial, usbDisplays } = require("./lcd-serial.cjs");
 const { LcdFirmware } = require("./lcd-firmware.cjs");
 const { saveLcdSample } = require("./lcd-samples.cjs");
 const { TerminalHost } = require("./terminal-host.cjs");
+const clipMux = require("./clip-mux.cjs");
 
 let win;
 let backend = null;
@@ -1032,8 +1033,13 @@ function openShotEditor(png) {
     }
   });
   editor.setMenuBarVisibility(false);
-  shotWaiting.set(editor.webContents.id, png);
-  editor.on("closed", () => shotWaiting.delete(editor.webContents.id));
+  /* TAKEN WHILE THE WINDOW IS ALIVE. Reading `editor.webContents.id` inside
+   * the `closed` handler throws "Object has been destroyed" - the
+   * webContents is gone by then - which Electron turns into a crash dialog
+   * in the operator's face every time they shut the window. */
+  const editorId = editor.webContents.id;
+  shotWaiting.set(editorId, png);
+  editor.on("closed", () => shotWaiting.delete(editorId));
   editor.loadFile(path.join(__dirname, "renderer", "shot-editor.html"));
   return editor;
 }
@@ -1097,29 +1103,146 @@ ipcMain.handle("glass:still", async (_event, options) => {
   }
 });
 
-ipcMain.handle("glass:clip", async (_event, seconds) => {
+/* THE RECORDING, WAITING TO BE CUT.
+ *
+ * The three pieces are written to a folder of their own rather than carried
+ * around in memory: the export window plays the video, which means it needs a
+ * URL rather than bytes, and a 30-second recording plus two WAVs is tens of
+ * megabytes to hold in an object that exists only to be handed to ffmpeg.
+ * The folder is removed when the window closes. */
+const clipWaiting = new Map();
+
+function openClipExport(made) {
+  const dir = clipMux.stash();
+  const held = { dir, video: path.join(dir, "screen.mp4"), broadcast: null,
+    mic: null, seconds: made.seconds, notes: made.notes || [],
+    broadcastOffset: 0, micOffset: 0, micQuiet: false };
+  fs.writeFileSync(held.video, made.mp4);
+  const audio = made.audio || {};
+  if (audio.broadcast && audio.broadcast.wav && audio.broadcast.wav.length > 44) {
+    held.broadcast = path.join(dir, "broadcast.wav");
+    fs.writeFileSync(held.broadcast, audio.broadcast.wav);
+    held.broadcastOffset = audio.broadcast.offset || 0;
+  }
+  if (audio.mic && audio.mic.wav && audio.mic.wav.length > 44) {
+    held.mic = path.join(dir, "mic.wav");
+    fs.writeFileSync(held.mic, audio.mic.wav);
+    held.micOffset = audio.mic.offset || 0;
+    held.micQuiet = !!audio.mic.quiet;
+  }
+
+  const window_ = new BrowserWindow({
+    width: 1080,
+    height: 820,
+    minWidth: 720,
+    minHeight: 560,
+    title: "Export the tablet clip",
+    icon: path.join(__dirname, "assets", "pinebox.ico"),
+    backgroundColor: "#0d1217",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+  window_.setMenuBarVisibility(false);
+  /* The id, not the window - see openShotEditor. Worse here than there: the
+   * throw happened BEFORE clipMux.forget below, so every cancelled export
+   * also left its screen recording and both WAVs behind in the temp folder. */
+  const clipId = window_.webContents.id;
+  clipWaiting.set(clipId, held);
+  window_.on("closed", () => {
+    clipWaiting.delete(clipId);
+    /* The pieces existed only to be cut. Keeping them would fill the temp
+     * folder with hundreds of megabytes nobody will ever look for again. */
+    clipMux.forget(dir);
+  });
+  window_.loadFile(path.join(__dirname, "renderer", "clip-export.html"));
+  return window_;
+}
+
+/* file:// for the window to play and decode. It is a file:// page itself, so
+ * these load without any protocol handler - and the alternative, tens of
+ * megabytes of data: URL through IPC, is what this exists to avoid. */
+function fileUrl(where) {
+  return where ? "file:///" + String(where).replace(/\\/g, "/") : null;
+}
+
+ipcMain.handle("clip:pending", (event) => {
+  const held = clipWaiting.get(event.sender.id);
+  if (!held) return { ok: false, why: "there is no recording waiting for this window" };
+  return {
+    ok: true,
+    seconds: held.seconds,
+    notes: held.notes,
+    videoUrl: fileUrl(held.video),
+    broadcastUrl: fileUrl(held.broadcast),
+    micUrl: fileUrl(held.mic),
+    broadcastOffset: held.broadcastOffset,
+    micOffset: held.micOffset,
+    micQuiet: held.micQuiet
+  };
+});
+
+ipcMain.handle("clip:done", (event) => {
+  const window_ = BrowserWindow.fromWebContents(event.sender);
+  if (window_ && !window_.isDestroyed()) window_.close();
+  return { ok: true };
+});
+
+ipcMain.handle("clip:export", async (event, choices) => {
   const { dialog } = require("electron");
+  const held = clipWaiting.get(event.sender.id);
+  if (!held) return { ok: false, why: "there is no recording waiting for this window" };
   try {
-    const made = await (await terminalHost.glass()).clip(seconds);
-    if (!made.ok) return made;
-    /* Asked for AFTER the recording, not before: a save dialog open across
-     * the ten seconds being filmed is a modal window over the thing the
-     * operator is trying to watch, and on Windows it steals the focus the
-     * tablet's screen is being recorded to show. */
     const when = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     let folder = app.getPath("videos");
     try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
     catch { folder = app.getPath("downloads"); }
-    const picked = await dialog.showSaveDialog(win, {
-      title: "Save the tablet clip",
-      defaultPath: path.join(folder, `pinetab-${when}.mp4`),
-      filters: [{ name: "MP4 video", extensions: ["mp4"] }]
-    });
-    if (picked.canceled || !picked.filePath) {
-      return { ok: false, canceled: true, why: "not saved", seconds: made.seconds };
-    }
-    fs.writeFileSync(picked.filePath, made.mp4);
-    return { ok: true, path: picked.filePath, bytes: made.bytes, seconds: made.seconds };
+    const picked = await dialog.showSaveDialog(
+      BrowserWindow.fromWebContents(event.sender), {
+        title: "Save the tablet clip",
+        defaultPath: path.join(folder, `pinetab-${when}.mp4`),
+        filters: [{ name: "MP4 video", extensions: ["mp4"] }]
+      });
+    if (picked.canceled || !picked.filePath) return { ok: false, canceled: true };
+
+    const use = (choices && choices.use) || {};
+    const done = await clipMux.mux({
+      video: held.video,
+      broadcast: use.broadcast && held.broadcast
+        ? { path: held.broadcast, offset: held.broadcastOffset } : null,
+      mic: use.mic && held.mic ? { path: held.mic, offset: held.micOffset } : null,
+      inPoint: choices.inPoint,
+      outPoint: choices.outPoint,
+      gains: choices.gains || {},
+      mono: !!choices.mono,
+      out: picked.filePath
+    }, { ffmpeg: (readConfig() || {}).ffmpeg });
+
+    /* "After exporting a video, open the folder in Windows Explorer,
+     *  allowing me to see the video selected." */
+    try { shell.showItemInFolder(done.path); } catch (error) { /* not fatal */ }
+    return done;
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("glass:clip", async (_event, seconds, options) => {
+  try {
+    const made = await (await terminalHost.glass()).clip(seconds, options);
+    if (!made.ok) return made;
+    /* Straight into the export window rather than into a save dialog. The
+     * cutting, the channels and the gains are all decisions that need the
+     * recording in front of you, and a file written before any of them is a
+     * file that has to be written again. */
+    openClipExport(made);
+    return { ok: true, seconds: made.seconds, bytes: made.bytes,
+      notes: made.notes || [],
+      broadcast: !!(made.audio && made.audio.broadcast),
+      mic: !!(made.audio && made.audio.mic) };
   } catch (error) {
     return { ok: false, why: error.message };
   }

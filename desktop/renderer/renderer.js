@@ -959,11 +959,18 @@ $("glassClip")?.addEventListener("click", () => {
     }, 1000);
     try {
       const made = await api.glassClip(seconds);
-      if (made && made.canceled) return glassSay("Recorded, but not saved.");
       if (!made || !made.ok) {
         return glassSay(made && made.why ? made.why : "the clip did not come back", true);
       }
-      glassSay(`Saved ${made.seconds}s \u2014 ${Math.round(made.bytes / 1024)} kB.`);
+      /* WHAT CAME BACK WITH IT, said plainly. A recording whose microphone
+       * was busy is still worth having, but finding that out in the export
+       * window - or worse, in the exported file - is finding it out too
+       * late. */
+      const heard = [made.broadcast ? "broadcast" : null, made.mic ? "mic" : null]
+        .filter(Boolean).join(" + ") || "no audio";
+      glassSay(`Recorded ${made.seconds}s with ${heard}. Choose what to export.`
+        + ((made.notes || []).length ? " \u2014 " + made.notes.join("; ") : ""),
+        !made.broadcast && !made.mic);
     } finally {
       clearInterval(tick);
     }
