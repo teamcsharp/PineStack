@@ -76831,6 +76831,23 @@ SAY_TURN_BUDGET = 3600
 # speak_turns, not by throwing words away.
 SAY_MAX_ANNOUNCES = 40
 
+# #1275: HOW LONG A SINGLE SPOKEN LINE MAY RUN, in seconds, before the
+# turn is cut at its own line breaks and each piece is rendered on its
+# own. That is what gives every line a MEASURED window in the welded wav
+# - clip_from/clip_until - rather than one window for a whole speech.
+#
+# Measured against a live hour (182 turns, 1,893s of audio): the longest
+# element was 78.2 seconds. At 12 this becomes 13.7 and costs 20% more
+# render; at 10, 13.7 for 24%; splitting EVERY turn costs 43% and buys
+# nothing, because the worst case is bounded by the longest single line
+# either way. 12 is the knee. 0 turns the whole thing off.
+SAY_LINE_SECONDS = 12
+
+# Spoken English runs about fourteen characters a second - the same
+# arithmetic say_max_chars uses - and the cut has to be decided before
+# any audio exists, so the ceiling is carried in characters.
+SAY_CHARS_PER_SECOND = 14
+
 
 def say_max_chunks(cap: int) -> int:
     """How many chunks one turn may occupy.
@@ -76867,14 +76884,22 @@ def say_chunks_for(text: str, cap: int) -> int:
     return max(say_max_chunks(cap), min(SAY_MAX_ANNOUNCES, need))
 
 
-def sentence_chunks(text: str, cap: int = 300, most: int = 10) -> list[str]:
+def sentence_chunks(text: str, cap: int = 300, most: int = 10,
+                    house: bool = False) -> list[str]:
     """A long turn cut at sentence boundaries into speakable pieces.
 
     The old pipe sliced every turn at 300 characters mid-word, which is
     exactly what mangled the passages delivered as asked — the compliant
     turns were the ones punished. Chunks go out in the same voice, one after
-    another, so 'read it out in full' is finally true."""
-    parts = [x for x in re.split(r"(?<=[.!?…—])\s+", str(text or "")) if x]
+    another, so 'read it out in full' is finally true.
+
+    #1275: `house` adds the SEMICOLON, because that is the line break
+    this station writes in. Measured over one hour, 173 of 183 spoken
+    elements carried one and the hour held 323 of them; without it a turn
+    is 1.23 pieces and with it 2.99. It is off by default so the six
+    other callers of this function are untouched."""
+    edge = r"(?<=[.!?…—;])\s+" if house else r"(?<=[.!?…—])\s+"
+    parts = [x for x in re.split(edge, str(text or "")) if x]
     chunks: list[str] = []
     current = ""
     for part in parts:
@@ -77329,10 +77354,27 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # The slider is the ceiling (#423): every piece fits in one
         # announce the box can drain; the SAME voice takes a breath at
         # each seam and simply continues the thought.
+        # #1275: ONE LINE, ONE CLIP. The cap was say_max_chars() - the
+        # say slider times fourteen, up to 800 - so the chunker split a
+        # turn at its sentence ends and then MERGED the pieces straight
+        # back into a single 800-character chunk. One render, one row,
+        # one window: a 78-second element with twelve sentences inside
+        # it and nothing to mark them by.
+        #
+        # Each piece rendered on its own gets its own clip_from /
+        # clip_until in the welded wav, which is a physical fact about a
+        # file rather than an estimate - so the script gains real lines
+        # and the highlight can walk them without anything being
+        # inferred. See the patch note for why the boundaries cannot be
+        # recovered from one welded clip instead (0 of 8 agreement).
+        _line_cap = say_max_chars()
+        if SAY_LINE_SECONDS > 0:
+            _line_cap = min(_line_cap,
+                            SAY_LINE_SECONDS * SAY_CHARS_PER_SECOND)
         for at, chunk in enumerate(
-                sentence_chunks(text, cap=say_max_chars(),
-                                most=say_chunks_for(
-                                    text, say_max_chars()))):
+                sentence_chunks(text, cap=_line_cap,
+                                most=say_chunks_for(text, _line_cap),
+                                house=SAY_LINE_SECONDS > 0)):
             if at:
                 chunk = breath_for(f"{who}{len(playlist)}") + chunk
             playlist.append({
