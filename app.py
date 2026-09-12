@@ -9065,8 +9065,24 @@ def page_wedge_state() -> dict[str, Any]:
     that owns the air is still polling. A page that has gone away is not
     wedged - it is gone, and #1008's lease already handles that."""
     out: dict[str, Any] = {"wedged": False, "waiting": 0, "quiet": 0.0,
-                           "stalls": 0, "owner": "", "why": ""}
+                           "stalls": 0, "owner": "", "why": "",
+                           "paused": False}
     try:
+        # #1211: IS THE DOOR SIMPLY CLOSED? Asked during a six-hour pause
+        # this said "the broadcast is stuck, nothing heard for 21644
+        # seconds" - every number true and the conclusion wrong, sending
+        # the operator to a troubleshooting console when the cure was
+        # "press play". A paused station is the one state where none of
+        # the evidence below means anything.
+        if radio_paused():
+            out["paused"] = True
+            out["why"] = ("the station is PAUSED - you took it off air "
+                          "%.1f hour(s) ago and nothing has resumed it. "
+                          "The booth kept working: %ds of speech is "
+                          "banked and waiting."
+                          % (radio_paused_for() / 3600.0,
+                             int(prepared_seconds())))
+            return out
         out["owner"] = owner = audio_owner()
         rows = list(_PAGE_DELIVERIES.values())
         out["waiting"] = waiting = sum(
@@ -111832,6 +111848,24 @@ async def api_broadcast_health(
         listeners = len(_listeners_live())
     except Exception:  # noqa: BLE001
         listeners = 0
+    if state.get("paused"):
+        # #1211: say the true thing FIRST. Every other number this
+        # endpoint reports is meaningless while the door is shut, and
+        # reported on its own it sent the operator hunting a fault that
+        # was not there for six hours.
+        return {
+            "at": now, "stuck": False, "paused": True,
+            "say": str(state.get("why") or "the station is paused"),
+            "offer": ["put it back on air"],
+            "listeners": listeners,
+            "heard_seconds_ago": (round(now - heard_at, 1)
+                                  if heard_at else None),
+            "clips_waiting": int(state.get("waiting") or 0),
+            "stall_reports": int(state.get("stalls") or 0),
+            "holding_the_air": str(state.get("owner") or ""),
+            "detail": str(state.get("why") or ""),
+            "fix_with": "POST /api/radio/pause with paused false",
+        }
     stuck = bool(state.get("wedged"))
     if stuck:
         say = ("The broadcast is stuck. %d clip(s) are queued on the page "
@@ -111885,6 +111919,10 @@ BROADCAST_STEPS: list[dict[str, str]] = [
      "say": "Four checks - is the station making audio, is the page "
             "taking it, is anything sounding, who holds the air. "
             "Changes nothing.", "tone": "look"},
+    {"key": "onair", "label": "Put it back on air",
+     "say": "Lifts a pause. The booth banks material while the door is "
+            "shut, so there is always something to say on the way back.",
+     "tone": "air"},
     {"key": "flush", "label": "Drop what it is stuck on",
      "say": "Advances the feed epoch so every page abandons the clip it "
             "cannot start and takes the next one.", "tone": "do"},
@@ -111982,8 +112020,30 @@ async def broadcast_step(step: str) -> dict[str, Any]:
         got.sort(key=lambda r: -float(r.get("air_at") or 0))
         return got, pool
 
-    if step == "look":
+    if step == "onair":
+        said.append("$ put it back on air")
+        if not radio_paused():
+            said.append("  the station is already on air - nothing to do")
+        else:
+            said.append("  it has been off air for %.1f hour(s)"
+                        % (radio_paused_for() / 3600.0))
+            radio_pause_set(False, why="the wedge console")
+            changed = True
+            said.append("  back on air with %ds of speech standing by"
+                        % int(prepared_seconds()))
+
+    elif step == "look":
         said.append("$ locate")
+        # #1211: the first question, because for six hours it was the
+        # only one that mattered and nothing asked it.
+        if radio_paused():
+            said.append("PAUSED     you took the station off air %.1f "
+                        "hour(s) ago - that is why nothing is playing."
+                        % (radio_paused_for() / 3600.0))
+            said.append("           %ds of speech is banked and waiting."
+                        % int(prepared_seconds()))
+            said.append("           press 'Put it back on air'.")
+            said.append("")
         said.append("station    on=%s paused=%s routed=%s"
                     % (bool(_RADIO.get("on")), radio_paused(),
                        _RADIO.get("voice_to") or "box"))
@@ -156918,7 +156978,28 @@ function pineFmOff() {
   try { djApplyGain(); } catch (e) {}
 }
 
+/* #1211: what the CLOCK last said about the pause, so a page can tell
+   "the station is off air" from "I think it is". */
+let pineClockPaused = null;
+
 function djResync(clock) {
+  /* #1211: THE PAUSE IS A STATION-WIDE FACT AND IS READ FIRST.
+   *
+   * It used to be lifted at the BOTTOM of this function, behind four
+   * early returns that are all about where the RECORD plays - external
+   * output, a pinned track, a missing player, a clock with no track on
+   * it. Any one of them and `pineAirPaused` stayed true for the life of
+   * the page, djVoiceNext returned at its first line forever, and the
+   * booth sat taking clips it would never start: received, never played,
+   * no errors, nothing to see. Measured exactly that way after a six
+   * hour pause, and no server restart can reach a flag that lives in the
+   * tab. Where the record plays has nothing to do with whether the door
+   * is open. */
+  if (clock && typeof clock.paused !== "undefined") {
+    pineClockPaused = !!clock.paused;
+    if (pineClockPaused && !pineAirPaused) { pineAirPause(true); }
+    else if (!pineClockPaused && pineAirPaused) { pineAirPause(false); }
+  }
   if (!clock || !clock.id || !clock.url || (!clock.on && !clock.playing)) {
     /* #1144: FM OFF stops the record here too. This branch used to stop
      * FOLLOWING and let the loaded track play itself out — "turn off the
@@ -158095,6 +158176,15 @@ let djVoiceBusyUntil = 0;               // #1207: when the slot must be free
    still be sounding, and nothing sounding - the player is stuck, and the
    reason does not matter. Tear the slot down and take the next clip. */
 function djVoiceUnstick() {
+  /* #1211: GAGGED FOR NOTHING. #1207 only rescued a stuck BUSY flag, and
+   * a page holding a stale pause is not busy at all - it is idle, which
+   * reads as healthy while every clip piles up unplayed. If this page
+   * believes the station is off air and the clock says otherwise, that
+   * belief is the fault. */
+  if (pineAirPaused && pineClockPaused === false) {
+    try { pineAirPause(false); } catch (e) { pineAirPaused = false; }
+    return true;
+  }
   if (!djVoiceBusy || !djVoiceBusyUntil) return false;
   if (Date.now() < djVoiceBusyUntil) return false;
   const sounding = (djVoiceEls || []).some(
@@ -159005,8 +159095,14 @@ async function airPause() {
    * next clock poll — corrects this page if they ever disagree. */
   try { pineAirPause(!airPausedPaint); } catch (e) {}
   try {
+    /* #1211: SAY WHAT YOU WANT. An empty body is a TOGGLE on the server
+     * (#1108), so this asked for "the other one" rather than for off-air
+     * or on-air - and against a painted state up to fifteen seconds old,
+     * a double tap, or a second panel open somewhere, a toggle is a
+     * button that sometimes does the opposite of what it shows. The
+     * desktop shell has always sent its intent; so does this now. */
     const got = await api("/api/radio/pause", {method: "POST",
-                                               body: JSON.stringify({})});
+      body: JSON.stringify({paused: !airPausedPaint})});
     airPaint(got);
     if (!!got.paused !== pineAirPaused) pineAirPause(!!got.paused);
     setStatus(got.say || "");
