@@ -1955,6 +1955,155 @@
 
   let feedPrint = "";
 
+  /* WHERE THE OPERATOR WAS LOOKING, HELD ACROSS A REPAINT.
+   *
+   * At the top means "follow the show"; anywhere else means "I am reading
+   * this row, leave it alone". Four pixels of slack because a touch scroll
+   * rarely lands exactly on zero.
+   *
+   * ONE ELEMENT, AND ITS REAL POSITION ON THE GLASS. This is deliberately
+   * not arithmetic about ids and offsets: the rows now survive the repaint
+   * (see stitchFeed), so the honest measurement is available - ask one row
+   * where it is before, ask the SAME element again after, and move the
+   * scroll by the difference.
+   *
+   * The first version did the arithmetic instead, because the list was
+   * rebuilt and there was no surviving element to ask. It matched rows by id
+   * across the rebuild and restored `child.offsetTop - offset`. Measured on
+   * the tablet it wrote 600, 654, 117, 118, 726 over twelve seconds -
+   * `offsetTop` is measured from `.pb-left` rather than from the scroll box,
+   * and the rows above the anchor reflow as the station speaks, so both
+   * terms moved underneath it. A measurement cannot be recovered from a list
+   * that no longer exists; the cure was to stop destroying it. */
+  function feedAnchor(list) {
+    if (!list || list.scrollTop <= 4) return { pinned: true };
+    const box = list.getBoundingClientRect();
+    for (const child of list.children) {
+      const rect = child.getBoundingClientRect();
+      if (rect.bottom <= box.top + 1) continue;   /* scrolled off the top */
+      return { node: child, was: rect.top };
+    }
+    return { pinned: true };
+  }
+
+  function restoreFeed(list, anchor) {
+    if (!list || !anchor) return;
+    if (anchor.pinned) { list.scrollTop = 0; return; }
+    const node = anchor.node;
+    /* The anchored row rolled off the station's 240-row ring while it was
+     * being read. Leave the scroll alone: the browser's own anchoring has
+     * already picked a neighbour, and snapping to the top here would do the
+     * very thing this exists to prevent. */
+    if (!node || node.parentNode !== list) return;
+    const drift = node.getBoundingClientRect().top - anchor.was;
+    if (Math.abs(drift) > 0.5) {
+      list.scrollTop = Math.max(0, list.scrollTop + drift);
+    }
+  }
+
+  /* ------------------------------------------------------------------
+     THE ROWS THEMSELVES, KEPT RATHER THAN REBUILT.
+
+     `feedNodes` holds one element per row id for as long as that row is in
+     the station's ring. `feedList` is the list they hang in - if the sampler
+     is unmounted and mounted again that is a brand new element, and the old
+     rows are dropped rather than adopted into it.
+     ------------------------------------------------------------------ */
+  const feedNodes = new Map();
+  let feedList = null;
+
+  /* Everything about a row that is actually drawn. If this has not changed
+   * the element is left completely alone - no text written, no class
+   * touched - which is what makes a repaint free for the rows that did not
+   * move, and there are usually 240 of those. */
+  function rowPrint(row, source) {
+    return [row.name || row.who || row.kind || "booth",
+            row.text || "", row.lcdStatus || "",
+            source ? source.kind : ""].join("\u0001");
+  }
+
+  /* Built once. The listeners are bound to the ELEMENT and read the row off
+   * it, because the row object is a fresh one out of every poll while the
+   * element is not - a closure over `row` here would carry a four-second-old
+   * copy for as long as the element lived. */
+  function makeRow() {
+    const item = document.createElement("div");
+    const who = document.createElement("b");
+    const text = document.createElement("span");
+    const tag = document.createElement("em");
+    item.appendChild(who);
+    item.appendChild(text);
+    item.appendChild(tag);
+    item.pineWho = who;
+    item.pineText = text;
+    item.pineTag = tag;
+    item.addEventListener("pointerdown", (event) => {
+      if (item.pineRow) carryStart(event, item, item.pineRow);
+    });
+    item.addEventListener("pointermove", carryMove);
+    item.addEventListener("pointerup", carryEnd);
+    item.addEventListener("pointercancel", () => carryEnd(null));
+    return item;
+  }
+
+  function dressRow(item, row, source, wantsSpectrum) {
+    item.pineRow = row;
+    const print = rowPrint(row, source);
+    if (item.pinePrint !== print) {
+      item.pinePrint = print;
+      item.className = "pb-row" + (source ? " grabbable" : " quiet")
+        + (row.lcdStatus === "Playing" ? " playing" : "");
+      item.dataset.rowId = row.id;
+      /* And the hold, which reads data-line - see line-actions.js. A drag
+       * puts this row on a pad; a HOLD offers the rest of what can be done
+       * with it, and there is no reason the sampler's feed should be the one
+       * list where that does not work. */
+      if (row.id) item.dataset.line = String(row.id);
+      item.pineWho.textContent = row.name || row.who || row.kind || "booth";
+      item.pineText.textContent = row.text || "";
+      item.pineTag.textContent = row.lcdStatus || "";
+      item.title = source ? "Drag onto a pad — " + source.kind : "";
+    }
+    /* THE SPECTRUM NOW OUTLIVES THE POLL. It used to be a new canvas on
+     * every repaint with the draw loop chasing whichever one was current, so
+     * a clip that played for twenty seconds was drawn by five canvases in
+     * turn. Kept here, one canvas lasts as long as the row is the one making
+     * the sound. */
+    const has = !!item.pineSpec;
+    if (wantsSpectrum && !has) {
+      const bars = document.createElement("canvas");
+      bars.className = "pb-spec";
+      bars.width = 128;
+      bars.height = 22;
+      item.insertBefore(bars, item.pineText);
+      item.pineSpec = bars;
+      startSpectrum(bars);
+    } else if (!wantsSpectrum && has) {
+      item.pineSpec.remove();
+      item.pineSpec = null;
+    }
+  }
+
+  /* Put `order` into `list`, in that order, moving as little as possible.
+   * Walk the wanted rows against a cursor into the existing children: a row
+   * already in the right place costs one comparison, anything else is one
+   * insertBefore. On the ordinary poll - one new line at the top and the
+   * rest unchanged - that is a single DOM insertion for the whole feed. */
+  function stitchFeed(list, order) {
+    let cursor = list.firstChild;
+    for (const item of order) {
+      if (item === cursor) { cursor = cursor.nextSibling; continue; }
+      list.insertBefore(item, cursor);
+    }
+    /* Anything still after the cursor was not asked for: it has rolled off
+     * the station's ring. */
+    while (cursor) {
+      const next = cursor.nextSibling;
+      cursor.remove();
+      cursor = next;
+    }
+  }
+
   /* ONE rAF LOOP FOR THE SPECTRUM, and only while a canvas is on screen.
    *
    * The feed is rebuilt whenever it changes, so the canvas is a new element
@@ -2015,7 +2164,36 @@
     if (print === feedPrint) return;
     feedPrint = print;
 
-    const fragment = document.createDocumentFragment();
+    /* WHERE THE OPERATOR WAS LOOKING, KEPT ACROSS THE REBUILD.
+     *
+     * "Allow me to scroll up on the left side feed and grab previous clips.
+     *  I need to be able to grab clips that just played."
+     *
+     * The rows were always there - 222 of 241 takeable on the screen this
+     * was reported from - but reaching them was impossible: replaceChildren
+     * below throws the whole list away, and on a live station something
+     * changes every poll, so a scroll up snapped back to the top within a
+     * few seconds. The comment above this one already knew ("it throws away
+     * scroll position") and only guarded the case where nothing changed,
+     * which on air is never.
+     *
+     * AN ANCHOR, NOT A NUMBER. The newest row is at the TOP, so new arrivals
+     * push everything down; restoring the old scrollTop would slide the line
+     * you were reading out from under you by exactly as much as the station
+     * just said. So the ROW is remembered, and it is put back at the same
+     * height it was at.
+     *
+     * Sitting at the top is its own state and means "follow the show" - so
+     * that pins rather than anchors, and new lines keep streaming in. */
+    /* THE SAMPLER MAY HAVE BEEN UNMOUNTED AND MOUNTED AGAIN, which builds a
+     * brand new list element. Rows kept for the old one belong to a list
+     * nobody is showing, so they are dropped rather than adopted. */
+    if (feedList !== list) {
+      feedList = list;
+      feedNodes.clear();
+    }
+
+    const anchor = feedAnchor(list);
     /* Newest at the top: the thing worth grabbing almost always just
      * happened, and reaching for it should not mean scrolling.
      *
@@ -2025,25 +2203,18 @@
      * moments from the operator. The list grows as the broadcast runs and
      * rolls off the bottom when the station's own ring does. */
     const newestFirst = rows.slice().reverse();
+    const order = [];
+    const wanted = new Set();
     let drawnSpectrum = false;
     for (const row of newestFirst) {
+      const key = String(row.id);
+      wanted.add(key);
       const source = sourceFor(row);
-      const item = document.createElement("div");
-      item.className = "pb-row" + (source ? " grabbable" : " quiet");
-      item.dataset.rowId = row.id;
-      /* And the hold, which reads data-line - see line-actions.js. A drag
-       * puts this row on a pad; a HOLD offers the rest of what can be done
-       * with it, and there is no reason the sampler's feed should be the one
-       * list where that does not work. */
-      if (row.id) item.dataset.line = String(row.id);
-      if (row.lcdStatus === "Playing") item.classList.add("playing");
-      const who = document.createElement("b");
-      who.textContent = row.name || row.who || row.kind || "booth";
-      const text = document.createElement("span");
-      text.textContent = row.text || "";
-      const tag = document.createElement("em");
-      tag.textContent = row.lcdStatus || "";
-      item.appendChild(who);
+      let item = feedNodes.get(key);
+      if (!item) {
+        item = makeRow();
+        feedNodes.set(key, item);
+      }
       /* WHICH CLIP IS ACTUALLY SOUNDING, drawn rather than asserted.
        *
        * "For the actively playing sound effect, put an audio spectrogram
@@ -2059,27 +2230,16 @@
        * and two spectra means two canvases of which only the later is
        * driven, so the other sits there black and looks broken. Measured:
        * two canvases, 1305 lit pixels in one and 0 in the other. */
-      if (row.lcdStatus === "Playing" && !drawnSpectrum) {
-        drawnSpectrum = true;
-        const bars = document.createElement("canvas");
-        bars.className = "pb-spec";
-        bars.width = 128;
-        bars.height = 22;
-        item.appendChild(bars);
-        startSpectrum(bars);
-      }
-      item.appendChild(text);
-      item.appendChild(tag);
-      if (source) {
-        item.title = "Drag onto a pad — " + source.kind;
-        item.addEventListener("pointerdown", (event) => carryStart(event, item, row));
-        item.addEventListener("pointermove", carryMove);
-        item.addEventListener("pointerup", carryEnd);
-        item.addEventListener("pointercancel", () => carryEnd(null));
-      }
-      fragment.appendChild(item);
+      const wantsSpectrum = row.lcdStatus === "Playing" && !drawnSpectrum;
+      if (wantsSpectrum) drawnSpectrum = true;
+      dressRow(item, row, source, wantsSpectrum);
+      order.push(item);
     }
-    list.replaceChildren(fragment);
+    stitchFeed(list, order);
+    for (const key of Array.from(feedNodes.keys())) {
+      if (!wanted.has(key)) feedNodes.delete(key);
+    }
+    restoreFeed(list, anchor);
 
     const tally = el("pbTally");
     if (tally) {
