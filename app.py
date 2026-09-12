@@ -113235,7 +113235,254 @@ async def api_broadcast_unwedge(
 # Each is one thing, safe to press when nothing is wrong, and each says
 # what it DID rather than that it ran. The list is meant to grow: add a
 # row here and a handler below and the console shows it.
+# #1240: HOW LONG A WINDOW THE VERDICT READS.
+TRIAGE_WINDOW = 150.0
+
+
+def broadcast_triangulate(since: float = 0.0) -> dict[str, Any]:
+    """#1240: name the fault in front of us, and the one cure for it.
+
+    Reads the acknowledgment ring per LISTENER - which has carried
+    listener_id, error, muted, volume and audible_volume all along and
+    was never read for anything but the last three error strings - and
+    returns the most specific verdict the evidence supports.
+
+    `cure` is a step key for broadcast_step, or "" when there is
+    nothing a server can do. An empty cure is a RESULT: "the tablet's
+    volume is at zero" is the most useful sentence available on the
+    night it is true, and no amount of ladder will turn a tablet up."""
+    now = time.time()
+    out: dict[str, Any] = {"at": now, "cause": "", "why": "", "cure": "",
+                           "listener": "", "evidence": []}
+
+    def verdict(cause: str, why: str, cure: str = "",
+                listener: str = "") -> dict[str, Any]:
+        out.update(cause=cause, why=why, cure=cure, listener=listener)
+        return out
+
+    try:
+        if not _RADIO.get("on"):
+            return verdict("off_air", "the station is switched off", "onair")
+        if radio_paused():
+            return verdict("paused", "the station is paused", "onair")
+
+        # --- the acknowledgments, split by who sent them --------------
+        live = set(_listeners_live() or [])
+        seen: dict[str, dict[str, Any]] = {}
+        for ev in list(_PAGE_ACK_EVENTS[-400:]):
+            try:
+                # #1240d: ...or, when re-checking a cure, only what has
+                # happened SINCE it ran. The first re-check read the
+                # whole window nine seconds after releasing the gag, so
+                # the acks that proved the fault were still in it and
+                # every cure was going to report itself a failure.
+                _evat = float(ev.get("at") or 0)
+                if since:
+                    if _evat < float(since):
+                        continue
+                elif now - _evat > TRIAGE_WINDOW:
+                    continue
+                who = str(ev.get("listener_id") or "")
+                if not who:
+                    continue
+                row = seen.setdefault(who, {
+                    "acks": 0, "played": 0, "muted": 0, "silent": 0,
+                    "vol_zero": 0, "interrupted": 0, "stalled": 0,
+                    "last": 0.0})
+                row["acks"] += 1
+                row["last"] = max(row["last"], float(ev.get("at") or 0))
+                # #1240b: VOLUME AND MUTED ARE ONLY REAL ONCE SOMETHING
+                # IS PLAYING. The page reads them off `voice`, the
+                # element for the clip in hand, and reports
+                # `Number(voice && voice.volume || 0)` - so before a
+                # clip starts there is no element, null || 0 is 0, and
+                # every page reports a volume of zero for a clip it has
+                # not begun. The same null reports muted as FALSE
+                # however gagged the page is. Counted on a `received`
+                # ack, both fields are noise that reads exactly like
+                # the fault they are supposed to detect.
+                # #1240c: ...but MUTED is not the same kind of reading
+                # as volume, and #1240b wrongly threw both away. The
+                # page sends `!!(voice && (voice.muted ||
+                # window.__pineGagged))` - a null element makes it
+                # FALSE, so a true can only come from a real element
+                # that really is muted. It is never a null artefact and
+                # it is the one signal the solo gate leaves behind, on
+                # a page that is gagged before it ever starts anything.
+                # Only `volume: 0` is the null-reads-as-zero trap.
+                if ev.get("muted"):
+                    row["muted"] += 1
+                if ev.get("event") in ("playing", "ended"):
+                    row["played"] += 1
+                    if float(ev.get("volume") or 0) <= 0:
+                        row["vol_zero"] += 1
+                    elif float(ev.get("audible_volume") or 0) <= 0:
+                        row["silent"] += 1
+                err = str(ev.get("error") or "")
+                if "interrupted by a call to pause" in err:
+                    row["interrupted"] += 1
+                elif "stall" in err.lower():
+                    row["stalled"] += 1
+            except Exception:  # noqa: BLE001
+                continue
+        out["listeners"] = {k: dict(v) for k, v in seen.items()}
+        out["evidence"] = [
+            "%s: %d ack(s), %d played, %d muted, %d vol=0, "
+            "%d play-interrupted, %d stalled"
+            % (k[:10], v["acks"], v["played"], v["muted"], v["vol_zero"],
+               v["interrupted"], v["stalled"])
+            for k, v in seen.items()]
+
+        # --- was any DIALOGUE even offered in the window? -------------
+        made = 0
+        for row in list(_PAGE_DELIVERIES.values()):
+            try:
+                _rat = float(row.get("at") or 0)
+                if bool(row.get("speech")) and (
+                        _rat >= float(since) if since
+                        else now - _rat <= TRIAGE_WINDOW):
+                    made += 1
+            except Exception:  # noqa: BLE001
+                continue
+        out["speech_offered"] = made
+        out["dialogue_quiet"] = round(dialogue_quiet_for(), 1)
+
+        # --- most specific first --------------------------------------
+        # #1240c: THE SOLO GATE FIRST OF ALL. Measured on the tablet:
+        # the clock named pblj52fs2j the owner, the tablet is
+        # pbt2is2fv9, and pineSoloGate mutes every audio element on any
+        # page that is not the owner - so it gagged itself, and gagged
+        # itself again after each reload, which is exactly why reload
+        # after reload never fixed it. It looks identical to a page
+        # that will not start, so it has to be tested first or the
+        # wrong cure wins.
+        owner0 = audio_owner()
+        for who, v in seen.items():
+            if v["muted"] >= 2 and owner0 and owner0 != who:
+                return verdict(
+                    "gagged",
+                    "%s is MUTED by the solo gate: %s holds the air, so "
+                    "every player on %s is silenced. It re-gags itself "
+                    "after a reload, which is why reloading does not "
+                    "help. Releasing the exclusive lets it sound."
+                    % (who[:10], str(owner0)[:10], who[:10]),
+                    "release", who)
+
+        # #1240b: NEVER STARTED comes before anything about volume. A
+        # clip that did not play has no volume to be wrong, and this is
+        # the state the tablet was actually in - acknowledging clip
+        # after clip and starting none of them.
+        dead = [who for who, v in seen.items()
+                if v["acks"] >= 3 and v["played"] <= 0]
+        if dead and made > 0:
+            return verdict(
+                "never_starts",
+                "%s took %d clip(s) and started none of them, while %d "
+                "speech delivery(s) went out. The page is accepting the "
+                "handover and never playing - only a reload clears that."
+                % (dead[0][:10], seen[dead[0]]["acks"], made),
+                "reload_pages", dead[0])
+
+        # The device's own volume - and it must have PLAYED something
+        # for that to mean anything. No server-side cure exists, and
+        # saying so beats running four rungs that cannot help.
+        for who, v in seen.items():
+            if v["played"] >= 2 and v["vol_zero"] >= v["played"]:
+                return verdict(
+                    "device_muted",
+                    "%s played %d clip(s) with the volume at zero - the "
+                    "station is sending and that device is turned down. "
+                    "Nothing here can raise it."
+                    % (who[:10], v["played"]), "", who)
+
+        owner = audio_owner()
+        for who, v in seen.items():
+            # #1240b: v["muted"] is now only counted on played acks, so
+            # this can no longer be answered by a null element.
+            if v["muted"] >= 2 and owner and owner != who:
+                return verdict(
+                    "gagged",
+                    "%s is muted by the solo gate because %s holds the "
+                    "air. Releasing the exclusive lets it sound."
+                    % (who[:10], str(owner)[:10]), "release", who)
+
+        for who, v in seen.items():
+            if v["interrupted"] >= 2:
+                return verdict(
+                    "play_interrupted",
+                    "%s is starting clips and something is calling "
+                    "pause() before they sound - %d interrupted in the "
+                    "last %ds, then abandoned. The player is in a bad "
+                    "state and only a reload clears it."
+                    % (who[:10], v["interrupted"], int(TRIAGE_WINDOW)),
+                    "reload_pages", who)
+
+        waiting = sum(1 for r in _PAGE_DELIVERIES.values()
+                      if str(r.get("state") or "") == "received")
+        if waiting >= 3:
+            return verdict(
+                "not_started",
+                "%d clip(s) handed over and not one started. The page is "
+                "holding a clip it cannot play; advancing the feed epoch "
+                "makes it abandon that one and take the next." % waiting,
+                "flush")
+
+        for who, v in seen.items():
+            if v["stalled"] >= 2:
+                return verdict(
+                    "stalling",
+                    "%s reports %d stall(s) with no interrupt - the clips "
+                    "are arriving too slowly to start. Measure the pipe "
+                    "before pulling anything."
+                    % (who[:10], v["stalled"]), "speed", who)
+
+        # #1240d: ...and not merely because the ring was wiped. A
+        # restart empties _PAGE_ACK_EVENTS, so "listeners connected and
+        # not one acknowledgment" is true of every healthy station for
+        # the first minute of its life - I watched it return exactly
+        # that, twice, on a station that was fine.
+        _up = now - (_BUILD_MS / 1000.0)
+        if live and not seen and (since or _up > 60.0):
+            return verdict(
+                "page_silent",
+                "%d listener(s) are connected and not one has "
+                "acknowledged anything in %ds. The pages are attached "
+                "but not playing." % (len(live), int(TRIAGE_WINDOW)),
+                "reload_pages")
+
+        mute = dialogue_quiet_for()
+        if made <= 0 and mute >= 60:
+            return verdict(
+                "nothing_to_play",
+                "no speech has even been OFFERED to a page in %ds, so "
+                "this is not a page fault - the booth is not producing. "
+                "Standing the rooms down gives the loop the air."
+                % int(TRIAGE_WINDOW), "relieve")
+
+        if mute >= 60:
+            return verdict(
+                "quiet_unexplained",
+                "the DJs have not been heard for %ds and no page is "
+                "reporting a fault. Reloading is the safe first move."
+                % int(mute), "reload_pages")
+
+        return verdict("healthy", "the broadcast is being heard and no "
+                                  "page is reporting a fault")
+    except Exception as exc:  # noqa: BLE001
+        return verdict("unreadable", "the evidence could not be read: "
+                       + type(exc).__name__, "reload_pages")
+
+
 BROADCAST_STEPS: list[dict[str, str]] = [
+    {"key": "triangulate", "label": "What exactly is wrong?",
+     "say": "Reads every page's own acknowledgments - who is muted, "
+            "whose clips are being interrupted, whose volume is at "
+            "zero - and names the one fault and its cure. Changes "
+            "nothing.", "tone": "look"},
+    {"key": "repair", "label": "Identify it and fix it",
+     "say": "Triangulates, runs the one cure that matches, then checks "
+            "whether it took and escalates once if it did not.",
+     "tone": "air"},
     {"key": "look", "label": "Locate the problem",
      "say": "Four checks - is the station making audio, is the page "
             "taking it, is anything sounding, who holds the air. "
@@ -113344,6 +113591,65 @@ async def broadcast_step(step: str) -> dict[str, Any]:
     state = page_wedge_state()
     now = time.time()
     changed = False
+
+    # #1240: name the fault, and - for `repair` - run its cure.
+    if step in ("triangulate", "repair"):
+        got = broadcast_triangulate()
+        said.append("$ triangulate")
+        for row in (got.get("evidence") or []):
+            said.append("  " + str(row)[:130])
+        said.append("  speech offered in the window: %s"
+                    % got.get("speech_offered"))
+        said.append("")
+        said.append("cause      " + str(got.get("cause") or "?"))
+        said.append("why        " + str(got.get("why") or "")[:200])
+        said.append("cure       " + (str(got.get("cure"))
+                                     or "none - see above"))
+        if step == "triangulate" or not got.get("cure"):
+            return {"ok": True, "step": step, "lines": said,
+                    "changed": False, "triage": got}
+        said.append("")
+        said.append("$ running the cure: " + str(got.get("cure")))
+        try:
+            ran = await broadcast_step(str(got.get("cure")))
+        except Exception as exc:  # noqa: BLE001
+            said.append("  the cure would not run: " + type(exc).__name__)
+            return {"ok": False, "step": step, "lines": said,
+                    "changed": False, "triage": got}
+        for row in (ran.get("lines") or []):
+            said.append("  " + str(row)[:130])
+        # Did it take? A page needs a moment to come back and start
+        # something, so this waits rather than declaring victory.
+        _cured_at = time.time()
+        await asyncio.sleep(12.0)
+        # #1240d: judged on what happened AFTER the cure, not on the
+        # window that contained the fault.
+        after = broadcast_triangulate(since=_cured_at)
+        if not (after.get("listeners") or {}):
+            said.append("(no page has reported back in the 12s since - "
+                        "give it a moment and press again)")
+        said.append("")
+        if after.get("cause") in ("healthy", ""):
+            said.append("*** the broadcast is back - "
+                        + str(after.get("why") or "") + " ***")
+            return {"ok": True, "step": step, "lines": said,
+                    "changed": True, "triage": got, "after": after}
+        said.append("still      " + str(after.get("cause")))
+        # One escalation, and only one: the precise fix was the wrong
+        # guess, so fall back to the ladder that assumes nothing.
+        if str(after.get("cure") or "") not in ("", str(got.get("cure"))):
+            said.append("$ escalating to: " + str(after.get("cure")))
+            try:
+                more = await broadcast_step(str(after.get("cure")))
+                for row in (more.get("lines") or []):
+                    said.append("  " + str(row)[:130])
+            except Exception as exc:  # noqa: BLE001
+                said.append("  " + type(exc).__name__)
+        else:
+            said.append("suggest    the precise cure did not take - "
+                        "'Reload every page', then the console's ladder")
+        return {"ok": True, "step": step, "lines": said,
+                "changed": True, "triage": got, "after": after}
 
     async def rows_back(seconds: float) -> tuple:
         pool = await asyncio.to_thread(
@@ -113921,6 +114227,7 @@ async def broadcast_console_api(
         "gagged": bool(state.get("gagged")),
         "on": bool(_RADIO.get("on")), "paused": radio_paused(),
         "steps": BROADCAST_STEPS,
+        "triage": broadcast_triangulate(),          # #1240
         "log": tail[-14:],
         "say": (("The broadcast is stuck: " + str(state.get("why") or ""))
                 if state.get("wedged") else
@@ -174551,11 +174858,49 @@ async function fixRun(from) {
       fixSay("=== reinitialising the station ===");
     }
     let health = await fixHealth();
-    if (health && fixHeard(health, 25) && step <= 1) {
+    if (health && fixHeard(health, 25) && step <= 1
+        && !(Number(health.dialogue_quiet) >= 60)) {
+      /* #1240: ...and the DJs specifically. "heard 3s ago" was the
+       * MUSIC on a different element while the pair had been silent
+       * three minutes, which is the exact night this was written for. */
       fixSay("the broadcast is being heard right now ("
              + Math.round(Number(health.heard_seconds_ago)) + "s ago).");
       fixSay("nothing needs doing - but every step below is safe to press.");
       return;
+    }
+
+    /* #1240: TRIANGULATE BEFORE CLIMBING. The ladder below is a fixed
+     * order that knows nothing about the fault in front of it - it
+     * would reach a page reload four rungs after the evidence already
+     * named it. This asks the station which fault this is and runs the
+     * one cure for it; the ladder stays exactly where it was, for when
+     * the precise answer turns out to be the wrong guess. */
+    if (step <= 1) {
+      fixSay("0 IDENTIFY  reading every page's own acknowledgments…");
+      try {
+        const got = await api("/api/broadcast/fix/repair", {method: "POST"});
+        (got.lines || []).forEach((l) => fixSay("            " + l));
+        const after = got.after || {};
+        const cause = String((got.triage || {}).cause || "");
+        if (after.cause === "healthy" || cause === "healthy") {
+          fixSay("");
+          fixSay("*** sound is back - stopping here. ***");
+          fixMarkWrite(null);
+          return;
+        }
+        if (cause === "device_muted") {
+          /* The one fault no rung can reach. Say it and stop, rather
+           * than running four cures that cannot turn a tablet up. */
+          fixSay("");
+          fixSay("*** this device's own volume is at zero. ***");
+          fixSay("    turn it up on the tablet - the station is sending.");
+          fixMarkWrite(null);
+          return;
+        }
+      } catch (e) {
+        fixSay("            the station would not answer - "
+               + "falling through to the ladder");
+      }
     }
 
     if (step <= 1) {
