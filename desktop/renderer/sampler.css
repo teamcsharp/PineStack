@@ -411,7 +411,33 @@
 
 /* How much of the feed can actually be taken. Answers "is it expanding?"
    and "why is that row grey?" without the operator having to ask. */
-.pb-tally { flex: 1; color: var(--muted); font-size: 10.5px; text-align: right; padding-right: 6px; }
+/* THE HEAD CARRIES FOUR THINGS NOW, on a nine-inch screen. The tally is the
+ * one that gives way, because it is the only one whose meaning survives
+ * being cut short - the buttons must stay whole and stay tappable. */
+.pb-tally {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 10.5px;
+  text-align: right;
+  padding-right: 6px;
+}
+.pb-feed-head b, .pb-feed-head .pb-toggle { flex: 0 0 auto; }
+
+/* +5 and the arrow back. Taller than the `line` toggle beside them, because
+ * these two are meant to be tapped repeatedly with a thumb and the 22px a
+ * .pb-toggle comes to is a target you have to aim at. */
+.pb-step {
+  min-width: 36px;
+  padding: 7px 10px;
+  color: var(--cyan);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.pb-step:active { background: var(--cyan); color: #05131a; border-color: var(--cyan); }
 
 /* Carrying a clip to a pad.
    pan-y tells the browser a vertical drag is ITS gesture (the list scrolls

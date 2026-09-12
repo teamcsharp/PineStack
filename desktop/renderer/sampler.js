@@ -29,6 +29,17 @@
   let unsubscribe = null;
   let mounted = false;
   let feedRows = [];
+
+  /* HOW FAR BACK THE FEED IS OPENED, in entries.
+   *
+   * FEED_START is a pane-full on the tablet, so opening the sampler shows
+   * what it always showed. FEED_STEP is the operator's five. */
+  const FEED_START = 12;
+  const FEED_STEP = 5;
+  let feedShown = FEED_START;
+  /* Set by the +5 button so the paint that follows knows to bring the newly
+   * revealed rows into view rather than holding the old scroll. */
+  let feedReveal = 0;
   let grabWhole = false;        /* the line, or the whole welded round */
 
   const modes = {
@@ -63,7 +74,8 @@
         poly: modes.poly, gate: modes.gate, full: modes.full,
         sixteen: modes.sixteen, repeat: modes.repeat,
         division: modes.division, bpm: modes.bpm,
-        octave: modes.octave, chord: modes.chord, progress: modes.progress
+        octave: modes.octave, chord: modes.chord, progress: modes.progress,
+        feedShown: feedShown
       }));
     } catch (err) { /* a preference is not worth an exception */ }
   }
@@ -87,6 +99,12 @@
     if ([4, 6, 8, 12, 16, 24, 32].indexOf(division) >= 0) modes.division = division;
     const bpm = Number(saved.bpm);
     if (isFinite(bpm) && bpm >= 20 && bpm <= 300) modes.bpm = bpm;
+    /* How far back the feed was left open. Bounded by the station's own ring
+     * so a corrupt or ancient value cannot ask for a list that never ends. */
+    const shown = Number(saved.feedShown);
+    if (isFinite(shown) && shown >= FEED_START && shown <= 240) {
+      feedShown = Math.round(shown);
+    }
   }
 
   /* THE SHAPES 16 LEVEL CAN TAKE.
@@ -2159,7 +2177,9 @@
      * which reads exactly like a browser gesture conflict and is not one. */
     if (carry) return;
 
-    const print = rows.length + ":" + rows.map(
+    /* The window is part of the print, or tapping +5 would be a no-op until
+     * the station happened to say something. */
+    const print = feedShown + "/" + rows.length + ":" + rows.map(
       (row) => row.id + (row.lcdStatus === "Playing" ? "*" : "")).join(",");
     if (print === feedPrint) return;
     feedPrint = print;
@@ -2202,7 +2222,10 @@
      * that has thought about it - and halving that again only hid takeable
      * moments from the operator. The list grows as the broadcast runs and
      * rolls off the bottom when the station's own ring does. */
-    const newestFirst = rows.slice().reverse();
+    /* NEWEST FIRST, AND ONLY AS FAR BACK AS THE WINDOW IS OPEN. The station
+     * caps its own ring at 240 rows (app.py:25061); the window says how much
+     * of that the operator has asked to see. */
+    const newestFirst = rows.slice().reverse().slice(0, Math.max(1, feedShown));
     const order = [];
     const wanted = new Set();
     let drawnSpectrum = false;
@@ -2239,14 +2262,28 @@
     for (const key of Array.from(feedNodes.keys())) {
       if (!wanted.has(key)) feedNodes.delete(key);
     }
-    restoreFeed(list, anchor);
+
+    /* A TAP OF +5 BEATS THE ANCHOR. The anchor's job is to hold the view
+     * still while the station talks underneath it; this is the one case
+     * where the operator asked the view to MOVE, and to the rows that were
+     * just brought in. `feedReveal` is the index of the first of them. */
+    if (feedReveal > 0 && order[feedReveal]) {
+      const box = list.getBoundingClientRect();
+      const first = order[feedReveal].getBoundingClientRect();
+      list.scrollTop = Math.max(0, list.scrollTop + (first.top - box.top));
+      feedReveal = 0;
+    } else {
+      restoreFeed(list, anchor);
+    }
 
     const tally = el("pbTally");
     if (tally) {
-      const takeables = rows.filter(takeable).length;
+      const takeables = newestFirst.filter(takeable).length;
       tally.textContent = rows.length
-        ? takeables + " of " + rows.length + " takeable" : "";
+        ? order.length + " of " + rows.length + " \u00b7 "
+          + takeables + " takeable" : "";
     }
+    paintSteps(rows.length);
   }
 
   /* --------------------------------------------------------------- build */
@@ -2260,6 +2297,13 @@
       '<div class="pb-feed-head">'
       + '<b>Feed</b>'
       + '<span id="pbTally" class="pb-tally"></span>'
+      /* THE WAY BACK. Only shown once the window has been widened,
+       * because until then it would do nothing, and every millimetre of
+       * a nine-inch head row is worth something. */
+      + '<button id="pbNewest" class="pb-toggle pb-step" hidden '
+      + 'title="Back to the newest entries">\u2191</button>'
+      + '<button id="pbMore" class="pb-toggle pb-step" '
+      + 'title="Bring in the previous five entries">+5</button>'
       + '<button id="pbWhole" class="pb-toggle" title="Grab this line alone, '
       + 'or the whole welded round it aired in">line</button>'
       + '</div><div id="pbFeed" class="pb-feed"></div>'
@@ -2661,6 +2705,50 @@
       el("pbWhole").textContent = grabWhole ? "round" : "line";
       el("pbWhole").classList.toggle("on", grabWhole);
     });
+
+    el("pbMore").addEventListener("click", () => stepFeed(FEED_STEP));
+    el("pbNewest").addEventListener("click", () => stepFeed(0));
+  }
+
+  /* The two step buttons, which only say what is true of the window now.
+   * The label counts down as the ring runs out - a button that still says
+   * "+5" with three entries left is a small lie, and the operator is using
+   * it to decide whether to keep tapping. */
+  function paintSteps(total) {
+    const more = el("pbMore");
+    const newest = el("pbNewest");
+    if (more) {
+      const left = Math.max(0, total - feedShown);
+      more.hidden = left <= 0;
+      more.textContent = "+" + Math.min(FEED_STEP, left);
+      more.title = left
+        ? "Bring in the previous " + Math.min(FEED_STEP, left)
+          + " entries (" + left + " older)"
+        : "";
+    }
+    if (newest) newest.hidden = feedShown <= FEED_START;
+  }
+
+  function stepFeed(by) {
+    const total = feedRows.length;
+    const was = feedShown;
+    if (by > 0) {
+      feedShown = Math.min(Math.max(total, FEED_START), feedShown + by);
+      /* The index of the first row brought in, which is where the view is
+       * sent. Nothing new means nothing to reveal. */
+      feedReveal = feedShown > was ? was : 0;
+    } else {
+      feedShown = FEED_START;
+      feedReveal = 0;
+    }
+    rememberModes();
+    /* Repaint now rather than at the next poll: a button that takes four
+     * seconds to answer reads as a button that did not work. */
+    paintFeed(feedRows);
+    if (by <= 0) {
+      const list = el("pbFeed");
+      if (list) list.scrollTop = 0;
+    }
   }
 
   /* --------------------------------------------------------------- mount */
