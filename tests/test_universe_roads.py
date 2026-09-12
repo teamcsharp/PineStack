@@ -30,10 +30,27 @@ class UniverseRoadsTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(bank.take("v", "xtts", "anything", crystal="OTHER:x"))
             chosen = bank.take("v", "xtts", "anything", crystal="DOOM:doom")
             self.assertEqual(chosen["said"], "I'm all ears, no fears, spit it here.")
-            # The fixed acknowledgments are only owed to the plain repertoire.
-            self.assertTrue(any(r["text"] == "Go on." for r in bank.missing_entries("v", "xtts")))
-            self.assertFalse(any(r["text"] == "Go on."
-                                 for r in bank.missing_entries("v", "xtts", crystal="DOOM:doom")))
+            # 2026-09-09: the fixed acknowledgments are owed to BOTH
+            # repertoires now. #1064 owed them only to the plain one, and
+            # the consequence was measured on air: under a crystal the
+            # listening pool could never grow, so it stayed at the seven
+            # rows that happened to be tinted before that rule landed and
+            # one back-channel aired fifteen times in an hour. Under a
+            # crystal they come back marked "rap" - the recorder raps each
+            # one before it records it, and what is stored is the bar.
+            self.assertTrue(any(r["text"] == "Go on."
+                                for r in bank.missing_entries("v", "xtts")))
+            owed = [r for r in bank.missing_entries("v", "xtts", crystal="DOOM:doom")
+                    if r["text"] == "Go on."]
+            self.assertEqual(len(owed), 1)
+            self.assertTrue(owed[0].get("rap"))
+            # ...and the plain take still never serves under the crystal,
+            # which is the invariant #1064 actually exists to protect.
+            self.assertEqual([r["text"] for r in bank.ready("v", "xtts", "DOOM:doom")],
+                             ["I'm listening."])
+            self.assertEqual([r.get("clip", {}).get("path")
+                              for r in bank.ready("v", "xtts", "DOOM:doom")],
+                             ["/voice/bar.wav"])
 
     def test_the_playlist_speaks_the_bar(self):
         playlist = [{"who": "dj", "chunk": "x" * 300, "turn_end": False},

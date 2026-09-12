@@ -218,12 +218,18 @@ class WholeResumeTests(unittest.IsolatedAsyncioTestCase):
         self.writer.side_effect = ['1: Still a failed first candidate.',
                                    '2: Still a failed second candidate.',
                                    '3: Still a failed third candidate.']
+        # 2026-09-09: 1100, not 900. The ceiling here is chosen so that
+        # EXACTLY ONE of these turns fits a visit - that is what the rotation
+        # is being tested for - and budget_plan's expansion estimate rose with
+        # the bar length rule, so 900 now fits none of them and the road under
+        # test is never reached. The scenario is the same one, sized for the
+        # estimate it is measured against.
         for i in range(3):
             before = self.writer.await_count
-            await self.resume(progress, ceiling=900)
+            await self.resume(progress, ceiling=1100)
             self.assertEqual(self.writer.await_count, before + 1)
             self.assertEqual(self.writer.call_args.kwargs['mark']['turn_ids'], [i + 1])
-            self.assertLessEqual(self.writer.call_args.kwargs['limit'], 900)
+            self.assertLessEqual(self.writer.call_args.kwargs['limit'], 1100)
         self.assertEqual(progress['repair_next'], 0)
 
     async def test_untouched_failures_do_not_rejournal_but_each_fresh_attempt_still_learns(self):

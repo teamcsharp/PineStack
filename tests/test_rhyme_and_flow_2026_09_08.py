@@ -187,7 +187,9 @@ class TheDeepRepertoire(unittest.TestCase):
     def test_a_gold_bar_may_fill_a_gap_under_the_floor(self):
         with open(app.__file__, encoding="utf-8") as handle:
             body = handle.read()
-        self.assertIn("went = await gold_fill_gap(why, floorless=floor_held)", body)
+        # 2026-09-09: the gap filler asks for a RUN now, not one bar - a
+        # shorter runway under the floor, the full one when the air is free.
+        self.assertIn("ahead=GOLD_RUN_AHEAD_HELD if floor_held else GOLD_RUN_AHEAD", body)
         self.assertIn("_door = _dj_speak_floorless if floorless else dj_speak", body)
 
 
@@ -197,7 +199,19 @@ class TheCallsComplete(unittest.TestCase):
             body = handle.read()
         self.assertIn("A PHONE CALL IS NEVER PAGED", body)
         at = body.find("A PHONE CALL IS NEVER PAGED")
-        self.assertIn("elif caller_name:", body[at:at + 1600])
+        block = body[at:at + 3000]
+        # 2026-09-09: the rule is not that the branch EXISTS - it did, and it
+        # was unreachable behind two `_all_hit` arms, which is how a fully
+        # banked call over 150s was still being paged in eights. What is
+        # asserted is that the caller test comes FIRST.
+        # Anchored on the STATEMENTS at their own indentation - the prose
+        # above them names both branches and would otherwise answer for
+        # the code.
+        caller_at = block.find("            if caller_name:")
+        all_hit_at = block.find("            elif _all_hit and")
+        self.assertGreater(caller_at, 0, "the caller branch is gone")
+        self.assertGreater(all_hit_at, caller_at,
+                           "a call can still be paged: _all_hit is tested first")
 
     def test_a_part_aired_round_is_not_abandoned(self):
         with open(app.__file__, encoding="utf-8") as handle:

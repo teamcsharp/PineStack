@@ -27,9 +27,15 @@ class CrystalPromptIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        # 2026-09-09: these cases count the asks of the FIRST-PASS ladder -
+        # the meta retry, the unchanged retry, caller fidelity and the
+        # evaluator repair. The one revision pass added the same day is a
+        # separate stage that runs on an ALREADY-ACCEPTED bar and is proved in
+        # test_crystal_revision; left on here it would be priced into every
+        # ladder count and hide the thing these cases measure.
         self.settings = {**app.DEFAULT_DJ, "reply_max_chars": 1000,
                          "crystal_tint_pass": True, "crystal_tint_hold": True,
-                         "crystal_coverage": 100}
+                         "crystal_coverage": 100, "crystal_revision": "off"}
         values = {
             "dj_settings": mock.Mock(return_value=self.settings),
             "crystal_force": mock.Mock(return_value=.88),
