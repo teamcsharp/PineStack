@@ -611,11 +611,24 @@
     }
   }
 
+  /* WHO WANTS TO KNOW WHEN THE PAD OR THE BANK CHANGES.
+   *
+   * The face - the knob row and the edit sheet - has to follow the selection,
+   * and polling for it would be a timer running all day to catch something
+   * that happens when a finger moves. */
+  const watchers = [];
+  function told() {
+    for (const fn of watchers) {
+      try { fn(bank, selected); } catch (err) { /* one bad watcher, not all */ }
+    }
+  }
+
   function select(index) {
     selected = index;
     document.querySelectorAll(".pb-pad").forEach((element) => {
       element.classList.toggle("selected", Number(element.dataset.pad) === index);
     });
+    told();
   }
 
   /* ---------------------------------------------------------------- chop */
@@ -987,6 +1000,7 @@
     if (foot) foot.textContent = footprintLine();
 
     paintBanks();
+    told();
   }
 
   /* ------------------------------------------------------------- kits */
@@ -1823,6 +1837,7 @@
     }, extra || {});
     meta.seconds = engine().seconds(key);
     layout[bank][index] = meta;
+    if (root.PineSamplerFace) root.PineSamplerFace.forgetPeaks(key);
     saveLayout();
     paintPads();
     return meta;
@@ -2500,6 +2515,10 @@
      * empty pad, or the first hold finds an empty buffer. It is idempotent
      * and cheap, so starting it on every mount is the safe shape. */
     if (root.PineAir) root.PineAir.start();
+    /* The face - the wallpaper, the waveforms on the pads, the knob row and
+     * the edit sheet. It hangs off the seams this file publishes rather than
+     * reaching inside, so it can be absent without anything here noticing. */
+    if (root.PineSamplerFace) root.PineSamplerFace.start();
     paintDials();
     engine().setPolyphonic(modes.poly);
     paintPads();
@@ -2574,6 +2593,12 @@
     /* The kit loader writes whole banks back; it needs the same door the
      * sampler's own imports use rather than a second store of its own. */
     put: dbPut,
+    /* Told on every selection and every repaint, so the face follows without
+     * a timer of its own. */
+    onPad: (fn) => { if (typeof fn === "function") watchers.push(fn); },
+    select,
+    padCount: PADS,
+    bankCount: BANKS,
     /* "Put this somewhere" - used by the Listen view's grab pad, which has
      * no bank or pad in mind and wants the roll across banks for free. */
     putBytes: putBytesAnywhere,

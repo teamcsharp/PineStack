@@ -75,7 +75,7 @@
     if (!pad) {
       pad = {
         id: key, buffer: null, reversed: null,
-        gain: 1, pitch: 1, loop: false, reverse: false,
+        gain: 1, pitch: 1, pan: 0, loop: false, reverse: false,
         trim: null,          /* {start, end} in seconds, or null for whole  */
         choke: ""            /* pads sharing a non-empty group cut each other */
       };
@@ -267,6 +267,13 @@
       const pad = padRecord(padId);
       if ("gain" in patch) pad.gain = Math.max(0, Math.min(4, Number(patch.gain) || 0));
       if ("pitch" in patch) pad.pitch = Math.max(0.03125, Math.min(32, Number(patch.pitch) || 1));
+      /* -1 hard left, 0 centre, +1 hard right - the same range and the same
+       * meaning as the native engine, so a pad patched from the view lands
+       * in the same place on either terminal. NaN is centre, not silence. */
+      if ("pan" in patch) {
+        const want = Number(patch.pan);
+        pad.pan = isFinite(want) ? Math.max(-1, Math.min(1, want)) : 0;
+      }
       if ("loop" in patch) pad.loop = !!patch.loop;
       if ("choke" in patch) pad.choke = String(patch.choke || "");
       if ("reverse" in patch) {
@@ -315,13 +322,20 @@
       source.playbackRate.value = pitch;
 
       const gain = audio.createGain();
+      /* PAN, to match the native engine. StereoPannerNode is constant-power
+       * the same way the C++ mixer is, so a pad sounds in the same place on
+       * either terminal - which is the point of the two sharing a seam. */
+      const panner = typeof audio.createStereoPanner === "function"
+        ? audio.createStereoPanner() : null;
+      if (panner) panner.pan.value = Math.max(-1, Math.min(1, pad.pan || 0));
       const peak = pad.gain * velocity;
       const now = audio.currentTime;
       gain.gain.setValueAtTime(0, now);
       gain.gain.linearRampToValueAtTime(peak, now + ATTACK);
 
       source.connect(gain);
-      gain.connect(master);
+      if (panner) { gain.connect(panner); panner.connect(master); }
+      else gain.connect(master);
 
       const { offset, duration } = window_(pad, buffer);
       if (loop) {

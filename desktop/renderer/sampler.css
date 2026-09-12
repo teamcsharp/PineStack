@@ -921,3 +921,296 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ==========================================================================
+   THE FACE: a photograph behind the pads, waveform tiles, knobs, edit sheet
+   ========================================================================== */
+
+/* THE BACKDROP.
+ *
+ * Fixed rather than scrolled, and covered rather than contained: the picture
+ * is a room the instrument sits in, not a tile. The dark wash over it is not
+ * decoration - a gallery render is a full-contrast photograph and white pad
+ * text on top of one is unreadable perhaps a third of the time. The wash
+ * makes the type legible against ANY picture, which is the only way a
+ * changing backdrop can be allowed. */
+#sampler.pb-skinned, .pb-sampler.pb-skinned {
+  background-size: cover;
+  background-position: center;
+  background-attachment: local;
+  background-repeat: no-repeat;
+  position: relative;
+}
+#sampler.pb-skinned::before, .pb-sampler.pb-skinned::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(9,13,17,.74), rgba(9,13,17,.86));
+  pointer-events: none;
+  z-index: 0;
+}
+#sampler.pb-skinned > *, .pb-sampler.pb-skinned > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* Pads let the room through. A solid tile over a photograph looks like a
+ * sticker; a translucent one looks like glass on top of it. */
+#sampler.pb-skinned .pb-pad, .pb-sampler.pb-skinned .pb-pad {
+  background: rgba(28, 36, 44, .58);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  border-color: rgba(255, 255, 255, .22);
+}
+#sampler.pb-skinned .pb-pad.filled, .pb-sampler.pb-skinned .pb-pad.filled {
+  background: rgba(34, 43, 53, .72);
+}
+#sampler.pb-skinned .pb-left, .pb-sampler.pb-skinned .pb-left,
+#sampler.pb-skinned .pb-dials, .pb-sampler.pb-skinned .pb-dials {
+  background: rgba(16, 20, 25, .72);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  border-radius: 10px;
+}
+
+/* The waveform each pad carries, behind its own label. */
+.pb-pad-wave {
+  position: absolute;
+  left: 6px; right: 6px; top: 50%;
+  transform: translateY(-58%);
+  width: calc(100% - 12px);
+  height: 44px;
+  opacity: .85;
+  pointer-events: none;
+}
+.pb-pad.filled .pb-pad-label { position: relative; }
+
+/* --- the knob row --------------------------------------------------------
+ *
+ * Above the grid and below the banks, which is where the reference puts it:
+ * the knobs act on the SELECTED pad, so they belong between the thing that
+ * chooses a pad and the thing that plays it. */
+.pb-face {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(16, 20, 25, .66);
+  border: 1px solid var(--line);
+}
+.pb-face.empty { opacity: .45; pointer-events: none; }
+
+.pb-knob {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 64px;
+  touch-action: none;
+  cursor: ns-resize;
+}
+.pb-knob-dial {
+  position: relative;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 38% 32%, #fdfdfd, #d8dee2 62%, #b9c2c8);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, .5), inset 0 -2px 5px rgba(0, 0, 0, .18);
+}
+.pb-knob.turning .pb-knob-dial { box-shadow: 0 0 0 2px var(--cyan), 0 2px 6px rgba(0,0,0,.5); }
+/* The pointer is drawn from the centre so a rotate() about the middle puts
+ * its tip on the rim - a mark positioned at the rim and rotated about itself
+ * would orbit instead of turn. */
+.pb-knob-mark {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2px;
+  height: 46%;
+  margin-left: -1px;
+  background: #2a333a;
+  border-radius: 2px;
+  transform-origin: 50% 100%;
+  transform: translateY(-100%) rotate(0deg);
+}
+.pb-knob-mark { transform-origin: 1px 100%; }
+.pb-knob-dial .pb-knob-mark { top: 4%; height: 46%; }
+.pb-knob-name {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: .1em;
+  color: var(--red, #e46b6b);
+}
+.pb-knob-said {
+  font-size: 10.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.pb-face-acts {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.pb-face-act {
+  min-width: 108px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: #f2f5f6;
+  color: #c4444f;
+  border: 1px solid rgba(0, 0, 0, .25);
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  cursor: pointer;
+}
+.pb-face-act:hover { background: #fff; }
+.pb-face-skin { background: #222b35; color: var(--cyan); border-color: var(--line); }
+
+/* --- the edit sheet ------------------------------------------------------
+ *
+ * It drops over the pads rather than opening beside them: on a nine-inch
+ * screen there is no beside, and the reference does the same. */
+.pb-edit {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 8px;
+  z-index: 40;
+  padding: 10px;
+  border-radius: 14px;
+  background: #7fd4ea;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, .55);
+}
+.pb-edit-stage {
+  position: relative;
+  border-radius: 10px;
+  background: #7d2b33;
+  border: 2px solid #e46b6b;
+  overflow: hidden;
+}
+.pb-edit-wave { display: block; width: 100%; height: 150px; }
+.pb-edit-lane {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 100%;
+  touch-action: none;
+  cursor: ew-resize;
+}
+.pb-edit-band {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: rgba(127, 212, 234, .16);
+  pointer-events: none;
+}
+.pb-edit-handle {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 3px;
+  margin-left: -1px;
+  background: #fff;
+  box-shadow: 0 0 6px rgba(0, 0, 0, .6);
+  pointer-events: none;
+}
+.pb-edit-tabs { display: flex; justify-content: flex-end; margin: 6px 2px 0; }
+.pb-edit-tab {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .14em;
+  color: #0d3a46;
+  opacity: .75;
+}
+.pb-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.pb-edit-arrow {
+  flex: 0 0 auto;
+  width: 46px;
+  padding: 10px 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #0d3a46;
+  font-size: 17px;
+  cursor: pointer;
+}
+.pb-edit-arrow:hover { background: rgba(255, 255, 255, .35); }
+.pb-edit-modes { flex: 1; display: flex; gap: 8px; }
+.pb-edit-mode {
+  flex: 1;
+  padding: 11px 6px;
+  border-radius: 8px;
+  background: #fff;
+  color: #c4444f;
+  border: 1px solid rgba(0, 0, 0, .18);
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  cursor: pointer;
+}
+.pb-edit-mode.on { background: #e4525f; color: #fff; border-color: #b93b47; }
+.pb-edit-said {
+  margin: 8px 2px 2px;
+  font-size: 10.5px;
+  color: #0d3a46;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- the backdrop picker -------------------------------------------------- */
+
+.pb-skins {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2147483041;
+  width: min(640px, 94vw);
+  max-height: 86vh;
+  overflow: auto;
+  padding: 16px 18px 18px;
+  border-radius: 14px;
+  background: #1c242c;
+  color: #edf3f5;
+  border: 1px solid #35414c;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+}
+.pb-skins-head { display: flex; align-items: center; justify-content: space-between; }
+.pb-skins-x {
+  background: none; border: 0; color: #8fa0ad;
+  font-size: 22px; line-height: 1; cursor: pointer;
+}
+.pb-skins-acts { display: flex; gap: 6px; margin: 10px 0 12px; flex-wrap: wrap; }
+.pb-skins-act {
+  flex: 1 1 auto;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: none;
+  color: #65c7da;
+  border: 1px solid #35414c;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.pb-skins-act:hover { background: #222b35; }
+.pb-skins-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+}
+.pb-skins-tile {
+  aspect-ratio: 1 / 1;
+  border-radius: 8px;
+  border: 1px solid #35414c;
+  background-size: cover;
+  background-position: center;
+  cursor: pointer;
+  padding: 0;
+}
+.pb-skins-tile:hover { border-color: #65c7da; }
+.pb-skins-none { font-size: 12px; color: #8fa0ad; }
