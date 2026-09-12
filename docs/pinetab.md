@@ -834,6 +834,11 @@ are drawn dashed so they never again look like a light that could be left on.
   the same `/comfy-output` folder, the same `favorites.md`, the same twenty
   transitions, and the SC stack's console folded into one poll because
   eleven subprocesses cannot run here.
+* **The overlays** — same document, `#1241`. The readouts are the product:
+  the render ComfyUI is working on and its prompt, the per-core CPU, the
+  NVIDIA section, the OpenWebUI rolodex with its resident models. One module
+  that also runs standalone at `/spark`, and that stops polling the moment
+  nobody is looking at it.
 
 * **The headphone jack** — working, after five dead roads. See
   *The 3.5 mm jack* above. The terminal makes the wired-device announcement the
@@ -847,7 +852,101 @@ are drawn dashed so they never again look like a light that could be left on.
 
 ---
 
-## 11. What comes next
+## 11. Off the LAN: the tailnet road
+
+"I want to be able to connect the tablet up to my phone through 3G or the
+localized network and be able to connect and interact with the radio and be
+able to start it, have it broadcast to me and be able to download samples to
+the sampler."
+
+**The station and the DGX Spark are the same machine.** Worth stating plainly,
+because the ask named them separately: `lilspark` is aarch64 with an NVIDIA
+GB10 and carries `~/oww-train`. One host, one Tailscale node, no subnet router
+and no second hop to arrange.
+
+| | |
+| --- | --- |
+| tailnet | `tail1fec29.ts.net`, account masterxeon1001@ |
+| the box | `lilspark` — `100.74.95.59`, MagicDNS `lilspark.tail1fec29.ts.net` |
+| also on it | `iphone184` (the phone), and this desktop, offline since ~89 days |
+| Tailscale SSH | enabled 2026-09-12 (`tailscale set --ssh=true`) |
+| sshd host keys | ED25519 `SHA256:uDi74jxpAQMe49eTEkTJy+oaokvfcVI6U1x7EVQyzlE` |
+| | RSA `SHA256:bxWiwv8E4GMpk3Ejwh+vaAEIoEU0iKTsszjwehC8THU` |
+
+### Three roads, and the terminal picks
+
+`net/Reach.kt` holds an ordered list and uses the first that answers:
+
+    http://10.89.1.246:8096            the LAN, at home
+    http://100.74.95.59:8096           the tailnet, from anywhere
+    http://lilspark.tail1fec29.ts.net  the same, by MagicDNS name
+
+The LAN goes first because Tailscale will happily carry traffic between two
+machines on the same switch and it is a longer path through a userspace TUN —
+and the panel is one very large document. The address goes before the name
+because `100.74.95.59` needs no resolver, while MagicDNS needs the tablet to
+be accepting Tailscale's DNS, which is a setting inside their app and
+therefore not something the terminal can promise.
+
+The road is chosen by `StationClient.reachable()`, which the offline banner
+already calls on its own retry — so a tablet carried out of the house
+re-chooses with no second timer and no "the network changed" listener.
+
+### Two things that will bite
+
+**The network policy fails closed.** `res/xml/network_security_config.xml`
+permits cleartext per host BY NAME. A road added to Reach and not to that file
+is refused before a packet leaves, and nothing in the failure says so. Both
+tailnet hosts are named there now.
+
+**A probe must confirm the STATION, not merely an answer.** `answers()` first
+accepted `200..499`, inherited from the old reachable() where the question was
+"is the station I already know about up?". As a road chooser that is wrong,
+and the first test proved it: pointed at `:8099` — the restart bridge — the
+terminal announced "station on the LAN" and loaded the panel from a service
+whose whole vocabulary is `{"error": "GET /status or POST /restart/<name>"}`.
+It now requires 200 and a body saying `"status"` and `ok`. The case that
+matters is a captive portal: exactly what sits between this tablet and the
+internet on somebody else's wifi, and it answers everything.
+
+Measured after the fix: pointed at the decoy it logged
+`station over the tailnet` and loaded from the second road; pointed at the
+real config it logged `station on the LAN`, panel up in 3.5s.
+
+### Why remote listening needs no station change
+
+The served panel contains **no absolute `http://10.89.1.246:` references at
+all**, and the feed hands out media as relative paths (`/sfx/<id>?t=<sig>`, and
+`media` as a bare filename). Everything therefore resolves against whatever
+origin the page was loaded from: load the panel from the tailnet address and
+the audio, the API and the sampler's clip cuts all follow it. Nothing on the
+station had to learn about Tailscale.
+
+### ConfigStore wrote an explicit key list
+
+`tailnetUrl` and `tailnetName` are settings rather than constants, so a tailnet
+address can move without a new build — but `ConfigStore` writes a named list of
+keys and they were not on it, so `writeConfig` appeared to work and read back
+the compiled-in default. `recordingFolder` was missing from that same list and
+had been since it was added, so "download it to the local recording folder"
+had never survived a restart. All three are stored now.
+
+### What still needs a human
+
+Tailscale 1.102.4 is installed on the tablet (`tailscale-android-universal`,
+SHA-256 verified against Tailscale's published checksum, signature verified).
+Two things cannot be done for the operator and should not be:
+
+1. **The VPN consent dialog** — `com.android.vpndialogs.ConfirmDialog`. Android
+   is asking the person, not the tool.
+2. **The sign-in** — the tailnet is an account.
+
+There is a browser on this GSI (`org.lineageos.jelly`), so the login flow can
+complete on the tablet itself. Until both are done the second and third roads
+cannot answer, and the terminal simply stays on the LAN — which is the correct
+behaviour when it is at home anyway.
+
+## 12. What comes next
 
 1. **Unlock** — through the app, past the gate above, with the tablet confirming
    on its own screen.
@@ -868,7 +967,7 @@ are drawn dashed so they never again look like a light that could be left on.
 
 ---
 
-## 12. Things that cost time, recorded so they do not again
+## 13. Things that cost time, recorded so they do not again
 
 - No adb on the machine means **no RSA prompt ever appears**. The empty device
   list is the symptom; the missing tool is the cause.
