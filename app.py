@@ -37059,12 +37059,30 @@ def cupboard_horizon() -> float:
     return float(hours) * 3600.0
 
 
+_CUPBOARD_SHORT_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
 def cupboard_short() -> list[dict[str, Any]]:
     """#1057: which roads are below the floor, worst first.
 
     Counts only footage that is actually usable - right cast, still
     within its horizon, audio present. This is the debt the station
-    carries until it is paid."""
+    carries until it is paid.
+
+    #1233: MEMOIZED 3s, the same medicine as dialogue_flow_state (#1149)
+    and for the same reason. This walks every row of every reusable road
+    and asks the filesystem about each one (`pantry_get` stats the clip),
+    and it is reached from /api/orchestrator/asks - which the panel was
+    polling THIRTY times a minute from two separate pollers. Measured on
+    the box 2026-09-12: 0.42-0.99 s per call, sequential, which is up to
+    half of every minute of the station's event loop spent counting a
+    shelf that had not changed, on the same loop that has to write and
+    record the show. A debt figure may be three seconds stale; the loop
+    may not be three seconds deaf."""
+    now_memo = time.time()
+    if (now_memo - float(_CUPBOARD_SHORT_MEMO["at"] or 0) < 3.0
+            and _CUPBOARD_SHORT_MEMO["value"] is not None):
+        return [dict(r) for r in _CUPBOARD_SHORT_MEMO["value"]]
     out: list[dict[str, Any]] = []
     try:
         floor = cupboard_floor()
@@ -37072,6 +37090,12 @@ def cupboard_short() -> list[dict[str, Any]]:
             return out
         horizon = cupboard_horizon()
         now = time.time()
+        # #1233: ONE cast signature for the whole walk. It was being
+        # rebuilt inside shelf_cast_stale for every row of every road -
+        # each rebuild taking the settings lock through dj_settings - so
+        # a few hundred rows meant a few hundred lock acquisitions to
+        # answer a question whose answer cannot change mid-walk.
+        cast_now = cast_signature()
         for kind in SHELF_REUSABLE:
             good = 0
             # #1169: banter is banked in the LARDER. Read off the shelf it
@@ -37079,8 +37103,9 @@ def cupboard_short() -> list[dict[str, Any]]:
             # on the station reported "have 0, short 8" and the pause was
             # spent building more of it.
             for row in road_source(kind):
-                if shelf_cast_stale(row):
-                    continue
+                was_cast = str(row.get("cast") or "")
+                if was_cast and was_cast != cast_now:
+                    continue          # #1233: shelf_cast_stale, hoisted
                 # 2026-09-10: AGE NO LONGER DISQUALIFIES STOCK, and the
                 # loop it was caught in is why.
                 #
@@ -37128,7 +37153,8 @@ def cupboard_short() -> list[dict[str, Any]]:
         out.sort(key=lambda r: -r["short"])
     except Exception:  # noqa: BLE001
         pass
-    return out
+    _CUPBOARD_SHORT_MEMO.update({"at": time.time(), "value": out})
+    return [dict(r) for r in out]
 
 
 def cupboard_rotate() -> dict[str, Any]:
@@ -40180,6 +40206,19 @@ def coordinator_hourly_state(refresh: bool = False) -> dict[str, Any]:
     }
 
 
+def _coordinator_hourly_brief() -> dict[str, Any]:
+    """#1233: the hour contract without the archive behind it.
+
+    Same object as `coordinator_hourly_state`, with `latest` cut from the
+    last twelve closed hours to the last one. See the call site in
+    `coordinator_state` for the measurement that motivated it."""
+    got = dict(coordinator_hourly_state())
+    archive = list(got.get("latest") or [])
+    got["latest"] = archive[:1]
+    got["latest_held"] = len(archive)      # the rest: /api/coordinator/hourly
+    return got
+
+
 def air_last_heard() -> float:
     """#1023: the last moment a LISTENER could hear anything, on any road.
 
@@ -41626,7 +41665,26 @@ def coordinator_state() -> dict[str, Any]:
             "plan": dict(_COORD_PLAN),
             # #1131: the exact active-hour contract, its pause yield and the
             # bounded corrections learned from prior closed hours.
-            "hourly": coordinator_hourly_state(),
+            #
+            # #1233: WITHOUT THE TWELVE CLOSED HOURS. `coordinator_state`
+            # is read through exactly one door - `dialogue_flow`, which
+            # rides every /api/dj poll - and measured on the tablet
+            # 2026-09-12 that one field was 233 kB of the route's 310 kB,
+            # shipped 24 times a minute, for NOBODY: the only client
+            # reader is djDialogueFlowPaint and it never looks at
+            # `.hourly` at all, here or in the desktop renderer or the
+            # kiosk views. The full twelve still live at their own door,
+            # /api/coordinator/hourly, which is where a reader would go.
+            #
+            # Why it mattered: the tablet's link delivers about 400 kB/s
+            # and the panel was asking for 24 MB a minute, so the six
+            # HTTP/1.1 sockets were permanently full and everything small
+            # queued behind them - a 2.4 kB /api/orchestrator/asks waited
+            # a measured 19 s, a 650-byte /api/radio/clock 21 s. That
+            # queue is what the operator feels as "the popup is slow".
+            # The newest closed hour stays, so anything asking "how did
+            # the last hour score" is answered without the archive.
+            "hourly": _coordinator_hourly_brief(),
             # #911: what is COMING and whether anything is ready for it.
             "upcoming": coord_upcoming()[:10],
             "bare_arrivals": dict(_BARE_ARRIVALS),
@@ -60103,7 +60161,8 @@ def sfxguy_ready_release(identity: str) -> bool:
 def _sfxguy_ready_status(voice: str = "") -> dict[str, Any]:
     """Inspect stock and receipts without starting any preparation work."""
     current = str(voice or dj_settings().get("drop_voice") or "")
-    rows = _SFX_READY_BANK.rows(current, _sfxguy_ready_profile())
+    rows = _SFX_READY_BANK.rows(current, _sfxguy_ready_profile(),
+                                deep=False)          # #1243: read-only
     ready = [row for row in rows if row.get("state") == "ready" and _sfxguy_ready_valid(row, current)]
     failed = sorted((row for row in rows if row.get("why") and row not in ready),
                     key=lambda row: float(row.get("last_attempt") or 0), reverse=True)
@@ -60237,7 +60296,7 @@ async def sfxguy_ready_prepare(limit: int = 1) -> dict[str, Any]:
             finally:
                 _SFX_READY_BANK.put(row)
         _SFX_READY_STATE.update(made=made, attempted=attempted, why=why, at=time.time(),
-            ready=len({row["text"] for row in _SFX_READY_BANK.rows(voice, profile)
+            ready=len({row["text"] for row in _SFX_READY_BANK.rows(voice, profile, deep=False)
                        if row.get("state") == "ready" and _sfxguy_ready_valid(row, voice)}))
     return dict(_SFX_READY_STATE)
 
@@ -61772,12 +61831,51 @@ SFX_BANS_PATH = data_path("sfx_bans.json")
 _SFX_BANS_LOCK = RLock()
 
 
-def sfx_bans() -> set[str]:
+# #1242: BOTH OF THESE WERE READ FROM DISK ON EVERY ROLL, and #1232's
+# dial moved the roll from once every forty-five seconds to once every
+# three. Memoised on the file's own (mtime, size) - which answers
+# exactly what a fresh read would, because every writer replaces the
+# file - with the stat behind it throttled to once a second.
+_SFX_FILE_MEMO: dict[str, dict[str, Any]] = {}
+
+
+def _sfx_file_memo(path: Any, parse: Any, empty: Any) -> Any:
+    key = str(path)
+    memo = _SFX_FILE_MEMO.setdefault(
+        key, {"at": 0.0, "sig": None, "val": empty})
+    now = time.time()
+    if now - float(memo.get("at") or 0) < 1.0 and memo.get("sig") is not None:
+        return memo["val"]
+    memo["at"] = now
     try:
-        rows = json.loads(SFX_BANS_PATH.read_text())
-        return {str(x) for x in rows} if isinstance(rows, list) else set()
-    except Exception:
-        return set()
+        st = path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        memo["sig"] = (0, 0)
+        memo["val"] = empty
+        return memo["val"]
+    if sig == memo.get("sig"):
+        return memo["val"]
+    try:
+        memo["val"] = parse(json.loads(path.read_text()))
+    except Exception:  # noqa: BLE001
+        memo["val"] = empty
+    memo["sig"] = sig
+    return memo["val"]
+
+
+def _sfx_file_sig(path: Any) -> Any:
+    """The stamp the memo above last read a file at - what the draw
+    sets are keyed on, so they turn over exactly when a file does."""
+    return (_SFX_FILE_MEMO.get(str(path)) or {}).get("sig")
+
+
+def sfx_bans() -> set[str]:
+    return _sfx_file_memo(
+        SFX_BANS_PATH,
+        lambda rows: ({str(x) for x in rows}
+                      if isinstance(rows, list) else set()),
+        set())
 
 
 # How often a given sample is allowed to come up (#645). A ban is a hard
@@ -61788,12 +61886,51 @@ _SFX_WEIGHTS_LOCK = RLock()
 
 
 def sfx_weights() -> dict[str, float]:
+    return _sfx_file_memo(
+        SFX_WEIGHTS_PATH,
+        lambda rows: ({str(k): float(v) for k, v in rows.items()}
+                      if isinstance(rows, dict) else {}),
+        {})
+
+
+# #1242: the ban-filtered pool, the weighted draw list and the fresh
+# set - rebuilt only when the pool, the bans or the weights move.
+_STING_DRAW_MEMO: dict[str, Any] = {"sig": None, "pool": [],
+                                    "names": [], "fresh": set()}
+
+
+def _sting_draw_sets() -> tuple:
+    """(pool, names_pool, fresh) for the sting draw, memoised.
+
+    Every one of these is a pure function of the clip pool, the bans
+    and the weights, and all three were recomputed on every roll -
+    fourteen thousand sha1 and a fourteen-thousand-string list, on the
+    event loop, three seconds apart."""
+    banned = sfx_bans()
+    weights = sfx_weights()
+    sig = (_SFX_POOL_AT[0], len(_SFX_POOL_CACHE),
+           _sfx_file_sig(SFX_BANS_PATH), _sfx_file_sig(SFX_WEIGHTS_PATH))
+    if _STING_DRAW_MEMO.get("sig") == sig:
+        return (_STING_DRAW_MEMO["pool"], _STING_DRAW_MEMO["names"],
+                _STING_DRAW_MEMO["fresh"])
+    pool = [p for p in _SFX_POOL_CACHE if sfx_id(p) not in banned]
+    if weights:
+        weighted: list[str] = []
+        for path in pool:
+            want = weights.get(sfx_id(path), 1.0)
+            if want <= 0.05:
+                continue                    # marked all the way down
+            weighted += [str(path)] * max(1, int(round(want * 2)))
+        names_pool = weighted or [str(p) for p in pool]
+    else:
+        names_pool = [str(p) for p in pool]
     try:
-        rows = json.loads(SFX_WEIGHTS_PATH.read_text())
-        return {str(k): float(v) for k, v in rows.items()} \
-            if isinstance(rows, dict) else {}
-    except Exception:
-        return {}
+        fresh = {str(p) for p in sfx_fresh_paths(pool)}
+    except Exception:  # noqa: BLE001
+        fresh = set()
+    _STING_DRAW_MEMO.update(sig=sig, pool=pool, names=names_pool,
+                            fresh=fresh)
+    return pool, names_pool, fresh
 
 
 def sfx_set_weight(sid: str, weight: float) -> dict[str, float]:
@@ -62630,38 +62767,19 @@ def sting_due() -> Path | None:
         return None
     if random.random() >= dj["sfx_rate"]:
         return None
-    banned = sfx_bans()
     # #826: never walk the share here — the cache refreshes off-loop
     # once a minute, and a newly dropped file is in the draw on the
     # next refresh rather than at the price of a frozen event loop.
     if time.time() - _SFX_POOL_AT[0] > 60:
         fire_and_forget(_sfx_pool_refresh())
-    pool = [p for p in _SFX_POOL_CACHE if sfx_id(p) not in banned]
+    # #1242: ...and never walk the CACHE here either. The ban filter,
+    # your per-sample dial (#645) and the fresh list (#1062) are all
+    # pure functions of the pool, the bans and the weights, and all
+    # three were rebuilt on every roll. The draw itself is unchanged -
+    # `unrepeated` below still chooses on every call.
+    pool, names_pool, fresh = _sting_draw_sets()
     if not pool:
         return None
-    # Your dial on each one (#645): a sample marked down comes up rarely, one
-    # marked up leans in. Applied as repeats in the draw so the unrepeated
-    # memory below still works exactly as it did.
-    weights = sfx_weights()
-    if weights:
-        weighted: list[str] = []
-        for path in pool:
-            want = weights.get(sfx_id(path), 1.0)
-            if want <= 0.05:
-                continue                    # marked all the way down
-            weighted += [str(path)] * max(1, int(round(want * 2)))
-        names_pool = weighted or [str(p) for p in pool]
-    else:
-        names_pool = [str(p) for p in pool]
-    # #1062: HALF THE DRAWS GO TO WHAT IS NEW. A never-played sample, or
-    # one first seen inside SFX_FRESH_HOURS, is drawn from its own short
-    # list on a coin flip - through the same unrepeated memory, so a
-    # single new file does not land three times in a row. The other half
-    # of the draws is the rotation exactly as it was.
-    try:
-        fresh = {str(p) for p in sfx_fresh_paths(pool)}
-    except Exception:  # noqa: BLE001
-        fresh = set()
     if fresh and random.random() < SFX_FRESH_SHARE:
         fresh_pool = [n for n in names_pool if n in fresh] or sorted(fresh)
         names = unrepeated(fresh_pool, "sting",
@@ -105199,6 +105317,7 @@ async def response_bank_play_api(
 @app.get("/api/dj/pending")
 async def dj_pending(
     full: int = 0,
+    have: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """#887: the rounds waiting to go on air, and how ready each one is.
@@ -105234,14 +105353,68 @@ async def dj_pending(
     full=1 today, so nothing that works now changes."""
     require_read_auth(authorization)
     want_full = bool(full)
-    rows: list[dict[str, Any]] = []
-    for at, entry in enumerate(list(_LARDER)):
+
+    # #1233: THE SIGNATURE PASS, and why `have` exists.
+    #
+    # #1160 above cut the payload from 2.1 MB to 758 kB and named the
+    # real constraint while doing it: "that mattered because of the
+    # connection pool, not the bandwidth". Measured again on the tablet
+    # 2026-09-12, with the panel idle and untouched, this route was still
+    # 6.8 MB of the 12.2 MB the panel pulled in thirty seconds, against a
+    # link that delivers about 400 kB/s. The six HTTP/1.1 sockets were
+    # therefore never free, and the small requests behind them waited: a
+    # 2.4 kB /api/orchestrator/asks took 19 s and a 650-byte
+    # /api/radio/clock took 21 s, while the same two calls answered in
+    # 0.6 s and 0.03 s on the box itself. That queue is the whole of what
+    # the operator feels when a popup will not open.
+    #
+    # But the client already knows it does not need the payload.
+    # djPendingTick decides whether to repaint from six fields a row -
+    # id/state/made/chunks/turns/progress - and holds still otherwise.
+    # So it now sends back the signature of what it last painted and this
+    # answers "same" until something really moves, which on a settled
+    # reserve is most of the time. The walk still happens (the signature
+    # is made of it) but the rows, the preview lines and three 12,000-
+    # character scripts a row are neither built nor sent.
+    #
+    # No `have` behaves exactly as before, so every other reader -
+    # pvPending's drawers, ?full=1, anything outside this file - is
+    # untouched.
+    held: list[tuple[Any, list[Any], int, int, str, str]] = []
+    for entry in list(_LARDER):
         try:
             turns = banter_turns(str(entry.get("script") or ""),
                                  str(entry.get("caller_name") or ""),
                                  str(entry.get("caller2_name") or ""))
         except Exception:  # noqa: BLE001
             turns = []
+        chunks = int(entry.get("chunks") or 0)
+        made = int(entry.get("made") or 0)
+        state = ("ready" if dialogue_row_ready("banter", entry)
+                 else "tinting" if entry.get("tinting")
+                 else "rendering" if entry.get("preparing")
+                 else "waiting for tint" if not dialogue_tint_ready("banter", entry)
+                 else "written")
+        row_id = hashlib.sha1(
+            str(entry.get("script") or "").encode("utf-8", "ignore")
+        ).hexdigest()[:10]
+        held.append((entry, turns, chunks, made, state, row_id))
+
+    window = pantry_window()
+    buffered = prepared_seconds()                                # #1048
+    mark = hashlib.sha1(json.dumps(
+        [int(round(float(buffered or 0))), str(window or ""), want_full,
+         [[row_id, state, made, chunks, len(turns),
+           int(round((made / chunks if chunks else 0.0) * 100))]
+          for _entry, turns, chunks, made, state, row_id in held]],
+        default=str).encode("utf-8", "ignore")).hexdigest()[:16]
+    if have and have == mark:
+        return {"same": True, "sig": mark, "pending": None,
+                "pending_rows": len(held), "buffered_seconds": buffered,
+                "window": window, "building": bool(window)}
+
+    rows: list[dict[str, Any]] = []
+    for at, (entry, turns, chunks, made, state, row_id) in enumerate(held):
         said = []
         _cast: dict[str, dict[str, Any]] = {}                    # #1030
         for marker, text in turns[:14]:
@@ -105258,13 +105431,9 @@ async def dj_pending(
                 # thrown away after the preview.
                 _seat = _cast.setdefault(who, {"who": who, "turns": 0})
                 _seat["turns"] += 1
-        chunks = int(entry.get("chunks") or 0)
-        made = int(entry.get("made") or 0)
-        state = ("ready" if dialogue_row_ready("banter", entry)
-                 else "tinting" if entry.get("tinting")
-                 else "rendering" if entry.get("preparing")
-                 else "waiting for tint" if not dialogue_tint_ready("banter", entry)
-                 else "written")
+        # chunks / made / state / the row id were all worked out in the
+        # signature pass above; this loop reuses them rather than asking
+        # the shelf the same questions twice (#1233).
         # #1030: names and voices onto the seats, and the live ones
         # marked - a caller's phone line is drawn per call, so those
         # turns cannot be recorded ahead and the listing should say so
@@ -105287,9 +105456,7 @@ async def dj_pending(
         rows.append({
             "cast": sorted(_cast.values(),
                            key=lambda c: -int(c.get("turns") or 0)),
-            "id": hashlib.sha1(
-                str(entry.get("script") or "").encode("utf-8", "ignore")
-            ).hexdigest()[:10],
+            "id": row_id,
             "at": float(entry.get("at") or 0),
             "state": state,
             "tint_revalidation": dict(entry.get("tint_revalidation") or {}),
@@ -105334,10 +105501,10 @@ async def dj_pending(
                                or [])[:12],
             } if entry.get("tint") else {},
         })
-    window = pantry_window()
     return {
         "pending": rows,
-        "buffered_seconds": prepared_seconds(),  # #1048
+        "sig": mark,                             # #1233: send it back next time
+        "buffered_seconds": buffered,            # #1048
         "pantry_clips": len(_PANTRY),
         "window": window,
         "building": bool(window),
@@ -115105,14 +115272,55 @@ async def perf(
     return out
 
 
+_HEALTH_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+_HEALTH_MEMO_LOCK = asyncio.Lock()
+HEALTH_MEMO_REST = 20.0
+
+
 @app.get("/api/health/details")
 async def health_details(
+    fresh: int = 0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Everything the health popup shows: per-service state, loaded models,
-    system stats, and recent operation timings."""
+    system stats, and recent operation timings.
+
+    #1233: BEHIND A 20-SECOND MEMO, AND ONE PROBE AT A TIME.
+
+    This is the most expensive read on the station and it was the most
+    frequent. `services_census` knocks on five services over the network
+    and then runs a REAL SearXNG search; measured sequentially on the box
+    2026-09-12 it took 5.2, 5.8, 13.6, 14.4, 22.5 and 32.4 seconds. The
+    panel's screensaver vitals line (sparkShowVitals) asked for it every
+    FOUR, so seven censuses were in flight at once, each holding five
+    outbound connections, to paint one line of text that reads "RAM 62%
+    - GPU 51C - services 5 up".
+
+    The memo is on the ROUTE, not on `services_census`, deliberately: the
+    steward's second census after a repair has to be live evidence that
+    the repair took, and the chat's "how are the services doing" is asked
+    by a person who has just asked. Those keep calling the function
+    directly. `?fresh=1` is here for a hand on the popup that wants to
+    see the knock happen.
+
+    The lock is the other half. Without it a burst of pollers each
+    started their own census before any of them finished, which is how
+    four seconds of poll became thirty seconds of probing."""
     require_read_auth(authorization)
-    return await services_census()
+    now = time.time()
+    if (not int(fresh or 0) and _HEALTH_MEMO["value"] is not None
+            and now - float(_HEALTH_MEMO["at"] or 0) < HEALTH_MEMO_REST):
+        return _HEALTH_MEMO["value"]
+    async with _HEALTH_MEMO_LOCK:
+        # Someone else may have taken it while we waited for the lock -
+        # that is the whole point of waiting.
+        now = time.time()
+        if (not int(fresh or 0) and _HEALTH_MEMO["value"] is not None
+                and now - float(_HEALTH_MEMO["at"] or 0) < HEALTH_MEMO_REST):
+            return _HEALTH_MEMO["value"]
+        got = await services_census()
+        _HEALTH_MEMO.update({"at": time.time(), "value": got})
+        return got
 
 
 async def services_census() -> dict[str, Any]:
@@ -152399,6 +152607,10 @@ var djPendTimer = null;
 var djPendFrame = 0;
 /* #1160: one request at a time. See djPendingTick below. */
 var djPendBusy = false;
+/* #1233: the signature of the listing this panel last painted. It rides
+ * up with the next request so the station can answer "same" instead of
+ * resending three quarters of a megabyte. */
+var djPendSig = "";
 const DJ_SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 function djPendingStyle() {
@@ -152436,10 +152648,41 @@ async function djPendingTick(force) {
    * pvPending() above has carried exactly this guard all along; this is
    * the same one. Skipping a tick costs nothing - the next is 1.6s away
    * and repaints from fresher data than the one we dropped. */
+  /* #1233: AND THE ANSWER IS STILL 758 kB, SO ASK FOR IT ONLY WHEN IT
+   * HAS CHANGED.
+   *
+   * #1160 above cut the payload and named the real constraint while
+   * doing it. Measured again on the tablet 2026-09-12, idle: this route
+   * was 6.8 MB of the 12.2 MB the panel pulled in thirty seconds, over a
+   * link that carries about 400 kB/s. The six sockets were therefore
+   * never free and every small request queued - /api/orchestrator/asks
+   * (2.4 kB) took a measured 19 s, /api/radio/clock (650 bytes) 21 s -
+   * which is exactly what the operator feels when a popup will not open.
+   *
+   * The signature below is the whole of what this tick needs to decide
+   * whether to repaint. So it now goes UP with the request, and the
+   * station answers `{same:true}` - about sixty bytes - until something
+   * really moves. When it says same we carry on with the last full
+   * payload, so the spinner still turns and the fold still folds; only
+   * the wire is quiet. */
   if (djPendBusy) return;
   djPendBusy = true;
   let got = null;
-  try { got = await api("/api/dj/pending"); }
+  try {
+    const ask = "/api/dj/pending"
+      + (!force && djPendSig && PV_PEND.data
+         ? "?have=" + encodeURIComponent(djPendSig) : "");
+    got = await api(ask);
+    if (got && got.same) {
+      got = PV_PEND.data;                 /* nothing moved; reuse it */
+    } else if (got && got.pending) {
+      djPendSig = String(got.sig || "");
+      /* One fetch for the strip AND for the drawers below it, which
+       * used to keep their own copy of the same 758 kB (pvPending). */
+      PV_PEND.data = got;
+      PV_PEND.at = Date.now();
+    }
+  }
   catch (e) { host.style.display = "none"; return; }
   finally { djPendBusy = false; }
   const rows = (got && got.pending) || [];
@@ -174484,6 +174727,152 @@ let orchTimer = null;
 let orchPicks = {};
 let orchLastOpen = -1;
 
+/* #1233: ONE READER FOR /api/orchestrator/asks, AND THE TAP NEVER WAITS
+ * ON IT.
+ *
+ * Measured on the tablet 2026-09-12. Four separate places fetched this
+ * route: orchBell() and orchToast() BOTH ran on every djRender, which is
+ * every four seconds, back to back; orchPaint() ran on its own 20s
+ * timer; and orchPlexusOpen() - the popup the operator actually taps -
+ * fetched it AGAIN before drawing anything at all. Counted over thirty
+ * seconds of an idle panel: fifteen calls, thirty a minute, for a route
+ * that costs 0.42-0.99 s of the station's event loop per call and which
+ * answered `open: 0` every single time.
+ *
+ * What that cost the operator: the panel pulls 12.2 MB in thirty
+ * seconds over a link that carries about 400 kB/s, so the six HTTP/1.1
+ * sockets are always full. A bare GET of this 2.4 kB route from the
+ * tablet was timed at 3.4, 3.4, 4.1, 6.1, 7.9, 12.7 and 28.2 seconds,
+ * against 0.7-1.6 s with the heavy pollers held back. orchPlexusOpen
+ * put that wait BETWEEN the finger and any pixel moving - tap, then
+ * three to twenty-eight seconds of nothing, then the popup.
+ *
+ * So: one fetch, shared, with the in-flight call deduplicated; and the
+ * popup opens from what is already held. The toast the operator is
+ * tapping was BUILT from that row - the data is in the page already, and
+ * going back for it was never anything but a round trip. */
+const ORCH_ASKS = {at: 0, data: null, busy: null};
+const ORCH_ASKS_REST = 3500;     // under the 4s djRender beat, so one per beat
+
+function orchAsks(force) {
+  const fresh = !force && ORCH_ASKS.data
+                && (Date.now() - ORCH_ASKS.at) < ORCH_ASKS_REST;
+  if (fresh) return Promise.resolve(ORCH_ASKS.data);
+  if (ORCH_ASKS.busy) return ORCH_ASKS.busy;     // never two at once
+  ORCH_ASKS.busy = fetch("/api/orchestrator/asks")
+    .then((r) => r.json())
+    .then((data) => {
+      ORCH_ASKS.at = Date.now();
+      ORCH_ASKS.data = data;
+      return data;
+    })
+    .catch(() => ORCH_ASKS.data)    /* the last answer beats no answer */
+    .finally(() => { ORCH_ASKS.busy = null; });
+  return ORCH_ASKS.busy;
+}
+
+/* What the popup should draw RIGHT NOW, with no network at all. Null
+ * only before the first poll has ever landed. */
+function orchAsksHeld() {
+  return ORCH_ASKS.data;
+}
+
+/* #1233: THE ANSWER GOES AT ONCE, THE STATION CATCHES UP.
+ *
+ * The old handler disabled the button, said "applying…", awaited the
+ * POST, and then waited a further 1,700 ms on a timer before closing.
+ * Measured on the tablet, the POST alone queues behind the panel's own
+ * polling the same way every other request does - seconds, not
+ * milliseconds - so the operator's "tap an answer and it goes away" was
+ * a round trip plus a second and three quarters of deliberate delay.
+ *
+ * This closes the popup on the tap, because the pick is the operator's
+ * and does not need permission to have been made. What it does NOT do is
+ * pretend the station has applied it: the chip below stays on screen
+ * until the POST lands, says what the orchestrator actually did, and if
+ * the station never answers it says so and offers the tap back. The
+ * question is put back on the board in that case, so the bell brings it
+ * around again rather than the answer being quietly lost.
+ */
+function orchChip(text, tone, onTap) {
+  let chip = document.getElementById("orchChip");
+  if (!chip) {
+    chip = el("div", "", "");
+    chip.id = "orchChip";
+    chip.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:210;"
+      + "max-width:min(360px,92vw);border-radius:10px;padding:9px 12px;"
+      + "font-size:11.5px;line-height:1.45;"
+      + "background:rgba(10,12,18,.97);box-shadow:0 12px 34px rgba(0,0,0,.6);"
+      + "transition:opacity .3s ease";
+    document.body.appendChild(chip);
+  }
+  clearTimeout(chip._fade);
+  chip.style.opacity = "1";
+  chip.textContent = text;
+  chip.style.border = "1px solid " + tone + "66";
+  chip.style.borderLeft = "3px solid " + tone;
+  chip.style.cursor = onTap ? "pointer" : "default";
+  chip.onclick = onTap || null;
+  return chip;
+}
+
+function orchChipGo(after) {
+  const chip = document.getElementById("orchChip");
+  if (!chip) return;
+  chip._fade = setTimeout(() => {
+    chip.style.opacity = "0";
+    setTimeout(() => { try { chip.remove(); } catch (e) {} }, 350);
+  }, after || 2600);
+}
+
+function orchAnswerSend(row, picks) {
+  /* Take the question off the board the operator is looking at, so the
+   * bell and the card do not bring back the thing they just answered
+   * while the POST is still in the air. */
+  const held = ORCH_ASKS.data;
+  let putBack = null;
+  try {
+    if (held && Array.isArray(held.rows)) {
+      const at = held.rows.findIndex((r) => String(r.id) === String(row.id));
+      if (at >= 0) {
+        putBack = {at: at, row: held.rows[at]};
+        held.rows.splice(at, 1);
+        held.open = Math.max(0, Number(held.open || 0) - 1);
+      }
+    }
+  } catch (e) { /* the send is what matters */ }
+  try { orchCardHide(); orchBell(); } catch (e) {}
+
+  orchChip("applying your answer…", "#ffc94a", null);
+  return api("/api/orchestrator/asks/" + encodeURIComponent(row.id),
+             {method: "POST", body: JSON.stringify({picks: picks})})
+    .then((got) => {
+      const did = ((got || {}).did || []).join("; ");
+      orchChip("the orchestrator did: " + (did || "nothing it could name"),
+               "#5fd8a4", null);
+      orchChipGo(3400);
+      /* force: the three-second rest would otherwise re-paint the
+       * question that has just been answered. */
+      try { orchAsks(true).then(() => { orchBell(); orchToast();
+                                        if (orchBox) orchPaint(); }); }
+      catch (e) {}
+      return got;
+    })
+    .catch((err) => {
+      if (putBack && ORCH_ASKS.data
+          && Array.isArray(ORCH_ASKS.data.rows)) {
+        ORCH_ASKS.data.rows.splice(putBack.at, 0, putBack.row);
+        ORCH_ASKS.data.open = Number(ORCH_ASKS.data.open || 0) + 1;
+      }
+      orchChip("the station did not take that answer ("
+               + String((err && err.message) || "no reply")
+               + ") — tap to send it again", "#ff7a3c",
+               () => orchAnswerSend(row, picks));
+      try { orchBell(); } catch (e) {}
+      throw err;
+    });
+}
+
 function orchClose() {
   if (orchTimer) { clearInterval(orchTimer); orchTimer = null; }
   if (orchBox) { orchBox.remove(); orchBox = null; }
@@ -175232,10 +175621,8 @@ async function fixResume() {
 }
 
 async function orchToast() {
-  let data;
-  try {
-    data = await (await fetch("/api/orchestrator/asks")).json();
-  } catch (err) { return; }
+  const data = await orchAsks();          /* #1233: the shared reader */
+  if (!data) return;
   const rows = data.rows || [];
   if (!rows.length || Date.now() < orchSnooze) { orchCardHide(); return; }
   const row = rows[0];
@@ -179382,11 +179769,25 @@ async function orchPlexusOpen() {
     document.head.appendChild(tag);
     return;
   }
-  let data;
-  try {
-    data = await (await fetch("/api/orchestrator/asks")).json();
-  } catch (err) { return; }
-  const row = (data.rows || [])[0];
+  /* #1233: NO NETWORK BETWEEN THE FINGER AND THE POPUP.
+   *
+   * This used to `await fetch("/api/orchestrator/asks")` here, before
+   * drawing a single pixel. On the tablet that fetch was timed at 3.4 to
+   * 28.2 seconds, because the panel's own polling keeps all six sockets
+   * busy - so the operator tapped "Answer 3 questions" and the screen did
+   * nothing for anywhere up to half a minute.
+   *
+   * The row is already in the page: the toast being tapped was built from
+   * it, and orchBell/orchToast refresh it every four seconds. Draw from
+   * what is held; ask again only if nothing has landed yet (the first
+   * seconds after a reload), which is the one case where there is
+   * genuinely nothing to draw. */
+  let data = orchAsksHeld();
+  if (!data) {
+    setStatus("reading the orchestrator…");
+    data = await orchAsks();
+  }
+  const row = ((data || {}).rows || [])[0];
   if (!row) { setStatus("the orchestrator has nothing to ask"); return; }
   orchCardHide();
 
@@ -179573,24 +179974,16 @@ async function orchPlexusOpen() {
   send.style.cssText = "width:100%;padding:11px;border-radius:9px;border:none;"
     + "font-weight:800;font-size:13px;cursor:pointer;background:" + toneCss
     + ";color:#0b0d12";
-  send.onclick = async () => {
+  send.onclick = () => {
     const want = (row.questions || []).length;
     if (Object.keys(picks).length < want) {
       send.textContent = "pick one for each of the " + want;
       return;
     }
-    send.disabled = true;
-    send.textContent = "applying…";
-    try {
-      const got = await api("/api/orchestrator/asks/"
-        + encodeURIComponent(row.id),
-        {method: "POST", body: JSON.stringify({picks: picks})});
-      send.textContent = "done · " + ((got.did || []).join("; "));
-      setTimeout(() => { orchPlexusClose(); orchToast(); }, 1700);
-    } catch (err) {
-      send.disabled = false;
-      send.textContent = "could not reach the orchestrator";
-    }
+    /* #1233: closes on the tap. The POST rides on behind it and the chip
+     * says honestly what became of it - see orchAnswerSend. */
+    orchPlexusClose();
+    orchAnswerSend(row, Object.assign({}, picks)).catch(() => {});
   };
   glass.appendChild(send);
   sheet.appendChild(glass);
@@ -179631,10 +180024,8 @@ async function lineReviewOpen(id) {
 }
 
 async function orchBell() {
-  let data;
-  try {
-    data = await (await fetch("/api/orchestrator/asks")).json();
-  } catch (err) { return; }
+  const data = await orchAsks();          /* #1233: the shared reader */
+  if (!data) return;
   const open = Number(data.open || 0);
   let bell = document.getElementById("orchBell");
   if (!bell) {
@@ -179674,13 +180065,14 @@ async function orchBell() {
   } else if (dot) { dot.remove(); }
 }
 
-async function orchPaint() {
+async function orchPaint(force) {
   if (!orchBox) return;
   const body = orchBox.querySelector("#orchBody");
-  let data;
-  try {
-    data = await (await fetch("/api/orchestrator/asks")).json();
-  } catch (err) { return; }
+  /* #1233: the shared reader. `force` is for the moment after an answer
+   * has been applied, when the three-second rest would otherwise show
+   * the question that was just answered. */
+  const data = await orchAsks(force);
+  if (!data) return;
   if (!orchBox) return;
   const rows = data.rows || [];
   body.textContent = "";
@@ -179762,29 +180154,22 @@ async function orchPaint() {
   send.style.cssText = "width:100%;padding:9px;border-radius:7px;"
     + "font-weight:700;font-size:12.5px;cursor:pointer;background:" + tone
     + ";color:#111;border:none;margin-top:4px";
-  send.onclick = async () => {
+  send.onclick = () => {
     const want = (row.questions || []).length;
     if (Object.keys(orchPicks).length < want) {
       send.textContent = "pick one for each of the "
         + want + " questions";
       return;
     }
-    send.disabled = true;
-    send.textContent = "applying\u2026";
-    try {
-      /* the panel's own helper - it carries the operator's key and
-       * throws on a bad answer rather than returning one. */
-      const got = await api(
-        "/api/orchestrator/asks/" + encodeURIComponent(row.id),
-        {method: "POST", body: JSON.stringify({picks: orchPicks})});
-      send.textContent = got && got.ok
-        ? ("done \u00b7 " + (got.did || []).join("; ")).slice(0, 90)
-        : "the orchestrator could not apply that";
-    } catch (err) {
-      send.textContent = "could not reach the orchestrator";
-    }
+    /* #1233: the same contract as the plexus popup above - the answer
+     * leaves on the tap and the chip reports what the station made of
+     * it. This panel stays open (it is a dock, not a popup), so it
+     * repaints straight away onto the next question rather than sitting
+     * on the one that has just gone. */
+    const sent = Object.assign({}, orchPicks);
     orchPicks = {};
-    setTimeout(() => { orchPaint(); orchBell(); }, 1200);
+    orchAnswerSend(row, sent).catch(() => {});
+    orchPaint();
   };
   body.appendChild(send);
 }
@@ -187754,7 +188139,21 @@ async function sparkShowInit() {
   sparkShow.timer = setInterval(
     () => { if (sparkShow.playing) sparkShowNext(); }, 5000);
   clearInterval(sparkShow.stats);
-  sparkShow.stats = setInterval(sparkShowVitals, 4000);
+  /* #1233: TWENTY SECONDS, NOT FOUR.
+   *
+   * This one line of text - "RAM 62% - GPU 51C - services 5 up" - was
+   * the single most expensive read on the station. /api/health/details
+   * knocks on five services over the network and then runs a real
+   * SearXNG search; measured sequentially on the box 2026-09-12 it took
+   * 5.2, 5.8, 13.6, 14.4, 22.5 and 32.4 seconds. Asked every four, seven
+   * censuses were in flight at once, each holding five outbound
+   * connections, on the loop that has to write and record the show.
+   *
+   * The route now holds a 20s memo of its own (and takes one census at a
+   * time), so this cadence simply matches it rather than queueing behind
+   * it. A vitals line may be twenty seconds old; the station may not be
+   * twenty seconds deaf. */
+  sparkShow.stats = setInterval(sparkShowVitals, 20000);
   setInterval(sparkShowLoad, 60000);   // new renders join the show
   // The deep behind-the-scenes overlays: poll only does work fullscreen.
   clearInterval(sparkShow.deep);

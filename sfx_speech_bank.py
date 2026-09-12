@@ -54,7 +54,13 @@ class SfxSpeechBank:
 
     def seed(self, voice, profile, sources):
         with self.lock:
-            rows = copy.deepcopy(self._load())
+            # #1243: a shallow ledger. Every row this adds is BRAND NEW,
+            # and the existing rows are only read, so there was nothing
+            # for the deep copy to protect - it simply copied 2 MB to
+            # append to a dict. A _save that throws still leaves
+            # self._rows untouched, because this dict is a different
+            # object until _save adopts it.
+            rows = dict(self._load())
             added = 0
             for source in sources:
                 text = str(source.get("text") or "").strip()
@@ -72,15 +78,26 @@ class SfxSpeechBank:
                 self._save(rows)
             return added
 
-    def rows(self, voice="", profile=None):
+    def rows(self, voice="", profile=None, deep=True):
+        """#1243: `deep` is what the caller actually needs.
+
+        due() hands rows to a loop that mutates them with top-level
+        update()/pop() and puts them back, so a shallow copy per row
+        protects the stored row exactly as well as a deep one. The
+        status reader only reads scalars. Deep stays the default so no
+        caller silently loses a copy it was relying on."""
         with self.lock:
-            return copy.deepcopy([row for row in self._load().values()
-                if (not voice or row.get("voice") == voice)
-                and (profile is None or row.get("profile") == profile)])
+            got = [row for row in self._load().values()
+                   if (not voice or row.get("voice") == voice)
+                   and (profile is None or row.get("profile") == profile)]
+            return copy.deepcopy(got) if deep else [dict(r) for r in got]
 
     def put(self, row):
         with self.lock:
-            rows = copy.deepcopy(self._load())
+            # #1243: as #1236 did for pick and finish - the atomicity
+            # comes from REPLACING one entry in a shallow ledger, not
+            # from copying every row to change one of them.
+            rows = dict(self._load())
             current = rows.get(row.get("id"))
             if not current:
                 raise ValueError("Unknown SFX source")
@@ -98,7 +115,9 @@ class SfxSpeechBank:
 
     def due(self, voice, profile):
         now = self.clock()
-        return sorted([row for row in self.rows(voice, profile)
+        # #1243: shallow - see rows(). The preparation loop only ever
+        # assigns top-level keys on what this hands back.
+        return sorted([row for row in self.rows(voice, profile, deep=False)
                        if row.get("state") != "suspended"
                        and float(row.get("retry_at") or 0) <= now],
                       key=lambda row: (bool(row.get("clip")), int(row.get("attempts") or 0),
