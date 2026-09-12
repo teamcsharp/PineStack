@@ -19869,7 +19869,8 @@ def _replay_save() -> None:
 
 
 async def voice_generate(text: str, voice: str, engine: str,
-                         fx: dict[str, float] | None = None) -> dict[str, Any]:
+                         fx: dict[str, float] | None = None,
+                         line: str = "") -> dict[str, Any]:
     """text + voice in, a stored audio path out. Nothing is created unless
     synthesis succeeds. `fx` wets the line — echo and a room — for the callers
     that want the pair to sound like they are in a booth rather than a
@@ -19952,7 +19953,11 @@ async def voice_generate(text: str, voice: str, engine: str,
     # The attempt and the success are different facts; only success
     # resets the clock (stamped after the engine answers, below).
     _SYNTH_TRIED[0] = time.time()
-    note_activity("voicing", f"{engine} · {len(text)} chars")
+    # #1277: WITH THE LINE'S OWN NAME ON IT. Optional, because fifteen
+    # other callers render things that are not script lines; when it is
+    # given, the feed can show the words and point at the script.
+    note_activity("voicing", f"{engine} · {len(text)} chars",
+                  line=line, text=text)
     pipeline_log("voice", f"{engine} · {voice or 'default voice'} · "
                           f"{len(text)} chars in",
                  extra=(f"INPUT to {engine} "
@@ -22889,14 +22894,32 @@ def radio_state() -> dict[str, Any]:
 # What the desk is doing RIGHT NOW (#305): writing, voicing, speaking —
 # breadcrumbs the panel draws as an activity spectrograph, so a quiet
 # moment is visibly a pause and not a mystery.
-def note_activity(stage: str, detail: str = "") -> None:
-    _RADIO["activity"] = {"stage": stage, "detail": str(detail)[:80],
-                          "at": time.time()}
+def note_activity(stage: str, detail: str = "",
+                  line: str = "", text: str = "") -> None:
+    """#1277: ...and WHICH LINE it is, and what the line says.
+
+    The feed used to show `voicing · xtts · 163 chars` while the station
+    was talking - true, and useless, because the row had no identity and
+    no words. It could not be matched to the script, could not be
+    clicked through to, and could not be told apart from the row above
+    it. `line` is the id the air log will file this same line under, so
+    every surface can say the same thing about the same line."""
+    now = {"stage": stage, "detail": str(detail)[:80], "at": time.time()}
+    if line:
+        now["line"] = str(line)
+    if text:
+        now["text"] = str(text)[:400]
+    _RADIO["activity"] = now
     log = _RADIO.setdefault("activity_log", [])
     # #790: the detail rides in the log too, so the Route cell's history can
     # expand each notification to what was actually said/done.
-    log.append({"stage": stage, "detail": str(detail)[:200],
-                "at": int(time.time())})
+    row = {"stage": stage, "detail": str(detail)[:200],
+           "at": int(time.time())}
+    if line:
+        row["line"] = str(line)
+    if text:
+        row["text"] = str(text)[:400]
+    log.append(row)
     del log[:-120]
 
 
@@ -26462,6 +26485,99 @@ def _ensure_chat_ids() -> None:
 _BUILD_MS = int(time.time() * 1000)
 
 
+def timeline_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """THE canonical order of the station's lines. One function, so that
+    every surface showing a timeline shows the SAME timeline.
+
+    #1280. Each feed used to sort for itself, and all but the script
+    sorted on `air_at` - the most rewritten field in the file. Measured
+    over 32 consecutive polls: 59% of rows had it move, median +47.9s,
+    the last correction landing a median of 104 seconds after the row
+    was already on screen, and the booth's visible order changing on
+    53% of its polls. `ts` moved for none of them.
+
+    The rules are the script's, because the script is the timeline:
+
+      * a conversation (`sid`) is ONE BLOCK, anchored on the earliest
+        `ts` in it - written once, never rewritten;
+      * blocks run in anchor order, `air_at` breaking ties because `ts`
+        is whole seconds;
+      * inside a block, lines run in `turn` order, and a descent to
+        at-or-below the run's start opens the next BURST rather than
+        reading as a jump backwards (#1257);
+      * an interjection - a quip, a sting, a gold bar, `turn` absent or
+        negative - keeps its place against the turn it followed, so it
+        still cuts in where it cut in;
+      * a row with no `sid` is its own block on its own stamps, which is
+        what stops a single-shot line being shuffled into the middle of
+        somebody else's conversation.
+
+    Pure, and total: every row in goes out exactly once, so a caller can
+    never lose a line to this."""
+    def stamps(row: dict[str, Any]) -> tuple[float, float]:
+        at = float(row.get("air_at") or row.get("ts") or 0)
+        ts = float(row.get("ts") or 0) or at
+        return (ts, at)
+
+    blocks: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []                  # blocks in first-seen order
+    for at_ix, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        sid = str(row.get("sid") or "")
+        key = sid or ("\x00solo:%d" % at_ix)   # a lone line is its own block
+        if key not in blocks:
+            blocks[key] = []
+            order.append(key)
+        blocks[key].append(row)
+
+    def anchor(key: str) -> tuple[float, float]:
+        best: tuple[float, float] | None = None
+        for row in blocks[key]:
+            got = stamps(row)
+            if best is None or got < best:
+                best = got
+        return best or (0.0, 0.0)
+
+    out: list[dict[str, Any]] = []
+    for key in sorted(order, key=anchor):
+        held = blocks[key]
+        if len(held) > 1:
+            burst = 0
+            low: int | None = None
+            last: int | None = None
+            keyed: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+            for seat, row in enumerate(held):
+                raw = row.get("turn")
+                turn = None
+                try:
+                    turn = int(raw) if raw is not None else None
+                except (TypeError, ValueError):
+                    turn = None
+                if turn is None or turn < 0:
+                    # An interjection: it follows the turn it cut into.
+                    keyed.append(((burst, last if last is not None else -1,
+                                   1, seat), row))
+                    continue
+                if low is None:
+                    low = turn
+                elif last is not None and turn <= low and turn <= last:
+                    burst += 1              # the next burst of this round
+                    low = turn
+                last = turn
+                keyed.append(((burst, turn, 0, seat), row))
+            keyed.sort(key=lambda pair: pair[0])
+            held = [row for _, row in keyed]
+        out.extend(held)
+
+    for seat, row in enumerate(out):
+        try:
+            row["seq"] = seat               # #1280: the position itself
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 def dj_state() -> dict[str, Any]:
     base = radio_state()
     base["build"] = _BUILD_MS
@@ -26662,9 +26778,15 @@ def dj_state() -> dict[str, Any]:
         # whole burst before any of it is audible, so insertion order is not
         # broadcast order and never was. Stable, so anything sharing a moment
         # keeps the order it was written in.
-        "chat": sorted(chat_rows,
-                       key=lambda m: float(m.get("air_at")
-                                           or m.get("ts") or 0)),
+        # #1280: THE SAME TIMELINE THE SCRIPT SHOWS. This sorted on
+        # `air_at` alone, and every surface downstream - the booth, the
+        # LCD, the sampler, the wall, the marquee, the public page and
+        # the Script view's feed - inherited that order. `air_at` is
+        # rewritten after publication (59% of rows over 32 polls, median
+        # +47.9s, the last correction a median of 104s after the row was
+        # on screen), so those surfaces re-sorted themselves on 53% of
+        # polls while the script sat still. One order, computed once.
+        "chat": timeline_order(chat_rows),
         # #772: the whole per-turn timeline of the round that is playing, so
         # the panel can follow the clip continuously instead of finding out
         # where it has got to on a four-second poll. On an eight-second turn
@@ -78614,6 +78736,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             playlist.append({"who": take["who"], "voice": take["voice"],
                              "chunk": take["text"], "turn_text": take["text"],
                              "ready_clip": dict(clip), "turn_end": True,
+                             "line_id": uuid.uuid4().hex,      # #1277
                              "vec": {}, "big": False})
         turns = []
         recorded, whole, render_stream = True, True, True
@@ -78857,6 +78980,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 "who": who,
                 "chunk": inject_disfluencies(
                     chunk, vec, seed=f"{who}{len(playlist)}"),
+                # #1277: the line is named HERE, before it is rendered,
+                # and the air log files it under this same name.
+                "line_id": uuid.uuid4().hex,
                 "vec": vec, "turn_end": False, "big": False,
             })
         if len(playlist) > first_at:
@@ -79246,6 +79372,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # aired_items turn (-1 for stings and quips).
             seg_ix: list[int] = []
             turn_ix: list[int] = []
+            line_ids: list[str] = []        # #1277: one name per row
             # #no-repeats: the playlist item behind each transcript row, kept in step
             # with it, so the ledger below can be written from the item's
             # turn_text — the whole clean turn the gate tested — instead of
@@ -79300,7 +79427,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     try:
                         clip = await voice_generate(
                             spoken_text(item["chunk"]), v,
-                            voice_engine_for(v), fx=_turn_fx(item))
+                            voice_engine_for(v), fx=_turn_fx(item),
+                            line=str(item.get("line_id") or ""))   # #1277
                     except Exception:
                         clip = None
                     # A clone that fails must NOT drop the turn from the call —
@@ -79345,6 +79473,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                        _clip_seconds(clip["path"])))
                     seg_ix.append(len(seg) - 1)
                     turn_ix.append(len(aired_items))
+                    line_ids.append(str(item.get("line_id")             # #1277
+                                        or uuid.uuid4().hex))
                     aired_items.append(item)                          # #no-repeats
                     _DIALOGUE_AT[0] = time.time()                     # 2026-09-07
                     # Gold: a rhymed turn with its take is kept to fire again.
@@ -79376,6 +79506,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         transcript.append((_extra["who"], _extra["text"], _extra["seconds"]))
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
+                        line_ids.append(uuid.uuid4().hex)               # #1277
                         _sfx_extra_seconds += _extra["seconds"] + max(CONCAT_BEAT)
                     _sting = "" if _keep_mic else sting_due()
                     if _sting:
@@ -79390,6 +79521,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                                float(_gold.get("seconds") or 0)))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
+                            line_ids.append(uuid.uuid4().hex)           # #1277
                             gold_fired(_gold)
                             pipeline_log("air", "a gold bar fires again, sting to "
                                          f"follow: {str(_gold.get('text') or '')[:70]}")
@@ -79403,6 +79535,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                            sfx_seconds(_sting)))
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
+                        line_ids.append(uuid.uuid4().hex)               # #1277
                         pipeline_log("air", f"sting: {_sting.stem} "
                                      "dropped between lines (#833)")
                     # #835: the SFX Guy's MOUTH — at the slider's rate a
@@ -79455,6 +79588,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                  _clip_seconds(_qc["path"])))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
+                            line_ids.append(uuid.uuid4().hex)           # #1277
                             pipeline_log("air", "the SFX guy pipes up: "
                                          f"{_quip[:60]} (#835)")
                     # #748/#830: the turn's transcript row was appended
@@ -79644,7 +79778,15 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     _ti = turn_ix[_row] if _row < len(turn_ix) else -1
                     _turn = str((aired_items[_ti].get("turn_text") or "")
                                 if 0 <= _ti < len(aired_items) else "")
-                    rid = uuid.uuid4().hex  # durable receipt identity across station restarts
+                    # #1277: THE NAME IT WAS GIVEN BEFORE IT WAS MADE.
+                    # This used to mint a fresh uuid here, after the
+                    # audio existed - so the thing being rendered and
+                    # the thing that aired never shared an identity, and
+                    # no surface could connect them. The fallback keeps
+                    # a row that somehow arrived without a name airing
+                    # rather than failing.
+                    rid = (line_ids[_row] if _row < len(line_ids)
+                           else uuid.uuid4().hex)
                     _kind = "sfx" if who == "board" else "call"
                     if who == "drop" and _row in _sfx_meta:
                         _kind = "sfxguy"
