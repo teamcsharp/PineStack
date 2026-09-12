@@ -1,0 +1,49 @@
+/* #1067: photographic, ruled broadsheet. Article text and the tabloid are shared. */
+:root{--ink:#181714;--ink2:#48453f;--rule:#25221e;--paper:#f7f4e9;--paper2:#bcbdbb;--red:#a72e2b;--accent:#a72e2b;--tint:#eeeadd}
+.page{box-shadow:0 4px 20px #0003}
+.ears{font:9px/1.3 Arial,sans-serif;letter-spacing:.075em;border-bottom:0;padding:3px 0}
+.masthead-row{display:grid;grid-template-columns:140px minmax(0,1fr) 140px;align-items:center;gap:20px;margin:6px 0 3px}
+.masthead-ear{font:10px/1.65 Georgia,serif;text-align:center;padding:13px 6px;border-right:1px solid var(--rule);color:var(--ink2)}
+.masthead-ear:last-child{border-right:0;border-left:1px solid var(--rule)}
+h1.masthead{margin:0;font-weight:400;line-height:1}
+.masthead-station{display:block;font:15px/1.2 Georgia,serif;letter-spacing:.035em;margin-bottom:1px}
+.masthead-name{display:block;font:94px/1 'Pine Gazette Blackletter',Georgia,serif;letter-spacing:-.02em}
+.masthead-name.custom{font-size:58px;line-height:1.05;overflow-wrap:anywhere}
+.motto{font:10px/1.3 Georgia,serif;margin:2px 0 7px}
+.dateline{border-top:3px double var(--rule);border-bottom:1px solid var(--rule);font:10px/1.4 Arial,sans-serif;letter-spacing:.035em;margin-bottom:12px;padding:5px 0}
+.pghead{font:9px/1.35 Arial,sans-serif;gap:14px;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) auto}
+.pghead .mh{font:20px/1.15 'Pine Gazette Blackletter',Georgia,serif;text-wrap:balance}
+.front .main{padding-right:26px;border-right:1px solid #aaa69b}
+.reference-lead{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:18px;margin:0;padding:0;border:0}
+.reference-photo{position:relative;min-width:0;overflow:hidden;background:#242821;color:#fff}
+.reference-photo figure.plate{position:absolute;inset:0;margin:0}
+.reference-photo figure.plate img{width:100%;height:100%;max-height:none;aspect-ratio:auto;border:0;object-fit:cover;filter:none}
+.reference-overlay{position:absolute;bottom:0;left:0;right:0;padding:72px 22px 20px;background:linear-gradient(transparent,#000b 22%,#000d);text-shadow:0 1px 2px #0005}
+.reference-overlay h2{font:700 42px/.99 Georgia,serif;letter-spacing:-.035em;margin:0 0 12px;color:#fff;text-wrap:balance}
+.reference-overlay .deck{font:15px/1.25 Georgia,serif;font-style:normal;margin:0 0 10px;color:#fff}
+.reference-overlay .kicker{color:#fff;font:700 10px/1.4 Arial,sans-serif;letter-spacing:.1em}
+.reference-overlay .byline,.reference-overlay .byline .sec{color:#fff;font:9px/1.35 Arial,sans-serif}
+.reference-overlay blockquote.pull{color:#fff;border-color:#ffffff80;font:italic 15px/1.25 Georgia,serif;margin:10px 0;padding:7px 0}
+.reference-overlay blockquote.pull:before{display:none}
+.reference-caption{font:9px/1.35 Arial,sans-serif;color:#eeece7;margin-top:10px;padding-top:7px;border-top:1px solid #ffffff66}
+.reference-copy{min-width:0}
+.reference-copy .lead-body{margin-top:0;text-align:justify;hyphens:auto}
+.reference-copy .lead-body p:first-of-type::first-letter{font-size:43px;padding:4px 5px 0 0}
+.flow{column-rule:1px solid #b8b3a8}
+.story{border-color:#aaa69b}
+.story h2{letter-spacing:-.025em}
+.story .kicker,.section{font-family:Arial,sans-serif;font-size:10px}
+.story.span{border-top:2px solid var(--rule)}
+.story.span h2{font-size:30px;letter-spacing:-.03em}
+.side .stats{display:block;border:0;margin:0 0 12px}
+.side .stat{padding:8px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);text-align:left}
+.side .stat b{font:700 42px/1 Georgia,serif;color:var(--ink)}
+.side .stat span{font:10px/1.3 Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em}
+.side .box{background:transparent;border-color:var(--rule)}
+.side .box h3{font:700 11px/1.3 Arial,sans-serif}
+.side .index{border-top:3px solid var(--rule)}
+.side .index h3{font:700 13px/1.3 Arial,sans-serif}
+.filler{border-color:#a39e92}
+.filler .fh,.fillhead{font-family:Arial,sans-serif}
+figure.plate img{filter:saturate(.88) contrast(1.03);border:0}
+@media print{.page{box-shadow:none}.reference-photo{-webkit-print-color-adjust:exact;print-color-adjust:exact}}

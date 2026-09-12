@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- #971: the page title IS the window title in Electron - it
+       overrides the BrowserWindow `title` option the moment the
+       document loads, so the application is named here too. -->
+  <title>Pine Box</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<!-- agent-down until the first health check proves otherwise: the compact
+     rail's mark ring is the only state indicator, and it must not open green
+     while the backend is still being reached. -->
+<body class="agent-down">
+  <aside class="rail">
+    <div class="brand">
+      <button id="panicBtn" class="mark" title="Deploy the newest app.py to the box, then collapse, rebuild and relaunch this app on the newest source (#1044)"><img src="../assets/pinebox.png" alt="Pine Box"></button>
+      <div>
+        <h1>Pine Box</h1>
+        <p id="connLine">checking agent...</p>
+        <!-- 2026-09-10: whether this app is the newest source on the
+             share, so the mark says whether it needs pressing. -->
+        <p id="buildLine" class="build-line"></p>
+      </div>
+      <!-- OFF AIR, WHICH IS NOT OFF. The FM switch below stops the
+           station and every service under it. This shuts only the door
+           to the air: the writing desk, the recording room and the
+           crystal keep working, and everything they make is banked for
+           when you come back. -->
+      <button id="airPauseBtn" class="air-pause"
+              title="Go off air without stopping the booth">&#9208;</button>
+    </div>
+    <section class="route-panel">
+      <label class="fm-row" for="fmSwitch">
+        <span>FM</span>
+        <input id="fmSwitch" type="checkbox">
+        <i></i>
+      </label>
+      <label for="broadcastTarget">Broadcast</label>
+      <select id="broadcastTarget">
+        <option value="nabu" selected>Nabu</option>
+        <option value="box">Pine Box</option>
+        <option value="web">Web page</option>
+        <option value="app">Application</option>
+        <option value="custom" disabled>Custom routes</option>
+      </select>
+      <p id="routeNote">routing unknown</p>
+      <p id="routeSummary" class="route-summary" role="status">Waiting for the station's routes.</p>
+      <div class="stream-routes">
+        <button id="nabuMuteBtn" type="button" title="Mute every sound on Nabu without changing its physical volume or routes">Mute Nabu</button>
+        <button id="nabuUnmuteBtn" type="button" title="Restore Nabu at its existing physical volume and channel settings">Unmute Nabu</button>
+      </div>
+      <!-- #980: the three streams, each redirectable on its own, on the
+           fly. The Broadcast picker above is a preset that moves all
+           three at once; these say where each one is actually going and
+           let one of them be moved without disturbing the others. -->
+      <div id="streamRoutes" class="stream-routes">
+        <label for="routeMusic"><span>Music</span>
+          <select id="routeMusic" data-stream="music">
+            <option value="here">App</option>
+            <option value="box">Pine Box</option>
+            <option value="both">Both</option>
+            <option value="off">Off</option>
+          </select>
+          <input id="vol_music" class="stream-vol" type="range"
+                 min="0" max="100" step="1" value="100"
+                 data-stream="music" title="Volume for this stream">
+        </label>
+        <label for="routeVoice"><span>DJs</span>
+          <select id="routeVoice" data-stream="voice">
+            <option value="here">App</option>
+            <option value="box">Pine Box</option>
+            <option value="both">Both</option>
+            <option value="off">Off</option>
+          </select>
+          <input id="vol_voice" class="stream-vol" type="range"
+                 min="0" max="100" step="1" value="100"
+                 data-stream="voice" title="Volume for this stream">
+        </label>
+        <label for="routeReply"><span>Replies</span>
+          <select id="routeReply" data-stream="reply">
+            <option value="here">App</option>
+            <option value="box">Pine Box</option>
+            <option value="both">Both</option>
+            <option value="off">Off</option>
+          </select>
+          <input id="vol_reply" class="stream-vol" type="range"
+                 min="0" max="100" step="1" value="100"
+                 data-stream="reply" title="Volume for this stream">
+        </label>
+      </div>
+      <!-- #1007: "I do not want the device's volume affected when i set it
+           on the device." Off, the station never calls volume_set on the
+           box - the physical dial is the only owner of that number. -->
+      <label class="stream-owner" for="boxVolOwn">
+        <input id="boxVolOwn" type="checkbox">
+        <span>Keep the record level applied on the box</span>
+      </label>
+      <!-- #1011/#1012: how long you have to rest on something before it
+           explains itself. Shared with the control panel through the
+           station's own settings, so the two cannot disagree. -->
+      <label class="stream-owner" for="tipDelay">
+        <span style="flex:1">Tooltips appear after</span>
+        <input id="tipDelay" type="number" min="0" max="10" step="0.5"
+               style="width:56px" value="3">
+        <span>s</span>
+      </label>
+      <label class="volume-row" for="appVolume">
+        <span>App volume</span>
+        <b id="appVolumeValue">35%</b>
+      </label>
+      <input id="appVolume" type="range" min="0" max="100" step="1" value="35">
+      <!-- #997: this switch governs the shell's own music player now as
+           well as the booth feed, so it is no longer only about the
+           booth. Route says WHERE the broadcast goes; this says whether
+           you also hear it in here. -->
+      <label class="monitor-row" for="boothMonitor"
+             title="Hear the broadcast in this app even while it is going out to the Pine Box or the Nabu.">
+        <input id="boothMonitor" type="checkbox">
+        <span>Monitor here</span>
+      </label>
+      <audio id="desktopRadioPlayer" class="desktop-radio" controls preload="auto"></audio>
+    </section>
+    <nav class="tabs" aria-label="Desktop views">
+      <button class="tab active" data-view="control" title="Full Pine Box Agent">#<span>Agent</span></button>
+      <button class="tab" data-view="radio" title="Radio player">&gt;<span>Radio</span></button>
+      <button class="tab" data-view="system2" title="Hourly plans, scripts and line diagnostics">2<span>System2</span></button>
+      <!-- #1073: the scheduler's controls, dropped under the rail - which
+           engine writes the hour and its dials. Compact rail: the same
+           controls open in the strip cell's popup instead. -->
+      <button class="tab" id="schedBtn"
+              title="Scheduler - which engine writes the hour (the original chain or System2) and its dials">⧗<span>Scheduler</span></button>
+      <div id="schedList" class="sched-list" style="display:none"></div>
+      <button class="tab" data-view="overview" title="Desktop command deck">=<span>Deck</span></button>
+      <button class="tab" data-view="guide" title="Recovery guide">+<span>Recover</span></button>
+      <button class="tab" data-view="logs" title="Agent logs">~<span>Logs</span></button>
+      <button class="tab" data-view="settings" title="Desktop settings">*<span>Settings</span></button>
+      <button class="tab" id="threejsBtn"
+              title="Every 3JS experience on the page — jump between them">◆<span>3js</span></button>
+      <div id="threejsList" class="threejs-list" style="display:none"></div>
+      <button class="tab" id="stationBtn"
+              title="The station — public broadcast, the DJs, troubleshooting">○<span>Station</span></button>
+      <button class="tab" id="sampleTabBtn"
+              title="Add sample — paste a link, clip moments into the DJs' rotation">🎬<span>Sample</span></button>
+      <button class="tab" id="callInBtn"
+              title="Call the booth — hold to talk, let go and you are on air with the DJs">☎<span>Call in</span></button>
+      <button class="tab" id="lcdBtn"
+              title="LCD — find USB or Wi-Fi displays; switch Quanta avatars and Pine Box">▣<span>LCD</span></button>
+    </nav>
+    <div class="rail-actions">
+      <button id="wakeBtn" class="wake-btn"
+              title="Wake words — what the box listens for after the button: turn them off, add new ones, remove them">🗣</button>
+      <button id="launchBtn">Launch</button>
+      <button id="attachBtn">Attach</button>
+    </div>
+    <div id="wakePopup" class="wake-popup" style="display:none"></div>
+    <div id="routeHistory" class="route-history" style="display:none"></div>
+  </aside>
+  <style>
+    /* Sits with the Pine Box mark, hard right of the brand block, so it
+       reads as part of the station's identity rather than as one more
+       control in the route panel. */
+    .brand { position: relative; }
+    .air-pause {
+      position: absolute; top: 0; right: 0;
+      background: rgba(255,255,255,.06); color: #cfd8e3;
+      border: 1px solid rgba(255,255,255,.16); border-radius: 8px;
+      font-size: 13px; line-height: 1; padding: 5px 8px; cursor: pointer;
+    }
+    .air-pause:hover { background: rgba(255,255,255,.12); }
+    .air-pause.off-air {
+      background: rgba(255,183,77,.18); color: #ffb74d;
+      border-color: rgba(255,183,77,.45);
+    }
+    .air-pause .banked { font-size: 10px; opacity: .85; margin-left: 4px; }
+  </style>
+  <div id="railResizer" class="rail-resizer" title="Resize sidebar"></div>
+
+  <main>
+    <!-- #904: THE ON-AIR MARQUEE, across the very top of the app.
+           Left: the segment the running order has reached — a button that
+           drops open the whole sheet so any segment can be jumped to, or
+           interjected for a single round, after which the hour carries on
+           untouched. Middle: every line the station is saying, scrolling
+         past; click one and the systems that made it open as a three.js
+         infographic. Right (#900): the piece currently being SOLD.
+
+         Its own grid ROW of <main>, above the status strip — not a wrapped
+         line inside .top. That header is a flex row whose status strip is
+         flex:1/min-width:0, so a 100%-basis child does NOT get a line of
+         its own there: the strip has a hypothetical size of zero, rides up
+         beside it, and collapses to a vertical stack 11px wide. -->
+    <div id="dxMarquee" class="dx-marquee">
+      <button id="dxSegBtn" class="dx-seg"
+              title="The segment the running order has reached — click to jump to another, or interject one for a single round">
+        <em id="dxSegKind">—</em><b id="dxSegName">no schedule</b><i>▾</i>
+      </button>
+      <div id="dxSegMenu" class="dx-segmenu" style="display:none"></div>
+      <div id="dxTicker" class="dx-ticker"
+           title="Everything going out on air — click a line to see every system that made it">
+        <div id="dxTickerTrack" class="dx-track"></div>
+        <span id="dxIdle" class="dx-idle">the booth is quiet</span>
+      </div>
+      <!-- #968: the booth, from the marquee. The transcript window lives
+           inside the control panel, so this reaches into that frame and
+           toggles it - the same door the panel's own header opens. -->
+      <button id="dxBoothBtn" class="dx-booth"
+              title="Show or hide the In the booth window - every line as it airs, with play and download on each">🎙</button>
+      <button id="dxSelling" class="dx-selling" style="display:none"
+              title="What the station is selling right now — click to hold it up big">
+        <img id="dxSellingArt" alt="">
+        <span><b id="dxSellingName"></b><em id="dxSellingWhy"></em></span>
+      </button>
+    </div>
+    <header class="top">
+      <div class="status-strip">
+        <div id="agentCell" class="agent-cell"
+             title="Radio Triage — click for the troubleshooter that repairs the broadcast">
+          <span>Agent</span><b id="agentState">unknown</b></div>
+        <div id="boxCell" class="pulse-cell">
+          <span>Box</span><b id="boxState">unknown</b>
+          <canvas id="boxPulse"></canvas>
+          <em id="boxTasks"></em>
+        </div>
+        <div id="routeCell" class="route-cell"
+             title="What is sounding on the broadcast device — click for the notification history">
+          <span>Route</span><b id="routeState">unknown</b>
+          <span id="routeSpeak" class="route-speak" style="display:none">
+            <i></i><i></i><i></i><i></i><em id="routeSpeakLabel"></em>
+          </span>
+        </div>
+        <!-- #988: "I also want to have the active segment moment
+             happening showing in the top bar. So it's basically a section
+             out of the itinerary that shows the active segment that's
+             going on, and then I want to be able to click on it and go in
+             and investigate the details of it."
+
+             The same figures the hour view puts on an entry card - what
+             it is, how far through its own minutes the clock is, and what
+             the rooms are holding against what it owns - in the strip
+             that is on screen whatever panel is open. #957 puts the
+             transition bar here too, so a segment change is watchable
+             from the moment it is clicked. -->
+        <div id="segCell" class="seg-cell"
+             title="The segment the running order has reached - click for everything behind it">
+          <span>Segment</span><b id="segCellName">no schedule</b>
+          <em id="segCellSub"></em>
+          <i id="segCellBar"><u id="segCellFill"></u></i>
+        </div>
+        <!-- #984: the record playing, and a way into the library from
+             it - the artist, the album, a search, and a corner of the
+             shelf put on for however long you say. -->
+        <div id="nowCell" class="now-cell"
+             title="What is playing - click for the artist, the album, and the request desk">
+          <span>Now</span><b id="nowState">quiet</b>
+        </div>
+        <!-- #1073: "add sections for managing the active scheduler
+             algorithm." The engine writing the hour - the original chain
+             or System2 - with the occurrence on air and what it still
+             owes; click for the switch, the two coexistence dials, the
+             horizon and the turns, and the doors into System2. -->
+        <div id="schedCell" class="sched-cell"
+             title="The scheduler writing the hour - click to switch between the original chain and System2, and to set its dials">
+          <span>Scheduler</span><b id="schedState">unknown</b>
+          <em id="schedSub"></em>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="reloadFrameBtn" title="Reload current panel">R</button>
+        <button id="fullscreenBtn" title="Hide desktop chrome">[]</button>
+        <button id="openBrowserBtn" title="Open in browser">^</button>
+        <button id="refreshBtn" title="Refresh status">!</button>
+        <!-- #1043b: the endless press - split the main area and run
+             every Gazette issue, newspaper then tabloid, down the
+             right half. The same page the web panel opens. -->
+        <button id="slidesSplitBtn"
+                title="The endless press - every Gazette issue scrolling down the right half">&#128478;</button>
+      </div>
+    </header>
+
+    <section id="control" class="view frame-view active">
+      <!-- #988: backgroundThrottling=no - the control frame carries
+           the broadcast on the Application route and must keep
+           decoding while another tab is on top. A hidden webview
+           is otherwise frozen: no animation frames, timers cut to
+           one wake a minute, and eventually a suspended audio
+           context. -->
+      <webview id="controlFrame" allowpopups webpreferences="backgroundThrottling=no"></webview>
+    </section>
+
+    <section id="radio" class="view frame-view">
+      <webview id="radioFrame" allowpopups webpreferences="backgroundThrottling=no"></webview>
+    </section>
+    <section id="system2" class="view frame-view">
+      <webview id="system2Frame" webpreferences="backgroundThrottling=no"></webview>
+    </section>
+
+    <section id="overview" class="view">
+      <div class="grid">
+        <section class="panel box-panel">
+          <div class="panel-head">
+            <h2>Pine Box</h2>
+            <span id="spokenLine">waiting for status</span>
+          </div>
+          <div id="checks" class="checks"></div>
+          <div class="button-row">
+            <button id="probeBtn">Probe</button>
+            <button id="initBtn">Initialize</button>
+            <button id="recoverBtn">Recover</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Speak</h2>
+            <span>send a line through the agent</span>
+          </div>
+          <textarea id="sayText" rows="5" placeholder="Type what Pine should say or answer..."></textarea>
+          <div class="button-row">
+            <button id="sayBtn">Say</button>
+            <button id="listenBtn">Listen</button>
+          </div>
+          <p id="sayResult" class="muted"></p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Station</h2>
+            <span id="stationSub">radio state</span>
+          </div>
+          <div class="button-row">
+            <button id="startRadioBtn">Start</button>
+            <button id="stopRadioBtn">Stop</button>
+            <button id="nextRadioBtn">Next</button>
+          </div>
+          <div id="pipeline" class="pipeline"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Deep Interface</h2>
+            <span>full surfaces inside the app</span>
+          </div>
+          <div class="launch-grid">
+            <button data-view-target="control">Studio</button>
+            <button data-view-target="radio">Player</button>
+            <button data-view-target="guide">Guide</button>
+            <button data-route="/api/radio-cache/export">Export</button>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section id="guide" class="view frame-view">
+      <webview id="guideFrame" allowpopups webpreferences="backgroundThrottling=no"></webview>
+    </section>
+
+    <section id="logs" class="view">
+      <pre id="logBox" class="log"></pre>
+    </section>
+
+    <section id="settings" class="view">
+      <section class="panel settings-panel">
+        <div class="panel-head">
+          <h2>Desktop Settings</h2>
+          <span>launch locally or attach to another agent</span>
+        </div>
+        <label>Agent URL<input id="baseUrlInput" spellcheck="false"></label>
+        <label>API key<input id="apiKeyInput" type="password" spellcheck="false"></label>
+        <label>Python command<input id="pythonInput" placeholder="python or python3" spellcheck="false"></label>
+        <label>Data directory<input id="dataDirInput" spellcheck="false"></label>
+        <div class="segmented">
+          <button id="modeLaunch">Launch local</button>
+          <button id="modeAttach">Attach only</button>
+        </div>
+        <div class="button-row">
+          <button id="saveSettingsBtn">Save</button>
+          <button id="setupBtn">Install Python Deps</button>
+          <button id="stopBtn">Stop Agent</button>
+        </div>
+      </section>
+    </section>
+    <!-- #1043b: the endless press. The webview is left without a src
+         until the split is opened, and pointed back at about:blank
+         when it closes, so nothing scrolls in the dark. -->
+    <div id="slidesGrip" class="slides-grip" title="Drag to change the split"></div>
+    <section id="slidesPane" class="slides-pane">
+      <webview id="slidesFrame" allowpopups
+               webpreferences="backgroundThrottling=no"></webview>
+    </section>
+  </main>
+  <!-- The Station drawer: public broadcast, DJ handling and troubleshooting
+       at the APPLICATION level — every value lives on the agent, so all
+       installs on the network share one master configuration. -->
+  <aside id="stationDrawer" class="station-drawer" hidden>
+    <div class="drawer-head">
+      <b>○ The Station</b>
+      <button id="stationClose" title="Close">✕</button>
+    </div>
+    <div class="drawer-body">
+      <section id="sparkSection">
+        <h3>⚡ DGX Spark</h3>
+        <pre id="sparkStats" class="muted">reading the machine…</pre>
+        <div class="drawer-row">
+          <label style="flex:1;margin:0">model
+            <select id="sparkModel" style="width:100%"></select>
+          </label>
+        </div>
+        <div class="drawer-row">
+          <button id="sparkRestart">🌲 Restart agent</button>
+          <button id="sparkRefresh">↻</button>
+        </div>
+      </section>
+      <section>
+        <h3>Public broadcast</h3>
+        <p id="pubStatus" class="muted">checking…</p>
+        <div class="drawer-row">
+          <button id="pubStart" class="wide">📡 Broadcast the public station</button>
+        </div>
+        <div class="drawer-row">
+          <input id="pubLink" readonly placeholder="the shareable link lands here">
+          <button id="pubCopy" title="Copy the link">⧉</button>
+          <button id="pubOpen" title="Open in browser">↗</button>
+        </div>
+        <div class="drawer-row">
+          <button id="pubRecheck">↻ Re-check</button>
+          <span id="pubStages" class="muted"></span>
+        </div>
+      </section>
+      <section>
+        <h3>The DJs</h3>
+        <label>talkativeness <output id="stTalkV"></output>
+          <input id="stTalk" type="range" min="0" max="100" step="5"></label>
+        <label>rounds at most every <output id="stGapV"></output> min
+          <input id="stGap" type="range" min="0.5" max="10" step="0.5"></label>
+        <label>calls per hour <output id="stCallsV"></output>
+          <input id="stCalls" type="range" min="0" max="20" step="1"></label>
+        <label>deep conversations <output id="stDeepV"></output>%
+          <input id="stDeep" type="range" min="0" max="100" step="5"></label>
+        <label>box volume <output id="stVolV"></output>%
+          <input id="stVol" type="range" min="30" max="160" step="5"></label>
+        <p id="stSaved" class="muted"></p>
+      </section>
+      <section>
+        <h3>Troubleshooting</h3>
+        <div class="drawer-row">
+          <button id="stInit">🛠 Initialize</button>
+          <button id="stRecover">🔄 Recover</button>
+          <button id="stDiag">🩺 Diagnose</button>
+        </div>
+        <pre id="stDiagOut" class="muted"></pre>
+      </section>
+    </div>
+  </aside>
+
+  <section id="rebuildOverlay" class="rebuild-overlay" aria-live="polite">
+    <canvas id="rebuildCanvas"></canvas>
+    <div class="rebuild-console">
+      <div class="rebuild-head">
+        <span class="rebuild-mark"><img src="../assets/pinebox.png" alt="Pine Box"></span>
+        <div>
+          <h2>Collapsing And Rebuilding Pine Box</h2>
+          <p id="rebuildStage">standing by</p>
+        </div>
+        <b id="rebuildPct">0%</b>
+      </div>
+      <div class="rebuild-bars">
+        <label><span>source</span><i><em id="barSource"></em></i></label>
+        <label><span>npx</span><i><em id="barNpx"></em></i></label>
+        <label><span>backend</span><i><em id="barBackend"></em></i></label>
+        <label><span>route</span><i><em id="barRoute"></em></i></label>
+      </div>
+      <div id="rebuildProcesses" class="rebuild-processes"></div>
+      <pre id="rebuildLog" class="rebuild-log"></pre>
+    </div>
+  </section>
+
+  <!-- #799: the status bar — left, the newest line of everything the
+       server is doing (click for the live terminal); right, the go-live
+       switch and a marquee of the Spark's vitals and heaviest tenants. -->
+  <footer id="statusBar">
+    <div id="sbTermLine"
+         title="Everything the Spark is running — click for the live terminal">booting…</div>
+    <div id="sbRight">
+      <button id="crystalBtn"
+              title="Crystals — click to let the active crystal tint the whole universe of Pine Box FM; click again to lift it">🔮</button>
+      <button id="sampleBtn"
+              title="Add sample — paste a link (or Ctrl+V one over this button), watch it, cut moments into the DJs' rotation">🎬</button>
+      <button id="sbLiveBtn"
+              title="Go LIVE — mint a public listen link for the station">📡</button>
+      <div id="sbMarquee"><span id="sbMarqueeInner"></span></div>
+    </div>
+  </footer>
+  <div id="sbTermPopup" style="display:none"></div>
+  <div id="samplePopup" style="display:none"></div>
+  <div id="crystalPopup" style="display:none"></div>
+  <!-- #904: the provenance window — built on a click and torn down on
+       close, so nothing here is ever rebuilt underneath you. -->
+  <div id="dxProvPopup" style="display:none"></div>
+
+  <script src="./renderer.js"></script>
+  <script src="./lcd-dialogue.js"></script>
+  <script src="./lcd-frame.js"></script>
+  <script src="./lcd-controls.js"></script>
+  <script src="./lcd-gallery.js"></script>
+  <script src="./lcd-review.js"></script>
+  <script src="./lcd.js"></script>
+</body>
+</html>

@@ -1,0 +1,101 @@
+{
+  "name": "Princeton WordNet",
+  "version": "3.0",
+  "url": "https://wordnetcode.princeton.edu/3.0/WordNet-3.0.tar.gz",
+  "archive_sha256": "640db279c949a88f61f851dd54ebbb22d003f8b90b85267042ef85a3781d3a52",
+  "archive_bytes": 11537239,
+  "license_url": "https://wordnet.princeton.edu/license-and-commercial-use",
+  "documentation_url": "https://wordnet.princeton.edu/documentation/wndb5wn",
+  "files": [
+    {
+      "path": "README",
+      "bytes": 4129,
+      "sha256": "adad8d28ddea1db05b67ba1ac23506b025d29e0bcbf23bb35dde346089d8808d",
+      "archive_member": "WordNet-3.0/README"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1625,
+      "sha256": "7731175a77952e259390b496fab905e57118b8d19ad3a8383c67eee724ff443f",
+      "archive_member": "WordNet-3.0/LICENSE"
+    },
+    {
+      "path": "adj.exc",
+      "bytes": 23019,
+      "sha256": "8824cc24bbedd797b9702316b27f07cd4c2b76b629539f0a1276f03926758016",
+      "archive_member": "WordNet-3.0/dict/adj.exc"
+    },
+    {
+      "path": "adv.exc",
+      "bytes": 85,
+      "sha256": "e7291461b629abfe63301bbe1998cee09fd575ed7107abd7ea9763adb05bf0a8",
+      "archive_member": "WordNet-3.0/dict/adv.exc"
+    },
+    {
+      "path": "noun.exc",
+      "bytes": 38301,
+      "sha256": "2b5d675c380b39ecf595af9fa9d4e7feb1d58c643b0bff08c40ed5bfe41fab7a",
+      "archive_member": "WordNet-3.0/dict/noun.exc"
+    },
+    {
+      "path": "verb.exc",
+      "bytes": 38033,
+      "sha256": "dbbcf9a601b2d77e934e413b91d90e88ec7f933a8b77cfc00602a923b891b42c",
+      "archive_member": "WordNet-3.0/dict/verb.exc"
+    },
+    {
+      "path": "index.adj",
+      "bytes": 824127,
+      "sha256": "42f58dda2c7cff66eb8fa55ba62e0a873a9b3f43c878e8201108f5dab6dcff28",
+      "archive_member": "WordNet-3.0/dict/index.adj"
+    },
+    {
+      "path": "index.adv",
+      "bytes": 162816,
+      "sha256": "6f5465ed5758fe9c8a2f7ec17b1300f3aa875756c70ff7cba162f7e71bcf88ea",
+      "archive_member": "WordNet-3.0/dict/index.adv"
+    },
+    {
+      "path": "index.noun",
+      "bytes": 4786655,
+      "sha256": "a490d99d93d017bf4822fe2f0ffa51fd73911ce271dc7535fade21f8814b5a04",
+      "archive_member": "WordNet-3.0/dict/index.noun"
+    },
+    {
+      "path": "index.verb",
+      "bytes": 523980,
+      "sha256": "c7c79b558d787f1e31c6f8b3eeadb8fcbb26a64545ecc1241e21d9b61f95ee8e",
+      "archive_member": "WordNet-3.0/dict/index.verb"
+    },
+    {
+      "path": "data.adj",
+      "bytes": 3155426,
+      "sha256": "f24b635368be441501c9b8001e9271fd3b30b203f00d91e332979e6f8fe35646",
+      "archive_member": "WordNet-3.0/dict/data.adj"
+    },
+    {
+      "path": "data.adv",
+      "bytes": 516696,
+      "sha256": "e66dbbda0e0359e41b7f225bff71dd0c263dc7c66c1b61abc9ba334973d92979",
+      "archive_member": "WordNet-3.0/dict/data.adv"
+    },
+    {
+      "path": "data.noun",
+      "bytes": 15300280,
+      "sha256": "489f145e0f68877c0be5bd0eb4117adaaac52f38f6204eb8d85dbe2158b614cc",
+      "archive_member": "WordNet-3.0/dict/data.noun"
+    },
+    {
+      "path": "data.verb",
+      "bytes": 2772517,
+      "sha256": "7fff397e93b4fb152fdaee116747cf1c40d7badedccb4b63f5503e8e962d9102",
+      "archive_member": "WordNet-3.0/dict/data.verb"
+    },
+    {
+      "path": "cntlist.rev",
+      "bytes": 911244,
+      "sha256": "a198580b8f705fa02797bba8b13e5cbe4a9f9f40cb1697e774c7fc6a5865b035",
+      "archive_member": "WordNet-3.0/dict/cntlist.rev"
+    }
+  ]
+}

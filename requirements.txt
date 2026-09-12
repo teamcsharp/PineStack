@@ -1,0 +1,34 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+httpx==0.28.1
+# Pinned to the versions verified running (audit: unpinned meant a
+# container RECREATE — the documented recovery path — silently pulled
+# whatever PyPI served, or hung if PyPI was down).
+mutagen==1.48.1
+pyserial==3.5
+# A static ffmpeg as a wheel, for levelling mp3 stingers (#220, #225). The
+# sample packs are mp3 and the stdlib cannot decode one, so without this a
+# meme sting lands several times louder than the DJ who set it up. No apt, no
+# root, no system package — it ships the binary and pip already runs here.
+imageio-ffmpeg==0.6.0
+numpy
+# The Gazette's unattended front-page card (#1020). When no panel is open the
+# press has nothing to photograph, so paper_snapshot_pillow draws the card
+# itself — masthead, kicker, headline, the lead plate, the first paragraph in
+# two columns — and the gallery filmstrip shows every paper, not only the ones
+# an operator happened to be watching. It uses ImageFont.load_default(size=N)
+# (Pillow >= 10.1) because the container has no system font. Without this line
+# the import fails, the function returns "" and the card is simply not drawn;
+# nothing else in the file needs PIL. The wheel is prebuilt for cp312/aarch64
+# (6.0 MB, verified resolving in the running container), so no build tools.
+pillow==11.3.0
+# The Gazette's PDF writer and lane P1's screenplay PDF (#1048). Pure
+# python - no system libraries, no compiler, and no fonts: the built-in
+# PDF faces (Times, Helvetica, Courier) are part of every reader, which
+# matters on an image that has none. Verified resolving in the running
+# container (py3-none-any wheel, 0.4 MB, pulls fonttools + defusedxml).
+# Without this line every road is inert and honest: paper_pdf returns
+# None, GET /api/paper/<id>/pdf answers 501 naming this line, the
+# screenplay's .pdf answers 501, and the panel's PDF button falls back to
+# the browser's print dialogue - which is what it did before #1048.
+fpdf2==2.8.8

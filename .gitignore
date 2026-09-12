@@ -1,0 +1,22 @@
+# Runtime data, not source: the music index alone is 15 MB and the gear
+# manual corpus is a few hundred.
+data/
+__pycache__/
+*.pyc
+node_modules/
+dist-desktop/
+
+# Patch scripts used to drop a timestamped copy of app.py here before
+# editing. Git already keeps every version; backups now go to /tmp.
+*.backup.*
+h1.json
+
+# Audit evidence written beside the docs by the resolver sessions: replay
+# captures, live observations, screenshots. Some run to tens of megabytes
+# and they are records of a moment, not source; the markdown that reads
+# them is tracked, the captures stay on the share like data/.
+docs/*.json
+docs/*.json.lock
+docs/*.png
+docs/*.jpg
+docs/system2-ui-images/
