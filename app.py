@@ -100099,11 +100099,64 @@ def _slideshow_state_write_blocking(patch: dict[str, Any]) -> tuple[dict, str]:
 
 # ---- thumbnails ----------------------------------------------------------
 
-_SLIDESHOW_THUMB_SIZES = (64, 128, 256, 512)
+# The rungs a picture may be served at. It used to stop at 512, which was
+# right while the only caller was the seven-thumbnail filmstrip — and then
+# slideshow-source.js started asking for the size the SCREEN can show (its
+# own measurement: 6.7 MB of PNG in thirty seconds of ordinary slideshow).
+# MEASURED after that change: `?w=1280` and `?w=512` returned the SAME 43,673
+# bytes, because the nearest rung to 1280 was 512. A 1340px-wide tablet was
+# being handed a 512px picture and nothing said so.
+#
+# Pillow's thumbnail() never upscales, so asking for a rung above the
+# original simply returns the original's size — an oversized ask costs
+# nothing and an undersized one costs sharpness.
+_SLIDESHOW_THUMB_SIZES = (64, 128, 256, 512, 768, 1024, 1280, 1600, 1920)
+# How much disk the derivatives may take before the oldest are dropped. This
+# box has a documented history of stores with no retention (7.5 GB of one,
+# once), and this one grows with every new picture times every rung asked for.
+_SLIDESHOW_THUMB_BUDGET = 512 * 1024 * 1024
+_SLIDESHOW_THUMB_SWEPT = {"at": 0.0}
 
 
 def _slideshow_thumb_dir() -> Path:
     return data_path("slideshow_thumbs")
+
+
+def _slideshow_thumb_sweep() -> None:
+    """Keep the derivative cache under its budget, oldest first.
+
+    BLOCKING, and deliberately rare: it only runs after a cache MISS, and at
+    most once every ten minutes. A sweep on every read would stat a few
+    thousand files to answer a question whose answer changes slowly."""
+    now = time.time()
+    if now - float(_SLIDESHOW_THUMB_SWEPT.get("at") or 0.0) < 600:
+        return
+    _SLIDESHOW_THUMB_SWEPT["at"] = now
+    root = _slideshow_thumb_dir()
+    try:
+        rows = []
+        total = 0
+        with os.scandir(root) as scan:
+            for entry in scan:
+                try:
+                    stat = entry.stat()
+                except OSError:
+                    continue
+                rows.append((stat.st_mtime, stat.st_size, entry.path))
+                total += stat.st_size
+        if total <= _SLIDESHOW_THUMB_BUDGET:
+            return
+        rows.sort()                       # oldest first
+        for _at, size, path in rows:
+            if total <= _SLIDESHOW_THUMB_BUDGET:
+                break
+            try:
+                os.unlink(path)
+                total -= size
+            except OSError:
+                continue
+    except OSError:
+        return
 
 
 def _slideshow_thumb_blocking(name: str, width: int) -> tuple[bytes, str] | None:
@@ -100146,6 +100199,7 @@ def _slideshow_thumb_blocking(name: str, width: int) -> tuple[bytes, str] | None
             img.thumbnail((width, width), Image.LANCZOS)
             cache.parent.mkdir(parents=True, exist_ok=True)
             img.save(cache, format="JPEG", quality=82, optimize=True)
+        _slideshow_thumb_sweep()
     except Exception:  # noqa: BLE001
         return None
     try:
@@ -100270,8 +100324,12 @@ async def slideshow_media_api(
     path = SLIDESHOW_ROOT / filename
 
     if w:
-        width = min(_SLIDESHOW_THUMB_SIZES,
-                    key=lambda size: abs(size - int(w)))
+        # THE SMALLEST RUNG THAT IS NOT SMALLER THAN THE ASK. "Nearest"
+        # rounds 1280 down to 512 and serves a soft picture; this rounds up,
+        # so a caller never gets less than it asked for.
+        wanted = max(1, int(w))
+        width = next((size for size in _SLIDESHOW_THUMB_SIZES if size >= wanted),
+                     _SLIDESHOW_THUMB_SIZES[-1])
         thumb = await asyncio.to_thread(_slideshow_thumb_blocking,
                                         filename, width)
         if thumb is not None:
@@ -121612,6 +121670,8 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     scene_round = None
     speaker = ""
     spoke_at = 0.0
+    scene_mark: tuple[str, str] | None = None   # #1266: the heading standing
+    cut_in = False                              # #1266: last line interrupted
     counts = {"lines": 0, "tinted": 0, "clips": 0, "scenes": 0,
               "actions": 0, "seconds": 0.0}
 
@@ -121635,15 +121695,49 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         rnd = by_line.get(line_id) or {}
         round_kind = str(row.get("round") or "") or str(rnd.get("kind") or "")
         gap = at - spoke_at if spoke_at else 0.0
-        if (scene_round is None or round_kind != scene_round
-                or (gap and gap > SCREENPLAY_GAP_SCENE)):
-            scene_round = round_kind
-            push("scene", screenplay_scene_slug(round_kind, at),
-                 f"sc-{int(at)}-{round_kind or 'air'}", at=at,
-                 round=round_kind)
+        # #1266: AN INTERJECTION IS NOT A CHANGE OF SCENE. A gold bar
+        # and an SFX-guy quip are each their own round, so one quip
+        # dropped into a conversation opened TWO scenes - in and back
+        # out - and put a heading, a subheader and a character cue
+        # between two lines of the same exchange. Measured: 81 headings
+        # for 234 lines, 38 of them word-for-word identical to the one
+        # above. At 12px/1.45 that furniture is 96.8px - 5.6 text lines
+        # - which is the "jumping down like ten lines" the operator is
+        # reading.
+        #
+        # The row says so ITSELF: kind "interject". Measured over 6,000
+        # rows that signal is exact - 877 interjections, not one of
+        # them carrying a sid, and all 243 gold/sfxguy lines among
+        # them. Note it is the KIND and never the ROAD: `interject`
+        # turns up under banter, caller, news, manager and gallery
+        # alike, because `round` only records which road was
+        # dispatching when the quip fired.
+        #
+        # "No sid" was the first rule I wrote here and it is too wide -
+        # it also swept up 61 track_talk intros, 38 emergency_host
+        # lines and the 22 sid-less caller rows, none of which are
+        # interjections. An interjection keeps the standing scene and
+        # is cued by its own character line, which is how a script has
+        # always written somebody cutting in.
+        cuts_in = str(row.get("kind") or "") == "interject"
+        _want = (scene_round is None or round_kind != scene_round
+                 or (gap and gap > SCREENPLAY_GAP_SCENE))
+        if (cuts_in and scene_round is not None
+                and not (gap and gap > SCREENPLAY_GAP_SCENE)):
+            _want = False               # it happens INSIDE this scene
+        if _want:
+            slug = screenplay_scene_slug(round_kind, at)
             label = (" ".join(str(rnd.get("label") or "").split())
                      or SCREENPLAY_ROUND_WORDS.get(round_kind,
                                                    round_kind or "the air"))
+            if (slug, label) == scene_mark:
+                _want = False           # the heading already standing
+        if _want:
+            scene_round = round_kind
+            scene_mark = (slug, label)
+            push("scene", slug,
+                 f"sc-{int(at)}-{round_kind or 'air'}", at=at,
+                 round=round_kind)
             push("subheader", label.upper(),
                  f"sh-{int(at)}-{round_kind or 'air'}", at=at,
                  round=round_kind)
@@ -121657,7 +121751,12 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                       and str((rnd.get("tint") or {}).get("used") or "")
                       == "tinted")
         clip = str(row.get("url") or "")
+        # #1266: ...and whoever was talking is named again after
+        # being cut into. Without `cut_in` the pair would carry on
+        # under no CHARACTER at all, because `speaker` still held the
+        # name they had before the quip.
         if (name != speaker
+                or cut_in
                 or (gap and gap > SCREENPLAY_GAP_BLOCK)
                 or (elements and elements[-1]["type"] == "action")):
             speaker = name
@@ -121683,6 +121782,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         if clip:
             counts["clips"] += 1
         spoke_at = at + float(row.get("seconds") or 0)
+        cut_in = cuts_in                        # #1266
 
     for i, (ix, began) in enumerate(scenes):
         ends = (scenes[i + 1][1] if i + 1 < len(scenes)
