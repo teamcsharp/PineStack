@@ -1081,7 +1081,14 @@ DEFAULT_DJ = {
     # `manager_break_after` is the backstop: however the sheet is going,
     # the memo road may not go longer than this unheard.
     "manager_breaks_in": True,
-    "manager_break_after": 1500,
+    "manager_break_after": 600,
+    # #1263: while an entry is on air and its road has a finished round
+    # waiting, nothing else takes the floor. Conditioned on stock, so it
+    # can only ever swap one thing for another - never open a hole.
+    "entry_guard": True,
+    # #1264: the orchestrator applies the cure its own measurements
+    # support and reports it, rather than waiting to be agreed with.
+    "orchestrator_acts": True,
     # #1260: THE CUPBOARD MUST BE HEARD. A finished, recorded round that
     # has waited longer than `cupboard_unheard_hours` without ever being
     # on the air goes out OF TURN, at most one every
@@ -2052,6 +2059,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         },
         "saved_rate": max(0.0, min(1.0, float(
             raw_dj.get("saved_rate", DEFAULT_DJ["saved_rate"]) or 0))),
+        "entry_guard": bool(raw_dj.get(
+            "entry_guard", DEFAULT_DJ["entry_guard"])),
+        "orchestrator_acts": bool(raw_dj.get(
+            "orchestrator_acts", DEFAULT_DJ["orchestrator_acts"])),
         "manager_breaks_in": bool(raw_dj.get(
             "manager_breaks_in", DEFAULT_DJ["manager_breaks_in"])),
         "manager_break_after": max(120, min(14400, int(
@@ -19869,8 +19880,7 @@ def _replay_save() -> None:
 
 
 async def voice_generate(text: str, voice: str, engine: str,
-                         fx: dict[str, float] | None = None,
-                         line: str = "") -> dict[str, Any]:
+                         fx: dict[str, float] | None = None) -> dict[str, Any]:
     """text + voice in, a stored audio path out. Nothing is created unless
     synthesis succeeds. `fx` wets the line — echo and a room — for the callers
     that want the pair to sound like they are in a booth rather than a
@@ -19953,11 +19963,7 @@ async def voice_generate(text: str, voice: str, engine: str,
     # The attempt and the success are different facts; only success
     # resets the clock (stamped after the engine answers, below).
     _SYNTH_TRIED[0] = time.time()
-    # #1277: WITH THE LINE'S OWN NAME ON IT. Optional, because fifteen
-    # other callers render things that are not script lines; when it is
-    # given, the feed can show the words and point at the script.
-    note_activity("voicing", f"{engine} · {len(text)} chars",
-                  line=line, text=text)
+    note_activity("voicing", f"{engine} · {len(text)} chars")
     pipeline_log("voice", f"{engine} · {voice or 'default voice'} · "
                           f"{len(text)} chars in",
                  extra=(f"INPUT to {engine} "
@@ -22894,32 +22900,14 @@ def radio_state() -> dict[str, Any]:
 # What the desk is doing RIGHT NOW (#305): writing, voicing, speaking —
 # breadcrumbs the panel draws as an activity spectrograph, so a quiet
 # moment is visibly a pause and not a mystery.
-def note_activity(stage: str, detail: str = "",
-                  line: str = "", text: str = "") -> None:
-    """#1277: ...and WHICH LINE it is, and what the line says.
-
-    The feed used to show `voicing · xtts · 163 chars` while the station
-    was talking - true, and useless, because the row had no identity and
-    no words. It could not be matched to the script, could not be
-    clicked through to, and could not be told apart from the row above
-    it. `line` is the id the air log will file this same line under, so
-    every surface can say the same thing about the same line."""
-    now = {"stage": stage, "detail": str(detail)[:80], "at": time.time()}
-    if line:
-        now["line"] = str(line)
-    if text:
-        now["text"] = str(text)[:400]
-    _RADIO["activity"] = now
+def note_activity(stage: str, detail: str = "") -> None:
+    _RADIO["activity"] = {"stage": stage, "detail": str(detail)[:80],
+                          "at": time.time()}
     log = _RADIO.setdefault("activity_log", [])
     # #790: the detail rides in the log too, so the Route cell's history can
     # expand each notification to what was actually said/done.
-    row = {"stage": stage, "detail": str(detail)[:200],
-           "at": int(time.time())}
-    if line:
-        row["line"] = str(line)
-    if text:
-        row["text"] = str(text)[:400]
-    log.append(row)
+    log.append({"stage": stage, "detail": str(detail)[:200],
+                "at": int(time.time())})
     del log[:-120]
 
 
@@ -26485,99 +26473,6 @@ def _ensure_chat_ids() -> None:
 _BUILD_MS = int(time.time() * 1000)
 
 
-def timeline_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """THE canonical order of the station's lines. One function, so that
-    every surface showing a timeline shows the SAME timeline.
-
-    #1280. Each feed used to sort for itself, and all but the script
-    sorted on `air_at` - the most rewritten field in the file. Measured
-    over 32 consecutive polls: 59% of rows had it move, median +47.9s,
-    the last correction landing a median of 104 seconds after the row
-    was already on screen, and the booth's visible order changing on
-    53% of its polls. `ts` moved for none of them.
-
-    The rules are the script's, because the script is the timeline:
-
-      * a conversation (`sid`) is ONE BLOCK, anchored on the earliest
-        `ts` in it - written once, never rewritten;
-      * blocks run in anchor order, `air_at` breaking ties because `ts`
-        is whole seconds;
-      * inside a block, lines run in `turn` order, and a descent to
-        at-or-below the run's start opens the next BURST rather than
-        reading as a jump backwards (#1257);
-      * an interjection - a quip, a sting, a gold bar, `turn` absent or
-        negative - keeps its place against the turn it followed, so it
-        still cuts in where it cut in;
-      * a row with no `sid` is its own block on its own stamps, which is
-        what stops a single-shot line being shuffled into the middle of
-        somebody else's conversation.
-
-    Pure, and total: every row in goes out exactly once, so a caller can
-    never lose a line to this."""
-    def stamps(row: dict[str, Any]) -> tuple[float, float]:
-        at = float(row.get("air_at") or row.get("ts") or 0)
-        ts = float(row.get("ts") or 0) or at
-        return (ts, at)
-
-    blocks: dict[str, list[dict[str, Any]]] = {}
-    order: list[str] = []                  # blocks in first-seen order
-    for at_ix, row in enumerate(rows):
-        if not isinstance(row, dict):
-            continue
-        sid = str(row.get("sid") or "")
-        key = sid or ("\x00solo:%d" % at_ix)   # a lone line is its own block
-        if key not in blocks:
-            blocks[key] = []
-            order.append(key)
-        blocks[key].append(row)
-
-    def anchor(key: str) -> tuple[float, float]:
-        best: tuple[float, float] | None = None
-        for row in blocks[key]:
-            got = stamps(row)
-            if best is None or got < best:
-                best = got
-        return best or (0.0, 0.0)
-
-    out: list[dict[str, Any]] = []
-    for key in sorted(order, key=anchor):
-        held = blocks[key]
-        if len(held) > 1:
-            burst = 0
-            low: int | None = None
-            last: int | None = None
-            keyed: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
-            for seat, row in enumerate(held):
-                raw = row.get("turn")
-                turn = None
-                try:
-                    turn = int(raw) if raw is not None else None
-                except (TypeError, ValueError):
-                    turn = None
-                if turn is None or turn < 0:
-                    # An interjection: it follows the turn it cut into.
-                    keyed.append(((burst, last if last is not None else -1,
-                                   1, seat), row))
-                    continue
-                if low is None:
-                    low = turn
-                elif last is not None and turn <= low and turn <= last:
-                    burst += 1              # the next burst of this round
-                    low = turn
-                last = turn
-                keyed.append(((burst, turn, 0, seat), row))
-            keyed.sort(key=lambda pair: pair[0])
-            held = [row for _, row in keyed]
-        out.extend(held)
-
-    for seat, row in enumerate(out):
-        try:
-            row["seq"] = seat               # #1280: the position itself
-        except Exception:  # noqa: BLE001
-            pass
-    return out
-
-
 def dj_state() -> dict[str, Any]:
     base = radio_state()
     base["build"] = _BUILD_MS
@@ -26778,15 +26673,9 @@ def dj_state() -> dict[str, Any]:
         # whole burst before any of it is audible, so insertion order is not
         # broadcast order and never was. Stable, so anything sharing a moment
         # keeps the order it was written in.
-        # #1280: THE SAME TIMELINE THE SCRIPT SHOWS. This sorted on
-        # `air_at` alone, and every surface downstream - the booth, the
-        # LCD, the sampler, the wall, the marquee, the public page and
-        # the Script view's feed - inherited that order. `air_at` is
-        # rewritten after publication (59% of rows over 32 polls, median
-        # +47.9s, the last correction a median of 104s after the row was
-        # on screen), so those surfaces re-sorted themselves on 53% of
-        # polls while the script sat still. One order, computed once.
-        "chat": timeline_order(chat_rows),
+        "chat": sorted(chat_rows,
+                       key=lambda m: float(m.get("air_at")
+                                           or m.get("ts") or 0)),
         # #772: the whole per-turn timeline of the round that is playing, so
         # the panel can follow the clip continuously instead of finding out
         # where it has got to on a four-second poll. On an eight-second turn
@@ -37893,6 +37782,20 @@ def orch_apply(does: str) -> str:
                 "value": str(arg), "at": time.time()}
             said = (f"{SHELF_LABEL.get(str(arg), str(arg))} gives way first"
                     if arg != "keep" else "the ladder is unchanged")
+        elif verb == "guard":
+            # #1263: "guard any road with stock ready" - the switch, and
+            # the arg names the road that prompted it for the record.
+            _ORCH["policy"]["entry_guard"] = {"value": str(arg) != "off",
+                                              "at": time.time()}
+            said = ("an entry holds its own turn while its road has a "
+                    "finished round waiting" if str(arg) != "off" else
+                    "an entry takes whatever reaches the floor first")
+        elif verb == "acts":
+            _ORCH["policy"]["lessons_apply"] = {"value": str(arg) != "off",
+                                                "at": time.time()}
+            said = ("I apply what the ledger is confident about and tell "
+                    "you afterwards" if str(arg) != "off" else
+                    "I measure and propose; you decide")
         elif verb == "breakin":
             # #1261: the manager's own switch. "off" puts him back behind
             # an entry that measured 0% adherence, which is what the
@@ -43764,6 +43667,33 @@ async def _torrent_talk() -> None:
             # Only ever swaps IN a memo that is finished, tinted and
             # recorded, so this costs the listener nothing and the round
             # it stands down is banked banter, which keeps.
+            # #1263: THE ENTRY ON AIR GETS ITS OWN ROAD. Only ever
+            # swaps in a road that has a finished, recorded round ready,
+            # so this cannot make the air emptier - only more like the
+            # sheet. Measured cause: a 240-second manager entry that got
+            # 0s of manager and 198s of calls, stings and quips while 19
+            # finished memos sat on the shelf.
+            try:
+                if not _chosen:
+                    _groad = entry_guard_road()
+                    if _groad and _groad != kind:
+                        pipeline_log(
+                            "air", "(#1263) %s -> %s: the %s entry is on "
+                            "air and has a finished round waiting - it "
+                            "gets its own turn"
+                            % (kind, _groad, SHELF_LABEL.get(_groad, _groad)))
+                        if (_sched_row is not None
+                                and _sched_row.get("kind")
+                                and str(SCHED_PREP_KIND.get(
+                                    _sched_row.get("kind"))
+                                    or _sched_row.get("kind")) == _groad):
+                            _sched_miss_reason = ""     # it is being KEPT
+                        kind = _groad
+                        if _groad == "manager":
+                            _RADIO["manager_announce"] = (
+                                "his own entry is on air")
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 if kind != "manager" and not _chosen:
                     _mwhy = manager_break_claim()
@@ -44594,9 +44524,12 @@ def manager_due_why() -> str:
     now = time.time()
     kind, start, deadline = entry_window_now()
     if kind == "manager" and start < now < deadline:
-        # Give the ordinary road a fair run at its own entry first.
-        if now - start >= max(15.0, (deadline - start) / 4.0) \
-                and entry_own_aired("manager", start, deadline) <= 1.0:
+        # EVERY ENTRY, not "if there is room left in it". The operator's
+        # answer: the memo is a fixture of the show, so his entry is his
+        # from the moment it opens - #1263 holds the floor for it and the
+        # round chooser serves it, rather than the pair getting a quarter
+        # of the way through something else first.
+        if entry_own_aired("manager", start, deadline) <= 1.0:
             return ("his own entry is %ds old with none of him in it"
                     % int(now - start))
         return ""
@@ -44969,6 +44902,114 @@ def schedule_lessons(most: int = 400) -> dict[str, Any]:
             if clock.get("readable") else str(clock.get("why") or "")))
     }
 
+# #1263: THE ENTRY ON THE SHEET GETS ITS OWN ROAD FIRST.
+#
+# The operator's answer, given the measurement: "guard any road with stock
+# ready". While a road's entry is on air AND that road has a finished,
+# recorded round waiting AND none of it has aired inside this entry, every
+# other road and the SFX Guy's discretionary noise stand down until it has
+# gone out.
+#
+# The measurement it answers, from the first row the #1262 ledger ever
+# wrote - a live manager entry, 240 seconds, 19 memos ready:
+#
+#     own 0s   |   ate: call 92s, sfx 82s, interject 24s
+#
+# 198 of his 240 seconds went to other roads while his own material sat
+# finished on the shelf.
+#
+# THE GUARD CANNOT CAUSE SILENCE, and that is the whole reason it is
+# conditioned on stock. It only ever stands something down when there is a
+# finished round ready to go out INSTEAD - so the air is never emptier for
+# it, only more like the sheet. An entry whose road has nothing ready is
+# not guarded at all and is covered exactly as it is today.
+#
+# It also does not touch the dead-air rescue. The SFX Guy's PURPOSE is
+# dead air and that road stays open; what stands down is the
+# discretionary half - the punctuation over a record and the first
+# refusal on a join, which is where his 82 seconds came from.
+_ENTRY_GUARD_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+_ENTRY_GUARD_LOG: dict[str, Any] = {"held": 0, "road": "", "at": 0.0}
+
+
+def entry_guard_on() -> bool:
+    """#1263: is the sheet allowed to hold its own entry?"""
+    try:
+        got = orch_policy("entry_guard")
+        if got is not None:
+            return bool(got)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return bool(dj_settings().get("entry_guard", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def entry_guard_road() -> str:
+    """The road whose entry is on air and owed its own turn - "" when
+    nothing is guarded.
+
+    Memoised for two seconds: this is asked by the round chooser, both
+    SFX roads and the panel, and it walks the air log for the window.
+    """
+    now = time.time()
+    if (_ENTRY_GUARD_MEMO["value"] is not None
+            and now - float(_ENTRY_GUARD_MEMO["at"]) < 2.0):
+        return str(_ENTRY_GUARD_MEMO["value"])
+    road = ""
+    try:
+        if entry_guard_on():
+            kind, start, deadline = entry_window_now()
+            road_of = str(SCHED_PREP_KIND.get(kind) or kind or "")
+            if kind and start < now < deadline and road_of:
+                # Only while it still has something to put on. This is
+                # what makes the guard safe: standing others down is
+                # only ever a swap, never a hole.
+                if entry_own_aired(kind, start, deadline) <= 1.0 \
+                        and _ready_shelf_row(road_of, rescue=True) is not None:
+                    road = road_of
+    except Exception:  # noqa: BLE001
+        road = ""
+    _ENTRY_GUARD_MEMO.update({"at": now, "value": road})
+    if road and _ENTRY_GUARD_LOG.get("road") != road:
+        _ENTRY_GUARD_LOG.update({"road": road, "at": now,
+                                 "held": int(_ENTRY_GUARD_LOG.get("held") or 0) + 1})
+        try:
+            pipeline_log(
+                "air", "the %s entry is on air with a finished round "
+                "waiting - it gets its own turn before anything else "
+                "takes the floor (#1263)" % SHELF_LABEL.get(road, road))
+        except Exception:  # noqa: BLE001
+            pass
+    return road
+
+
+def entry_guard_blocks(asking: str) -> bool:
+    """May this road take the floor right now? False means stand down."""
+    try:
+        road = entry_guard_road()
+        if not road:
+            return False
+        return str(SCHED_PREP_KIND.get(asking) or asking or "") != road
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def entry_guard_state() -> dict[str, Any]:
+    """#1263: what the guard is holding, for the glass and the lessons."""
+    road = entry_guard_road()
+    return {"on": entry_guard_on(), "road": road,
+            "label": SHELF_LABEL.get(road, road) if road else "",
+            "held": int(_ENTRY_GUARD_LOG.get("held") or 0),
+            "say": ("the %s entry is holding its own turn - it has a "
+                    "finished round ready and nothing else may take the "
+                    "floor until it airs" % SHELF_LABEL.get(road, road))
+            if road else ("nothing is guarded: no entry is on air with a "
+                          "finished round of its own waiting"
+                          if entry_guard_on() else
+                          "the entry guard is switched off")}
+
 async def entry_arrears_serve() -> str:
     """#1189: the floor is free - put out the oldest thing owed.
 
@@ -45128,6 +45169,12 @@ async def dead_air_watch() -> None:
             # somebody happened to look at it.
             try:
                 entry_close_note()
+            except Exception:  # noqa: BLE001
+                pass
+            # #1264: ...and act on what the ledger now knows. Its own
+            # clock (fifteen minutes), one road per pass.
+            try:
+                lessons_apply()
             except Exception:  # noqa: BLE001
                 pass
             # #1261: THE MEMO FROM UPSTAIRS GETS THROUGH. Also ungated:
@@ -64919,6 +64966,11 @@ async def sfx_fill_over_music() -> str:
     try:
         if radio_paused() or not _RADIO.get("on") or _SPEAKING[0]:
             return ""
+        # #1263: ...and not over an entry that is holding its own turn.
+        # This is punctuation, not rescue: the road that fills real dead
+        # air (sfx_fill_gap from the watchdog) is deliberately not gated.
+        if entry_guard_blocks("sfxguy"):
+            return ""
         # #1245: ...and when the dialogue clock is unusable, ask the one
         # that works. dialogue_quiet_for returns -1 whenever no speech
         # delivery has been acknowledged audible - which is the state
@@ -65071,6 +65123,10 @@ def sfx_punctuate(why: str) -> None:
         # rest between clips would bound it in practice; a latch bounds
         # it on purpose.
         if _SFX_PUNCTUATING[0]:
+            return
+        # #1263: a join inside a guarded entry is noise in front of the
+        # thing the sheet is waiting to put on.
+        if entry_guard_blocks("sfxguy"):
             return
         _SFX_PUNCTUATING[0] = True
 
@@ -78736,7 +78792,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             playlist.append({"who": take["who"], "voice": take["voice"],
                              "chunk": take["text"], "turn_text": take["text"],
                              "ready_clip": dict(clip), "turn_end": True,
-                             "line_id": uuid.uuid4().hex,      # #1277
                              "vec": {}, "big": False})
         turns = []
         recorded, whole, render_stream = True, True, True
@@ -78980,9 +79035,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 "who": who,
                 "chunk": inject_disfluencies(
                     chunk, vec, seed=f"{who}{len(playlist)}"),
-                # #1277: the line is named HERE, before it is rendered,
-                # and the air log files it under this same name.
-                "line_id": uuid.uuid4().hex,
                 "vec": vec, "turn_end": False, "big": False,
             })
         if len(playlist) > first_at:
@@ -79372,7 +79424,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # aired_items turn (-1 for stings and quips).
             seg_ix: list[int] = []
             turn_ix: list[int] = []
-            line_ids: list[str] = []        # #1277: one name per row
             # #no-repeats: the playlist item behind each transcript row, kept in step
             # with it, so the ledger below can be written from the item's
             # turn_text — the whole clean turn the gate tested — instead of
@@ -79427,8 +79478,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     try:
                         clip = await voice_generate(
                             spoken_text(item["chunk"]), v,
-                            voice_engine_for(v), fx=_turn_fx(item),
-                            line=str(item.get("line_id") or ""))   # #1277
+                            voice_engine_for(v), fx=_turn_fx(item))
                     except Exception:
                         clip = None
                     # A clone that fails must NOT drop the turn from the call —
@@ -79473,8 +79523,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                        _clip_seconds(clip["path"])))
                     seg_ix.append(len(seg) - 1)
                     turn_ix.append(len(aired_items))
-                    line_ids.append(str(item.get("line_id")             # #1277
-                                        or uuid.uuid4().hex))
                     aired_items.append(item)                          # #no-repeats
                     _DIALOGUE_AT[0] = time.time()                     # 2026-09-07
                     # Gold: a rhymed turn with its take is kept to fire again.
@@ -79506,7 +79554,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         transcript.append((_extra["who"], _extra["text"], _extra["seconds"]))
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
-                        line_ids.append(uuid.uuid4().hex)               # #1277
                         _sfx_extra_seconds += _extra["seconds"] + max(CONCAT_BEAT)
                     _sting = "" if _keep_mic else sting_due()
                     if _sting:
@@ -79521,7 +79568,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                                float(_gold.get("seconds") or 0)))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
-                            line_ids.append(uuid.uuid4().hex)           # #1277
                             gold_fired(_gold)
                             pipeline_log("air", "a gold bar fires again, sting to "
                                          f"follow: {str(_gold.get('text') or '')[:70]}")
@@ -79535,7 +79581,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                            sfx_seconds(_sting)))
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
-                        line_ids.append(uuid.uuid4().hex)               # #1277
                         pipeline_log("air", f"sting: {_sting.stem} "
                                      "dropped between lines (#833)")
                     # #835: the SFX Guy's MOUTH — at the slider's rate a
@@ -79588,7 +79633,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                  _clip_seconds(_qc["path"])))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
-                            line_ids.append(uuid.uuid4().hex)           # #1277
                             pipeline_log("air", "the SFX guy pipes up: "
                                          f"{_quip[:60]} (#835)")
                     # #748/#830: the turn's transcript row was appended
@@ -79778,15 +79822,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     _ti = turn_ix[_row] if _row < len(turn_ix) else -1
                     _turn = str((aired_items[_ti].get("turn_text") or "")
                                 if 0 <= _ti < len(aired_items) else "")
-                    # #1277: THE NAME IT WAS GIVEN BEFORE IT WAS MADE.
-                    # This used to mint a fresh uuid here, after the
-                    # audio existed - so the thing being rendered and
-                    # the thing that aired never shared an identity, and
-                    # no surface could connect them. The fallback keeps
-                    # a row that somehow arrived without a name airing
-                    # rather than failing.
-                    rid = (line_ids[_row] if _row < len(line_ids)
-                           else uuid.uuid4().hex)
+                    rid = uuid.uuid4().hex  # durable receipt identity across station restarts
                     _kind = "sfx" if who == "board" else "call"
                     if who == "drop" and _row in _sfx_meta:
                         _kind = "sfxguy"
@@ -118872,6 +118908,140 @@ async def cupboard_why_not_ready_api(
     }
 
 
+# #1264: THE ORCHESTRATOR ACTS ON WHAT IT MEASURED, then says so.
+#
+# The operator, asked how much it should do on its own: "act, then tell
+# me". So this is the half that was missing - #1262 reached the verdict
+# and then waited for a human to agree with it, which over a broadcast
+# means a road stays broken for the whole of it.
+#
+# It only ever applies the cure the MEASUREMENT supports, and the two
+# cures are opposite:
+#
+#   TALKED OVER  - missed its entry with stock ready. The cupboard is
+#                  full; building more would make it worse. Hold its
+#                  entry (#1263) and thin whatever ate it.
+#   STARVED      - missed its entry with nothing ready. Guarding an empty
+#                  road guards nothing; build it ahead instead.
+#
+# Every change is written into the judgment book as taken ALONE, which
+# halves its weight on the road factors (#1081) and makes the graph show
+# which decisions were the machine's own. Nothing here deletes anything,
+# and every dial it moves is one the operator can move back.
+LESSON_APPLY_EVERY = float(os.getenv("PINE_LESSON_APPLY_EVERY", "900"))
+LESSON_APPLY_ENTRIES = 4
+LESSON_APPLY_UNDER = 40
+_LESSON_APPLIED: dict[str, Any] = {"at": 0.0, "rows": []}
+
+
+def lessons_apply_on() -> bool:
+    try:
+        got = orch_policy("lessons_apply")
+        if got is not None:
+            return bool(got)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return bool(dj_settings().get("orchestrator_acts", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _policy_set(key: str, value: Any) -> None:
+    """Write one standing policy the way an answered question would."""
+    orch_load()
+    with _ORCH_LOCK:
+        _ORCH.setdefault("policy", {})[str(key)] = {
+            "value": value, "at": time.time(), "by": "orchestrator"}
+        orch_save()
+
+
+def lessons_apply() -> list[dict[str, Any]]:
+    """#1264: read the ledger, fix what it is confident about, report.
+
+    Confident means a road with at least LESSON_APPLY_ENTRIES measured
+    entries and adherence at or under LESSON_APPLY_UNDER per cent. One
+    road per pass, worst first, so a broadcast converges rather than
+    lurching."""
+    if not lessons_apply_on():
+        return []
+    now = time.time()
+    if now - float(_LESSON_APPLIED.get("at") or 0) < LESSON_APPLY_EVERY:
+        return []
+    _LESSON_APPLIED["at"] = now
+    done: list[dict[str, Any]] = []
+    try:
+        book = schedule_lessons(240)
+        for seat in book.get("roads") or []:
+            if int(seat.get("entries") or 0) < LESSON_APPLY_ENTRIES:
+                continue
+            # `or 100` here read a legitimate ZERO as a hundred, which
+            # skipped the one case this exists for - a road that becomes
+            # itself none of the time. Caught by the test that fed it
+            # exactly that. Never default a measured number with `or`.
+            _adh = seat.get("adherence")
+            if _adh is None or int(_adh) > LESSON_APPLY_UNDER:
+                continue
+            road = str(seat.get("road") or "")
+            missed = int(seat.get("missed") or 0)
+            starved = int(seat.get("starved") or 0)
+            if not road or not missed:
+                continue
+            ate = list((seat.get("ate") or {}).items())
+            if starved * 2 >= missed:
+                # SHORT OF MATERIAL. Build it; guarding an empty road
+                # guards nothing.
+                _policy_set("drive_road", road)
+                did = ("%s is short of material - it is now built ahead of "
+                       "every other road until it has stock"
+                       % (seat.get("label") or road))
+                verb = "drive:" + road
+            else:
+                # TALKED OVER. Its entry is held for it, and the biggest
+                # eater is thinned. Never thin a road into nothing: the
+                # thin dial is a preference, not a ban.
+                _policy_set("entry_guard", True)
+                verb = "guard:" + road
+                did = ("%s is being talked over - its entry now holds its "
+                       "own turn whenever it has a finished round waiting"
+                       % (seat.get("label") or road))
+                if ate:
+                    _policy_set("thin_road", str(ate[0][0]))
+                    verb = "thin:" + str(ate[0][0])
+                    did += (", and %s (which ate %ds of it) is thinned"
+                            % (ate[0][0], int(ate[0][1])))
+            row = {"at": now, "road": road, "adherence": seat.get("adherence"),
+                   "entries": seat.get("entries"), "did": did, "verb": verb,
+                   "lesson": seat.get("lesson")}
+            done.append(row)
+            try:
+                pipeline_log("lookahead",
+                             "THE ORCHESTRATOR ACTED ON WHAT IT MEASURED: "
+                             + did + " (#1264)",
+                             extra="WHY\n\n" + str(seat.get("lesson") or ""))
+                note_action("the orchestrator changed the running order by "
+                            "itself - " + did)
+                judgment_note("sheet_adherence",
+                              "%s became itself %d%% of %d measured entries"
+                              % (seat.get("label") or road,
+                                 int(seat.get("adherence") or 0),
+                                 int(seat.get("entries") or 0)),
+                              did, verb, str(seat.get("lesson") or ""), True)
+            except Exception:  # noqa: BLE001
+                pass
+            break               # one road per pass
+    except Exception:  # noqa: BLE001
+        pass
+    if done:
+        _LESSON_APPLIED.setdefault("rows", []).extend(done)
+        del _LESSON_APPLIED["rows"][:-40]
+    return done
+
+
+def lessons_applied() -> list[dict[str, Any]]:
+    """What it has changed by itself, newest last."""
+    return list(_LESSON_APPLIED.get("rows") or [])
+
 @app.get("/api/manager/breakin")
 async def manager_breakin_api(
     authorization: str | None = Header(default=None),
@@ -118943,7 +119113,15 @@ async def orchestrator_lessons_api(
     opposite cures and the sheet alone cannot tell them apart - this is
     the reading that can."""
     _journal_auth(authorization, key)
-    return schedule_lessons(max(1, min(1200, int(most or 400))))
+    out = schedule_lessons(max(1, min(1200, int(most or 400))))
+    out["applied"] = lessons_applied()          # #1264
+    out["guard"] = entry_guard_state()          # #1263
+    out["acting"] = lessons_apply_on()
+    if out["applied"]:
+        out["say"] += ("; I have changed the running order %d time(s) by "
+                       "myself - most recently: %s"
+                       % (len(out["applied"]), out["applied"][-1]["did"]))
+    return out
 
 @app.get("/api/cupboard/unheard")
 async def cupboard_unheard_api(

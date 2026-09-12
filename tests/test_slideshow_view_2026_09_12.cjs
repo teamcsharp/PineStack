@@ -113,12 +113,24 @@ test('the hot-load question is never answered from cache', async () => {
 });
 
 test('the bytes doors are built here, not by each caller', () => {
-  assert.equal(source.url('a b.png'), '/api/slideshow/media/a%20b.png');
+  /* BOTH DOORS ASK FOR A SIZE, and neither hands back the original.
+   *
+   * `thumb` is the filmstrip's: a cell that forgot its width would pull
+   * 1.3 MB to draw 64 pixels, which is the measured stall this whole file
+   * is about. `url` is the STAGE's, and it carries a width too - measured
+   * over thirty seconds of ordinary slideshow, the bare route cost 6.7 MB
+   * of PNG out of 10 MB of total traffic on a 400 kB/s link.
+   *
+   * The width it picks depends on the screen, so this pins the shape rather
+   * than a number. The station rounds UP to its next rung, so an ask can
+   * never be answered with something smaller. */
+  assert.match(source.url('a b.png'), /^\/api\/slideshow\/media\/a%20b\.png\?w=\d+$/);
   assert.equal(source.thumb('a b.png', 128),
     '/api/slideshow/media/a%20b.png?w=128');
-  /* A filmstrip cell that forgot the width would pull 1.3 MB to draw 64
-   * pixels - the exact shape of the measured stall. */
   assert.match(source.thumb('x.png'), /\?w=128$/);
+  /* The stage must never ask for less than the filmstrip does. */
+  const stage = Number(source.url('x.png').split('w=')[1]);
+  assert.ok(stage >= 640, 'the stage width should be a display size, got ' + stage);
 });
 
 test('page() asks only for what was actually set', async () => {

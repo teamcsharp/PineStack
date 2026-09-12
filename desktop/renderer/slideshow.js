@@ -262,8 +262,27 @@
     }
 
     function visible() {
-      /* rail.js keeps a mounted view in the document at display:none. */
-      return !!(host.offsetParent || host.classList.contains('open'));
+      /* IS THIS VIEW ON SCREEN?
+       *
+       * rail.js keeps a mounted view in the document at display:none, and
+       * its `open` class is the plainest signal there is — so that is asked
+       * first.
+       *
+       * offsetParent IS NOT A SUBSTITUTE, and the fit probe caught it:
+       * offsetParent is ALWAYS null for a position:fixed element, which the
+       * rail's host and the standalone page's picture stage both are. So
+       * `offsetParent || open` answered "not visible" for every host that
+       * did not happen to use the rail's class, and the whole monitor sat
+       * asleep on a page that was plainly being looked at. A box with real
+       * dimensions that is not display:none is the honest test. */
+      if (host.classList.contains('open')) return true;
+      try {
+        var box = host.getBoundingClientRect();
+        if (!box.width || !box.height) return false;
+        return getComputedStyle(host).display !== 'none';
+      } catch (err) {
+        return true;      /* never make a measurement failure into silence */
+      }
     }
 
     /* IT MUST NOT GIVE UP ON ONE MISS, and the first version did.
@@ -889,9 +908,10 @@
       if (overlaysOn && !overlays && root.SparkOverlays) {
         overlays = root.SparkOverlays.mount(wrap, {
           mode: 'overlay',
-          /* Nothing is asked of the station while this view is not the one
-           * on screen — the same gate the slideshow's own timer runs on. */
-          active: visible
+          /* Nothing is asked of the station unless this view is the one on
+           * screen AND the overlay layer is switched on. Pressing S does
+           * not just hide the readouts, it stops them being fetched. */
+          active: function () { return overlaysOn && visible(); }
         });
       }
       if (overlays) overlays.node.style.display = overlaysOn ? '' : 'none';
@@ -907,6 +927,33 @@
      * the control bar was drawn underneath it — the key letters were clipped
      * off every button. Measured rather than assumed, and re-measured on a
      * turn, because the tablet rotates and that line wraps. */
+    /* HOW MUCH OF THE RIGHT EDGE BELONGS TO THE RAIL.
+     *
+     * THE TRAP, and it is a CSS one worth writing down: `.pine-view-host`
+     * reserves the rail's strip with `padding-right:34px`, and this view is
+     * `position:absolute; inset:0` inside it — so it was assumed to be
+     * inset by that padding. IT IS NOT. The containing block for an
+     * absolutely positioned child is the padding BOX, which INCLUDES the
+     * padding; only in-flow content is pushed in by it. So the panels ran
+     * underneath the rail's tabs, which paint over them at z-index
+     * 2147483001, and the right-hand figures were simply covered.
+     *
+     * Measured rather than hardcoded at 34, and re-measured on a turn: the
+     * rail's tabs are vertical text and its width follows the font. */
+    function measureRail() {
+      var rail = document.getElementById('pineViewRail');
+      var width = 0;
+      if (rail) {
+        try {
+          var box = rail.getBoundingClientRect();
+          if (box.width && box.right >= root.innerWidth - 4) {
+            width = Math.round(box.width);
+          }
+        } catch (err) { width = 0; }
+      }
+      wrap.style.setProperty('--sl-rail', width + 'px');
+    }
+
     function measureFoot() {
       var line = document.getElementById('pineConsoleLine');
       var height = 0;
@@ -922,8 +969,29 @@
       }
       wrap.style.setProperty('--sl-console', height + 'px');
     }
-    measureFoot();
-    root.addEventListener('resize', measureFoot);
+    function measureChrome() { measureFoot(); measureRail(); }
+    measureChrome();
+    /* AND AGAIN ONCE THE PAGE HAS SETTLED. MEASURED on the tablet: at mount
+     * time the rail's own box was 0px wide — it is built at boot but had not
+     * been laid out at the instant this view was created — so the readouts
+     * were drawn under it and their right-hand figures were covered. rail.js
+     * defers its own reopen by 1200ms for the same reason: a view that
+     * measures a still-settling document measures the wrong thing. */
+    setTimeout(measureChrome, 1400);
+    /* A ResizeObserver catches the rest: a tab added, the font changing, the
+     * tablet turned. Not every engine has one, and a missing observer must
+     * not cost the measurement that already happened. */
+    var watcher = null;
+    try {
+      if (root.ResizeObserver) {
+        watcher = new root.ResizeObserver(measureChrome);
+        var rail = document.getElementById('pineViewRail');
+        if (rail) watcher.observe(rail);
+        watcher.observe(document.documentElement);
+      }
+    } catch (err) { watcher = null; }
+    function onResize() { measureChrome(); }
+    root.addEventListener('resize', onResize);
 
     wake();
     applyOverlays();
@@ -934,6 +1002,11 @@
       node: wrap,
       state: S,
       reload: reload,
+      /* The overlay layer this view owns. A host that embeds the slideshow
+       * reads this rather than mounting a SECOND layer on top — which is
+       * exactly what /spark?pictures=1 did until the fit probe counted
+       * fourteen widgets where there should have been seven. */
+      overlays: function () { return overlays; },
       destroy: function () {
         destroyed = true;
         if (timer) clearTimeout(timer);
@@ -941,7 +1014,8 @@
         if (hotTimer) clearInterval(hotTimer);
         if (barTimer) clearTimeout(barTimer);
         document.removeEventListener('keydown', onKey);
-        root.removeEventListener('resize', measureFoot);
+        root.removeEventListener('resize', onResize);
+        if (watcher) { try { watcher.disconnect(); } catch (err) { /* gone */ } }
         if (overlays) overlays.destroy();
         layers[0].innerHTML = '';
         layers[1].innerHTML = '';

@@ -48,6 +48,9 @@
   'use strict';
 
   var POLL_MS = {dashboard: 2000, overlay: 3000};
+  /* While nobody is looking: how often to check whether they are back. A
+   * DOM read and nothing else — the station is not asked anything. */
+  var WAKE_CHECK_MS = 4000;
   var HISTORY = 120;            /* the desktop's deque(maxlen=120) */
   var CENSUS_EVERY = 8;         /* polls between service census refreshes */
 
@@ -115,7 +118,9 @@
 
   function feed(mode, active) {
     var listeners = [];
-    var timer = null;
+    var fast = null;      /* the polling interval, while someone is looking */
+    var watch = null;     /* the cheap "are they back yet" check, while not */
+    var onVisibility = null;
     var busy = false;
     var ticks = 0;
     var last = null;
@@ -130,15 +135,63 @@
       });
     }
 
+    /* IS ANYONE LOOKING AT THIS?
+     *
+     * Three ways the answer is no, and all three have to be asked:
+     *   - the whole app or browser tab is in the background (document.hidden)
+     *   - rail.js has this view mounted but closed, at display:none
+     *   - the operator pressed S and put the overlay layer away
+     * The last two arrive through `active`, which the host supplies. */
+    function awake() {
+      if (typeof document !== 'undefined' && document.hidden) return false;
+      if (typeof active === 'function' && !active()) return false;
+      return true;
+    }
+
+    /* WHAT IS DELIBERATELY NOT IN THAT TEST.
+     *
+     * Nothing about the station. Not whether it is on air, not whether the
+     * operator has paused it, not which Pine Box tab is in front. This is a
+     * monitor for the BOX — its cores, its memory, its GPU, what ComfyUI is
+     * rendering — and the box goes on doing all of that while the radio is
+     * silent. A monitor that stops reporting because the show stopped is
+     * useless at exactly the moment somebody is looking to find out why.
+     *
+     * A station that does not answer is likewise a reason to keep asking,
+     * not to give up: a failed poll leaves the interval running and puts a
+     * line on screen saying how many have been missed. */
+
+    /* AND WHEN THE ANSWER IS NO, THE TIMER STOPS — it does not keep firing
+     * and returning early.
+     *
+     * "Make sure that we're only pulsing whenever we are in the tab and
+     *  we're actually receiving and accessing the information. Otherwise it
+     *  needs to sleep and relax."
+     *
+     * A three-second interval that wakes only to decide it has nothing to
+     * do still wakes a sleeping tablet's CPU twenty times a minute, for
+     * ever, on a view nobody has open. So the polling interval is CLEARED
+     * and replaced by a much slower check that touches nothing but the DOM
+     * — no request, no work for the station — until someone comes back. */
+    function sleep() {
+      if (fast) { clearInterval(fast); fast = null; }
+      if (!watch) {
+        watch = setInterval(function () {
+          if (awake()) wake();
+        }, WAKE_CHECK_MS);
+      }
+    }
+
+    function wake() {
+      if (watch) { clearInterval(watch); watch = null; }
+      if (fast) return;
+      tick();
+      fast = setInterval(tick, POLL_MS[mode] || 3000);
+    }
+
     function tick() {
       if (busy) return;                 /* never two at once */
-      /* NOTHING IS ASKED FOR A SCREEN NOBODY IS ON. rail.js keeps a mounted
-       * view in the document at display:none, and a browser tab can be in
-       * the background for hours; either way the poll would go on spending
-       * the station's socket pool on readouts no one is reading. This is
-       * the same discipline the slideshow's own timer runs on. */
-      if (document.hidden) return;
-      if (typeof active === 'function' && !active()) return;
+      if (!awake()) { sleep(); return; }
       busy = true;
       /* The census probes five services and runs a real search, so it does
        * not ride every poll — the desktop's own service panel rotated one
@@ -150,12 +203,15 @@
           failures = 0;
           /* A poll without the census must not blank the panel that shows
            * it, so the previous answer's rows are carried forward. */
-          if (!data.services && last && last.services) {
-            data.services = last.services;
-            data.ops = last.ops;
-            data.marquee = last.marquee;
-            data.restartable = last.restartable;
-          }
+          /* EVERY field that only rides the census poll, or the OpenWebUI
+           * panel is blank on seven polls out of eight — which is what it
+           * was, and it read as OpenWebUI being unreachable. */
+          ['services', 'ops', 'marquee', 'restartable', 'owui'].forEach(
+            function (field) {
+              if (data[field] === undefined && last && last[field] !== undefined) {
+                data[field] = last[field];
+              }
+            });
           last = data;
           listeners.forEach(function (fn) {
             try { fn(data, null); } catch (err) { /* one widget, not all */ }
@@ -178,14 +234,28 @@
         };
       },
       start: function () {
-        if (timer) return;
-        tick();
-        timer = setInterval(tick, POLL_MS[mode] || 3000);
+        /* The browser tells us the moment a tab is hidden or shown, which
+         * is faster and cheaper than waiting for the slow check to notice. */
+        if (!onVisibility && typeof document !== 'undefined') {
+          onVisibility = function () {
+            if (awake()) wake(); else sleep();
+          };
+          document.addEventListener('visibilitychange', onVisibility);
+        }
+        if (awake()) wake(); else sleep();
       },
       stop: function () {
-        if (timer) clearInterval(timer);
-        timer = null;
+        if (fast) clearInterval(fast);
+        if (watch) clearInterval(watch);
+        fast = null;
+        watch = null;
+        if (onVisibility && typeof document !== 'undefined') {
+          document.removeEventListener('visibilitychange', onVisibility);
+          onVisibility = null;
+        }
       },
+      /* For a probe, and for the panel that reports on itself. */
+      polling: function () { return !!fast; },
       now: function () { return last; },
       failures: function () { return failures; }
     };
@@ -432,54 +502,228 @@
     };
   }
 
-  /* TopActivityBanner — what is busy RIGHT NOW. Hidden when nothing is, the
-   * way the desktop's is: a banner that is always on screen saying "idle"
-   * stops being a signal. */
+  /* TopActivityBanner — THE TOP OF THE SCREEN, and the readout the
+   * operator asked for by name: "the details of the task that were
+   * happening with Comfy UI".
+   *
+   * It is not "is ComfyUI busy". It is the render itself: its model, its
+   * size, its sampler and scheduler and steps and cfg, any LoRAs stacked on
+   * it, where it is being saved, how long it has been going, and the prompt
+   * text it is working from. All of that comes out of the workflow graph
+   * that /queue carries — see spark_overlays.analyze_workflow, which is the
+   * desktop application's own reader, node type for node type.
+   *
+   * IT DOES NOT GO BLANK WHEN NOTHING IS RENDERING. The desktop's banner
+   * hides, because the desktop has ten other panels; here it keeps the
+   * board and the last few renders on screen, because a panel that shows
+   * nothing most of the time teaches you not to look at it. */
   function activityWidget() {
     var node = el('div', 'so-w so-activity');
-    node.hidden = true;
     var line = el('div', 'so-act-line');
     node.appendChild(line);
     var track = el('div', 'so-track so-act-track');
     var fill = el('div', 'so-fill');
     track.appendChild(fill);
     node.appendChild(track);
+    var basis = el('div', 'so-act-basis');
+    node.appendChild(basis);
     var detail = el('div', 'so-act-detail');
     node.appendChild(detail);
     var prompt = el('div', 'so-act-prompt');
     node.appendChild(prompt);
+    var negative = el('div', 'so-act-negative');
+    node.appendChild(negative);
+    var board = el('div', 'so-act-board');
+    node.appendChild(board);
+
+    function chips(parent, pairs) {
+      parent.innerHTML = '';
+      pairs.forEach(function (pair) {
+        if (pair[1] === null || pair[1] === undefined || pair[1] === ''
+            || (Array.isArray(pair[1]) && !pair[1].length)) return;
+        var chip = el('span', 'so-fact');
+        chip.appendChild(el('i', '', pair[0]));
+        chip.appendChild(document.createTextNode(
+          Array.isArray(pair[1]) ? pair[1].join(', ') : String(pair[1])));
+        parent.appendChild(chip);
+      });
+    }
+
+    function shortModel(name) {
+      return name ? String(name).replace(/\.[a-z0-9]+$/i, '') : '';
+    }
 
     return {
       id: 'activity', title: 'Activity', corner: 'tc',
       node: node,
       paint: function (data) {
         var comfy = (data && data.comfy) || {};
-        var busy = comfy.running > 0 || comfy.pending > 0;
-        node.hidden = !busy;
-        if (!busy) return;
-        var now = comfy.now || {};
-        line.textContent = comfy.running
-          ? '◍  ComfyUI is rendering'
-          : '◍  ComfyUI has ' + comfy.pending + ' waiting';
-        /* HONEST BAR. ComfyUI publishes node-by-node progress over a
-         * websocket the desktop app holds open; a poll cannot join that
-         * without a second connection to a station this page is already
-         * rationing. So the bar is QUEUE DEPTH, and the label says so —
-         * rather than a progress bar that is really a guess. */
-        var depth = (comfy.running || 0) + (comfy.pending || 0);
-        fill.style.width = Math.min(100, depth * 20) + '%';
-        fill.style.background = heat(Math.min(100, depth * 20));
-        var bits = [];
-        if (now.model) bits.push(now.model);
-        if (now.size) bits.push(now.size);
-        if (now.nodes) bits.push(now.nodes + ' nodes');
-        bits.push(comfy.running + ' running · ' + comfy.pending + ' queued');
-        if (comfy.last && comfy.last.seconds) {
-          bits.push('last took ' + comfy.last.seconds + 's');
+        var now = comfy.now;
+        node.classList.toggle('busy', !!now);
+
+        if (!comfy.up) {
+          line.textContent = '○  ComfyUI is not answering';
+          track.hidden = true;
+          basis.textContent = comfy.why || '';
+          detail.innerHTML = '';
+          prompt.hidden = true;
+          negative.hidden = true;
+          board.textContent = '';
+          return;
         }
-        detail.textContent = bits.join('  ·  ');
-        prompt.textContent = now.positive || '';
+
+        var b = comfy.board || {};
+        board.textContent = [
+          b.device,
+          b.comfyui ? 'ComfyUI ' + b.comfyui : '',
+          b.vram_total_gb
+            ? 'VRAM ' + b.vram_used_gb + ' / ' + b.vram_total_gb + ' GB' : '',
+          b.python ? 'python ' + b.python : ''
+        ].filter(Boolean).join('  ·  ');
+
+        if (!now) {
+          line.textContent = comfy.pending
+            ? '◍  ' + comfy.pending + ' waiting in the queue'
+            : '○  ComfyUI is idle';
+          track.hidden = true;
+          basis.textContent = '';
+          prompt.hidden = true;
+          negative.hidden = true;
+          /* The last few renders and what they cost — which is the thing
+           * that makes the NEXT elapsed figure mean something. */
+          chips(detail, (comfy.finished || []).slice(0, 4).map(function (row) {
+            return [shortModel(row.model) || 'render',
+              row.seconds + 's' + (row.size ? ' · ' + row.size : '')];
+          }));
+          return;
+        }
+
+        track.hidden = false;
+        line.textContent = '◍  rendering — ' + now.elapsed_s + 's elapsed';
+        if (now.progress !== null && now.progress !== undefined) {
+          fill.style.width = Math.round(now.progress * 100) + '%';
+          fill.style.background = heat(now.progress * 100);
+          /* SAID, because it is an estimate and an unlabelled progress bar
+           * is a promise. There is no node-by-node figure without holding
+           * ComfyUI's websocket open — see the module's header. */
+          basis.textContent = 'estimated against the last render of this '
+            + 'shape (' + now.expected_s + 's) — ComfyUI reports no '
+            + 'progress over HTTP';
+        } else {
+          fill.style.width = '100%';
+          fill.style.background = '#2b3742';
+          basis.textContent = 'no previous render of this model, size and '
+            + 'step count to measure against yet';
+        }
+
+        chips(detail, [
+          ['model', shortModel(now.model)],
+          ['size', now.size],
+          ['steps', now.steps],
+          ['cfg', now.cfg],
+          ['sampler', now.sampler],
+          ['scheduler', now.scheduler],
+          ['batch', now.batch > 1 ? now.batch : null],
+          ['frames', now.frames],
+          ['lora', (now.loras || []).map(shortModel)],
+          ['nodes', now.nodes],
+          ['into', now.into]
+        ]);
+
         prompt.hidden = !now.positive;
+        prompt.textContent = now.positive || '';
+        negative.hidden = !now.negative;
+        negative.textContent = now.negative ? 'negative: ' + now.negative : '';
+      }
+    };
+  }
+
+  /* THE OPENWEBUI ROLODEX — the other half of what the operator named.
+   *
+   * The desktop's bottom strip has an OpenWebUI tab that asks a dozen of its
+   * endpoints in one tick and lists the lot: version, every model, which are
+   * RESIDENT, the chats, the tools, the functions, the knowledge bases, the
+   * memories. This is that tab.
+   *
+   * RESIDENT MODELS COME FIRST, and that is not alphabetical. It is the one
+   * figure that says whether the next question is answered now or after a
+   * twenty-gigabyte load. */
+  function owuiWidget() {
+    var node = el('div', 'so-w so-owui');
+    var head = el('div', 'so-head');
+    head.appendChild(el('span', 'so-title', 'OPEN WEBUI'));
+    var version = el('span', 'so-svc-detail');
+    head.appendChild(version);
+    node.appendChild(head);
+    var body = el('div', 'so-body');
+    node.appendChild(body);
+
+    return {
+      id: 'owui', title: 'Open WebUI', corner: 'bc',
+      node: node,
+      paint: function (data) {
+        var o = (data && data.owui) || null;
+        body.innerHTML = '';
+        if (!o) {
+          version.textContent = '';
+          body.appendChild(el('div', 'so-note', 'not read yet'));
+          return;
+        }
+        version.textContent = [
+          o.up ? 'answering' : 'not answering',
+          o.version ? 'v' + o.version : '',
+          o.auth ? 'auth on' : '',
+          o.key ? 'key set' : 'no api key'
+        ].filter(Boolean).join(' · ');
+        if (!o.up) {
+          body.appendChild(el('div', 'so-note', o.why || 'no reply'));
+          return;
+        }
+
+        var resident = o.resident || [];
+        body.appendChild(el('h5', 'so-section', 'resident models'));
+        if (!resident.length) {
+          body.appendChild(el('div', 'so-note',
+            'nothing resident — the next question loads a model first'));
+        } else {
+          resident.forEach(function (m) {
+            var row = el('div', 'so-cell');
+            row.appendChild(el('span', 'so-cell-k', m.name));
+            row.appendChild(el('span', 'so-cell-v', m.vram_gb + ' GB'));
+            body.appendChild(row);
+          });
+        }
+
+        var rows = o.rows || {};
+        function count(name) {
+          var row = rows[name] || {};
+          if (row.count === null || row.count === undefined) {
+            return row.state && row.state !== 'ok' ? row.state : '—';
+          }
+          return row.count;
+        }
+        body.appendChild(el('h5', 'so-section', 'the shelf'));
+        var grid = el('div', 'so-grid');
+        [['models', count('models')], ['ollama', count('ollama_models')],
+         ['chats', count('chats')], ['tools', count('tools')],
+         ['functions', count('functions')], ['knowledge', count('knowledge')],
+         ['prompts', count('prompts')], ['memories', count('memories')]
+        ].forEach(function (pair) {
+          var cell = el('div', 'so-cell');
+          cell.appendChild(el('span', 'so-cell-k', pair[0]));
+          cell.appendChild(el('span', 'so-cell-v', pair[1]));
+          grid.appendChild(cell);
+        });
+        body.appendChild(grid);
+
+        var chats = o.chats || [];
+        if (chats.length) {
+          body.appendChild(el('h5', 'so-section', 'latest chats'));
+          chats.slice(0, 5).forEach(function (chat) {
+            body.appendChild(el('div', 'so-svc-fact',
+              chat.title || '(untitled)'));
+          });
+        }
       }
     };
   }
@@ -689,7 +933,10 @@
         var s = (data || {}).station || {};
         body.innerHTML = '';
         var grid = el('div', 'so-grid');
-        [['stalling now', s.stalling_now ? String(s.stalling_now) : 'no'],
+        /* The station flattens this to a sentence or an empty string; it
+         * used to arrive as a whole stall record, and printing it straight
+         * gave "[object Object]" at the one moment it mattered most. */
+        [['stalling now', s.stalling_now || 'no'],
          ['stalls', s.stalls === undefined ? '—'
            : s.stalls + ' in ' + Math.round((s.window_s || 0) / 60) + 'm'],
          ['worst', show(s.worst_s, ' s', 1)],
@@ -718,6 +965,7 @@
     stats: statsWidget,
     activity: activityWidget,
     services: servicesWidget,
+    owui: owuiWidget,
     temp: tempWidget,
     station: stationWidget,
     ramring: function () {
@@ -755,8 +1003,8 @@
     }
   };
 
-  var DEFAULT = ['activity', 'perf', 'stats', 'services', 'station',
-                 'ramring', 'tempring', 'temp'];
+  var DEFAULT = ['activity', 'perf', 'stats', 'owui', 'services',
+                 'station', 'ramring', 'tempring', 'temp'];
 
   function mount(host, options) {
     if (!host) return null;
@@ -767,13 +1015,62 @@
     var wrap = el('div', 'so so-' + mode);
     host.appendChild(wrap);
 
+    /* REGIONS, NOT CORNERS — and this is the whole of "nothing overlaps and
+     * nothing is trimmed off screen".
+     *
+     * The first version pinned each widget to the corner its desktop
+     * counterpart uses. On a 1920x1080 desk that is fine; on a 1340x800
+     * tablet two widgets share every bottom corner, the panels ran off the
+     * right edge under the rail, and rotating to portrait made all of it
+     * worse. Absolute corners cannot be made safe by nudging them, because
+     * the failure is structural: nothing stops two of them occupying the
+     * same pixels.
+     *
+     * So the layer is a GRID of four regions — a left rail, a right rail, a
+     * top band and a bottom band — with the middle left transparent for
+     * whatever is behind. Grid regions cannot overlap by construction, and
+     * each one SCROLLS, so a column too tall for the screen is reachable
+     * rather than cut off. Portrait collapses the two rails into one band,
+     * because 800px of width cannot carry two 296px columns and still show
+     * a picture.
+     *
+     * The regions are `pointer-events: none` with the widgets `auto`, so the
+     * gaps between them still belong to the slideshow underneath — a swipe
+     * that lands on bare picture still changes the picture. */
+    var regions = null;
+    if (mode === 'overlay') {
+      regions = {};
+      /* The top band is always its own child of the grid. The other three
+       * live inside a BAND, which is `display: contents` in landscape — so
+       * the grid sees the three regions directly and places them left,
+       * right and bottom — and becomes a real scrolling container in
+       * portrait, where all three fold into one strip along the foot. One
+       * element, two behaviours, and no widget ever changes parent. */
+      regions.t = el('div', 'so-region so-region-t');
+      wrap.appendChild(regions.t);
+      var band = el('div', 'so-band');
+      wrap.appendChild(band);
+      ['l', 'r', 'b'].forEach(function (key) {
+        var region = el('div', 'so-region so-region-' + key);
+        band.appendChild(region);
+        regions[key] = region;
+      });
+    }
+
+    /* Which region each of the desktop application's corners becomes. */
+    var REGION_OF = {tl: 'l', bl: 'l', tr: 'r', br: 'r', tc: 't', bc: 'b'};
+
     var built = wanted.map(function (name) {
       var make = BUILDERS[name];
       if (!make) return null;
       var widget = make();
       widget.node.dataset.soId = widget.id;
-      if (mode === 'overlay') widget.node.dataset.soCorner = widget.corner;
-      wrap.appendChild(widget.node);
+      if (regions) {
+        widget.node.dataset.soCorner = widget.corner;
+        (regions[REGION_OF[widget.corner] || 'l']).appendChild(widget.node);
+      } else {
+        wrap.appendChild(widget.node);
+      }
       return widget;
     }).filter(Boolean);
 
@@ -808,12 +1105,14 @@
       chip.classList.toggle('on', !hidden[widget.id]);
       switchboard.appendChild(chip);
     });
-    wrap.appendChild(switchboard);
+    /* In the flow of the top band, not floating: a control that covers the
+     * readout it controls is the same fault as two overlapping panels. */
+    (regions ? regions.t : wrap).appendChild(switchboard);
     applyHidden();
 
     var banner = el('div', 'so-banner');
     banner.hidden = true;
-    wrap.appendChild(banner);
+    (regions ? regions.t : wrap).appendChild(banner);
 
     var river = feed(mode, opts.active);
     var stop = river.subscribe(function (data, err) {
@@ -837,6 +1136,7 @@
       node: wrap,
       widgets: built,
       data: function () { return river.now(); },
+      polling: function () { return river.polling(); },
       destroy: function () {
         stop();
         river.stop();
@@ -846,7 +1146,180 @@
     };
   }
 
-  root.SparkOverlays = {mount: mount, WIDGETS: Object.keys(BUILDERS)};
+
+  /* ================= the pop-up ======================================= */
+
+  /* THE SC STACK AS A POP-UP, over whatever is already on screen.
+   *
+   * "...while also being able to access it as a pop up inside of Pinebox
+   *  tab."
+   *
+   * The SLIDES view is full-bleed: it replaces the panel. That is right when
+   * the readouts are what you are there for, and wrong when you are working
+   * the deck and want to glance at the GPU without losing your place. So
+   * this is a real floating window — drag it by its bar, resize it from the
+   * corner, put it away — and it hosts the SAME module in dashboard mode.
+   *
+   * ONE AT A TIME, and calling popup() again closes it. A second monitor
+   * polling the same station on the same glass would double the traffic for
+   * nothing, and the toggle is what a button on a rail expects.
+   *
+   * WHERE IT SITS IS REMEMBERED, per glass, in localStorage — a pop-up that
+   * comes back to the middle of the screen every time is one you end up
+   * dragging every time. Clamped on restore, because a window remembered at
+   * the edge of a landscape tablet is off the side of a portrait one.
+   */
+  var POPUP_MEMORY = 'sparkPopup';
+  var popupLive = null;
+
+  function popupBox() {
+    var box = {x: null, y: null, w: 560, h: 460};
+    try {
+      var held = JSON.parse(localStorage.getItem(POPUP_MEMORY) || 'null');
+      if (held && typeof held === 'object') {
+        ['x', 'y', 'w', 'h'].forEach(function (k) {
+          if (typeof held[k] === 'number') box[k] = held[k];
+        });
+      }
+    } catch (err) { /* a remembered corner is not worth a broken window */ }
+    /* Never larger than the glass, never smaller than useful, never off it. */
+    box.w = Math.max(280, Math.min(box.w, root.innerWidth - 16));
+    box.h = Math.max(220, Math.min(box.h, root.innerHeight - 16));
+    if (box.x === null) box.x = Math.max(8, (root.innerWidth - box.w) / 2);
+    if (box.y === null) box.y = Math.max(8, (root.innerHeight - box.h) / 3);
+    box.x = Math.max(0, Math.min(box.x, root.innerWidth - box.w));
+    box.y = Math.max(0, Math.min(box.y, root.innerHeight - box.h));
+    return box;
+  }
+
+  function rememberBox(box) {
+    try { localStorage.setItem(POPUP_MEMORY, JSON.stringify(box)); }
+    catch (err) { /* fine */ }
+  }
+
+  function popup(options) {
+    if (popupLive) {
+      popupLive.close();
+      return null;
+    }
+    var opts = options || {};
+    var box = popupBox();
+
+    var frame = el('div', 'so-popup');
+    frame.style.left = box.x + 'px';
+    frame.style.top = box.y + 'px';
+    frame.style.width = box.w + 'px';
+    frame.style.height = box.h + 'px';
+
+    var bar = el('div', 'so-popup-bar');
+    bar.appendChild(el('span', 'so-popup-title', opts.title || 'SC STACK'));
+    var buttons = el('span', 'so-popup-buttons');
+    bar.appendChild(buttons);
+    frame.appendChild(bar);
+
+    var body = el('div', 'so-popup-body');
+    frame.appendChild(body);
+    var grip = el('div', 'so-popup-grip');
+    frame.appendChild(grip);
+    document.body.appendChild(frame);
+
+    var layer = mount(body, {
+      mode: 'dashboard',
+      /* A pop-up that has been put away asks the station nothing. */
+      active: function () { return !!frame.parentNode; }
+    });
+
+    function button(label, hint, onPress) {
+      var node = el('button', 'so-popup-btn', label);
+      node.title = hint;
+      node.addEventListener('click', function (event) {
+        event.stopPropagation();
+        onPress();
+      });
+      buttons.appendChild(node);
+      return node;
+    }
+
+    var wide = false;
+    button('⤢', 'Fill the screen, or come back', function () {
+      wide = !wide;
+      frame.classList.toggle('wide', wide);
+      if (!wide) {
+        frame.style.left = box.x + 'px';
+        frame.style.top = box.y + 'px';
+        frame.style.width = box.w + 'px';
+        frame.style.height = box.h + 'px';
+      }
+    });
+    /* Straight through to the standalone application, for when a glance
+     * turns into a session. */
+    button('↗', 'Open the SC Stack on its own', function () {
+      try { root.open('/spark?pictures=1', '_blank'); } catch (err) { /* blocked */ }
+    });
+    button('✕', 'Put it away', function () { api.close(); });
+
+    /* ---- dragging and resizing, by pointer so a finger works --------- */
+
+    function drags(handle, onMove) {
+      handle.addEventListener('pointerdown', function (event) {
+        if (wide) return;
+        event.preventDefault();
+        var startX = event.clientX;
+        var startY = event.clientY;
+        var from = {x: frame.offsetLeft, y: frame.offsetTop,
+                    w: frame.offsetWidth, h: frame.offsetHeight};
+        handle.setPointerCapture(event.pointerId);
+        function move(ev) { onMove(ev.clientX - startX, ev.clientY - startY, from); }
+        function up(ev) {
+          handle.releasePointerCapture(ev.pointerId);
+          handle.removeEventListener('pointermove', move);
+          handle.removeEventListener('pointerup', up);
+          box = {x: frame.offsetLeft, y: frame.offsetTop,
+                 w: frame.offsetWidth, h: frame.offsetHeight};
+          rememberBox(box);
+        }
+        handle.addEventListener('pointermove', move);
+        handle.addEventListener('pointerup', up);
+      });
+    }
+
+    drags(bar, function (dx, dy, from) {
+      /* Clamped to the glass while dragging, not only on restore: a window
+       * dragged off the top has no bar left to drag it back by. */
+      var x = Math.max(0, Math.min(from.x + dx, root.innerWidth - from.w));
+      var y = Math.max(0, Math.min(from.y + dy, root.innerHeight - 40));
+      frame.style.left = x + 'px';
+      frame.style.top = y + 'px';
+    });
+
+    drags(grip, function (dx, dy, from) {
+      frame.style.width = Math.max(280,
+        Math.min(from.w + dx, root.innerWidth - from.x)) + 'px';
+      frame.style.height = Math.max(220,
+        Math.min(from.h + dy, root.innerHeight - from.y)) + 'px';
+    });
+
+    var api = {
+      node: frame,
+      layer: layer,
+      data: function () { return layer.data(); },
+      polling: function () { return layer.polling(); },
+      close: function () {
+        if (!frame.parentNode) return;
+        /* The layer first: it owns the timer, and a detached frame with a
+         * live poll is exactly the leak this whole file is careful about. */
+        try { layer.destroy(); } catch (err) { /* going anyway */ }
+        frame.parentNode.removeChild(frame);
+        popupLive = null;
+      }
+    };
+    popupLive = api;
+    return api;
+  }
+
+  root.SparkOverlays = {mount: mount, popup: popup,
+    isPopupOpen: function () { return !!popupLive; },
+    WIDGETS: Object.keys(BUILDERS)};
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = root.SparkOverlays;
   }

@@ -224,3 +224,204 @@ gradle assembleDebug  &&  adb -s 10.89.1.154:5555 install -r app-debug.apk
 
 A renderer edit that is not copied to the assets tree is a desktop that
 changed and a tablet that did not.
+
+---
+
+# The overlays — #1241
+
+> "The slideshow is one thing, but the overlays of the elements is the most
+> important component and that's what I need."
+>
+> "Whenever I would be looking at that slideshow, I would be getting overlays
+> that would be telling me everything that was happening with backend
+> components in a detailed fashion."
+
+#1240 put the pictures on the tablet and folded the telemetry into a single
+summary sheet. That was backwards, and this is the correction: the desktop
+application is a **wall of readouts with renders playing behind it**, and the
+readouts are the product.
+
+## 1. One module, four ways in
+
+> "SC stack should be its own application that I'm able to access... I wanted
+> to be able to access the media slideshow as its own application with all of
+> its functionality inside of that, while also being able to access it as a
+> pop up inside of Pinebox tab."
+
+`desktop/renderer/spark-overlays.js` is the whole of it, and `mount(host,
+{mode})` is the whole contract:
+
+| Way in | What it is | Mode |
+| --- | --- | --- |
+| **Its own app** — the **SC Stack** icon | `SparkActivity`, its own launcher entry, its own task in Recents. Opens on `/spark?pictures=1` | `overlay`, renders behind |
+| **A pop-up** — the **SC** tab on the rail | `SparkOverlays.popup()`: a real floating window, dragged by its bar, resized from its corner, closed with ✕ | `dashboard`, in a frame |
+| **Full-bleed** — the **SLIDES** tab | the slideshow view, overlays over the pictures | `overlay` |
+| **Any browser** — `GET /spark` | a phone, a laptop, a second screen. `?pictures=1` for the renders | either |
+
+**`SparkActivity` is deliberately thin, and that is the point.** `MainActivity`
+is a kiosk — it owns HOME, locks the task, and injects every view from the
+APK's own assets, so changing one needs a rebuild. `SparkActivity` loads a URL
+and attaches the bridge. Everything it shows is served from
+`desktop/renderer/`, so **editing an overlay changes what the app shows on its
+next launch with no APK in the loop.** What it still needs from native is only
+the bridge: a like writes to `favorites.md` and a setting writes to the desktop
+app's own state file, and both need the bearer.
+
+It is **not** a kiosk: no HOME filter, no lock task, Back leaves, and it pads
+itself for the system bars rather than going immersive — an app you are meant
+to be able to leave should not hide the button you leave it with.
+
+Only the kiosk's bundled copy is a second source, and only because its WebView
+refuses the `file:///android_asset/` → `http://` crossing (`BootAssets.kt`).
+
+**The pop-up is one at a time**, remembers where it was put (clamped on
+restore, because a corner remembered in landscape is off the side in
+portrait), and asks the station nothing once it is closed — its `active` gate
+is simply whether it is still in the document.
+
+## 2. The widgets, and what each is a port of
+
+| Widget | media-slideshow class | What it actually shows |
+| --- | --- | --- |
+| `activity` | `TopActivityBanner` | the render happening now — model, size, sampler, scheduler, steps, cfg, LoRAs, node count, output prefix, elapsed, estimated progress, the **prompt text**; the board and the last four renders when idle |
+| `perf` | `PerformanceGraph` | rolling CPU / RAM / GPU plots, **20 per-core bars**, load average, uptime |
+| `stats` | `StatsPanel` | memory / CPU / disk / swap gauges, then the NVIDIA section: utilisation, temperature, power, fan, SM and memory clocks |
+| `owui` | the OpenWebUI tab | version, auth, **resident models and their VRAM**, models / ollama / chats / tools / functions / knowledge / prompts / memories, and the latest chat titles |
+| `services` | `ServiceLogPanel` | all 17 services in rotation, each with what it is *doing* |
+| `station` | — | the station's own event loop: stalls, worst, held up, and its written verdict |
+| `temp` | `TempReadout` | the hottest sensor, huge, flipping °C/°F on the desktop's four-second cadence |
+| `ramring` / `tempring` | `RamCircle` / `TempCircle` | the ring gauges |
+
+## 3. What could not be ported, and is said rather than faked
+
+Three of the desktop's features have no road from a container, and the
+payload names each one with its reason (`unavailable` in
+`/api/slideshow/backend`):
+
+* **The task list, "kill the biggest RAM hog", "kill the thermal
+  contributors".** No shared PID namespace, so the host's processes are
+  invisible. The rings still draw; touching one says why it cannot act.
+* **`docker logs` tailers.** The socket proxy is restarts-only by design
+  (`compose.yaml`: *do NOT re-add CONTAINERS=1*). `services_census()` probes
+  each service live instead, which for a readout is better than a log tail.
+* **The process's own FPS and RSS.** On the tablet those would be the
+  WebView's, which is not a fact about the Spark.
+
+And two fields are **absent rather than zero**:
+
+* **GPU utilisation is not in the `_GPU_TEMP` slot** — `gpu_temp_refresh`
+  copies only `c`/`zone`/`how`, so a `util` there would be permanently null
+  dressed as a reading.
+* **VRAM on a GB10 is `[N/A]`** — unified memory. The panel says so and
+  points at the memory gauge, which is the same silicon.
+
+## 4. The progress bar is an estimate, and says so
+
+`/queue` says *what* is running, never *since when*. So `spark_overlays.py`
+keeps state across polls exactly as the desktop's `_http_prev` does: a prompt
+id that appears gets a timestamp, and one that disappears records how long
+**that shape of workflow** took, keyed on model + sampler + resolution +
+steps. The next render of the same shape is measured against it.
+
+The bar prints its own basis underneath: *"estimated against the last render
+of this shape (77.1s) — ComfyUI reports no progress over HTTP."*
+
+Node-by-node progress exists, on ComfyUI's websocket. Holding that socket open
+would mean this process — which is also recording a live radio show — carrying
+a second event-loop client and reconnecting it whenever 8188 restarts. The
+signature estimate costs one dict.
+
+## 5. It sleeps
+
+> "Make sure that we're only pulsing whenever we are in the tab and we're
+> actually receiving and accessing the information. Otherwise it needs to
+> sleep and relax."
+
+The polling interval is **cleared**, not merely skipped, whenever:
+
+* the app or browser tab is in the background (`document.hidden`), or
+* `rail.js` has the view mounted but closed, or
+* the operator pressed `S` and put the layer away.
+
+What remains is a 4-second check that touches the DOM and nothing else.
+`visibilitychange` short-circuits it in both directions. Measured on the
+tablet: **2–3 fresh readings per 11 s with the view open, and zero — the
+timestamp does not move at all — with it closed.**
+
+Nothing in that test looks at the station. Not whether it is on air, not
+whether it is paused, not which Pine Box tab is in front: the box goes on
+having cores and a GPU while the radio is silent, and a monitor that stops
+reporting because the show stopped is useless exactly when someone is looking
+to find out why. A station that does not answer is likewise a reason to keep
+asking — the interval survives, and a line says how many polls have been
+missed.
+
+## 6. Fitting on the glass, both ways up
+
+> "Make sure the accommodations are taken for the resolution and display size
+> so the elements are fitting on screen and aren't overlapping and be trimmed
+> off screen." / "I want it to be compatible in both landscape and portrait."
+
+The first version pinned each widget to its desktop counterpart's corner. On
+a 1340×800 tablet two widgets shared every bottom corner and the right-hand
+column ran under the rail. That cannot be nudged into correctness, because
+nothing *stops* two absolutely-positioned boxes occupying the same pixels.
+
+So the layer is a **grid of four scrolling regions**:
+
+```
+landscape   [ left | picture | right ]   with a top and a bottom band
+portrait    the picture on top, every readout in one scrolling band beneath
+```
+
+Regions cannot overlap by construction, and each scrolls, so a column taller
+than the glass is reachable rather than cut off. `tools/overlay-fit-probe.cjs`
+drives a headless Chrome through **seven sizes** — the tablet both ways, a
+1080p desk, a phone, a small window, in both modes — and measures overlap,
+clipping, content overflow and the sleeping. It exits non-zero on a fault.
+
+### Three traps this found, all invisible to the eye
+
+1. **`padding-right` does not inset an absolutely-positioned child.** The
+   host reserves the rail's strip with padding; the containing block for an
+   absolute child is the padding *box*, which includes it. The panels ran
+   under the rail's tabs, which paint over them at z-index 2147483001.
+2. **A module cannot assume its host's `box-sizing`.** At 800px the band's
+   columns were 256px and a widget rendered 270 — its padding and border
+   added outside the width. Exactly the 6px overlap the probe reported.
+3. **`offsetParent` is always null for `position: fixed`.** The visibility
+   test used it, so on a fixed host the monitor slept on a page plainly being
+   looked at.
+
+And one of timing: at mount the rail's own box measured **0px wide** — built
+at boot but not yet laid out — so the inset came out zero. It is re-measured
+after a settle and by a `ResizeObserver`, which is also what makes a rotation
+work.
+
+## 7. Keeping the station out of trouble
+
+The station is a single process that is also recording a live show, and its
+own pulse report regularly counts thirty-plus stalls in ten minutes. So:
+
+* **one request in flight, ever** — every widget paints from the same answer;
+* the payload is cached 2 s, the folder scan 8 s, **`nvidia-smi` 6 s** (it is
+  a process spawn; at the payload's rate that would have been 1,800 an hour);
+* the **census and the OpenWebUI sweep never block the answer**. They refresh
+  behind it and a stale copy is handed back. Measured: the first poll after a
+  restart went from *timing out past the tablet's 20 s read limit* — which
+  drew nothing and reported the station down — to **2.4 s**, then 0.76 s, then
+  0.1 s cached;
+* the twelve OpenWebUI endpoints are asked **concurrently**, not in a row.
+
+## 8. Tests
+
+```
+tests/test_spark_overlays_2026_09_12.py   16   the workflow reader
+tools/overlay-fit-probe.cjs                7   sizes × fit + sleeping
+```
+
+The Python tests are fixtures of the graph shapes this box really renders, and
+pin the three failures that would look fine: a forwarding node between the
+sampler and its text (every flux workflow has one), the negative prompt coming
+back as the positive, and two renders differing only in seed failing to share
+a signature — which would mean no render ever got a progress bar.

@@ -311,6 +311,31 @@
       } catch (err) { /* the rail is more important than the handle */ }
     }
 
+    /* THE SC STACK, AS A POP-UP.
+     *
+     * "...while also being able to access it as a pop up inside of Pinebox
+     *  tab."
+     *
+     * A tab rather than a view host: pressing it opens a floating window
+     * over whatever is already on screen, so the deck does not have to be
+     * left to glance at the GPU. The same readouts live full-bleed on the
+     * SLIDES tab and as their own application (SparkActivity / /spark);
+     * this is the third door and the least disruptive one. */
+    if (root.SparkOverlays && typeof root.SparkOverlays.popup === 'function') {
+      try {
+        var stack = make('button', 'pineViewTab-stack', 'pine-view-tab');
+        stack.textContent = 'SC';
+        stack.title = 'The SC stack, in a window over this';
+        stack.addEventListener('click', function () {
+          try {
+            root.SparkOverlays.popup();
+            stack.classList.toggle('on', root.SparkOverlays.isPopupOpen());
+          } catch (err) { /* never take the rail down with it */ }
+        });
+        rail.appendChild(stack);
+      } catch (err) { /* the rail is more important than the handle */ }
+    }
+
     /* The talk dot, on every screen - the operator asked for it on all of
      * them, not only the one it was designed against. */
     if (root.PineTalkDot) {
