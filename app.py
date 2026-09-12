@@ -121656,9 +121656,34 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         if len(_talk) > 1:
             # only the slots conversations hold between them
             _held = sorted(_i for _w in _talk.values() for _i in _w)
-            _blocks = sorted(
-                _talk.values(),
-                key=lambda w: min(float(events[_i]["at"] or 0) for _i in w))
+            # #1274: ON `ts`, WHICH IS NEVER REWRITTEN.
+            #
+            # This was `min(at)`, and `at` is restamped after the fact -
+            # measured on the live log, 104 of 129 re-appended ids had
+            # their air_at move, median 88s and worst 277s, while not
+            # one of them had its `ts` move. Anchoring a block on its
+            # earliest line meant a single restamp four minutes early
+            # dragged the whole conversation up the page: reading one
+            # hour twice, 45 seconds apart, six changed stamps put 83 of
+            # 468 elements back in a different order.
+            #
+            # A burst already shares one `ts` (measured spreads of 0s
+            # across rounds of 5 to 28 rows), so it is a per-round
+            # quantity, which is what an anchor wants. `at` breaks the
+            # tie because `ts` is whole seconds and two rounds can open
+            # inside one; a row with no `ts` falls back to `at`.
+            def _anchor(w: list[int]) -> tuple[float, float]:
+                _best: tuple[float, float] | None = None
+                for _i in w:
+                    _r = events[_i].get("row") or {}
+                    _at = float(events[_i]["at"] or 0)
+                    _t = float(_r.get("ts") or 0) or _at
+                    _key = (_t, _at)
+                    if _best is None or _key < _best:
+                        _best = _key
+                return _best or (0.0, 0.0)
+
+            _blocks = sorted(_talk.values(), key=_anchor)
             _lined = [events[_i] for _w in _blocks for _i in _w]
             for _i, _e in zip(_held, _lined):
                 events[_i] = _e
