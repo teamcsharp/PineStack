@@ -67,6 +67,9 @@ from response_bank import ResponseBank, add_listening_responses
 from rap_battle import (COMBATANTS as RAP_COMBATANTS, RapBattle,
                         SEAT_NAMES as RAP_SEAT_NAMES)
 from sfx_cadence import SfxCadence, due_after as sfx_due_after
+# The broadcast stream (#1253): one URL, one socket, the mix made here.
+# station_stream.py carries why the tune page cannot do this in a car.
+from station_stream import StationStream, icy_block
 import library
 import library_extract
 # #1241: the detail behind the overlays' top and bottom panels —
@@ -74266,11 +74269,37 @@ def caller_voice_for(name: str, taken: set[str],
         if held and held in usable:
             return held
         air = voice_airtime()
+        # #1256: AND WHAT THE BOOK ALREADY HOLDS. Two holes put two
+        # voices on 65% of 378 callers while 35 sat available.
+        #
+        # Handing a voice out does not move `airings` - only
+        # voice_aired() does, and that is called from one site in this
+        # file - so every caller drawn before the last one reached the
+        # air saw an identical ledger and took an identical answer.
+        # Callers are written in bursts; they were assigned in bursts,
+        # all the same.
+        #
+        # And with most voices never credited an airing the key
+        # collapsed to (0, 0, v), so `sorted` returned the
+        # alphabetically lowest id every single time. A rotation that
+        # is a constant with extra steps.
+        #
+        # The count of callers already carrying a voice leads the key,
+        # and ties break at RANDOM rather than by name - thirty-five
+        # voices with nothing to separate them should land on
+        # thirty-five callers, not on whichever sorts first.
+        try:
+            _held = collections.Counter(
+                str(v) for v in (_caller_voice_book() or {}).values()
+                if isinstance(v, str))
+        except Exception:  # noqa: BLE001
+            _held = {}
         fresh = sorted(
             usable,
-            key=lambda v: (int((air.get(v) or {}).get("airings") or 0),
+            key=lambda v: (int(_held.get(v, 0)),
+                           int((air.get(v) or {}).get("airings") or 0),
                            int((air.get(v) or {}).get("last") or 0),
-                           v))
+                           random.random()))
         pick = fresh[0]
         _caller_voice_remember(name, pick)
         return pick
@@ -96062,6 +96091,22 @@ async def radio_clock_api(
     track = _RADIO.get("now") or {}
     tid = str(track.get("id") or "")
     root = "/tape" if track.get("tape") else "/music"
+    # #1253: A LISTENER IN A CAR IS NOT IN THE ROOM.
+    #
+    # Both of the exclusives below exist to stop two players in ONE
+    # HOUSE sounding the same audio a few hundred milliseconds apart.
+    # Neither has any meaning for somebody on the road, and both were
+    # silencing them outright. Measured 2026-09-12: `pinetab` holds
+    # the air permanently (terminals: play=true), so pineSoloGate
+    # muted every remote page in the house's favour - a tune-in link
+    # that showed a green dot, a title and a moving progress bar, and
+    # made no sound at all. `music_here` was the same fault for the
+    # record: false means 'the box has it', and no box is in the car.
+    #
+    # A request through the public listener door is by definition not
+    # in the house, so it is exempt from both. Everything on the LAN
+    # keeps the old behaviour exactly.
+    _away = request.headers.get('x-pinebox-public') == '1'
     return {
         "server_ms": int(time.time() * 1000),
         "started_ms": int(float(_RADIO.get("started") or 0) * 1000),
@@ -96075,7 +96120,7 @@ async def radio_clock_api(
         # 2026-09-09: ONE DESTINATION, and the clock is where every player
         # in the house learns it. False means the box is carrying the
         # record and this page must not play it as well.
-        "music_here": page_carries_music(),
+        "music_here": True if _away else page_carries_music(),
         "title": str(track.get("title") or ""),
         "seconds": float(track.get("seconds") or 0),
         "url": f"{root}/{tid}?t={media_sign(tid)}" if tid else "",
@@ -96085,7 +96130,7 @@ async def radio_clock_api(
         # #1008: "" means everybody plays, which is the default and the
         # old behaviour exactly. A listener id means only that one plays
         # and every other page mutes itself.
-        "audio_owner": audio_owner(),
+        "audio_owner": "" if _away else audio_owner(),
     }
 
 
@@ -110978,8 +111023,19 @@ PUBLIC_ENABLED = os.getenv("SPARK_PUBLIC_LISTEN", "true").lower() in (
 # Exact paths, or prefixes ending in "/". Nothing is matched loosely: a
 # regex over a public surface is how an allowlist quietly grows a hole.
 _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
-               "/api/radio/clock"}
-_PUBLIC_GET_PREFIX = ("/tune/", "/media/", "/music/", "/data/vendor/")
+               "/api/radio/clock",
+               # #1253: the broadcast stream. This is the road a car
+               # actually uses - one socket, held open, mixed here.
+               "/stream.mp3", "/stream.m3u", "/api/stream/state"}
+# #1253: ...and the things the listener page itself asks for. The
+# gallery pictures and the icon font were never on this list, so on a
+# phone the artwork was a broken-image box and the icons fell back to
+# system emoji - the page was being served through a door that then
+# refused its own assets. /icons serves two named files and takes no
+# auth at all; the picture road is read-only and now takes the same
+# tune-in token as everything else on this page.
+_PUBLIC_GET_PREFIX = ("/tune/", "/media/", "/music/", "/data/vendor/",
+                      "/icons/", "/api/generations/image/")
 _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
                 "/api/music/vote",
                 # #1149: wake-only - the route refuses to pause anything,
@@ -111045,6 +111101,234 @@ async def _startup_public_door() -> None:
         print(f"[public] listener door did not start: {exc}", flush=True)
 
 
+# --- THE BROADCAST STREAM (#1253) ------------------------------------------
+#
+# "why it's unable to play at a real time pace whenever I'm listening to it
+#  on the go ... I want this able to stream one to one without any sort of
+#  issue and to be persistent."
+#
+# The tune page cannot do that job and no amount of tuning will make it.
+# It is a clock-chaser: it seeks the record to a position this server
+# dictates and fetches every DJ line separately against a deadline. Three
+# measured facts kill it on a cellular link:
+#
+#   * this process spent 7,276 seconds in 24 hours with its event loop
+#     BLOCKED (121 of 144 dead-air gaps in six hours were logged
+#     `cause: event-loop stall`). The public door is a second uvicorn in
+#     this same process, so the clock, the voice feed and the record's
+#     byte-ranges freeze together;
+#   * a clip past its deadline is DISCARDED by the page as hopeless, so a
+#     bad link thins the show out rather than delaying it;
+#   * a screen-locked phone throttles the timers that drain the queue.
+#
+# A stream is immune to all three, because a stream is allowed to BUFFER
+# AHEAD. Thirty seconds of stall becomes thirty seconds of latency instead
+# of thirty seconds of damage, and latency on a radio is not a fault.
+#
+# Nothing here writes to station state. The mixer only ever reads the
+# snapshot below, on its own thread, so it cannot take the station off air.
+STREAM_BITRATE = int(os.getenv("STREAM_BITRATE", "128"))
+STREAM_ICY_INTERVAL = 16000
+
+
+def _stream_clip_path(url: str) -> str:
+    """The local file behind a voice clip's URL, or "".
+
+    The feed hands out "/media/<key>?t=<signature>"; the key is the file
+    name under VOICE_MEDIA_DIR. Anything that is not exactly that shape
+    is refused rather than resolved - this runs off a mixer thread with
+    no request context, so it must not be a road to arbitrary paths.
+    """
+    try:
+        raw = str(url or "").split("?", 1)[0]
+        if not raw.startswith("/media/"):
+            return ""
+        key = raw[len("/media/"):]
+        if not MEDIA_KEY_SHAPE.match(key):
+            return ""
+        path = VOICE_MEDIA_DIR / key
+        return str(path) if path.is_file() else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _stream_snapshot() -> dict[str, Any]:
+    """What is on air this instant, in the shape station_stream wants.
+
+    Contract: CHEAP and NEVER RAISES. It is called four times a second
+    from the mixer thread; anything expensive here would be paid for in
+    the very stalls this road exists to survive. Every lookup below is
+    an in-memory dict read or a stat().
+    """
+    try:
+        track = _RADIO.get("now") or {}
+        music: dict[str, Any] | None = None
+        tid = str(track.get("id") or "")
+        if tid and not track.get("tape"):
+            row = music_track(tid)
+            if row:
+                # The local shelf first, exactly as /music does: the
+                # library is a CIFS share and the mixer must not wait on
+                # a Wi-Fi hop for the next frame (#1156).
+                hot = music_hot_file(row)
+                music = {
+                    "id": tid,
+                    "path": str(hot) if hot is not None else str(row["path"]),
+                    "started": float(_RADIO.get("started") or 0),
+                    "title": str(track.get("title") or ""),
+                    "artist": str(track.get("artist") or ""),
+                }
+
+        clips: list[dict[str, Any]] = []
+        cut = int(_RADIO.get("voice_cut_ms") or 0)
+        for clip in list(_RADIO.get("voice_clips") or [])[-40:]:
+            ts = int(clip.get("ts") or 0)
+            if ts <= cut:
+                continue                      # a dead schedule's material
+            air = int(clip.get("broadcast_ms")
+                      or ts + VOICE_BROADCAST_LEAD_MS)
+            path = _stream_clip_path(str(clip.get("url") or ""))
+            if not path:
+                continue
+            try:
+                length = float((clip.get("stream") or {}).get("length") or 0)
+            except Exception:  # noqa: BLE001
+                length = 0.0
+            clips.append({"key": f"{ts}|{clip.get('url')}",
+                          "air_at": air / 1000.0,
+                          "path": path, "length": length})
+
+        return {"on": bool(_RADIO.get("on")), "paused": radio_paused(),
+                "music": music, "clips": clips}
+    except Exception:  # noqa: BLE001
+        # A broken snapshot must degrade to silence-on-a-held-socket,
+        # never to an exception that ends the broadcast.
+        return {"on": False, "paused": False, "music": None, "clips": []}
+
+
+STATION_STREAM = StationStream(_stream_snapshot, bitrate=STREAM_BITRATE)
+
+
+@app.get("/stream.mp3")
+async def station_stream_mp3(
+    request: Request,
+    t: str = "",
+    br: str = "",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The broadcast, as one continuous mp3. Open it in a car.
+
+    This is a real stream: it starts at the live edge with a few seconds
+    of burst so audio begins on the first packet, and then it NEVER ENDS
+    - not when the record turns over, not when the booth pauses, not
+    when the box stalls. That is the persistence ask. A paused station
+    is fed silence down a held socket rather than a closed connection,
+    so coming back on air needs nothing from the listener.
+    """
+    require_listen_auth(t, authorization)
+    wants_meta = str(request.headers.get("icy-metadata")
+                     or request.headers.get("Icy-MetaData") or "") == "1"
+    # #1253: the listener chooses the quality, exactly as they have for
+    # the clips since #999. One mix, several encoders - a phone on 48k
+    # and a desktop on 128k share every decode behind them.
+    sink = STATION_STREAM.attach(br)
+
+    async def body() -> Any:
+        since = 0
+        last_title: str | None = None
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                # take() parks on a condition variable, so it waits on a
+                # THREAD - the event loop is never blocked by a quiet
+                # moment, and a stalled loop costs the listener latency
+                # out of their buffer rather than audio.
+                chunk = await asyncio.to_thread(sink.take, 1.0)
+                if not sink.open:
+                    break
+                if not chunk:
+                    continue                  # keep-alive tick, no bytes
+                if not wants_meta:
+                    yield chunk
+                    continue
+                # ICY: the record's name, for the display in the dash.
+                while chunk:
+                    room = STREAM_ICY_INTERVAL - since
+                    if len(chunk) < room:
+                        yield chunk
+                        since += len(chunk)
+                        break
+                    yield chunk[:room]
+                    chunk = chunk[room:]
+                    since = 0
+                    title = STATION_STREAM.icy_title()
+                    if title != last_title:
+                        last_title = title
+                        yield icy_block(title)
+                    else:
+                        yield b"\0"
+        finally:
+            STATION_STREAM.detach(sink)
+
+    headers = {
+        "Content-Type": "audio/mpeg",
+        # A live feed, for everything between here and the car.
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+        "X-Content-Type-Options": "nosniff",
+        # No ranges on a live stream. Saying so stops a player trying to
+        # seek it and then treating the refusal as an error.
+        "Accept-Ranges": "none",
+        "icy-name": "Pine Box FM",
+        "icy-description": "The house station",
+        "icy-br": str(getattr(sink, "bitrate", STREAM_BITRATE)),
+        "icy-pub": "0",
+    }
+    if wants_meta:
+        headers["icy-metaint"] = str(STREAM_ICY_INTERVAL)
+    return StreamingResponse(body(), media_type="audio/mpeg", headers=headers)
+
+
+@app.get("/stream.m3u")
+async def station_stream_playlist(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The one-line playlist a car head unit or VLC wants to be given.
+
+    It carries the token, so the file itself is the thing you save in
+    the dash - open it once and the radio has a station preset.
+    """
+    require_listen_auth(t, authorization)
+    base = str(request.base_url).rstrip("/")
+    link = f"{base}/stream.mp3" + (f"?t={quote(t)}" if t else "")
+    body = ("#EXTM3U\n"
+            "#EXTINF:-1,Pine Box FM\n"
+            f"{link}\n")
+    return Response(content=body, media_type="audio/x-mpegurl", headers={
+        "Content-Disposition": 'attachment; filename="pineboxfm.m3u"',
+        "Cache-Control": "no-store"})
+
+
+@app.get("/api/stream/state")
+async def station_stream_state(
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Is the stream up, who is on it, and what has it produced.
+
+    `produced_seconds` against `up_seconds` is the honest pace check: a
+    mixer that is keeping real time has them within a second of each
+    other however badly the event loop is behaving, because the mix runs
+    on its own thread.
+    """
+    require_listen_auth(t, authorization)
+    return STATION_STREAM.state()
+
+
 @app.get("/tune/{token}")
 async def tune_page(token: str, request: Request) -> HTMLResponse:
     """Opened by a shared link. The page is handed the TOKEN, never the key.
@@ -111066,7 +111350,12 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
     public = request.headers.get("x-pinebox-public") == "1"
     page = (CONTROL_PANEL_HTML if (scope == "full" and not public)
             else RADIO_PAGE_HTML)
-    return HTMLResponse(page.replace("__SERVER_KEY__", json.dumps(token)))
+    # #1253: the page needs to know which side of the door it came
+    # through. In the house it keeps the synchronised player; on the road
+    # it defaults to the stream, which is the only road that works there.
+    return HTMLResponse(page
+                        .replace("__SERVER_KEY__", json.dumps(token))
+                        .replace("__AWAY__", "true" if public else "false"))
 
 
 @app.post("/api/dj/shout")
@@ -118963,11 +119252,19 @@ async def comfy_outputs(
 @app.get("/api/generations/image/{filename}")
 async def generation_image(
     filename: str,
+    t: str = "",
     authorization: str | None = Header(default=None),
 ) -> Response:
     """Proxy a finished render out of ComfyUI's output folder so the gallery
-    can show it. Open (read) auth so the live view works on any device."""
-    require_read_auth(authorization)
+    can show it. Open (read) auth so the live view works on any device.
+
+    #1253: ...and a TUNE-IN TOKEN, because an <img> tag cannot send an
+    Authorization header and the public door strips the one it could not
+    have sent anyway. This is the same contract /media has carried since
+    the beginning: the URL is the credential, and revoking the link
+    closes it. Read-only, one bind-mounted output folder, name-checked
+    below."""
+    require_listen_auth(t, authorization)
     if "/" in filename or ".." in filename or not re.fullmatch(
         r"[\w.\- ()\[\]]{1,200}", filename
     ):
@@ -191304,6 +191601,25 @@ the library files untouched">📶 quality</label>
     <div class="gallery-caption" id="galleryCaption"></div>
   </div>
 
+  <!-- #1253: THE TWO WAYS TO LISTEN.
+       "Live with the house" is the original road: this page chases
+       the station clock so it sits on the same second of the same
+       record as the tablet and the desktop, and plays each DJ line
+       as its own fetch. It is right in the house and hopeless in a
+       car - it cannot buffer ahead, because being ahead is the one
+       thing a shared clock forbids, and it throws away any line that
+       misses its instant.
+       "Car stream" is one socket carrying a mix made on the box. It
+       buffers as far ahead as your phone likes, it survives a tunnel,
+       and it does not stop when the screen locks. It is a few seconds
+       behind the house, which on a radio is not a fault. -->
+  <div class="lev" style="margin-bottom:10px">
+    <label for="lvMode">📻 listen</label>
+    <select id="lvMode" onchange="setMode()">
+      <option value="stream">Car stream · buffered, never stops</option>
+      <option value="live">Live with the house · in step</option>
+    </select>
+  </div>
   <button class="big" id="tune" onclick="tune()">Tune in</button>
 
   <!-- #1149: an inert station is not a dead end. Anyone with a live link
@@ -191344,6 +191660,10 @@ the library files untouched">📶 quality</label>
 
 <script>
 const KEY = __SERVER_KEY__;
+/* #1253: is this page on the ROAD (through the public listener door)
+ * or in the HOUSE? The two want opposite things, and the page used
+ * to do the house thing for everybody. */
+const AWAY = __AWAY__;
 // A listener id keeps the count honest across reloads in the same tab.
 const ME = sessionStorage.getItem("pbfm") ||
   (sessionStorage.setItem("pbfm", Math.random().toString(36).slice(2)),
@@ -191448,6 +191768,13 @@ function setRate(save) {
     label.textContent = voiceRate ? voiceRate + "k" : "raw";
   }
   try { localStorage.pbfmRate = String(voiceRate); } catch (e) {}
+  /* #1253: on the stream road the rate is baked into the URL, so a new
+   * choice means a new connection. Only when something is actually
+   * playing - changing it before you tune in should not start anything. */
+  if (save !== false && typeof streamMode !== "undefined"
+      && streamMode && playing) {
+    try { startStream(); } catch (e) {}
+  }
 }
 
 function initRate() {
@@ -191720,6 +192047,7 @@ let anchorKey = "";
 let lastHardSeek = 0;
 
 function retime(now, serverMs, startedMs, seconds) {
+  if (streamMode) return;      // #1253: no clock to chase on the stream
   if (!audio || !now || !now.url || !serverMs) return;
   if (stationPaused) return;   // #1149: NO road restarts a paused record
   const key = String(now.id || "") + "|" + String(startedMs || 0);
@@ -191819,6 +192147,10 @@ async function clockPoll() {
     pineSoloGate(c);                                        // #1008
     /* #1138: the station is paused - this listener goes quiet with it. */
     stationPaused = !!c.paused;          // #1147: voiceNext reads this
+    /* #1253: the stream carries the pause itself - the box feeds silence
+     * down a held socket. Touching the element here would close the very
+     * connection that makes coming back cost nothing. */
+    if (streamMode) return;
     if (c.paused) {
       if (audio && !audio.paused) audio.pause();
       /* #1147: the BOOTH goes quiet too - this path silenced only the
@@ -191861,7 +192193,10 @@ function renderGallery(state) {
   galleryNames = names; galleryIndex = 0;
   const show = () => {
     const name = galleryNames[galleryIndex % galleryNames.length];
-    image.src = "/api/generations/image/" + encodeURIComponent(name);
+    /* #1253: carry the tune-in token - an <img> has no headers, so
+     * without this every picture on a shared link is a broken box. */
+    image.src = "/api/generations/image/" + encodeURIComponent(name)
+      + (GUEST ? "?t=" + encodeURIComponent(KEY) : "");
     caption.textContent = name;
     galleryIndex += 1;
   };
@@ -191981,6 +192316,7 @@ async function pollOnce() {
     const state = await api("/api/dj?lean=1&listener=" + ME);
     stateAt = Date.now();
     sync(state);
+    paintMediaSession(state);           // #1253: the dashboard display
     renderGallery(state);
     patter(state);
   } catch (error) {
@@ -192123,6 +192459,9 @@ function voiceRelease(url) {
 }
 
 function voiceNext() {
+  /* #1253: in stream mode the mix arrives already made. Letting this
+   * road run as well is the show played twice, a few seconds apart. */
+  if (streamMode) return;
   if (stationPaused) return;   // #1147: a paused station starts nothing
   if (voiceBusy || !voiceQueue.length) return;
   // #998: PEEK. This used to shift the clip off and unshift it back on
@@ -192322,6 +192661,188 @@ function voiceNext() {
   });
 }
 
+/* #1253: THE STREAM PLAYER.
+ *
+ * One element, one src, one socket. There is deliberately no clock here
+ * and no queue: the mix arrives already made, so there is nothing to keep
+ * in step and nothing to throw away for being late. Everything this page
+ * used to do to stay on cue is exactly what broke it on a cellular link.
+ */
+let streamMode = AWAY;          /* on the road, this is the default */
+let radio = null;
+let streamTries = 0;
+let streamTimer = null;
+
+function streamUrl() {
+  /* #1253: the quality selector governs the stream too. 0 ("Original")
+   * has no meaning for a live mix, so it takes the station default. */
+  const rate = Number(voiceRate || 0);
+  let url = "/stream.mp3?_=" + Date.now();
+  if (GUEST) url += "&t=" + encodeURIComponent(KEY);
+  if (rate > 0) url += "&br=" + rate;
+  return url;
+}
+
+function initMode() {
+  const m = document.getElementById("lvMode");
+  if (!m) return;
+  let saved = null;
+  try { saved = localStorage.pbfmMode; } catch (e) { saved = null; }
+  m.value = (saved === "live" || saved === "stream") ? saved
+          : (AWAY ? "stream" : "live");
+  streamMode = m.value === "stream";
+}
+
+function setMode() {
+  const m = document.getElementById("lvMode");
+  if (!m) return;
+  const want = m.value === "stream";
+  try { localStorage.pbfmMode = m.value; } catch (e) {}
+  if (want === streamMode) return;
+  streamMode = want;
+  /* Switching hands over cleanly: whichever road was sounding stops
+   * before the other starts, or you hear the show twice. */
+  stopEverything();
+  if (playing) { startListening(); }
+}
+
+function stopEverything() {
+  try { if (radio) { radio.pause(); radio.removeAttribute("src"); radio.load(); } } catch (e) {}
+  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+  try { if (audio) audio.pause(); } catch (e) {}
+  try { if (voice) { voice.pause(); voice.removeAttribute("src"); voice.load(); } } catch (e) {}
+  voiceBusy = false; voiceNowTs = 0; voiceCurrentClip = null;
+  trackId = "";
+  if (ducking) { ducking = false; applyLevels(); }
+}
+
+function streamElement() {
+  if (radio) return radio;
+  radio = new Audio();
+  radio.preload = "none";
+  /* #1147: stamped and in the document, so the solo gate and the
+   * desktop volume gating can both see it. */
+  try {
+    radio.dataset.pineLive = "stream";
+    radio.setAttribute("playsinline", "");
+    radio.style.display = "none";
+    document.body.appendChild(radio);
+  } catch (e) {}
+  /* A live stream has no end. These two mean the link is genuinely
+   * gone, so they reconnect. */
+  radio.onended = () => streamRecover("ended");
+  radio.onerror = () => streamRecover("error");
+  /* #1253 review: `stalled` and `waiting` DO NOT reconnect, and the
+   * first cut of this page had them doing exactly that. They fire while
+   * the buffer is merely running dry - which is precisely when the box
+   * is in one of the event-loop stalls this whole road exists to ride
+   * out. Reconnecting there throws away the thirty seconds of burst that
+   * would have covered it and asks for a fresh one over a cellular link:
+   * the same self-feeding stall #998 documents for the record element,
+   * rebuilt on a new road. Only the watchdog below may give up, and only
+   * after the playhead has genuinely stopped moving. */
+  radio.onplaying = () => {
+    streamTries = 0;
+    const note = document.getElementById("note");
+    if (note) note.textContent = "streaming — this stays on until you stop it";
+  };
+  return radio;
+}
+
+function startStream() {
+  const el = streamElement();
+  streamTries = 0;
+  el.src = streamUrl();
+  el.volume = 1;
+  el.play().catch((e) => streamRecover("play: " + (e && e.message)));
+  armStreamWatch();
+}
+
+/* #1253: THE ONLY THING ALLOWED TO GIVE UP ON THE STREAM.
+ *
+ * Not `stalled`, not `waiting` - those fire during a buffer dip and a
+ * reconnect there is the cure that causes the disease. This watches the
+ * PLAYHEAD. If it has not advanced in forty seconds while we believe we
+ * are playing, the connection really is dead and a fresh one is the only
+ * way back. Forty seconds is longer than the worst stall the box has
+ * ever been measured at, so a stall can never trip it.
+ */
+let streamWatch = null;
+let streamAt = -1;
+let streamAtSince = 0;
+
+function armStreamWatch() {
+  if (streamWatch) clearInterval(streamWatch);
+  streamAt = -1; streamAtSince = Date.now();
+  streamWatch = setInterval(() => {
+    if (!playing || !streamMode || !radio) return;
+    const at = Number(radio.currentTime || 0);
+    if (at > streamAt + 0.05) { streamAt = at; streamAtSince = Date.now(); return; }
+    if (Date.now() - streamAtSince > 40000) {
+      streamAtSince = Date.now();
+      streamRecover("the playhead stopped for 40s");
+    }
+  }, 5000);
+}
+
+/* Reconnect, backing off, FOREVER. A tunnel, a tower handoff, a car park:
+ * none of them are a reason to make the listener press anything. */
+function streamRecover(why) {
+  if (!playing || !streamMode) return;
+  if (streamTimer) return;
+  streamTries = Math.min(8, streamTries + 1);
+  const wait = Math.min(15000, 500 * Math.pow(2, streamTries - 1));
+  const note = document.getElementById("note");
+  if (note) note.textContent = "reconnecting… (" + why + ")";
+  streamTimer = setTimeout(() => {
+    streamTimer = null;
+    if (!playing || !streamMode) return;
+    const el = streamElement();
+    try { el.pause(); } catch (e) {}
+    el.src = streamUrl();
+    el.play().catch(() => streamRecover("retry"));
+  }, wait);
+}
+
+/* The lock screen, the steering wheel and the dashboard. Without this a
+ * phone treats the tab as a page that happens to make noise, and both
+ * iOS and Android are entitled to stop it when the screen goes off. */
+function paintMediaSession(state) {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    const now = (state && state.now) || {};
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: now.title || "Pine Box FM",
+      artist: now.artist || "Pine Box FM",
+      album: "Pine Box FM",
+      artwork: now.art ? [{src: now.art, sizes: "512x512", type: "image/jpeg"}]
+                       : [],
+    });
+    navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+    navigator.mediaSession.setActionHandler("play", () => {
+      if (!playing) tune();
+    });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      if (playing) tune();
+    });
+    navigator.mediaSession.setActionHandler("stop", () => {
+      if (playing) tune();
+    });
+    /* A live stream cannot be scrubbed, and offering it is how a car
+     * head unit ends up sending seeks that kill the connection. */
+    ["seekbackward", "seekforward", "seekto", "previoustrack",
+     "nexttrack"].forEach((a) => {
+      try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {}
+    });
+  } catch (e) { /* the show goes on */ }
+}
+
+function startListening() {
+  if (streamMode) { startStream(); return; }
+  voice.play().catch(() => {});      // unlock the voice element too
+  poll();
+}
+
 function tune() {
   // Browsers only allow audio that a person started, so this button is not
   // decoration — it is the gesture that unlocks playback.
@@ -192354,11 +192875,17 @@ function tune() {
     if (voiceCurrentClip) {
       voiceAck(voiceCurrentClip, "error", new Error("listener stopped playback"));
     }
-    audio.pause(); voice.pause(); trackId = ""; return;
+    /* #1253: STOP MEANS STOP, and nothing else does. The stream road
+     * reconnects through anything, so the ONLY thing that ends it is
+     * this button - which is the persistence that was asked for. */
+    stopEverything();
+    paintMediaSession(null);
+    return;
   }
-  voice.play().catch(() => {});      // unlock the voice element too
+  startListening();
   poll();
   signIn();
+  paintMediaSession(null);
 }
 
 function burst(anchor, up) {
@@ -192456,6 +192983,7 @@ async function request() {
 }
 
 initLevels();
+initMode();                     // #1253: which road this page takes
 poll();
 setInterval(poll, 3000);
 setInterval(clockPoll, 1500);   // the cheap one, often — stays on cue (#631)
