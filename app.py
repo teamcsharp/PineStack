@@ -28542,7 +28542,7 @@ def _round_chunks(turns: list[tuple[str, str]],
     dropped at the end) so the running chunk index — which is the
     disfluency seed — stays in step with the live playlist."""
     out: list[tuple[str, str, str]] = []
-    cap = say_max_chars()
+    cap = say_line_cap()                                # #1275b
     turns = _prep_intro_pad(turns, caller_name)
     for marker, said in turns:
         who = ("caller" if marker == "C" else "caller2" if marker == "E"
@@ -28578,9 +28578,12 @@ def _round_chunks(turns: list[tuple[str, str]],
         # other half of what this line always said.
         live_only = not voice
         vec = {} if live_only else performance_vector(who, voice)
+        # #1275b: the SAME cap and the SAME separators the air will ask
+        # for, or this take is keyed on something nobody looks up.
         for at, chunk in enumerate(
                 sentence_chunks(text, cap=cap,
-                                most=say_chunks_for(text, cap))):
+                                most=say_chunks_for(text, cap),
+                                house=say_house_split())):
             if live_only:
                 out.append(("", "", who))
                 continue
@@ -28612,7 +28615,7 @@ def round_line_plan(turns: list[tuple[str, str]],
     what the transcript reads from."""
     out: list[dict[str, Any]] = []
     try:
-        cap = say_max_chars()
+        cap = say_line_cap()                            # #1275b
         seen = 0                        # chunks the prepared plan will hold
         for at, (marker, said) in enumerate(
                 _prep_intro_pad(list(turns or []), caller_name)):
@@ -28629,8 +28632,9 @@ def round_line_plan(turns: list[tuple[str, str]],
             # _round_chunks drops the live rows, so only prepared turns
             # advance the offset — the same arithmetic, from the same
             # three functions, so the two lists cannot drift apart.
-            n = len(sentence_chunks(text, cap=cap,
-                                    most=say_chunks_for(text, cap)))
+            n = len(sentence_chunks(text, cap=cap,          # #1275b
+                                    most=say_chunks_for(text, cap),
+                                    house=say_house_split()))
             out.append({
                 "at": at, "marker": marker, "who": who, "text": text,
                 # The caller's turns are real turns that are voiced at the
@@ -76875,6 +76879,27 @@ def say_max_chunks(cap: int) -> int:
     return max(10, min(SAY_MAX_ANNOUNCES, (budget + cap - 1) // cap))
 
 
+def say_line_cap() -> int:
+    """#1275b: THE cap, for every road that chunks a turn.
+
+    Three functions must produce byte-identical chunks or the bank
+    misses: what airs (_speak_turns_floorless), what is baked
+    (_round_chunks) and what the panel counts (round_line_plan). They
+    each used to call say_max_chars() and hold their own arithmetic;
+    #1275 changed one of them and would have made every banked take a
+    cache miss. There is one answer now and they all ask for it."""
+    cap = say_max_chars()
+    if SAY_LINE_SECONDS > 0:
+        cap = min(cap, SAY_LINE_SECONDS * SAY_CHARS_PER_SECOND)
+    return cap
+
+
+def say_house_split() -> bool:
+    """#1275b: whether the SEMICOLON counts as a line break. Rides with
+    the cap so the three chunkers cannot disagree about it either."""
+    return SAY_LINE_SECONDS > 0
+
+
 def say_chunks_for(text: str, cap: int) -> int:
     """#842: how many chunks THIS text needs — never fewer than it takes
     to say all of it. The old ceiling was computed from a budget alone,
@@ -77367,14 +77392,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # and the highlight can walk them without anything being
         # inferred. See the patch note for why the boundaries cannot be
         # recovered from one welded clip instead (0 of 8 agreement).
-        _line_cap = say_max_chars()
-        if SAY_LINE_SECONDS > 0:
-            _line_cap = min(_line_cap,
-                            SAY_LINE_SECONDS * SAY_CHARS_PER_SECOND)
+        _line_cap = say_line_cap()
         for at, chunk in enumerate(
                 sentence_chunks(text, cap=_line_cap,
                                 most=say_chunks_for(text, _line_cap),
-                                house=SAY_LINE_SECONDS > 0)):
+                                house=say_house_split())):
             if at:
                 chunk = breath_for(f"{who}{len(playlist)}") + chunk
             playlist.append({
@@ -150946,13 +150968,38 @@ function renderMusicFlow(tracks) {
 // When the pair start talking, put their conversation on screen. It opens on
 // a new line, keeps the whole history, and stays where you leave it.
 let djTalkSeen = 0;
-let djTalkPinned = false;
+
+/* THE PIN OUTLIVES THE PAGE.
+ *
+ * djTalkClose(manual) has always set this so the booth stays shut, and the
+ * auto-open below honours it - but it was a plain `false` on every load, so a
+ * reload threw the decision away and the next line the pair spoke conjured
+ * the window straight back. From the operator's chair: a window that will not
+ * stay shut.
+ *
+ * localStorage is where this panel already keeps window state - see
+ * pineWinRemember, "pineWin:" + key - and it is per screen, which is what is
+ * wanted: the tablet on the wall can give the booth up while the desktop
+ * beside it keeps it. */
+let djTalkPinned = (function () {
+  try { return localStorage.getItem("pineShut:booth") === "1"; }
+  catch (e) { return false; }
+})();
+
+/* ONE DOOR FOR THE PIN. Four places set it, and a decision that lives in both
+ * a variable and a stored string diverges at whichever one somebody forgets
+ * to update. */
+function djTalkPin(on) {
+  djTalkPinned = !!on;
+  try { localStorage.setItem("pineShut:booth", djTalkPinned ? "1" : "0"); }
+  catch (e) { /* a preference is not worth an exception */ }
+}
 
 function djTalkClose(manual) {
   const box = document.getElementById("djTalkPopup");
   if (box) box.remove();
   boothGlassStop();                    // #668: nothing to draw on
-  if (manual) djTalkPinned = true;     // do not reopen until the next session
+  if (manual) djTalkPin(true);         // and stay shut across reloads too
 }
 
 /* #858: the way back in. djTalkClose(manual) sets djTalkPinned so the
@@ -150960,7 +151007,7 @@ function djTalkClose(manual) {
  * This clears the pin, builds the window and fills it with whatever is
  * already in hand rather than waiting for the next line. */
 function djBoothReopen() {
-  djTalkPinned = false;
+  djTalkPin(false);
   const box = djTalkPopup();
   try {
     if (typeof djTalkPaint === "function") djTalkPaint();
@@ -164492,7 +164539,7 @@ async function djGo() {
       station: (document.getElementById("djStation") || {}).value || "",
     }),
   });
-  djTalkPinned = false;
+  djTalkPin(false);
   djRender(state);
   const select = document.getElementById("radioStation");
   if (select && state.station) select.value = state.station;
@@ -164618,7 +164665,7 @@ async function djToggleSession() {
     const state = await api("/api/dj/start", {
       method: "POST", body: JSON.stringify({station}),
     });
-    djTalkPinned = false;
+    djTalkPin(false);
     djRender(state);
     if (status) {
       status.textContent = state.fallback
