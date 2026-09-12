@@ -805,27 +805,128 @@
      * this WebView; the manual two-tap timer underneath it is for the
      * cases where a fast double touch is delivered as two taps and the
      * synthetic dblclick never arrives. */
-    var lastTap = 0;
-    function bigToggle() {
-      host.classList.toggle('sp-big');
-      /* The pane changed size, so the line that was centred no longer
-         is. Re-seat it rather than leaving the reader stranded. */
+    /* SINGLE TAP full-screens it; DOUBLE TAP changes how it is set.
+     * A single tap cannot fire until the double-tap window has passed,
+     * or every double tap would full-screen on its way past. 260ms is
+     * the shortest wait that does not swallow a deliberate double. */
+    var tapTimer = null;
+    var LOOKS = ['', 'sp-look-wide', 'sp-look-plain', 'sp-look-big'];
+    var lookAt = 0;
+
+    function reseat() {
+      /* The pane changed shape, so the line that was centred no longer
+         is. Re-seat rather than leave the reader stranded. */
       follow = true;
       nowLineId = '';
-      try { tick(); } catch (e) { /* the toggle matters more */ }
+      try { tick(); } catch (e) { /* the change matters more */ }
     }
-    script.addEventListener('dblclick', function (ev) {
-      ev.preventDefault();
-      bigToggle();
+    function bigToggle() { host.classList.toggle('sp-big'); reseat(); }
+    function lookNext() {
+      host.classList.remove.apply(host.classList,
+        LOOKS.filter(function (c) { return c; }));
+      lookAt = (lookAt + 1) % LOOKS.length;
+      if (LOOKS[lookAt]) host.classList.add(LOOKS[lookAt]);
+      reseat();
+    }
+
+    /* A tap on a LINE still opens that line - that is what the detail
+     * panel is for and it predates this. These gestures belong to the
+     * PANE: the margins, the gutters, the space between the speeches. */
+    function onTap(ev) {
+      var t = ev && ev.target;
+      if (t && t.closest && t.closest('button, input, a, .sp-detail')) return;
+      if (t && t !== script && t.closest && t.closest('.sp-el')) return;
+      if (tapTimer) {                       /* the second of a double */
+        clearTimeout(tapTimer); tapTimer = null;
+        lookNext();
+        return;
+      }
+      tapTimer = setTimeout(function () { tapTimer = null; bigToggle(); }, 260);
+    }
+    script.addEventListener('click', onTap);
+
+    /* --- THE CRAWL -------------------------------------------------
+     *
+     * "I want an icon that allows me to start it auto scrolling, but by
+     *  default I want it to automatically be on the area that's actively
+     *  airing. However, I do want a slider that allows me to choose the
+     *  speed."
+     *
+     * Two different ways to move, and they must not fight: FOLLOW keeps
+     * the live line in view and is the default; CRAWL walks the page at
+     * a chosen rate for reading ahead. Starting the crawl stands follow
+     * down, and tapping the live chip (which already exists) stands the
+     * crawl down and goes back to the air. */
+    var crawl = false;
+    var crawlPx = 18;            /* pixels per second at the middle */
+    var crawlLast = 0;
+    var crawlOwed = 0;
+
+    var tools = make('div', 'sp-crawl');
+    var run = make('button', 'sp-crawl-go');
+    run.type = 'button';
+    run.textContent = '▶';           /* play; becomes pause when on */
+    run.title = 'Auto-scroll the script';
+    var rate = document.createElement('input');
+    rate.type = 'range';
+    rate.min = '1'; rate.max = '100'; rate.value = '30';
+    rate.className = 'sp-crawl-rate';
+    rate.title = 'How fast it scrolls';
+    tools.appendChild(run);
+    tools.appendChild(rate);
+    right.appendChild(tools);
+
+    function crawlRate() {
+      /* 1..100 on the slider, about 2 to 220 px a second, curved so the
+         slow half of the travel has real resolution - that is the half
+         anybody reading along actually uses. */
+      var v = Math.max(1, Math.min(100, Number(rate.value) || 30)) / 100;
+      return 2 + 218 * v * v;
+    }
+    function crawlSet(on) {
+      crawl = !!on;
+      run.textContent = crawl ? '⏸' : '▶';
+      run.classList.toggle('on', crawl);
+      tools.classList.toggle('on', crawl);
+      if (crawl) {
+        follow = false;             /* the two cannot both drive */
+        var chip = el('spNow');
+        if (chip) chip.classList.add('adrift');
+        crawlLast = 0;
+        crawlOwed = 0;
+        requestAnimationFrame(crawlStep);
+      }
+    }
+    function crawlStep(ts) {
+      if (!crawl) return;
+      var box = el('spScript');
+      if (!box) { crawl = false; return; }
+      if (crawlLast) {
+        crawlOwed += crawlRate() * ((ts - crawlLast) / 1000);
+        var whole = Math.floor(crawlOwed);
+        if (whole >= 1) {
+          crawlOwed -= whole;
+          selfScrollUntil = Date.now() + 400;   /* our own scroll (#the guard) */
+          box.scrollTop += whole;
+          if (box.scrollTop + box.clientHeight >= box.scrollHeight - 2) {
+            crawlSet(false);                    /* the end of the script */
+          }
+        }
+      }
+      crawlLast = ts;
+      if (crawl) requestAnimationFrame(crawlStep);
+    }
+    run.addEventListener('click', function (ev) {
+      ev.stopPropagation();                     /* not a pane tap */
+      crawlSet(!crawl);
     });
-    script.addEventListener('pointerup', function (ev) {
-      if (ev.pointerType === 'mouse') return;      /* dblclick has it */
-      var now2 = Date.now();
-      if (now2 - lastTap < 400) { lastTap = 0; bigToggle(); }
-      else { lastTap = now2; }
+    rate.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    rate.addEventListener('input', function () {
+      if (crawl) { crawlLast = 0; }             /* take the new rate now */
     });
 
     now.addEventListener('click', function () {
+      crawlSet(false);       /* back to the air stands the crawl down */
       follow = true;
       now.classList.remove('adrift');
       nowLineId = '';        /* force markNow to re-seat and scroll */

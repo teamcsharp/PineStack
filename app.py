@@ -16241,6 +16241,36 @@ def prep_board() -> list[dict[str, Any]]:
     return rows
 
 
+def prepare_work_target_seconds() -> float:
+    """#1261: how much to BUILD, which is not how much to keep.
+
+    "Whenever I pause the station, that means that I want the system to
+     go even harder on making the dialogue something worth listening to
+     ... and stocked."
+
+    Measured on a paused station: writing False, prepared 27 against a
+    target of 12, blocker "continuity reserve is healthy". The room had
+    met its number and stopped - with six hours of quiet ahead of it and
+    nothing competing for the engine.
+
+    #1121 saw half of this and lifted the SHELVES while paused
+    (build_lift 3.0), and said so in its own docstring: "the real
+    governors are untouched: the pantry's six-gigabyte allowance and
+    prepared_seconds() against the target still bound everything." So
+    pause tripled where material could be PUT and left the decision to
+    make it exactly where it was. The room filled the same twelve and
+    stood still.
+
+    The keeper works to this instead. The storage promise -
+    prepare_target_seconds - is untouched, and so are the two real
+    ceilings: the six-gigabyte allowance and the shelf caps."""
+    try:
+        base = float(prepare_target_seconds())
+        return base * (build_lift() if radio_paused() else 1.0)
+    except Exception:  # noqa: BLE001
+        return prepare_target_seconds()
+
+
 def prepare_target_seconds() -> float:
     """How much finished audio to keep standing by, in SECONDS, off the
     operator's hours dial — "an hour, 2 hours or even a day worth"."""
@@ -33139,7 +33169,11 @@ async def pantry_keeper() -> None:
             window = pantry_window()
             if not window:
                 continue
-            target = prepare_target_seconds()
+            # #1261: the BUILD target - three times the storage promise
+            # while paused, because a paused station has no listener
+            # competing for the engine and the whole point of a pause is
+            # to come back stocked.
+            target = prepare_work_target_seconds()
             # #871: CALLS PER HOUR is a promise about what AIRS, and the
             # hours-of-audio ceiling is met by booth rounds and bumpers
             # long before the phone line has anything on it — so the

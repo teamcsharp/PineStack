@@ -429,42 +429,74 @@
   .sp-character { margin-left: 28%; }
 }
 
-/* --- #1260: THE SCRIPT, FULL PAGE, ON A DOUBLE TAP ----------------------
+
+/* --- #1260: THE SCRIPT AS A PLACE TO READ ------------------------------
  *
- * "If I double tap the script page, I want to also have the script show up
- *  in this view." - the way the desktop shows it: the screenplay across the
- *  whole glass instead of a column beside the player.
+ * "If I single tap the script in the script pane, I want it to go full
+ *  screen. If I double tap it, I want to change the way that the
+ *  screenplay is being presented. Also I want an icon that allows me to
+ *  start it auto scrolling... and a slider that allows me to choose the
+ *  speed."
  *
  * Both selectors are spelled out with the host classes for the reason this
  * file already carries two comments about: `.pine-view-host.open.sp-page`
- * is three classes, and a one-class `.sp-big` loses to it silently. The
- * media query above is the same trap and solved the same way.
+ * is three classes, and a one-class rule loses to it silently.
  *
- * The left column is hidden rather than removed, so the player keeps
- * running and every listener stays wired - a double tap changes what you
- * are looking at, never what the station is doing. */
+ * FULL PAGE. The left column is hidden rather than removed, so the player
+ * keeps running and every listener stays wired - a tap changes what you are
+ * looking at, never what the station is doing. */
 .pine-view-host.open.sp-page.sp-big,
-.sp-page.sp-big {
-  grid-template-columns: 1fr;
-  grid-template-rows: 1fr;
-  overflow: hidden;
-}
+.sp-page.sp-big { grid-template-columns: 1fr; grid-template-rows: 1fr; overflow: hidden; }
 .pine-view-host.open.sp-page.sp-big > .sp-left,
 .sp-page.sp-big > .sp-left { display: none; }
 .pine-view-host.open.sp-page.sp-big > .sp-right,
-.sp-page.sp-big > .sp-right {
-  grid-column: 1 / -1;
-  grid-row: 1 / -1;
-  min-height: 0;
-}
-/* The page a script is read on: wider measure, more air, and the type a
- * shade larger because this is the mode you switch to in order to READ. */
+.sp-page.sp-big > .sp-right { grid-column: 1 / -1; grid-row: 1 / -1; min-height: 0; }
 .sp-page.sp-big #spScript {
   max-height: none;
-  padding: 18px clamp(12px, 6vw, 90px) 40px;
+  padding: 18px clamp(12px, 6vw, 90px) 60px;
   font-size: 1.06em;
   line-height: 1.5;
 }
 .sp-page.sp-big .sp-dialogue { margin-left: 22%; max-width: 58%; }
 .sp-page.sp-big .sp-character { margin-left: 38%; }
 .sp-page.sp-big .sp-parenthetical { margin-left: 31%; max-width: 44%; }
+
+/* THE THREE OTHER WAYS IT CAN BE SET, on a double tap. Screenplay is the
+ * default and has no class of its own; these are the alternatives. */
+.sp-page.sp-look-wide .sp-dialogue { margin-left: 6%; max-width: 88%; }
+.sp-page.sp-look-wide .sp-character { margin-left: 6%; letter-spacing: .14em; }
+.sp-page.sp-look-wide .sp-parenthetical { margin-left: 6%; max-width: 60%; }
+
+/* PLAIN: no screenplay indenting at all - a transcript, for skimming who
+ * said what when the indents are just costing width. */
+.sp-page.sp-look-plain .sp-dialogue,
+.sp-page.sp-look-plain .sp-character,
+.sp-page.sp-look-plain .sp-parenthetical,
+.sp-page.sp-look-plain .sp-action { margin-left: 0; max-width: 100%; }
+.sp-page.sp-look-plain .sp-character { display: inline-block; margin-right: .6em; opacity: .8; }
+
+/* BIG TYPE: the one to read from across the room. */
+.sp-page.sp-look-big #spScript { font-size: 1.5em; line-height: 1.45; }
+.sp-page.sp-look-big .sp-dialogue { margin-left: 8%; max-width: 84%; }
+.sp-page.sp-look-big .sp-character { margin-left: 30%; }
+
+/* --- the crawl ---------------------------------------------------------
+ * Bottom-right of the script column, out of the reading measure, and it
+ * stays put while the page scrolls under it. */
+.sp-crawl {
+  position: absolute; right: 14px; bottom: 14px; z-index: 6;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-radius: 999px;
+  background: rgba(12, 18, 26, .82);
+  border: 1px solid rgba(150, 180, 210, .22);
+  opacity: .5; transition: opacity .15s ease;
+}
+.sp-crawl:hover, .sp-crawl.on { opacity: 1; }
+.sp-crawl-go {
+  min-width: 34px; height: 30px; border-radius: 999px; cursor: pointer;
+  background: rgba(28, 40, 54, .9); color: #d8e6f2; font-size: 15px;
+  border: 1px solid rgba(150, 180, 210, .3);
+}
+.sp-crawl-go.on { background: #2f6f4f; border-color: #46a273; color: #eaf7ef; }
+.sp-crawl-rate { width: 108px; accent-color: #46a273; }
+.sp-right { position: relative; }
