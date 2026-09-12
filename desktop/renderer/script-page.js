@@ -47,6 +47,8 @@
   var scriptNodes = new Map();      /* #1273: element id -> its live node */
   var paintedIn = null;             /* #1273: the box those nodes hang in */
   var chasedAt = 0;                 /* #1271: last re-read chased by a mark */
+  var beforeKey = '';               /* #1276: the closed hour we hold */
+  var beforePage = null;            /*         and its page, fetched once */
   /* #1269: the join between an element's id and its text. A character no
      id or text can contain, written as an ESCAPE - an earlier patch put a
      real NUL byte in this file, which every text tool then read as binary. */
@@ -413,11 +415,31 @@
        */
       var before = hours[1] && Number(hours[1].lines || 0) > 0
         ? String(hours[1].key || '') : '';
+      /* #1276: THE HOUR THAT IS OVER IS FETCHED ONCE.
+       *
+       * This asked for both hours on every poll AND every chase. The
+       * earlier hour is 238 kB, it is closed, and the server holds it
+       * for fifteen minutes - the answer cannot change. Worse,
+       * `fetching` is one latch across the whole Promise.all, so while
+       * that 238 kB was in flight the #1271 chase returned at
+       * `if (fetching) return;` and the live line could not be
+       * collected. Measured on the tablet: thirty seconds after opening
+       * the view, script rendered, nothing lit, because the sounding
+       * line was not on the page yet.
+       *
+       * It is kept until the clock rolls and a different hour becomes
+       * the one before. */
       var want = [api().get('/api/screenplay/'
         + encodeURIComponent(hourKey) + live)];
-      if (before) {
+      if (before && before === beforeKey && beforePage) {
+        want.push(Promise.resolve(beforePage));        /* already held */
+      } else if (before) {
         want.push(api().get('/api/screenplay/' + encodeURIComponent(before))
-          .then(null, function () { return null; }));  /* its loss is survivable */
+          .then(function (page) {
+            beforeKey = before; beforePage = page; return page;
+          }, function () { return null; }));   /* its loss is survivable */
+      } else {
+        beforeKey = ''; beforePage = null;
       }
       return Promise.all(want).then(function (got) {
         return {now: got[0] || {}, was: got[1] || null,
@@ -1254,6 +1276,10 @@
       loadScreenplay(true);
     }
     if (root.PineConsoleLine) root.PineConsoleLine.start();
+    /* #1276: the read the operator is actually waiting on when they
+       switch to this view. Forced, so it cannot be answered out of a
+       twenty-second cache that predates the line now sounding. */
+    loadScreenplay(true);
     if (!beat) beat = setInterval(tick, 250);
     return Promise.resolve(true);
   }
