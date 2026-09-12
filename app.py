@@ -38722,8 +38722,14 @@ def surplus_topic() -> dict[str, Any]:
         got = surplus()
         if got <= 0.02:
             return {}
-        # From a coin flip up to nearly always, as the room allows.
-        if random.random() > (0.35 + 0.6 * got):
+        # #1226: THE FLOOR COMES UP. This was a coin flip at the bottom
+        # of the range, which was mercy while the bank held 87 topics
+        # all sprung a dozen times each - reaching for it more often
+        # would only have repeated them faster. With the cooker keeping
+        # fresh material in it, restraint is just silence: above a small
+        # surplus the bank is always in the draw and the chance climbs
+        # from there.
+        if random.random() > (0.60 + 0.4 * got):
             return {}
         return drop_bombshell() or {}
     except Exception:  # noqa: BLE001
@@ -67255,6 +67261,137 @@ def use_bombshell(topic_id: str, shape: str = "") -> None:
                     row["shapes"] = (had + [shape])[-len(BANTER_SHAPES):]
                     row["shape"] = shape
         write_bombshells(rows)
+
+
+# #1226: THE COOKER. The bank was 87 topics, every one sprung 13 or 14
+# times, and nothing in the station had ever written one.
+TOPIC_COOK_REST = 420.0          # at most one sitting every seven minutes
+TOPIC_COOK_BATCH = 5             # asked for per sitting
+TOPIC_COOK_DEEP = 40             # stop once the least-used has this many peers
+_TOPIC_COOK = {"at": 0.0, "made": 0, "why": "not started"}
+
+
+def topic_bank_state() -> dict[str, Any]:
+    """How fresh the things-to-spring-on-them bank is."""
+    rows = read_bombshells()
+    used = sorted(int(r.get("used") or 0) for r in rows) or [0]
+    fresh = sum(1 for u in used if u <= 0)
+    return {"topics": len(rows), "never_used": fresh,
+            "least_used": used[0], "most_used": used[-1],
+            "median_used": used[len(used) // 2],
+            "made_tonight": int(_TOPIC_COOK.get("made") or 0),
+            "why": str(_TOPIC_COOK.get("why") or "")}
+
+
+async def topic_cook_once() -> int:
+    """Write a few new things to spring on them, off the speakbox.
+
+    Returns how many went into the bank. Everything that guards the
+    other preparation roads guards this one, and it asks for nothing at
+    all unless the room is genuinely spare."""
+    if not _RADIO.get("on") or radio_paused():
+        _TOPIC_COOK["why"] = "the station is off air"
+        return 0
+    if time.time() - float(_TOPIC_COOK.get("at") or 0) < TOPIC_COOK_REST:
+        return 0
+    if prep_should_stop() or not pantry_window():
+        _TOPIC_COOK["why"] = "the room is wanted by the live road"
+        return 0
+    # "When idle" - the cupboard is at or past what the operator asked
+    # to keep standing by, so the writing room has nothing else to do.
+    try:
+        if prepared_seconds() < prepare_target_seconds():
+            _TOPIC_COOK["why"] = ("the cupboard is still filling - topics "
+                                  "wait until the rounds are banked")
+            return 0
+    except Exception:  # noqa: BLE001
+        pass
+    state = topic_bank_state()
+    if state["never_used"] >= TOPIC_COOK_DEEP:
+        _TOPIC_COOK["why"] = ("%d unused topic(s) already waiting - the "
+                              "bank is deep enough" % state["never_used"])
+        return 0
+    if state["topics"] >= BOMBSHELL_MAX:
+        _TOPIC_COOK["why"] = "the bank is full"
+        return 0
+    _TOPIC_COOK["at"] = time.time()
+    try:
+        swath = await speakbox_quote(most=3, cap=900) or {}
+    except Exception:  # noqa: BLE001
+        swath = {}
+    seed = str(swath.get("text") or "").strip()
+    if not seed:
+        _TOPIC_COOK["why"] = "the speakbox had nothing to read"
+        return 0
+    ask = (
+        "Below is a passage from one of the station's own documents.\n\n"
+        + seed[:900]
+        + "\n\nWrite %d THINGS TO SPRING ON THEM: each one a single "
+        "sentence that one presenter could drop on the other cold, "
+        "mid-show, with no warning - a confession, an accusation, a piece "
+        "of news, something they have done. Take the flavour of the "
+        "passage but do not quote it and do not explain it. First person, "
+        "spoken out loud, plain and blunt. No preamble, no numbering, no "
+        "quotation marks. One per line." % TOPIC_COOK_BATCH)
+    try:
+        got = await ask_model(ask, limit=700, spice=0.9,
+                              mark={"kind": "topic_cook"})
+    except Exception as exc:  # noqa: BLE001
+        _TOPIC_COOK["why"] = "the model would not answer: " + type(exc).__name__
+        return 0
+    made = 0
+    seen = {str(r.get("text") or "").strip().lower()
+            for r in read_bombshells()}
+    # #1226: ONE SENTENCE EACH, however it comes back. Asked for one
+    # per line, the model returns a paragraph about half the time -
+    # measured, the first cook stored "I took the case to protect
+    # someone I love. They buried the evidence deep in the basement.
+    # The money disappeared right after the ceremony. I saw the..." as
+    # a SINGLE topic: four bombshells welded together and then cut off
+    # at the ceiling. A thing to spring on somebody is one sentence, so
+    # every line is split again on sentence ends. Five a sitting
+    # instead of one, measured either side of the change.
+    pieces: list[str] = []
+    for raw in str(got or "").splitlines():
+        head = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", raw).strip()
+        pieces.extend(re.split(r'(?<=[.!?])\s+(?=["“A-Z])', head))
+    for raw in pieces:
+        line = raw.strip().strip('"“” ')
+        # A bombshell is a sentence, not a paragraph and not a fragment.
+        if not (12 <= len(line) <= 240):
+            continue
+        if not looks_english(line) or _looks_meta(line):
+            continue
+        if line.lower() in seen:
+            continue
+        seen.add(line.lower())
+        add_bombshell(line, "topic")
+        made += 1
+        if made >= TOPIC_COOK_BATCH:
+            break
+    _TOPIC_COOK["made"] = int(_TOPIC_COOK.get("made") or 0) + made
+    _TOPIC_COOK["why"] = ("wrote %d off %s" % (made, str(swath.get("file")
+                          or "the speakbox")[:40]) if made
+                          else "nothing usable came back")
+    if made:
+        pipeline_log("speakbox", "%d new thing(s) to spring on them, written "
+                     "off %s - the bank was %d topics all sprung %d times "
+                     "(#1226)" % (made, str(swath.get("file") or "a document")[:40],
+                                  state["topics"], state["median_used"]))
+    return made
+
+
+async def topic_cooker() -> None:
+    """#1226: keep the bank stocked while the room is idle."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await topic_cook_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(120)
 
 
 def drop_bombshell() -> dict[str, Any]:
@@ -112680,6 +112817,11 @@ async def _startup_air_watch() -> None:
     fire_and_forget(air_watch())
 
 
+@app.on_event("startup")
+async def _startup_topic_cooker() -> None:
+    fire_and_forget(topic_cooker())
+
+
 async def air_relieve_hold(seconds: float = 60.0) -> None:
     """#1217: hold the preparation brake down for a while.
 
@@ -112847,6 +112989,31 @@ async def broadcast_fix_api(
     """#1208: fire one troubleshooting step and hand back its transcript."""
     require_auth(authorization)
     return await broadcast_step(str(step or "")[:32])
+
+
+@app.get("/api/topics/bank")
+async def topics_bank_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1226: how fresh the things-to-spring-on-them bank is."""
+    require_read_auth(authorization)
+    state = topic_bank_state()
+    return {**state, "say": (
+        "%d topic(s); the least-used has been sprung %d time(s), the "
+        "most-used %d. %d have never gone out. %s"
+        % (state["topics"], state["least_used"], state["most_used"],
+           state["never_used"], state["why"]))}
+
+
+@app.post("/api/topics/cook")
+async def topics_cook_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1226: write some now, whatever the room is doing."""
+    require_auth(authorization)
+    _TOPIC_COOK["at"] = 0.0                    # the operator asking beats the rest
+    made = await topic_cook_once()
+    return {"made": made, **topic_bank_state()}
 
 
 @app.get("/api/notifications")
