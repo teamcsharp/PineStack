@@ -115,7 +115,8 @@ class SfxSpeechBank:
         except (OSError, TypeError, ValueError):
             return False
 
-    def eligible(self, context, voice, profile, validate, *, cooldown=180):
+    def eligible(self, context, voice, profile, validate, *, cooldown=180,
+                 deep=True):
         """Read eligible takes with the same ownership/cooldown proof as pick."""
         with self.lock:
             now, terms = self.clock(), response_terms(context)
@@ -141,34 +142,50 @@ class SfxSpeechBank:
                         continue
                 except Exception:
                     continue
-                pool.append(copy.deepcopy(row))
+                pool.append(copy.deepcopy(row) if deep else row)
             return pool
 
     def pick(self, context, voice, profile, validate, *, cooldown=180, lease_seconds=900):
         """Reserve a complete take; only a later audible ACK counts as heard."""
         with self.lock:
             now, terms = self.clock(), response_terms(context)
-            pool = self.eligible(context, voice, profile, validate, cooldown=cooldown)
+            # #1236: pick reads three fields off each row to choose a
+            # winner and never hands the pool out, so it does not pay to
+            # deep-copy 33 rows of tint paperwork in order to sort them.
+            pool = self.eligible(context, voice, profile, validate,
+                                 cooldown=cooldown, deep=False)
             if not pool:
                 return None
             picked = min(pool, key=lambda row: (-len(terms & response_terms(row.get("text_plain", ""))),
                                                 float(row.get("last_played") or 0), row["id"]))
-            rows = copy.deepcopy(self._load())
+            # #1236: a shallow ledger and ONE replaced row, not a deep
+            # copy of 1.45 MB to write two fields. The atomicity the
+            # deep copy bought is kept exactly: the stored row is
+            # replaced rather than mutated, so a _save that throws
+            # leaves self._rows holding the original, untouched.
+            rows = dict(self._load())
             token = uuid.uuid4().hex
-            rows[picked["id"]].update(reservation=token, reserved_until=now + lease_seconds)
+            rows[picked["id"]] = {**rows[picked["id"]],
+                                  "reservation": token,
+                                  "reserved_until": now + lease_seconds}
             self._save(rows)
             return {**copy.deepcopy(rows[picked["id"]]), "id": token, "entry_id": picked["id"]}
 
     def finish(self, token, *, heard):
         with self.lock:
-            rows = copy.deepcopy(self._load())
-            for row in rows.values():
+            # #1236: as in pick - one row replaced in a shallow ledger,
+            # which keeps the save atomic without copying the rest.
+            held = self._load()
+            for key, row in held.items():
                 if row.get("reservation") != token:
                     continue
-                row.pop("reservation", None)
-                row.pop("reserved_until", None)
+                fresh = {k: v for k, v in row.items()
+                         if k not in ("reservation", "reserved_until")}
                 if heard:
-                    row.update(last_played=self.clock(), plays=int(row.get("plays") or 0) + 1)
+                    fresh.update(last_played=self.clock(),
+                                 plays=int(row.get("plays") or 0) + 1)
+                rows = dict(held)
+                rows[key] = fresh
                 self._save(rows)
                 return True
             return False
