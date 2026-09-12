@@ -45,6 +45,7 @@
   var elements = [];
   var hourKey = '';
   var painted = [];                 /* #1269: what is already on the page */
+  var chasedAt = 0;                 /* #1271: last re-read chased by a mark */
   var fetchedAt = 0;
   var fetching = false;
   var pinned = null;                /* the element the operator tapped */
@@ -669,7 +670,25 @@
     var node = id
       ? document.querySelector('.sp-el[data-line="' + id + '"]')
       : null;
-    if (id && !node) { nowLineId = ''; return; }   /* not on the page yet */
+    if (id && !node) {
+      /* #1271: AND THE PAGE GOES AND GETS IT.
+       *
+       * The line the room is saying can only be marked if it is ON the
+       * page, and the script is re-read every twenty seconds - so a
+       * line that aired since the last read waits, and the highlight
+       * sits on the one before it. Measured on the tablet: correct
+       * within 3 seconds at some changes and 7 at others, always one
+       * line behind, always catching up in the end. The wait was the
+       * whole of it.
+       *
+       * Being unable to find the line IS the signal that the script is
+       * stale, so it asks for a fresh one there and then, at most once
+       * every three seconds. Nothing else in the view has to know. */
+      nowLineId = '';
+      var t = Date.now();
+      if (t - chasedAt > 3000) { chasedAt = t; loadScreenplay(true); }
+      return;
+    }
     nowLineId = id || '';
     if (!node) return;
     node.classList.add('sp-now');
