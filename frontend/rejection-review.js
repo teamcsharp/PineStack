@@ -46,6 +46,22 @@ export function create(options = {}) {
   let hooks = {...options};
   const desktop = /Electron\//i.test(navigator.userAgent) || window.__pineRejectionNotificationOwner === 'desktop';
   const notifications = options.notifications == null ? !desktop : !!options.notifications;
+  /* SWITCHED OFF FOR THIS SCREEN, AND REMEMBERED.
+   *
+   * localStorage is already per screen - that is the whole reason it is the
+   * right store here rather than a station setting. A tablet on a wall
+   * showing the script all day gives these up; the desktop beside it keeps
+   * them. The key is deliberately plain and shared in shape, so any other
+   * notice this panel raises can honour the same decision. */
+  const quietKey = 'pine-notices-off:' + location.origin;
+  let silenced = false;
+  try { silenced = localStorage.getItem(quietKey) === '1'; } catch (_) { /* private browser */ }
+  function silence(off) {
+    silenced = !!off;
+    try { localStorage.setItem(quietKey, silenced ? '1' : '0'); }
+    catch (_) { /* a preference is not worth an exception */ }
+    if (silenced) dismissNotice();
+  }
   let disposed = false, timer = null, polling = null, cursor = 0, booted = false;
   let dialog = null, panel = null, queue = null, detail = null, count = null, notice = null;
   let selected = null, selectedEvent = null, selection = 0, listVersion = 0, queueReads = 0, rows = new Map(), nextBefore = null;
@@ -177,16 +193,56 @@ export function create(options = {}) {
     }
   }
   function dismissNotice() { if (notice) notice.remove(); notice = null; newCount = 0; }
+
+  /* LATER MEANS THE ORCHESTRATOR TAKES IT.
+   *
+   * It used to mean only "go away", so the same queue interrupted the same
+   * person again a few minutes later, forever - which is not what anybody
+   * pressing Later intends. `regrade` re-reads every pending cut against
+   * today's grader and makes the calls itself; the road has existed since
+   * 2026-09-08 and nothing was pointed at it.
+   *
+   * The card is dismissed FIRST and the ask sent after. The operator has
+   * said they are done with it either way, and a card that hangs about
+   * saying "asking…" for as long as a grader pass takes is the interruption
+   * they were trying to end. */
+  async function handOver() {
+    dismissNotice();
+    try {
+      await request(BASE + '/regrade', {method: 'POST'});
+    } catch (error) {
+      /* Said once, quietly, and only because a silent failure here means the
+       * queue is untouched while the operator believes it is being worked. */
+      try { console.warn('[rejections] the orchestrator was not reached: ' + error.message); }
+      catch (_) { /* no console */ }
+    }
+  }
+
   function showNotice() {
-    if (!notifications || disposed || dialog || !newCount) return;
+    if (!notifications || silenced || disposed || dialog || !newCount) return;
     if (!notice) {
       notice = el('aside', null, 'prr-notice'); notice.dataset.rejectionReview = 'notice';
       notice.setAttribute('aria-label', 'Rejected lines');
+      /* THE CORNER SWITCH. In the corner because that is where a thing you
+       * want gone is looked for, and it silences this screen for good rather
+       * than closing one card - the difference is said in the tooltip,
+       * because the two are a tap apart. */
+      const off = button('\u00d7', () => silence(true), 'prr-notice-off');
+      off.title = 'Stop showing these notices on this screen. '
+        + 'The queue stays reachable from the Rejected lines badge.';
+      off.setAttribute('aria-label', 'Stop notices on this screen');
       const title = el('strong', '', 'prr-notice-title'); title.setAttribute('role', 'status');
       const text = el('p', 'Includes unsuccessful rewrites and retries. Inspect the words, the failed checks and the orchestrator’s repair workflow.');
       const actions = el('div', null, 'prr-actions');
-      actions.append(button('Review lines', () => open(newestId, newestEvent)), button('Later', dismissNotice));
-      notice.append(title, text, actions); document.body.append(notice);
+      const later = button('Later', handOver);
+      later.title = 'Hand it to the orchestrator: it re-reads every pending cut '
+        + 'against today’s grader and makes the calls itself.';
+      actions.append(button('Review lines', () => open(newestId, newestEvent)), later);
+      /* APPENDED LAST ON PURPOSE. The stylesheet paints
+       * `.prr-notice button:first-child` green as the primary action, so a
+       * switch put in first would steal that and look like the thing to
+       * press. It is absolutely positioned, so DOM order costs nothing. */
+      notice.append(title, text, actions, off); document.body.append(notice);
     }
     notice.querySelector('strong').textContent = newCount === 1 ? 'A rejection needs review' : newCount + ' rejection updates';
   }
