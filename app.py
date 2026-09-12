@@ -65415,26 +65415,84 @@ def media_present(name: str) -> bool:
     return there
 
 
+# #1228: WHY A FINISHED ROUND IS NOT READY, said by the function that
+# decides it. There are eight ways out of _ready_round_takes and nothing
+# recorded which one fired, so "144 written and 8 airable" could only be
+# guessed at - and the guess was wrong once already (#1225, reverted).
+#
+# A counter, not a log: this runs for every row of every road on every
+# sweep, and #1216/#1218 were both about exactly that path, so nothing
+# here may allocate or format. One dict increment.
+_TAKES_WHY: dict[str, dict[str, int]] = {}
+
+
+def _takes_no(kind: str, why: str) -> list[dict[str, Any]]:
+    """Record why this row cannot air, and refuse it."""
+    try:
+        book = _TAKES_WHY.setdefault(str(kind), {})
+        book[why] = book.get(why, 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
+def takes_why(kind: str = "") -> dict[str, Any]:
+    """#1228: the refusal census, per road, since the last restart."""
+    if kind:
+        return dict(_TAKES_WHY.get(str(kind)) or {})
+    return {road: dict(book) for road, book in _TAKES_WHY.items()}
+
+
 def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
     """Validate saved performances without rebuilding voices or speech text."""
     try:
         if not dialogue_row_ready(kind, row):
-            return []
+            return _takes_no(kind, "the row itself is not ready")
         entry = dialogue_entry(row)
-        if not entry or not _larder_current(entry):
-            return []
+        if not entry:
+            return _takes_no(kind, "no dialogue entry on the row")
+        if not _larder_current(entry):
+            # The #1160 trap: the writing contract carries the crystal
+            # and the plot's act, so an act rolling over orphans every
+            # plain round written under the old one.
+            return _takes_no(kind, "written under an older writing "
+                                   "contract (_larder_current)")
         takes = sorted(list(entry.get("takes") or []), key=lambda t: int(t.get("i", -1)))
         count = int(entry.get("chunks") or 0)
         if not count or len(takes) != count or [int(t.get("i", -1)) for t in takes] != list(range(count)):
-            return []
+            return _takes_no(kind, "the takes do not match the script's "
+                                   "chunk count or order")
         if kind == "news" and time.time() - float(entry.get("prep_news_at") or 0) > NEWS_PREP_LIFE:
-            return []
+            return _takes_no(kind, "the bulletin is past its life")
         ready = []
         for take in takes:
             text, voice, who, key = (str(take.get(k) or "") for k in ("text", "voice", "who", "key"))
             saved = _PANTRY.get(key) or {}
             clip = saved.get("clip") or {}
             name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
+            # #1229: THE STATION-NAME VETO IS GONE FROM HERE.
+            #
+            # It read `station_name_scrub(text) != text`, and that
+            # function is RANDOM by design (#459): "roughly one line in
+            # four that names it keeps the full name", implemented as
+            # `if random.random() < 0.25: return text`. Used as a purity
+            # test it refused a round on a coin flip, per line, re-rolled
+            # every sweep - so a round naming the station passed only
+            # when every one of its eleven lines won the toss.
+            #
+            # Measured by the census added beside it: of 144 caller
+            # rounds refused, 96 were refused for this and nothing else,
+            # all of them written, tinted, recorded, clips on disk.
+            # _larder_current - the writing-contract check I twice
+            # predicted was the cause - fired ZERO times.
+            #
+            # The governor's place is prep_air_text, at WRITING time,
+            # where it already is and where it loops up to eight times
+            # precisely to defeat that randomness. Finished audio that
+            # says the station's name is not worth binning a hundred
+            # rounds for, and #459 already lets the pair say it.
+            #
+            #     caller readiness 12/144 (8%) -> 128/144 (89%)
             if (not text.strip() or not voice or who not in ("dj", "cohost", "third", "caller", "caller2")
                     # #1218: one cached answer instead of two stats per
                     # take, per row, per sweep. Same verdict - a missing
@@ -65444,8 +65502,26 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
                     or str(saved.get("voice") or "") != voice[:64]
                     or key not in {pantry_key(text, voice, engine) for engine in
                                    ("piper", "xtts", "f5", "voxtral")}
-                    or is_binned(text) or station_name_scrub(text) != text):
-                return []
+                    or is_binned(text)):
+                # Which of them, so a whole road is not written off for
+                # one missing clip or one stale pantry row.
+                return _takes_no(kind, (
+                    "a take has no text" if not text.strip() else
+                    "a take has no voice" if not voice else
+                    "a take is on a seat that cannot air" if who not in
+                    ("dj", "cohost", "third", "caller", "caller2") else
+                    "a take has no clip name" if not name else
+                    "a take's clip is missing from disk" if not media_present(name)
+                    else "the pantry's text does not match the take"
+                    if str(saved.get("text") or "") != text[:600] else
+                    "the pantry's voice does not match the take"
+                    if str(saved.get("voice") or "") != voice[:64] else
+                    "a line is binned" if is_binned(text) else
+                    # Deliberately NOT recomputed: the key test builds
+                    # four pantry keys, and this path is hot for exactly
+                    # the rows that fail it. #1216 and #1218 were both
+                    # about work like that on this sweep.
+                    "the take's key is not a pantry key for any engine"))
             ready.append({**dict(take), "clip": dict(clip)})
 
         def runs(parts: Any) -> list[tuple[str, list[str]]]:
@@ -65467,7 +65543,8 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
                          str(entry.get("caller_name") or "")))
         recorded = runs((take["who"], take["text"]) for take in ready)
         if not source or [s[0] for s in source] != [s[0] for s in recorded]:
-            return []
+            return _takes_no(kind, "the recorded speaker order does not "
+                                   "match the script")
         for (_, expected), (_, actual) in zip(source, recorded):
             # Saved breath/stutter words may surround the complete original
             # words, but no source turn may vanish or cross another speaker.
@@ -65477,10 +65554,11 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
             if (len(actual) > len(expected) * 1.5 + 8
                     or any(word not in extra_words for word in actual)
                     or not all(any(word == got for got in cursor) for word in expected)):
-                return []
+                return _takes_no(kind, "a turn's words drifted from the "
+                                       "script")
         return ready
-    except (KeyError, TypeError, ValueError, OSError):
-        return []
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        return _takes_no(kind, "raised " + type(exc).__name__)
 
 
 def _ready_slot_window(kind: str) -> dict[str, Any] | None:
@@ -102801,6 +102879,7 @@ async def api_director_why_not(
         out["rescue_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:140])
     try:
         out["in_dead_air_stock"] = int((dead_air_stock() or {}).get(kind) or 0)
+        out["not_ready_because"] = takes_why(kind)          # #1228
         out["rescue_road_open"] = kind in RESCUE_ROADS_OPEN
     except Exception:  # noqa: BLE001
         pass
@@ -113014,6 +113093,28 @@ async def topics_cook_api(
     _TOPIC_COOK["at"] = 0.0                    # the operator asking beats the rest
     made = await topic_cook_once()
     return {"made": made, **topic_bank_state()}
+
+
+@app.get("/api/cupboard/why-not-ready")
+async def cupboard_why_not_ready_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1228: why finished rounds are not airable, said by the function
+    that decides it rather than by a second opinion about it."""
+    require_read_auth(authorization)
+    census = takes_why()
+    worst = ""
+    top = 0
+    for road, book in census.items():
+        for why, count in book.items():
+            if count > top:
+                top, worst = count, "%s: %s (%d)" % (road, why, count)
+    return {
+        "at": time.time(), "roads": census,
+        "say": ("the commonest refusal since this process started is "
+                + worst) if worst else
+               "nothing has been refused since this process started",
+    }
 
 
 @app.get("/api/notifications")
