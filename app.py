@@ -25353,6 +25353,14 @@ _ROUTING_MOVES: list[dict[str, Any]] = []
 _LISTENER_SEEN: dict[str, dict[str, Any]] = {}
 _AUDIO_OWNER: dict[str, Any] = {}
 AUDIO_OWNER_LIFE = 90.0                 # an owner that stops polling frees it
+# #1241: ...but an owner that has been REPLACED does not get ninety
+# seconds. A listener id is minted fresh on every page load, so that
+# grace turned each reload of the nominated device into a minute and a
+# half of silence, with the page that just came back gagged in favour
+# of the id that died with the old one. Once the owner's own id has
+# been quiet this long AND the same device is live under a new id, the
+# air moves at once.
+AUDIO_OWNER_QUICK = 12.0
 
 
 _TERMINALS_CACHE: dict[str, Any] = {"at": 0.0, "rows": {}}
@@ -25451,6 +25459,28 @@ def audio_owner() -> str:
     id that evaporates. So the air follows the DEVICE."""
     try:
         who = str(_AUDIO_OWNER.get("who") or "")
+        # #1241: HAS THE DEVICE COME BACK UNDER A NEW ID? Asked BEFORE
+        # the liveness grace, because #1185 wrote this cure and put it
+        # after - where it cannot run until the ninety seconds it
+        # exists to prevent have already been served. Measured: the
+        # tablet relaunched, came back as pboqomi55u at the same
+        # address, and the air sat on the dead pblj52fs2j while every
+        # page in the house gagged itself and eight clips queued.
+        try:
+            _seen_at = float((_LISTENER_SEEN.get(who) or {}).get("at") or 0)
+            if who and time.time() - _seen_at > AUDIO_OWNER_QUICK:
+                _row_now = terminal_for_listener(who)
+                if _row_now and _row_now.get("play"):
+                    _back = _listener_for_terminal(_row_now)
+                    if _back and _back != who:
+                        _AUDIO_OWNER.update({"who": _back, "at": time.time()})
+                        pipeline_log(
+                            "air", "the device holding the air came back as "
+                            "%s - handing it over now rather than after the "
+                            "90s grace (#1241)" % _back)
+                        return _back
+        except Exception:  # noqa: BLE001
+            pass
         if who and _listener_live(who):
             # #1187: ...UNLESS ITS OWN ROW SAYS IT DOES NOT PLAY OUT LOUD.
             # Measured: the air was held by `desktop-jvi6zk3h` while the
