@@ -516,7 +516,15 @@ SFX_DEFAULT_FOLDERS = (
     "DJ_SAPPO_ROLLING_JUNGLE_&_DnB/SAP_SOUNDS_&_FX/SAP_FX",
 )
 SFX_DEFAULT_FOLDER = SFX_DEFAULT_FOLDERS[0]     # what the panel offers first
-SFX_MAX_FILES = 400                # one folder of stingers, not a library
+# #1251: "any clip that's in the clip folders are allowed to be
+# played, and I want to hear each and every clip". This was 400 - of
+# 7,180 - so a clip had to win a 1-in-18 lottery to be CONSIDERED. The
+# cap was there to bound the per-draw cost and #1242 removed that cost
+# (the draw sets are built once per change, not once per roll), so it
+# had stopped paying for itself. High enough to mean "all of them", and
+# a dial rather than a constant so it can be pulled back without a
+# deploy.
+SFX_MAX_FILES = int(os.getenv("SFX_MAX_FILES", "20000"))
 # #835: the DROP folders. New cuts land on the quickswap share while
 # the show is running - often in a subfolder that did not exist an hour
 # ago - and the operator wants them "showing up as I am adding them".
@@ -531,6 +539,10 @@ SFX_RESCAN_SECONDS = 120
 # A sting punctuates a line; anything longer is a pad, and an announce
 # cannot be called back once it starts (#208).
 SFX_MAX_SECONDS = 4.0
+# #1251: ...and what the dial defaults to now that the operator has
+# lifted the limit. SFX_MAX_SECONDS is left alone - other readers want
+# it for the question it actually answers, which is what a STING is.
+SFX_CAP_DEFAULT = float(os.getenv("SFX_CAP_SECONDS", "600"))
 
 # Walking a CIFS-mounted iTunes library takes minutes, so the index is
 # persisted and only re-tags files whose mtime or size actually changed. The
@@ -2282,8 +2294,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("talk_radio", DEFAULT_DJ["talk_radio"]) or 0))),
         "talk_radio_mode": bool(raw_dj.get("talk_radio_mode", False)),
         "records_first": bool(raw_dj.get("records_first", True)),   # #689
-        "sfx_max_seconds": max(0.5, min(30.0, float(                # #704
-            raw_dj.get("sfx_max_seconds", 5.0) or 5.0))),
+        "sfx_max_seconds": max(0.5, min(600.0, float(              # #1251
+            raw_dj.get("sfx_max_seconds", SFX_CAP_DEFAULT)
+            or SFX_CAP_DEFAULT))),
         # #1198: and the shortest. Below this a sample is a click rather
         # than a sting - see sfx_floor_seconds.
         "sfx_min_seconds": max(0.0, min(3.0, float(
@@ -56877,7 +56890,8 @@ SPEAKBOX_DIR_TTL = 60.0
 def _speakbox_scan(rid: str) -> dict[str, Any]:
     """The walk itself. Blocking on purpose - only ever called in a
     thread, or once on a cold cache."""
-    out: dict[str, Any] = {"at": time.time(), "files": [], "mtime": {}}
+    out: dict[str, Any] = {"at": time.time(), "files": [], "mtime": {},
+                           "size": {}}
     try:
         for p in sorted(speakbox_dir(rid).glob("*.md")):
             try:
@@ -56888,6 +56902,7 @@ def _speakbox_scan(rid: str) -> dict[str, Any]:
                 continue                  # S_ISREG, without the import
             out["files"].append(p)
             out["mtime"][p.name] = st.st_mtime
+            out["size"][p.name] = st.st_size      # #1250b
     except OSError:
         pass
     return out
@@ -56989,7 +57004,15 @@ def speakbox_hunger(name: str, rid: str = "",
                      else speakbox_uses(rid)).get(name) or 0)
         if drawn <= 0:
             return 1.0
-        size_kb = max(1.0, (speakbox_dir(rid) / name).stat().st_size / 1024.0)
+        # #1250b: THE SAME STAT, TWO FUNCTIONS AWAY. #1250 took the
+        # mtime stat out of speakbox_weight and left its twin here -
+        # and speakbox_files calls this for every one of 322 documents,
+        # so the walk of the share simply moved next door. It was the
+        # top frame on the very next pulse, at 6.3s.
+        _sz = (speakbox_scan_cache(rid).get("size") or {}).get(name)
+        if _sz is None:
+            raise OSError("not in the scan")
+        size_kb = max(1.0, float(_sz) / 1024.0)
         per_kb = drawn / size_kb
         return 1.0 / (1.0 + per_kb / max(0.1, HUNGER_SOFTEN))
     except Exception:  # noqa: BLE001
@@ -60900,12 +60923,22 @@ def sfx_floor_seconds() -> float:
 
 
 def sfx_cap_seconds() -> float:
-    """The longest a sample may be and still go out (#704)."""
+    """The longest a sample may be and still go out (#704).
+
+    #1251: the operator has overruled "a sting punctuates a line;
+    anything longer is a pad" - "I don't want there to be any time
+    limit being imposed anymore" - so the dial reaches ten minutes and
+    defaults there. The floor stays: #1198 is about a click nobody can
+    hear, which is not a clip anybody wanted either.
+
+    An announce cannot be called back once it starts (#208), so a long
+    clip holds the air for its whole length. That is the dial's to
+    decide now, not this function's."""
     try:
-        return max(0.5, min(30.0, float(dj_settings().get(
-            "sfx_max_seconds", SFX_MAX_SECONDS))))
-    except Exception:
-        return SFX_MAX_SECONDS
+        return max(0.5, min(600.0, float(dj_settings().get(
+            "sfx_max_seconds", SFX_CAP_DEFAULT))))
+    except Exception:  # noqa: BLE001
+        return SFX_CAP_DEFAULT
 
 
 _SFX_LEN_CACHE: dict[str, float] = {}
@@ -62013,8 +62046,17 @@ def _sting_draw_sets() -> tuple:
         fresh = {str(p) for p in sfx_fresh_paths(pool)}
     except Exception:  # noqa: BLE001
         fresh = set()
+    # #1251: and the ones nobody has ever heard. Built here, with the
+    # rest of the draw sets, so it costs one pass per CHANGE rather
+    # than one per roll.
+    try:
+        _played = sfx_plays() or {}
+        unheard = {str(p) for p in pool
+                   if int((_played.get(sfx_id(p)) or {}).get("plays") or 0) <= 0}
+    except Exception:  # noqa: BLE001
+        unheard = set()
     _STING_DRAW_MEMO.update(sig=sig, pool=pool, names=names_pool,
-                            fresh=fresh)
+                            fresh=fresh, unheard=unheard)
     return pool, names_pool, fresh
 
 
@@ -62295,6 +62337,13 @@ _SFX_SEEN: set[str] = set()
 SFX_ARRIVALS_PATH = data_path("sfx_seen.json")
 SFX_FRESH_HOURS = 48.0              # how long an arrival stays "new"
 SFX_FRESH_SHARE = 0.75              # the share of draws that go to it ("always using new entries")
+# #1251: and the share that goes to a clip with NO PLAYS against its
+# name. "I want to hear each and every clip" is a coverage promise, and
+# unrepeated() is not coverage - it keeps twelve names, so with
+# thousands of clips it prevents a repeat within a dozen draws and says
+# nothing about the thousands never drawn at all. This is #1062's road
+# for files that are new by MTIME, pointed at files never PLAYED.
+SFX_UNHEARD_SHARE = float(os.getenv("SFX_UNHEARD_SHARE", "0.80"))
 _SFX_ARRIVALS: dict[str, Any] = {"loaded": False, "rows": {}}
 _SFX_PLAYS_MEMO: dict[str, Any] = {"at": -1, "rows": {}}
 
@@ -62865,6 +62914,20 @@ def sting_due() -> Path | None:
     pool, names_pool, fresh = _sting_draw_sets()
     if not pool:
         return None
+    # #1251: NEVER HEARD GOES FIRST. Ahead of the fresh road, because
+    # "each and every clip" is a stronger promise than "the new ones
+    # first" and the two only disagree while there are still clips that
+    # have never been drawn at all.
+    _unheard = _STING_DRAW_MEMO.get("unheard") or set()
+    if _unheard and random.random() < SFX_UNHEARD_SHARE:
+        _pool = [n for n in names_pool if n in _unheard] or sorted(_unheard)
+        _pick = unrepeated(_pool, "sting",
+                           keep=min(12, max(1, len(set(_pool)) - 1)))
+        if _pick:
+            pipeline_log("air", "(#1251) a clip nobody has ever heard: %s "
+                         "(%d of %d in the pool still unheard)"
+                         % (Path(_pick).name, len(_unheard), len(pool)))
+            return Path(_pick)
     if fresh and random.random() < SFX_FRESH_SHARE:
         fresh_pool = [n for n in names_pool if n in fresh] or sorted(fresh)
         names = unrepeated(fresh_pool, "sting",
@@ -100287,6 +100350,9 @@ async def slideshow_stack_api(
 #   than a log tail, not worse.
 # ---------------------------------------------------------------------------
 
+_SLIDESHOW_GPU: dict[str, Any] = {"at": 0.0, "rows": []}
+_SLIDESHOW_GPU_TTL = 6.0
+
 _SLIDESHOW_BACKEND: dict[str, Any] = {"at": 0.0, "payload": {}}
 _SLIDESHOW_BACKEND_TTL = 2.0
 _SLIDESHOW_BACKEND_LOCK = asyncio.Lock()
@@ -100717,7 +100783,19 @@ async def slideshow_backend_api(
         out["thermal"] = thermal
         out["disk"] = disk
 
-        out["gpu"] = await asyncio.to_thread(_slideshow_gpu_blocking)
+        # A SUBPROCESS ON ITS OWN, SLOWER CLOCK. nvidia-smi is a process
+        # spawn, and the payload above is recomputed about every two
+        # seconds — that is 1,800 spawns an hour on a box whose own pulse
+        # report is already counting forty stalls in ten minutes. The
+        # repo's standing rule is that nvidia-smi is read on a clock into
+        # one slot and every consumer reads the slot (see _GPU_TEMP); this
+        # is that rule, with a clock fast enough for a gauge.
+        if (time.time() - float(_SLIDESHOW_GPU.get("at") or 0.0)
+                >= _SLIDESHOW_GPU_TTL):
+            _SLIDESHOW_GPU["rows"] = await asyncio.to_thread(
+                _slideshow_gpu_blocking)
+            _SLIDESHOW_GPU["at"] = time.time()
+        out["gpu"] = list(_SLIDESHOW_GPU.get("rows") or [])
         try:
             out["comfy"] = await spark_overlays.comfy_activity(COMFYUI_URL)
         except Exception as exc:  # noqa: BLE001
