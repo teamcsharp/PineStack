@@ -43053,6 +43053,16 @@ def dead_air_stock() -> dict[str, int]:
             rows = [r for r in road_source(kind)
                     if id(r) not in _READY_SHELF_BUSY
                     and _ready_round_takes(kind, r)]
+            # #1238c: ...AND THE DOOR WOULD ACTUALLY OPEN. The takes test
+            # says a round is finished; it does not say the road's own
+            # door will serve it. The caller road is a switchboard
+            # (#1033) - unaired in strict FIFO, then only calls inside a
+            # 6..10 hour re-air window - and with 18 unaired rows that
+            # fail the takes test and 126 aired a median of 20 hours ago,
+            # it reported 126 available while shelf_take would serve
+            # none. That is precisely the over-report #1165 removed.
+            if rows and _ready_shelf_row(kind, rescue=True) is None:
+                continue
             if rows:
                 out[kind] = len(rows)
         except Exception:  # noqa: BLE001
