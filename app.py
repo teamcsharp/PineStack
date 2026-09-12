@@ -1197,6 +1197,14 @@ DEFAULT_DJ = {
     # three can land inside one exchange — spliced through the banter rather
     # than one punchline per round (#225).
     "sfx_gap": 12,
+    # #1232: HOW ANXIOUS THE SFX GUY IS. One dial over every clock he
+    # obeys - how long silence runs before he calls it dead air, how
+    # long he rests between clips, how many he plays in a row, and how
+    # readily he lands one on top of the talk. 0 leaves the numbers
+    # above exactly as they were; 100 is a man who cannot bear a pause.
+    # Default high on purpose: "the clips are funny and are a major part
+    # of the show, so I want him punctuating the dead air often."
+    "sfx_anxiety": 70,
     # --- Conversation Director: the performance layer (plan §7-9, §28-30).
     # Master switch and strength: 0 reads every line flat, 1 is the full
     # send. Identity vectors skip all the machinery, so plain stays plain.
@@ -2134,6 +2142,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         **_dj_range(raw_dj, "fx_min", "fx_max", 0, 100),
         "sfx_gap": max(0, min(600, int(
             raw_dj.get("sfx_gap", DEFAULT_DJ["sfx_gap"]) or 0))),
+        "sfx_anxiety": max(0, min(100, int(
+            raw_dj.get("sfx_anxiety", DEFAULT_DJ["sfx_anxiety"]) or 0))),
         # #835: the drop roots, and how often they are re-read. Same
         # leading-slash scrub as sfx_folders - the real containment
         # check still happens where the folder is opened (#208).
@@ -9124,6 +9134,9 @@ def page_wedge_state() -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 continue
         out["heard_at"] = round(heard_at, 1)
+        # #1231: and when the pair were last HEARD, which is a different
+        # question from whether anything at all is sounding.
+        out["dialogue_quiet"] = round(dialogue_quiet_for(), 1)
         # Nothing audible anywhere in the ring counts as quiet - but it
         # can only ever matter alongside the two conditions below, which
         # a freshly started station does not meet.
@@ -14099,7 +14112,41 @@ async def news_retop(text: str) -> str:
     return said
 
 
+# #1230: repeat_safe is a regex over up to 4,000 characters and it is
+# asked of every caller and manager row on every cupboard sweep - 128
+# of them since #1229 freed the shelf, against 12 before. The answer
+# turns on the WORDS and the HOUR and nothing else, so it is remembered
+# on exactly those two.
+_REPEAT_SAFE_MEMO: dict[tuple[int, str], bool] = {}
+
+
 def repeat_safe(kind: str, row: dict[str, Any]) -> bool:
+    try:
+        if str(kind) not in ("caller", "manager"):
+            return True                 # evergreen by nature - no work at all
+        said = str(row.get("text") or "")
+        if not said:
+            entry = row.get("entry")
+            if isinstance(entry, dict):
+                said = str(entry.get("script")
+                           or entry.get("script_plain") or "")
+        if not said:
+            return True
+        memo = (time.localtime().tm_hour,
+                hashlib.sha1(said[:4000].encode("utf-8", "ignore")).hexdigest())
+        held = _REPEAT_SAFE_MEMO.get(memo)
+        if held is not None:
+            return held
+        got = _repeat_safe_read(kind, row)
+        if len(_REPEAT_SAFE_MEMO) > 4000:
+            _REPEAT_SAFE_MEMO.clear()   # the hour turned, or the shelf did
+        _REPEAT_SAFE_MEMO[memo] = got
+        return got
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _repeat_safe_read(kind: str, row: dict[str, Any]) -> bool:
     """#1055: may this segment be heard again in three hours?
 
     An advert names a product and a painting read names a picture -
@@ -21852,6 +21899,28 @@ def _acknowledge_delivery_lines(delivery_id: str, clip: dict[str, Any],
     return speech
 
 
+# #1231: WHEN A LISTENER LAST HEARD THE PAIR TALK.
+#
+# Three clocks, and only two of them existed. _SPOKE_AT is the booth
+# queueing a line (#822 - not the room). air_quiet_for is a listener
+# hearing SOMETHING, and music answers that one. This is the third:
+# a listener hearing DIALOGUE, which is the only one the operator was
+# ever asking about. _DIALOGUE_AT looks like it and is stamped when a
+# round is handed OVER, which is the two-clocks mistake this file has
+# now made four times.
+_DIALOGUE_HEARD = [0.0]
+DIALOGUE_QUIET_ALARM = 300.0           # five minutes without a word
+
+
+def dialogue_quiet_for() -> float:
+    """Seconds since a listener last reported hearing the pair talk.
+
+    -1 when nobody has reported one yet, which is not silence - it is a
+    station that has just started or has no listeners."""
+    at = float(_DIALOGUE_HEARD[0] or 0)
+    return (time.time() - at) if at else -1.0
+
+
 def page_playback_ack(payload: Any, addr: str = "",
                       agent: str = "") -> dict[str, Any]:
     """Record one browser media event and promote only audible `playing`.
@@ -21886,6 +21955,12 @@ def page_playback_ack(payload: Any, addr: str = "",
         sequence = max(0, int(body.get("sequence") or 0))
     except (TypeError, ValueError):
         raise ValueError("invalid media position or sequence")
+    # #1231: the pair were HEARD. Only a delivery the feed marked as
+    # speech counts - page_feed_append excludes replies and stings - so
+    # a record cannot answer for the DJs.
+    if audible > 0 and event in ("playing", "ended") \
+            and bool(delivery.get("speech")):
+        _DIALOGUE_HEARD[0] = now
     listeners = delivery.setdefault("listeners", {})
     previous = listeners.get(listener) or {}
     if sequence and sequence <= int(previous.get("sequence") or 0):
@@ -23360,6 +23435,11 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                    ("speech_rate", "Speech rate", "range", 75, 125, 1)],
         "third": [("third_name", "Third-seat name", "text", 0, 0, 0),
                   ("sfxguy_rate", "SFX Guy interjections", "range", 0, 100, 1),
+                  # #1232: the one dial over every clock he obeys - how
+                  # soon he calls silence dead, how long he rests, how
+                  # many clips go out in a row, how readily he cuts in.
+                  ("sfx_anxiety", "SFX Guy anxiety (dead-air filling)",
+                   "range", 0, 100, 1),
                   ("sfxguy_warp", "SFX Guy invention", "range", 0, 100, 1)],
         "caller": [("callin_per_hour", "Calls per hour", "range", 0, 20, 1),
                    # #839: the request-line quota. Distinct from the line
@@ -43299,7 +43379,10 @@ async def dead_air_watch() -> None:
                     pass        # the watchdog never dies of its own cure
             # 2026-09-08: silence is PUNCTUATED long before it is a strike
             # - a clip that exists, every tick the room stays quiet.
-            if quiet > min(float(limit), 12.0):
+            # #1232: and HOW LONG it must be silent first is the dial's,
+            # not a hard twelve seconds. This was the shortest hole the
+            # SFX Guy could ever hear.
+            if quiet > sfx_gap_notice(limit):
                 try:
                     await sfx_fill_gap(f"the room has been silent {int(quiet)}s",
                                        under_floor=True)
@@ -59964,6 +60047,17 @@ async def sfxguy_ready_prepare(limit: int = 1) -> dict[str, Any]:
         profile = _sfxguy_ready_profile()
         sources = [{"text": text, "generic": True} for text in REACTION_SOURCES]
         sources += [{"text": text, "generic": False} for text in sfxguy_quips(voice)[:16]]
+        # #1233: AND THE TOPICS BOARD. Everything above is a reply to
+        # somebody else talking - eight back-channels and his quips - so
+        # dropped into a silence he had nothing to say that was not
+        # addressed to a line that was not there. The board is 127 things
+        # the operator wants heard and he was never given one.
+        #
+        # generic=True on purpose: pick() only serves a generic row when
+        # there is no line to answer, and a topic blurted into dead air
+        # is not an answer to anything.
+        sources += [{"text": text, "generic": True}
+                    for text in sfx_topic_sources(SFXGUY_TOPIC_SEED)]
         _SFX_READY_BANK.seed(voice, profile, sources)
         for row in _SFX_READY_BANK.due(voice, profile):
             if _sfxguy_ready_valid(row, voice):
@@ -62418,7 +62512,12 @@ def sting_due() -> Path | None:
     # inside" slider did NOTHING below forty-five seconds and the desk's own
     # default of 12 was unreachable — which is why the show sounded bare.
     # A floor of three keeps one sting from landing on top of the last.
-    if time.time() - _STING_AT[0] < max(3.0, float(dj["sfx_gap"])):
+    # #1232: anxiety pulls this one too. sfx_gap was doing two unrelated
+    # jobs - the rest between dead-air fills AND the lockout on landing a
+    # sting over live talk - so the dial moves both: an anxious SFX Guy
+    # interrupts as well as fills.
+    _sting_rest = max(3.0, float(dj["sfx_gap"]) * (1.0 - 0.8 * sfx_anxiety()))
+    if time.time() - _STING_AT[0] < _sting_rest:
         return None
     if random.random() >= dj["sfx_rate"]:
         return None
@@ -62597,6 +62696,176 @@ _SFX_GAP: dict[str, Any] = {"at": 0.0, "turn": 0, "count": 0, "why": "", "went":
 # afford it - 400 gold bars at a five-minute rest serve 300 an hour
 # against the 174 the rule needs.
 SFX_GAP_REST = float(os.getenv("SFX_GAP_REST", "6"))
+# #1232: and what anxiety pulls those clocks down TO. The floors are
+# what the page road can actually carry back to back without the runs
+# overlapping each other; below them the extra clips would only be
+# refused by the cursor test above.
+SFX_ANXIOUS_REST = 1.5           # the shortest rest between clips
+SFX_ANXIOUS_NOTICE = 3.0         # the shortest silence he will call dead
+SFX_ANXIOUS_BURST = 4            # the most clips in one go
+
+
+SFXGUY_TOPIC_SEED = 24           # topics handed to his bank per sitting
+_SFX_TOPIC_CACHE: dict[str, Any] = {"at": 0.0, "rows": []}
+
+
+def _sfx_topic_rows() -> list[str]:
+    """The topics board as plain lines, re-read at most once a minute.
+
+    sfx_fill_gap runs on the event loop every couple of seconds at any
+    anxiety worth the name, and reading a file per fill is the mistake
+    #1216, #1218 and #1230 were each about. A minute is finer resolution
+    than a board of 127 topics has ever needed."""
+    try:
+        now = time.time()
+        if (now - float(_SFX_TOPIC_CACHE.get("at") or 0) > 60.0
+                or not _SFX_TOPIC_CACHE.get("rows")):
+            rows = []
+            for row in (read_bombshells() or []):
+                text = str((row or {}).get("text") or "").strip()
+                if 12 <= len(text) <= 400:
+                    rows.append(text)
+            _SFX_TOPIC_CACHE["rows"] = rows
+            _SFX_TOPIC_CACHE["at"] = now
+        return list(_SFX_TOPIC_CACHE.get("rows") or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def sfx_topic_sources(most: int = 24) -> list[str]:
+    """Topics to hand his bank, least-sprung first.
+
+    Read straight off the board rather than through the cache above:
+    this is called from the bounded preparation job, not the air road,
+    and it wants the freshest ordering it can get."""
+    try:
+        rows = [r for r in (read_bombshells() or [])
+                if 12 <= len(str((r or {}).get("text") or "").strip()) <= 400]
+        rows.sort(key=lambda r: int(r.get("used") or 0))
+        return [str(r.get("text")).strip() for r in rows[:max(0, int(most))]]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def sfx_topic_line() -> str:
+    """One topic for him to be thinking about while he fills a hole."""
+    pool = _sfx_topic_rows()
+    return random.choice(pool) if pool else ""
+
+
+def sfx_anxiety() -> float:
+    """The SFX Guy's anxiety, 0.0 (patient) to 1.0 (cannot bear a pause).
+
+    Read wherever one of his clocks is computed rather than stored, so
+    the dial takes effect on the next tick and never at a restart."""
+    try:
+        return max(0.0, min(1.0,
+                            float(dj_settings().get("sfx_anxiety") or 0) / 100.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def sfx_gap_rest() -> float:
+    """How long he waits between clips.
+
+    The old number was max(SFX_GAP_REST, sfx_gap), which put a six-second
+    FLOOR under the operator's own dial - turning sfx_gap down past six
+    did nothing at all. Anxiety pulls the whole thing down through that
+    floor, which is the point: "playing a clip every few moments is not
+    cutting it"."""
+    rest = SFX_GAP_REST
+    try:
+        rest = max(rest, float(dj_settings().get("sfx_gap") or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    anx = sfx_anxiety()
+    if anx <= 0:
+        return rest
+    return max(SFX_ANXIOUS_REST, rest * (1.0 - 0.92 * anx))
+
+
+def sfx_gap_notice(limit: float = 12.0) -> float:
+    """How long silence runs before he calls it dead air.
+
+    The watchdog punctuates at min(limit, 12) seconds of quiet, so the
+    shortest hole he could ever hear was twelve seconds of nothing. At
+    full anxiety he hears three."""
+    base = min(float(limit or 12.0), 12.0)
+    anx = sfx_anxiety()
+    if anx <= 0:
+        return base
+    return max(SFX_ANXIOUS_NOTICE, base * (1.0 - 0.75 * anx))
+
+
+def sfx_gap_burst() -> int:
+    """How many clips go out in one fill - the operator's "how many".
+
+    One at rest. At full anxiety four in a row, which on the page road
+    means four queued back to back over the next several seconds, not
+    four at once: the run behaves like any other and the cursor test
+    stands the filler down the moment real material is ready."""
+    return max(1, min(SFX_ANXIOUS_BURST,
+                      1 + int(sfx_anxiety() * (SFX_ANXIOUS_BURST - 1) + 0.5)))
+
+
+async def sfxguy_gap_talk(why: str = "", floorless: bool = False) -> str:
+    """#1233: the SFX Guy TALKS into the hole - a whole line already
+    recorded in his voice, chosen against a topic off the board.
+
+    His bank has always existed and has only ever been read from the
+    cadence planner, which appends an interjection inside a round that
+    is already speaking - so the one moment the station had nothing to
+    say was the one moment he was not asked. Nothing renders here: the
+    take is on disk, the same as a gold bar.
+
+    The topic is the PICK CONTEXT, not the words: pick() ranks by how
+    many terms a prepared line shares with the context, so drawing a
+    topic off the board is how he chooses which of his lines to say -
+    the one that best answers the thing he is thinking about."""
+    def _no(reason: str) -> str:
+        _SFX_GAP["talk_why"] = reason
+        return ""
+    try:
+        voice = str(dj_settings().get("drop_voice") or "")
+        if not voice:
+            return _no("no SFX speaker voice is configured (drop_voice)")
+        take = sfxguy_ready_pick(sfx_topic_line(), voice)
+        if not take:
+            return _no("nothing in his bank is recorded, rested and free")
+        token = str(take.get("id") or "")
+        name = str((take.get("clip") or {}).get("path")
+                   or "").split("?", 1)[0].rsplit("/", 1)[-1]
+        text = str(take.get("text") or "").strip()
+        if not name or not text:
+            if token:
+                sfxguy_ready_release(token)
+            return _no("the reserved line has no take on disk")
+        clip = {"path": "/media/" + name, "sig": media_sign(name),
+                "seconds": float(take.get("seconds") or 0)}
+        door = _dj_speak_floorless if floorless else dj_speak
+        try:
+            out = await door("interject", None, line=text, who="drop",
+                             voice=voice, name="The SFX Guy",
+                             checked=True, sting=False, clip=clip)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("air", "the SFX Guy could not fill the air: "
+                         + f"{type(exc).__name__}: {exc}"[:140])
+            out = ""
+        if not out:
+            if token:
+                sfxguy_ready_release(token)
+            return _no("the air road refused the line - "
+                       + ("somebody is talking" if _SPEAKING[0] else
+                          "the floor is held" if _floor_busy() else
+                          "the air is sold ahead"))
+        if token:
+            sfxguy_ready_commit(token)
+        _SFX_GAP["talk_why"] = "talked"
+        pipeline_log("air", "the SFX Guy talks into the dead air"
+                     + (f" - {why}" if why else "") + f": {text[:70]}")
+        return "talk"
+    except Exception as exc:  # noqa: BLE001
+        return _no("raised " + type(exc).__name__)
 
 
 async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
@@ -62636,11 +62905,7 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
                 return ""
         except Exception:  # noqa: BLE001
             pass
-        rest = SFX_GAP_REST
-        try:
-            rest = max(rest, float(dj_settings().get("sfx_gap") or 0))
-        except Exception:  # noqa: BLE001
-            pass
+        rest = sfx_gap_rest()                      # #1232: the dial
         if time.time() - float(_SFX_GAP.get("at") or 0) < rest:
             return ""
         _SFX_GAP["at"] = time.time()
@@ -62687,11 +62952,52 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
                 went = "sample" if await dj_sting(to_box, who="gap", force=True) else ""
             except Exception:  # noqa: BLE001
                 went = ""
+        if not went:
+            # #1233: "either clips or him incessantly talking about
+            # topics from the topics board." When the board has no sample
+            # to give - every clip rested, or the pool empty - he says
+            # something instead of the hole staying open.
+            went = await sfxguy_gap_talk(why, floorless=floor_held)
+        # #1232: AND HOW MANY. One clip and twelve seconds of nothing is
+        # the "every few moments" the operator says is not cutting it.
+        # Samples only - the soundboard is what he is asking for, and
+        # gold bars and liners are written material with their own worth
+        # and their own rest. Each extra queues behind the last on the
+        # page road; the cursor test at the top of this function is what
+        # stops the pile growing once real material is ready.
+        extra = 0
         if went:
-            _SFX_GAP["count"] = int(_SFX_GAP.get("count") or 0) + 1
+            # #1233: the burst ALTERNATES. Samples alone were the whole
+            # burst, and the operator's SFX Guy does two jobs - "either
+            # clips or him incessantly talking about topics from the
+            # topics board" - so every other clip in the run is him
+            # saying something off the board instead.
+            for _step in range(sfx_gap_burst() - 1):
+                laid = ""
+                if _step % 2 == 1:
+                    laid = await sfxguy_gap_talk(why, floorless=floor_held)
+                if not laid:
+                    try:
+                        laid = ("sample" if await dj_sting(
+                            to_box, who="gap", force=True) else "")
+                    except Exception:  # noqa: BLE001
+                        laid = ""
+                if not laid and _step % 2 == 0:
+                    laid = await sfxguy_gap_talk(why, floorless=floor_held)
+                if not laid:
+                    break
+                if laid == "talk":
+                    _SFX_GAP["talked"] = int(_SFX_GAP.get("talked") or 0) + 1
+                extra += 1
+        if went == "talk":
+            _SFX_GAP["talked"] = int(_SFX_GAP.get("talked") or 0) + 1
+        if went:
+            _SFX_GAP["count"] = int(_SFX_GAP.get("count") or 0) + 1 + extra
+            _SFX_GAP["burst"] = 1 + extra
             _SFX_GAP["why"] = str(why)[:120]
             _SFX_GAP["went"] = went
             pipeline_log("air", f"dead air punctuated with a {went}"
+                                + (f" and {extra} more clip(s)" if extra else "")
                                 + (f" - {why}" if why else "")
                                 + (" (under the floor)" if floor_held else ""))
         return went
@@ -62702,7 +63008,17 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
 
 
 def sfx_gap_status() -> dict[str, Any]:
-    return {**_SFX_GAP, "rest": SFX_GAP_REST}
+    # #1232: the numbers the dial is actually producing, not the constant
+    # it used to report - which was never the rest in force anyway.
+    anx = sfx_anxiety()
+    return {**_SFX_GAP, "rest": round(sfx_gap_rest(), 2),
+            "anxiety": int(round(anx * 100)),
+            "notices_after": round(sfx_gap_notice(), 1),
+            "clips_per_fill": sfx_gap_burst(),
+            "rest_floor": SFX_GAP_REST,
+            "say": ("the SFX Guy calls it dead air after %.0fs, plays %d "
+                    "clip(s) a go and rests %.1fs between them"
+                    % (sfx_gap_notice(), sfx_gap_burst(), sfx_gap_rest()))}
 
 
 async def dj_sting(to_box: bool, after: str = "", who: str = "",
@@ -62967,12 +63283,25 @@ def _bin_key(text: str) -> str:
 _BINNED_MEMO: dict[str, Any] = {"sig": None, "rows": [], "keys": frozenset()}
 
 
+_BINNED_LOOKED = [0.0]
+
+
 def _binned_memo() -> dict[str, Any]:
     """The bin list and its lookup set, memoised on (mtime, size).
 
     A memo keyed on the file's own stamp answers exactly what a fresh
-    read would - bin_line() writes the file, which moves both."""
+    read would - bin_line() writes the file, which moves both.
+
+    #1230: and the STAT is only taken once a second. #1216 made the
+    parse cheap; the syscall behind it is still paid on every call, and
+    this is called once per take, per row, per road, per sweep -
+    thousands of times a minute since #1229 freed the shelf. A bin list
+    does not need finer resolution than a second."""
     try:
+        if time.time() - _BINNED_LOOKED[0] < 1.0 \
+                and _BINNED_MEMO.get("sig") is not None:
+            return _BINNED_MEMO
+        _BINNED_LOOKED[0] = time.time()
         st = BINNED_PATH.stat()
         sig = (st.st_mtime_ns, st.st_size)
     except Exception:  # noqa: BLE001
@@ -112325,6 +112654,32 @@ async def api_broadcast_health(
             "fix_with": "POST /api/radio/pause with paused false",
         }
     stuck = bool(state.get("wedged"))
+    # #1231: THE PAIR HAVE STOPPED TALKING. The operator's actual
+    # complaint, and none of the wedge conditions had to be true for it:
+    # measured at "reaching 3 listener(s); last heard 9s ago, stuck
+    # False, waiting 1" while nobody had said a word in minutes. The
+    # music answers "is anything sounding"; this answers "is the show
+    # happening".
+    mute = float(state.get("dialogue_quiet") or -1)
+    if (not stuck and bool(_RADIO.get("on")) and not radio_paused()
+            and mute >= DIALOGUE_QUIET_ALARM):
+        return {
+            "at": now, "stuck": True, "dialogue_quiet": mute,
+            "say": ("Nobody has heard the DJs say anything for %d minute(s). "
+                    "The station is on and something is sounding, so this is "
+                    "not a dead broadcast - the dialogue is not reaching the "
+                    "air." % int(mute / 60)),
+            "offer": ["let the orchestrator work the ladder",
+                      "open the troubleshooting console"],
+            "listeners": listeners,
+            "heard_seconds_ago": (round(now - heard_at, 1)
+                                  if heard_at else None),
+            "clips_waiting": int(state.get("waiting") or 0),
+            "stall_reports": int(state.get("stalls") or 0),
+            "holding_the_air": str(state.get("owner") or ""),
+            "detail": str(state.get("why") or ""),
+            "fix_with": "POST /api/broadcast/fix/{step}",
+        }
     if stuck:
         say = ("The broadcast is stuck. %d clip(s) are queued on the page "
                "that is meant to be playing them and none has started; "
@@ -112334,6 +112689,9 @@ async def api_broadcast_health(
     elif heard_at:
         say = ("Reaching %d listener(s); last heard %ds ago."
                % (listeners, int(now - heard_at)))
+        if mute >= 60:
+            say += (" The DJs have not been heard for %d minute(s)."
+                    % int(mute / 60))
         offer = []
     else:
         say = ("Nobody has reported hearing anything yet - that is normal "
@@ -112341,6 +112699,10 @@ async def api_broadcast_health(
         offer = []
     return {
         "at": now, "stuck": stuck, "say": say, "offer": offer,
+        # #1231: always visible, not only when it has gone wrong - "is
+        # dialogue happening" is the question the operator asks, and a
+        # number he can watch is worth more than an alarm he cannot.
+        "dialogue_quiet": (round(mute, 1) if mute >= 0 else None),
         "listeners": listeners,
         "heard_seconds_ago": (round(now - heard_at, 1) if heard_at else None),
         "clips_waiting": int(state.get("waiting") or 0),
@@ -112798,7 +113160,14 @@ async def air_watch() -> None:
                          "Nothing here will undo that; press play."
                          % (radio_paused_for() / 60.0)))
                 continue
+            # #1231: THE PAIR, not merely "any sound". A record keeps
+            # air_quiet_for at zero while the DJs say nothing for ten
+            # minutes, which is exactly the hour the operator sat
+            # through. The ladder works whichever clock has stopped.
             quiet = air_quiet_for()
+            mute = dialogue_quiet_for()
+            if mute >= DIALOGUE_QUIET_ALARM and (quiet < 0 or mute > quiet):
+                quiet = mute
             _AIR_WATCH["quiet"] = round(quiet, 1)
             if quiet < 0:
                 _AIR_WATCH.update(rung=-1,
@@ -113115,6 +113484,78 @@ async def cupboard_why_not_ready_api(
                 + worst) if worst else
                "nothing has been refused since this process started",
     }
+
+
+@app.post("/api/sfx/fill")
+async def sfx_fill_now_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1234: punctuate the air NOW - the operator's hand, or the
+    orchestrator's, on the roads #1232 and #1233 built.
+
+    `road` picks which: "talk" is the SFX Guy saying something off the
+    topics board, "clip" is the soundboard, "any" (the default) is the
+    whole ladder - gold bar, liner, sample, then him talking."""
+    require_auth(authorization)
+    body = payload or {}
+    road = str(body.get("road") or "any").strip().lower()
+    why = str(body.get("why") or "asked for by hand")[:120]
+    _SFX_GAP["at"] = 0.0                   # the operator asking beats the rest
+    if road == "talk":
+        went = await sfxguy_gap_talk(why, floorless=_floor_busy())
+    elif road == "clip":
+        try:
+            went = "sample" if await dj_sting(
+                _RADIO.get("voice_to") in ("box", "both"),
+                who="gap", force=True) else ""
+        except Exception as exc:  # noqa: BLE001
+            return {**sfx_gap_status(), "went": "",
+                    "say": "the soundboard refused: " + type(exc).__name__}
+    else:
+        went = await sfx_fill_gap(why, under_floor=True)
+    return {**sfx_gap_status(), "went": went, "road": road, "say": (
+        "%s went out" % went if went else
+        "nothing went out - " + (
+            "the station is off air or paused" if (
+                not _RADIO.get("on") or radio_paused()) else
+            "somebody is talking" if _SPEAKING[0] else
+            "the air is already sold ahead" if float(
+                _PAGE_AIR_UNTIL[0] or 0) - time.time() > 1.5 else
+            str(_SFX_GAP.get("talk_why") or "")
+            or "no clip or prepared line was free"))}
+
+
+@app.get("/api/sfx/anxiety")
+async def sfx_anxiety_get_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1232: what the SFX Guy's dial is set to and what it produces."""
+    require_read_auth(authorization)
+    return sfx_gap_status()
+
+
+@app.post("/api/sfx/anxiety")
+async def sfx_anxiety_set_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1232: turn it, from the panel or from the orchestrator.
+
+    The standing rule is that every cure becomes a tool the orchestrator
+    can work, and dead air is the one it is most often looking at: this
+    is the knob that answers it without writing a line or rendering a
+    voice."""
+    require_auth(authorization)
+    body = payload or {}
+    want = body.get("anxiety", body.get("value"))
+    settings = load_settings()
+    dj = dict(settings.get("dj") or {})
+    dj["sfx_anxiety"] = max(0, min(100, int(float(want or 0))))
+    save_settings({**settings, "dj": dj})
+    pipeline_log("air", "the SFX Guy's anxiety set to %d (#1232)"
+                 % dj["sfx_anxiety"])
+    return sfx_gap_status()
 
 
 @app.get("/api/notifications")
