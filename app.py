@@ -36632,6 +36632,25 @@ async def reel_tick() -> None:
                 return                  # #1147: a zero-length clip is poison
             offset = 0.0
             rows: list[dict[str, Any]] = []
+            # #1264: THE REEL TELLS ITS LINES WHICH CONVERSATION THEY
+            # ARE. Every line the booth airs carries its round and its
+            # seat in it (#1201: sid / turn / turns); the reel's rows
+            # carried neither, though the reel computes a sid for
+            # itself three statements below and has always known.
+            #
+            # A line with no sid has nothing holding it to its
+            # neighbours, so the screenplay can only place it by the
+            # clock - and the clock is not good enough to carry it
+            # alone. Measured on 2026-09-12T14, the reel's eight lines
+            # were combed line-for-line into the conversation that
+            # followed, nine re-entries in one hour, which is the
+            # script "jumping up and down" the operator is reading.
+            #
+            # It shows up now because the reel only airs on unpause,
+            # and the station has been paused all week for this work:
+            # the minutes after every resume were the part of the
+            # script with no identity in them.
+            _reel_sid = alt_sid("banter", picked)
             for at, ln in enumerate(lines):
                 real = concat_real_seconds(
                     ln["seconds"], beats[at] if at < len(beats) else 0.0)
@@ -36640,6 +36659,8 @@ async def reel_tick() -> None:
                              "text": ln["text"],
                              "remember_text": ln["text"],
                              "name": booth_actor_name(ln["who"], ""),
+                             "sid": _reel_sid, "turn": at,
+                             "turns": len(lines),
                              "from": round(offset, 2),
                              "until": round(offset + real, 2)})
                 offset += real
@@ -36653,7 +36674,7 @@ async def reel_tick() -> None:
                 "media": str(one["path"]).rsplit("/", 1)[-1].split("?")[0],
                 "path": one["path"], "sig": one["sig"],
                 "length": length, "rows": rows,
-                "sid": alt_sid("banter", picked),
+                "sid": _reel_sid,                       # #1264: one sid
                 "at": time.time(), "turns": len(rows)})
             pipeline_log(
                 "lookahead",
@@ -121537,6 +121558,55 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     except Exception:  # noqa: BLE001
         pass                # a script that will not re-order still reads
 
+    # #1265: AND A CONVERSATION IS ONE BLOCK.
+    #
+    # The pass above fixes the order WITHIN a round. It leaves two
+    # rounds whose stamps overlap combed into each other, which is what
+    # the operator reads when the script "jumps up and down":
+    #
+    #     t t b b b b b t b t t b t t b t t t t t t b b b ...
+    #     11 switches, 9 re-entries in one hour
+    #
+    # No timestamp can mend that. The hour holds 753 seconds of speech
+    # in 681 seconds of wall clock - 112% - and 12 of 56 lines start
+    # before the previous line finished, some of them inside ONE round
+    # where the welded wav makes disorder physically impossible. I
+    # measured the alternatives before writing this: freezing the stamp
+    # against re-acks scores WORSE (500 s of overlap against 435 s) and
+    # the median is no better. air_at cannot order a script.
+    #
+    # A sid is a conversation. Which roads carry one is a property of
+    # how the road writes, not of this hour - banter, caller, manager
+    # and track_talk do; the gold bars and the SFX guy's quips never
+    # do - so the station already draws the operator's line, "with only
+    # interjections happening", and this pass only reads it.
+    #
+    # Each conversation is gathered into one block, in the slots its
+    # own lines already hold between them, ordered against the other
+    # conversations by its earliest stamp. Everything WITHOUT a sid
+    # keeps its slot, so a sting, a quip or a hang-up still lands
+    # inside the conversation it interrupted.
+    try:
+        _talk: dict[str, list[int]] = {}
+        for _i, _e in enumerate(events):
+            if _e.get("what") != "line":
+                continue
+            _sid = str((_e.get("row") or {}).get("sid") or "")
+            if not _sid:
+                continue                 # an interjection: it does not move
+            _talk.setdefault(_sid, []).append(_i)
+        if len(_talk) > 1:
+            # only the slots conversations hold between them
+            _held = sorted(_i for _w in _talk.values() for _i in _w)
+            _blocks = sorted(
+                _talk.values(),
+                key=lambda w: min(float(events[_i]["at"] or 0) for _i in w))
+            _lined = [events[_i] for _w in _blocks for _i in _w]
+            for _i, _e in zip(_held, _lined):
+                events[_i] = _e
+    except Exception:  # noqa: BLE001
+        pass                # a script that will not re-block still reads
+
     elements: list[dict[str, Any]] = []
     scenes: list[tuple[int, float]] = []    # (subheader index, scene start)
     scene_round = None
@@ -162304,83 +162374,32 @@ async function radioClockPoll() {
  * until it is released, and an owner that stops polling releases it on
  * its own, so this can never leave the house silent. With no owner set,
  * which is the default, nothing here does anything. */
-/* A TOUCH OUTRANKS AN ANIMATION FRAME (#1251).
+/* THE YIELD GUARD IS GONE, AND WHY IT IS NOT COMING BACK IN THAT SHAPE (#1251).
  *
- * Measured on the tablet, on an idle panel: touch to handler start 89-231 ms,
- * touch to the next paint 64-137 ms - while the handler ITSELF runs in 0-4 ms.
- * The delay is not the work, it is the queue in front of the work. Counted on
- * the same page: THIRTEEN live canvases, four of them actually on screen and
- * six alive but scrolled out of view, three of those WebGL. They all keep
- * requestAnimationFrame turning, so a finger landing on the glass waits for
- * whichever frame is already in flight and for the ones queued behind it.
+ * It wrapped requestAnimationFrame so that, for 160 ms after a touch, frames
+ * already in flight yielded instead of running - the idea being that the
+ * thirteen live canvases on this panel should not stand between a finger and
+ * its handler.
  *
- * The obvious cure - stop the off-screen ones - needs every one of the
- * sixty-odd rAF loops in this file to cooperate, and a loop that forgets to
- * restart is a dead panel. This does something smaller and general instead:
- * for a moment after a touch, animation frames YIELD. Nothing is cancelled;
- * each held callback simply asks for the next frame instead of running, so
- * every loop stays alive and no scene has to know this exists.
+ * IT BROKE cancelAnimationFrame. A deferred frame was re-queued under a NEW
+ * id, and the caller still held the old one, so a scene tearing down could no
+ * longer cancel its own loop. The callback then ran after the teardown, hit
+ * `state.raf = ...` on a holder that had been nulled, and threw - every
+ * frame. Measured: 144 of that one TypeError in a single log window.
  *
- * A SIXTH OF A SECOND, and it is chosen not guessed: long enough to cover the
- * handler and the paint that follows it, short enough that no eye can see an
- * animation pause. Anything longer would be visible on the meters.
+ * AND A REPEATING CONSOLE ERROR IS AN ANR. onConsoleMessage runs on the
+ * Android main thread, so the flood became main-thread log writes; the ANR
+ * trace showed the main thread blocked inside WebView native code with
+ * nothing else runnable, and the operator got "Pine Box isn't responding".
  *
- * This is deliberately NOT tied to the canvases being off screen. An
- * IntersectionObserver would tell us which ones are wasted, but it cannot
- * stop them without the loops cooperating - and the one thing every loop DOES
- * go through is rAF itself.
- */
-(function (win) {
-  'use strict';
-  var HOLD_MS = 160;
-  var original = win.requestAnimationFrame;
-  if (!original || original.__pineYield) return;
-  var holdUntil = 0;
-  var holdSince = 0;
-
-  var wrapped = function (callback) {
-    if (typeof callback !== 'function') return original.call(win, callback);
-    /* WHEN THIS FRAME WAS ASKED FOR, and it is the whole of the rule.
-     *
-     * The first version held EVERY callback for the hold window, including
-     * the one the touch handler had just scheduled to draw its own response
-     * - so the popup it was meant to speed up waited 160 ms longer.
-     * Measured: touch to paint 196-257 ms, worse than the 64-137 ms it
-     * started at. A guard that delays the thing it is protecting is not a
-     * guard.
-     *
-     * Only work that was ALREADY IN FLIGHT when the finger landed yields.
-     * Anything asked for after that moment is the response to the touch and
-     * goes at the next frame, which is exactly what should happen. */
-    var askedAt = win.performance.now();
-    var run = function (stamp) {
-      if (askedAt < holdSince && stamp < holdUntil) {
-        original.call(win, run);
-        return;
-      }
-      callback(stamp);
-    };
-    return original.call(win, run);
-  };
-  wrapped.__pineYield = true;
-  win.requestAnimationFrame = wrapped;
-
-  /* CAPTURE PHASE, so the hold is in place before any handler runs - and on
-   * pointerdown rather than click, because the whole point is to clear the
-   * road for the handler that a press is about to start. */
-  var press = function () {
-    holdSince = win.performance.now();
-    holdUntil = holdSince + HOLD_MS;
-  };
-  ['pointerdown', 'keydown', 'wheel'].forEach(function (kind) {
-    win.document.addEventListener(kind, press, {capture: true, passive: true});
-  });
-
-  /* Visible, because a knob nobody can read is a knob nobody can trust. */
-  win.pineYieldState = function () {
-    return {holdMs: HOLD_MS, holding: win.performance.now() < holdUntil};
-  };
-})(window);
+ * Proved rather than guessed, in the live page: schedule a frame, touch, let
+ * one frame boundary pass inside the hold, then cancel it - the callback ran
+ * anyway.
+ *
+ * The input delay it was aiming at is real (40-210 ms, and it IS the
+ * canvases), but the cure is to suspend the scenes that are off screen, not
+ * to break a platform guarantee for unmeasured milliseconds. Breaking
+ * cancellation to win a frame is not a trade worth making. */
 
 function pineSoloGate(clock) {
   try {
