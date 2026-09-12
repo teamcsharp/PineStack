@@ -1214,6 +1214,32 @@ def install(app, namespace):
             raise HTTPException(404, "No retained hour")
         return runtime().include_drafts(result)
 
+    @app.get("/api/system2/binding")
+    async def binding(hour: str = "", authorization: str | None = Header(default=None)):
+        """#1222: why each slot of an hour is bound, or is not."""
+        host.require_read_auth(authorization)
+        rt = runtime()
+        identity = hour
+        if not identity:
+            now = time.time()
+            for row in rt.store.hours(limit=24):
+                if float(row["start"]) <= now < float(row["start"]) + 3600:
+                    identity = row["id"]
+                    break
+        if not identity:
+            raise HTTPException(404, "No hour on air")
+        got = await asyncio.to_thread(rt.store.explain_hour, identity)
+        if not got:
+            raise HTTPException(404, "No retained hour")
+        empty = [s for s in got["slots"] if not s["allocations"]]
+        stuck = [s for s in empty if s["room_seconds"] <= 0]
+        got["say"] = (
+            "%d of %d slot(s) carry nothing. %d of those are past their "
+            "deadline and can never be filled. %d candidate(s) in the "
+            "catalogue."
+            % (len(empty), len(got["slots"]), len(stuck), got["candidates"]))
+        return got
+
     @app.get("/api/system2/line")
     async def line(candidate: str, line: str = "", authorization: str | None = Header(default=None)):
         host.require_read_auth(authorization)

@@ -42885,6 +42885,14 @@ DEAD_AIR_RESCUE_REST = 45.0
 # because a call is an intro, a conversation and a sign-off rather than
 # one round that can be handed to _banter_air.
 RESCUE_ROADS_OPEN = ("manager", "gallery", "news")
+# #1221: THE ARREARS BOOK IS WIDER THAN THE RESCUE.
+#
+# RESCUE_ROADS_OPEN answers "what may interrupt a silence". This answers
+# "what may be OWED an entry it was passed over for", and banter - the
+# road with the most entries and the most material - was missing from
+# it, so it could not even record that it had been skipped. They are
+# different questions and they were sharing one answer.
+ARREARS_ROADS = ("manager", "gallery", "news", "banter")
 
 
 def dead_air_stock() -> dict[str, int]:
@@ -43022,7 +43030,7 @@ def entry_arrears_note() -> str:
     so noticing must not be gated on the room being free the way serving
     has to be."""
     kind, start, deadline = entry_window_now()
-    if not kind or kind not in RESCUE_ROADS_OPEN:
+    if not kind or kind not in ARREARS_ROADS:          # #1221
         return ""
     now = time.time()
     if not (start < now < deadline):
@@ -43091,15 +43099,29 @@ async def entry_arrears_serve() -> str:
     # Cleared either way: a road that cannot answer must not hold the
     # queue against the road behind it.
     _ENTRY_ARREARS.pop(road, None)
-    if road not in (dead_air_stock() or {}):
+    if now - _RESCUE_AT[0] < DEAD_AIR_RESCUE_REST:
         return ""
-    said = await dead_air_rescue(0)
-    if said:
-        pipeline_log(
-            "air", "%s was owed an entry %ds ago and the floor is free - a "
-            "finished %s round goes out of turn to pay it (#1189)"
-            % (SHELF_LABEL.get(road, road), int(owed_for), said))
-    return said
+    if not _RADIO.get("on"):
+        return ""
+    # #1221: PAY THE ROAD THAT IS OWED. This called dead_air_rescue(0),
+    # which chooses from the whole cupboard by its own rules - so the
+    # line meant to pay the manager his missed entry would put out a
+    # gallery round, mark his debt paid on the way past, and leave him
+    # exactly where he was. Measured across a night: noted and cleared
+    # repeatedly, aired nothing.
+    #
+    # rescue=True is the #1165 exemption - "a finished, tinted, recorded
+    # memo from upstairs is worth more than silence whatever the sheet
+    # says it is time for" - pointed at the road that earned it.
+    said_lines = await _ready_shelf_air(road, _RADIO.get("now"), rescue=True)
+    if not said_lines:
+        return ""
+    _RESCUE_AT[0] = time.time()
+    pipeline_log(
+        "air", "%s was owed an entry %ds ago and the floor is free - its "
+        "own finished round goes out of turn to pay it (#1189/#1221)"
+        % (SHELF_LABEL.get(road, road), int(owed_for)))
+    return road
 
 
 async def entry_unanswered_fill() -> str:
@@ -43116,7 +43138,7 @@ async def entry_unanswered_fill() -> str:
     dead_air_rescue, which keeps its own rest timer, its own paused and
     off-air guards, and airs finished rounds alone."""
     kind, start, deadline = entry_window_now()
-    if not kind or kind not in RESCUE_ROADS_OPEN:
+    if not kind or kind not in ARREARS_ROADS:          # #1221
         return ""
     now = time.time()
     if not (start < now < deadline):
@@ -43126,16 +43148,25 @@ async def entry_unanswered_fill() -> str:
         return ""
     if entry_own_aired(kind, start, deadline) > 1.0:
         return ""                       # it answered for itself
-    if kind not in (dead_air_stock() or {}):
+    if now - _RESCUE_AT[0] < DEAD_AIR_RESCUE_REST or radio_paused():
         return ""
-    said = await dead_air_rescue(0)
-    if said:
-        pipeline_log(
-            "air", "the %s entry was %ds old with none of its own road on "
-            "the air - a finished %s round came out of the cupboard to "
-            "answer it (#1186)"
-            % (SHELF_LABEL.get(kind, kind), int(now - start), said))
-    return said
+    if not _RADIO.get("on"):
+        return ""
+    # #1221: SERVE THE ENTRY THAT IS ON AIR, not whatever the cupboard
+    # feels like. This named the road in its own log line and then
+    # called dead_air_rescue, which chooses for itself - so the entry
+    # went on being unanswered while the message said it had been
+    # answered.
+    said_lines = await _ready_shelf_air(kind, _RADIO.get("now"), rescue=True)
+    if not said_lines:
+        return ""
+    _RESCUE_AT[0] = time.time()
+    pipeline_log(
+        "air", "the %s entry was %ds old with none of its own road on "
+        "the air - its own finished round came out of the cupboard to "
+        "answer it (#1186/#1221)"
+        % (SHELF_LABEL.get(kind, kind), int(now - start)))
+    return kind
 
 
 async def dead_air_watch() -> None:

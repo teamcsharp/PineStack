@@ -438,6 +438,94 @@ class System2Store:
         hour['all_segments_present'] = all(s.get('coverage_seconds', s['ready_seconds']) > .001 or s['target_seconds'] == 0 for s in hour['slots'])
         return hour
 
+    def explain_hour(self, identity):
+        """#1222: why each slot of an hour is bound, or is not.
+
+        Read-only, and deliberately a REPLAY of plan_hour's own filters
+        rather than a summary of them: if the two ever disagree the
+        explanation is worthless, so it walks the same catalogue with
+        the same predicates in the same order and only counts.
+        """
+        with self._lock, closing(self._connect()) as db:
+            hour = self._hour(db, identity)
+            if not hour:
+                return {}
+            catalogue = [json.loads(raw[0]) for raw in
+                         db.execute('SELECT body FROM s2_candidates')]
+            bookings = []
+            for raw in db.execute('SELECT body FROM s2_slots WHERE hour_id<>?',
+                                  (identity,)):
+                other = json.loads(raw[0])
+                for allocation in other.get('allocations') or []:
+                    at = allocation['planned_start']
+                    candidate = allocation['candidate']
+                    if at + candidate['seconds'] + REPEAT_SECONDS > self.now():
+                        bookings.append((at, candidate))
+            used, fingerprints = set(), set()
+            for slot in hour['slots']:
+                for allocation in slot.get('allocations') or []:
+                    used.add(allocation['candidate']['id'])
+                    fingerprints.update(allocation['candidate']['fingerprints'])
+            out = []
+            for slot in hour['slots']:
+                metrics = self._slot_totals(db, slot)
+                held = sum(m['remaining'] for m in metrics)
+                need = slot['debt_seconds']
+                room = slot['deadline'] - max(slot['start'], self.now()) - held
+                refused, examples = {}, {}
+
+                def refuse(reason, candidate):
+                    refused[reason] = refused.get(reason, 0) + 1
+                    examples.setdefault(reason, candidate['id'])
+
+                for c in catalogue:
+                    if c['kind'] != slot['kind']:
+                        continue                     # another road entirely
+                    if not self._slot_matches(c, slot):
+                        refuse('slot_binding', c); continue
+                    if c['id'] in used:
+                        refuse('used', c); continue
+                    if set(c['fingerprints']) & fingerprints:
+                        refuse('fingerprint', c); continue
+                    if c['seconds'] > max(0.0, room):
+                        refuse('too_long', c); continue
+                    if any((booked['id'] == c['id']
+                            or set(booked['fingerprints']) & set(c['fingerprints']))
+                           and abs(max(slot['start'], self.now()) + held - at)
+                               < REPEAT_SECONDS + max(booked['seconds'], c['seconds'])
+                           for at, booked in bookings):
+                        refuse('booked', c); continue
+                    why = self._eligible(db, c, max(slot['start'], self.now()) + held)
+                    if why:
+                        refuse(why, c); continue
+                    refuse('WOULD FIT', c)
+                blocker = ('the slot is satisfied' if need <= .001 else
+                           'the slot deadline has passed - it can never be '
+                           'filled now' if room <= 0 else
+                           'nothing was refused; it simply has no candidate '
+                           'of this road' if not refused else '')
+                out.append({
+                    'id': slot['id'], 'kind': slot['kind'],
+                    'label': slot.get('label') or slot['kind'],
+                    'start': slot['start'], 'deadline': slot['deadline'],
+                    'enabled': bool(slot.get('enabled', True)),
+                    'allocations': len(slot.get('allocations') or []),
+                    'need_seconds': round(float(need), 1),
+                    'room_seconds': round(float(room), 1),
+                    'held_seconds': round(float(held), 1),
+                    'of_this_road': sum(1 for c in catalogue
+                                        if c['kind'] == slot['kind']),
+                    'would_fit': refused.get('WOULD FIT', 0),
+                    'refused': {k: v for k, v in refused.items()
+                                if k != 'WOULD FIT'},
+                    'first_refused': {k: v for k, v in examples.items()
+                                      if k != 'WOULD FIT'},
+                    'blocker': blocker,
+                })
+            return {'hour': identity, 'start': hour['start'],
+                    'now': self.now(), 'candidates': len(catalogue),
+                    'slots': out}
+
     def get_hour(self, identity):
         with self._lock, closing(self._connect()) as db:
             return self._hour(db, identity)
