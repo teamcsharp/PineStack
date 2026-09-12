@@ -33,7 +33,46 @@
 
   const modes = {
     poly: true, gate: false, full: false,
-    sixteen: false, repeat: false, division: 4, bpm: 90
+    sixteen: false, repeat: false, division: 4, bpm: 90,
+    /* 16 LEVEL, beyond one chromatic run. "I want options to adjust the
+     * octave, the chord, the progression."
+     *   octave   shifts the whole grid in twelfths, -2..+2
+     *   chord    the intervals the grid walks; "chromatic" is the original
+     *            behaviour and stays the default
+     *   progress a root movement applied every four pads, so the grid can
+     *            walk a progression rather than one scale */
+    octave: 0, chord: 'chromatic', progress: 'none'
+  };
+
+  /* THE SHAPES 16 LEVEL CAN TAKE.
+   *
+   * Semitones from the root, repeated up the octaves to fill sixteen pads.
+   * Chromatic is what 16 LEVEL has always done and is still what it does
+   * unless asked otherwise - this widens the control, it does not move it. */
+  const CHORDS = {
+    chromatic: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    majorScale: [0, 2, 4, 5, 7, 9, 11],
+    minorScale: [0, 2, 3, 5, 7, 8, 10],
+    pentatonic: [0, 3, 5, 7, 10],
+    major: [0, 4, 7],
+    minor: [0, 3, 7],
+    major7: [0, 4, 7, 11],
+    minor7: [0, 3, 7, 10],
+    dom7: [0, 4, 7, 10],
+    sus4: [0, 5, 7],
+    dim: [0, 3, 6],
+    fourths: [0, 5],
+    wholeTone: [0, 2, 4, 6, 8, 10]
+  };
+
+  /* Root movement per ROW of four pads, in semitones. */
+  const PROGRESSIONS = {
+    none: [0, 0, 0, 0],
+    'I-IV-V-I': [0, 5, 7, 0],
+    'I-V-vi-IV': [0, 7, 9, 5],
+    'ii-V-I': [2, 7, 0, 0],
+    'i-VI-III-VII': [0, 8, 3, 10],
+    'rising4ths': [0, 5, 10, 15]
   };
 
   const held = new Map();       /* padIndex -> {voiceId, repeatTimer} */
@@ -381,10 +420,54 @@
     return Math.max(0.25, Math.min(1, 1 - (y * 0.75)));
   }
 
-  /* 16 Level: one sample across the whole grid. Tune is the default
-   * parameter, so the pads play it chromatically, low at pad 1. */
+  /* 16 LEVEL: one sample across the whole grid.
+   *
+   * Semitones are worked out FIRST and the playback rate comes from them,
+   * not the other way round: chord and progression are both things you say
+   * in semitones, and neither is expressible as a ratio.
+   *
+   * The grid reads BOTTOM-LEFT UP, the way a keyboard does and the way the
+   * gradient draws it - pad 13, the bottom-left of a 4x4 laid out in
+   * reading order, is the lowest. Numbering it in reading order would put
+   * the lowest note at the top, backwards from every instrument and from
+   * the illumination the operator asked for. */
+  function sixteenSemitone(index) {
+    const row = Math.floor(index / 4);          /* 0 at the top         */
+    const column = index % 4;
+    const step = (3 - row) * 4 + column;        /* 0 at the bottom-left */
+    const shape = CHORDS[modes.chord] || CHORDS.chromatic;
+    const degree = step % shape.length;
+    /* TWO OCTAVES, THEN ROUND AGAIN - not a ladder that climbs forever.
+     *
+     * Stacking an octave on every cycle of the shape works for chromatic,
+     * which has twelve notes and so only wraps once across sixteen pads. For
+     * a triad it is a disaster: three notes per cycle means five octaves by
+     * pad sixteen, and `octaves` ([0] - since removed) reached +168
+     * semitones, a playback rate of 32768x. That is not a high note, it is a
+     * click. Measured exactly that.
+     *
+     * Wrapping at two octaves gives every shape a repeating two-octave
+     * layout, which is how pad grids are normally laid out anyway, and it
+     * leaves CHROMATIC EXACTLY AS IT WAS - twelve notes then 12..15, unity at
+     * the top-left, which is what 16 LEVEL has always done here. */
+    const octaveUp = Math.floor(step / shape.length) % 2;
+    const walk = PROGRESSIONS[modes.progress] || PROGRESSIONS.none;
+    const root = walk[Math.floor(step / 4) % walk.length] || 0;
+    /* CENTRED so the grid straddles the sample rather than climbing away
+     * from it - twelve is where the chromatic run puts unity, and every
+     * other shape inherits the same reference. */
+    const want = shape[degree] + (octaveUp * 12) + root + (modes.octave * 12) - 12;
+    /* AND BOUNDED. At -24 the clip runs four times as long, at +24 four
+     * times as fast; past that there is nothing recognisable left of it. The
+     * octave dial reaches +/-2 on its own, so this only ever bites when a
+     * progression pushes it further. */
+    return Math.max(-24, Math.min(24, want));
+  }
+
   function sixteenPitch(index) {
-    return Math.pow(2, (index - 8) / 12);
+    /* The semitone is already an interval FROM the sample, so this is the
+     * whole of the conversion. */
+    return Math.pow(2, sixteenSemitone(index) / 12);
   }
 
   function repeatInterval() {
@@ -406,6 +489,11 @@
       pitch: modes.sixteen ? sixteenPitch(index) : undefined
     };
 
+    /* "Whenever I tap on a sample pad, the broadcast is muted while it is
+     * playing the sample pad, allowing me to play the sample pad without
+     * audio interference." On by default - see sampler-air.js. */
+    duckForPads();
+
     const fire = () => audio.fire(key, options);
     const voiceId = fire();
     const record = { voiceId, repeatTimer: null };
@@ -420,6 +508,27 @@
     held.set(index, record);
     if (element) element.classList.add("lit");
     if (!modes.sixteen) select(index);
+  }
+
+  /* THE BROADCAST COMES BACK WHEN THE LAST VOICE DIES, not when the finger
+   * lifts: a one-shot outlives the press that started it, so counting
+   * presses would unduck over the top of a pad still sounding. The engine
+   * is asked how many voices are live instead. */
+  let unduckTimer = 0;
+  function duckForPads() {
+    const air = root.PineAir;
+    if (!air) return;
+    air.duck('pad');
+    if (unduckTimer) return;
+    unduckTimer = setInterval(() => {
+      const audio = engine();
+      const still = audio && typeof audio.playing === 'function'
+        ? audio.playing() : 0;
+      if (still > 0 || held.size > 0) return;
+      clearInterval(unduckTimer);
+      unduckTimer = 0;
+      air.release('pad');
+    }, 120);
   }
 
   function lift(index) {
@@ -788,12 +897,418 @@
       }
       element.title = meta
         ? (meta.label + (meta.cut ? "\n\n" + meta.cut : ""))
-        : "Drag a moment from the feed onto this pad";
+        : "Tap to grab what just played, or hold to take the air right now";
     }
+    paintSixteen();
     const foot = el("pbFoot");
     if (foot) foot.textContent = footprintLine();
 
     paintBanks();
+  }
+
+  /* ------------------------------------------------------------- kits */
+
+  /* PRESETS AND FILES ARE THE SAME OBJECT, deliberately. A preset is a kit
+   * kept in the browser; an export is the same kit written out. So a preset
+   * can be exported, and an imported file can be kept as a preset, without
+   * any conversion step for the operator to think about. */
+  let kitSheet = null;
+
+  function closeKits() {
+    if (kitSheet) { kitSheet.remove(); kitSheet = null; }
+  }
+
+  async function openKits() {
+    closeKits();
+    const kits = root.PineSamplerKits;
+    if (!kits) { note("Presets are not loaded on this terminal."); return; }
+
+    kitSheet = document.createElement("div");
+    kitSheet.className = "pb-kits";
+
+    const head = document.createElement("div");
+    head.className = "pb-kits-head";
+    const title = document.createElement("b");
+    title.textContent = "Presets";
+    const shut = document.createElement("button");
+    shut.className = "pb-kits-x";
+    shut.textContent = "\u00d7";
+    shut.addEventListener("click", closeKits);
+    head.appendChild(title);
+    head.appendChild(shut);
+    kitSheet.appendChild(head);
+
+    const said = document.createElement("p");
+    said.className = "pb-kits-say";
+    said.textContent = "A preset carries the AUDIO, not links to it - so it "
+      + "still plays when the station is off, and after the 48-hour sweep.";
+    kitSheet.appendChild(said);
+
+    const saved = document.createElement("div");
+    saved.className = "pb-kits-list";
+    kitSheet.appendChild(saved);
+
+    const acts = document.createElement("div");
+    acts.className = "pb-kits-acts";
+    acts.appendChild(kitAct("Save this bank", async () => {
+      const name = prompt("Name this preset", kits.defaultName(bank));
+      if (!name) return;
+      await kits.save(name, bank);
+      note("Preset saved: " + name);
+      await fillKits(saved);
+    }));
+    acts.appendChild(kitAct("Save all five banks", async () => {
+      const name = prompt("Name this preset", kits.defaultName(null));
+      if (!name) return;
+      await kits.save(name, null);
+      note("Preset saved: " + name);
+      await fillKits(saved);
+    }));
+    acts.appendChild(kitAct("Export this bank to a file", async () => {
+      const got = await kits.exportKit(bank, kits.defaultName(bank));
+      note(got.ok ? "Exported to " + got.where : "It would not export.");
+    }));
+    acts.appendChild(kitAct("Export all five to a file", async () => {
+      const got = await kits.exportKit(null, kits.defaultName(null));
+      note(got.ok ? "Exported to " + got.where : "It would not export.");
+    }));
+    acts.appendChild(kitAct("Import a kit file", async () => {
+      try {
+        const kit = await kits.importFile();
+        const only = Object.keys(kit.banks || {}).length === 1;
+        const got = await kits.apply(kit, only ? bank : null, false);
+        note("Loaded " + got.pads + " pads"
+          + (got.missing ? " - " + got.missing + " had no audio in the file" : ""));
+        await preload(bank);
+        closeKits();
+      } catch (err) {
+        note("Import failed: " + ((err && err.message) || err));
+      }
+    }));
+    kitSheet.appendChild(acts);
+
+    document.body.appendChild(kitSheet);
+    if (root.PineDismiss) root.PineDismiss.watch(kitSheet, closeKits, []);
+    await fillKits(saved);
+  }
+
+  function kitAct(words, run) {
+    const button = document.createElement("button");
+    button.className = "pb-kits-act";
+    button.textContent = words;
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      const bar = root.PineBusy ? root.PineBusy.attach(button, "working") : null;
+      try { await run(); if (bar) bar.finish(true); }
+      catch (err) {
+        if (bar) bar.finish(false);
+        note(((err && err.message) || err));
+      } finally { button.disabled = false; }
+    });
+    return button;
+  }
+
+  async function fillKits(into) {
+    const kits = root.PineSamplerKits;
+    into.innerHTML = "";
+    let saved = [];
+    try { saved = await kits.list(); } catch (err) { saved = []; }
+    if (!saved.length) {
+      const none = document.createElement("p");
+      none.className = "pb-kits-none";
+      none.textContent = "No presets kept yet.";
+      into.appendChild(none);
+      return;
+    }
+    for (const name of saved) {
+      const row = document.createElement("div");
+      row.className = "pb-kits-row";
+      const load = document.createElement("button");
+      load.className = "pb-kits-load";
+      load.textContent = String(name);
+      load.addEventListener("click", async () => {
+        const bar = root.PineBusy ? root.PineBusy.attach(load, "loading") : null;
+        try {
+          const kit = await kits.load(name);
+          const only = Object.keys(kit.banks || {}).length === 1;
+          const got = await kits.apply(kit, only ? bank : null, false);
+          if (bar) bar.finish(true);
+          note("Loaded " + got.pads + " pads from " + name
+            + (got.missing ? " - " + got.missing + " had no audio" : ""));
+          await preload(bank);
+          closeKits();
+        } catch (err) {
+          if (bar) bar.finish(false);
+          note("That preset would not load: " + ((err && err.message) || err));
+        }
+      });
+      const kill = document.createElement("button");
+      kill.className = "pb-kits-drop";
+      kill.textContent = "\u00d7";
+      kill.title = "Forget this preset";
+      kill.addEventListener("click", async () => {
+        await kits.forget(name);
+        await fillKits(into);
+      });
+      row.appendChild(load);
+      row.appendChild(kill);
+      into.appendChild(row);
+    }
+  }
+
+  /* ------------------------------------------------------- pad gestures */
+
+  const HOLD_MS = 600;    /* the same hold line-actions.js uses */
+  const SLOP = 12;        /* pixels that still count as standing still */
+  let gesture = null;
+  let bin = null;
+
+  function loadedAt(index) {
+    return !!layout[bank][index] && engine().loaded(padKey(bank, index));
+  }
+
+  /* THE BIN.
+   *
+   * "If I click and drag on a pad, show a trash can icon that I can drag the
+   * pad onto in order to clear the pad."
+   *
+   * It exists only while something is being carried. A permanently visible
+   * delete target on a grid you hit with your thumb is an accident waiting
+   * for a busy moment. */
+  function showBin(from) {
+    if (bin) bin.remove();
+    bin = document.createElement("div");
+    bin.className = "pb-bin";
+    const can = document.createElement("span");
+    can.className = "pb-bin-can";
+    can.textContent = String.fromCodePoint(0x1F5D1);
+    const say = document.createElement("span");
+    say.className = "pb-bin-say";
+    say.textContent = "drop to clear pad " + (from + 1);
+    bin.appendChild(can);
+    bin.appendChild(say);
+    document.body.appendChild(bin);
+    requestAnimationFrame(() => { if (bin) bin.classList.add("up"); });
+  }
+
+  function overBin(event) {
+    if (!bin || !event) return false;
+    const box = bin.getBoundingClientRect();
+    return event.clientX >= box.left && event.clientX <= box.right
+      && event.clientY >= box.top && event.clientY <= box.bottom;
+  }
+
+  function moveBin(event) {
+    if (bin) bin.classList.toggle("over", overBin(event));
+  }
+
+  async function dropOnBin(index, event) {
+    const hit = overBin(event);
+    if (bin) { bin.remove(); bin = null; }
+    if (hit) await clearPad(index);
+  }
+
+  /* Clearing is a real deletion - the bytes go too, or the bank keeps paying
+   * for a pad nobody can hear. UNDO holds them until the next clear, because
+   * a thumb over a bin is exactly the case this has to survive. */
+  let binUndo = null;
+  async function clearPad(index) {
+    const key = padKey(bank, index);
+    const meta = layout[bank][index];
+    if (!meta) return;
+    let record = null;
+    try { record = await dbGet(key); } catch (err) { /* gone already */ }
+    binUndo = { bank: bank, pad: index, meta: meta, record: record };
+    try { await dbDelete(key); } catch (err) { /* it may never have landed */ }
+    try { if (engine().unload) engine().unload(key); } catch (err) { /* older engine */ }
+    layout[bank][index] = null;
+    saveLayout();
+    paintPads();
+    note("Pad " + (index + 1) + " cleared.");
+    showUndo();
+  }
+
+  function showUndo() {
+    const foot = el("pbNote");
+    if (!foot || !binUndo) return;
+    const old = foot.querySelector(".pb-undo");
+    if (old) old.remove();
+    const button = document.createElement("button");
+    button.className = "pb-undo";
+    button.textContent = "UNDO";
+    button.addEventListener("click", async () => {
+      const back = binUndo;
+      binUndo = null;
+      button.remove();
+      if (!back) return;
+      if (back.record && back.record.bytes) {
+        await dbPut(padKey(back.bank, back.pad), back.record);
+        try { await engine().load(padKey(back.bank, back.pad), back.record.bytes); }
+        catch (err) { /* it will load cold on the next press */ }
+      }
+      layout[back.bank][back.pad] = back.meta;
+      saveLayout();
+      paintPads();
+      note("Pad " + (back.pad + 1) + " is back.");
+    });
+    foot.appendChild(button);
+  }
+
+  /* ------------------------------------------------- sampling the air */
+
+  /* HOLD AN EMPTY PAD: the broadcast, as it sounds right now.
+   *
+   * "Sample the current playing broadcast to the pad" - and "capture it at
+   * the current levels and the current audio", which is why this comes out
+   * of the tap in sampler-air.js rather than out of the station's files.
+   *
+   * It takes the seconds BEHIND the press, not after it: the operator hears
+   * something good and then reaches for a pad, so the moment worth keeping
+   * is already over by the time the finger lands. */
+  const LIVE_TAKE_S = 8;
+
+  async function sampleAirNow(index) {
+    const air = root.PineAir;
+    const cell = el("pad-" + index);
+    if (!air || !air.ready()) {
+      note("Cannot sample the air: " + (air ? air.why() : "the tap is not loaded"));
+      return;
+    }
+    const take = Math.min(LIVE_TAKE_S, air.seconds());
+    if (take < 0.4) {
+      note("There is not enough broadcast held yet - give it a few seconds.");
+      return;
+    }
+    /* NOTHING TO HEAR IS NOT THE SAME AS A BROKEN FEATURE, and the operator
+     * is owed the difference. The ring fills on the clock whether or not
+     * anything is playing, so without this a hold during a quiet stretch put
+     * eight seconds of digital silence on a pad and looked like a fault.
+     * Measured that way once: peak 0.0037, rms 0.00118. */
+    if (typeof air.quiet === "function" && air.quiet(take, 0)) {
+      note("That stretch was silent - nothing is playing on this terminal "
+        + "right now. Check the broadcast is coming here before holding a pad.");
+      return;
+    }
+    if (cell) cell.classList.add("loading");
+    const bar = root.PineBusy ? root.PineBusy.attach(cell, "taking the air") : null;
+    try {
+      const bytes = air.sliceWav(take, 0);
+      if (!bytes) throw new Error("the buffer would not give up that window");
+      await putBytesOnPad(index, bytes, {
+        label: "air " + take.toFixed(1) + "s",
+        who: "broadcast", kind: "air",
+        cut: "the last " + take.toFixed(1) + " seconds as it played"
+      });
+      if (bar) bar.finish(true);
+      note("Pad " + (index + 1) + " - " + take.toFixed(1)
+        + "s off the air. Right-click to trim it.");
+    } catch (err) {
+      if (bar) bar.finish(false);
+      note("Could not take the air: " + ((err && err.message) || err));
+    } finally {
+      if (cell) cell.classList.remove("loading");
+    }
+  }
+
+  /* THE ONE DOOR BYTES COME IN BY. importRow fetches from the station; this
+   * takes bytes already in hand - off the air, out of the grab window, or
+   * trimmed inside it - so all of them land identically and a pad cannot
+   * tell which road it arrived on. */
+  async function putBytesOnPad(index, bytes, extra) {
+    const key = padKey(bank, index);
+    await dbPut(key, { bytes: bytes, type: "audio/wav" });
+    await engine().load(key, bytes);
+    const meta = Object.assign({
+      label: "take", who: "", kind: "air", srcId: "",
+      exact: true, cut: "", at: Date.now(),
+      gain: 1, pitch: 1, loop: false, reverse: false, trim: null, choke: ""
+    }, extra || {});
+    meta.seconds = engine().seconds(key);
+    layout[bank][index] = meta;
+    saveLayout();
+    paintPads();
+    return meta;
+  }
+
+  /* TAP AN EMPTY PAD: the grab window - scrub back through what just played,
+   * or pick one of the clips listed beside it. Lives in sampler-grab.js. */
+  function openGrab(index) {
+    if (!root.PineSamplerGrab) {
+      note("The grab window is not loaded on this terminal.");
+      return;
+    }
+    root.PineSamplerGrab.open({
+      bank: bank,
+      pad: index,
+      put: (bytes, extra) => putBytesOnPad(index, bytes, extra),
+      note: note
+    });
+  }
+
+  /* A dial is shown only while the thing it dials is switched on. Three
+   * menus and a slider permanently on screen would be four controls doing
+   * nothing most of the time, on a nine-inch screen. */
+  function paintDials() {
+    const row = el("pbDials");
+    if (!row) return;
+    const rpt = el("pbRptDial");
+    if (rpt) rpt.hidden = !modes.repeat;
+    for (const id of ["pbOct", "pbChord", "pbProg"]) {
+      const dial = el(id);
+      if (dial) dial.hidden = !modes.sixteen;
+    }
+    row.hidden = !modes.repeat && !modes.sixteen;
+  }
+
+  /* SIXTEEN LEVELS, SHOWN AS SIXTEEN LEVELS.
+   *
+   * "Whenever I go into sixteen level, I want the pads to be illuminated in
+   * a gradient going up the pads, showing the sixteen levels in action."
+   *
+   * The brightness is the PITCH, not the pad number, so a chord or a
+   * progression reads as the shape it actually is rather than as a flat
+   * ramp - a triad shows its steps, `octaves` shows four wide jumps. The
+   * unity pad, the one that plays the sample untouched, is marked
+   * separately; without it there is no way to see where the original sits. */
+  function paintSixteen() {
+    const grid = document.querySelector(".pb-grid");
+    if (grid) grid.classList.toggle("sixteen", !!modes.sixteen);
+    if (!modes.sixteen) {
+      for (let p = 0; p < PADS; p += 1) {
+        const element = el("pad-" + p);
+        if (!element) continue;
+        element.style.removeProperty("--lvl");
+        element.classList.remove("unity");
+        const tone = element.querySelector(".pb-pad-tone");
+        if (tone) tone.remove();
+      }
+      return;
+    }
+    const notes = [];
+    for (let p = 0; p < PADS; p += 1) notes.push(sixteenSemitone(p));
+    const low = Math.min.apply(null, notes);
+    const high = Math.max.apply(null, notes);
+    const span = Math.max(1, high - low);
+    for (let p = 0; p < PADS; p += 1) {
+      const element = el("pad-" + p);
+      if (!element) continue;
+      element.style.setProperty("--lvl", ((notes[p] - low) / span).toFixed(3));
+      element.classList.toggle("unity", notes[p] === 0);
+      let tone = element.querySelector(".pb-pad-tone");
+      if (!tone) {
+        tone = document.createElement("span");
+        tone.className = "pb-pad-tone";
+        element.appendChild(tone);
+      }
+      tone.textContent = stepName(notes[p]);
+    }
+  }
+
+  /* An interval from the SAMPLE'S OWN pitch, not a concert pitch: calling an
+   * arbitrary clip "C" would be a lie about it. */
+  function stepName(semitone) {
+    if (semitone === 0) return "unity";
+    return (semitone < 0 ? "-" : "+") + Math.abs(semitone);
   }
 
   let feedPrint = "";
@@ -888,6 +1403,18 @@
 
     const banks = document.createElement("div");
     banks.className = "pb-banks";
+
+    /* KITS, at the top, where the operator asked for them: "have that saved
+     * as a preset that I can jump between with an icon at the top of the
+     * screen". It sits beside the bank numbers because that is what it acts
+     * on - one page, or all five. */
+    const kitBtn = document.createElement("button");
+    kitBtn.id = "pbKit";
+    kitBtn.className = "pb-kit";
+    kitBtn.title = "Presets - save, load and swap whole banks of pads";
+    kitBtn.textContent = String.fromCodePoint(0x1F4BE);
+    kitBtn.addEventListener("click", openKits);
+    banks.appendChild(kitBtn);
     for (let b = 0; b < BANKS; b += 1) {
       const button = document.createElement("button");
       button.id = "pbBank-" + b;
@@ -914,20 +1441,76 @@
       pad.innerHTML = '<span class="pb-pad-num">' + (p + 1) + '</span>'
         + '<span class="pb-pad-label"></span><span class="pb-pad-sub"></span>';
 
+      /* ONE POINTERDOWN, FOUR MEANINGS, and which it turns out to be is
+       * decided by what the pad holds and what the finger then does:
+       *
+       *   loaded, tapped    play it              (what it always did)
+       *   loaded, dragged   the bin appears, drop on it to clear the pad
+       *   empty,  tapped    the grab window - the last two minutes of
+       *                     broadcast, and the clips that just played
+       *   empty,  held      take the air NOW, straight onto this pad
+       *
+       * The empty pair are the operator's: "tap and hold on a pad that is
+       * idle or blank to sample the current playing broadcast to the pad",
+       * and "if I tap on a pad and there is nothing there, then allow me to
+       * open a pop up that allows me to grab from previous seconds".
+       *
+       * A HOLD IS NOT A DRAG AND A DRAG IS NOT A SCROLL: the hold dies on
+       * movement past a few pixels, exactly as line-actions.js does it, or
+       * the grid cannot be dragged at all. */
       pad.addEventListener("pointerdown", (event) => {
         event.preventDefault();
         try { pad.setPointerCapture(event.pointerId); } catch (err) { /* mouse */ }
-        press(p, event);
+        gesture = {
+          pad: p, x: event.clientX, y: event.clientY,
+          moved: false, dragging: false, took: false, timer: 0
+        };
+        if (loadedAt(p)) {
+          press(p, event);
+        } else {
+          gesture.timer = setTimeout(() => {
+            gesture.timer = 0;
+            gesture.took = true;
+            sampleAirNow(p);
+          }, HOLD_MS);
+        }
       });
-      const up = () => lift(p);
-      pad.addEventListener("pointerup", up);
-      pad.addEventListener("pointercancel", up);
+
+      pad.addEventListener("pointermove", (event) => {
+        if (!gesture || gesture.pad !== p) return;
+        const dx = Math.abs(event.clientX - gesture.x);
+        const dy = Math.abs(event.clientY - gesture.y);
+        if (dx <= SLOP && dy <= SLOP) return;
+        gesture.moved = true;
+        if (gesture.timer) { clearTimeout(gesture.timer); gesture.timer = 0; }
+        if (loadedAt(p) && !gesture.dragging) {
+          gesture.dragging = true;
+          lift(p);                     /* it is being carried, not played */
+          showBin(p);
+        }
+        if (gesture.dragging) moveBin(event);
+      });
+
+      const finish = (event) => {
+        const g = gesture;
+        gesture = null;
+        if (!g || g.pad !== p) { lift(p); return; }
+        if (g.timer) clearTimeout(g.timer);
+        if (g.dragging) { dropOnBin(p, event); return; }
+        if (loadedAt(p)) { lift(p); return; }
+        if (!g.took && !g.moved) openGrab(p);
+      };
+      pad.addEventListener("pointerup", finish);
+      pad.addEventListener("pointercancel", finish);
       pad.addEventListener("pointerleave", () => { if (held.has(p)) lift(p); });
 
 
-      /* Right-click / long-press opens the trim editor for that pad. */
+      /* Right-click / long-press opens the trim editor - but only on a pad
+       * that HAS something to trim. On an empty pad the long press is the
+       * operator's "sample the broadcast now", and the two would fight. */
       pad.addEventListener("contextmenu", (event) => {
         event.preventDefault();
+        if (!loadedAt(p)) return;
         select(p);
         if (root.PineSamplerTrim) root.PineSamplerTrim.open(bank, p);
       });
@@ -947,7 +1530,15 @@
       ["pb16", "16 LVL", "The selected pad across all sixteen, played chromatically.",
         () => modes.sixteen, () => { modes.sixteen = !modes.sixteen; }],
       ["pbRpt", "NOTE RPT", "Hold a pad and it retriggers in time.",
-        () => modes.repeat, () => { modes.repeat = !modes.repeat; }]
+        () => modes.repeat, () => { modes.repeat = !modes.repeat; }],
+      /* ON AT BOOT, because the operator asked for it that way: "by default
+       * I would have it on so that way whenever I tap on a sample pad, I am
+       * hearing just the sound of that sample pad." */
+      ["pbDuck", "SOLO PAD", "Mute the broadcast while a pad is playing.",
+        () => (root.PineAir ? root.PineAir.duckEnabled() : false),
+        () => {
+          if (root.PineAir) root.PineAir.setDuckEnabled(!root.PineAir.duckEnabled());
+        }]
     ];
     for (const spec of toggles) {
       const button = document.createElement("button");
@@ -958,11 +1549,18 @@
       button.addEventListener("click", () => {
         spec[4]();
         button.classList.toggle("on", spec[3]());
+        paintDials();
+        paintSixteen();
       });
       controls.appendChild(button);
     }
-    /* POLY is on at boot, so its light is on at boot. */
+    /* POLY is on at boot, so its light is on at boot - and so is SOLO PAD,
+     * which remembers the operator's last answer across reloads. */
     controls.querySelector("#pbPoly").classList.add("on");
+    const duckBtn = controls.querySelector("#pbDuck");
+    if (duckBtn && root.PineAir && root.PineAir.duckEnabled()) {
+      duckBtn.classList.add("on");
+    }
 
     /* TAP, CHOP and STOP DO something; POLY, GATE, FULL, 16 LVL and NOTE
      * RPT ARE something. Wearing the same button made the first three read
@@ -999,6 +1597,94 @@
     stop.addEventListener("click", () => engine().stopAll());
     controls.appendChild(stop);
 
+    /* ---- the second row: the dials the toggles above need ---------------
+     *
+     * Kept OFF the toggle row on purpose. POLY/GATE/FULL/16 LVL/NOTE RPT are
+     * lights that are either on or off; a slider and three menus are neither,
+     * and mixing the two kinds is how CHOP came to read as a mode. */
+    const dials = document.createElement("div");
+    dials.className = "pb-dials";
+    dials.id = "pbDials";
+
+    /* NOTE REPEAT: "there should be a slider for allowing the repeat
+     * frequency to go from one fourth notes all the way up to one thirty
+     * second notes." The slider STEPS through the divisions rather than
+     * sweeping a number, because 1/5 and 1/9 are not things - the positions
+     * are the musical values, and a continuous control that snaps is a
+     * control lying about what it can do. Triplets are in because a repeat
+     * row without them is missing the half of this that swings. */
+    const DIVISIONS = [
+      [4, "1/4"], [6, "1/4T"], [8, "1/8"], [12, "1/8T"],
+      [16, "1/16"], [24, "1/16T"], [32, "1/32"]
+    ];
+    const rptWrap = document.createElement("label");
+    rptWrap.className = "pb-dial";
+    rptWrap.id = "pbRptDial";
+    const rptName = document.createElement("span");
+    rptName.className = "pb-dial-name";
+    rptName.textContent = "REPEAT";
+    const rptSlider = document.createElement("input");
+    rptSlider.type = "range";
+    rptSlider.min = "0";
+    rptSlider.max = String(DIVISIONS.length - 1);
+    rptSlider.step = "1";
+    rptSlider.value = "0";
+    const rptSaid = document.createElement("b");
+    rptSaid.className = "pb-dial-said";
+    rptSaid.textContent = "1/4";
+    rptSlider.addEventListener("input", () => {
+      const pick = DIVISIONS[Number(rptSlider.value)] || DIVISIONS[0];
+      modes.division = pick[0];
+      rptSaid.textContent = pick[1];
+      note("Repeat " + pick[1] + " at " + modes.bpm + " bpm");
+    });
+    rptWrap.appendChild(rptName);
+    rptWrap.appendChild(rptSlider);
+    rptWrap.appendChild(rptSaid);
+    dials.appendChild(rptWrap);
+
+    const menu = (id, name, options, get, set) => {
+      const wrap = document.createElement("label");
+      wrap.className = "pb-dial";
+      wrap.id = id;
+      const title = document.createElement("span");
+      title.className = "pb-dial-name";
+      title.textContent = name;
+      const select = document.createElement("select");
+      for (const pair of options) {
+        const option = document.createElement("option");
+        option.value = String(pair[0]);
+        option.textContent = pair[1];
+        select.appendChild(option);
+      }
+      select.value = String(get());
+      select.addEventListener("change", () => {
+        set(select.value);
+        paintSixteen();
+        note(name.toLowerCase() + ": " + select.options[select.selectedIndex].textContent);
+      });
+      wrap.appendChild(title);
+      wrap.appendChild(select);
+      dials.appendChild(wrap);
+      return wrap;
+    };
+
+    menu("pbOct", "OCTAVE",
+      [[-2, "-2"], [-1, "-1"], [0, "0"], [1, "+1"], [2, "+2"]],
+      () => modes.octave, (v) => { modes.octave = Number(v); });
+    menu("pbChord", "CHORD", [
+      ["chromatic", "chromatic"], ["majorScale", "major scale"],
+      ["minorScale", "minor scale"], ["pentatonic", "pentatonic"],
+      ["major", "major"], ["minor", "minor"], ["major7", "major 7"],
+      ["minor7", "minor 7"], ["dom7", "dominant 7"], ["sus4", "sus4"],
+      ["dim", "diminished"], ["fourths", "fourths"], ["wholeTone", "whole tone"]
+    ], () => modes.chord, (v) => { modes.chord = v; });
+    menu("pbProg", "PROGRESSION", [
+      ["none", "none"], ["I-IV-V-I", "I - IV - V - I"],
+      ["I-V-vi-IV", "I - V - vi - IV"], ["ii-V-I", "ii - V - I"],
+      ["i-VI-III-VII", "i - VI - III - VII"], ["rising4ths", "rising 4ths"]
+    ], () => modes.progress, (v) => { modes.progress = v; });
+
     right.appendChild(banks);
     /* A PAD IS SQUARE. It is a thing you hit with a thumb, and a 4x4 of
      * rectangles is a spreadsheet. The grid stretches to whatever box it is
@@ -1010,6 +1696,7 @@
     padwrap.appendChild(grid);
     right.appendChild(padwrap);
     right.appendChild(controls);
+    right.appendChild(dials);
     host.appendChild(left);
     host.appendChild(right);
 
@@ -1028,6 +1715,11 @@
     config = await api().readConfig();
     build(host);
     engine().warm();
+    /* The air tap has to be listening BEFORE the operator reaches for an
+     * empty pad, or the first hold finds an empty buffer. It is idempotent
+     * and cheap, so starting it on every mount is the safe shape. */
+    if (root.PineAir) root.PineAir.start();
+    paintDials();
     engine().setPolyphonic(modes.poly);
     paintPads();
     /* SAY WHAT THE BUTTON WILL DO, FROM THE FIRST FRAME.
@@ -1098,6 +1790,9 @@
     save: saveLayout,
     repaint: paintPads,
     bytes: dbGet,
+    /* The kit loader writes whole banks back; it needs the same door the
+     * sampler's own imports use rather than a second store of its own. */
+    put: dbPut,
     forget: async (b, p) => {
       await dbDelete(padKey(b, p));
       engine().unload(padKey(b, p));

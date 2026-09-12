@@ -415,24 +415,415 @@ at all, the plan is the **newest TrebleDroid base plus Magisk**, patching the
 boot image separately. Magisk is better maintained than PHH Superuser, and the
 stock `boot.img` needed to patch is already on disk from the Lenovo package.
 
-## 8. What comes next
+---
 
-1. **Unlock** — through the app, past the gate above, with the tablet confirming
-   on its own screen.
-2. **Flash a LineageOS 21 arm64 A/B GSI**, no GApps, with
-   `fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img`.
-   `fastbootd` is where a driver problem would actually appear, since it
-   enumerates differently from the bootloader.
-3. **Hardware acceptance** — speakers, microphone, the 3.5 mm jack, Wi-Fi,
-   sleep/wake, volume keys, rotation. This is a **gate, not a report**: if audio
-   out, mic in, or the jack fail on the GSI, the sampler premise is dead and the
-   stock-Android route has to be reconsidered.
-4. **The kiosk app** — `PineDesktopBridge` so the Windows renderer runs in an
-   Android WebView, HOME launcher, lock task, boot receiver, foreground audio,
-   and the native Oboe sampler engine.
-5. **Wireless from then on** — terminal configuration held on the agent and
-   polled by the tablet, so every install on the network shares one master
-   configuration, as the station already does for its other settings.
+## 8. The audio, and the rule that shapes it
+
+Everything in this section exists to satisfy one sentence from the operator:
+
+> "My goal is to have the broadcast going to singularly the PineTab or the Pine
+> Box or the Nabu device, the app instance or the application loaded on PC.
+> Individually but never at the same time."
+
+That is a stronger rule than the station's own model, and the gap is the whole
+reason `desktop/pinetab-route.cjs` and `rail/AirOwners.kt` exist.
+
+### Why the station cannot say it alone
+
+Each stream routes to one of `box`, `here`, `both`, `off`, `nabu`
+(app.py:93361). Two of the five break the rule by themselves:
+
+| route | why it is not singular |
+| --- | --- |
+| `both` | the box **and** a page, by definition |
+| `here` | **every** browser looking at the station |
+
+`here` is the one that bites. The tablet, the Electron app and any web page open
+on the PC are all "here" clients. Measured on the live station with all three
+up, in the station's own words:
+
+```
+3 players are on this broadcast - if that is one machine,
+they will be playing over each other. Give one of them the air.
+```
+
+That is what "I'm hearing a different broadcast coming out of the application
+than out of the Pine Box tab" actually was: not two different shows, but **one
+show played three times, a few hundred milliseconds apart**.
+
+### The station already had the answer
+
+`#1008` (app.py:25001) gives ONE listener the air; every other page gags itself
+in `pineSoloGate` (app.py:154557), and an owner that stops polling releases it
+after `AUDIO_OWNER_LIFE` (90 s), so this can never leave the house silent.
+
+```
+GET  /api/radio/listeners   the roster, plus audio_owner
+POST /api/radio/solo        {"listener": id} | {"clear": true}
+```
+
+**It must not be reimplemented.** The terminal drives it; it does not replace
+it. A destination is therefore two decisions made together — the route, and who
+holds the air — and exclusivity falls out by construction: a route is a single
+value, and when it is `here`, exactly one listener id is left unmuted.
+
+### A listener id is not an identity
+
+This is the trap that made "only the tablet" keep coming undone. The id is
+minted fresh on every page load. Measured across three relaunches of the kiosk
+app: `pbnvgdtefn`, then `pbq8gj5qvq`, then another. So the tablet would hold the
+air until it reloaded, at which point the owner it named stopped polling, the
+station released it after 90 s, and every page started sounding again.
+
+Nothing durable is ever stored against a listener id. The durable statement is
+the **destination**, kept in settings; the id is re-resolved from the roster
+every time it is needed. Devices are identified two ways, both measured:
+
+- the Electron app mints `desktop-<rand>` (`renderer.js` `desktopListenerId`), so
+  it is self-identifying wherever it runs;
+- everything else mints `pb<rand>` and is placed by **address** against the
+  `terminals` table — which is why the tablet's row carries an `addr`.
+
+A `terminals` row that pins a `listener` is never matched by address to anything
+else. Two tabs on one machine share an address — the Electron app and a browser
+window both sat on `10.89.1.13` — so an address alone cannot tell them apart.
+
+### The half the desktop was missing
+
+`renderer.js` read `window.__pineGagged` to decide whether another listener owned
+the air, but **nothing in that file ever set it**. `pineSoloGate` sets it inside
+the station page, which is a `<webview>` and therefore a different JS context, so
+the shell's own players never learned they had been gagged and kept sounding.
+`/api/radio/clock` already carries `audio_owner`, so the shell only had to ask
+the same question about itself.
+
+> Renderer changes need a **desktop relaunch** to take effect. A running app
+> keeps the old `renderer.js` and will look exactly like an unfixed bug.
+
+### The routing table
+
+Beside the destination sits a table of devices in settings (`terminals`,
+validated by `validate_terminals` in app.py), one row per device:
+
+```
+pinetab  play=true   music .8  voice 1    addr 10.89.1.154
+desktop  play=false  music .6  voice .6   addr 10.89.1.13   fallback=true
+```
+
+Every client reads the same table and obeys its own row, which is what makes the
+tablet's volume settable from the computer. The levels drive the panel's own desk
+(`djGainMusic` / `djGainVoice`, read by `djLevels()` at app.py:149377) rather
+than a second audio path, so the panel's existing GainNode machinery does the
+work.
+
+**The clamp is not cosmetic.** The voice slider defaults to 160%, and on the
+tablet the DJs play through a plain `<audio>` element, whose volume setter throws
+above 1.0:
+
+```
+IndexSizeError: The volume provided (1.6) is outside the range [0, 1]
+```
+
+The throw aborted the routine that was setting it, so **the DJs were silent on
+the tablet while music played**. The desktop never saw it because its GainNode
+accepts boost. The setter is clamped for every element in the page, including
+ones the code has never heard of.
+
+Two rules that were **wrong in the first cut**, recorded so they are not
+reintroduced:
+
+- *"More than one device switched on is legitimate — the box and the tablet."*
+  It is not. More than one is a fault, resolved by id order so the desktop and
+  the tablet reach the same answer without talking to each other.
+- *Reading the desk clamped.* That made 160% and 100% indistinguishable, so the
+  table could never pull a boosted slider down — it always appeared to agree
+  already. The desk is read **raw**.
+
+### The 3.5 mm jack — the six roads, and the one that worked
+
+> "It is tantamount that I get the audio working through the jack as well. That
+> is one of the reasons I bought this unit. Typically I have the audio being
+> piped into a major system."
+
+Symptom: plugging an aux cable into the tablet did nothing; audio stayed on the
+speaker. Measured end to end, with a cable in the socket:
+
+| check | result |
+| --- | --- |
+| `/sys/class/switch/` | **empty** — no `h2w` node |
+| `/dev/input/event0` `ACCDET` | `SW (0005): 0002*` — `SW_HEADPHONE_INSERT` **set** |
+| `dumpsys input` Device 5 | `Switch Input Mapper: SwitchValues: 4` |
+| `/vendor/etc/audio_policy_configuration.xml` | declares `AUDIO_DEVICE_OUT_WIRED_HEADSET` and `..._HEADPHONE` |
+| `cmd overlay lookup android android:bool/config_useDevInputEventForAudioJack` | **`false`** |
+| `dumpsys audio` | `mMainType=0x0` — the audio layer is unaware |
+
+The kernel detects the plug, InputReader reports it, and the vendor policy has
+somewhere to send it — and then the framework drops it on the floor.
+InputManagerService's own bytecode says why:
+
+```
+iget-boolean v0, v6, InputManagerService.mUseDevInputEventForAudioJack
+if-eqz v0, 0080                 <- false, so jump past everything
+...
+invoke-interface WiredAccessoryCallbacks.notifyWiredAccessoryChanged
+```
+
+**Five roads round it were tried and every one is dead.** They are recorded
+because each looks plausible and each costs an afternoon:
+
+1. **A platform-signed RRO flipping that boolean true.** It installs and it
+   survives a reboot — and it still does not work, because a `/data` overlay is
+   applied **after** IMS constructs. Measured: IMS at 15:12:43, the overlay at
+   15:12:44. That is a hard ordering wall, not a bug with a fix.
+2. **A fabricated overlay.** Wiped on every framework start.
+3. **`cmd audio` / a vendor force-route property.** Neither exists on this build.
+4. **`AudioTrack.setPreferredDevice`.** Needs the device to appear in
+   `getDevices()`, which needs the framework to know about it. Circular.
+5. **Forcing the codec by hand as root.** `HPL/HPR Mux` was set to Audio Playback
+   and *held*, unopposed, for twenty seconds — and there was still nothing in the
+   headphones. The vendor's own `audio_device.xml` explains it:
+   `headphoneSpeaker_output` drives the **speaker** through the same headphone
+   pins in LoudSPK mode, so the amplifier's power follows whichever path the HAL
+   opened. **A mixer poke cannot open a path.**
+
+### What actually worked: say it ourselves
+
+The sixth road is to make the announcement the framework refuses to make —
+`AudioManager.setWiredDeviceConnectionState`, the same call
+`WiredAccessoryManager` would have made. It is `@SystemApi`, so it is reached by
+reflection, and it is gated on `MODIFY_AUDIO_ROUTING`, which is
+`signature|privileged`. **That is why the kiosk is signed with the platform key**
+— see *Platform signing* below. `DUMP` comes along for the same reason, because
+the terminal also has to *read* the switch and `getSwitchState` exists on neither
+`InputManager` nor `InputManagerGlobal` on this Android 14 build. What does know
+is the input service's own dump: `dumpsys input` prints `SwitchValues: 4` with a
+cable in and `0` without, and bit 2 is `SW_HEADPHONE_INSERT`.
+
+`audio/JackWatch.kt` polls that every two seconds — a question, not an event,
+because there is no callback for a device the framework has decided not to track.
+Verified through a full cycle:
+
+```
+cable out  ->  SwitchValues 0  ->  "the jack is out — audio back to the speaker"
+               dumpsys audio: mMainType=0x0, headset port gone from the policy
+cable in   ->  SwitchValues 1  ->  "the jack is in — audio handed to it"
+```
+
+### The announcement outlives the app
+
+This one cost a working jack twice, and it is not obvious.
+
+The announcement lives in the **framework**, not in the app. It survives the app
+being killed, force-stopped, crashed or reinstalled, because **none of those run
+`stop()`**. A fresh `JackWatch` that assumed `announced = false` then read
+`SwitchValues 0`, decided the two already agreed, and said nothing — leaving the
+tablet routed to a headset that was not plugged in:
+
+```
+dumpsys audio          mMainType=0x1                      (MAIN_HEADSET)
+media.audio_policy     "Wired Headset" Port 278 available
+dumpsys input          SwitchValues: 0                    (no cable)
+```
+
+And unplugging could never fix it, because unplugging is exactly the transition
+it believed had already happened. `announced` is therefore a `Boolean?` — `null`
+until we have spoken in this process — so the **first** reading is always
+announced, whatever it says. One redundant binder call at startup, against a
+terminal silently routed to nothing.
+
+**The general rule:** any state pushed into a system service must be reconciled
+on startup, never assumed.
+
+### Platform signing, and why the deploy is one script
+
+The jack needs `MODIFY_AUDIO_ROUTING` and `DUMP`. Both are
+`signature|privileged`, so they are granted only to a build signed with the same
+key as the framework — here the AOSP platform test key, SHA-256
+`c8a2e9bc…92ab8`, whose framework certificate hashCode is `b4addb29`
+(`dumpsys package android`).
+
+**Gradle cannot produce that APK.** `assembleDebug` always signs with the debug
+key (`4c7dcfcf`), so the platform signature is a separate step afterwards — and
+the moment anyone runs the two obvious commands:
+
+```
+gradle assembleDebug && adb install -r app-debug.apk
+```
+
+the tablet is quietly back on a debug-signed build, both permissions read
+`granted=false`, and the jack stops following the cable. **The app still launches
+and looks entirely normal.** There is no symptom except the audio, which is why
+this happened twice before it was caught.
+
+So `deploy.sh` welds build → zipalign → platform-sign → **verify** → install, and
+refuses to install an APK that is not platform-signed. Two things it checks, not
+one: that the APK's signer is the platform key by full SHA-256, *and* that the
+tablet's framework is still `b4addb29`, so reflashing with a differently signed
+GSI is noticed here rather than discovered later as a dead jack.
+
+> A guard that fails to read its input and then passes is worse than no guard.
+> The first version of that check parsed the framework hash into an empty string
+> and then matched everything against it.
+
+A signature change cannot be installed over the top, so the script uninstalls
+first when it has to — and **re-grants `RECORD_AUDIO` afterwards**, because an
+uninstall takes the runtime grants with it and the talk dot is silently useless
+without it: it records, gets zeros, and the station transcribes nothing. There is
+no permission prompt to fall back on in a kiosk that owns HOME.
+
+### The microphone, and a measurement that was wrong
+
+The terminal has **no speech recognizer of its own** — `cmd package
+query-services -a android.speech.RecognitionService` returns *"No services
+found"* on this GApps-less GSI. So `audio/MicCapture.kt` records 16 kHz mono
+here and the **station** hears it, through `/api/listen/transcribe` to
+wyoming-whisper.
+
+Two things worth keeping:
+
+- **`VOICE_RECOGNITION` is dead on this device.** Measured against `MIC`:
+  0.0004 against 0.63. My first sweep found them equivalent — it was taken in a
+  silent room, so it was comparing two noise floors. A level comparison is
+  meaningless without a signal.
+- **Wyoming sends the transcript in the `data_length` blob, not inline.** Reading
+  the header only gives an empty transcript and a 504 further up. This fix went
+  missing once and had to be applied twice, because `app.py` is edited from more
+  than one session.
+
+### The wallpaper is the gallery
+
+> "Constantly every five minutes be replacing the wallpaper with the latest image
+> being hawked by the Pine Box gallery on the station. I want the lock screen and
+> the home screen to always have images from the Pine Box Gallery as they are
+> being chosen by the station and being sold."
+
+`gallery/WallpaperWatch.kt`, every five minutes, onto `FLAG_SYSTEM` **and**
+`FLAG_LOCK` — set in two calls rather than one, because a build can refuse the
+keyguard alone and a single combined call that throws would leave both unchanged.
+
+Which picture, and in what order:
+
+1. **`selling_now`** — the station's own single answer to "what art is being sold
+   right now" (#900, app.py ~45587). It folds the three roads that sell things —
+   the sales floor `hawking_now`, the ad break `ad_now`, and the gallery press —
+   into one dict carrying a bare gallery filename, and it rides on `/api/dj`.
+2. **The newest still in the gallery**, when nothing is on the block — which is
+   most of the time, since `selling_now` is `None` between spots. Without this
+   the tablet would revert to a black rectangle, which is not "always have images
+   from the Pine Box Gallery".
+
+Two traps in that fallback. `/api/generations?limit=N` is **newest-first**
+(`read_generations` slices the tail and reverses), and it serves `.mp4`/`.webm`
+alongside stills — so anything wanting a *picture* must filter by extension.
+
+It reads `StationFeed.snapshot()` when that is fresh and only fetches `/api/dj`
+itself when nothing is collecting the feed. That is the single-poller rule, and
+it is also correctness: the snapshot goes stale the moment no view is attached,
+which on a locked tablet is most of the time, so trusting it outright would hang
+whatever was selling when the screen was last unlocked, forever. It runs from the
+Application rather than the Activity for the same reason — started from the
+activity it would stop at the moment it starts mattering.
+
+Renders are several thousand pixels square and the screen is not, so the bitmap
+is decoded at `inSampleSize` and then **centre-cropped to the screen's shape**.
+Left to itself the wallpaper service letterboxes or stretches it.
+
+### Wireless adb does not survive a reboot
+
+`adb tcpip 5555` is a runtime mode, not a setting. After a reboot the tablet
+pings but refuses adb, and **rebooting it is how remote access gets lost**. Two
+recoveries:
+
+- **Wireless debugging** (Android 11+): `adb mdns services` lists both
+  `_adb-tls-pairing._tcp` and `_adb-tls-connect._tcp` with their ports, so only
+  the six-digit pairing code has to come off the tablet's screen. This is how
+  access was recovered without a cable.
+- **USB**, then `adb tcpip 5555` again.
+
+Either way, make it permanent once you are back in:
+
+```
+adb shell setprop persist.adb.tcp.port 5555
+```
+
+Verified: after the next reboot, 5555 came back on its own.
+
+Note that `adb root` **restarts adbd and changes the TLS port**, so a wireless
+session must re-discover by mDNS afterwards. Reconnecting by the mDNS service
+name rather than the old `ip:port` is the reliable form.
+
+## 9. Making the panel fit a 9-inch screen
+
+"It is still scaled too big... the application is still very cramped even on
+mobile... I need to be able to spread the UI out."
+
+Two complaints that pull opposite ways, so the page was surveyed over the
+devtools socket in landscape before anything was changed:
+
+```
+viewport            1000 x 598 CSS px   (dpr 1.25, 1340x800 physical)
+controls on screen  112, of which 94 under 32px tall, median 30
+text on screen      123 elements at 9-11px
+flex rows           60, of which 22 have neighbours under 6px apart
+```
+
+**The type was never too big — most of it was tiny.** What was too big was the
+scale: at 1000 CSS px across a 1340 px panel everything renders at 1.34x, so the
+furniture ate a 598 px-tall viewport and the content was squeezed into what was
+left. Height is the scarce axis in landscape, and nothing was being spent on it.
+
+The fix is `TARGET_CSS_WIDTH` 1000 → **1150**, paid for by a WebView
+`minimumFontSize = 12`: the layout gains 15% while the smallest text ends up
+*larger* in real pixels than it was. Measured after:
+
+| | before | after |
+| --- | --- | --- |
+| viewport | 1000 × 598 | **1154 × 690** |
+| text under 12 px | 123 elements | **0** |
+| rows with <6 px gaps | 22 of 60 | **3 of 21** |
+| clipped overflow | 4 | **0** |
+
+> **Keep `tablet.css`'s breakpoint above `TARGET_CSS_WIDTH`.** It was
+> `max-width: 1100px` while the target was 1000; raising the target without
+> moving the query would leave it not matching and **every tablet rule silently
+> off** — which looks exactly like the stylesheet having no effect rather than
+> like a bug. It is now 1250.
+
+### Square pads
+
+"The point of the sampler's pads is that they are square pads that I tap on."
+
+The grid was 4×4 of `1fr` stretched across whatever box it was handed — and that
+box is square in neither orientation, so pads came out wide in landscape and tall
+in portrait. A 4×4 of rectangles is a spreadsheet.
+
+`.pb-padwrap` is a **size container**, so `min(100%, 100cqh)` inside it is "the
+smaller of this box's two sides" — the largest square that fits. Four equal
+columns and rows with equal gaps in both axes then give square cells with no
+per-pad rule. Measured in the real WebView:
+
+| viewport | pad | ratio |
+| --- | --- | --- |
+| 1066 × 1786 | 189 × 189 | 1.0000 |
+| 1154 × 690 | 251 × 251 | 1.0000 |
+| 1150 × 1924 | 208 × 208 | 1.0001 |
+| 1000 × 1834 | 172 × 172 | 1.0000 |
+
+### CHOP was never a mode
+
+"I am stuck in chop mode. I need the ability to exit chop mode."
+
+There was no chop mode. CHOP is one destructive press that writes sixteen slices
+of the selected pad across the whole bank, over whatever was there — but it sat
+in the row of toggles wearing the same button as POLY and GATE, so it *read* as a
+state, and with every pad relabelled `[3/16]` and no way back, that is exactly
+what it became.
+
+Both halves were needed: the bank is snapshotted first — **bytes, not just
+labels**, because the chop overwrites the other pads' records and a layout-only
+undo would restore fifteen names in front of the wrong audio — and the button now
+says what it will do next, CHOP then UNCHOP. One-shot actions (TAP, CHOP, STOP)
+are drawn dashed so they never again look like a light that could be left on.
 
 ---
 
@@ -444,7 +835,40 @@ stock `boot.img` needed to patch is already on disk from the Lenovo package.
   transitions, and the SC stack's console folded into one poll because
   eleven subprocesses cannot run here.
 
-## 9. Things that cost time, recorded so they do not again
+* **The headphone jack** — working, after five dead roads. See
+  *The 3.5 mm jack* above. The terminal makes the wired-device announcement the
+  GSI's framework refuses to make, which is why it is platform-signed.
+
+* **The gallery as wallpaper** — `gallery/WallpaperWatch.kt` hangs whatever the
+  station is selling on the home screen and the keyguard every five minutes.
+
+* **The microphone** — recorded here, transcribed by the station, because this
+  GSI ships no speech recognizer at all.
+
+---
+
+## 11. What comes next
+
+1. **Unlock** — through the app, past the gate above, with the tablet confirming
+   on its own screen.
+2. **Flash a LineageOS 21 arm64 A/B GSI**, no GApps, with
+   `fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img`.
+   `fastbootd` is where a driver problem would actually appear, since it
+   enumerates differently from the bootloader.
+3. ~~**Hardware acceptance**~~ — **walked, and passed.** Speakers, microphone
+   and the 3.5 mm jack all work on the GSI; the jack needed the terminal to
+   announce the cable itself, and the mic needed the station to do the
+   listening. The sampler premise stands.
+4. **The kiosk app** — `PineDesktopBridge` so the Windows renderer runs in an
+   Android WebView, HOME launcher, lock task, boot receiver, foreground audio,
+   and the native Oboe sampler engine.
+5. **Wireless from then on** — terminal configuration held on the agent and
+   polled by the tablet, so every install on the network shares one master
+   configuration, as the station already does for its other settings.
+
+---
+
+## 12. Things that cost time, recorded so they do not again
 
 - No adb on the machine means **no RSA prompt ever appears**. The empty device
   list is the symptom; the missing tool is the cause.
@@ -459,3 +883,21 @@ stock `boot.img` needed to patch is already on disk from the Lenovo package.
   package, encrypted YAML wearing a truncated extension.
 - A partition image can legitimately ship in more than one wrapping. Verify by
   magic bytes, allow several, and check more than one offset.
+- **A platform signature is not sticky.** Gradle signs with the debug key every
+  time, so any plain `assembleDebug` + `install -r` silently reverts the tablet
+  and takes `MODIFY_AUDIO_ROUTING` and `DUMP` with it. Deploy with `deploy.sh`,
+  which refuses to install anything that is not platform-signed.
+- **An uninstall takes the runtime grants with it.** A signature change forces
+  one, and `RECORD_AUDIO` does not come back on its own — the mic then records
+  silence rather than failing, which reads as "it did not hear me".
+- **State pushed into a system service outlives the app that pushed it.** The
+  wired-device announcement survived kills and reinstalls, so a watch that
+  assumed its own default fought a route it had itself set in a previous life.
+  Reconcile on startup; never assume.
+- **A level comparison in a silent room compares noise floors.** `MIC` and
+  `VOICE_RECOGNITION` measured identical until there was something to hear, and
+  then differed by three orders of magnitude.
+- **The platform keys must not live in a scratch directory.** They did, and the
+  directory was temporary. They belong beside the project that needs them.
+- **`[hidden]` is a UA type-level rule**, so any class-level `display` out-ranks
+  it. That is the whole of the "I still cannot close this overlay" bug.

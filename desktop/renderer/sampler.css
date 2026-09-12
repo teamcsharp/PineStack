@@ -397,3 +397,351 @@
   color: var(--pb-warn, #e0b341);
   font-weight: 700;
 }
+
+/* ==========================================================================
+   THE BIN, THE DIALS, SIXTEEN LEVELS, PRESETS AND THE GRAB WINDOW
+   ========================================================================== */
+
+/* --- the bin -------------------------------------------------------------
+ *
+ * It exists only while a pad is being carried. Fixed to the bottom of the
+ * screen rather than floating under the finger: a target you drag TO has to
+ * stay still, and the thumb is already covering wherever it started. */
+.pb-bin {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translate(-50%, 24px);
+  z-index: 2147483030;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-radius: 14px;
+  background: #1c242c;
+  border: 1px solid #35414c;
+  color: #8fa0ad;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+  opacity: 0;
+  transition: opacity .12s ease, transform .12s ease,
+              background .12s ease, border-color .12s ease, color .12s ease;
+  pointer-events: none;   /* a drop target, never a click target */
+}
+.pb-bin.up { opacity: 1; transform: translate(-50%, 0); }
+.pb-bin.over {
+  background: #3a1f22;
+  border-color: #e46b6b;
+  color: #ffd9d9;
+  transform: translate(-50%, -4px) scale(1.04);
+}
+.pb-bin-can { font-size: 22px; line-height: 1; }
+.pb-bin-say { font-size: 12px; font-weight: 600; letter-spacing: .02em; }
+
+.pb-undo {
+  margin-left: 10px;
+  background: #222b35;
+  color: #65c7da;
+  border: 1px solid #35414c;
+  border-radius: 6px;
+  padding: 2px 9px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* --- the dial row --------------------------------------------------------
+ *
+ * Below the toggles, and only while a toggle that needs it is on. */
+.pb-dials {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(34, 43, 53, .5);
+}
+.pb-dials[hidden] { display: none !important; }
+.pb-dial { display: flex; align-items: center; gap: 7px; }
+.pb-dial[hidden] { display: none !important; }
+.pb-dial-name {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .09em;
+  color: var(--muted);
+}
+.pb-dial-said {
+  min-width: 42px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--cyan);
+  font-variant-numeric: tabular-nums;
+}
+.pb-dial input[type="range"] { width: 148px; accent-color: var(--cyan); }
+.pb-dial select {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 7px;
+  font-size: 12px;
+}
+
+/* --- sixteen levels ------------------------------------------------------
+ *
+ * "I want the pads to be illuminated in a gradient going up the pads,
+ * showing the sixteen levels in action."
+ *
+ * --lvl is the PITCH of that pad normalised across the grid, set in
+ * paintSixteen, so a chord shows its steps rather than a flat ramp. */
+.pb-grid.sixteen .pb-pad {
+  background:
+    linear-gradient(0deg,
+      rgba(101, 199, 218, calc(.10 + (var(--lvl, 0) * .52))) 0%,
+      rgba(101, 199, 218, calc(.02 + (var(--lvl, 0) * .20))) 100%),
+    var(--panel);
+  border-color: rgba(101, 199, 218, calc(.22 + (var(--lvl, 0) * .55)));
+}
+.pb-grid.sixteen .pb-pad.unity {
+  border-color: var(--amber);
+  box-shadow: inset 0 0 0 1px rgba(227, 190, 99, .55);
+}
+.pb-pad-tone {
+  position: absolute;
+  top: 7px; right: 9px;
+  font-size: 10px;
+  font-weight: 700;
+  color: rgba(237, 243, 245, .82);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.pb-grid.sixteen .pb-pad.unity .pb-pad-tone { color: var(--amber); }
+
+/* --- presets ------------------------------------------------------------ */
+
+.pb-kit {
+  flex: 0 0 auto;
+  width: 42px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 0;
+  font-size: 15px;
+  cursor: pointer;
+}
+.pb-kit:hover { border-color: var(--cyan); }
+
+.pb-kits {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2147483040;
+  width: min(420px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel, #1c242c);
+  color: var(--text, #edf3f5);
+  border: 1px solid var(--line, #35414c);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+  padding: 16px 18px 18px;
+}
+.pb-kits-head { display: flex; align-items: center; justify-content: space-between; }
+.pb-kits-head b { font-size: 15px; }
+.pb-kits-x {
+  background: none; border: 0; color: var(--muted, #8fa0ad);
+  font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px;
+}
+.pb-kits-say {
+  margin: 7px 0 13px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted, #8fa0ad);
+}
+.pb-kits-list { display: flex; flex-direction: column; gap: 6px; }
+.pb-kits-row { display: flex; gap: 6px; }
+.pb-kits-load {
+  flex: 1;
+  text-align: left;
+  background: var(--panel-2, #222b35);
+  color: var(--text, #edf3f5);
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 12.5px;
+  cursor: pointer;
+  position: relative;
+}
+.pb-kits-load:hover { border-color: var(--cyan, #65c7da); }
+.pb-kits-drop {
+  width: 34px;
+  background: none;
+  color: var(--muted, #8fa0ad);
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  font-size: 16px;
+  cursor: pointer;
+}
+.pb-kits-drop:hover { color: var(--red, #e46b6b); border-color: var(--red, #e46b6b); }
+.pb-kits-none { font-size: 12px; color: var(--muted, #8fa0ad); margin: 2px 0 0; }
+.pb-kits-acts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 14px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line, #35414c);
+}
+.pb-kits-act {
+  position: relative;
+  text-align: left;
+  background: none;
+  color: var(--cyan, #65c7da);
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.pb-kits-act:hover { background: var(--panel-2, #222b35); }
+.pb-kits-act:disabled { opacity: .55; cursor: default; }
+
+/* --- the grab window -----------------------------------------------------
+ *
+ * Two columns where there is room, stacked on the tablet in portrait. The
+ * waveform is the thing being worked on, so it gets the width. */
+.sg-sheet {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2147483040;
+  width: min(880px, 96vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  background: #1c242c;
+  color: #edf3f5;
+  border: 1px solid #35414c;
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+  overflow: hidden;
+}
+.sg-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 13px 16px;
+  border-bottom: 1px solid #35414c;
+}
+.sg-head b { font-size: 14.5px; }
+.sg-x {
+  background: none; border: 0; color: #8fa0ad;
+  font-size: 23px; line-height: 1; cursor: pointer; padding: 0 4px;
+}
+.sg-body { display: flex; gap: 0; min-height: 0; flex: 1; }
+.sg-side {
+  width: 258px;
+  flex: 0 0 auto;
+  border-right: 1px solid #35414c;
+  padding: 12px;
+  overflow: auto;
+}
+.sg-side h4 {
+  margin: 0 0 9px;
+  font-size: 10px;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: #8fa0ad;
+}
+.sg-list { display: flex; flex-direction: column; gap: 5px; }
+.sg-clip {
+  position: relative;
+  display: flex; flex-direction: column; gap: 3px;
+  text-align: left;
+  background: #222b35;
+  border: 1px solid #35414c;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  color: inherit;
+}
+.sg-clip b { font-size: 10.5px; color: #65c7da; letter-spacing: .04em; }
+.sg-clip span {
+  font-size: 11.5px; line-height: 1.35; color: #c6d2d8;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.sg-clip:hover { border-color: #65c7da; }
+.sg-clip.on { border-color: #65c7da; background: #27333f; }
+.sg-none { font-size: 11.5px; color: #8fa0ad; line-height: 1.5; }
+
+.sg-stage { flex: 1; min-width: 0; padding: 12px 16px 16px; }
+.sg-pick { display: flex; align-items: center; gap: 11px; margin-bottom: 10px; }
+.sg-src {
+  background: #222b35; color: #8fa0ad;
+  border: 1px solid #35414c; border-radius: 8px;
+  padding: 7px 13px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.sg-src.on { color: #edf3f5; border-color: #65c7da; }
+.sg-said { font-size: 11.5px; color: #8fa0ad; }
+.sg-wave {
+  display: block;
+  width: 100%;
+  height: 118px;
+  background: #141b21;
+  border: 1px solid #35414c;
+  border-radius: 8px;
+}
+/* The handles get their own strip under the picture: dragging ON the
+ * waveform on a touch screen means the finger covers the thing being aimed
+ * at, and this is the one part of the window that has to be precise. */
+.sg-lane {
+  position: relative;
+  height: 30px;
+  margin-top: 5px;
+  border-radius: 6px;
+  background: #141b21;
+  border: 1px solid #35414c;
+  touch-action: none;
+  cursor: ew-resize;
+}
+.sg-sel {
+  position: absolute; top: 0; bottom: 0;
+  background: rgba(101, 199, 218, .22);
+  border-left: 1px solid rgba(101, 199, 218, .7);
+  border-right: 1px solid rgba(101, 199, 218, .7);
+  pointer-events: none;
+}
+.sg-handle {
+  position: absolute; top: -3px; bottom: -3px;
+  width: 12px;
+  margin-left: -6px;
+  border-radius: 4px;
+  background: #65c7da;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .5);
+  pointer-events: none;
+}
+.sg-read {
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: #8fa0ad;
+  font-variant-numeric: tabular-nums;
+}
+.sg-acts { display: flex; gap: 8px; margin-top: 13px; flex-wrap: wrap; }
+.sg-act {
+  background: #222b35; color: #edf3f5;
+  border: 1px solid #35414c; border-radius: 8px;
+  padding: 9px 15px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.sg-act:hover { border-color: #65c7da; }
+.sg-act.go { background: #1d3b44; border-color: #65c7da; color: #d8f4fa; }
+
+@media (max-width: 720px) {
+  .sg-body { flex-direction: column; }
+  .sg-side {
+    width: auto;
+    border-right: 0;
+    border-bottom: 1px solid #35414c;
+    max-height: 34vh;
+  }
+}

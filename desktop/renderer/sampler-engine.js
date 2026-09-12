@@ -403,6 +403,19 @@
       };
     },
 
+    /* LENT, so the air tap and the pads share one clock and one output
+     * stream. A second AudioContext is a second stream for the platform to
+     * schedule, and on this MediaTek that is audible. Web Audio only - the
+     * native terminal engine has no context to lend and says so by not
+     * defining this. */
+    context() { return context(); },
+
+    /* HOW MANY VOICES ARE STILL SOUNDING. The broadcast is ducked while a pad
+     * plays and has to come back when the LAST one finishes, not when the
+     * finger lifts - a one-shot outlives the press that started it, and
+     * reference-counting presses would unduck over the top of it. */
+    playing() { return voices.size; },
+
     backend: "webaudio"
   };
 
@@ -410,4 +423,9 @@
   /* The native terminal defines window.pineSampler before this file loads;
    * when it has, we leave it alone. */
   if (!root.pineSampler) root.pineSampler = engine;
+  /* Published under its own name as well: `pineSampler` may be the NATIVE
+   * engine on the terminal, and the air tap needs the Web Audio one
+   * specifically - it wants the context, which the native engine has not
+   * got. Asking for the right thing by name beats feature-sniffing. */
+  root.PineSamplerEngine = engine;
 })(typeof window !== "undefined" ? window : globalThis);

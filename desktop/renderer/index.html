@@ -606,8 +606,14 @@
   <script src="./terminal.js"></script>
   <script src="./sampler-engine.js"></script>
   <script src="./sampler-feed.js"></script>
+  <!-- The air tap loads BEFORE the sampler: sampler.js reads PineAir at
+       mount to light the SOLO PAD toggle and to start listening, and an
+       undefined one there would leave the toggle dark and the ring empty. -->
+  <script src="./sampler-air.js"></script>
   <script src="./sampler.js"></script>
   <script src="./sampler-trim.js"></script>
+  <script src="./sampler-grab.js"></script>
+  <script src="./sampler-kits.js"></script>
   <!-- THE TERMINAL VIEWS, IN THE APP TOO.
        "I wanna be able to access all of these views, these tabs, the
        interface, and continue refining it with you in the application
