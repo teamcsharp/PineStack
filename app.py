@@ -116464,14 +116464,28 @@ async def sfx_anxiety_set_api(
     voice."""
     require_auth(authorization)
     body = payload or {}
-    want = body.get("anxiety", body.get("value"))
     settings = load_settings()
     dj = dict(settings.get("dj") or {})
-    dj["sfx_anxiety"] = max(0, min(100, int(float(want or 0))))
-    save_settings({**settings, "dj": dj})
-    pipeline_log("air", "the SFX Guy's anxiety set to %d (#1232)"
-                 % dj["sfx_anxiety"])
-    return sfx_gap_status()
+    said = []
+    want = body.get("anxiety", body.get("value"))
+    if want is not None:
+        dj["sfx_anxiety"] = max(0, min(100, int(float(want))))
+        said.append("anxiety %d" % dj["sfx_anxiety"])
+    # #1251: and the clip-length ceiling, which lives in the SAME place
+    # and cannot be reached through PUT /api/settings - that route
+    # replaces the whole document and refuses one without prompts.
+    if body.get("max_seconds") is not None:
+        dj["sfx_max_seconds"] = max(0.5, min(600.0,
+                                             float(body["max_seconds"])))
+        said.append("clips up to %.0fs" % dj["sfx_max_seconds"])
+    if body.get("gap") is not None:
+        dj["sfx_gap"] = max(0, min(600, int(float(body["gap"]))))
+        said.append("rest %ds" % dj["sfx_gap"])
+    if said:
+        save_settings({**settings, "dj": dj})
+        pipeline_log("air", "the SFX Guy's dials: " + ", ".join(said))
+    return {**sfx_gap_status(), "set": said,
+            "max_seconds": dj.get("sfx_max_seconds")}
 
 
 @app.get("/api/notifications")
