@@ -8845,7 +8845,8 @@ REPAIR_SEED = [
     # reporting on and unpaused and the listener polling every second:
     # 16 clips waiting in `received`, nineteen "play() interrupted by a
     # call to pause()" and eighteen "playback stalled", and a talk gap of
-    # 696s while the server went on making deliveries.
+    # 696s while the server went on making deliveries. A flush of the
+    # feed epoch ends it; the speaker ladder cannot see it at all.
     {"fp": "page:wedged", "cure": "page_flush",
      "why": "the page holds clip after clip and starts none of them - "
             "each retry's play() is cancelled by a pause() and nothing "
@@ -9135,8 +9136,9 @@ def page_wedge_state() -> dict[str, Any]:
                 continue
         out["heard_at"] = round(heard_at, 1)
         # #1239: the clock above needs to know somebody is out there to
-        # have heard anything. Stamped once, here, where the listener
-        # count is already computed.
+        # have heard anything - "never heard" is only a fault when
+        # there is somebody who would have reported it. _listeners_live
+        # is the same source api_broadcast_health counts.
         try:
             if not _LISTENERS_SEEN[0] and len(_listeners_live()) > 0:
                 _LISTENERS_SEEN[0] = time.time()
@@ -61685,7 +61687,8 @@ def sfx_by_id(wanted: str) -> Path | None:
     # cached pool and sfx_all() do not always spell the same file the
     # same way - so an id minted from one could not be looked up through
     # the other, and the SFX desk's play button served a 404 on a clip
-    # sitting right there. Cheap, and it spares the CIFS walk besides.
+    # that was sitting right there. Cheap, and it also spares the CIFS
+    # walk on the common case.
     try:
         for path in sfx_pool_cached():
             if sfx_id(path) == wanted:
@@ -65944,23 +65947,24 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
             # function is RANDOM by design (#459): "roughly one line in
             # four that names it keeps the full name", implemented as
             # `if random.random() < 0.25: return text`. Used as a purity
-            # test it refused a round on a coin flip, per line, re-rolled
-            # every sweep - so a round naming the station passed only
-            # when every one of its eleven lines won the toss.
+            # test it therefore refused a round on a coin flip, per
+            # line, re-rolled on every sweep - so a round naming the
+            # station passed only when every one of its eleven lines
+            # won the toss, which is never.
             #
-            # Measured by the census added beside it: of 144 caller
-            # rounds refused, 96 were refused for this and nothing else,
-            # all of them written, tinted, recorded, clips on disk.
-            # _larder_current - the writing-contract check I twice
-            # predicted was the cause - fired ZERO times.
+            # Measured by the census this was added alongside: of 144
+            # caller rounds refused, 96 were refused for this and
+            # nothing else. All of them written, tinted, recorded, with
+            # their clips on disk. Meanwhile _larder_current - the
+            # writing-contract check I twice predicted was the cause -
+            # fired ZERO times.
             #
             # The governor's place is prep_air_text, at WRITING time,
             # where it already is and where it loops up to eight times
             # precisely to defeat that randomness. Finished audio that
-            # says the station's name is not worth binning a hundred
-            # rounds for, and #459 already lets the pair say it.
-            #
-            #     caller readiness 12/144 (8%) -> 128/144 (89%)
+            # says the station's name is not a defect worth binning a
+            # hundred rounds for, and #459 already allows the pair to
+            # say it.
             if (not text.strip() or not voice or who not in ("dj", "cohost", "third", "caller", "caller2")
                     # #1218: one cached answer instead of two stats per
                     # take, per row, per sweep. Same verdict - a missing
@@ -67908,8 +67912,7 @@ async def topic_cook_once() -> int:
     # The money disappeared right after the ceremony. I saw the..." as
     # a SINGLE topic: four bombshells welded together and then cut off
     # at the ceiling. A thing to spring on somebody is one sentence, so
-    # every line is split again on sentence ends. Five a sitting
-    # instead of one, measured either side of the change.
+    # every line is split again on sentence ends.
     pieces: list[str] = []
     for raw in str(got or "").splitlines():
         head = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", raw).strip()
@@ -98776,6 +98779,295 @@ async def stack_reconnect_api(
     return await stack_reconnect(restart_agent=bool(payload.get("restart", True)))
 
 
+async def whisper_transcribe(wav: bytes, timeout: float = 30.0) -> dict[str, Any]:
+    """Speak Wyoming at wyoming-whisper and come back with the words.
+
+    The protocol is one JSON header per line, optionally followed by a
+    binary payload whose length the header declares. Four messages are
+    enough for a transcription:
+
+        {"type": "transcribe"}                  what we want
+        {"type": "audio-start", "data": {...}}  the format that follows
+        {"type": "audio-chunk", ...} + bytes    the PCM itself
+        {"type": "audio-stop"}                  and we are done
+
+    and the service answers with a {"type": "transcript"} carrying the text.
+
+    THE WAV HEADER IS STRIPPED rather than sent. Wyoming wants raw PCM with
+    the rate, width and channel count declared in the header; handing it a
+    RIFF header would put 44 bytes of "RIFF....WAVEfmt " through the model
+    as if it were sound.
+    """
+    # 127.0.0.1, not the container name. BOTH containers run with
+    # `network_mode: host` (compose.yaml), so there is no Docker DNS to
+    # resolve "wyoming-whisper" - the first attempt failed with
+    # "[Errno -3] Temporary failure in name resolution". Host networking
+    # means the service is simply on this machine's loopback.
+    host = os.getenv("WHISPER_HOST", "127.0.0.1")
+    port = int(os.getenv("WHISPER_PORT", "10300"))
+
+    rate, width, channels, pcm = 16000, 2, 1, wav
+    try:
+        with wave.open(io.BytesIO(wav), "rb") as src:
+            rate = src.getframerate()
+            width = src.getsampwidth()
+            channels = src.getnchannels()
+            pcm = src.readframes(src.getnframes())
+        # 16 kHz MONO, because that is what the model wants.
+        #
+        # Measured: a 24 kHz clip went through the protocol cleanly - the
+        # container logged "Processing audio with duration" for it - and came
+        # back with an EMPTY transcript every time, while the station's own
+        # submissions of the same speech transcribed perfectly. Whisper does
+        # not resample for us; handing it 24 kHz and declaring 24 kHz means it
+        # hears the words at two-thirds speed and makes nothing of them.
+        import audioop
+        if channels > 1:
+            pcm = audioop.tomono(pcm, width, 0.5, 0.5)
+            channels = 1
+        if width != 2:
+            pcm = audioop.lin2lin(pcm, width, 2)
+            width = 2
+        if rate != 16000:
+            pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 16000, None)
+            rate = 16000
+    except Exception:  # noqa: BLE001
+        # Not a WAV. Send it as-is and let the service judge; saying so
+        # beats guessing at a format we were not given.
+        pass
+
+    def line(obj: dict[str, Any], payload: bytes = b"") -> bytes:
+        head = dict(obj)
+        if payload:
+            head["payload_length"] = len(payload)
+        return (json.dumps(head) + "\n").encode("utf-8") + payload
+
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(host, port), timeout=timeout)
+    try:
+        writer.write(line({"type": "transcribe", "data": {"language": "en"}}))
+        writer.write(line({"type": "audio-start", "data": {
+            "rate": rate, "width": width, "channels": channels}}))
+        # Chunked, because one very large write can outrun the socket buffer
+        # and a partial frame is heard as a click.
+        step = 16000 * width * channels
+        for at in range(0, len(pcm), step):
+            piece = pcm[at:at + step]
+            writer.write(line({"type": "audio-chunk", "data": {
+                "rate": rate, "width": width, "channels": channels}}, piece))
+        writer.write(line({"type": "audio-stop"}))
+        await writer.drain()
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            raw = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if not raw:
+                break
+            try:
+                head = json.loads(raw.decode("utf-8").strip() or "{}")
+            except Exception:  # noqa: BLE001
+                continue
+            # THE WORDS ARE NOT IN THE HEADER LINE.
+            #
+            # Measured by hand against wyoming 1.10.0 on 2026-09-11 - one
+            # socket, one eight-second clip of real speech, the reply
+            # printed raw:
+            #
+            #   {"type": "transcript", "version": "1.10.0", "data_length": 190}
+            #   {"text": " I don't know about that.  It smells like rotten
+            #    desperation. ..."}
+            #
+            # There is NO `data` key in that header at all - it reads back
+            # as None - and the sentence arrives in the `data_length` blob
+            # on the following 190 bytes. This loop looked only at
+            # head["data"], so it answered {"text": ""} for a clip the
+            # model had transcribed perfectly: the container's own log
+            # carried the sentence in the same second. That is the whole of
+            # the tablet's "Nothing was made out of that" - the operator
+            # spoke, whisper heard him, and the reader threw the answer
+            # away, three takes in a row.
+            #
+            # Why only the READ was wrong: wyoming's reader falls back to
+            # an inline `data` field when `data_length` is absent, so the
+            # sends above are accepted exactly as written. Its WRITER
+            # always declares the length. Both shapes are honoured here so
+            # this keeps working if either side changes its mind.
+            #
+            # The blob is consumed EVEN WHEN this is not the event we
+            # want. It sits between this header and the next one, so
+            # leaving it in the socket puts every later readline half way
+            # through a JSON document.
+            data: dict[str, Any] = head.get("data") or {}
+            declared = int(head.get("data_length") or 0)
+            if declared:
+                blob = await reader.readexactly(declared)
+                try:
+                    data = json.loads(blob.decode("utf-8")) or {}
+                except Exception:  # noqa: BLE001
+                    data = {}
+            extra = int(head.get("payload_length") or 0)
+            if extra:
+                await reader.readexactly(extra)
+            if head.get("type") == "transcript":
+                text = str(data.get("text") or "").strip()
+                if text:
+                    return {"ok": True, "text": text}
+                # An empty transcript is an ANSWER - "nothing was said" -
+                # not a failure to answer. Treating it as a timeout turned a
+                # quiet room into a 504 and hid the real fault. It carries
+                # its reason now, so a terminal can say something TRUE
+                # instead of the one catch-all sentence that hid the bug
+                # above for three takes running.
+                return {"ok": True, "text": "",
+                        "detail": "whisper listened to the whole clip and "
+                                  "found no words in it"}
+        return {"ok": False, "text": "", "detail": "whisper did not answer in time"}
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.get("/api/slideshow")
+async def slideshow_state_api(limit: int = 24) -> dict[str, Any]:
+    """What the media-slideshow is showing, for the terminal's lock screen.
+
+    `~/bin/media-slideshow` is a 25,000-line PySide6 app that puts the
+    ComfyUI output up full screen on the box.
+
+    TWO THINGS THIS ROUTE CANNOT DO, both measured rather than assumed,
+    because the first version of it claimed both and was quietly wrong:
+
+      - IT CANNOT READ THE SLIDESHOW'S DIAGNOSTIC. That file is at
+        /home/ehm_eckx/bin/media_slideshow_diagnostic.md on the HOST. This
+        process runs in a container whose HOME is /root and whose mounts
+        are /music, /app, /samples, /comfy-output and a few device paths -
+        /home/ehm_eckx/bin is not among them. An `os.path.expanduser("~")`
+        here resolves inside the container and finds nothing, for ever.
+      - IT CANNOT SEE WHETHER THE SLIDESHOW IS RUNNING. `docker inspect`
+        reports PidMode empty: no shared PID namespace, so `pgrep` in here
+        cannot see a host process. The honest answer is "cannot tell from
+        in here", not False.
+
+    WHAT IT CAN DO, and what the lock screen actually wants: report the
+    slideshow's MATERIAL. /comfy-output is bind-mounted and is the very
+    directory the slideshow plays from - the app's own diagnostic names
+    `root dir /home/ehm_eckx/ComfyUI/output`, which is the host side of
+    that same mount. So the newest pictures, the size of the playlist and
+    how fast it is growing are all real and all live, and they are the part
+    a terminal can put on a screen.
+    """
+    out: dict[str, Any] = {"at": time.time()}
+
+    out["can_see_process"] = False
+    out["can_see_diagnostic"] = False
+    out["why"] = (
+        "the station runs in a container with no shared PID namespace and "
+        "without /home/ehm_eckx/bin mounted, so neither the slideshow "
+        "process nor its diagnostic file is visible from here")
+
+    root = Path("/comfy-output")
+    if not root.is_dir():
+        out["ok"] = False
+        out["say"] = "the ComfyUI output directory is not mounted"
+        return out
+
+    want = max(1, min(int(limit or 24), 200))
+    kinds = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm")
+    rows: list[dict[str, Any]] = []
+    total = 0
+    newest = 0.0
+    try:
+        with os.scandir(root) as scan:
+            for entry in scan:
+                if not entry.is_file():
+                    continue
+                if not entry.name.lower().endswith(kinds):
+                    continue
+                total += 1
+                try:
+                    stamp = entry.stat().st_mtime
+                    size = entry.stat().st_size
+                except OSError:
+                    continue
+                if stamp > newest:
+                    newest = stamp
+                rows.append({"file": entry.name, "at": stamp, "bytes": size})
+    except Exception as exc:  # noqa: BLE001
+        out["ok"] = False
+        out["say"] = f"the output directory could not be read: {exc}"
+        return out
+
+    rows.sort(key=lambda r: r["at"], reverse=True)
+    out["playlist"] = total
+    out["newest_at"] = newest
+    out["newest_age"] = max(0.0, time.time() - newest) if newest else None
+    out["rows"] = rows[:want]
+    # Everything in /comfy-output is served by /api/generations/image/{name},
+    # which the terminal already uses for the wall - so the lock screen has
+    # a URL for every row without this route inventing one.
+    out["url"] = "/api/generations/image/"
+    out["ok"] = True
+    out["say"] = (
+        f"{total} pictures in the slideshow's folder; newest "
+        f"{rows[0]['file']}" if rows else "the folder is empty")
+    return out
+
+
+@app.post("/api/listen/transcribe")
+async def listen_transcribe_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Turn a spoken clip into words, for a terminal that cannot.
+
+    #1008-era terminals do the hearing themselves; this tablet cannot -
+    measured on the device, a GApps-less GSI declares NO
+    android.speech.RecognitionService at all, so there is nothing on it to
+    ask. The station has whisper; this is the door to it.
+
+    The body is the audio (a WAV from the browser's MediaRecorder, or raw
+    PCM). It answers with the words and does nothing else with them: what a
+    sentence MEANS is the caller's business, which is what lets one door
+    serve a song request, a chat line and whatever is built next.
+    """
+    require_auth(authorization)
+    blob = await request.body()
+    if len(blob) < 2000:
+        raise HTTPException(status_code=400, detail="Too little audio to hear")
+    if len(blob) > 12_000_000:
+        raise HTTPException(status_code=413, detail="That clip is too long")
+    try:
+        got = await whisper_transcribe(blob)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail="whisper is not answering - is the wyoming-whisper "
+                   "container up? (" + str(exc)[:120] + ")",
+        ) from exc
+    if not got.get("ok"):
+        raise HTTPException(status_code=504,
+                            detail=str(got.get("detail") or "no transcript"))
+    text = str(got.get("text") or "")
+    out: dict[str, Any] = {"text": text, "heard": bool(text)}
+    if not text:
+        # AN EMPTY ANSWER MUST CARRY ITS REASON.
+        #
+        # For three takes running the tablet showed the operator "Nothing
+        # was made out of that" while whisper's own container log held his
+        # exact sentences - because this route answered {"text": ""} and a
+        # bare empty string is indistinguishable from every other way of
+        # coming back with nothing. The transcriber knows which of them it
+        # was; it is passed on here so the terminal can repeat something
+        # true rather than guess.
+        out["detail"] = str(got.get("detail")
+                            or "the transcriber answered with no words in it")
+        out["bytes"] = len(blob)
+    return out
+
+
 @app.post("/api/pinebox/listen")
 async def pinebox_listen_api(
     request: Request,
@@ -99942,8 +100234,9 @@ async def api_cupboard_view(
     order has booked for that road in the coming hours."""
     require_read_auth(authorization)
     # #1195: OFF THE EVENT LOOP. This walks every shelf on the station and
-    # measures each round's takes, which on the loop is the stall shape
-    # #1156 measured. The memo keeps a polling view cheap.
+    # measures each round's takes - 9.6s on a 326-round cupboard, which on
+    # the loop is the stall shape #1156 measured. The memo keeps a polling
+    # view cheap; the first open pays it in a thread.
     return await asyncio.to_thread(
         cupboard_view, max(0, min(400, int(cells or 0))))
 
@@ -104875,10 +105168,42 @@ async def response_bank_play_api(
 
 @app.get("/api/dj/pending")
 async def dj_pending(
+    full: int = 0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """#887: the rounds waiting to go on air, and how ready each one is."""
+    """#887: the rounds waiting to go on air, and how ready each one is.
+
+    MEASURED, and the reason `full` exists. The panel polls this every 1.6s
+    (djPendingTick). On the tablet, at idle and untouched:
+
+        /api/dj/pending   25.5 requests/min   2,117.6 kB each   52.9 MB/min
+
+    Taken apart, 68 rows at 31,823 bytes each:
+
+        tint          1,086,987 bytes   50.3%   (tint.prompt is 8,146/row)
+        desk            473,388 bytes   21.9%   (desk.prompt is 6,130/row)
+        script_plain    174,818 bytes    8.1%
+        lines           127,347 bytes    5.9%
+
+    `desk` and `tint.prompt`/`tint.armed` are the full LLM prompt text for
+    every row, sent 37.5 times a minute - and NOTHING reads them. There is
+    no `.desk` member read anywhere in this file; the renderer touches only
+    `r.lines`, and the signature that decides whether to repaint at all
+    reads id/state/made/chunks/turns/progress, which is 1,808 bytes - 0.1%
+    of the payload.
+
+    That mattered because of the connection pool, not the bandwidth.
+    HTTP/1.1 allows six connections per origin, and with these polls in
+    flight the measured queueing was a p90 of 5,389ms and a p99 of
+    10,803ms: a 346-byte /api/radio/clock request was seen waiting 12.5
+    SECONDS behind them, and media on the tablet took 46 seconds to deliver
+    its first 64 kB, which is why the tablet played nothing at all.
+
+    So the list omits them and `?full=1` brings them back, for a detail
+    view that wants one round's paperwork. Nothing in the panel asks for
+    full=1 today, so nothing that works now changes."""
     require_read_auth(authorization)
+    want_full = bool(full)
     rows: list[dict[str, Any]] = []
     for at, entry in enumerate(list(_LARDER)):
         try:
@@ -104954,7 +105279,9 @@ async def dj_pending(
             # #987/#992: the paperwork - the prompt as sent, the system
             # prompt governing it, the schedule's instruction, the model
             # and what it cost.
-            "desk": entry.get("desk") or {},
+            # The whole prompt as sent. 6,130 bytes a row and read by
+            # nothing - see the docstring. ?full=1 brings it back.
+            **({"desk": entry.get("desk") or {}} if want_full else {}),
             "edited": bool(entry.get("edited")),
             # #1006/#1016: BOTH VERSIONS, and which one is going out.
             # `use` is "" for a round that was never tinted, which is how
@@ -104967,10 +105294,12 @@ async def dj_pending(
                 "why": str((entry.get("tint") or {}).get("why") or ""),
                 "world": str((entry.get("tint") or {}).get("world") or ""),
                 "ms": int((entry.get("tint") or {}).get("ms") or 0),
-                "armed": str((entry.get("tint") or {}).get("armed")
-                             or "")[:6000],
-                "prompt": str((entry.get("tint") or {}).get("prompt")
-                              or "")[:8000],
+                # Half the payload lived in these two. Same reasoning
+                # as `desk` above; ?full=1 brings them back.
+                **({"armed": str((entry.get("tint") or {}).get("armed")
+                                 or "")[:6000],
+                    "prompt": str((entry.get("tint") or {}).get("prompt")
+                                  or "")[:8000]} if want_full else {}),
                 "chunks": list((entry.get("tint") or {}).get("chunks")
                                or [])[:12],
             } if entry.get("tint") else {},
@@ -110302,9 +110631,10 @@ async def api_sfx_review(
     one request. Nothing is deleted here - POST /api/sfx/delete (#703)
     is the door, and it is the operator's to open."""
     require_read_auth(authorization)
-    # #1199: MEMOISED. Every sfx_seconds() lookup stats its file to key the
-    # cache and there are six thousand of them on a CIFS share, so one
-    # honest answer costs 45s of SMB round trips. The panel polls.
+    # #1199: MEMOISED. The walk is cheap per file and there are six and a
+    # half thousand of them on a CIFS share - every sfx_seconds() lookup
+    # stats the file to key its cache, so one honest answer costs 45s of
+    # SMB round trips. The panel polls; it must not pay that twice.
     memo = _SFX_REVIEW_MEMO
     if (memo.get("value") is not None and not int(scan or 0)
             and time.time() - float(memo.get("at") or 0) < SFX_REVIEW_REST):
@@ -138815,6 +139145,18 @@ const PINE_3JS = [
   {key: "off",      label: "⬛ All off",         open: () => {}},
 ];
 
+/* THE REGISTER, PUBLISHED.
+ *
+ * PINE_3JS is a module const, so a terminal script cannot see it - and the
+ * Pine Box tablet needs to: it lists every scene in its own chooser and
+ * promotes the panel's own modal to the whole glass ("every three JS
+ * experience in the sidebar... as a full screen interface"). Without this
+ * the terminal would have to carry its own copy of thirty-two entries, and
+ * a copy is the thing that goes stale the next time a scene is added here.
+ *
+ * Published, not duplicated. The panel's own code still uses the const. */
+window.PINE_3JS = PINE_3JS;
+
 // #786: the word cloud in the gallery opens as a FORMAL window like its
 // siblings — the standard frame with a title bar and a close — rather than
 // the ragged half-gallery overlay dock. #1072: that frame is pineWin.
@@ -149516,41 +149858,81 @@ function djStreamCurrentId() {
  * held is the only state that does not come off the clock: a line the box
  * accepted and never played is not "coming up", it is a line nobody heard,
  * and saying so is the whole point of the window. */
+/* #1002, and the measurement that changed how it writes.
+ *
+ * This runs for EVERY row of the booth log, four times a second
+ * (djBoothTick, setInterval 250ms). Measured on the tablet with 256 rows:
+ *
+ *     rowsChangedPerTick:   0
+ *     rowsUnchangedPerTick: 256
+ *
+ * It wrote textContent, style.color and title unconditionally - 768 style-
+ * and layout-invalidating writes per tick, 3,072 a second, none of which
+ * changed a pixel. On a 12,015-node document that 21ms/s of JS bought about
+ * 150ms/s of browser style and layout, and it grew with the log, which is
+ * why the panel got worse the longer the station ran.
+ *
+ * A/B on the real tablet against a restored control, 20s per phase:
+ *
+ *     unconditional writes    35.5 fps   190 ms/s layout   86 long tasks
+ *     write only on a change  53.0 fps    20 ms/s layout    1 long task
+ *
+ * and the wait before the browser could hand back a frame went from a p90
+ * of 71.9ms (max 1,028ms) to 18.3ms (max 182ms).
+ *
+ * So: decide the three values, then write only what differs. Reading
+ * textContent is cheap - it forces no layout - and that comparison buys all
+ * of the above. Behaviour is unchanged by construction: the same values are
+ * reached by the same branches. */
+function djRowPaint(st, text, color, title) {
+  if (st.textContent !== text) st.textContent = text;
+  /* COMPARE AGAINST WHAT WE LAST SET, NOT AGAINST THE ELEMENT.
+   *
+   * style.color reads back normalised - set "#7ce8a9" and it returns
+   * "rgb(124, 232, 169)" - so comparing the two is never equal and the
+   * write always went through. Measured on the tablet: 2,648 calls in 12s
+   * suppressed 57 text writes and 57 title writes, and NONE of the 2,648
+   * colour writes. Remembering the last value we wrote is exact, because
+   * it is the same string both times. */
+  if (color !== null && st.__pineColor !== color) {
+    st.style.color = color;
+    st.__pineColor = color;
+  }
+  if (title !== null && st.title !== title) st.title = title;
+}
+
 function djRowState(row, line) {
   try {
     const st = row.querySelector("[data-state]");
     if (!st) return;
     if (line && ["published", "prepared", "page"].includes(line.aired)) {
-      st.textContent = line.aired === "prepared" ? "recorded / waiting" : "awaiting playback";
-      st.style.color = "#d6b777";
-      st.title = "The station has not received an audible playing acknowledgment for this line.";
+      djRowPaint(st,
+        line.aired === "prepared" ? "recorded / waiting" : "awaiting playback",
+        "#d6b777",
+        "The station has not received an audible playing acknowledgment for this line.");
       return;
     }
     if (line && line.aired === "held") {
-      st.textContent = "\u26a0 not heard";
-      st.style.color = "#e0a35c";
-      st.title = "The box accepted this line and played none of it. It is "
-        + "held and will go out when the box answers.";
+      djRowPaint(st, "\u26a0 not heard", "#e0a35c",
+        "The box accepted this line and played none of it. It is "
+        + "held and will go out when the box answers.");
       return;
     }
     const at = Number(row.getAttribute("data-airat") || 0);
-    if (!at) { st.textContent = ""; return; }
+    if (!at) { djRowPaint(st, "", null, null); return; }
     const now = djStreamAt();
     const live = window.djSpeakingEid
       && row.getAttribute("data-eid") === window.djSpeakingEid;
     if (live) {
-      st.textContent = "\u25cf on air";
-      st.style.color = "#7ce8a9";
-      st.title = "This is the line sounding right now";
+      djRowPaint(st, "\u25cf on air", "#7ce8a9",
+        "This is the line sounding right now");
     } else if (at > now + 0.6) {
       const wait = Math.round(at - now);
-      st.textContent = "\u25f7 in " + (wait > 99 ? "99+" : wait) + "s";
-      st.style.color = "#6d8199";
-      st.title = "Written and recorded; it has not been heard yet";
+      djRowPaint(st, "\u25f7 in " + (wait > 99 ? "99+" : wait) + "s", "#6d8199",
+        "Written and recorded; it has not been heard yet");
     } else {
-      st.textContent = "\u2713 played";
-      st.style.color = "#5d7189";
-      st.title = "This line has gone out";
+      djRowPaint(st, "\u2713 played", "#5d7189",
+        "This line has gone out");
     }
   } catch (e) { /* the row still reads */ }
 }
@@ -158292,6 +158674,17 @@ function djRender(state) {
   // it goes off — always there while the DJs are playing. Unless the user
   // hid it (mindInline="0") or has it open full-screen/docked already.
   const host = document.getElementById("mindInlineHost");
+  /* HIDDEN MUST LOOK HIDDEN. The button's markup default is "Hide" and the
+   * host is a 420px near-black box, so a terminal whose mindInline is "0"
+   * showed a large black rectangle under a header claiming it was visible -
+   * which is exactly the "blank simulation" reported from the tablet.
+   * mindInlineToggle writes this placeholder on a click; boot never did. */
+  if (host && localStorage.mindInline === "0" && !host.firstElementChild) {
+    const btn = document.getElementById("mindInlineToggle");
+    if (btn) btn.textContent = "Show";
+    host.innerHTML = "<div class='muted' style='padding:20px;font-size:12px'>"
+      + "The Dialogue Mind is hidden — click Show to bring it back.</div>";
+  }
   if (host && localStorage.mindInline !== "0") {
     const haveMind = (typeof djMind !== "undefined" && djMind);
     if (djOn && (!haveMind || (djMind.mode !== "inline" && djMind.mode
@@ -158591,14 +158984,36 @@ function djResync(clock) {
   }
 }
 
+var radioClockIdleTick = 0;
 async function radioClockPoll() {
-  if (djOutputExternal() && !djMonitorAir) return;   // #825
+  /* #825 RETURNED HERE, AND IT MADE THE TABLET UNREACHABLE.
+   *
+   * Skipping the poll when the audio is elsewhere is right about the
+   * playhead - there is nothing to keep in step - but /api/radio/clock is
+   * also the ONLY route that registers a listener, and #1008 can only hand
+   * the air to a listener that is in the roster. So:
+   *
+   *   route the show to the Nabu
+   *     -> every page stops polling the clock
+   *     -> the PineTab falls out of the roster ("PineTab - not open")
+   *     -> nothing can give the tablet the air
+   *     -> you can never route back to the tablet
+   *
+   * A deadlock, and the reason the operator could not send the broadcast
+   * to his own terminal. A page must always say it is there.
+   *
+   * The load #825 was protecting is respected by slowing down rather than
+   * stopping: the clock is 346 bytes, and one every six seconds is nothing
+   * beside the 2 MB polls it sits next to. */
+  const external = djOutputExternal() && !djMonitorAir;
+  if (external && (radioClockIdleTick++ % 4) !== 0) return;
   try {
     const clock = await api("/api/radio/clock?listener="
       + encodeURIComponent(pineListenerId()));
     djStateAt = Date.now();
     pineSoloGate(clock);                                    // #1008
-    djResync(clock);
+    /* The playhead is only ours to follow when the show is on this page. */
+    if (!external) djResync(clock);
   } catch (error) { /* the panel works without it */ }
 }
 
@@ -169772,7 +170187,7 @@ async function mindTopologyOpen() {
     // #786: setSize ran UNCONDITIONALLY here — a drawing-buffer realloc
     // every frame, which dragged the whole page and froze the scene solid
     // (the #737 bug class). Only when the stage actually changed.
-    if(w!==_tw||h!==_th){_tw=w;_th=h;renderer.setSize(w,h,false);camera.aspect=w/Math.max(1,h);camera.updateProjectionMatrix();}
+    if(w!==_tw||h!==_th){_tw=w;_th=h;renderer.setSize(w,h);camera.aspect=w/Math.max(1,h);camera.updateProjectionMatrix();}
     const t=performance.now()*.001;
     // The topology BREATHES now: a slow idle spin the drag overrides, each
     // world bobbing on its own phase, orbs orbiting their person.
@@ -177745,7 +178160,12 @@ async function phonePanel() {
 
   const fit = () => {
     const w = stage.clientWidth || 900, h = stage.clientHeight || 600;
-    renderer.setSize(w, h, false);
+    /* No `false`. setSize(w, h, false) leaves the canvas with NO css size,
+     * so it lays out at its device-pixel attribute size - and with
+     * setPixelRatio(1.25) on this tablet that is 39% wider than its host,
+     * putting the outer cards off the edge. Invisible at dpr 1.0, which is
+     * why it survived on the desktop. */
+    renderer.setSize(w, h);
     camera.aspect = w / h; camera.updateProjectionMatrix();
   };
   fit();
