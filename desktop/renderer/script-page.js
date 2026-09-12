@@ -640,12 +640,48 @@
   /* Where the burst has got to, in its own seconds. Uses the server's clock
    * rather than ours: `server_ms` is stamped in every poll, so the offset
    * between the two machines cancels instead of accumulating. */
+  /* #1278: THE PLAYER THAT IS SOUNDING, or null when none is.
+   *
+   * The DJ voice rides one of a small set of <audio> elements. The one
+   * that matters is the one that is actually playing - unpaused, not
+   * ended, and past its first frame. */
+  function soundingPlayer() {
+    var all = document.querySelectorAll('audio');
+    for (var i = 0; i < all.length; i += 1) {
+      var a = all[i];
+      if (!a || a.paused || a.ended) continue;
+      if (!/djVoice/i.test(String(a.id || ''))) continue;
+      if (!(Number(a.currentTime) > 0)) continue;
+      return a;
+    }
+    return null;
+  }
+
+  /* Where the burst has got to, in its own seconds.
+   *
+   * #1278: READ, NOT ESTIMATED. This used to be
+   * `(Date.now() + skewMs)/1000 - liveStream.at`, and `skewMs` is
+   * re-read from `server_ms` on every poll, so it carried the whole
+   * delivery latency and all its jitter. Measured against the audio
+   * over 308 samples: behind the sound in 81.3% of them, off by more
+   * than three seconds in 58.5%, median -2.99s; skewMs spread 16.7s and
+   * moved a median of 1.79s between polls; the clock stalled in 61.3%
+   * of intervals and then lurched. Against six-second lines that is
+   * precisely a mark that skips forward and snaps back - 29.8% of moves
+   * were skips and 20.5% were backward, 26 of those 31 with the
+   * document completely unchanged.
+   *
+   * The audio element's currentTime is the SAME coordinate as the rows'
+   * from/until - both are offsets into the same welded file - so the
+   * position does not have to be estimated. Verified: a burst's maximum
+   * `until` 86.86s against the player's own duration 87.76s.
+   *
+   * The clock remains for the one case with nothing to read: no player
+   * sounding. */
   function streamAt() {
+    var player = soundingPlayer();
+    if (player) return Number(player.currentTime) || 0;
     if (!liveStream || !liveStream.at) return -1;
-    /* #1267: NO SECOND CLOCK. `skewMs` is re-read from `server_ms` on
-     * every poll and is the same correction the station feed itself
-     * uses; `driftMs` was a THIRD term on top, and it is what made the
-     * highlight trail the audio. See correct() below. */
     return ((Date.now() + skewMs) / 1000) - Number(liveStream.at || 0);
   }
 
@@ -656,13 +692,39 @@
   function activeRow() {
     var t = streamAt();
     var rows = (liveStream && liveStream.rows) || [];
-    if (t >= 0) {
-      for (var i = 0; i < rows.length; i += 1) {
-        var row = rows[i];
-        if (t >= Number(row.from || 0) && t < Number(row.until || 0)) {
-          return {id: String(row.id || ''), from: Number(row.from || 0),
-            until: Number(row.until || 0), at: t, index: i, of: rows.length};
+    function within(list, of) {
+      for (var i = 0; i < list.length; i += 1) {
+        var row = list[i];
+        var from = Number(row.from), until = Number(row.until);
+        if (!isFinite(from) || !isFinite(until)) continue;
+        if (t >= from && t < until) {
+          return {id: String(row.id || ''), from: from, until: until,
+            at: t, index: i, of: of};
         }
+      }
+      return null;
+    }
+    if (t >= 0) {
+      var seat = within(rows, rows.length);
+      if (seat) return seat;
+      /* #1278: A CLIP OF ITS OWN IS STILL A LINE OF THE SCRIPT.
+       *
+       * This searched `liveStream.rows` and nothing else - one burst.
+       * Anything that airs as its own single-row clip is not in that
+       * list, so no window contained the position and the mark was
+       * cleared. Measured over 827 sounding samples, the split was
+       * perfect: `interject` lit correctly 0 times of 151, and
+       * `station_id` 0 of 17, while every kind riding the welded burst
+       * was lit sometimes. That is 20% of sounding samples guaranteed
+       * wrong - and in 77% of the dark samples the line was already on
+       * the page, so it was never the screenplay being stale.
+       *
+       * The feed's full row list is where those clips live. */
+      var all = [];
+      try { all = (root.PineStationFeed.rows() || []); } catch (err) { all = []; }
+      if (all.length && all !== rows) {
+        var loose = within(all, all.length);
+        if (loose) return loose;
       }
     }
     if (speakingNow && speakingNow.id) {

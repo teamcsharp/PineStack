@@ -1074,6 +1074,16 @@ DEFAULT_DJ = {
     # Most callers should leave the station having actually won something;
     # the caller desk can deliberately make the show meaner when wanted.
     "caller_success_rate": 72,
+    # #1260: THE CUPBOARD MUST BE HEARD. A finished, recorded round that
+    # has waited longer than `cupboard_unheard_hours` without ever being
+    # on the air goes out OF TURN, at most one every
+    # `cupboard_unheard_every` seconds. Off, the cupboard reverts to
+    # waiting for a slot that measured 4% adherence and a silence the SFX
+    # Guy fills first - which is how 55 finished rounds came to age up to
+    # four days unheard on 2026-09-12.
+    "cupboard_air_unheard": True,
+    "cupboard_unheard_hours": 2.0,
+    "cupboard_unheard_every": 420,
     # #1033: THE CALLER BANK FLOOR. How many finished, never-aired calls
     # must stand on the shelf before the phone road counts as covered -
     # off the sheet as well as on it. Below it the writing rooms treat
@@ -2034,6 +2044,14 @@ def validate_settings(data: Any) -> dict[str, Any]:
         },
         "saved_rate": max(0.0, min(1.0, float(
             raw_dj.get("saved_rate", DEFAULT_DJ["saved_rate"]) or 0))),
+        "cupboard_air_unheard": bool(raw_dj.get(
+            "cupboard_air_unheard", DEFAULT_DJ["cupboard_air_unheard"])),
+        "cupboard_unheard_hours": max(0.05, min(96.0, float(
+            raw_dj.get("cupboard_unheard_hours",
+                       DEFAULT_DJ["cupboard_unheard_hours"]) or 0.05))),
+        "cupboard_unheard_every": max(60, min(7200, int(
+            raw_dj.get("cupboard_unheard_every",
+                       DEFAULT_DJ["cupboard_unheard_every"]) or 60))),
         "caller_every": max(0, min(50, int(
             raw_dj.get("caller_every", DEFAULT_DJ["caller_every"]) or 0))),
         "manager_every": max(0, min(50, int(
@@ -15202,6 +15220,604 @@ def retire_state() -> dict[str, Any]:
             "summary": retire_summary()}
 
 
+# #1260: WHY A FINISHED ROUND HAS NEVER BEEN HEARD - and the standing
+# consumer that stops the question needing to be asked.
+#
+# Measured 2026-09-12 17:00 CST. The shelf held 25 recorded memos from
+# upstairs and 30 recorded gallery rounds that had NEVER been on the air,
+# the oldest of each 103 hours old, every one of them reading "ready" on
+# the retirement desk. In the same 24 hours the station aired 36 manager
+# rounds and 54 gallery rounds and NOT ONE of them was a row off that
+# shelf: every one was written and rendered live.
+#
+# The cupboard was not broken. The door was not broken either -
+# /api/director/why-not answered "the air's own door would take one right
+# now" for both roads. NOBODY WAS KNOCKING.
+#
+# There are exactly two doors from the cupboard to the air and both were
+# shut for ordinary running:
+#
+#   IN TURN. _ready_slot_window hands back a deadline of 0.0 unless the
+#   running order is standing on that road's own slot, and then
+#   _ready_round_fits demands the round fit what is LEFT of it. Measured
+#   the same minute: the two manager slots of the live hour offered 0.0s
+#   and 15.5s of room against shelf rounds of 26-119s, and would_fit was
+#   0 on all eighteen slots of the hour. Sheet adherence was measured at
+#   4% the same day. So this door opens about never.
+#
+#   OUT OF TURN. _ready_shelf_air(rescue=True) - but its only callers are
+#   DEAD AIR and the two entry-debt rungs (#1186/#1189/#1221), and the
+#   SFX Guy now fills dead air before the rescue is reached at all.
+#
+# So the preparer wrote more, the supply counters kept saying the hour was
+# short of gallery ("the hour is short of caller, news, gallery - those go
+# first"), and finished radio aged four days on a shelf behind a slot that
+# never comes and a silence that never happens.
+#
+# Two things here. cupboard_why_row() answers "why has THIS not been
+# played" using the same functions the air uses to decide it, so the desk
+# can say it out loud instead of the operator inferring it. And
+# unheard_stock_air() is the standing consumer: the oldest unheard,
+# finished, recorded round goes out OF ITS OWN ACCORD once it has waited
+# longer than the dial allows. Content in the cupboard is there to be
+# used; if it is not used it should be replaced, and neither can happen
+# while nothing ever takes it off the shelf.
+CUPBOARD_UNHEARD_HOURS = float(os.getenv("PINE_UNHEARD_HOURS", "2"))
+CUPBOARD_UNHEARD_EVERY = float(os.getenv("PINE_UNHEARD_EVERY", "420"))
+_UNHEARD_AT = [0.0]
+_UNHEARD_LOG: list[dict[str, Any]] = []
+_UNHEARD_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+_UNHEARD_SWEEP: dict[str, Any] = {"at": 0.0, "why": "not run yet", "walks": 0,
+                                  "aired": 0, "passes": 0, "blocked": {}}
+
+
+def _unheard_no(why: str) -> str:
+    """Write down which gate shut the sweep, and refuse."""
+    try:
+        _UNHEARD_SWEEP["at"] = time.time()
+        _UNHEARD_SWEEP["why"] = why
+        _UNHEARD_SWEEP["passes"] = int(_UNHEARD_SWEEP.get("passes") or 0) + 1
+        book = _UNHEARD_SWEEP.setdefault("blocked", {})
+        book[why] = int(book.get(why) or 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def cupboard_ago(seconds: float) -> str:
+    """A duration a person reads, not a number of seconds."""
+    try:
+        seconds = max(0.0, float(seconds))
+    except Exception:  # noqa: BLE001
+        return "?"
+    if seconds >= 172800:
+        return "%dd %dh" % (seconds // 86400, (seconds % 86400) // 3600)
+    if seconds >= 3600:
+        return "%dh %dm" % (seconds // 3600, (seconds % 3600) // 60)
+    if seconds >= 60:
+        return "%dm" % (seconds // 60)
+    return "%ds" % seconds
+
+
+def cupboard_unheard_on() -> bool:
+    """#1260: may the cupboard put its own unheard stock on the air?"""
+    try:
+        got = orch_policy("air_unheard")
+        if got is not None:
+            return bool(got)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return bool(dj_settings().get("cupboard_air_unheard", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def cupboard_unheard_after() -> float:
+    """How long a finished round may wait unheard before it goes out of
+    turn, in seconds. The orchestrator's answer beats the slider."""
+    try:
+        got = orch_policy("unheard_hours")
+        if got is not None:
+            return max(120.0, float(got) * 3600.0)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return max(120.0, float(dj_settings().get(
+            "cupboard_unheard_hours", CUPBOARD_UNHEARD_HOURS)) * 3600.0)
+    except Exception:  # noqa: BLE001
+        return CUPBOARD_UNHEARD_HOURS * 3600.0
+
+
+def cupboard_unheard_every() -> float:
+    """The shortest gap between two out-of-turn airings from the shelf."""
+    try:
+        got = orch_policy("unheard_every")
+        if got is not None:
+            return max(60.0, float(got))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return max(60.0, float(dj_settings().get(
+            "cupboard_unheard_every", CUPBOARD_UNHEARD_EVERY)))
+    except Exception:  # noqa: BLE001
+        return CUPBOARD_UNHEARD_EVERY
+
+
+def cupboard_row_seconds(kind: str, row: Any) -> float:
+    """How long this round runs, without charging the takes census."""
+    try:
+        got = float(row.get("seconds") or 0)
+        if got:
+            return round(got, 1)
+        entry = dialogue_entry(row) or {}
+        got = float(entry.get("seconds") or 0)
+        if got:
+            return round(got, 1)
+        return round(sum(float(t.get("seconds") or 0)
+                         for t in (entry.get("takes") or [])
+                         if isinstance(t, dict)), 1)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def cupboard_find(rid: str) -> tuple[str, dict[str, Any] | None]:
+    """The cupboard item with this id, and which road it is on.
+
+    Returned BY IDENTITY - the row object itself, so that airing it,
+    moving it or retiring it all act on the row the air holds rather than
+    on a copy that merely compares equal to it (#926)."""
+    rid = str(rid or "")
+    if not rid:
+        return "", None
+    try:
+        for entry in list(_LARDER):
+            if isinstance(entry, dict) and retire_id("banter", entry) == rid:
+                return "banter", entry
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for kind, rows in list(_SHELF.items()):
+            for row in list(rows or []):
+                if isinstance(row, dict) and retire_id(str(kind), row) == rid:
+                    return str(kind), row
+    except Exception:  # noqa: BLE001
+        pass
+    return "", None
+
+
+def _cupboard_why(code: str, say: str, fix: str = "") -> dict[str, str]:
+    return {"code": code, "say": say, "fix": fix}
+
+
+def cupboard_why_row(kind: str, row: Any) -> dict[str, Any]:
+    """#1260: every reason this exact item is not on the air, asked in the
+    order the air itself asks them, by the functions that decide it.
+
+    `blocked` means something about the ITEM stops it. `blocked` False
+    with `aired` 0 means the item is finished radio and the only thing
+    between it and a listener is that no road has asked for it - which
+    was the whole of the 2026-09-12 finding and is what
+    unheard_stock_air() below exists to end."""
+    kind = str(kind or "")
+    now = time.time()
+    out: dict[str, Any] = {
+        "id": "", "kind": kind, "label": retire_kind_label(kind),
+        "reasons": [], "blocked": False, "ready": False, "at": now,
+    }
+    try:
+        out["id"] = retire_id(kind, row)
+        entry = dialogue_entry(row) or {}
+        aired = int(row.get("aired") or 0)
+        aired_at = float(row.get("aired_at") or 0)
+        age = max(0.0, now - float(row.get("at") or now))
+        out.update({
+            "name": retire_label(kind, row), "text": retire_text(kind, row),
+            "rhymed": row_is_rhymed(kind, row), "aired": aired,
+            "aired_at": aired_at, "age": round(age),
+            "seconds": cupboard_row_seconds(kind, row),
+            "never_heard": not (aired or aired_at),
+        })
+        try:
+            out["innings"] = row_innings(kind, row)
+        except Exception:  # noqa: BLE001
+            out["innings"] = 1
+        reasons: list[dict[str, str]] = out["reasons"]
+
+        # 1. The writing itself.
+        if row.get("off_brief") or entry.get("off_brief"):
+            brief = row.get("brief") or entry.get("brief") or {}
+            reasons.append(_cupboard_why(
+                "off_brief",
+                "it failed its segment brief when it was shelved"
+                + (" - the brief wanted %s" % str(brief.get("want"))[:90]
+                   if brief.get("want") else "")
+                + ", and dialogue_row_ready refuses off-brief rows outright",
+                "this one will never air. Remove it and let the road write "
+                "its replacement."))
+        if row.get("review_cancel_pending") or entry.get("review_cancel_pending"):
+            reasons.append(_cupboard_why(
+                "review_cancel", "a review has it marked for cancellation",
+                "decide the review, or remove it."))
+        if entry and not _larder_current(entry):
+            reasons.append(_cupboard_why(
+                "contract_moved",
+                "it was written under an older writing contract - the cast, "
+                "the crystal or the plot's act has turned since",
+                "rhymed rounds are exempt from this; a plain one has to be "
+                "rewritten. Remove it."))
+
+        # 2. The two passes.
+        if not dialogue_tint_ready(kind, row):
+            reasons.append(_cupboard_why(
+                "not_tinted",
+                "the crystal's second pass has not finished on it",
+                "it is still work in progress, not stock - the tint lane "
+                "will reach it, or /api/tint says why it cannot."))
+        if not dialogue_audio_ready(kind, row):
+            want = int(entry.get("chunks") or 0)
+            made = int(entry.get("made") or 0)
+            if entry and (want <= 0 or made < want or entry.get("partial")):
+                reasons.append(_cupboard_why(
+                    "unrendered",
+                    "it is written but not recorded - %d of %d line(s) have "
+                    "audio" % (made, want),
+                    "the recording room has never come back to it. It cannot "
+                    "air until it does."))
+            else:
+                reasons.append(_cupboard_why(
+                    "clip_gone",
+                    "its recording is no longer in the pantry - the clips "
+                    "were pruned out from under the row",
+                    "re-record it, or remove it: the words survive in the "
+                    "gold bars either way."))
+
+        # 3. The microphones it was made for.
+        if shelf_cast_stale(row):
+            reasons.append(_cupboard_why(
+                "recast",
+                "it was recorded by a cast that has since changed - it holds "
+                "\"%s\" and the booth is \"%s\" now"
+                % (str(row.get("cast") or "")[:60],
+                   str(cast_signature())[:60]),
+                "footage is audio and audio does not survive a recast. "
+                "Re-record it or remove it."))
+
+        # 4. Airings and rest - only asked once it has been out.
+        if aired_at:
+            try:
+                innings = int(out["innings"])
+            except Exception:  # noqa: BLE001
+                innings = 1
+            if aired >= innings:
+                reasons.append(_cupboard_why(
+                    "innings_used",
+                    "it has had all %d of its airings" % innings,
+                    "Keep it on the desk to grant it a fresh set."))
+            rest = shelf_rest_now() - (now - aired_at)
+            if rest > 0:
+                reasons.append(_cupboard_why(
+                    "resting",
+                    "it went out %s ago and rests another %s"
+                    % (cupboard_ago(now - aired_at), cupboard_ago(rest)),
+                    "the rest is the repetition dial - the reuse rest on "
+                    "/api/dj, or the orchestrator's \"rest:\" answer."))
+            if kind not in SHELF_REUSABLE and kind != "caller":
+                reasons.append(_cupboard_why(
+                    "single_use",
+                    "this road does not repeat - it has been heard and it is "
+                    "history now", ""))
+
+        # 5. In hand right this second.
+        try:
+            if id(row) in _READY_SHELF_BUSY:
+                reasons.append(_cupboard_why(
+                    "in_hand", "it is reserved for the air right now", ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+        out["ready"] = bool(dialogue_row_ready(kind, row))
+        out["blocked"] = bool(reasons)
+
+        # 6. THE DOORS. Nothing above is wrong with the item; these say
+        #    whether anything can actually ask for it.
+        door: dict[str, Any] = {"road_open": kind in RESCUE_ROADS_OPEN}
+        try:
+            window = _ready_slot_window(kind)
+            deadline = float((window or {}).get("deadline") or 0)
+            room = max(0.0, deadline - now) if deadline else 0.0
+            door.update({"on_its_slot": bool(deadline),
+                         "room": round(room, 1),
+                         "slot_now": str((window or {}).get("kind") or "")})
+            door["in_turn"] = bool(deadline and out["seconds"]
+                                   and out["seconds"] + 1.0 <= room
+                                   + segment_overrun(deadline, kind))
+        except Exception:  # noqa: BLE001
+            door["in_turn"] = False
+        out["door"] = door
+        if not out["blocked"]:
+            if not door.get("on_its_slot"):
+                reasons.append(_cupboard_why(
+                    "no_slot",
+                    "the running order is standing on %s, not on this road, "
+                    "so the in-turn door reports a deadline of 0 and refuses "
+                    "every row of this road"
+                    % (door.get("slot_now") or "another road"),
+                    "out-of-turn airing is the door that works: Play now, or "
+                    "let the unheard sweep take it."))
+            elif not door.get("in_turn"):
+                reasons.append(_cupboard_why(
+                    "too_long_for_its_slot",
+                    "its own entry is on air with %.0fs of room left and this "
+                    "round runs %.0fs" % (door.get("room") or 0,
+                                          out["seconds"] or 0),
+                    "it fits nowhere in turn while the sheet is this tight. "
+                    "Play now airs it over the top."))
+            if not door.get("road_open"):
+                reasons.append(_cupboard_why(
+                    "road_closed",
+                    "%s is not one of the roads allowed to air out of turn "
+                    "(%s), so its own slot is the only door it has"
+                    % (out["label"], ", ".join(RESCUE_ROADS_OPEN)),
+                    "nothing on this road can reach the air out of turn - "
+                    "this is why recap stock never moves."))
+
+        # 7. Its place in the queue - the honest answer to "why not this
+        #    one" when nothing at all is wrong with it.
+        try:
+            ahead = 0
+            for other in shelf_rows(kind):
+                if other is row:
+                    break
+                if row_unaired(other) and dialogue_row_ready(kind, other):
+                    ahead += 1
+            out["queue_ahead"] = ahead
+            if not out["blocked"] and ahead:
+                reasons.append(_cupboard_why(
+                    "behind_others",
+                    "%d finished unheard round(s) of this road stand ahead of "
+                    "it - the shelf is strict first-in, first-out" % ahead,
+                    "Send to the front jumps it to the head of the queue."))
+        except Exception:  # noqa: BLE001
+            out["queue_ahead"] = 0
+
+        # 8. And the waiting itself, which is the operator's actual
+        #    question. #1180: airings are the meter, so an unheard row has
+        #    no clock on it at all - that is what keeps it alive, and it is
+        #    also exactly how one comes to sit for four days.
+        if out["never_heard"]:
+            out["waited"] = round(age)
+            out["overdue"] = bool(age > cupboard_unheard_after())
+            if not out["blocked"]:
+                reasons.append(_cupboard_why(
+                    "never_asked_for",
+                    "nothing is wrong with it: it is finished, recorded radio "
+                    "that has waited %s and no road has asked for it"
+                    % cupboard_ago(age),
+                    "this is what the unheard sweep is for. Play now airs it "
+                    "immediately."))
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+    out["first"] = (out["reasons"][0]["code"] if out["reasons"] else "")
+    out["say"] = "; ".join(r["say"] for r in out["reasons"][:4]) or (
+        "it is ready and next in line")
+    return out
+
+
+def unheard_state() -> dict[str, Any]:
+    """#1260: the cupboard's unheard stock, per road - the census the
+    orchestrator reads and the desk shows.
+
+    "We should be having nothing that's sitting there for days and days
+    not being used." This is the measurement of that sentence.
+
+    #1142: memoised for three seconds like every other readiness
+    aggregate. It walks every shelf and the larder through
+    dialogue_row_ready, and /api/dj carries it now - which every panel
+    polls."""
+    now = time.time()
+    if (_UNHEARD_MEMO["value"] is not None
+            and now - float(_UNHEARD_MEMO["at"]) < 3.0):
+        return dict(_UNHEARD_MEMO["value"])
+    after = cupboard_unheard_after()
+    roads: list[dict[str, Any]] = []
+    total = ready = overdue = 0
+    oldest = 0.0
+    try:
+        piles: list[tuple[str, list[Any]]] = [("banter", list(_LARDER))]
+        piles += [(str(k), list(v or [])) for k, v in list(_SHELF.items())]
+        for kind, rows in piles:
+            if not rows:
+                continue
+            unheard = [r for r in rows
+                       if isinstance(r, dict) and row_unaired(r)]
+            good = [r for r in unheard if dialogue_row_ready(kind, r)]
+            ages = sorted((now - float(r.get("at") or now)) for r in good)
+            late = [a for a in ages if a > after]
+            total += len(unheard)
+            ready += len(good)
+            overdue += len(late)
+            oldest = max(oldest, ages[-1] if ages else 0.0)
+            roads.append({
+                "kind": kind, "label": retire_kind_label(kind),
+                "rows": len(rows), "unheard": len(unheard),
+                "ready": len(good), "overdue": len(late),
+                "oldest": round(ages[-1] if ages else 0.0),
+                "seconds": round(sum(cupboard_row_seconds(kind, r)
+                                     for r in good)),
+                "road_open": kind in RESCUE_ROADS_OPEN,
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    roads.sort(key=lambda r: -float(r.get("oldest") or 0))
+    shut = [r for r in roads if r["ready"] and not r["road_open"]]
+    said = ("%d finished round(s) have never been heard, %d of them past the "
+            "%s the dial allows; the oldest has waited %s"
+            % (ready, overdue, cupboard_ago(after), cupboard_ago(oldest))
+            if ready else
+            "every finished round in the cupboard has been on the air")
+    if shut:
+        said += ("; %s holds %d ready round(s) on a road that cannot air out "
+                 "of turn at all" % (shut[0]["label"], shut[0]["ready"]))
+    sweep = dict(_UNHEARD_SWEEP)
+    sweep["blocked"] = dict(sweep.get("blocked") or {})
+    sweep["next_in"] = max(0.0, round(cupboard_unheard_every()
+                                      - (now - _UNHEARD_AT[0])))
+    if sweep.get("why") and sweep["why"] != "aired":
+        said_sweep = ("the sweep has not aired anything: %s (last looked %s "
+                      "ago, %d walk(s), %d airing(s) since the process "
+                      "started)" % (sweep["why"],
+                                    cupboard_ago(now - float(sweep.get("at") or now)),
+                                    int(sweep.get("walks") or 0),
+                                    int(sweep.get("aired") or 0)))
+    else:
+        said_sweep = ("the sweep has put %d unheard round(s) on the air since "
+                      "the process started" % int(sweep.get("aired") or 0))
+    out = {"at": now, "sweep": sweep, "say_sweep": said_sweep,
+           "roads": roads, "unheard": total, "ready": ready,
+           "overdue": overdue, "oldest": round(oldest), "after": round(after),
+           "every": round(cupboard_unheard_every()), "on": cupboard_unheard_on(),
+           "shut_roads": [r["kind"] for r in shut],
+           "recent": list(_UNHEARD_LOG[-12:]), "say": said + " - " + said_sweep}
+    _UNHEARD_MEMO.update({"at": now, "value": out})
+    return dict(out)
+
+
+def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
+    """The one round that has waited longest and can actually go out.
+
+    Oldest first across every road that is open out of turn, so the
+    cupboard drains in the order it filled and no road can starve another
+    by being busier."""
+    now = time.time()
+    after = cupboard_unheard_after()
+    best: tuple[str, dict[str, Any] | None, float] = ("", None, 0.0)
+    try:
+        for kind in RESCUE_ROADS_OPEN:
+            for row in shelf_rows(kind):
+                if not isinstance(row, dict) or not row_unaired(row):
+                    continue
+                age = now - float(row.get("at") or now)
+                if age <= after or age <= best[2]:
+                    continue
+                if id(row) in _READY_SHELF_BUSY:
+                    continue
+                if not dialogue_row_ready(kind, row):
+                    continue
+                best = (kind, row, age)
+    except Exception:  # noqa: BLE001
+        pass
+    return best
+
+
+CUPBOARD_REPLACE_AFTER = float(os.getenv("PINE_UNHEARD_REPLACE", "345600"))
+_UNHEARD_SWEPT = [0.0]
+
+
+def unheard_replace_sweep() -> list[str]:
+    """#1260: "If it is not used for days and days, then we need to
+    replace it with things that will get used."
+
+    The other half of the operator's rule. unheard_stock_air() spends
+    everything that CAN go out, oldest first, so anything still unheard
+    days later is stock the air has been refusing for a reason - off
+    brief, never recorded, its clips pruned, recorded by a cast that has
+    gone. That is not stock, it is a blocked slot: it holds its road's
+    shelf against the replacement that would actually air.
+
+    It is sent to the RETIREMENT DESK, never deleted here. #1075 stands -
+    nothing throws away unheard radio on its own say-so - and retire_may
+    is the one road that asks the operator instead. A row the desk's
+    rules do not ask about is simply left alone; this raises the
+    question, it does not answer it."""
+    now = time.time()
+    if now - _UNHEARD_SWEPT[0] < 900.0:
+        return []
+    _UNHEARD_SWEPT[0] = now
+    asked: list[str] = []
+    try:
+        for kind, rows in list(_SHELF.items()):
+            for row in list(rows or []):
+                if not isinstance(row, dict) or not row_unaired(row):
+                    continue
+                if now - float(row.get("at") or now) < CUPBOARD_REPLACE_AFTER:
+                    continue
+                if dialogue_row_ready(str(kind), row):
+                    # It can air. The sweep above will spend it; the desk
+                    # must never be asked to bin airable unheard work.
+                    continue
+                why = cupboard_why_row(str(kind), row)
+                retire_may(str(kind), row,
+                           "unheard for %s and still cannot air: %s (#1260)"
+                           % (cupboard_ago(now - float(row.get("at") or now)),
+                              (why.get("reasons") or [{}])[0].get("say")
+                              or "no reason recorded"))
+                asked.append(str(why.get("id") or ""))
+    except Exception:  # noqa: BLE001
+        pass
+    if asked:
+        pipeline_log(
+            "lookahead",
+            "%d round(s) have sat unheard past %s and still cannot air - "
+            "the retirement desk has been asked about them so their road "
+            "can write something that will go out (#1260)"
+            % (len(asked), cupboard_ago(CUPBOARD_REPLACE_AFTER)))
+    return asked
+
+
+async def unheard_stock_air() -> str:
+    """#1260: THE STANDING CONSUMER. Put the longest-unheard finished round
+    on the air, out of turn, because nothing else ever will.
+
+    This is the rung the cupboard was built for and did not have. It goes
+    through the SAME door the rescue uses - rescue=True, a finished,
+    tinted, recorded round only - so it takes no new powers and every
+    guard those roads already have still applies. It differs from
+    dead_air_rescue in the one way that matters: it does not wait for
+    silence. Silence stopped happening when the SFX Guy started filling
+    it, and that is precisely how finished radio came to age four days on
+    a shelf."""
+    if not cupboard_unheard_on():
+        return _unheard_no("switched off")
+    now = time.time()
+    if now - _UNHEARD_AT[0] < cupboard_unheard_every():
+        return _unheard_no("inside the interval")
+    if not _RADIO.get("on") or radio_paused():
+        return _unheard_no("off air or paused")
+    if _SPEAKING[0] or _floor_busy():
+        return _unheard_no("somebody has the floor")
+    # The clock is spent on the WALK, not on the airing. unheard_pick()
+    # reads every row of four shelves through dialogue_row_ready, and this
+    # sits in the watchdog pass - charging it only when something actually
+    # airs would run the full walk on every tick of a loop that ticks every
+    # second or two, which is the #1142 fault class exactly. It also means
+    # a row that refuses after all costs one interval rather than being
+    # hammered on every pass.
+    _UNHEARD_AT[0] = now
+    try:
+        unheard_replace_sweep()
+    except Exception:  # noqa: BLE001
+        pass
+    _UNHEARD_SWEEP["walks"] = int(_UNHEARD_SWEEP.get("walks") or 0) + 1
+    kind, row, age = unheard_pick()
+    if row is None:
+        return _unheard_no("nothing unheard is past the dial and airable")
+    said = await _ready_shelf_air(kind, _RADIO.get("now"), rescue=True,
+                                  pick=row)
+    if not said:
+        return _unheard_no("the air's own door refused the row it picked")
+    _RESCUE_AT[0] = time.time()
+    _UNHEARD_SWEEP.update({"at": time.time(), "why": "aired",
+                           "aired": int(_UNHEARD_SWEEP.get("aired") or 0) + 1})
+    _UNHEARD_LOG.append({"at": time.time(), "kind": kind, "waited": round(age),
+                         "lines": len(said), "id": retire_id(kind, row)})
+    del _UNHEARD_LOG[:-60]
+    pipeline_log(
+        "air", "%s had waited %s on the shelf without ever being heard - it "
+        "goes out of turn, because no slot was ever going to come for it "
+        "(#1260)" % (SHELF_LABEL.get(kind, kind), cupboard_ago(age)))
+    return kind
+
 def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
     """#1068: when a prepared item stops being offered as stock. An
     unheard row is offered until the burn horizon - old unheard work is an
@@ -19240,7 +19856,8 @@ def _replay_save() -> None:
 
 
 async def voice_generate(text: str, voice: str, engine: str,
-                         fx: dict[str, float] | None = None) -> dict[str, Any]:
+                         fx: dict[str, float] | None = None,
+                         line: str = "") -> dict[str, Any]:
     """text + voice in, a stored audio path out. Nothing is created unless
     synthesis succeeds. `fx` wets the line — echo and a room — for the callers
     that want the pair to sound like they are in a booth rather than a
@@ -19323,7 +19940,11 @@ async def voice_generate(text: str, voice: str, engine: str,
     # The attempt and the success are different facts; only success
     # resets the clock (stamped after the engine answers, below).
     _SYNTH_TRIED[0] = time.time()
-    note_activity("voicing", f"{engine} · {len(text)} chars")
+    # #1277: WITH THE LINE'S OWN NAME ON IT. Optional, because fifteen
+    # other callers render things that are not script lines; when it is
+    # given, the feed can show the words and point at the script.
+    note_activity("voicing", f"{engine} · {len(text)} chars",
+                  line=line, text=text)
     pipeline_log("voice", f"{engine} · {voice or 'default voice'} · "
                           f"{len(text)} chars in",
                  extra=(f"INPUT to {engine} "
@@ -22260,14 +22881,32 @@ def radio_state() -> dict[str, Any]:
 # What the desk is doing RIGHT NOW (#305): writing, voicing, speaking —
 # breadcrumbs the panel draws as an activity spectrograph, so a quiet
 # moment is visibly a pause and not a mystery.
-def note_activity(stage: str, detail: str = "") -> None:
-    _RADIO["activity"] = {"stage": stage, "detail": str(detail)[:80],
-                          "at": time.time()}
+def note_activity(stage: str, detail: str = "",
+                  line: str = "", text: str = "") -> None:
+    """#1277: ...and WHICH LINE it is, and what the line says.
+
+    The feed used to show `voicing · xtts · 163 chars` while the station
+    was talking - true, and useless, because the row had no identity and
+    no words. It could not be matched to the script, could not be
+    clicked through to, and could not be told apart from the row above
+    it. `line` is the id the air log will file this same line under, so
+    every surface can say the same thing about the same line."""
+    now = {"stage": stage, "detail": str(detail)[:80], "at": time.time()}
+    if line:
+        now["line"] = str(line)
+    if text:
+        now["text"] = str(text)[:400]
+    _RADIO["activity"] = now
     log = _RADIO.setdefault("activity_log", [])
     # #790: the detail rides in the log too, so the Route cell's history can
     # expand each notification to what was actually said/done.
-    log.append({"stage": stage, "detail": str(detail)[:200],
-                "at": int(time.time())})
+    row = {"stage": stage, "detail": str(detail)[:200],
+           "at": int(time.time())}
+    if line:
+        row["line"] = str(line)
+    if text:
+        row["text"] = str(text)[:400]
+    log.append(row)
     del log[:-120]
 
 
@@ -35765,6 +36404,77 @@ def orch_scan() -> dict[str, Any]:
             out = orch_raise("road_empty", _why, "soon", _questions)
             return out
 
+        # #1260: 3b. FINISHED RADIO NOBODY HAS HEARD.
+        #
+        # The orchestrator could see that a road was EMPTY and never that
+        # a road was FULL AND UNSPENT, which is the more expensive of the
+        # two: every unheard round was paid for in model time and render
+        # time, and a round that ages out unheard is the whole of that
+        # spend thrown away. Asked only when the backlog is real - rounds
+        # that are finished, recorded and past the dial - so a cupboard
+        # that is merely stocked never raises it.
+        try:
+            _un = unheard_state()
+        except Exception:  # noqa: BLE001
+            _un = {}
+        if (int(_un.get("overdue") or 0) >= 6
+                and not _orch_recent("cupboard_unheard", 21600.0)):
+            _worst = [r for r in (_un.get("roads") or []) if r.get("overdue")]
+            _names = ", ".join(r["label"] for r in _worst[:3])
+            _why = (
+                "%s Nothing is wrong with these rounds - they are tinted, "
+                "recorded and airable this second. They have simply never "
+                "been asked for: a road may only air in turn inside its own "
+                "slot, and out of turn only into dead air. %s %s"
+                % (_un.get("say") or "",
+                   ("The backlog is worst on: %s." % _names) if _names else "",
+                   ("I am airing the longest-waiting one out of turn every "
+                    "%s; that is the only thing spending them."
+                    % cupboard_ago(float(_un.get("every") or 0)))
+                   if _un.get("on") else
+                   "Airing them out of turn is switched OFF, so nothing is "
+                   "spending them at all."))
+            out = orch_raise(
+                "cupboard_unheard", _why, "soon",
+                [
+                    {"ask": "%d finished round(s) have never been heard. "
+                            "What should I do with them?"
+                            % int(_un.get("ready") or 0),
+                     "options": [
+                         _opt("Air them out of turn - oldest first",
+                              "unheard:on",
+                              "The sheet stops being the only door. A "
+                              "round that has waited goes out over the "
+                              "top of whatever the running order says."),
+                         _opt("Only when a slot or a silence comes",
+                              "unheard:off",
+                              "The behaviour that let these age up to "
+                              "four days."),
+                         _opt("Air them and retire what still will not go",
+                              "unheard:hard",
+                              "Out of turn, and anything still unheard "
+                              "after four days goes to the desk to be "
+                              "replaced."),
+                     ]},
+                    {"ask": "How long may a finished round wait before I "
+                            "reach past the running order for it?",
+                     "options": [
+                         _opt("Two hours", "unheardafter:2"),
+                         _opt("Half an hour - spend it fast",
+                              "unheardafter:0.5"),
+                         _opt("Six hours - the sheet gets first refusal",
+                              "unheardafter:6"),
+                     ]},
+                    {"ask": "And how often may one go out that way?",
+                     "options": [
+                         _opt("Every seven minutes", "unheardevery:420"),
+                         _opt("Every three minutes - drain it",
+                              "unheardevery:180"),
+                         _opt("Every twenty minutes", "unheardevery:1200"),
+                     ]},
+                ])
+            return out
+
         # 4. NOTHING IS WRONG - but six hours is six hours.
         if now - float(_ORCH.get("last") or 0) >= ORCH_ASK_EVERY:
             # #1182: ...and it is not raised empty. If every question in
@@ -37011,6 +37721,35 @@ def orch_apply(does: str) -> str:
                 "value": str(arg), "at": time.time()}
             said = (f"{SHELF_LABEL.get(str(arg), str(arg))} gives way first"
                     if arg != "keep" else "the ladder is unchanged")
+        elif verb == "unheard":
+            # #1260: the standing consumer's own switch. "hard" also lets
+            # the retirement desk see stock that still has not gone out
+            # after four days, which is the operator's "if it's not used
+            # for days and days then we need to replace it".
+            _on = str(arg or "on") != "off"
+            _ORCH["policy"]["air_unheard"] = {"value": bool(_on),
+                                              "at": time.time()}
+            _ORCH["policy"]["unheard_retire"] = {
+                "value": str(arg) == "hard", "at": time.time()}
+            said = ("finished rounds nobody has heard go out of turn, "
+                    "oldest first"
+                    + (", and what still will not go after four days is "
+                       "sent to the retirement desk"
+                       if str(arg) == "hard" else "")
+                    if _on else
+                    "the cupboard waits for a slot or a silence")
+        elif verb == "unheardafter":
+            _ORCH["policy"]["unheard_hours"] = {
+                "value": max(0.05, min(96.0, float(arg or 2))),
+                "at": time.time()}
+            said = ("a finished round waits %s before it goes out of turn"
+                    % cupboard_ago(max(0.05, float(arg or 2)) * 3600.0))
+        elif verb == "unheardevery":
+            _ORCH["policy"]["unheard_every"] = {
+                "value": max(60.0, min(7200.0, float(arg or 420))),
+                "at": time.time()}
+            said = ("one unheard round may go out every %s"
+                    % cupboard_ago(max(60.0, float(arg or 420))))
         elif verb == "repeats":
             _ORCH["policy"]["repeats_hard"] = {
                 "value": str(arg) == "hard", "at": time.time()}
@@ -42278,6 +43017,11 @@ def _dialogue_flow_state_fresh() -> dict[str, Any]:
         "prefill": bool(dj.get("dialogue_prefill", True)),
         "tint_hold": crystal_tint_holds(),                          # #1063
         "retire": retire_summary(),                                # 2026-09-08: the desk
+        # #1260: AND WHAT IS NOT BEING SPENT. Every other number here is
+        # about whether there is ENOUGH; none of them could see finished
+        # radio that nobody was taking. The orchestrator reads this panel.
+        "unheard": {k: v for k, v in unheard_state().items()
+                    if k not in ("roads", "recent")},
         "blockers": blockers,
         # #886/#887: depth in ROUNDS says nothing about whether the
         # station can keep talking. These say it in seconds of finished
@@ -43640,7 +44384,17 @@ async def dead_air_watch() -> None:
                 pass
             if not (_SPEAKING[0] or _floor_busy()):
                 try:
-                    await entry_unanswered_fill() or await entry_arrears_serve()
+                    # #1260: ...AND THE CUPBOARD'S OWN UNHEARD STOCK, last.
+                    # The two rungs above answer an entry that asked and
+                    # got nothing. Nothing above them ever answers the
+                    # round that NOBODY asked for - which measured, on
+                    # 2026-09-12, as 55 finished recorded rounds aged up
+                    # to 103 hours while the same roads were written live
+                    # 90 times in a day. It runs after both, so a road
+                    # that is owed its own entry is still paid first.
+                    (await entry_unanswered_fill()
+                     or await entry_arrears_serve()
+                     or await unheard_stock_air())
                 except Exception:  # noqa: BLE001
                     pass
             # #1235: ASK THE SFX GUY FIRST. The reset below is right
@@ -66848,9 +67602,35 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
         return False
 
 
-def _ready_shelf_row(kind: str, rescue: bool = False
+def unheard_free(kind: str, row: Any) -> bool:
+    """#1260: may this row ignore the running order?
+
+    Only if it has never been heard and has waited longer than the dial
+    allows. Not "is it old" - AIRINGS ARE THE METER (#1180) - and not
+    "is the road behind": a rested repeat has its own rules and does not
+    borrow these."""
+    try:
+        if not cupboard_unheard_on():
+            return False
+        if not isinstance(row, dict) or not row_unaired(row):
+            return False
+        return (time.time() - float(row.get("at") or 0)
+                > cupboard_unheard_after())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ready_shelf_row(kind: str, rescue: bool = False,
+                     pick: dict[str, Any] | None = None
                      ) -> dict[str, Any] | None:
     """#1168: `rescue` is DEAD AIR, and it selects out of turn.
+
+    #1260: `pick` names ONE row - the operator pressing Play now on the
+    retirement desk, or the unheard sweep spending the round that has
+    waited longest. It chooses which candidate is offered and nothing
+    else: the row must still be on the shelf this second and must still
+    pass `eligible`, so a named row gets no power the queue's own head
+    row would not have had.
 
     Without it this computed its own window and refused every row that
     would not fit inside the entry on air - which outside the road's own
@@ -66877,7 +67657,18 @@ def _ready_shelf_row(kind: str, rescue: bool = False
         takes = _ready_round_takes(kind, row)
         if not takes:
             return False
-        return rescue or _ready_round_fits(kind, takes, window)
+        # #1260: finished radio nobody has heard is not held by a sheet
+        # that is not standing on its road.
+        return (rescue or unheard_free(kind, row)
+                or _ready_round_fits(kind, takes, window))
+
+    # #1260: a named row answers for itself. It is still checked against
+    # the shelf by IDENTITY, so a row that has since been aired, trimmed
+    # or recast cannot be resurrected by holding a reference to it.
+    if pick is not None:
+        if not any(held is pick for held in shelf_rows(kind)):
+            return None
+        return pick if eligible(pick) else None
 
     # #1160: a round written INSIDE the live act goes first. This used to
     # be enforced by profile_compatible refusing everything else, which
@@ -66907,7 +67698,8 @@ def _ready_shelf_row(kind: str, rescue: bool = False
 
 
 async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
-                           rescue: bool = False) -> list[str]:
+                           rescue: bool = False,
+                           pick: dict[str, Any] | None = None) -> list[str]:
     """Reserve one exact finished round; only its transport can commit it.
 
     2026-09-10: `rescue` is DEAD AIR, and it is the one caller allowed to
@@ -66920,13 +67712,28 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     already grants the needle ("the station must never be silent, and that
     outranks every other rule here"), extended to the cupboard."""
     window = None if rescue else _ready_slot_window(kind)
-    row = _ready_shelf_row(kind, rescue)            # #1168: out of turn
+    row = _ready_shelf_row(kind, rescue, pick)      # #1168/#1260
     if row is None:
         return []
     takes = _ready_round_takes(kind, row)
-    if not takes or (not rescue
+    # #1260: `free` is "this may air out of turn" - the dead-air rescue
+    # as before, or an unheard round past the dial. Everything below that
+    # asked `rescue` asks this instead, so the selection and the handoff
+    # proof cannot disagree about which rules the round is under.
+    free = bool(rescue) or unheard_free(kind, row)
+    if not takes or (not free
                      and not _ready_round_fits(kind, takes, window)):
         return []
+    if free and not rescue:
+        try:
+            pipeline_log(
+                "air", "%s had waited %s unheard and its road asked for "
+                "something to say - the cupboard answers instead of the "
+                "writing room (#1260)"
+                % (SHELF_LABEL.get(kind, kind),
+                   cupboard_ago(time.time() - float(row.get("at") or 0))))
+        except Exception:  # noqa: BLE001
+            pass
     _READY_SHELF_BUSY.add(id(row))
     owned = False
     committed = False
@@ -66936,7 +67743,7 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     def can_handoff() -> bool:
         if not any(held is row for held in shelf_rows(kind)):
             return False
-        if rescue:
+        if free:
             # The round still has to be intact; it simply no longer has to
             # belong to whatever entry the clock is standing on.
             current = _ready_round_takes(kind, row)
@@ -66986,7 +67793,7 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
         if not any(held is row for held in shelf_rows(kind)):
             return []
         takes = _ready_round_takes(kind, row)
-        if not takes or (not rescue
+        if not takes or (not free
                          and not _ready_round_fits(kind, takes, window)):
             return []
         entry = dict(dialogue_entry(row) or {})
@@ -77160,6 +77967,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             playlist.append({"who": take["who"], "voice": take["voice"],
                              "chunk": take["text"], "turn_text": take["text"],
                              "ready_clip": dict(clip), "turn_end": True,
+                             "line_id": uuid.uuid4().hex,      # #1277
                              "vec": {}, "big": False})
         turns = []
         recorded, whole, render_stream = True, True, True
@@ -77403,6 +78211,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 "who": who,
                 "chunk": inject_disfluencies(
                     chunk, vec, seed=f"{who}{len(playlist)}"),
+                # #1277: the line is named HERE, before it is rendered,
+                # and the air log files it under this same name.
+                "line_id": uuid.uuid4().hex,
                 "vec": vec, "turn_end": False, "big": False,
             })
         if len(playlist) > first_at:
@@ -77792,6 +78603,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # aired_items turn (-1 for stings and quips).
             seg_ix: list[int] = []
             turn_ix: list[int] = []
+            line_ids: list[str] = []        # #1277: one name per row
             # #no-repeats: the playlist item behind each transcript row, kept in step
             # with it, so the ledger below can be written from the item's
             # turn_text — the whole clean turn the gate tested — instead of
@@ -77846,7 +78658,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     try:
                         clip = await voice_generate(
                             spoken_text(item["chunk"]), v,
-                            voice_engine_for(v), fx=_turn_fx(item))
+                            voice_engine_for(v), fx=_turn_fx(item),
+                            line=str(item.get("line_id") or ""))   # #1277
                     except Exception:
                         clip = None
                     # A clone that fails must NOT drop the turn from the call —
@@ -77891,6 +78704,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                        _clip_seconds(clip["path"])))
                     seg_ix.append(len(seg) - 1)
                     turn_ix.append(len(aired_items))
+                    line_ids.append(str(item.get("line_id")             # #1277
+                                        or uuid.uuid4().hex))
                     aired_items.append(item)                          # #no-repeats
                     _DIALOGUE_AT[0] = time.time()                     # 2026-09-07
                     # Gold: a rhymed turn with its take is kept to fire again.
@@ -77922,6 +78737,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         transcript.append((_extra["who"], _extra["text"], _extra["seconds"]))
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
+                        line_ids.append(uuid.uuid4().hex)               # #1277
                         _sfx_extra_seconds += _extra["seconds"] + max(CONCAT_BEAT)
                     _sting = "" if _keep_mic else sting_due()
                     if _sting:
@@ -77936,6 +78752,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                                float(_gold.get("seconds") or 0)))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
+                            line_ids.append(uuid.uuid4().hex)           # #1277
                             gold_fired(_gold)
                             pipeline_log("air", "a gold bar fires again, sting to "
                                          f"follow: {str(_gold.get('text') or '')[:70]}")
@@ -77949,6 +78766,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                            sfx_seconds(_sting)))
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
+                        line_ids.append(uuid.uuid4().hex)               # #1277
                         pipeline_log("air", f"sting: {_sting.stem} "
                                      "dropped between lines (#833)")
                     # #835: the SFX Guy's MOUTH — at the slider's rate a
@@ -78001,6 +78819,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                  _clip_seconds(_qc["path"])))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
+                            line_ids.append(uuid.uuid4().hex)           # #1277
                             pipeline_log("air", "the SFX guy pipes up: "
                                          f"{_quip[:60]} (#835)")
                     # #748/#830: the turn's transcript row was appended
@@ -78190,7 +79009,15 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     _ti = turn_ix[_row] if _row < len(turn_ix) else -1
                     _turn = str((aired_items[_ti].get("turn_text") or "")
                                 if 0 <= _ti < len(aired_items) else "")
-                    rid = uuid.uuid4().hex  # durable receipt identity across station restarts
+                    # #1277: THE NAME IT WAS GIVEN BEFORE IT WAS MADE.
+                    # This used to mint a fresh uuid here, after the
+                    # audio existed - so the thing being rendered and
+                    # the thing that aired never shared an identity, and
+                    # no surface could connect them. The fallback keeps
+                    # a row that somehow arrived without a name airing
+                    # rather than failing.
+                    rid = (line_ids[_row] if _row < len(line_ids)
+                           else uuid.uuid4().hex)
                     _kind = "sfx" if who == "board" else "call"
                     if who == "drop" and _row in _sfx_meta:
                         _kind = "sfxguy"
@@ -117253,6 +118080,252 @@ async def cupboard_why_not_ready_api(
     }
 
 
+@app.get("/api/cupboard/unheard")
+async def cupboard_unheard_api(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """#1260: the cupboard's unheard stock, per road.
+
+    "Content in the cupboard must be used." This is the meter for that
+    sentence, and it is the one the orchestrator reads."""
+    _journal_auth(authorization, key)
+    return unheard_state()
+
+
+@app.get("/api/cupboard/why")
+async def cupboard_why_api(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+    id: str = "",
+    kind: str = "",
+    most: int = 40,
+) -> dict[str, Any]:
+    """#1260: WHY THIS HAS NOT BEEN PLAYED - one item, or a whole road.
+
+    Answered by the functions the air itself uses, in the order the air
+    asks them, so the desk's explanation and the station's behaviour
+    cannot drift apart. Peek only: nothing is reserved and nothing airs.
+    """
+    _journal_auth(authorization, key)
+    if id:
+        road, row = cupboard_find(str(id)[:80])
+        if row is None:
+            raise HTTPException(status_code=404,
+                                detail="no such item in the cupboard - it "
+                                       "may have aired or been retired")
+        return {"at": time.time(), "item": cupboard_why_row(road, row)}
+    road = str(kind or "")[:32]
+    if not road:
+        raise HTTPException(status_code=400, detail="ask for an id or a kind")
+    rows = (list(_LARDER) if road == "banter"
+            else list(shelf_rows(road) or []))
+    items = [cupboard_why_row(road, r) for r in rows[:max(1, min(200, most))]
+             if isinstance(r, dict)]
+    unheard = [i for i in items if i.get("never_heard")]
+    stuck = [i for i in unheard if i.get("blocked")]
+    return {
+        "at": time.time(), "kind": road, "rows": len(rows), "items": items,
+        "say": ("%d row(s) on this road; %d have never been heard, %d of "
+                "those are blocked by something and %d are simply waiting "
+                "to be asked for"
+                % (len(rows), len(unheard), len(stuck),
+                   len(unheard) - len(stuck))),
+    }
+
+
+async def cupboard_judge(kind: str, row: dict[str, Any]) -> dict[str, Any]:
+    """#1260: the orchestrator looks at ONE unplayed round and says
+    whether it should go out or be replaced.
+
+    The operator's ask: "having the orchestrator examine them and make a
+    judgment call on why or why not they should be able to be played".
+    It is handed the round's own words and the machine's own refusal
+    reasons - never a summary of them - so the verdict is about the thing
+    rather than about a description of it. The verdict is written onto
+    the row and into the judgment book; acting on it is still a separate
+    press, because a model's opinion is not a deletion."""
+    why = cupboard_why_row(kind, row)
+    text = retire_text(kind, row) or ""
+    entry = dialogue_entry(row) or {}
+    script = str(entry.get("script") or entry.get("script_plain")
+                 or row.get("text") or text)[:1400]
+    stops = "\n".join("- %s" % r["say"] for r in (why.get("reasons") or [])
+                      ) or "- nothing: it is ready and next in line"
+    prompt = (
+        "You run the running order of a live radio station. A finished, "
+        "recorded segment has been sitting in the cupboard for %s and has "
+        "never been on the air.\n\n"
+        "THE SEGMENT (%s, %.0f seconds, %d airing(s) of %d used):\n%s\n\n"
+        "WHY THE MACHINE HAS NOT PLAYED IT:\n%s\n\n"
+        "Judge it. Answer in exactly three lines and nothing else:\n"
+        "VERDICT: air | replace | hold\n"
+        "WHY: one sentence about THIS segment's words - is it still worth "
+        "the airtime, is it stale, does it refer to something that has "
+        "passed?\n"
+        "DO: one short instruction to the station.\n"
+        % (cupboard_ago(float(why.get("age") or 0)),
+           why.get("label") or kind, float(why.get("seconds") or 0),
+           int(why.get("aired") or 0), int(why.get("innings") or 1),
+           script, stops))
+    said = ""
+    try:
+        said = await ask_model(prompt, limit=220, spice=0.1,
+                               mark={"kind": "cupboard_judge"})
+    except Exception as exc:  # noqa: BLE001
+        said = ""
+        why["judge_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:140])
+    verdict, reason, does = "", "", ""
+    spare: list[str] = []
+    for line in str(said or "").splitlines():
+        line = line.strip().lstrip("-*# ").strip()
+        if not line:
+            continue
+        head, sep, tail = line.partition(":")
+        head = head.strip().upper().strip("*_ ")
+        if sep and head in ("VERDICT", "DECISION") and not verdict:
+            got = tail.strip().lower().strip("*_ .")
+            verdict = got.split()[0] if got else ""
+        elif sep and head in ("WHY", "REASON") and not reason:
+            reason = tail.strip()[:400]
+        elif sep and head in ("DO", "ACTION") and not does:
+            does = tail.strip()[:200]
+        else:
+            spare.append(line)
+    if verdict not in ("air", "replace", "hold"):
+        # An unreadable answer is not a verdict. Fall back to what the
+        # machine already knows rather than inventing one, and SAY that
+        # is what happened.
+        verdict = "hold" if why.get("blocked") else "air"
+        reason = reason or "; ".join(spare)[:400] or (
+            "the model did not answer at all; this is the machine's own "
+            "reading of its refusal reasons")
+    elif not reason:
+        # It kept the verdict line and dropped the contract for the rest.
+        # The prose it did write is worth more than an empty box.
+        reason = "; ".join(spare)[:400] or (
+            "the model gave a verdict and no reasoning" if said else
+            "the model call failed - this is not a judgement")
+    judged = {"at": time.time(), "verdict": verdict, "why": reason,
+              "do": does, "by": "orchestrator",
+              "raw": " ".join(str(said or "").split())[:600]}
+    try:
+        row["judged"] = judged
+        if isinstance(row.get("entry"), dict):
+            row["entry"]["judged"] = judged
+        _pantry_save(True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        judgment_note("cupboard_unheard",
+                      "should this unplayed %s round go out or be replaced?"
+                      % kind,
+                      "%s: %s" % (verdict, reason), "unheard:" + verdict,
+                      why.get("say") or "", True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pipeline_log("lookahead",
+                     "the orchestrator judged a %s round that had waited "
+                     "%s unheard: %s (#1260)"
+                     % (kind, cupboard_ago(float(why.get("age") or 0)),
+                        verdict),
+                     extra="WHY\n\n" + (reason or said or "")[:900])
+    except Exception:  # noqa: BLE001
+        pass
+    return {**judged, "item": why}
+
+
+@app.post("/api/cupboard/act")
+async def cupboard_act_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """#1260: do something about one unplayed item, from the desk.
+
+    play    - air it NOW, out of turn, through the rescue door. No new
+              powers: _ready_shelf_air(rescue=True, pick=row) still
+              refuses anything unfinished, and the station still has to
+              be on air with the floor free.
+    top     - move it to the head of its road's queue, so the next take
+              of any kind picks it. The shelf is strict FIFO, so this is
+              the whole of "cue it up".
+    judge   - the orchestrator examines it and records a verdict.
+    remove  - the existing retirement road, unchanged.
+    """
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    rid = str(body.get("id") or "")[:80]
+    action = str(body.get("action") or "")[:16].lower()
+    kind, row = cupboard_find(rid)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail="no such item in the cupboard - it may "
+                                   "have aired or been retired already")
+    if action == "remove":
+        got = retire_decide([rid], "remove", None)
+        return {"ok": True, "action": action, "id": rid, **got,
+                "say": "it is out of the cupboard"}
+    if action == "top":
+        rows = (_LARDER if kind == "banter" else shelf_rows(kind))
+        try:
+            rest = [r for r in rows if r is not row]
+            rows[:] = [row] + rest
+            _pantry_save(True)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500,
+                                detail="the queue would not move: %s"
+                                       % type(exc).__name__) from exc
+        note_action("you moved a %s round to the head of its queue" % kind)
+        return {"ok": True, "action": action, "id": rid, "kind": kind,
+                "item": cupboard_why_row(kind, row),
+                "say": "it is at the head of the %s queue - the next take "
+                       "of that road gets it" % kind}
+    if action == "judge":
+        got = await cupboard_judge(kind, row)
+        return {"ok": True, "action": action, "id": rid, "kind": kind, **got,
+                "say": "the orchestrator says %s: %s"
+                       % (got.get("verdict"), got.get("why") or "")}
+    if action == "play":
+        if kind not in RESCUE_ROADS_OPEN:
+            raise HTTPException(
+                status_code=400,
+                detail="%s cannot be aired out of turn - the roads that "
+                       "can are %s" % (retire_kind_label(kind),
+                                       ", ".join(RESCUE_ROADS_OPEN)))
+        if not _RADIO.get("on") or radio_paused():
+            raise HTTPException(status_code=409,
+                                detail="the station is not on air")
+        try:
+            said = await _ready_shelf_air(kind, _RADIO.get("now"),
+                                          rescue=True, pick=row)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500,
+                                detail="%s: %s" % (type(exc).__name__,
+                                                   str(exc)[:160])) from exc
+        if said:
+            _RESCUE_AT[0] = time.time()
+            _UNHEARD_AT[0] = time.time()
+            note_action("you put a waiting %s round on the air" % kind)
+            pipeline_log("air", "OPERATOR: a %s round that had waited on the "
+                                "shelf was put on the air by hand - %d "
+                                "line(s) (#1260)" % (kind, len(said)))
+        return {"ok": bool(said), "action": action, "id": rid, "kind": kind,
+                "lines": said,
+                "item": None if said else cupboard_why_row(kind, row),
+                "say": ("%d line(s) went out" % len(said)) if said else
+                       "the air's own door refused it - the reasons are on "
+                       "the item"}
+    raise HTTPException(status_code=400,
+                        detail="action is one of play, top, judge, remove")
+
 @app.post("/api/sfx/fill")
 async def sfx_fill_now_api(
     payload: dict[str, Any] | None = None,
@@ -137254,6 +138327,24 @@ RETIRE_PAGE_HTML = r"""<!doctype html>
   .empty { color: #7f93a8; padding: 10px 0; }
   .filters label { margin-right: 14px; font-size: 12px; color: #9fb3c8; }
   .note { color: #7f93a8; font-size: 11px; }
+  /* #1260: the why-drawer, and the stripe on anything never heard */
+  .chev { background: none; border: 0; color: #8fd3ff; padding: 0 4px; font-size: 12px; }
+  .chev:hover { color: #d6efff; }
+  tr.unheard td:first-child { box-shadow: inset 3px 0 0 #ffb347; }
+  tr.drawer > td { background: #080e18; border-bottom: 1px solid #1e2a3a; padding: 10px 14px; }
+  .reason { margin: 0 0 7px; padding-left: 12px; border-left: 2px solid #2c3d54; }
+  .reason b { color: #ffb347; font-weight: 600; }
+  .reason.clear b { color: #d1e8a2; }
+  .fix { color: #7f93a8; font-size: 12px; }
+  .drawer-acts { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .drawer-acts button { padding: 4px 10px; }
+  button.go { border-color: #2f6f8f; } button.go:hover { background: #12303f; }
+  .verdict { margin-top: 9px; padding: 8px 10px; background: #101a2a; border-radius: 6px; }
+  .verdict b { color: #8fd3ff; }
+  .banner { margin: 10px 0 0; padding: 9px 12px; border-radius: 7px;
+            background: #1a1408; border: 1px solid #4a3a12; color: #ffd479; }
+  .banner b { color: #ffb347; }
+  .banner .meta { color: #c8b184; }
 </style>
 </head>
 <body>
@@ -137274,11 +138365,17 @@ RETIRE_PAGE_HTML = r"""<!doctype html>
   <div id="pending"></div>
   <div class="h">Rules by type</div>
   <div id="rules"></div>
+  <div class="h">Never been on the air</div>
+  <div id="unheard"></div>
   <div class="h">Everything in the cupboard</div>
+  <div class="note">Click <b>why?</b> on any row to open what the station itself says about that item -
+  every reason it has not been played, asked of the same functions the air uses to decide it - and to play it now,
+  move it to the head of its queue, have the orchestrator judge it, or remove it.</div>
   <div class="filters">
     <label><input type="checkbox" id="fRhymed"> rhymed only</label>
     <label><input type="checkbox" id="fPending"> waiting only</label>
     <label><input type="checkbox" id="fAired"> aired only</label>
+    <label><input type="checkbox" id="fUnheard"> never heard</label>
     <span id="invCount" class="meta"></span>
   </div>
   <div id="inventory"></div>
@@ -137311,6 +138408,27 @@ function fmt(sec) {
 }
 function when(t) { return t ? new Date(t * 1000).toLocaleString() : ""; }
 let state = null, fetchedAt = 0, busy = false;
+/* #1260: which rows have their why-drawer open, and what is in them. */
+const openWhy = new Set();
+const whyCache = {};
+const CODE_FACE = {
+  never_asked_for: "Nothing asked for it",
+  no_slot: "Its slot never comes round",
+  too_long_for_its_slot: "Too long for the room its slot has left",
+  behind_others: "Behind others in the queue",
+  road_closed: "This road cannot air out of turn",
+  off_brief: "It failed its brief",
+  contract_moved: "Written under an older contract",
+  not_tinted: "The crystal has not finished with it",
+  unrendered: "Written but never recorded",
+  clip_gone: "Its recording has been pruned",
+  recast: "Recorded by a cast that has changed",
+  innings_used: "Its airings are used up",
+  resting: "Resting between airings",
+  single_use: "Heard once - this road does not repeat",
+  in_hand: "In hand for the air right now",
+  review_cancel: "A review has it marked for cancellation",
+};
 function lifeCell(sec, keepUntil) {
   const title = keepUntil ? "kept until " + when(keepUntil) : "";
   return '<span class="life" data-life="' + Number(sec || 0) + '" title="' + esc(title) + '">' + fmt(sec || 0) + '</span>';
@@ -137328,10 +138446,54 @@ function actions(id, kind, pending) {
         : '<button class="kp" data-act="keep" data-h="' + hours + '" data-id="' + esc(id) + '">Keep +' + hours + 'h</button>')
     + '<button class="kp" data-act="keep" data-h="168" data-id="' + esc(id) + '">Keep +7d</button></span>';
 }
-function itemCells(it) {
+function itemCells(it, askable) {
   return '<td><span class="badge">' + esc(it.label || it.kind) + '</span>' + (it.rhymed ? '<span class="badge r">♪ rhymed</span>' : '')
-    + (it.name ? '<div class="meta">' + esc(it.name) + '</div>' : '') + '</td>'
+    + (it.name ? '<div class="meta">' + esc(it.name) + '</div>' : '')
+    + (askable ? '<div><button class="chev" data-why="' + esc(it.id) + '">'
+        + (openWhy.has(it.id) ? 'hide why' : 'why?') + '</button></div>' : '') + '</td>'
     + '<td class="text">' + esc(it.text || "") + (it.why ? '<div class="why">' + esc(it.why) + '</div>' : '') + '</td>';
+}
+/* #1260: the drawer. Deliberately the station's own words - `say` and
+   `fix` come straight off cupboard_why_row, so what the desk explains
+   and what the air decided cannot drift apart. */
+function drawerRow(it, span) {
+  if (!openWhy.has(it.id)) return "";
+  const got = whyCache[it.id];
+  let body;
+  if (!got) body = '<span class="meta">asking the station…</span>';
+  else if (got.error) body = '<span class="why">' + esc(got.error) + '</span>';
+  else {
+    const w = got.item || {};
+    const rs = (w.reasons || []);
+    const d = w.door || null;
+    body = '<div class="meta">' + esc(w.label || w.kind) + ' · ' + Math.round(w.seconds || 0) + 's · '
+      + (w.never_heard ? 'never been on the air, waiting ' + fmt(w.age || 0)
+                       : (w.aired || 0) + ' airing(s), last ' + esc(when(w.aired_at)))
+      + (w.overdue ? ' · <b>past the dial</b>' : '') + '</div>'
+      + (rs.length ? rs.map((r) => '<div class="reason' + (r.code === "never_asked_for" ? ' clear' : '') + '">'
+            + '<b>' + esc(CODE_FACE[r.code] || r.code) + '</b> — ' + esc(r.say)
+            + (r.fix ? '<div class="fix">' + esc(r.fix) + '</div>' : '') + '</div>').join("")
+          : '<div class="reason clear"><b>Ready and next in line</b> — nothing is holding it.</div>')
+      + (d ? '<div class="meta">the running order is on <b>' + esc(d.slot_now || "another road") + '</b>; its own slot is '
+          + (d.on_its_slot ? 'live with ' + Math.round(d.room || 0) + 's of room left' : 'not live')
+          + ' · out-of-turn airing is ' + (d.road_open ? 'open' : 'CLOSED') + ' for this road</div>' : '')
+      + (w.judged ? verdictBox(w.judged) : '')
+      + (got.verdict ? verdictBox(got) : '');
+  }
+  return '<tr class="drawer"><td colspan="' + span + '">' + body
+    + '<div class="drawer-acts">'
+    + '<button class="go" data-cact="play" data-id="' + esc(it.id) + '">Play it now</button>'
+    + '<button class="go" data-cact="top" data-id="' + esc(it.id) + '">Send to the front of the queue</button>'
+    + '<button class="go" data-cact="judge" data-id="' + esc(it.id) + '">Ask the orchestrator to judge it</button>'
+    + '<button class="rm" data-cact="remove" data-id="' + esc(it.id) + '">Remove it</button>'
+    + '</div></td></tr>';
+}
+function verdictBox(v) {
+  return '<div class="verdict"><b>The orchestrator says: ' + esc(v.verdict || "") + '</b>'
+    + (v.why ? '<div>' + esc(v.why) + '</div>' : '')
+    + (v.do ? '<div class="fix">' + esc(v.do) + '</div>' : '')
+    + ((!v.why && v.raw) ? '<div class="fix">' + esc(v.raw) + '</div>' : '')
+    + '<div class="meta">' + esc(when(v.at)) + '</div></div>';
 }
 function render() {
   if (!state) return;
@@ -137356,23 +138518,54 @@ function render() {
       + '<td class="meta">' + esc(r.clocks) + '</td>'
       + '<td><button data-save="' + esc(r.kind) + '">Save</button></td></tr>').join("") + '</table>';
   const fR = document.getElementById("fRhymed").checked, fP = document.getElementById("fPending").checked, fA = document.getElementById("fAired").checked;
-  const inv = (state.inventory || []).filter((i) => (!fR || i.rhymed) && (!fP || i.pending) && (!fA || i.aired));
+  const fU = document.getElementById("fUnheard").checked;
+  const inv = (state.inventory || []).filter((i) => (!fR || i.rhymed) && (!fP || i.pending) && (!fA || i.aired) && (!fU || !i.aired));
   document.getElementById("invCount").textContent = inv.length + " shown";
   document.getElementById("inventory").innerHTML = inv.length ? '<table><tr><th>type</th><th>round</th><th>stage</th><th>airings</th><th>age</th><th>life</th><th>decision</th><th></th></tr>'
-    + inv.map((i) => '<tr class="' + (i.pending ? 'pending' : '') + (i.rhymed ? ' rhymed' : '') + '">' + itemCells(i)
+    + inv.map((i) => '<tr class="' + (i.pending ? 'pending' : '') + (i.rhymed ? ' rhymed' : '') + (i.aired ? '' : ' unheard') + '">' + itemCells(i, true)
       + '<td>' + esc(i.stage) + '</td>'
       + '<td>' + (i.aired || 0) + '/' + (i.innings || 1) + (i.rest_left ? '<div class="meta">rests ' + fmt(i.rest_left) + '</div>' : '') + '</td>'
       + '<td class="meta">' + fmt(i.age || 0) + '</td>'
       + '<td>' + lifeCell(i.life_left, i.keep_until) + '</td>'
       + '<td class="meta">' + esc(i.pending ? "waiting for you" : i.decision || "") + (i.kept_times ? ' · kept ' + i.kept_times + '×' : '') + '</td>'
-      + '<td>' + actions(i.id, i.kind, i.pending) + '</td></tr>').join("") + '</table>'
+      + '<td>' + actions(i.id, i.kind, i.pending) + '</td></tr>'
+      + drawerRow(i, 8)).join("") + '</table>'
     : '<div class="empty">Nothing matches.</div>';
+  renderUnheard();
   const dec = state.decided || [];
   document.getElementById("decided").innerHTML = dec.length ? '<table><tr><th>when</th><th>type</th><th>round</th><th>what</th></tr>'
     + dec.map((d) => '<tr>' + '<td class="meta">' + esc(when(d.decided_at || d.last_asked)) + '</td>' + itemCells(d).replace('<td class="text">', '<td class="text">')
       + '<td class="meta">' + esc({remove: 'removed', keep: 'kept ' + (d.keep_hours ? '+' + d.keep_hours + 'h' : ''), forced: 'REMOVED BY A CEILING', gone: 'left by another road'}[d.state] || d.state) + '</td></tr>').join("") + '</table>'
     : '<div class="empty">No decisions yet.</div>';
   tick();
+}
+/* #1260: the census the operator actually asked for - what is sitting
+   there for days and days without being used, per road, and whether
+   anything at all is currently spending it. */
+function renderUnheard() {
+  const el = document.getElementById("unheard");
+  if (!el) return;
+  const u = unheard;
+  if (!u) { el.innerHTML = '<div class="empty">Reading the shelves…</div>'; return; }
+  const roads = (u.roads || []).filter((r) => r.unheard);
+  el.innerHTML = '<div class="banner"><b>' + (u.ready || 0) + ' finished round(s) have never been on the air</b>'
+      + ((u.overdue || 0) ? ' — <b>' + u.overdue + '</b> of them have waited longer than the ' + fmt(u.after || 0) + ' the dial allows' : '')
+      + ((u.oldest || 0) ? '; the oldest has waited ' + fmt(u.oldest) : '') + '.'
+      + '<div class="meta">' + (u.on
+          ? 'The station is airing the longest-waiting one out of turn, at most one every ' + fmt(u.every || 0) + '.'
+          : 'Airing them out of turn is SWITCHED OFF — nothing is spending them but the running order.')
+      + ((u.shut_roads || []).length ? ' ' + esc(u.shut_roads.join(", ")) + ' cannot air out of turn at all.' : '')
+      + '</div></div>'
+    + (roads.length ? '<table><tr><th>road</th><th>never heard</th><th>of those, airable</th><th>past the dial</th><th>oldest</th><th>airtime held</th><th>out of turn</th></tr>'
+        + roads.map((r) => '<tr><td><b>' + esc(r.label) + '</b><div class="meta">' + esc(r.kind) + '</div></td>'
+          + '<td>' + r.unheard + ' of ' + r.rows + '</td><td>' + r.ready + '</td>'
+          + '<td>' + (r.overdue ? '<span class="why">' + r.overdue + '</span>' : '0') + '</td>'
+          + '<td class="meta">' + fmt(r.oldest || 0) + '</td>'
+          + '<td class="meta">' + fmt(r.seconds || 0) + '</td>'
+          + '<td class="meta">' + (r.road_open ? 'open' : '<span class="why">closed</span>') + '</td></tr>').join("")
+        + '</table>' : '<div class="empty">Everything finished has been on the air.</div>')
+    + '<div class="drawer-acts"><button class="go" id="airOldest">Air the longest-waiting one now</button>'
+    + '<button class="go" id="judgeOldest">Ask the orchestrator about the backlog</button></div>';
 }
 function tick() {
   const dt = (Date.now() - fetchedAt) / 1000;
@@ -137383,8 +138576,13 @@ function tick() {
   });
 }
 setInterval(tick, 1000);
+let unheard = null;
 async function load() {
-  try { state = await api("/api/retire"); fetchedAt = Date.now(); render(); }
+  try {
+    state = await api("/api/retire"); fetchedAt = Date.now();
+    try { unheard = await api("/api/cupboard/unheard"); } catch (e) { unheard = null; }
+    render();
+  }
   catch (e) { document.getElementById("pending").innerHTML = '<div class="empty">The desk could not be read: ' + esc(e.message) + (KEY ? '' : ' - open this page with ?key=YOUR_KEY') + '</div>'; }
 }
 async function decide(ids, action, hours) {
@@ -137393,8 +138591,45 @@ async function decide(ids, action, hours) {
   catch (e) { alert("The desk refused: " + e.message); }
   finally { busy = false; }
 }
+/* #1260 */
+async function loadWhy(id) {
+  try { whyCache[id] = await api("/api/cupboard/why?id=" + encodeURIComponent(id)); }
+  catch (e) { whyCache[id] = {error: e.message}; }
+  render();
+}
+async function cupboardAct(id, action) {
+  if (busy) return; busy = true;
+  const before = whyCache[id];
+  whyCache[id] = {error: "working…"};
+  render();
+  try {
+    const got = await api("/api/cupboard/act", {id, action});
+    if (action === "remove") { openWhy.delete(id); delete whyCache[id]; await load(); return; }
+    if (action === "judge") { whyCache[id] = {item: (before || {}).item, verdict: got.verdict, why: got.why, do: got.do, at: got.at}; }
+    else { whyCache[id] = {error: got.say}; }
+    render();
+    await load();
+    await loadWhy(id);
+  } catch (e) { whyCache[id] = {error: e.message}; render(); }
+  finally { busy = false; }
+}
 document.addEventListener("click", async (ev) => {
   const b = ev.target.closest("button"); if (!b) return;
+  if (b.id === "airOldest" || b.id === "judgeOldest") {
+    const first = (state.inventory || []).filter((i) => !i.aired)
+      .sort((x, y) => (y.age || 0) - (x.age || 0))[0];
+    if (!first) { alert("Nothing in the cupboard is unheard."); return; }
+    openWhy.add(first.id); render();
+    await cupboardAct(first.id, b.id === "airOldest" ? "play" : "judge");
+    return;
+  }
+  if (b.dataset.why) {
+    const id = b.dataset.why;
+    if (openWhy.has(id)) { openWhy.delete(id); render(); }
+    else { openWhy.add(id); render(); await loadWhy(id); }
+    return;
+  }
+  if (b.dataset.cact) { await cupboardAct(b.dataset.id, b.dataset.cact); return; }
   if (b.dataset.act) { await decide([b.dataset.id], b.dataset.act, b.dataset.h ? Number(b.dataset.h) : null); return; }
   if (b.dataset.save) {
     const kind = b.dataset.save;
@@ -137406,7 +138641,7 @@ document.addEventListener("click", async (ev) => {
 document.getElementById("refresh").onclick = load;
 document.getElementById("removeAll").onclick = () => { if (confirm("Remove every waiting item from the cupboard?")) decide((state.pending || []).map((p) => p.id), "remove", null); };
 document.getElementById("keepAll").onclick = () => decide((state.pending || []).map((p) => p.id), "keep", null);
-["fRhymed", "fPending", "fAired"].forEach((id) => document.getElementById(id).onchange = render);
+["fRhymed", "fPending", "fAired", "fUnheard"].forEach((id) => document.getElementById(id).onchange = render);
 load();
 setInterval(load, 15000);
 </script>
@@ -163040,8 +164275,48 @@ let glyPollTimer = null;
 let glyLast = null;
 let glyConsoleOpen = false;
 
+/* WHERE HE WAS PUT AWAY, remembered per screen. The tablet on the wall can
+ * do without him while the desktop beside it keeps him. */
+function glyphyShut(on) {
+  try { localStorage.setItem("glyphyShut", on ? "1" : "0"); }
+  catch (e) { /* a preference is not worth an exception */ }
+}
+
+function glyphyIsShut() {
+  try { return localStorage.getItem("glyphyShut") === "1"; }
+  catch (e) { return false; }
+}
+
+/* THE WAY BACK. glyphyMount is called once at boot and nothing else can
+ * summon him, so an X that only removed him would remove him until somebody
+ * cleared localStorage by hand. This is what is left behind: a dot where he
+ * was, one tap from having him back. */
+function glyphyDot() {
+  if (document.getElementById("glyphyDot")) return;
+  const dot = document.createElement("button");
+  dot.id = "glyphyDot";
+  let left = 18, top = 16;
+  try {
+    const saved = JSON.parse(localStorage.getItem("glyphyAt") || "null");
+    if (saved && Number.isFinite(saved.x)) { left = saved.x; top = saved.y; }
+  } catch (e) { /* first run */ }
+  dot.style.cssText = "position:fixed;left:" + left + "px;top:" + top
+    + "px;z-index:180;width:26px;height:26px;padding:0;line-height:1;"
+    + "border-radius:50%;background:#070c12e8;border:1px solid #1b2c3c;"
+    + "color:#8ba0b5;font-size:13px;cursor:pointer;box-shadow:0 6px 18px #0009";
+  dot.textContent = "\u25CE";
+  dot.title = "Bring the conductor back";
+  dot.onclick = () => {
+    dot.remove();
+    glyphyShut(false);
+    glyphyMount();
+  };
+  document.body.appendChild(dot);
+}
+
 function glyphyMount() {
   if (document.getElementById("glyphy")) return;
+  if (glyphyIsShut()) { glyphyDot(); return; }
   const box = document.createElement("div");
   box.id = "glyphy";
   /* The area the operator outlined: top-left of the panel's own content,
@@ -163056,7 +164331,11 @@ function glyphyMount() {
   box.style.cssText = "position:fixed;left:" + left + "px;top:" + top
     + "px;z-index:180;background:#070c12e8;border:1px solid #1b2c3c;"
     + "border-radius:9px;padding:7px 9px 6px;cursor:pointer;"
-    + "box-shadow:0 10px 30px #0009;user-select:none;min-width:196px";
+    /* touch-action:none or the drag below never starts on a touch screen:
+       Chromium decides the gesture is a scroll, fires pointercancel, and the
+       card stops dead a few pixels in. The same lesson as the sampler feed. */
+    + "box-shadow:0 10px 30px #0009;user-select:none;min-width:196px;"
+    + "touch-action:none";
   const pre = document.createElement("pre");
   pre.id = "glyphyFace";
   pre.style.cssText = "margin:0;font-family:ui-monospace,Consolas,"
@@ -163082,6 +164361,32 @@ function glyphyMount() {
     + "monospace;font-size:9.5px;line-height:1.45;color:#9db4c8;"
     + "width:min(560px,46vw);max-height:76px;overflow:hidden";
   box.appendChild(con);
+  /* THE X, in the corner, where a thing you want gone is looked for. It is
+   * absolutely positioned inside a fixed box - which is its own containing
+   * block - so it needs no other change to the card. */
+  const shut = document.createElement("button");
+  shut.id = "glyphyClose";
+  shut.textContent = "\u00d7";
+  shut.title = "Put the conductor away. A dot is left where he was.";
+  shut.setAttribute("aria-label", "Put the conductor away");
+  shut.style.cssText = "position:absolute;top:2px;right:2px;width:22px;"
+    + "height:22px;padding:0;line-height:1;border:0;border-radius:6px;"
+    + "background:transparent;color:#8ba0b5;font-size:15px;cursor:pointer;"
+    + "opacity:.55";
+  shut.onmouseenter = () => { shut.style.opacity = "1"; };
+  shut.onmouseleave = () => { shut.style.opacity = ".55"; };
+  /* Both stopped: the card's own click opens the console, and a pointerdown
+   * that reaches the card starts a drag - so an X that did not swallow them
+   * would slide the card and open the console on its way out. */
+  shut.onpointerdown = (ev) => ev.stopPropagation();
+  shut.onclick = (ev) => {
+    ev.stopPropagation();
+    box.remove();
+    glyphyShut(true);
+    glyphyDot();
+  };
+  box.appendChild(shut);
+
   box.title = "Glyphy, the conductor \u2014 click for the console of "
     + "everything the coordinator is carrying out. Drag to move him.";
   box.onclick = (ev) => {
@@ -163091,22 +164396,38 @@ function glyphyMount() {
     con.style.display = glyConsoleOpen ? "block" : "none";
     glyphyPaint(glyLast);
   };
-  /* Drag, remembered. */
+  /* DRAG, REMEMBERED - AND ON POINTER EVENTS, so a finger can move him.
+   *
+   * This was `onmousedown` with mousemove/mouseup, which a touch screen never
+   * sends: on the tablet, the one place the comment above cared about, he
+   * could not be moved at all. Pointer events cover mouse, touch and pen from
+   * one set of handlers.
+   *
+   * He is also kept ON the glass. The old version clamped only the top and
+   * left, so he could be pushed off the right-hand edge of a 9" screen and
+   * left there - remembered, and unreachable. */
   let sx = 0, sy = 0, ox = 0, oy = 0, down = false;
-  box.onmousedown = (ev) => {
+  box.onpointerdown = (ev) => {
     down = true; sx = ev.clientX; sy = ev.clientY;
     ox = parseInt(box.style.left, 10) || 0;
     oy = parseInt(box.style.top, 10) || 0;
+    /* Capture so the drag survives the pointer leaving the card, which it
+       does immediately on a small screen. Captured events still bubble, so
+       the document listeners below keep working. */
+    try { box.setPointerCapture(ev.pointerId); } catch (e) { /* mouse */ }
   };
-  document.addEventListener("mousemove", (ev) => {
+  document.addEventListener("pointermove", (ev) => {
     if (!down) return;
     const dx = ev.clientX - sx;
     const dy = ev.clientY - sy;
     if (Math.abs(dx) + Math.abs(dy) > 3) box.dataset.dragged = "1";
-    box.style.left = Math.max(0, ox + dx) + "px";
-    box.style.top = Math.max(0, oy + dy) + "px";
+    const room = box.getBoundingClientRect();
+    const capX = Math.max(0, window.innerWidth - room.width);
+    const capY = Math.max(0, window.innerHeight - room.height);
+    box.style.left = Math.min(capX, Math.max(0, ox + dx)) + "px";
+    box.style.top = Math.min(capY, Math.max(0, oy + dy)) + "px";
   });
-  document.addEventListener("mouseup", () => {
+  document.addEventListener("pointerup", () => {
     if (!down) return;
     down = false;
     try {
@@ -177909,6 +179230,20 @@ let orchCard = null;
 let orchSnooze = 0;
 let orchPlex = null;
 
+/* HAS THIS SCREEN ASKED FOR QUIET?
+ *
+ * The key is set by the X in the corner of a notice - see
+ * frontend/rejection-review.js, which raised the question first. It is
+ * localStorage, so it is per screen by nature: the tablet on the wall can
+ * give notices up while the desktop beside it keeps them.
+ *
+ * Read fresh each time rather than cached at load, so switching it off takes
+ * effect on the next notice instead of the next reload. */
+function pineNoticesOff() {
+  try { return localStorage.getItem("pine-notices-off:" + location.origin) === "1"; }
+  catch (e) { return false; }
+}
+
 function orchCardHide() {
   if (orchCard) { orchCard.remove(); orchCard = null; }
 }
@@ -178645,6 +179980,12 @@ async function orchToast() {
   if (!data) return;
   const rows = data.rows || [];
   if (!rows.length || Date.now() < orchSnooze) { orchCardHide(); return; }
+  /* This is advice about work that will still be there in an hour, so a
+   * screen that has asked for quiet gets it. The asks themselves are
+   * untouched and still reachable from the console - only the interruption
+   * stops. Note the wedge card below does NOT do this: dead air is an alarm,
+   * not advice. */
+  if (pineNoticesOff()) { orchCardHide(); return; }
   const row = rows[0];
   if (orchCard && orchCard.dataset.ask === String(row.id)) return;
   orchCardHide();
