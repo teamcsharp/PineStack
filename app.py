@@ -19385,6 +19385,18 @@ async def _floor_take(label: str = "") -> bool:
     """Hold the air for one round. Returns whether THIS frame took it -
     hand that to _floor_drop, so a re-entrant inner call never releases
     its outer round's hold."""
+    # #1246: THE LOADING TIME. A writer takes the floor when something
+    # has to be MADE before it can sound, and #1146 measured that hold
+    # at six to seventy-eight seconds a line - the longest and most
+    # reliable hole the station produces, many times an hour, and until
+    # now filled only by a watchdog noticing the silence afterwards.
+    # Asked before the wait, not after it.
+    try:
+        if not _floor_busy():
+            sfx_punctuate("the floor is being taken for " + str(label)[:60])
+    except Exception:  # noqa: BLE001
+        pass
+
     cur = asyncio.current_task()
     if _FLOOR_OWNER.get("task") is cur:
         return False
@@ -63055,7 +63067,14 @@ async def sfx_fill_over_music() -> str:
     try:
         if radio_paused() or not _RADIO.get("on") or _SPEAKING[0]:
             return ""
+        # #1245: ...and when the dialogue clock is unusable, ask the one
+        # that works. dialogue_quiet_for returns -1 whenever no speech
+        # delivery has been acknowledged audible - which is the state
+        # the station was actually in - and -1 is below every threshold,
+        # so this road returned immediately, every tick, for ever.
         mute = dialogue_quiet_for()
+        if mute < 0:
+            mute = talk_quiet_for()
         if mute < sfx_music_notice():
             return ""
         if time.time() - float(_SFX_GAP.get("music_at") or 0) < sfx_music_rest():
@@ -63073,6 +63092,37 @@ async def sfx_fill_over_music() -> str:
         return went
     except Exception:  # noqa: BLE001
         return ""
+
+
+SFX_SOLD_PATIENT = 1.5          # how far ahead the air may be sold, at rest
+SFX_SOLD_ANXIOUS = 25.0         # ...and at full anxiety
+SFX_WAITING_CAP = 4             # clips already handed over, at any anxiety
+
+
+def sfx_sold_tolerance() -> float:
+    """#1247: how much already-sold air he will still punctuate over.
+
+    The gate this replaces was a flat 1.5 seconds, written against a
+    watchdog laying whole RUNS of gold on top of sounding audio. One
+    clip queued behind thirteen seconds of sold air is not that - it is
+    the interjection at the join the operator keeps asking for, and the
+    flat rule refused it every single time on a station where something
+    is nearly always queued."""
+    anx = sfx_anxiety()
+    return SFX_SOLD_PATIENT + (SFX_SOLD_ANXIOUS - SFX_SOLD_PATIENT) * anx
+
+
+def sfx_queue_deep() -> int:
+    """#1247: clips handed to the page and not yet started.
+
+    THIS is what the old gate was really protecting - a pile-up - and
+    it is a count rather than a clock, so a slow page cannot talk its
+    way past it the way a stretching air cursor could."""
+    try:
+        return sum(1 for r in _PAGE_DELIVERIES.values()
+                   if str(r.get("state") or "") == "received")
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def sfx_gap_burst() -> int:
@@ -63147,6 +63197,101 @@ async def sfxguy_gap_talk(why: str = "", floorless: bool = False) -> str:
         return _no("raised " + type(exc).__name__)
 
 
+_SFX_PUNCTUATING = [False]      # #1246: one join's clip at a time
+
+
+def sfx_punctuate(why: str) -> None:
+    """#1246: the SFX Guy gets first refusal on a JOIN.
+
+    Fire-and-forget on purpose. A join must never wait for a sample and
+    a sample must never delay the round behind it, so this hands the
+    work to the loop and returns at once. Every gate that protects a
+    live voice is inside sfx_fill_gap, and the rest between clips is
+    still the operator's dial - so this makes him ASKED more often, not
+    louder."""
+    try:
+        if not _RADIO.get("on") or radio_paused():
+            return
+        # #1246: NOT FROM INSIDE ITS OWN WORK. sfx_fill_gap can reach
+        # dj_speak, dj_speak takes the floor, and _floor_take is one of
+        # the two doors that calls this - so without a latch a join
+        # could ask for a clip whose own airing asks for another. The
+        # rest between clips would bound it in practice; a latch bounds
+        # it on purpose.
+        if _SFX_PUNCTUATING[0]:
+            return
+        _SFX_PUNCTUATING[0] = True
+
+        async def _one() -> None:
+            try:
+                await sfx_fill_gap(why, under_floor=True)
+            finally:
+                _SFX_PUNCTUATING[0] = False
+
+        fire_and_forget(_one())
+    except Exception:  # noqa: BLE001
+        _SFX_PUNCTUATING[0] = False
+        pass                    # a join is never worth an exception
+
+
+SFX_WATCH_TICK = 2.0
+_SFX_WATCH: dict[str, Any] = {"at": 0.0, "ticks": 0, "fired": 0,
+                              "quiet": 0.0, "why": "not started"}
+
+
+async def sfx_guy_watch() -> None:
+    """#1245: THE SFX GUY'S OWN WATCH - his job, nobody else's.
+
+    He had no road of his own. dead_air_watch ends its pass the moment
+    a record is playing (#1235); the cure written for that is gated on
+    dialogue_quiet_for(), which returns -1 whenever no speech delivery
+    has been acknowledged audible - and -1 is below every threshold. So
+    both his doors were held shut by a clock that was not working, and
+    sfx_fill_gap had been ENTERED once in ten minutes while the dial
+    sat at 70 and 7,180 clips waited.
+
+    talk_quiet_for() is the clock that answers "is anyone talking". Its
+    own docstring says air_quiet_for is "useless" for that because a
+    spinning record counts as air, and that both existing watchdogs are
+    gated on it, "which is why neither has ever seen this". It is
+    anchored on _LAST_SAID, so no page and no acknowledgment can break
+    it.
+
+    Two seconds a tick. Everything that protects a live voice is still
+    inside sfx_fill_gap, which is why this can afford to simply ask."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await asyncio.sleep(SFX_WATCH_TICK)
+            _SFX_WATCH["ticks"] = int(_SFX_WATCH.get("ticks") or 0) + 1
+            if radio_paused() or not _RADIO.get("on"):
+                _SFX_WATCH["why"] = "the station is off air"
+                continue
+            quiet = talk_quiet_for()
+            _SFX_WATCH["quiet"] = round(quiet, 1)
+            need = sfx_gap_notice()
+            if quiet < need:
+                _SFX_WATCH["why"] = ("somebody is talking (%.0fs of %.0fs)"
+                                     % (quiet, need))
+                continue
+            went = await sfx_fill_gap(
+                "nobody has said anything for %ds" % int(quiet),
+                under_floor=True)
+            if went:
+                _SFX_WATCH["fired"] = int(_SFX_WATCH.get("fired") or 0) + 1
+                _SFX_WATCH["at"] = time.time()
+                _SFX_WATCH["why"] = "fired a " + str(went)
+            else:
+                _SFX_WATCH["why"] = ("quiet %ds but the filler declined: %s"
+                                     % (int(quiet),
+                                        str(_SFX_GAP.get("gate") or "?")))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _SFX_WATCH["why"] = "raised " + type(exc).__name__
+            await asyncio.sleep(5.0)
+
+
 async def sfx_fill_gap(why: str = "", under_floor: bool = False,
                        clips_only: bool = False,
                        ignore_rest: bool = False) -> str:
@@ -63164,16 +63309,21 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
     (both are clips that already exist, on the floorless road); only the
     liner waits, because a liner is written and would queue behind the
     round it is covering for."""
+    def _no(gate: str) -> str:
+        # #1245: eight silent returns, and no way to answer "why am I
+        # not hearing clips" but to guess which one fired.
+        _SFX_GAP["gate"] = gate
+        return ""
     try:
         if radio_paused() or not _RADIO.get("on"):
-            return ""
+            return _no("the station is off air or paused")
         if _SPEAKING[0]:
-            return ""
+            return _no("somebody is speaking")
         floor_held = _floor_busy()
         if floor_held and not under_floor:
-            return ""
+            return _no("a writer holds the floor")
         if time.time() - _SPOKE_AT[0] < 2.5:
-            return ""
+            return _no("a line was queued less than 2.5s ago")
         # 2026-09-09: AIR ALREADY SOLD IS NOT DEAD AIR. The run below sells
         # up to forty-five seconds ahead on the page road, and a listener
         # whose client has not acknowledged playout yet leaves
@@ -63182,14 +63332,26 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
         # already sounding. The cursor is the truth: while it is in the
         # future, somebody is talking.
         try:
-            if float(_PAGE_AIR_UNTIL[0] or 0) - time.time() > 1.5:
-                return ""
+            # #1247: a PILE-UP is the fault, not a punctuation. The
+            # flat 1.5s here refused him whenever anything at all was
+            # queued, which on a talk station is nearly always - so the
+            # dial, the watch and seven thousand clips were all sitting
+            # behind one `return`.
+            _ahead = float(_PAGE_AIR_UNTIL[0] or 0) - time.time()
+            if _ahead > sfx_sold_tolerance():
+                return _no("the air is already sold %.0fs ahead (allowing "
+                           "%.0fs)" % (_ahead, sfx_sold_tolerance()))
+            _deep = sfx_queue_deep()
+            if _deep >= SFX_WAITING_CAP:
+                return _no("%d clip(s) already waiting on the page"
+                           % _deep)
         except Exception:  # noqa: BLE001
             pass
         rest = sfx_gap_rest()                      # #1232: the dial
         if (not ignore_rest
                 and time.time() - float(_SFX_GAP.get("at") or 0) < rest):
-            return ""
+            return _no("resting - %.1fs of %.1fs"
+                       % (time.time() - float(_SFX_GAP.get("at") or 0), rest))
         _SFX_GAP["at"] = time.time()
         _SFX_GAP["turn"] = int(_SFX_GAP.get("turn") or 0) + 1
         vto = _RADIO.get("voice_to") or "box"
@@ -63299,9 +63461,14 @@ def sfx_gap_status() -> dict[str, Any]:
     # #1232: the numbers the dial is actually producing, not the constant
     # it used to report - which was never the rest in force anyway.
     anx = sfx_anxiety()
-    return {**_SFX_GAP, "rest": round(sfx_gap_rest(), 2),
+    return {**_SFX_GAP, "watch": dict(_SFX_WATCH),      # #1245
+            "talk_quiet": round(talk_quiet_for(), 1),
+            "rest": round(sfx_gap_rest(), 2),
             "anxiety": int(round(anx * 100)),
             "notices_after": round(sfx_gap_notice(), 1),
+            "sold_tolerance": round(sfx_sold_tolerance(), 1),   # #1247
+            "queue_deep": sfx_queue_deep(),
+            "queue_cap": SFX_WAITING_CAP,
             "notices_over_music_after": round(sfx_music_notice(), 1),
             "rest_over_music": round(sfx_music_rest(), 1),
             "clips_per_fill": sfx_gap_burst(),
@@ -80683,6 +80850,14 @@ async def _banter_air(entry: dict[str, Any],
                 speakbox_remember({"file": swath.get("file", ""),
                                    "text": " ".join(said_lines),
                                    "lines": said_lines})
+    # #1246: A DIALOGUE CHAIN HAS JUST COMPLETED. This is the one door
+    # every prepared and every live round leaves by, so this is the
+    # join at the end of banter, the manager, the gallery, news and a
+    # call alike - and it is the operator's "any time a script is
+    # completed or any segment is completed".
+    if spoken:
+        sfx_punctuate("a %s round just finished"
+                      % (str((entry or {}).get("prep_kind") or "") or "talk"))
     return spoken
 
 
@@ -114323,6 +114498,11 @@ async def _startup_air_watch() -> None:
 @app.on_event("startup")
 async def _startup_topic_cooker() -> None:
     fire_and_forget(topic_cooker())
+
+
+@app.on_event("startup")
+async def _startup_sfx_guy_watch() -> None:
+    fire_and_forget(sfx_guy_watch())            # #1245
 
 
 async def air_relieve_hold(seconds: float = 60.0) -> None:
@@ -188410,7 +188590,25 @@ function mpxBuildTip() {
 }
 async function mpxPoll() {
   try {
-    const s = await api("/api/dj");
+    /* #1233: THE SECOND /api/dj POLLER, AND IT DOES NOT NEED TO BE ONE.
+     *
+     * pollDJ already fetches this exact route every four seconds and
+     * leaves the answer in djLastState with djStateAt stamped beside it.
+     * This meter was fetching the whole state again every TWO seconds -
+     * measured 2026-09-12 at 88 kB a time after the #1233 trim, 310 kB
+     * before it - to read `s.activity`, which is about 200 bytes and
+     * whose own freshness test below allows six seconds.
+     *
+     * Between them the two pollers asked for /api/dj 45 times a minute
+     * on a link that carries about 400 kB/s, and everything the operator
+     * tapped queued behind that. So this one takes what has already
+     * arrived whenever it is younger than the poll that fetched it, and
+     * goes to the wire only when pollDJ has gone quiet - which is itself
+     * worth knowing, because the meter should not freeze silently. */
+    let s = djLastState;
+    if (!s || !djStateAt || (Date.now() - djStateAt) > 3500) {
+      s = await api("/api/dj");
+    }
     MPX.state = s;
     // #655: the engineering half of the story lives on the pipeline feed.
     // Only fetched while the card is actually open, so the extra request
