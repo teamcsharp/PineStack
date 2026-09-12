@@ -9134,6 +9134,14 @@ def page_wedge_state() -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 continue
         out["heard_at"] = round(heard_at, 1)
+        # #1239: the clock above needs to know somebody is out there to
+        # have heard anything. Stamped once, here, where the listener
+        # count is already computed.
+        try:
+            if not _LISTENERS_SEEN[0] and len(_listeners_live()) > 0:
+                _LISTENERS_SEEN[0] = time.time()
+        except Exception:  # noqa: BLE001
+            pass
         # #1231: and when the pair were last HEARD, which is a different
         # question from whether anything at all is sounding.
         out["dialogue_quiet"] = round(dialogue_quiet_for(), 1)
@@ -13821,6 +13829,15 @@ SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 8, "caller": 8,
 # pantry_seconds() against prepare_target_seconds(), and the six-gigabyte
 # allowance below that.
 SHELF_ROW_CEILING = 3
+# #1237: what the FILLER roads are called when a verdict has to name
+# the thing that took an entry's window. Separate from SHELF_LABEL,
+# which lists prepared roads that have a shelf - none of these do.
+ROUND_LABEL = {
+    "gold": "the rhyme bank",
+    "cover": "a live cover line",
+    "sfxguy": "the SFX Guy",
+    "banter": "unnamed conversation",
+}
 SHELF_LABEL = {"ad": "an advert", "station_id": "a station ID",
                "manager": "a message from upstairs",
                "caller": "a phone call",
@@ -21910,15 +21927,38 @@ def _acknowledge_delivery_lines(delivery_id: str, clip: dict[str, Any],
 # now made four times.
 _DIALOGUE_HEARD = [0.0]
 DIALOGUE_QUIET_ALARM = 300.0           # five minutes without a word
+# #1239: and how long a station that has NEVER been heard is given
+# before that counts. A page has to load, fetch a clip and start it,
+# and a listener can arrive at a genuinely silent moment - but this
+# ends, which is the whole defect it was written for.
+DIALOGUE_FIRST_GRACE = 90.0
+_LISTENERS_SEEN = [0.0]                # when listeners were first noticed
 
 
 def dialogue_quiet_for() -> float:
     """Seconds since a listener last reported hearing the pair talk.
 
-    -1 when nobody has reported one yet, which is not silence - it is a
-    station that has just started or has no listeners."""
+    -1 when nobody has reported one yet AND there is nobody to report -
+    a station that has just started, or one with no listeners, is not a
+    silent one.
+
+    #1239: but with listeners connected and the process up past
+    DIALOGUE_FIRST_GRACE, "never heard" stops being an exemption and
+    becomes the WORST reading this can take - measured from the later
+    of process start and the moment listeners were first seen. That is
+    the exact state the operator found: on, unpaused, three listeners,
+    clips going out, not one acknowledged, and health reassuring him
+    about the first minute after a restart for a hundred seconds."""
+    now = time.time()
     at = float(_DIALOGUE_HEARD[0] or 0)
-    return (time.time() - at) if at else -1.0
+    if at:
+        return now - at
+    seen = float(_LISTENERS_SEEN[0] or 0)
+    if not seen:
+        return -1.0
+    began = max(seen, _BUILD_MS / 1000.0)
+    waited = now - began
+    return waited if waited >= DIALOGUE_FIRST_GRACE else -1.0
 
 
 def page_playback_ack(payload: Any, addr: str = "",
@@ -24304,7 +24344,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    name: str = "", source_text: str = "",
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
-                   checked: bool = False, remember_text: str = "") -> str:
+                   checked: bool = False, remember_text: str = "",
+                   round_as: str = "") -> str:
     """#1146: the floor door for single lines. A cover, a news line or an
     interjection waits for the round that has the air instead of landing
     in the middle of it. Re-entrant: the recovery road inside a round is
@@ -24316,14 +24357,14 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             kind, track, extra=extra, line=line, who=who, voice=voice,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
-            checked=checked, remember_text=remember_text)
+            checked=checked, remember_text=remember_text, round_as=round_as)
     _owned = await _floor_take(f"a {kind} line from {who}")
     try:
         return await _dj_speak_floorless(
             kind, track, extra=extra, line=line, who=who, voice=voice,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
-            checked=checked, remember_text=remember_text)
+            checked=checked, remember_text=remember_text, round_as=round_as)
     finally:
         _floor_drop(_owned)
 
@@ -24336,7 +24377,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                    name: str = "", source_text: str = "",
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
-                   checked: bool = False, remember_text: str = "") -> str:
+                   checked: bool = False, remember_text: str = "",
+                   round_as: str = "") -> str:
     """Say it, log it to the chat channel so the panel can show the patter.
     `who` is "dj" or "cohost" — the co-host has his own voice so the two are
     told apart by ear, not only by the transcript. `source` is the speakbox
@@ -25047,7 +25089,12 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         "id": line_id,                                            # #742
         "ts": int(time.time()), "who": who, "kind": kind, "text": spoken,
         "air_at": _air_at or time.time(),                          # #770
-        "round": airlog_round_for(kind, who, name),              # #1023 (G1)
+        # #1237: the dispatching road may NAME itself. `interject` is
+        # the kind airlog_round_for refuses to name - it defers to the
+        # stale hint, or to "banter", which is the residue bucket
+        # wearing a real road's name. A filler that says what it is
+        # cannot be read back as the road whose window it filled.
+        "round": (str(round_as) or airlog_round_for(kind, who, name)),
         "name": booth_actor_name(who, name),
         # Who said it and what wrote it, on the line itself (#226). Sixty
         # voices and a settable model mean "that one — do that again" is
@@ -42970,7 +43017,15 @@ DEAD_AIR_RESCUE_REST = 45.0
 # the deepest shelf on the station and needs a transport of its own,
 # because a call is an intro, a conversation and a sign-off rather than
 # one round that can be handed to _banter_air.
-RESCUE_ROADS_OPEN = ("manager", "gallery", "news")
+# #1238: AND CALLS. 127 of the 144 rows on the caller pile carried
+# recorded audio while in_dead_air_stock read 0 and the road reported
+# "NOT one the rescue may open" - the operator's most important road,
+# finished and unreachable, while holes were filled with emergency_host
+# and with banter that was 66/68 spent. The order below already listed
+# caller third and dead_air_rescue already promotes the road the sheet
+# is ON, so this changes which roads may be reached and nothing about
+# which is preferred.
+RESCUE_ROADS_OPEN = ("manager", "gallery", "news", "caller")
 # #1221: THE ARREARS BOOK IS WIDER THAN THE RESCUE.
 #
 # RESCUE_ROADS_OPEN answers "what may interrupt a silence". This answers
@@ -62905,7 +62960,8 @@ async def sfxguy_gap_talk(why: str = "", floorless: bool = False) -> str:
         try:
             out = await door("interject", None, line=text, who="drop",
                              voice=voice, name="The SFX Guy",
-                             checked=True, sting=False, clip=clip)
+                             checked=True, sting=False, clip=clip,
+                             round_as="sfxguy")          # #1237
         except Exception as exc:  # noqa: BLE001
             pipeline_log("air", "the SFX Guy could not fill the air: "
                          + f"{type(exc).__name__}: {exc}"[:140])
@@ -63683,9 +63739,12 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
         text = str(bar.get("text") or "")
         _door = _dj_speak_floorless if floorless else dj_speak
         try:
+            # #1237: a bar off the bank is the BANK filling a hole, not
+            # the round whose window the hole is in.
             out = await _door("interject", None, line=text,
                               who=str(bar.get("who") or "dj"),
-                              checked=True, sting=False, clip=clip)
+                              checked=True, sting=False, clip=clip,
+                              round_as="gold")
         except Exception as exc:  # noqa: BLE001
             pipeline_log("air", "a gold bar could not fill the air: "
                          f"{type(exc).__name__}: {exc}"[:160])
@@ -66100,8 +66159,14 @@ def _ready_shelf_row(kind: str, rescue: bool = False
     The rescue never once selected a round.
 
     A rescue may air a FINISHED round out of turn. It may not air an
-    unfinished one, so the takes test stands either way."""
-    if kind not in ("gallery", "news", "manager"):
+    unfinished one, so the takes test stands either way.
+
+    #1238b: and WHICH roads is RESCUE_ROADS_OPEN's question, not a
+    fourth copy of the answer. This read ("gallery", "news", "manager")
+    of its own, so opening that list to caller changed the count and
+    nothing else - dead_air_rescue tried the road, came through here,
+    and got None."""
+    if kind not in RESCUE_ROADS_OPEN:
         return None
     window = None if rescue else _ready_slot_window(kind)
 
@@ -66351,7 +66416,10 @@ def gap_kind_policy(kind: str, dj: dict[str, Any] | None = None,
         # rooms; it just cannot make the listener wait while it is written.
         if (talk_is_incessant(dj)
                 and kind not in ("banter", "caller")):
-            if kind in ("gallery", "news", "manager") and _ready_shelf_row(kind):
+            # #1238b: the same list a third time. A road with a
+            # finished round of its OWN is not improved by being
+            # replaced with banked banter, whichever road it is.
+            if kind in RESCUE_ROADS_OPEN and _ready_shelf_row(kind):
                 return kind, ""
             # At the absolute top stop, "a script exists" is not enough.
             # A shelf road can invalidate its own takes while freshening or
@@ -67194,8 +67262,12 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
                         f"rendering{(' - ' + why) if why else ''} (#784)",
                  extra=text[:300])
     try:
+        # #1237: the live cover is the COVER road, not the round
+        # whose window it is covering. This line is the largest single
+        # contributor to the residue the verdict reads as "banter".
         out = await dj_speak("interject", _RADIO.get("now"), line=text,
-                             who=who, voice=voice or None)
+                             who=who, voice=voice or None,
+                             round_as="cover")
     except Exception:
         return bool(punctuated)
     if out and line.get("file"):
@@ -102171,8 +102243,13 @@ def director_room(which: int = 0) -> dict[str, Any]:
                             _r.get("seconds") or 0)
                 if _took:
                     _worst = max(_took, key=lambda k: _took[k])
+                    # #1237: a filler road names itself now, so this can
+                    # say the bank or the cover took the window rather
+                    # than blaming "banter", which was the residue
+                    # bucket wearing a real road's name.
                     state = ("went by - %s aired instead"
-                             % SHELF_LABEL.get(_worst, _worst))
+                             % ROUND_LABEL.get(
+                                 _worst, SHELF_LABEL.get(_worst, _worst)))
                 else:
                     state = "went by with nothing of its own"
             else:
@@ -112763,6 +112840,20 @@ async def api_broadcast_health(
             say += (" The DJs have not been heard for %d minute(s)."
                     % int(mute / 60))
         offer = []
+    elif mute >= DIALOGUE_FIRST_GRACE:
+        # #1239: THE GRACE PERIOD ENDS. This branch had no upper bound,
+        # so a station nobody has ever heard sat in it forever telling
+        # the operator, in the present tense, about the first minute
+        # after a restart. Measured at 100+ seconds with three
+        # listeners connected and not one delivery acknowledged; one
+        # call to reload-pages cured it.
+        say = ("Reaching %d listener(s), but not one of them has "
+               "acknowledged a single clip in %d second(s). The station "
+               "is on and sending; the pages are taking clips and not "
+               "starting them. Reloading the pages is the cure."
+               % (listeners, int(mute)))
+        offer = ["reload the pages", "open the troubleshooting console"]
+        stuck = True
     else:
         say = ("Nobody has reported hearing anything yet - that is normal "
                "for the first minute after a restart.")
