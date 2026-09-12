@@ -63274,15 +63274,26 @@ async def sfx_guy_watch() -> None:
                 _SFX_WATCH["why"] = ("somebody is talking (%.0fs of %.0fs)"
                                      % (quiet, need))
                 continue
-            went = await sfx_fill_gap(
-                "nobody has said anything for %ds" % int(quiet),
-                under_floor=True)
-            if went:
+            # #1248: HAND IT OVER, NEVER WAIT FOR IT. This awaited
+            # sfx_fill_gap, which reaches gold_fill_gap, which - when
+            # the floor is not already held - goes out through dj_speak,
+            # which calls _floor_take and WAITS. #1146 measured that
+            # hold at 6 to 78 seconds a line, so the one loop whose job
+            # is to notice silence parked inside a wait for the thing
+            # that causes it. Measured: ticks frozen at 32 for over a
+            # minute while the room was silent for 36 seconds and its
+            # own `why` still read "somebody is talking".
+            _before = int(_SFX_GAP.get("count") or 0)
+            sfx_punctuate("nobody has said anything for %ds" % int(quiet))
+            _SFX_WATCH["asked"] = int(_SFX_WATCH.get("asked") or 0) + 1
+            _SFX_WATCH["at"] = time.time()
+            # The answer lands on the next tick rather than this one,
+            # which is what not waiting costs and it is worth it.
+            if int(_SFX_GAP.get("count") or 0) > _before:
                 _SFX_WATCH["fired"] = int(_SFX_WATCH.get("fired") or 0) + 1
-                _SFX_WATCH["at"] = time.time()
-                _SFX_WATCH["why"] = "fired a " + str(went)
+                _SFX_WATCH["why"] = "fired"
             else:
-                _SFX_WATCH["why"] = ("quiet %ds but the filler declined: %s"
+                _SFX_WATCH["why"] = ("quiet %ds, asked - last gate: %s"
                                      % (int(quiet),
                                         str(_SFX_GAP.get("gate") or "?")))
         except asyncio.CancelledError:
@@ -63322,7 +63333,16 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
         floor_held = _floor_busy()
         if floor_held and not under_floor:
             return _no("a writer holds the floor")
-        if time.time() - _SPOKE_AT[0] < 2.5:
+        # #1248: ...UNLESS THE ROOM SAYS OTHERWISE. _SPOKE_AT marks the
+        # booth QUEUEING a line, not the room hearing one (#822, and
+        # this file has now made that mistake six times). Two and a half
+        # seconds is a fair guard against talking over the end of a
+        # line; on a station whose booth queues steadily into a room
+        # that has been silent for thirty-six seconds it is a permanent
+        # veto, and it was the gate that actually fired on the tick the
+        # operator was complaining about.
+        if time.time() - _SPOKE_AT[0] < 2.5 \
+                and talk_quiet_for() < sfx_gap_notice():
             return _no("a line was queued less than 2.5s ago")
         # 2026-09-09: AIR ALREADY SOLD IS NOT DEAD AIR. The run below sells
         # up to forty-five seconds ahead on the page road, and a listener
@@ -99388,6 +99408,719 @@ async def slideshow_state_api(limit: int = 24) -> dict[str, Any]:
         f"{total} pictures in the slideshow's folder; newest "
         f"{rows[0]['file']}" if rows else "the folder is empty")
     return out
+
+
+# ---------------------------------------------------------------------------
+# #1240: THE SLIDESHOW, ON THE TABLET.
+#
+# `~/bin/media-slideshow` is 25,000 lines of PySide6 that has run on the
+# box's own glass since May. It is not only a slideshow: the same window
+# carries the SC stack's whole readout — the service tailers, the GPU
+# sampler, py-spy, the ComfyUI workflow reader, the OpenWebUI conversation
+# feed — and the operator asked for THAT on the tablet, with the same
+# material and the same settings, not a second app that happens to show
+# pictures.
+#
+# The tablet cannot run any of it. It is a WebView on a GApps-less GSI that
+# reaches exactly one origin, and the desktop app's whole lower half is
+# subprocesses: nvidia-smi, py-spy, docker, ssh to lilspark. So the port is
+# a split — the READING stays here, where those things are already
+# reachable and already cached on a clock, and the tablet gets the VIEW.
+#
+# WHAT IS GENUINELY SHARED, AND WHAT ONLY LOOKS SHARED. Measured:
+#
+#   /comfy-output IS the slideshow's folder. compose binds
+#   ../ComfyUI/output there, and the app's own diagnostic names
+#   `root dir /home/ehm_eckx/ComfyUI/output` — the host side of that same
+#   mount. So the playlist, every picture, and favorites.md (which
+#   class Favorites writes NEXT TO THE MEDIA, not in a config dir) are all
+#   first-hand from in here. Nothing is copied and nothing is mirrored:
+#   a like on the tablet is a line in the file the desktop app reads.
+#
+#   ~/bin is NOT mounted. screensaver_state.json — the transition, the
+#   speed, the filter, which panels were open — lives next to output.md in
+#   the launcher's directory, and this container cannot see it. The route
+#   below therefore SAYS which file it read rather than serving a
+#   station-side copy while implying it is the desktop's. Adding
+#       - /home/ehm_eckx/bin:/host-bin
+#   to spark-agent's volumes gives the two applications one settings file
+#   in both directions; without it the tablet keeps its own and the route
+#   answers `source: "station"`. Both are honest; only one is shared.
+#
+# ONE MORE THING THE TABLET FORCES. pine-media-origin.js records 38
+# concurrent requests to this station producing a 46-second media stall on
+# that glass. A slideshow is the worst possible shape for that — a picture
+# every ten seconds, a filmstrip of thumbnails, and a telemetry panel — so
+# every road here is either cached on a clock or answers in one request,
+# and the thumbnails exist precisely so the filmstrip never asks for 1,358
+# full-size PNGs.
+# ---------------------------------------------------------------------------
+
+SLIDESHOW_ROOT = Path("/comfy-output")
+# ~/bin, when compose binds it. Absent by default — see the header.
+SLIDESHOW_HOST_BIN = Path("/host-bin")
+# The desktop app's "lewd" sink: items flagged on the trash disc's outer L
+# ring are MOVED here and its scanner skips the directory entirely. Skipped
+# here too, or the tablet would show what the box deliberately does not.
+SLIDESHOW_ASIDE_DIR = os.environ.get("SLIDESHOW_SMUT_DIR", "smut")
+
+# Copied from the desktop app rather than narrowed, deliberately: if the two
+# disagree about what a playable file is, the tablet's playlist silently
+# stops being the box's playlist and nothing says so.
+SLIDESHOW_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif",
+                        ".tif", ".tiff"}
+SLIDESHOW_VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+SLIDESHOW_MEDIA_EXTS = SLIDESHOW_IMAGE_EXTS | SLIDESHOW_VIDEO_EXTS
+
+# Spelled out rather than left to mimetypes, which is not imported here and
+# whose database in python:3.12-slim has gaps on exactly the modern formats
+# ComfyUI writes. A wrong content-type on a video is a silent non-play.
+SLIDESHOW_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".bmp": "image/bmp", ".gif": "image/gif",
+    ".tif": "image/tiff", ".tiff": "image/tiff",
+    ".mp4": "video/mp4", ".mkv": "video/x-matroska", ".webm": "video/webm",
+    ".mov": "video/quicktime", ".avi": "video/x-msvideo", ".m4v": "video/mp4",
+}
+
+# The desktop's own transition set, in its own order, so "cycle transition"
+# means the same thing on both screens and a state file written by either
+# names something the other can show.
+SLIDESHOW_TRANSITIONS = [
+    "all", "slide", "swirl", "rotate", "flip", "mosaic", "fold",
+    "bump", "bash", "unroll", "origami", "sand", "shatter", "cube",
+    "delete", "tv", "crt", "vaporwave", "unfold", "liquid",
+]
+
+# ONE SCAN, SHARED. 1,358 files today and climbing; #1237 is the standing
+# lesson here — the draw walked 7,180 clips twice every three seconds
+# because nothing held the result. The playlist road, the stack road and
+# the lock screen all read this slot.
+_SLIDESHOW_SCAN: dict[str, Any] = {"at": 0.0, "rows": [], "total": 0,
+                                   "newest": 0.0}
+_SLIDESHOW_SCAN_TTL = 8.0
+_SLIDESHOW_SCAN_LOCK = asyncio.Lock()
+
+_SLIDESHOW_SAFE_FILE = re.compile(r"[\w.\- ()\[\]]{1,200}")
+
+
+def _slideshow_kind(name: str) -> str:
+    suffix = Path(name).suffix.lower()
+    if suffix in SLIDESHOW_VIDEO_EXTS:
+        return "video"
+    return "image" if suffix in SLIDESHOW_IMAGE_EXTS else ""
+
+
+def _slideshow_scan_blocking() -> dict[str, Any]:
+    """Every playable file in the slideshow's folder, newest first.
+
+    BLOCKING — a scandir over a thousand-odd entries. Only ever called
+    through asyncio.to_thread; the station is also writing a live radio
+    show on this loop."""
+    rows: list[dict[str, Any]] = []
+    newest = 0.0
+    try:
+        with os.scandir(SLIDESHOW_ROOT) as scan:
+            for entry in scan:
+                if not entry.is_file():
+                    continue
+                kind = _slideshow_kind(entry.name)
+                if not kind:
+                    continue
+                try:
+                    stat = entry.stat()
+                except OSError:
+                    continue
+                rows.append({"file": entry.name, "at": stat.st_mtime,
+                             "bytes": stat.st_size, "kind": kind})
+                if stat.st_mtime > newest:
+                    newest = stat.st_mtime
+    except OSError:
+        return {"rows": [], "total": 0, "newest": 0.0, "ok": False}
+    rows.sort(key=lambda r: r["at"], reverse=True)
+    return {"rows": rows, "total": len(rows), "newest": newest, "ok": True}
+
+
+async def slideshow_scan(force: bool = False) -> dict[str, Any]:
+    """The cached folder scan. Under the lock so a burst of panes asking at
+    once costs one walk, not one each."""
+    async with _SLIDESHOW_SCAN_LOCK:
+        fresh = (time.time() - float(_SLIDESHOW_SCAN.get("at") or 0.0)
+                 < _SLIDESHOW_SCAN_TTL)
+        if fresh and not force and _SLIDESHOW_SCAN.get("rows") is not None:
+            return dict(_SLIDESHOW_SCAN)
+        result = await asyncio.to_thread(_slideshow_scan_blocking)
+        _SLIDESHOW_SCAN.update(result)
+        _SLIDESHOW_SCAN["at"] = time.time()
+        return dict(_SLIDESHOW_SCAN)
+
+
+# ---- favorites.md, the file the desktop app already keeps ----------------
+
+def _slideshow_favorites_path() -> Path:
+    return SLIDESHOW_ROOT / "favorites.md"
+
+
+def _slideshow_favorites_read_blocking() -> set[str]:
+    """Parse favorites.md the way class Favorites does.
+
+    It accepts three shapes — `- [name](path)`, `- path` and a bare path —
+    because its own writer has changed shape over time and it reads files a
+    human has edited. All three are accepted here for the same reason. Only
+    names inside the media root are kept: the desktop resolves each entry
+    and drops anything that no longer exists, and a tablet that showed
+    favourites the box had deleted would be the wrong kind of different."""
+    path = _slideshow_favorites_path()
+    names: set[str] = set()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return names
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("- "):
+            candidate = line[2:].strip()
+            if "(" in candidate and candidate.endswith(")"):
+                candidate = candidate[candidate.rindex("(") + 1:-1]
+        elif "(" in line and line.endswith(")"):
+            candidate = line[line.rindex("(") + 1:-1]
+        else:
+            candidate = line
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        # Entries are relative to the media root. An absolute host path
+        # (/home/ehm_eckx/ComfyUI/output/x.png) is the same picture seen
+        # from the other side of the mount, so it is matched by name.
+        name = Path(candidate).name
+        if not _SLIDESHOW_SAFE_FILE.fullmatch(name):
+            continue
+        if (SLIDESHOW_ROOT / name).exists():
+            names.add(name)
+    return names
+
+
+def _slideshow_favorites_write_blocking(names: set[str]) -> None:
+    """Write favorites.md BYTE-FOR-BYTE the way class Favorites._write does.
+
+    Both applications write this one file. A different header or a different
+    link shape would still parse, but the file would churn every time the
+    other one touched it, and a diff would stop meaning anything."""
+    lines = ["# Favorites", "",
+             "Edited by media-slideshow. One file per line.", ""]
+    for name in sorted(names):
+        lines.append(f"- [{name}]({name})")
+    _slideshow_favorites_path().write_text("\n".join(lines) + "\n",
+                                           encoding="utf-8")
+
+
+# ---- the desktop app's own UI state --------------------------------------
+
+def _slideshow_state_file() -> tuple[Path, str]:
+    """Where the settings live, and whose they are.
+
+    Returns the path and one of "host" (the desktop app's own file, shared)
+    or "station" (this container's copy, not shared). The caller reports
+    which; see the header for the one compose line that changes the answer."""
+    if SLIDESHOW_HOST_BIN.is_dir():
+        return SLIDESHOW_HOST_BIN / "screensaver_state.json", "host"
+    return data_path("slideshow_state.json"), "station"
+
+
+def _slideshow_state_read_blocking() -> tuple[dict[str, Any], str]:
+    path, source = _slideshow_state_file()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, source
+    return (data if isinstance(data, dict) else {}), source
+
+
+def _slideshow_state_write_blocking(patch: dict[str, Any]) -> tuple[dict, str]:
+    """Merge and write. A MERGE, not a replace: the desktop app persists
+    keys this tablet has no opinion about — the two diagnostic circles'
+    dragged positions, whether the service panel is in cyberpunk colours —
+    and a tablet that wrote a whole state object would silently reset them
+    on the box's next launch."""
+    path, source = _slideshow_state_file()
+    current, _ = _slideshow_state_read_blocking()
+    current.update(patch)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500,
+                            detail=f"could not write {path}: {exc}") from exc
+    return current, source
+
+
+# ---- thumbnails ----------------------------------------------------------
+
+_SLIDESHOW_THUMB_SIZES = (64, 128, 256, 512)
+
+
+def _slideshow_thumb_dir() -> Path:
+    return data_path("slideshow_thumbs")
+
+
+def _slideshow_thumb_blocking(name: str, width: int) -> tuple[bytes, str] | None:
+    """A small JPEG of one picture, cached on disk.
+
+    THE FILMSTRIP IS WHY THIS EXISTS. The desktop app's hot-load queue shows
+    seven 64-pixel thumbnails and decodes them from a local disk in a
+    process with a 750 MB budget. The tablet was measured at 148 MB free
+    under a load average of 25, on an origin that allows six connections —
+    so asking it to pull seven 1.3 MB PNGs to draw 64 pixels each is not a
+    slower version of the same thing, it is the stall in
+    pine-media-origin.js all over again. A 64px thumb is about 2 kB.
+
+    Videos get no thumbnail: pulling a frame needs a decoder this image does
+    not have. The caller falls back to a placeholder rather than a broken
+    picture."""
+    source = SLIDESHOW_ROOT / name
+    if _slideshow_kind(name) != "image":
+        return None
+    try:
+        stat = source.stat()
+    except OSError:
+        return None
+    key = hashlib.sha1(
+        f"{name}|{stat.st_mtime_ns}|{stat.st_size}|{width}".encode()
+    ).hexdigest()
+    cache = _slideshow_thumb_dir() / f"{key}.jpg"
+    try:
+        return cache.read_bytes(), "image/jpeg"
+    except OSError:
+        pass
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        with Image.open(source) as img:
+            img.draft("RGB", (width * 2, width * 2))   # cheap JPEG downscale
+            img = img.convert("RGB")
+            img.thumbnail((width, width), Image.LANCZOS)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            img.save(cache, format="JPEG", quality=82, optimize=True)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return cache.read_bytes(), "image/jpeg"
+    except OSError:
+        return None
+
+
+@app.get("/api/slideshow/playlist")
+async def slideshow_playlist_api(
+    request: Request,
+    limit: int = 200,
+    offset: int = 0,
+    kind: str = "all",
+    favorites: int = 0,
+    order: str = "shuffle",
+    seed: int = 0,
+    since: float = 0.0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The whole playlist, paged — what the box is playing from.
+
+    `/api/slideshow` (#1165) answers the lock screen: the newest handful and
+    a count. A slideshow needs the LIST, and the list is 1,358 items, so it
+    is paged and the order is settable.
+
+    ORDER DEFAULTS TO SHUFFLE, because the desktop app's Playlist is a
+    shuffled rotation and a tablet that played the same folder in date order
+    would not be showing the same show. A shuffle has to be stable across
+    pages or page two re-deals the deck, so it is seeded: the client picks a
+    seed once and keeps it, exactly as the desktop keeps one random.Random
+    for the life of a run.
+
+    `since` is the hot-load road. The desktop watches the directory and
+    inserts a new render AHEAD OF THE CURSOR so a picture that just finished
+    is the next thing on screen. The tablet cannot watch a directory, so it
+    asks "anything newer than this stamp?" on a clock and gets only the new
+    rows — one cheap request rather than re-fetching the list."""
+    require_read_auth(authorization)
+    scan = await slideshow_scan()
+    rows: list[dict[str, Any]] = list(scan.get("rows") or [])
+
+    favourite_names = await asyncio.to_thread(_slideshow_favorites_read_blocking)
+    for row in rows:
+        row["fav"] = row["file"] in favourite_names
+
+    if since > 0:
+        fresh = [r for r in rows if r["at"] > since]
+        return {"ok": bool(scan.get("ok")), "at": time.time(),
+                "fresh": fresh[:200], "total": scan.get("total", 0),
+                "newest_at": scan.get("newest", 0.0),
+                "url": "/api/slideshow/media/",
+                "say": (f"{len(fresh)} new since" if fresh
+                        else "nothing new since")}
+
+    want_kind = (kind or "all").strip().lower()
+    if want_kind in ("image", "video"):
+        rows = [r for r in rows if r["kind"] == want_kind]
+    if favorites:
+        rows = [r for r in rows if r["fav"]]
+
+    want_order = (order or "shuffle").strip().lower()
+    if want_order == "old":
+        rows.sort(key=lambda r: r["at"])
+    elif want_order == "name":
+        rows.sort(key=lambda r: r["file"].lower())
+    elif want_order == "shuffle":
+        random.Random(int(seed) or 1).shuffle(rows)
+    # "new" is the scan's own order, already newest-first.
+
+    total = len(rows)
+    start = max(0, int(offset))
+    want = max(1, min(int(limit or 200), 500))
+    page = rows[start:start + want]
+    return {
+        "ok": bool(scan.get("ok")),
+        "at": time.time(),
+        "rows": page,
+        "offset": start,
+        "limit": want,
+        "matched": total,
+        "total": scan.get("total", 0),
+        "newest_at": scan.get("newest", 0.0),
+        "favorites": len(favourite_names),
+        "order": want_order,
+        "seed": int(seed) or 1,
+        "transitions": SLIDESHOW_TRANSITIONS,
+        # The bytes door, so the page never builds this prefix itself.
+        "url": "/api/slideshow/media/",
+        "say": (f"{total} of {scan.get('total', 0)} pictures match"
+                if scan.get("ok")
+                else "the ComfyUI output directory is not mounted"),
+    }
+
+
+@app.get("/api/slideshow/media/{filename}")
+async def slideshow_media_api(
+    filename: str,
+    request: Request,
+    w: int = 0,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """One picture or one video out of the slideshow's folder.
+
+    WHY THIS IS NOT /api/generations/image. That route reads the WHOLE file
+    into memory and answers with it — right for a 1.3 MB PNG on the panel,
+    wrong for both of the things a slideshow does. It has no Range, so a
+    video cannot be sought or streamed and the tablet buffers the entire
+    file before the first frame; and it has no small size, so a filmstrip
+    costs the full bytes per thumbnail. Both of those are the documented
+    tablet stall, so this door has Range and `?w=`.
+
+    Read auth, like the gallery: the picture is already on the panel of any
+    device that can reach the station."""
+    require_read_auth(authorization)
+    if "/" in filename or ".." in filename or not _SLIDESHOW_SAFE_FILE.fullmatch(
+        filename
+    ):
+        raise HTTPException(status_code=400, detail="Bad filename")
+    if not _slideshow_kind(filename):
+        raise HTTPException(status_code=400, detail="Not a playable file")
+    path = SLIDESHOW_ROOT / filename
+
+    if w:
+        width = min(_SLIDESHOW_THUMB_SIZES,
+                    key=lambda size: abs(size - int(w)))
+        thumb = await asyncio.to_thread(_slideshow_thumb_blocking,
+                                        filename, width)
+        if thumb is not None:
+            return Response(
+                content=thumb[0], media_type=thumb[1],
+                headers={"Cache-Control": "private, max-age=86400, immutable"})
+        # No thumbnail (a video, or no decoder): fall through to the whole
+        # file rather than answering 404 for a picture that plainly exists.
+
+    try:
+        size = await asyncio.to_thread(lambda: path.stat().st_size)
+    except OSError:
+        raise HTTPException(status_code=404, detail="No such file")
+
+    guess = SLIDESHOW_MEDIA_TYPES.get(Path(filename).suffix.lower(),
+                                      "application/octet-stream")
+    headers = {"Accept-Ranges": "bytes", "X-Content-Type-Options": "nosniff",
+               "Cache-Control": "private, max-age=86400"}
+    window = _range_slice(str(request.headers.get("range") or ""), size)
+    if window == (-1, -1):
+        return Response(status_code=416,
+                        headers={"Content-Range": f"bytes */{size}"})
+    if window:
+        first, last = window
+        headers.update({"Content-Range": f"bytes {first}-{last}/{size}",
+                        "Content-Length": str(last - first + 1)})
+        return StreamingResponse(_range_stream(path, first, last),
+                                 status_code=206, headers=headers,
+                                 media_type=guess)
+    return FileResponse(path, media_type=guess, headers=headers)
+
+
+@app.get("/api/slideshow/favorites")
+async def slideshow_favorites_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The likes, out of the desktop app's own favorites.md."""
+    require_read_auth(authorization)
+    names = await asyncio.to_thread(_slideshow_favorites_read_blocking)
+    path = _slideshow_favorites_path()
+    return {"ok": True, "at": time.time(), "files": sorted(names),
+            "count": len(names), "file": str(path), "exists": path.exists(),
+            "say": f"{len(names)} favourites in {path.name}"}
+
+
+@app.post("/api/slideshow/favorites")
+async def slideshow_favorite_set_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Like or unlike one picture — {"file": name, "on": true|null}.
+
+    `on` absent means toggle, which is what the L key does on the box.
+
+    ONE HONEST LIMITATION, stated rather than discovered. class Favorites
+    holds the set in memory and rewrites the whole file on every toggle,
+    reloading it only at startup. So while the desktop app is RUNNING, its
+    next like overwrites anything written here since it started. The
+    tablet's likes are never lost when the box's slideshow is closed or
+    restarted — which is most of the time — and the reverse direction (the
+    box's likes showing on the tablet) is live and always correct."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    name = Path(str((body or {}).get("file") or "")).name
+    if not name or not _SLIDESHOW_SAFE_FILE.fullmatch(name):
+        raise HTTPException(status_code=400, detail="Bad filename")
+    if not (SLIDESHOW_ROOT / name).exists():
+        raise HTTPException(status_code=404, detail="No such file")
+    names = await asyncio.to_thread(_slideshow_favorites_read_blocking)
+    want = (body or {}).get("on")
+    on = (name not in names) if want is None else bool(want)
+    if on:
+        names.add(name)
+    else:
+        names.discard(name)
+    await asyncio.to_thread(_slideshow_favorites_write_blocking, names)
+    return {"ok": True, "file": name, "on": on, "count": len(names),
+            "say": ("liked " if on else "unliked ") + name}
+
+
+@app.get("/api/slideshow/state")
+async def slideshow_state_read_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The desktop app's settings — transition, speed, filter, panels.
+
+    `source` is the whole point of this route: "host" means this IS
+    ~/bin/screensaver_state.json and the two applications share one file;
+    "station" means ~/bin is not mounted and the tablet is keeping its
+    own. See the header for the one compose line between them."""
+    require_read_auth(authorization)
+    state, source = await asyncio.to_thread(_slideshow_state_read_blocking)
+    path, _ = _slideshow_state_file()
+    return {
+        "ok": True, "at": time.time(), "state": state,
+        "source": source, "file": str(path), "exists": path.exists(),
+        "shared": source == "host",
+        "why": ("this is the desktop slideshow's own settings file, so a "
+                "change here comes up on the box's next launch"
+                if source == "host" else
+                "/home/ehm_eckx/bin is not mounted into this container, so "
+                "the tablet keeps its own settings; add "
+                "'- /home/ehm_eckx/bin:/host-bin' to spark-agent's volumes "
+                "to share the desktop app's file instead"),
+        "transitions": SLIDESHOW_TRANSITIONS,
+    }
+
+
+@app.post("/api/slideshow/state")
+async def slideshow_state_write_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Merge settings into that file. Keys the desktop app owns and this
+    one has no opinion about are left exactly as they were."""
+    require_auth(authorization)
+    try:
+        patch = await request.json()
+    except Exception:  # noqa: BLE001
+        patch = {}
+    if not isinstance(patch, dict) or not patch:
+        raise HTTPException(status_code=400, detail="Body must be an object")
+    known = {"transition", "image_seconds", "media_filter", "favorites_only",
+             "perf_visible", "stats_visible", "help_visible", "queue_visible",
+             "diagnostics_on", "cyberpunk"}
+    unknown = sorted(set(patch) - known)
+    if "transition" in patch and patch["transition"] not in SLIDESHOW_TRANSITIONS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown transition {patch['transition']!r}")
+    state, source = await asyncio.to_thread(
+        _slideshow_state_write_blocking, {k: patch[k] for k in patch
+                                          if k in known})
+    return {"ok": True, "state": state, "source": source,
+            "shared": source == "host", "ignored": unknown,
+            "say": "settings written to " + str(_slideshow_state_file()[0])}
+
+
+@app.post("/api/slideshow/aside/{filename}")
+async def slideshow_aside_api(
+    filename: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Put one picture out of the rotation without destroying it.
+
+    The desktop app's trash disc has an outer ring that MOVES an item into
+    `smut/` instead of unlinking it; its scanner skips that directory, so
+    the picture is gone from the show and still on disk. Ported because the
+    alternative on the tablet is that every "not this one" is permanent —
+    and a delete you cannot undo, made by a thumb on a nine-inch screen, is
+    a different decision from the one the keyboard asks for."""
+    require_auth(authorization)
+    if "/" in filename or ".." in filename or not _SLIDESHOW_SAFE_FILE.fullmatch(
+        filename
+    ):
+        raise HTTPException(status_code=400, detail="Bad filename")
+    source = SLIDESHOW_ROOT / filename
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="No such file")
+    target_dir = SLIDESHOW_ROOT / SLIDESHOW_ASIDE_DIR
+
+    def _move() -> str:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / filename
+        stem, suffix = Path(filename).stem, Path(filename).suffix
+        n = 1
+        while target.exists():
+            target = target_dir / f"{stem}_{n}{suffix}"
+            n += 1
+        source.rename(target)
+        return target.name
+
+    try:
+        moved = await asyncio.to_thread(_move)
+    except OSError as exc:
+        raise HTTPException(status_code=500,
+                            detail=f"could not move: {exc}") from exc
+    await slideshow_scan(force=True)
+    return {"ok": True, "file": filename, "moved_to": moved,
+            "folder": SLIDESHOW_ASIDE_DIR,
+            "say": f"{filename} moved to {SLIDESHOW_ASIDE_DIR}/"}
+
+
+_SLIDESHOW_STACK: dict[str, Any] = {"at": 0.0, "payload": {}}
+_SLIDESHOW_STACK_TTL = 10.0
+_SLIDESHOW_STACK_LOCK = asyncio.Lock()
+
+
+@app.get("/api/slideshow/stack")
+async def slideshow_stack_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The SC stack, in ONE request — the desktop window's lower half.
+
+    That window runs eleven tailers: services, sysmon, nvidia, RAM, cfree,
+    weights, tool servers, SC status, reachy, py-spy and the LLM feed. Each
+    is a subprocess on a clock, and none of them can run on the tablet.
+
+    This is not eleven routes. presentation-source.js is the standing
+    lesson: 38 concurrent requests to this station produced a 46-second
+    media stall on that glass, and a slideshow is already spending its
+    budget on pictures. So the panel gets one poll, answered from slots
+    this process already fills on its own clocks — the GPU sampler at
+    GPU_TEMP_TTL, the pulse report, the folder scan — plus one short call
+    to ComfyUI. Cached for ten seconds on top of that, so two panes and a
+    reopened view cost one answer."""
+    require_read_auth(authorization)
+    async with _SLIDESHOW_STACK_LOCK:
+        if (time.time() - float(_SLIDESHOW_STACK.get("at") or 0.0)
+                < _SLIDESHOW_STACK_TTL):
+            return dict(_SLIDESHOW_STACK.get("payload") or {})
+
+        out: dict[str, Any] = {"at": time.time()}
+
+        scan = await slideshow_scan()
+        now = time.time()
+        rows = list(scan.get("rows") or [])
+        out["folder"] = {
+            "total": scan.get("total", 0),
+            "newest_at": scan.get("newest", 0.0),
+            "newest_age": (max(0.0, now - float(scan.get("newest") or 0.0))
+                           if scan.get("newest") else None),
+            "newest_file": rows[0]["file"] if rows else "",
+            "last_hour": sum(1 for r in rows if now - r["at"] < 3600),
+            "last_day": sum(1 for r in rows if now - r["at"] < 86400),
+            "bytes": sum(int(r.get("bytes") or 0) for r in rows),
+        }
+
+        # The GPU slot, never a fresh subprocess: _GPU_TEMP is filled on its
+        # own clock precisely so a reading path never shells out.
+        gpu = dict(_GPU_TEMP or {})
+        out["gpu"] = {
+            "c": gpu.get("c") or 0.0,
+            "util": gpu.get("util"),
+            "zone": gpu.get("zone") or "",
+            "how": gpu.get("how") or "",
+            "age": (max(0.0, now - float(gpu.get("at") or 0.0))
+                    if gpu.get("at") else None),
+            "stale": bool(gpu.get("at")) and (now - float(gpu.get("at") or 0)
+                                              > GPU_TEMP_TTL * 2),
+        }
+
+        # ComfyUI's queue — the one thing here that is not already in a slot.
+        # Short timeout on purpose: 8188 being down is a fact to report, not
+        # a reason for this route to take eight seconds.
+        comfy: dict[str, Any] = {"up": False, "why": ""}
+        try:
+            async with httpx.AsyncClient(timeout=2.5) as client:
+                queue = await client.get(f"{COMFYUI_URL}/queue")
+                queue.raise_for_status()
+                body = queue.json() or {}
+            running = body.get("queue_running") or []
+            pending = body.get("queue_pending") or []
+            comfy.update(up=True, running=len(running), pending=len(pending))
+        except Exception as exc:  # noqa: BLE001
+            comfy["why"] = f"{type(exc).__name__}: {exc}"
+        out["comfy"] = comfy
+
+        # The loop's own health, which is what the desktop's py-spy pane was
+        # really for: not a flamegraph, but "is the box wedged".
+        try:
+            out["pulse"] = pulse_report(600)
+        except Exception as exc:  # noqa: BLE001
+            out["pulse"] = {"ok": False, "why": str(exc)}
+
+        try:
+            out["system"] = await asyncio.to_thread(system_stats)
+        except Exception:  # noqa: BLE001
+            out["system"] = ""
+
+        state, source = await asyncio.to_thread(_slideshow_state_read_blocking)
+        out["settings"] = {"state": state, "source": source,
+                           "shared": source == "host"}
+
+        parts = [f"{out['folder']['total']} pictures",
+                 f"{out['folder']['last_hour']} this hour"]
+        if comfy.get("up"):
+            parts.append(f"ComfyUI {comfy.get('pending', 0)} queued")
+        else:
+            parts.append("ComfyUI not answering")
+        if out["gpu"].get("c"):
+            parts.append(f"GPU {out['gpu']['c']}°C")
+        out["say"] = ", ".join(parts)
+        out["ok"] = True
+
+        _SLIDESHOW_STACK["payload"] = out
+        _SLIDESHOW_STACK["at"] = time.time()
+        return dict(out)
 
 
 @app.post("/api/listen/transcribe")
