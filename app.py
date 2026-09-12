@@ -65280,6 +65280,38 @@ def gap_report(hours: float = 3.0,
 _READY_SHELF_BUSY: set[int] = set()
 
 
+# #1218: a media clip is IMMUTABLE - _store_media mints a random key and
+# writes it once, and nothing ever rewrites one - so "does this exist and
+# does it have bytes" is asked once and remembered. It was asked twice
+# (is_file, then stat) per take, for every take of every row, on every
+# sweep, on the event loop.
+_MEDIA_THERE: dict[str, bool] = {}
+
+
+def media_present(name: str) -> bool:
+    """Is this clip on disk with bytes in it? Cached on the name.
+
+    The name IS the identity: keys are random and never reused, so a
+    True can never go stale into a wrong answer for a different clip. A
+    False is not cached - a clip being written right now must be allowed
+    to appear - which is also why this cannot mask a real absence."""
+    if not name:
+        return False
+    got = _MEDIA_THERE.get(name)
+    if got:
+        return True
+    try:
+        st = (VOICE_MEDIA_DIR / name).stat()
+        there = st.st_size > 0
+    except Exception:  # noqa: BLE001
+        return False
+    if there:
+        if len(_MEDIA_THERE) > 20000:
+            _MEDIA_THERE.clear()
+        _MEDIA_THERE[name] = True
+    return there
+
+
 def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
     """Validate saved performances without rebuilding voices or speech text."""
     try:
@@ -65301,8 +65333,10 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
             clip = saved.get("clip") or {}
             name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
             if (not text.strip() or not voice or who not in ("dj", "cohost", "third", "caller", "caller2")
-                    or not name or not (VOICE_MEDIA_DIR / name).is_file()
-                    or (VOICE_MEDIA_DIR / name).stat().st_size <= 0
+                    # #1218: one cached answer instead of two stats per
+                    # take, per row, per sweep. Same verdict - a missing
+                    # or empty clip still fails here.
+                    or not media_present(name)
                     or str(saved.get("text") or "") != text[:600]
                     or str(saved.get("voice") or "") != voice[:64]
                     or key not in {pantry_key(text, voice, engine) for engine in
@@ -75459,6 +75493,21 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
 
     Shared by the written exchange and the generated one, so an approved bit
     goes out through exactly the same door as a fresh one (#202)."""
+    # #1219: ONE ID FOR THIS CONVERSATION, minted HERE - at the top of the
+    # only function that uses it.
+    #
+    # #1201 put this assignment 385 lines BELOW the coalesced burst loop
+    # that reads it, so the welded-round road raised UnboundLocalError on
+    # its very first turn, every time, and the station fell through to
+    # single-line interjects. Measured in the air log: rows carrying
+    # clip_media went 98% -> 93% -> 51% -> 14% -> 4% across the hours
+    # either side of that deploy, and the show became 222 interjects an
+    # hour with no conversation in it at all. The director's verdict on
+    # the hour: "went by with nothing" seven times, one entry aired.
+    #
+    # It cost two days of chasing the page, the loop and the wire, all of
+    # which had real faults - and none of which was this one.
+    _round_sid = uuid.uuid4().hex[:12]
     dj = dj_settings()
     voices = ({str(t["who"]): str(t["voice"]) for t in ready_takes}
               if ready_takes is not None else await session_voices())
@@ -76967,9 +77016,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             pipeline_log("drop", f"{len(order)} scheduled turn(s) never "
                          "made it into a burst — airing the round's tail "
                          "in sequence (#767/#1146)")
-    # #1201: ONE ID FOR THIS CONVERSATION, so every line it airs can be
-    # tied back to it and read in script order.
-    _round_sid = uuid.uuid4().hex[:12]
+    # #1201/#1219: the id is minted at the top of this function now. It
+    # must NOT be re-minted here: the turns above and the turns below
+    # belong to ONE conversation, and a second id would split it in two
+    # for anything reading the log in script order.
     reached: set[int] = set()
     consumed = 0
     content_turns_spoken = 0
