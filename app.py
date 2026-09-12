@@ -53418,6 +53418,9 @@ UPSTAIRS_GRIPES = (
 MANAGER_CUT_IN_PCT = 20
 # #1173: and how often the memo entry itself is a personal gripe.
 MANAGER_GRIPE_PCT = 65
+# #1244: how often a memo that is already about them also brings up
+# something off the operator's topics board.
+MANAGER_TOPIC_PCT = 35.0
 
 # The ways it arrives. Rolled per interruption, because a memo slid under
 # the door and a phone light blinking are different scenes even when the
@@ -67903,6 +67906,20 @@ BANTER_SHAPES: tuple[tuple[str, str], ...] = (
      "{a} raises it and the SFX GUY behind the glass has an opinion and "
      "will not keep it to himself. It becomes three-handed and the pair "
      "half-regret letting him in."),
+    # #1244: THE ONE SHAPE THAT SAYS IT OUT LOUD. Every shape above is
+    # built on the topic arriving sideways, and the angle's closing rule
+    # forbids announcing it - which is what stops the bank sounding like
+    # a list being read. This is the operator's opposite ask, so it is a
+    # shape of its own rather than a change to the other thirteen, and
+    # bombshell_angle tells it the opposite rule in as many words.
+    ("conversation starter",
+     "{a} RAISES IT DIRECTLY, out loud, as the thing they want to talk "
+     "about - says it in their own words at the top and hands it "
+     "straight to {b} - and the two of them have a proper conversation "
+     "about it. This is the one shape where the topic is announced. "
+     "{b} answers it seriously first and then they go wherever it "
+     "takes them; disagree, build on it, bring in something from their "
+     "own lives. It is the opener, not an interruption."),
 )
 
 # How far sideways it is allowed to go. Rolled separately from the shape,
@@ -67922,6 +67939,9 @@ BANTER_SWERVES: tuple[tuple[str, str], ...] = (
 )
 
 
+TOPIC_STARTER_SHAPE = "conversation starter"     # #1244
+
+
 def bombshell_angle(text: str, shape: str = "") -> str:
     """#1161: hand a topic to one of them, in one of twelve shapes.
 
@@ -67934,14 +67954,26 @@ def bombshell_angle(text: str, shape: str = "") -> str:
     name = shape if shape in deck else random.choice(
         [row[0] for row in BANTER_SHAPES])
     swerve, how_far = random.choice(BANTER_SWERVES)
+    # #1244: the closing rule follows the SHAPE. Twelve of these are
+    # built on the topic arriving sideways and the rule is what makes
+    # them work; the conversation starter must announce it, and cannot
+    # also be forbidden from announcing it.
+    if name == TOPIC_STARTER_SHAPE:
+        close = ("Never read this instruction out loud. DO say the topic "
+                 "itself out loud - that is the whole point of this one. "
+                 "Open the round on it, in their own words, and let the "
+                 "conversation come out of it.")
+    else:
+        close = ("Never read this instruction out loud and never announce "
+                 "the topic as a topic — it is a thing one of them said, "
+                 "in the middle of a show, and everything after it is the "
+                 "two of them dealing with it.")
     return (
         "THE TOPIC, DROPPED INTO THIS ROUND: \"" + text + "\"\n"
         + "HOW IT GOES (" + name + "): "
         + deck[name].format(a=first, b=other) + " "
         + how_far + "\n"
-        "Never read this instruction out loud and never announce the topic "
-        "as a topic — it is a thing one of them said, in the middle of a "
-        "show, and everything after it is the two of them dealing with it."
+        + close
     )
 
 
@@ -80896,12 +80928,31 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
                                 last=int(time.time()))
     except Exception:  # noqa: BLE001
         _gripe = ""            # a broken book never silences the booth
+    # #1244: ...AND HE HAS HEARD WHAT THEY WERE TALKING ABOUT. A topic
+    # off the operator's board, raised from upstairs while he is already
+    # telling them off - a memo, an admonishment and a conversation
+    # starter at once. Only on the gripe branch: a memo that is not
+    # already about them is not improved by a topic stapled to it.
+    _topic = ""
+    try:
+        if _gripe and random.random() < float(dj_settings().get(
+                "manager_topic_pct", MANAGER_TOPIC_PCT)) / 100.0:
+            _topic = str((drop_bombshell() or {}).get("text") or "").strip()
+    except Exception:  # noqa: BLE001
+        _topic = ""            # a broken board never silences the booth
     if _gripe:
         _angle = (
             "a memo has just come down from the manager upstairs, and it is "
             "about THE TWO OF YOU. One of you reads it out to the other and "
             "to the listeners. What management wants you to know is this:\n"
             f"\"{_gripe}\"\n"
+            + (("The memo also brings up something he has heard the two of "
+                "you going on about, and he raises it the way a manager "
+                "does - as one more thing he is not impressed by:\n"
+                f"\"{_topic}\"\n"
+                "Deal with THAT on air too, and mind that he has clearly "
+                "been listening.\n") if _topic else "")
+            +
             "Do not read that back word for word - it is a memo, so say it "
             "the way a memo says it, and then deal with it on air. Take it "
             "personally, because it is personal: defend yourself, blame each "
