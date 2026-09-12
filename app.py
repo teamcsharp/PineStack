@@ -1243,6 +1243,11 @@ DEFAULT_DJ = {
     # a list being read - and is also why its subject is never heard.
     # Half and half. 0 is the station exactly as it was.
     "topic_aloud": 50,
+    # #1254: what share of rounds carry a spoken passage out of the
+    # speakbox - three or four sentences, said aloud, chosen at random
+    # and unrelated to the theme. The operator's "I need it said in
+    # every script in every segment"; 100 is literally every one.
+    "mono_pct": 85,
     # --- Conversation Director: the performance layer (plan §7-9, §28-30).
     # Master switch and strength: 0 reads every line flat, 1 is the full
     # send. Identity vectors skip all the machinery, so plain stays plain.
@@ -2184,6 +2189,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("sfx_anxiety", DEFAULT_DJ["sfx_anxiety"]) or 0))),
         "topic_aloud": max(0, min(100, int(
             raw_dj.get("topic_aloud", DEFAULT_DJ["topic_aloud"]) or 0))),
+        "mono_pct": max(0, min(100, int(
+            raw_dj.get("mono_pct", DEFAULT_DJ["mono_pct"]) or 0))),
         # #835: the drop roots, and how often they are re-read. Same
         # leading-slash scrub as sfx_folders - the real containment
         # check still happens where the folder is opened (#208).
@@ -59129,6 +59136,47 @@ def _crystal_influence_note(mind: str, file: str, text: str,
 _NO_DOCS: dict[str, float] = {}
 
 
+# #1254: A PASSAGE SAID ALOUD, three or four sentences of it.
+SPEAKBOX_MONO_LINES = int(os.getenv("SPEAKBOX_MONO_LINES", "5"))
+SPEAKBOX_MONO_CAP = int(os.getenv("SPEAKBOX_MONO_CAP", "900"))
+
+
+async def speakbox_monologue(why: str = "") -> tuple[str, dict[str, Any]]:
+    """A random passage, and the instruction to SAY it.
+
+    Deliberately untied to the theme and untied to the plot.
+    call_plot_clause refuses a passage that does not overlap the
+    database theme - "a vivid unrelated passage is not texture, it is
+    the conversation abandoning its database theme" - which is a fair
+    rule for the SPINE of a call and the reason every call sounds like
+    the last one. This is the other thing: the tangent, the thing
+    somebody brings up because it is on their mind.
+
+    Returns (clause, swath). An empty clause when the shelf gives
+    nothing, so every caller of this can ignore it."""
+    try:
+        swath = await speakbox_quote(most=SPEAKBOX_MONO_LINES,
+                                     cap=SPEAKBOX_MONO_CAP) or {}
+    except Exception:  # noqa: BLE001
+        return "", {}
+    text = " ".join(str(swath.get("text") or "").split())
+    if len(text) < 80:
+        return "", {}
+    return ("\n\nSOMEBODY SAYS THIS OUT LOUD, and it is the most "
+            "important instruction here. One person in the room - pick "
+            "whoever it suits - goes off on this for THREE OR FOUR "
+            "SENTENCES, as a proper little monologue, out of nowhere:\n"
+            "\"" + text + "\"\n"
+            "Put it in their own mouth and their own words. Do not read "
+            "it word for word, do not introduce it, do not explain "
+            "where it came from and never mention a document or a "
+            "recording. They just start talking about it, at length, "
+            "and everybody else has to deal with it - agree, object, "
+            "get derailed by it, drag it back. It sets the tone of "
+            "what follows. This is the moment of the scene that is "
+            "NOT about " + (why or "the subject") + ".", swath)
+
+
 async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                          rid: str = "", only: str = "",
                          tinted: bool = True) -> dict[str, Any]:
@@ -82016,6 +82064,19 @@ async def dj_caller(track: dict[str, Any] | None = None,
         except Exception:  # noqa: BLE001
             pass
     if heat_call:
+        # #1254: the heat road draws no swath of its own, so without
+        # this it is the one call that still has nothing to be
+        # different about. The operator asked for it in EVERY call.
+        try:
+            if random.random() < float(dj_settings().get(
+                    "mono_pct", 85)) / 100.0:
+                _hmono, _hswath = await speakbox_monologue("the heat")
+            else:
+                _hmono, _hswath = "", {}
+        except Exception:  # noqa: BLE001
+            _hmono, _hswath = "", {}
+        if _hswath and not _call_meta.get("source"):
+            _call_meta["source"] = str(_hswath.get("file") or "")
         heat_lines = await dj_banter(track, lines=4,
                                      bank=bank_to is not None,
                                      bank_to=bank_to,
@@ -82030,6 +82091,11 @@ async def dj_caller(track: dict[str, Any] | None = None,
                                          dj_settings().get(
                                              "call_stream", True)),
                                      call_meta=_call_meta,
+                                     # #1254: the document, on the heat
+                                     # road too - it drew no swath of
+                                     # its own, so the monologue is its
+                                     # only speakbox material.
+                                     source=str(_call_meta.get("source") or ""),
                                      angle=(
             f"{_cname} has got through on {line_say} and is calling about "
             "the HEAT. "
@@ -82051,7 +82117,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
             # talking to themselves.
             + f" Format the caller's lines as 'C: ...' — C is {_cname}. "
             f"{_cname} gets real turns of their own and the hosts answer "
-            "THEM, never each other about them."))
+            "THEM, never each other about them." + _hmono))      # #1254
         if bank_to is not None:
             # Banked, not aired: nothing ended, so nothing is written to
             # the ledger. The outcome it was written towards rides WITH
@@ -82122,12 +82188,26 @@ async def dj_caller(track: dict[str, Any] | None = None,
                  "original_topic": str(want), "prepared_call": bank_to is not None})
     try:
         _seed_bit, _seed_extra = await story_call_seed_clause(2)
+        # #1254: AND A PASSAGE SAID ALOUD. The two scraps above are
+        # capped at 220 characters and are pivots, not speech; this is
+        # the operator's "three or four sentences as a monologue",
+        # drawn at random and untied to the theme.
+        try:
+            if random.random() < float(dj_settings().get(
+                    "mono_pct", 85)) / 100.0:
+                _mono_bit, _mono_swath = await speakbox_monologue(
+                    "the call")
+            else:
+                _mono_bit, _mono_swath = "", {}
+        except Exception:  # noqa: BLE001
+            _mono_bit, _mono_swath = "", {}
     except Exception as exc:  # noqa: BLE001
         station_flow_event(
             "pivots", "error", "The random caller-pivot draw failed",
             trace_id=_pivot_trace, parent_id=(_pivot_start or {}).get("id"),
             details={"error_type": type(exc).__name__, "caller": _cname})
         _seed_bit, _seed_extra = "", []
+        _mono_bit, _mono_swath = "", {}          # #1254
     # #1066: reworked into the situation and the story before the writer
     # sees them; the clause quotes them, so it is retold with the new words.
     if _seed_extra and ((_themed or {}).get("text") or _pline):
@@ -82221,6 +82301,15 @@ async def dj_caller(track: dict[str, Any] | None = None,
                             render_stream=bool(
                                 dj_settings().get("call_stream", True)),
                             call_meta=_call_meta,
+                            # #1254: the document, on every aired line.
+                            # dj_caller has always KNOWN which document
+                            # it drew and put it on _call_meta["source"]
+                            # - but dj_banter stamps entry["source"]
+                            # from its own `source` kwarg, which this
+                            # road never passed. So every caller line
+                            # has logged an empty source for as long as
+                            # the road has existed.
+                            source=str(_call_meta.get("source") or ""),
                             angle=(
         f"The request line rings and {_cname} is on {line_say}. "
         "It OPENS with the phone RINGING and one of the hosts hearing it out "
@@ -82234,6 +82323,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
         + _pline_bit                                               # #1157
         + _plot
         + _seed_bit                                                # #1033
+        + _mono_bit                                                # #1254
         + _disp
         # #854: the case supplies the SUBJECT, the disposition above
         # supplies the TEMPER, and the rule below supplies the ENDING. On
@@ -116283,6 +116373,92 @@ async def _startup_topic_cooker() -> None:
 @app.on_event("startup")
 async def _startup_sfx_guy_watch() -> None:
     fire_and_forget(sfx_guy_watch())            # #1245
+
+
+# #1253: the pinned-era stock, retired once.
+PIN_DOC = "vil1.md"
+PIN_MIN_AGE = 12 * 3600.0            # never touch anything written today
+UNFREEZE_MARK = data_path("unfroze_pinned_stock")
+
+
+def _unfreeze_pinned_stock() -> dict[str, int]:
+    """Retire the rounds the k=1 pin wrote. Blocking; called in a thread.
+
+    The predicate is deliberately an AGE rather than the exact hour the
+    pin was cured, which nothing records: a row sourced from the pinned
+    document, stamped keep-forever, and written more than twelve hours
+    ago. Anything written since is left alone whatever it is sourced
+    from, so a legitimate draw of that document today survives."""
+    took = {"larder": 0, "shelf": 0}
+    now = time.time()
+
+    def _pinned(row: Any) -> bool:
+        try:
+            if str((row or {}).get("source") or "") != PIN_DOC:
+                return False
+            made = float(row.get("at") or row.get("made") or 0)
+            if not made or now - made < PIN_MIN_AGE:
+                return False
+            return float(row.get("keep_until") or 0) > 4_000_000_000
+        except Exception:  # noqa: BLE001
+            return False
+
+    try:
+        drop = [e for e in _LARDER if _pinned(e)]
+        for e in drop:
+            try:
+                retire_forced("banter", e,
+                              "#1253: written while the k=1 theme pin was "
+                              "in force")
+            except Exception:  # noqa: BLE001
+                pass
+        if drop:
+            gone = {id(e) for e in drop}
+            _LARDER[:] = [e for e in _LARDER if id(e) not in gone]
+            took["larder"] = len(drop)
+            _larder_save()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for kind, rows in list(_SHELF.items()):
+            if not isinstance(rows, list):
+                continue
+            keep = [r for r in rows
+                    if not _pinned((r or {}).get("entry") or r)]
+            gone = len(rows) - len(keep)
+            if gone:
+                rows[:] = keep
+                took["shelf"] += gone
+        if took["shelf"]:
+            _pantry_save(True)
+    except Exception:  # noqa: BLE001
+        pass
+    return took
+
+
+@app.on_event("startup")
+async def _startup_unfreeze_pinned() -> None:
+    """#1253: ONCE. The k=1 pin was cured in the PICKER on 09-10 and its
+    three days of output was left in the bank, stamped keep-forever by
+    #1157 because it was rhymed - so the bug's own writing became the
+    majority of the stock and one document has been on the air ever
+    since. The operator asked for this exception explicitly; every
+    rhymed round written since keeps its forever."""
+    try:
+        if UNFREEZE_MARK.exists():
+            return
+        await asyncio.sleep(25)         # let the stores load first
+        took = await asyncio.to_thread(_unfreeze_pinned_stock)
+        UNFREEZE_MARK.write_text(str(time.time()))
+        pipeline_log("cupboard",
+                     "#1253: retired %d larder and %d shelf round(s) from "
+                     "%s written while the k=1 theme pin was in force - "
+                     "the pin was cured in the picker on 09-10 and its "
+                     "output had been kept forever"
+                     % (took["larder"], took["shelf"], PIN_DOC))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("cupboard", "#1253 could not run: "
+                     + type(exc).__name__)
 
 
 async def air_relieve_hold(seconds: float = 60.0) -> None:
@@ -161673,13 +161849,28 @@ async function radioClockPoll() {
   var original = win.requestAnimationFrame;
   if (!original || original.__pineYield) return;
   var holdUntil = 0;
+  var holdSince = 0;
 
   var wrapped = function (callback) {
     if (typeof callback !== 'function') return original.call(win, callback);
+    /* WHEN THIS FRAME WAS ASKED FOR, and it is the whole of the rule.
+     *
+     * The first version held EVERY callback for the hold window, including
+     * the one the touch handler had just scheduled to draw its own response
+     * - so the popup it was meant to speed up waited 160 ms longer.
+     * Measured: touch to paint 196-257 ms, worse than the 64-137 ms it
+     * started at. A guard that delays the thing it is protecting is not a
+     * guard.
+     *
+     * Only work that was ALREADY IN FLIGHT when the finger landed yields.
+     * Anything asked for after that moment is the response to the touch and
+     * goes at the next frame, which is exactly what should happen. */
+    var askedAt = win.performance.now();
     var run = function (stamp) {
-      /* performance.now() and the rAF stamp share an origin, so they are
-       * directly comparable - no second clock is involved. */
-      if (stamp < holdUntil) { original.call(win, run); return; }
+      if (askedAt < holdSince && stamp < holdUntil) {
+        original.call(win, run);
+        return;
+      }
       callback(stamp);
     };
     return original.call(win, run);
@@ -161690,7 +161881,10 @@ async function radioClockPoll() {
   /* CAPTURE PHASE, so the hold is in place before any handler runs - and on
    * pointerdown rather than click, because the whole point is to clear the
    * road for the handler that a press is about to start. */
-  var press = function () { holdUntil = win.performance.now() + HOLD_MS; };
+  var press = function () {
+    holdSince = win.performance.now();
+    holdUntil = holdSince + HOLD_MS;
+  };
   ['pointerdown', 'keydown', 'wheel'].forEach(function (kind) {
     win.document.addEventListener(kind, press, {capture: true, passive: true});
   });

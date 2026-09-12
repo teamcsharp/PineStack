@@ -1887,9 +1887,17 @@
     /* POLY is on at boot, so its light is on at boot - and so is SOLO PAD,
      * which remembers the operator's last answer across reloads. */
     controls.querySelector("#pbPoly").classList.add("on");
+    /* THE LIGHT MUST MATCH THE STATE, both ways.
+     *
+     * This only ever ADDED the class, so a terminal whose stored preference
+     * was off still showed SOLO PAD lit - and then a press to "turn it on"
+     * turned it off. Measured exactly that: duckEnabled false while the
+     * button carried "pb-mode on". A toggle that lies about its own state is
+     * worse than one that does nothing. */
     const duckBtn = controls.querySelector("#pbDuck");
-    if (duckBtn && root.PineAir && root.PineAir.duckEnabled()) {
-      duckBtn.classList.add("on");
+    if (duckBtn) {
+      duckBtn.classList.toggle("on",
+        !!(root.PineAir && root.PineAir.duckEnabled()));
     }
 
     /* TAP, CHOP and STOP DO something; POLY, GATE, FULL, 16 LVL and NOTE

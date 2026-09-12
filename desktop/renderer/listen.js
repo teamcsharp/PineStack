@@ -627,7 +627,8 @@
        * what is playing, it keeps it - and the top right is the one corner
        * of this view that is never covered by the artwork or the headline. */
       + '<button id="plPad" class="pl-pad" title="Tap: keep the whole of '
-      + 'what is playing. Double tap: the last twenty seconds.">'
+      + 'what is playing. Double tap: the last twenty seconds. '
+      + 'Triple tap: the last two lines said.">'
       + '<i></i><b>grab</b><span id="plPadSay"></span></button>'
       + '<i id="plClock" class="pl-clock">--:--</i></div>'
 
@@ -899,7 +900,12 @@
           tapTimer = 0;
           pad.classList.add("busy");
           try {
-            if (many >= 2) await grabLastSeconds(say);
+            /* One, two or three taps are three different takes:
+             *   1  the whole of what is playing now
+             *   2  the last twenty seconds off the ring
+             *   3  the last two things SAID, each onto its own pad */
+            if (many >= 3) await grabLastTwoClips(say);
+            else if (many === 2) await grabLastSeconds(say);
             else await grabWholeOfNow(say);
           } finally {
             pad.classList.remove("busy");
@@ -1041,6 +1047,51 @@
     say(got.ok
       ? "bank " + (got.bank + 1) + ", pad " + (got.pad + 1) + " · " + whatFor
       : got.why, !got.ok);
+  }
+
+  /* THE LAST TWO THINGS SAID, each onto its own pad.
+   *
+   * "If I tap the sampler dot on the listen tab three times, grab the last
+   *  two clips and put those on a sample pad."
+   *
+   * Two SEPARATE takes, not one welded pair: they are two moments, they get
+   * two pads, and the roll across banks puts them wherever there is room.
+   * Oldest first, so they land in the order they were said - a pair read
+   * back off the pads in the other order is a conversation running
+   * backwards.
+   *
+   * Serialised on purpose. sampler.grab() refuses a second call while one is
+   * in flight ("still fetching the last one"), and the measured fetch for a
+   * single clip has run from 1.1 s to 13.5 s against a busy station - fired
+   * together they would race for the same free pad and one would be lost. */
+  async function grabLastTwoClips(say) {
+    const sampler = root.PineSampler;
+    const feed = root.PineStationFeed;
+    if (!sampler || typeof sampler.grab !== "function") {
+      say("no sampler here", true);
+      return;
+    }
+    const rows = (feed && feed.rows ? feed.rows() : []) || [];
+    const want = [];
+    for (let i = rows.length - 1; i >= 0 && want.length < 2; i -= 1) {
+      const row = rows[i];
+      if (!row || !sampler.takeable(row)) continue;
+      if (root.PineListenModel && root.PineListenModel.mediaStale
+        && root.PineListenModel.mediaStale(row, Date.now())) continue;
+      want.push(row);
+    }
+    if (!want.length) { say("nothing said has audio behind it", true); return; }
+    want.reverse();                       /* oldest first */
+    const landed = [];
+    for (let i = 0; i < want.length; i += 1) {
+      say("keeping " + (i + 1) + " of " + want.length + "…");
+      const got = await sampler.grab(want[i]);
+      if (got.ok) landed.push("b" + (got.bank + 1) + "p" + (got.pad + 1));
+      else { say(got.why, true); return; }
+    }
+    say(landed.length === 2
+      ? "two lines kept · " + landed.join(" and ")
+      : "one line kept · " + landed[0]);
   }
 
   /* THE LAST TWENTY SECONDS, off the ring rather than off a file - so it is

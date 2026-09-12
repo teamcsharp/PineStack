@@ -95,6 +95,8 @@
    * the broadcast is ducked has to be caught on arrival. */
   var ducked = false;
   var silenced = [];
+  /* Whether the pad solo took the record's gain down as well as muting it. */
+  var mutedMusic = false;
   var known = [];           /* every element we have seen play         */
   var reason = 'not started';
   var live = false;
@@ -366,12 +368,123 @@
           silenced.push(element);
         } catch (err) { /* nothing to be done */ }
       }
+      /* AND THE RECORD'S GAIN TO ZERO ON TOP OF THE MUTE.
+       *
+       * "I need the radio COMPLETELY muted while the pad is playing so I can
+       * hear the pad cleanly." Muting the elements is the right primitive
+       * and covers every player this file has seen - but the record also
+       * runs through a gain node the panel owns and writes on its own
+       * schedule, and a player that starts a moment later is not in `known`
+       * yet. Zeroing the gain closes both, and it is restored from the
+       * desk's own number rather than a remembered one, so a level changed
+       * while a pad was sounding is not undone. */
+      mutedMusic = setMusicGain(0);
       return;
     }
     for (var j = 0; j < silenced.length; j += 1) {
       try { silenced[j].muted = false; } catch (err) { /* gone */ }
     }
     silenced = [];
+    if (mutedMusic) {
+      var level = musicLevels();
+      /* Back to wherever the desk says it should be - ducked if something is
+       * still talking, full if not. */
+      setMusicGain(clipDucked ? level.music * (1 - level.duck) : level.music);
+      mutedMusic = false;
+    }
+  }
+
+  /* ------------------------------------------------- the music, specifically
+   *
+   * TWO THINGS NEED THE MUSIC ALONE, and both were asked for:
+   *
+   *   "Make sure that whenever someone is speaking or a clip is playing that
+   *    the music ducks."
+   *   "Whenever I tap on a pad, I need the radio completely muted while the
+   *    pad is playing so I can hear the pad cleanly."
+   *
+   * The panel already ducks, and correctly - measured on the tablet, the
+   * music gain goes 1.000 -> 0.300 the moment djSpeaking flips, which is
+   * exactly music x (1 - duck). But djSpeaking is set for the DJ VOICE path
+   * only. A sting, an advert preview, a clip fired from a console - anything
+   * else that makes a sound - leaves the record at full level underneath it.
+   *
+   * So this watches every player it already knows about (see the header: it
+   * knows about all of them, attached or not) and ducks the music whenever
+   * anything ELSE is sounding. It writes the same node the panel writes,
+   * with the same ramp, so the two cannot disagree about the shape - only
+   * about the moment, and the later writer wins, which is the correct
+   * answer for "is something talking right now". */
+
+  function musicPlayer() {
+    if (typeof document === 'undefined') return null;
+    return document.getElementById('musicPlayer');
+  }
+
+  /** The panel's own gain node for the record, or null off the panel. */
+  function musicGain() {
+    var player = musicPlayer();
+    if (!player || typeof root.gainFor !== 'function') return null;
+    var entry = null;
+    try { entry = root.gainFor(player, 'music'); } catch (err) { entry = null; }
+    return entry && entry.node ? entry : null;
+  }
+
+  function musicLevels() {
+    if (typeof root.djLevels === 'function') {
+      try { return root.djLevels(); } catch (err) { /* fall through */ }
+    }
+    return {music: 1, voice: 1.6, duck: 0.7};
+  }
+
+  /* Set the record's gain, with the panel's own ramp - a step is a click. */
+  function setMusicGain(value) {
+    var entry = musicGain();
+    if (!entry) return false;
+    try {
+      entry.node.gain.setTargetAtTime(value, entry.context.currentTime, 0.12);
+    } catch (err) {
+      try { entry.node.gain.value = value; } catch (inner) { return false; }
+    }
+    return true;
+  }
+
+  /* Is anything OTHER than the record making a sound? */
+  function somethingElseTalking() {
+    var record = musicPlayer();
+    for (var i = 0; i < known.length; i += 1) {
+      var element = known[i];
+      if (!element || element === record) continue;
+      if (element.paused || element.ended || element.muted) continue;
+      if (isOurs(element)) continue;
+      /* A player at zero volume is not talking, whatever its clock says. */
+      if (Number(element.volume) === 0) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /* THE CLIP DUCK, on its own clock.
+   *
+   * 250 ms because that is the pace the station itself uses for the round
+   * clock, and because a duck that arrives late on a one-second sting has
+   * ducked nothing. It only ever writes when the answer CHANGES, so a quiet
+   * minute costs one comparison every quarter second and no audio work. */
+  var clipDucked = false;
+  var clipTimer = 0;
+
+  function watchClips() {
+    if (clipTimer) return;
+    clipTimer = setInterval(function () {
+      /* The pad solo is a full mute and outranks a duck; while it holds,
+       * this must not write the gain back up underneath it. */
+      if (ducked) return;
+      var talking = somethingElseTalking();
+      if (talking === clipDucked) return;
+      clipDucked = talking;
+      var level = musicLevels();
+      setMusicGain(talking ? level.music * (1 - level.duck) : level.music);
+    }, 250);
   }
 
   /* ------------------------------------------------------------ reading out */
@@ -528,6 +641,7 @@
     ['pointerdown', 'keydown'].forEach(function (kind) {
       document.addEventListener(kind, wake, true);
     });
+    watchClips();
     reason = live ? 'listening' : 'waiting for the broadcast to start';
   }
 
@@ -537,6 +651,12 @@
   var api = {
     start: start, ready: ready, why: why, seconds: seconds, level: level,
     sliceWav: sliceWav, measure: measure, quiet: quiet,
+    /* Visible so the behaviour can be checked rather than believed. */
+    duckState: function () {
+      return {clipDucked: clipDucked, padMuted: ducked,
+              musicGain: (musicGain() || {node: {gain: {value: null}}}).node.gain.value,
+              talking: somethingElseTalking()};
+    },
     duck: duck, release: release,
     setDuckEnabled: setDuckEnabled, duckEnabled: duckEnabled,
     /* Marks a player as the sampler's own, so auditioning a clip in the grab
