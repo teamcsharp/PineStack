@@ -645,9 +645,32 @@
      * that true by construction, whatever else clears what. */
     var lit = document.querySelectorAll('.sp-el.sp-now');
     for (var i = 0; i < lit.length; i += 1) lit[i].classList.remove('sp-now');
+    /* #1270: A MARK THAT DID NOT HAPPEN IS NOT REMEMBERED.
+     *
+     * This used to write `nowLineId = id` and only THEN look for the
+     * node, returning quietly when the line was not on the page yet -
+     * which happens constantly, because the station moves to a line
+     * the moment it airs and the screenplay is only re-read every
+     * twenty seconds. The id was now recorded as marked when nothing
+     * had been marked, so every later tick hit `id === nowLineId` at
+     * the top and returned. The highlight then sat on the PREVIOUS
+     * line until the station moved again - which is the one-to-three
+     * entry lag measured on the tablet, always behind and never ahead.
+     *
+     * It was masked until now: paintScript cleared nowLineId on every
+     * repaint, so the mark was forced to re-seat three times a minute.
+     * #1269 stopped rebuilding the page and the mask went with it.
+     *
+     * So the node is found FIRST. If the line has not arrived yet the
+     * id is left unset and the next tick - a quarter of a second - has
+     * another go, which is also what makes the view seat itself on
+     * mount instead of sitting at the top of a 72,000px script.
+     */
+    var node = id
+      ? document.querySelector('.sp-el[data-line="' + id + '"]')
+      : null;
+    if (id && !node) { nowLineId = ''; return; }   /* not on the page yet */
     nowLineId = id || '';
-    if (!nowLineId) return;
-    var node = document.querySelector('.sp-el[data-line="' + nowLineId + '"]');
     if (!node) return;
     node.classList.add('sp-now');
     if (follow) {
