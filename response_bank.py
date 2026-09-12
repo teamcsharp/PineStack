@@ -9,11 +9,41 @@ import time
 from pathlib import Path
 
 
+# 2026-09-09: EIGHT PHRASES WAS THE STALENESS.
+#
+# "ensure that the play out never gets stale." Measured over eighteen hours
+# of the air log: 57% of every spoken line was a repeat of something already
+# aired that day, and the worst offenders were these - one back-channel went
+# out EIGHTY times, the next 48, the next 45. take() rotates least-recently-
+# used and rotated honestly; there were only seven listening rows and one
+# surprise row per voice to rotate over (the 125 topic rows need a two-anchor
+# keyword match and almost never fire), so eight lines carried every seam in
+# the show. The rotation was never the fault; the pool was.
+#
+# These stay strictly non-topical - they bridge a continuing turn or
+# acknowledge a monologue and must fit ANY context, which is the whole
+# contract in add_listening_responses. Each one is rapped separately by the
+# crystal, so the aired variety is this list times the tint.
 PHRASES = (
     ("Mm-hmm.", "listening"), ("I hear you.", "listening"),
     ("Yeah.", "listening"), ("Go on.", "listening"),
     ("Hmm.", "listening"), ("I'm listening.", "listening"),
     ("I understand.", "listening"), ("Oh wow.", "surprise"),
+    ("Right.", "listening"), ("Keep going.", "listening"),
+    ("I follow.", "listening"), ("Say more.", "listening"),
+    ("That tracks.", "listening"), ("Sure.", "listening"),
+    ("Okay, okay.", "listening"), ("I'm with you.", "listening"),
+    ("Uh-huh.", "listening"), ("Fair enough.", "listening"),
+    ("I take your point.", "listening"), ("Noted.", "listening"),
+    ("Carry on.", "listening"), ("I'm still here.", "listening"),
+    ("Makes sense.", "listening"), ("So far, so good.", "listening"),
+    ("Right, right.", "listening"), ("Understood.", "listening"),
+    ("Yeah, go on.", "listening"), ("I hear that.", "listening"),
+    ("Point taken.", "listening"), ("Mm.", "listening"),
+    ("Let's have it.", "listening"), ("Finish the thought.", "listening"),
+    ("Well now.", "surprise"), ("You're joking.", "surprise"),
+    ("Get out.", "surprise"), ("No chance.", "surprise"),
+    ("Hold on.", "surprise"), ("Say that again.", "surprise"),
 )
 
 _STOP = set("a an and are as at be been but by can could did do does for from had has have how i if in into is it its just like may me more most my no not of on one or our out say so some than that the their them then there these they this those to too us very was we were what when where which who why will with would you your about after again also being even much really something thing think know way want hear tell sounds sound".split())
@@ -341,12 +371,27 @@ class ResponseBank:
         crystal = str(crystal or "")
         present = {row["text"] for row in self.ready(voice, engine, crystal)}
         # #1064: the fixed acknowledgments are plain by nature; under a
-        # crystal only rows rapped through it are candidates.
-        candidates = ([] if crystal else
-                      [{"text": text, "intent": intent} for text, intent in PHRASES])
+        # crystal only rows rapped through it were candidates.
+        #
+        # 2026-09-09: and they are candidates under a crystal again, marked
+        # so the recorder raps each one BEFORE it records it. Excluding them
+        # left the crystal's entire listening repertoire at whatever had
+        # happened to be tinted before that rule landed - measured on the
+        # live station: SEVEN listening rows per voice against 56 crystal
+        # catalog rows that are all `topic` and almost never fire, which is
+        # how one back-channel came to air fifteen times in an hour.
+        #
+        # The catalog budget subtracts what the phrases ACTUALLY took, not
+        # len(PHRASES) unconditionally: with the phrases excluded that
+        # subtraction was charging for candidates it had not added, so
+        # widening the phrase list narrowed the crystal pool it was meant
+        # to widen (56 -> 26 when the list went from 8 to 38).
+        phrases = [{"text": text, "intent": intent, "rap": bool(crystal)}
+                   for text, intent in PHRASES]
+        candidates = list(phrases)
         candidates.extend([r for r in self.catalog()
                            if str(r.get("crystal") or "") == crystal
-                           ][:max(0, self.target - len(PHRASES))])
+                           ][:max(0, self.target - len(phrases))])
         missing = [row for row in candidates if row["text"] not in present
                    and not self._is_retired(row["text"])]
         if available_only:
@@ -354,6 +399,24 @@ class ResponseBank:
                 (retry := self.retry_state(voice, engine, row["text"], crystal)).get("suspended")
                 or float(retry.get("retry_after") or 0) > time.time())]
         return missing
+
+    def rapped_said(self, text, crystal):
+        """2026-09-09: the bar an acknowledgment was already rapped into.
+
+        The rap belongs to the crystal, not to the seat, so the second
+        presenter reuses the first one's bar instead of paying another
+        model visit for the same line."""
+        crystal = str(crystal or "")
+        if not crystal:
+            return ""
+        with self.lock:
+            for row in self._load().values():
+                if (row.get("text") == text
+                        and str(row.get("crystal") or "") == crystal):
+                    said = str(row.get("said") or "").strip()
+                    if said:
+                        return said
+        return ""
 
     def put(self, voice, engine, text, intent, clip, metadata=None):
         row = {"voice": voice, "engine": engine, "text": text, "intent": intent,
