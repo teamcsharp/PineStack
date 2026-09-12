@@ -74,6 +74,9 @@
    * complaint; the operator asked for "previous seconds", and two minutes is
    * comfortably more than anyone scrubs back through by hand. */
   var HISTORY_S = 120;
+  /* See the two-rings note above: long enough to reach a line you just
+   * heard, short enough not to cost a second 23 MB. */
+  var VOICE_HISTORY_S = 60;
 
   /* ScriptProcessor, not AudioWorklet, on purpose: a worklet needs a module
    * fetched from a URL, and these views are injected into a page whose origin
@@ -82,8 +85,37 @@
    * WebGL canvases, not this. */
   var BLOCK = 4096;
 
+  /* TWO RINGS, BECAUSE "THE AIR" MEANS TWO DIFFERENT THINGS.
+   *
+   * "The samples I am capturing from the air appear to be double playing and
+   *  overlap. I think it is recording multiple clips on top of each other."
+   *
+   * Nothing is recorded twice - that was measured three ways: a known probe
+   * came back as 440 Hz, silence, 880 Hz in order at rms 0.355 for a 0.5
+   * sine, which is EXACTLY unity gain and so not summed twice; the load path
+   * takes a fresh token and replaces; and one tap produces exactly one voice.
+   *
+   * What is actually happening is that the MIX contains several things at
+   * once. This station routinely has three or four players sounding
+   * together - a record underneath, a line over it, a sting across the top -
+   * and a tap placed after the desk faithfully records all of them. That is
+   * right for "keep what I just heard" and wrong for "keep what they said",
+   * and the operator wanted the second one.
+   *
+   * So the voices are kept SEPARATELY, from the same analysers minus the
+   * record. A grab off a pad takes that one; the mix is still there and the
+   * grab window can still offer it.
+   *
+   * THE VOICE RING IS SHORTER - sixty seconds against the mix's two minutes.
+   * You reach for a line you just heard; nobody scrubs back two minutes for
+   * one. And a second full-length ring is another 23 MB on a 4 GB tablet for
+   * history that would never be read. */
   var ctx = null;
   var capture = null;       /* the ScriptProcessor doing the copying   */
+  var voiceCapture = null;  /* the same, for everything but the record */
+  var voiceRing = null;
+  var voiceWrite = 0;
+  var voiceFilled = 0;
   var sink = null;          /* a silent destination for it to feed     */
   var ring = null;          /* Float32Array, HISTORY_S * sampleRate    */
   var write = 0;            /* next write index                        */
@@ -168,6 +200,25 @@
       if (filled < ring.length) filled = Math.min(ring.length, filled + n);
     };
     capture.connect(sink);
+
+    /* The voices-only ring. Same shape, its own clock, fed in tap(). */
+    voiceRing = new Float32Array(Math.round(VOICE_HISTORY_S * c.sampleRate));
+    voiceCapture = c.createScriptProcessor(BLOCK, 2, 1);
+    voiceCapture.onaudioprocess = function (event) {
+      var input = event.inputBuffer;
+      var left = input.getChannelData(0);
+      var right = input.numberOfChannels > 1 ? input.getChannelData(1) : null;
+      var n = left.length;
+      for (var i = 0; i < n; i += 1) {
+        var v = right ? (left[i] + right[i]) * 0.5 : left[i];
+        voiceRing[voiceWrite] = v;
+        voiceWrite = voiceWrite + 1 === voiceRing.length ? 0 : voiceWrite + 1;
+      }
+      if (voiceFilled < voiceRing.length) {
+        voiceFilled = Math.min(voiceRing.length, voiceFilled + n);
+      }
+    };
+    voiceCapture.connect(sink);
     return true;
   }
 
@@ -504,6 +555,10 @@
     if (element === musicPlayer()) return;
     var c = context();
     if (!c) return;
+    /* The same signal, into the voices-only ring. */
+    if (voiceCapture) {
+      try { from.connect(voiceCapture); } catch (err) { /* already, or refused */ }
+    }
     if (!speechAnalyser) {
       speechAnalyser = c.createAnalyser();
       speechAnalyser.fftSize = 128;
@@ -524,11 +579,17 @@
 
   /* ------------------------------------------------------------ reading out */
 
-  function seconds() {
+  function seconds(voicesOnly) {
     var c = context();
-    if (!c || !ring) return 0;
-    return filled / c.sampleRate;
+    if (!c) return 0;
+    if (voicesOnly) return voiceRing ? voiceFilled / c.sampleRate : 0;
+    return ring ? filled / c.sampleRate : 0;
   }
+
+  /* Is there anything in the voices ring worth taking? A terminal where the
+   * panel never built an analyser for a voice player has an empty one, and a
+   * grab must fall back to the mix rather than hand back silence. */
+  function haveVoices() { return !!(voiceRing && voiceFilled > 0); }
 
   function level() {
     var was = loudest;
@@ -585,28 +646,39 @@
    * operator thinks about it - "the last eight seconds" - and because the
    * present keeps moving while the window is being chosen.
    */
-  function sliceWav(fromAgo, toAgo) {
+  /**
+   * @param voicesOnly take it from the voices ring - the broadcast WITHOUT
+   *   the record underneath. That is what a pad grab wants: "what they
+   *   said", not "what the room sounded like".
+   */
+  function sliceWav(fromAgo, toAgo, voicesOnly) {
     var c = context();
-    if (!c || !ring || !filled) return null;
+    /* Deliberately NOT named ring/write/filled: shadowing the module's own
+     * cursors here would make a mix slice read the voice ring's head. */
+    var useVoice = !!voicesOnly && voiceRing && voiceFilled > 0;
+    var from = useVoice ? voiceRing : ring;
+    var head = useVoice ? voiceWrite : write;
+    var much = useVoice ? voiceFilled : filled;
+    if (!c || !from || !much) return null;
     var rate = c.sampleRate;
     var older = Math.max(0, Number(fromAgo) || 0);
     var newer = Math.max(0, Number(toAgo) || 0);
     if (older <= newer) return null;
-    var have = filled / rate;
+    var have = much / rate;
     if (older > have) older = have;
     if (newer >= older) return null;
 
     var count = Math.round((older - newer) * rate);
     if (count < 1) return null;
     var out = new Float32Array(count);
-    /* `write` is where the NEXT sample goes, so it is also "now". */
-    var end = write - Math.round(newer * rate);
+    /* `head` is where the NEXT sample goes, so it is also "now". */
+    var end = head - Math.round(newer * rate);
     var start = end - count;
     var peak = 0;
     for (var i = 0; i < count; i += 1) {
       var at = start + i;
-      while (at < 0) at += ring.length;
-      var v = ring[at % ring.length];
+      while (at < 0) at += from.length;
+      var v = from[at % from.length];
       out[i] = v;
       var a = v < 0 ? -v : v;
       if (a > peak) peak = a;
@@ -686,6 +758,7 @@
   var api = {
     start: start, ready: ready, why: why, seconds: seconds, level: level,
     sliceWav: sliceWav, measure: measure, quiet: quiet, spectrum: spectrum,
+    haveVoices: haveVoices,
     /* Visible so the behaviour can be checked rather than believed. */
     duckState: function () {
       return {clipDucked: clipDucked, padMuted: ducked,

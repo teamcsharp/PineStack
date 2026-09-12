@@ -1744,7 +1744,19 @@
       note("Cannot sample the air: " + (air ? air.why() : "the tap is not loaded"));
       return;
     }
-    const take = Math.min(LIVE_TAKE_S, air.seconds());
+    /* THE VOICES, NOT THE ROOM.
+     *
+     * "The samples I am capturing appear to overlap - it is recording
+     *  multiple clips on top of each other."
+     *
+     * Nothing was being recorded twice; the MIX simply has several things in
+     * it at once, and this station usually does. A pad grab wants what they
+     * SAID, so it takes the voices ring where there is one and falls back to
+     * the mix where there is not - a terminal whose panel never built an
+     * analyser for a voice player would otherwise get silence. */
+    const voicesOnly = typeof air.haveVoices === "function" && air.haveVoices();
+    const take = Math.min(LIVE_TAKE_S,
+      voicesOnly ? air.seconds(true) : air.seconds());
     if (take < 0.4) {
       note("There is not enough broadcast held yet - give it a few seconds.");
       return;
@@ -1754,7 +1766,7 @@
      * anything is playing, so without this a hold during a quiet stretch put
      * eight seconds of digital silence on a pad and looked like a fault.
      * Measured that way once: peak 0.0037, rms 0.00118. */
-    if (typeof air.quiet === "function" && air.quiet(take, 0)) {
+    if (!voicesOnly && typeof air.quiet === "function" && air.quiet(take, 0)) {
       note("That stretch was silent - nothing is playing on this terminal "
         + "right now. Check the broadcast is coming here before holding a pad.");
       return;
@@ -1762,12 +1774,15 @@
     if (cell) cell.classList.add("loading");
     const bar = root.PineBusy ? root.PineBusy.attach(cell, "taking the air") : null;
     try {
-      const bytes = air.sliceWav(take, 0);
+      const bytes = air.sliceWav(take, 0, voicesOnly);
       if (!bytes) throw new Error("the buffer would not give up that window");
       await putBytesOnPad(index, bytes, {
         label: "air " + take.toFixed(1) + "s",
         who: "broadcast", kind: "air",
-        cut: "the last " + take.toFixed(1) + " seconds as it played",
+        cut: "the last " + take.toFixed(1) + " seconds"
+          + (voicesOnly ? " - voices only, without the record underneath"
+                        : " as it played, mix and all"),
+        voicesOnly: voicesOnly,
         /* WHERE IN THE RING THIS CAME FROM, so it can be widened afterwards.
          *
          * "In the event that I am tapping and holding it when audio is
@@ -1782,8 +1797,9 @@
         air: {from: take, to: 0, at: Date.now()}
       });
       if (bar) bar.finish(true);
-      note("Pad " + (index + 1) + " - " + take.toFixed(1)
-        + "s off the air. Right-click to trim it.");
+      note("Pad " + (index + 1) + " - " + take.toFixed(1) + "s "
+        + (voicesOnly ? "of voices" : "off the air")
+        + ". Hold it again to widen, right-click to trim.");
     } catch (err) {
       if (bar) bar.finish(false);
       note("Could not take the air: " + ((err && err.message) || err));
