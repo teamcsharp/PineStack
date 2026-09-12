@@ -500,3 +500,54 @@
 .sp-crawl-go.on { background: #2f6f4f; border-color: #46a273; color: #eaf7ef; }
 .sp-crawl-rate { width: 108px; accent-color: #46a273; }
 .sp-right { position: relative; }
+
+/* --- #1272 THE SCRIPT-DOCUMENT SETTING -----------------------------
+ *
+ * "If i tripple tap it, show it with the colorings and display style of
+ *  a script document so it can be easier on the eyes."
+ *
+ * Three taps on the blank area puts the pane on paper: the measures and
+ * the typeface a screenplay is actually set in, and each element
+ * coloured for WHAT IT IS rather than for a dark console.
+ *
+ * Only the SCRIPT changes. The rails, the panels and the player keep
+ * the station's own dark chrome, because the operator is working this
+ * view with a thumb in a dim room and a page of white either side of
+ * the script would be the opposite of easier on the eyes.
+ */
+.sp-page.sp-look-paper #spScript {
+  background: #f3ecdd;                       /* paper, not white */
+  color: #241f18;                            /* ink, not black */
+  font: 14px/1.5 "Courier New", Courier, ui-monospace, monospace;
+  padding: 22px 46px 30px 30px;
+}
+/* The standard measures, in Courier, where a screenplay puts them. */
+.sp-page.sp-look-paper .sp-scene {
+  color: #1d2a35; margin: 26px 0 10px;
+  text-decoration: underline; letter-spacing: 0;
+}
+.sp-page.sp-look-paper .sp-subheader {
+  color: #7b6a4e; font-size: 11px; letter-spacing: .08em;
+}
+.sp-page.sp-look-paper .sp-action { color: #3a3128; margin: 0 0 12px; }
+.sp-page.sp-look-paper .sp-character {
+  color: #5d2f1c; margin: 14px 0 0 34%; letter-spacing: .06em;
+}
+.sp-page.sp-look-paper .sp-parenthetical {
+  color: #6d6455; font-style: italic; margin: 0 0 0 28%; max-width: 42%;
+}
+.sp-page.sp-look-paper .sp-dialogue {
+  color: #241f18; margin: 0 0 12px 20%; max-width: 56%;
+}
+.sp-page.sp-look-paper .sp-transition { color: #5d2f1c; }
+/* The live line still has to be findable at a glance across the room. */
+.sp-page.sp-look-paper .sp-el.sp-now {
+  background: #f6df9a;
+  box-shadow: 0 0 0 2px #d8b74e;
+  border-radius: 3px;
+}
+.sp-page.sp-look-paper .sp-el.tinted { color: #3d2d63; }
+.sp-page.sp-look-paper .sp-el.pending {
+  border-left: 2px dotted #b08a2e; opacity: .9;
+}
+.sp-page.sp-look-paper .sp-empty { color: #6d6455; }

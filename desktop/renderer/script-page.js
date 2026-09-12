@@ -46,6 +46,10 @@
   var hourKey = '';
   var painted = [];                 /* #1269: what is already on the page */
   var chasedAt = 0;                 /* #1271: last re-read chased by a mark */
+  /* #1269: the join between an element's id and its text. A character no
+     id or text can contain, written as an ESCAPE - an earlier patch put a
+     real NUL byte in this file, which every text tool then read as binary. */
+  var SEP = '\u0000';
   var fetchedAt = 0;
   var fetching = false;
   var pinned = null;                /* the element the operator tapped */
@@ -481,7 +485,7 @@
      */
     var fresh = [];
     for (var i = 0; i < elements.length; i += 1) {
-      fresh.push(String(elements[i].id || i) + ' '
+      fresh.push(String(elements[i].id || i) + SEP
         + String(elements[i].text || ''));
     }
     var keep = 0;
@@ -974,13 +978,29 @@
      * this WebView; the manual two-tap timer underneath it is for the
      * cases where a fast double touch is delivered as two taps and the
      * synthetic dblclick never arrives. */
-    /* SINGLE TAP full-screens it; DOUBLE TAP changes how it is set.
-     * A single tap cannot fire until the double-tap window has passed,
-     * or every double tap would full-screen on its way past. 260ms is
-     * the shortest wait that does not swallow a deliberate double. */
+    /* #1272: A SINGLE TAP DOES NOTHING, AND THAT IS THE POINT.
+     *
+     * "script view should only go fullscreen if i double tap the blank
+     *  area of the script view. If i tripple tap it, show it with the
+     *  colorings and display style of a script document so it can be
+     *  easier on the eyes."
+     *
+     * The operator works this view with a thumb while the station is
+     * playing - listening, reading, and grabbing clips onto sampler
+     * pads - so a single stray tap on the margin must not throw the
+     * pane into full screen underneath them. Nothing happens until a
+     * second tap says it was meant.
+     *
+     *     two taps    full screen, on and off
+     *     three taps  the script-document setting, on and off
+     *
+     * The count is held for one window after the LAST tap rather than
+     * the first, so a deliberate triple is never cut short by the
+     * double firing on its way past. */
     var tapTimer = null;
-    var LOOKS = ['', 'sp-look-wide', 'sp-look-plain', 'sp-look-big'];
-    var lookAt = 0;
+    var taps = 0;
+    var TAP_WINDOW = 300;
+    var PAPER = 'sp-look-paper';
 
     function reseat() {
       /* The pane changed shape, so the line that was centred no longer
@@ -990,13 +1010,11 @@
       try { tick(); } catch (e) { /* the change matters more */ }
     }
     function bigToggle() { host.classList.toggle('sp-big'); reseat(); }
-    function lookNext() {
-      host.classList.remove.apply(host.classList,
-        LOOKS.filter(function (c) { return c; }));
-      lookAt = (lookAt + 1) % LOOKS.length;
-      if (LOOKS[lookAt]) host.classList.add(LOOKS[lookAt]);
-      reseat();
-    }
+    /* #1272: the script-document setting - paper, Courier, the standard
+       measures, and each element coloured for what it IS. One setting
+       that goes on and off, not a cycle: the operator asked for a look,
+       not a carousel. */
+    function paperToggle() { host.classList.toggle(PAPER); reseat(); }
 
     /* A tap on a LINE still opens that line - that is what the detail
      * panel is for and it predates this. These gestures belong to the
@@ -1004,13 +1022,20 @@
     function onTap(ev) {
       var t = ev && ev.target;
       if (t && t.closest && t.closest('button, input, a, .sp-detail')) return;
+      /* THE BLANK AREA ONLY. A tap on a line belongs to that line - it
+         opens the detail panel, which is how a clip is inspected and
+         sent to a pad - and must never be read as part of a gesture. */
       if (t && t !== script && t.closest && t.closest('.sp-el')) return;
-      if (tapTimer) {                       /* the second of a double */
-        clearTimeout(tapTimer); tapTimer = null;
-        lookNext();
-        return;
-      }
-      tapTimer = setTimeout(function () { tapTimer = null; bigToggle(); }, 260);
+      taps += 1;
+      if (tapTimer) clearTimeout(tapTimer);
+      tapTimer = setTimeout(function () {
+        var count = taps;
+        tapTimer = null;
+        taps = 0;
+        if (count === 2) bigToggle();
+        else if (count >= 3) paperToggle();
+        /* one tap: nothing at all */
+      }, TAP_WINDOW);
     }
     script.addEventListener('click', onTap);
 
