@@ -112014,6 +112014,10 @@ BROADCAST_STEPS: list[dict[str, str]] = [
      "say": "Lifts a pause. The booth banks material while the door is "
             "shut, so there is always something to say on the way back.",
      "tone": "air"},
+    {"key": "relieve", "label": "Stand the rooms down",
+     "say": "Pauses the writing and recording rooms for a minute so the "
+            "loop can get the air out. The cupboard is usually hours "
+            "deep, so this costs nothing.", "tone": "do"},
     {"key": "speed", "label": "Why are clips not starting?",
      "say": "Times a real clip and reads what the event loop is stuck "
             "in. The one fault with no error anywhere (#1214). Changes "
@@ -112179,6 +112183,21 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                         "failed yet - give it a moment before pulling a "
                         "lever")
 
+    elif step == "relieve":
+        said.append("$ stand the preparation rooms down")
+        said.append("  banked  %ds of speech, %d round(s) in the larder"
+                    % (int(prepared_seconds()), len(_LARDER)))
+        # PREP_YIELD_HOLD is eight seconds a shout, so this is a brake
+        # held down rather than a switch thrown - and it is held in the
+        # BACKGROUND, because a console button that hangs for a minute is
+        # a console button nobody presses twice.
+        prep_yield("the air is late - the loop is wanted for the "
+                   "broadcast (#1217)")
+        asyncio.create_task(air_relieve_hold())
+        changed = True
+        said.append("  holding them off the loop for about a minute")
+        said.append("  they come back on their own - nothing is cancelled")
+
     elif step == "speed":
         said.append("$ time a clip, and read the loop")
         got = await media_speed_probe()
@@ -112323,6 +112342,12 @@ AIR_WATCH_SETTLE = 45.0               # how long a rung is given to work
 AIR_RESTART_REST = 3600.0             # at most one process restart an hour
 # The ladder: (quiet seconds before it fires, step, what to call it).
 AIR_LADDER: list[tuple[float, str, str]] = [
+    # #1217: FIRST, because it is the only rung that touches a congested
+    # loop - every other one assumes the clip never arrived, and a
+    # stalling loop delivers it late instead. Nearly free to be wrong
+    # about: the rooms are building hours nobody can hear yet.
+    (90.0, "relieve",
+     "stood the preparation rooms down so the loop can serve the air"),
     (120.0, "flush", "dropped whatever the pages were stuck on"),
     (180.0, "release", "released the exclusive so every player may sound"),
     (240.0, "reload", "asked every page to reload itself"),
@@ -112502,6 +112527,22 @@ async def air_watch() -> None:
 @app.on_event("startup")
 async def _startup_air_watch() -> None:
     fire_and_forget(air_watch())
+
+
+async def air_relieve_hold(seconds: float = 60.0) -> None:
+    """#1217: hold the preparation brake down for a while.
+
+    prep_yield stands the rooms down for PREP_YIELD_HOLD (eight seconds)
+    per shout, so relief that lasts a minute is a shout every seven. In
+    the background, because the console must answer at once."""
+    until = time.time() + max(8.0, float(seconds))
+    while time.time() < until:
+        try:
+            prep_yield("the air is late - the loop is wanted for the "
+                       "broadcast (#1217)")
+        except Exception:  # noqa: BLE001
+            return
+        await asyncio.sleep(7.0)
 
 
 async def media_speed_probe() -> dict[str, Any]:
