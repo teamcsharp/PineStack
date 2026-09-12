@@ -25547,6 +25547,10 @@ _BUILD_MS = int(time.time() * 1000)
 def dj_state() -> dict[str, Any]:
     base = radio_state()
     base["build"] = _BUILD_MS
+    # #1213: when a page was last ASKED to reload. A page whose own start
+    # predates this stamp reloads itself - the one cure the station could
+    # never perform from its end.
+    base["reload_at"] = int(_RADIO.get("reload_at") or 0)
     track = _RADIO.get("now") or {}
     elapsed = base.get("elapsed") or 0.0
     now = None
@@ -111923,6 +111927,9 @@ BROADCAST_STEPS: list[dict[str, str]] = [
      "say": "Lifts a pause. The booth banks material while the door is "
             "shut, so there is always something to say on the way back.",
      "tone": "air"},
+    {"key": "reload_pages", "label": "Reload every page",
+     "say": "A stale pause, a stuck player, yesterday's code - all live "
+            "in the tab, where no restart can reach them.", "tone": "do"},
     {"key": "flush", "label": "Drop what it is stuck on",
      "say": "Advances the feed epoch so every page abandons the clip it "
             "cannot start and takes the next one.", "tone": "do"},
@@ -112081,6 +112088,14 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                         "failed yet - give it a moment before pulling a "
                         "lever")
 
+    elif step == "reload_pages":
+        said.append("$ ask every page to reload")
+        pages_reload("the wedge console")
+        changed = True
+        said.append("  stamped - every open page reloads within seconds")
+        said.append("  this reaches the flags a restart cannot: a stale "
+                    "pause (#1211), a stuck player (#1207), old code")
+
     elif step == "flush":
         said.append("$ flush the page feed")
         _RADIO["voice_cut_ms"] = int(now * 1000)
@@ -112189,6 +112204,206 @@ async def broadcast_restart_task() -> None:
     os._exit(3)
 
 
+# --- #1213: THE AIR WATCHDOG ----------------------------------------
+#
+# Every other watchdog in this file measures the STATION. This one
+# measures the LISTENER: how long since anybody reported hearing
+# anything. That is the only clock that was telling the truth through
+# both of this week's outages.
+AIR_FIXES_PATH = data_path("air_fixes.jsonl")
+AIR_WATCH_EVERY = 20.0                # how often to look
+AIR_WATCH_SETTLE = 45.0               # how long a rung is given to work
+AIR_RESTART_REST = 3600.0             # at most one process restart an hour
+# The ladder: (quiet seconds before it fires, step, what to call it).
+AIR_LADDER: list[tuple[float, str, str]] = [
+    (120.0, "flush", "dropped whatever the pages were stuck on"),
+    (180.0, "release", "released the exclusive so every player may sound"),
+    (240.0, "reload", "asked every page to reload itself"),
+    (360.0, "restart", "restarted the station process"),
+]
+_AIR_WATCH: dict[str, Any] = {
+    "quiet": 0.0, "rung": -1, "at": 0.0, "tried": [], "worked": "",
+    "last_restart": 0.0, "runs": 0, "say": "watching",
+}
+
+
+def air_quiet_for() -> float:
+    """Seconds since any listener reported AUDIBLE sound.
+
+    -1 when nobody has ever reported, which is not silence - it is a
+    station nobody is listening to, and there is nothing to cure."""
+    try:
+        heard = 0.0
+        for ev in list(_PAGE_ACK_EVENTS[-200:]):
+            try:
+                if float(ev.get("audible_volume") or 0) > 0:
+                    heard = max(heard, float(ev.get("at") or 0))
+            except Exception:  # noqa: BLE001
+                continue
+        if not heard:
+            return -1.0
+        return max(0.0, time.time() - heard)
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
+def air_fix_note(row: dict[str, Any]) -> None:
+    """Write down what was tried and whether it worked."""
+    try:
+        _AIR_WATCH["tried"] = (list(_AIR_WATCH.get("tried") or [])
+                               + [row])[-12:]
+        AIR_FIXES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with AIR_FIXES_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def pages_reload(why: str = "") -> int:
+    """#1213: THE RUNG THAT DID NOT EXIST.
+
+    A stale pause flag, a stuck busy flag, a page running yesterday's
+    code - all of them live in the tab, and no restart of this process
+    has ever been able to reach one. `reload_at` rides the state both
+    pages poll; a page whose own start is older than this stamp reloads
+    itself. The server can finally perform the cure it needed most."""
+    now = int(time.time() * 1000)
+    _RADIO["reload_at"] = now
+    pipeline_log("air", "every page was asked to reload itself"
+                 + (" - " + why if why else "") + " (#1213)")
+    return now
+
+
+async def air_watch() -> None:
+    """#1213: while the station is on and unpaused, keep sound coming out.
+
+    Rung by rung, waiting AIR_WATCH_SETTLE between each for the cure to
+    land, resetting the moment anybody hears anything. It is deliberately
+    slower than a listener's patience at the top and faster than an
+    operator's at the bottom: the first rung costs a page its queue, the
+    last costs the station twenty seconds, and nothing in between costs
+    anything at all."""
+    await asyncio.sleep(60)                 # let a boot settle first
+    while True:
+        try:
+            await asyncio.sleep(AIR_WATCH_EVERY)
+            if not _RADIO.get("on"):
+                _AIR_WATCH.update(rung=-1, say="the station is off")
+                continue
+            if radio_paused():
+                # #1211: a pause is the operator's own hand on the door.
+                # An agent that undoes it is a worse fault than silence.
+                _AIR_WATCH.update(
+                    rung=-1,
+                    say=("the station is PAUSED - %.0f minute(s) now. "
+                         "Nothing here will undo that; press play."
+                         % (radio_paused_for() / 60.0)))
+                continue
+            quiet = air_quiet_for()
+            _AIR_WATCH["quiet"] = round(quiet, 1)
+            if quiet < 0:
+                _AIR_WATCH.update(rung=-1,
+                                  say="nobody is listening - nothing to cure")
+                continue
+            if quiet < AIR_LADDER[0][0]:
+                if int(_AIR_WATCH.get("rung") or -1) >= 0:
+                    step = AIR_LADDER[int(_AIR_WATCH["rung"])][1]
+                    _AIR_WATCH["worked"] = step
+                    air_fix_note({"at": time.time(), "event": "recovered",
+                                  "after": step, "quiet": round(quiet, 1)})
+                    pipeline_log("air", "sound is back after '%s' - the "
+                                 "ladder rests (#1213)" % step)
+                _AIR_WATCH.update(rung=-1,
+                                  say="reaching listeners (last heard %ds ago)"
+                                      % int(quiet))
+                continue
+            # Silent, on, and unpaused. Which rung is due?
+            due = -1
+            for index, (after, _step, _said) in enumerate(AIR_LADDER):
+                if quiet >= after:
+                    due = index
+            held = int(_AIR_WATCH.get("rung") or -1)
+            if due <= held:
+                _AIR_WATCH["say"] = ("quiet %ds - giving '%s' time to work"
+                                     % (int(quiet), AIR_LADDER[held][1]))
+                continue
+            if time.time() - float(_AIR_WATCH.get("at") or 0) < AIR_WATCH_SETTLE:
+                continue
+            after, step, said = AIR_LADDER[due]
+            if step == "restart":
+                if (time.time() - float(_AIR_WATCH.get("last_restart") or 0)
+                        < AIR_RESTART_REST):
+                    _AIR_WATCH["say"] = (
+                        "quiet %ds and the ladder is spent - a restart ran "
+                        "less than an hour ago, so this one needs hands"
+                        % int(quiet))
+                    continue
+                _AIR_WATCH["last_restart"] = time.time()
+            _AIR_WATCH.update(rung=due, at=time.time(),
+                              runs=int(_AIR_WATCH.get("runs") or 0) + 1,
+                              say="quiet %ds - %s" % (int(quiet), said))
+            pipeline_log("air", "nothing has been heard for %ds - %s (#1213)"
+                         % (int(quiet), said))
+            note = {"at": time.time(), "event": "tried", "step": step,
+                    "quiet": round(quiet, 1), "said": said}
+            try:
+                if step == "reload":
+                    pages_reload("nothing heard for %ds" % int(quiet))
+                elif step == "restart":
+                    air_fix_note(note)
+                    asyncio.create_task(broadcast_restart_task())
+                    continue
+                else:
+                    got = await broadcast_step(step)
+                    note["lines"] = list(got.get("lines") or [])[:8]
+            except Exception as exc:  # noqa: BLE001
+                note["failed"] = type(exc).__name__
+            air_fix_note(note)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(30)
+
+
+@app.on_event("startup")
+async def _startup_air_watch() -> None:
+    fire_and_forget(air_watch())
+
+
+@app.get("/api/broadcast/watch")
+async def broadcast_watch_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1213: what the orchestrator has been doing about the silence."""
+    require_read_auth(authorization)
+    quiet = air_quiet_for()
+    rung = int(_AIR_WATCH.get("rung") or -1)
+    return {
+        "at": time.time(),
+        "quiet_seconds": (round(quiet, 1) if quiet >= 0 else None),
+        "on": bool(_RADIO.get("on")), "paused": radio_paused(),
+        "working": rung >= 0,
+        "rung": (AIR_LADDER[rung][1] if 0 <= rung < len(AIR_LADDER) else ""),
+        "say": str(_AIR_WATCH.get("say") or ""),
+        "ladder": [{"after_seconds": a, "step": b, "does": c}
+                   for a, b, c in AIR_LADDER],
+        "tried": list(_AIR_WATCH.get("tried") or [])[-8:],
+        "recovered_by": str(_AIR_WATCH.get("worked") or ""),
+        "runs": int(_AIR_WATCH.get("runs") or 0),
+    }
+
+
+@app.post("/api/broadcast/reload-pages")
+async def broadcast_reload_pages_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1213: ask every open page to reload itself."""
+    require_auth(authorization)
+    stamp = pages_reload("the operator asked")
+    return {"ok": True, "reload_at": stamp,
+            "say": "every page will reload within a few seconds"}
+
+
 @app.get("/api/broadcast/console")
 async def broadcast_console_api(
     authorization: str | None = Header(default=None),
@@ -112210,6 +112425,9 @@ async def broadcast_console_api(
         "at": now,
         "stuck": bool(state.get("wedged")),
         "why": str(state.get("why") or ""),
+        # #1213: and what the orchestrator is doing about it unaided.
+        "watch": str(_AIR_WATCH.get("say") or ""),
+        "watch_working": int(_AIR_WATCH.get("rung") or -1) >= 0,
         "clips_waiting": int(state.get("waiting") or 0),
         "stalls": int(state.get("stalls") or 0),
         "heard_seconds_ago": (round(now - heard, 1) if heard else None),
@@ -156744,6 +156962,19 @@ function djRender(state) {
   try { wedgeToast(); } catch (e) { /* the panel still reads */ }
   /* #1207: ...and the one that does not need the operator at all. */
   try { djVoiceUnstick(); } catch (e) { /* the panel still reads */ }
+  /* #1212: the restart rail - built once, then only its badge changes. */
+  try {
+    if (!fixRail) { fixRailBuild(); fixResume(); }
+    if (state && state.build && typeof panelBuildSeen !== "undefined") {
+      const stale = panelBuildSeen
+                    && Number(state.build) !== Number(panelBuildSeen);
+      if (stale && (!fixState || !fixState.outOfDate)) {
+        fixState = Object.assign({}, fixState || {}, {outOfDate: true,
+          why: "this page is running code the station has replaced"});
+        fixPaint();
+      }
+    }
+  } catch (e) { /* the panel still reads */ }
   /* #1008: the overlap setting reaches the page on every poll now, not
    * only when the settings panel happens to be painted. */
   try {
@@ -156890,6 +157121,7 @@ async function pollDJ() {
     djStateAt = Date.now();             // when this truth arrived (#631)
     /* #1209: is this panel still the box's own code? */
     try { panelBuildWatch(state); } catch (e) { /* the panel still reads */ }
+    try { panelReloadWatch(state); } catch (e) { /* the panel still reads */ }
     djRender(state);
     if (typeof state.monitor !== "undefined"
         && djMonitorAir !== !!state.monitor) {
@@ -172515,6 +172747,16 @@ let panelBuildSeen = 0;
 const panelBuildUp = Date.now();
 let panelBuildGoing = false;
 
+/* #1213: an asked-for reload, the same shape as the build watch. */
+function panelReloadWatch(state) {
+  const at = Number((state || {}).reload_at || 0);
+  if (!at || panelBuildGoing) return;
+  if (at <= panelBuildUp) return;
+  panelBuildGoing = true;
+  setTimeout(() => { try { location.reload(); } catch (e) {} },
+             800 + Math.floor(Math.random() * 4000));
+}
+
 function panelBuildWatch(state) {
   const build = Number((state || {}).build || 0);
   if (!build) return;
@@ -172524,6 +172766,404 @@ function panelBuildWatch(state) {
   panelBuildGoing = true;
   setTimeout(() => { try { location.reload(); } catch (e) {} },
              1500 + Math.floor(Math.random() * 6000));
+}
+
+
+/* --- #1212: THE RESTART RAIL -------------------------------------------
+   "a button that I can tap in the sidebar that basically does whatever
+    troubleshooting steps you require to get this back up."
+
+   The one cure no server can perform is reloading the page, and today
+   that had to be asked for in words four times. This is the thumb that
+   does it - and everything cheaper, first. */
+const FIX_MARK = "pineReinitLadder";
+let fixRail = null;
+let fixDrawer = null;
+let fixLines = [];
+let fixBusy = false;
+let fixSteps = [];
+let fixState = null;
+
+function fixSay(line) {
+  fixLines.push(String(line));
+  if (fixLines.length > 300) fixLines = fixLines.slice(-300);
+  const term = fixDrawer && fixDrawer.querySelector(".pb-fix-term");
+  if (term) {
+    term.textContent = fixLines.join("\n");
+    term.scrollTop = term.scrollHeight;
+  }
+}
+
+/* Where the ladder had got to, across the reload it performs itself. */
+function fixMarkRead() {
+  try {
+    const raw = sessionStorage.getItem(FIX_MARK);
+    const got = raw ? JSON.parse(raw) : null;
+    if (!got || Date.now() - Number(got.at || 0) > 180000) return null;
+    return got;
+  } catch (e) { return null; }
+}
+function fixMarkWrite(got) {
+  try {
+    if (got) sessionStorage.setItem(FIX_MARK, JSON.stringify(got));
+    else sessionStorage.removeItem(FIX_MARK);
+  } catch (e) { /* private browsing - the ladder just cannot resume */ }
+}
+
+async function fixHealth() {
+  try { return await api("/api/broadcast/health"); }
+  catch (e) { return null; }
+}
+
+/* Heard anything in the last `within` seconds? The only honest test of
+   whether any of this worked. */
+function fixHeard(health, within) {
+  const ago = health && health.heard_seconds_ago;
+  return ago !== null && ago !== undefined && Number(ago) <= within;
+}
+
+/* THE LOCAL HALF. No round trip, and the reason this button exists at
+   all: a page gagged by a stale pause (#1211) or holding a busy flag
+   nothing will clear (#1207) cannot be reached from the station. */
+function fixUngag() {
+  let did = [];
+  try {
+    if (typeof pineAirPaused !== "undefined" && pineAirPaused) {
+      pineAirPause(false); did.push("lifted this page's own pause");
+    }
+  } catch (e) { try { pineAirPaused = false; } catch (e2) {} }
+  try {
+    if (typeof djVoiceBusy !== "undefined" && djVoiceBusy) {
+      djVoiceEpoch += 1;
+      (djVoiceEls || []).forEach((a) => {
+        if (a) { try { a.pause(); a.removeAttribute("src"); a.load(); } catch (e) {} }
+      });
+      djVoiceBusy = false; djVoiceLive = 0; djVoiceNow = null;
+      djStreamNow = null; djStreamLiveId = "";
+      did.push("released the player slot it was holding");
+    }
+  } catch (e) {}
+  try { window.cacheHold = false; } catch (e) {}
+  try { djVoiceNext(); did.push("kicked the queue"); } catch (e) {}
+  return did;
+}
+
+async function fixRun(from) {
+  if (fixBusy) return;
+  fixBusy = true;
+  fixDrawerOpen(true);
+  const big = fixDrawer && fixDrawer.querySelector(".pb-fix-go");
+  if (big) { big.disabled = true; big.textContent = "working…"; }
+  try {
+    let step = Number(from || 1);
+    if (step <= 1) {
+      fixSay("");
+      fixSay("=== reinitialising the station ===");
+    }
+    let health = await fixHealth();
+    if (health && fixHeard(health, 25) && step <= 1) {
+      fixSay("the broadcast is being heard right now ("
+             + Math.round(Number(health.heard_seconds_ago)) + "s ago).");
+      fixSay("nothing needs doing - but every step below is safe to press.");
+      return;
+    }
+
+    if (step <= 1) {
+      if (health && health.paused) {
+        fixSay("1 ON AIR    the station is paused - lifting it");
+        try {
+          const got = await api("/api/broadcast/fix/onair", {method: "POST"});
+          (got.lines || []).forEach((l) => fixSay("            " + l));
+        } catch (e) { fixSay("            the station would not answer"); }
+      } else {
+        fixSay("1 ON AIR    not paused - nothing to lift");
+      }
+      step = 2;
+    }
+    if (step <= 2) {
+      const did = fixUngag();
+      fixSay("2 UNGAG     " + (did.length ? did.join("; ")
+             : "this page was not holding anything"));
+      step = 3;
+    }
+    if (step <= 3) {
+      try {
+        const got = await api("/api/broadcast/fix/flush", {method: "POST"});
+        fixSay("3 FLUSH     " + ((got.lines || [])[1] || "feed epoch advanced"));
+      } catch (e) { fixSay("3 FLUSH     the station would not answer"); }
+      step = 4;
+    }
+    if (step <= 4) {
+      health = await fixHealth();
+      if (health && (health.gagged || !health.holding_the_air)) {
+        try {
+          await api("/api/broadcast/fix/release", {method: "POST"});
+          fixSay("4 RELEASE   the exclusive is released - every player may sound");
+        } catch (e) { fixSay("4 RELEASE   the station would not answer"); }
+      } else {
+        fixSay("4 RELEASE   the air is held by a page that is answering - left alone");
+      }
+      step = 5;
+    }
+
+    fixSay("            listening for eight seconds…");
+    await new Promise((r) => setTimeout(r, 8000));
+    health = await fixHealth();
+    if (fixHeard(health, 12)) {
+      fixSay("");
+      fixSay("*** sound is back - stopping here. ***");
+      fixMarkWrite(null);
+      return;
+    }
+
+    if (step <= 5) {
+      const mark = fixMarkRead();
+      if (mark && mark.reloaded) {
+        fixSay("5 RELOAD    already reloaded once this run - moving on");
+      } else {
+        fixSay("5 RELOAD    reloading this page - the one cure the station");
+        fixSay("            cannot perform from its end. Back in a moment.");
+        fixMarkWrite({at: Date.now(), step: 6, reloaded: true,
+                      lines: fixLines.slice(-40)});
+        setTimeout(() => { try { location.reload(); } catch (e) {} }, 1200);
+        return;
+      }
+      step = 6;
+    }
+    if (step <= 6) {
+      fixSay("6 RESTART   restarting the station process - about twenty");
+      fixSay("            seconds of silence, then every page reconnects.");
+      fixMarkWrite({at: Date.now(), step: 7, reloaded: true,
+                    restarted: true, lines: fixLines.slice(-40)});
+      try { await api("/api/broadcast/fix/restart", {method: "POST"}); }
+      catch (e) { /* the process is going down; a dropped reply is normal */ }
+      return;
+    }
+
+    fixSay("");
+    fixSay("*** the ladder is spent and the room is still quiet. ***");
+    fixSay("Everything that can be done from software has been done, so");
+    fixSay("what is left needs hands:");
+    fixSay("  - this tablet: close the app fully and open it again, or");
+    fixSay("    plug it in by USB if it will not come back at all;");
+    fixSay("  - the box: check it is powered and on the network;");
+    fixSay("  - the speaker: power-cycle it (ping answers, ports refused");
+    fixSay("    is the firmware-down signature).");
+    fixMarkWrite(null);
+  } finally {
+    fixBusy = false;
+    if (big) { big.disabled = false; big.textContent = "⟳  Reinitialise"; }
+    fixPaint();
+  }
+}
+
+/* ------------------------------------------------------------ the rail */
+
+function fixDrawerOpen(on) {
+  if (!fixDrawer) fixDrawerBuild();
+  fixDrawer.style.transform = on ? "translateX(0)" : "translateX(-104%)";
+  fixDrawer.dataset.open = on ? "1" : "";
+  if (on) fixLoad();
+}
+
+function fixDrawerBuild() {
+  const box = el("div", "", "");
+  box.style.cssText = "position:fixed;left:0;top:0;bottom:0;z-index:600;"
+    + "width:min(360px,88vw);display:flex;flex-direction:column;"
+    + "background:#070a10;border-right:1px solid #2a3a52;"
+    + "box-shadow:8px 0 40px rgba(0,0,0,.6);transform:translateX(-104%);"
+    + "transition:transform .18s ease-out";
+
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:9px;"
+    + "padding:12px 14px;border-bottom:1px solid #1b2735";
+  const mark = el("span", "", "⟳");
+  mark.style.cssText = "font-size:19px;color:#7fe0c0";
+  head.appendChild(mark);
+  const title = el("b", "", "Reinitialise");
+  title.style.cssText = "font-size:13.5px;flex:1";
+  head.appendChild(title);
+  const shut = el("button", "", "✕");
+  shut.style.cssText = "background:#16202e;color:#cfe0f0;border:1px solid #2a3a52;"
+    + "border-radius:6px;padding:3px 9px;cursor:pointer";
+  shut.onclick = () => fixDrawerOpen(false);
+  head.appendChild(shut);
+  box.appendChild(head);
+
+  const say = el("div", "pb-fix-say muted", "reading the station…");
+  say.style.cssText = "padding:9px 14px;font-size:11.5px;line-height:1.5";
+  box.appendChild(say);
+
+  const go = el("button", "pb-fix-go", "⟳  Reinitialise");
+  go.style.cssText = "margin:4px 14px 10px;padding:15px;border-radius:11px;"
+    + "border:none;cursor:pointer;font-weight:800;font-size:14px;"
+    + "background:linear-gradient(160deg,#2ee6a8,#14b98a);color:#04140f;"
+    + "box-shadow:0 6px 22px rgba(46,230,168,.25)";
+  go.onclick = () => fixRun(1);
+  box.appendChild(go);
+
+  const rungs = el("div", "pb-fix-rungs", "");
+  rungs.style.cssText = "padding:0 10px 8px;display:grid;gap:5px;"
+    + "max-height:34vh;overflow:auto";
+  box.appendChild(rungs);
+
+  const term = el("pre", "pb-fix-term", "");
+  term.style.cssText = "flex:1;min-height:120px;margin:0;padding:10px 12px;"
+    + "background:#04060a;border-top:1px solid #1b2735;color:#9fe6b0;"
+    + "font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;"
+    + "white-space:pre-wrap;overflow:auto";
+  box.appendChild(term);
+
+  document.body.appendChild(box);
+  fixDrawer = box;
+  if (fixLines.length) fixSay("");        /* paint whatever we carried in */
+}
+
+function fixPaint() {
+  if (!fixRail) return;
+  const bad = !!(fixState && (fixState.stuck || fixState.paused
+                              || fixState.outOfDate));
+  fixRail.style.borderColor = bad ? "#ff9d4d" : "#2a3a52";
+  fixRail.style.color = bad ? "#ffc79a" : "#7f93a8";
+  fixRail.style.background = bad ? "#231607" : "#0d141d";
+  fixRail.title = bad
+    ? ("the station wants attention - " + (fixState.why || ""))
+    : "Reinitialise the station";
+  if (bad && !fixRail.dataset.pulsing) {
+    fixRail.dataset.pulsing = "1";
+    try {
+      fixRail.animate([{opacity: 1}, {opacity: .45}, {opacity: 1}],
+                      {duration: 1700, iterations: Infinity});
+    } catch (e) {}
+  }
+  if (!fixDrawer) return;
+  const say = fixDrawer.querySelector(".pb-fix-say");
+  if (say && fixState) say.textContent = String(fixState.say || "");
+}
+
+async function fixLoad() {
+  let got = null;
+  try { got = await api("/api/broadcast/console"); } catch (e) {}
+  if (got) {
+    fixSteps = got.steps || [];
+    fixState = {stuck: !!got.stuck, paused: !!got.paused,
+                say: got.say, why: got.why, gagged: !!got.gagged,
+                /* the build badge is stamped by the tick, which is the
+                   only place that has both numbers to compare. */
+                outOfDate: !!(fixState && fixState.outOfDate)};
+    fixPaint();
+  }
+  if (!fixDrawer) return;
+  const rungs = fixDrawer.querySelector(".pb-fix-rungs");
+  if (!rungs || rungs.dataset.built === String(fixSteps.length)) return;
+  rungs.dataset.built = String(fixSteps.length);
+  rungs.innerHTML = "";
+  const mine = [{key: "__reload", label: "Reload this page",
+                 say: "The cure the station cannot perform from its end."}];
+  mine.concat(fixSteps).forEach((row) => {
+    const b = el("button", "", "");
+    b.style.cssText = "text-align:left;padding:7px 10px;border-radius:8px;"
+      + "cursor:pointer;background:#101722;border:1px solid #24344a;"
+      + "color:#cfe0f0;font-size:11.5px";
+    const nm = el("div", "", String(row.label || row.key));
+    nm.style.cssText = "font-weight:700";
+    b.appendChild(nm);
+    const wh = el("div", "muted", String(row.say || ""));
+    wh.style.cssText = "font-size:10px;line-height:1.4;margin-top:2px";
+    b.appendChild(wh);
+    b.onclick = async () => {
+      if (row.key === "__reload") {
+        fixSay("$ reload this page");
+        fixMarkWrite({at: Date.now(), step: 99, reloaded: true,
+                      lines: fixLines.slice(-40)});
+        setTimeout(() => { try { location.reload(); } catch (e) {} }, 400);
+        return;
+      }
+      fixSay("");
+      fixSay("$ " + row.key);
+      try {
+        const out = await api("/api/broadcast/fix/"
+                              + encodeURIComponent(row.key), {method: "POST"});
+        (out.lines || []).forEach((l) => fixSay("  " + l));
+      } catch (e) {
+        fixSay("  the station would not answer: " + (e.message || e));
+      }
+      fixLoad();
+    };
+    rungs.appendChild(b);
+  });
+}
+
+function fixRailBuild() {
+  if (fixRail) return;
+  const tab = el("div", "", "⟳");
+  tab.style.cssText = "position:fixed;left:0;top:50%;z-index:601;"
+    + "transform:translateY(-50%);width:26px;height:74px;cursor:pointer;"
+    + "display:flex;align-items:center;justify-content:center;font-size:17px;"
+    + "border:1px solid #2a3a52;border-left:none;color:#7f93a8;"
+    + "background:#0d141d;border-radius:0 10px 10px 0;"
+    + "touch-action:none;user-select:none";
+  tab.onclick = () => fixDrawerOpen(
+    !(fixDrawer && fixDrawer.dataset.open));
+  document.body.appendChild(tab);
+  fixRail = tab;
+
+  /* "slides out whenever I slide it from the left" - a drag anywhere in
+     the first 24px of the glass opens it, which is how a thumb reaches
+     for a drawer without having to find a 26px target first. */
+  let from = null;
+  document.addEventListener("touchstart", (ev) => {
+    const t = ev.touches && ev.touches[0];
+    from = (t && t.clientX <= 24) ? t.clientX : null;
+  }, {passive: true});
+  document.addEventListener("touchmove", (ev) => {
+    if (from === null) return;
+    const t = ev.touches && ev.touches[0];
+    if (t && t.clientX - from > 36) { from = null; fixDrawerOpen(true); }
+  }, {passive: true});
+  document.addEventListener("touchend", () => { from = null; }, {passive: true});
+  fixPaint();
+}
+
+/* #1212: BUILT ON LOAD, NOT OFF A POLL. The first cut hung this off
+   djRender, which only runs when the station answers a two-megabyte
+   /api/dj - so the one control that has to work when the station is NOT
+   answering was waiting for the station to answer. Measured: the handle
+   appeared in one headless run and not in the next, purely on poll
+   timing. It is the emergency brake; it is built with the page. */
+function fixRailBoot() {
+  try { fixRailBuild(); } catch (e) { /* nothing else depends on it */ }
+  try { fixResume(); } catch (e) { /* a spent ladder is not a fault */ }
+}
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", fixRailBoot);
+} else {
+  setTimeout(fixRailBoot, 0);
+}
+
+/* Did we reload as part of a ladder? Then pick it up where it stopped. */
+async function fixResume() {
+  const mark = fixMarkRead();
+  if (!mark) return;
+  fixLines = (mark.lines || []).slice();
+  if (Number(mark.step) === 99) {
+    fixMarkWrite(null);
+    fixSay("… reloaded. This page is now running the station's own code.");
+    return;
+  }
+  fixDrawerOpen(true);
+  fixSay("");
+  fixSay("… back after the reload, carrying on.");
+  if (mark.restarted) {
+    fixMarkWrite(null);
+    const health = await fixHealth();
+    fixSay(fixHeard(health, 30)
+           ? "*** sound is back after the restart. ***"
+           : "the station restarted and the room is still quiet - the"
+             + " rungs below are all that is left, then it needs hands.");
+    return;
+  }
+  fixRun(Number(mark.step) || 6);
 }
 
 async function orchToast() {
@@ -186181,6 +186821,17 @@ let pineBuildSeen = 0;
 const pineBuildUp = Date.now();
 let pineBuildGoing = false;
 
+/* #1213: and the same shape for an ASKED-FOR reload. The station can
+   now reach the flags that live in this tab. */
+function pineReloadWatch(state) {
+  const at = Number((state || {}).reload_at || 0);
+  if (!at || pineBuildGoing) return;
+  if (at <= pineBuildUp) return;           /* older than this page */
+  pineBuildGoing = true;
+  setTimeout(() => { try { location.reload(); } catch (e) {} },
+             800 + Math.floor(Math.random() * 4000));
+}
+
 function pineBuildWatch(state) {
   const build = Number((state || {}).build || 0);
   if (!build) return;
@@ -186196,6 +186847,7 @@ function sync(state) {
   /* #1209: first thing, before anything on this page is painted by a
    * build that may no longer exist. */
   try { pineBuildWatch(state); } catch (e) { /* the page still paints */ }
+  try { pineReloadWatch(state); } catch (e) { /* the page still paints */ }
   const now = state.now || {};
   document.getElementById("dot").className = "dot" + (state.on ? " live" : "");
   document.getElementById("title").textContent =
