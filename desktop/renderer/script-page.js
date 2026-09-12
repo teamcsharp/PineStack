@@ -793,6 +793,38 @@
       if (chip) chip.classList.toggle('adrift', !follow);
     });
     right.appendChild(script);
+
+    /* #1260: DOUBLE-TAP THE SCRIPT TO READ IT PROPERLY.
+     *
+     * "If I double tap the script page, I want to also have the script
+     *  show up in this view." - the full-page screenplay the desktop
+     *  shows, on the glass, instead of a column beside the player.
+     *
+     * A class on the host, so the layout is CSS's business and nothing
+     * here has to know about the other six regions. dblclick fires on
+     * this WebView; the manual two-tap timer underneath it is for the
+     * cases where a fast double touch is delivered as two taps and the
+     * synthetic dblclick never arrives. */
+    var lastTap = 0;
+    function bigToggle() {
+      host.classList.toggle('sp-big');
+      /* The pane changed size, so the line that was centred no longer
+         is. Re-seat it rather than leaving the reader stranded. */
+      follow = true;
+      nowLineId = '';
+      try { tick(); } catch (e) { /* the toggle matters more */ }
+    }
+    script.addEventListener('dblclick', function (ev) {
+      ev.preventDefault();
+      bigToggle();
+    });
+    script.addEventListener('pointerup', function (ev) {
+      if (ev.pointerType === 'mouse') return;      /* dblclick has it */
+      var now2 = Date.now();
+      if (now2 - lastTap < 400) { lastTap = 0; bigToggle(); }
+      else { lastTap = now2; }
+    });
+
     now.addEventListener('click', function () {
       follow = true;
       now.classList.remove('adrift');

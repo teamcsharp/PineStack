@@ -428,3 +428,43 @@
   .sp-dialogue { margin-left: 12%; max-width: 78%; }
   .sp-character { margin-left: 28%; }
 }
+
+/* --- #1260: THE SCRIPT, FULL PAGE, ON A DOUBLE TAP ----------------------
+ *
+ * "If I double tap the script page, I want to also have the script show up
+ *  in this view." - the way the desktop shows it: the screenplay across the
+ *  whole glass instead of a column beside the player.
+ *
+ * Both selectors are spelled out with the host classes for the reason this
+ * file already carries two comments about: `.pine-view-host.open.sp-page`
+ * is three classes, and a one-class `.sp-big` loses to it silently. The
+ * media query above is the same trap and solved the same way.
+ *
+ * The left column is hidden rather than removed, so the player keeps
+ * running and every listener stays wired - a double tap changes what you
+ * are looking at, never what the station is doing. */
+.pine-view-host.open.sp-page.sp-big,
+.sp-page.sp-big {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+  overflow: hidden;
+}
+.pine-view-host.open.sp-page.sp-big > .sp-left,
+.sp-page.sp-big > .sp-left { display: none; }
+.pine-view-host.open.sp-page.sp-big > .sp-right,
+.sp-page.sp-big > .sp-right {
+  grid-column: 1 / -1;
+  grid-row: 1 / -1;
+  min-height: 0;
+}
+/* The page a script is read on: wider measure, more air, and the type a
+ * shade larger because this is the mode you switch to in order to READ. */
+.sp-page.sp-big #spScript {
+  max-height: none;
+  padding: 18px clamp(12px, 6vw, 90px) 40px;
+  font-size: 1.06em;
+  line-height: 1.5;
+}
+.sp-page.sp-big .sp-dialogue { margin-left: 22%; max-width: 58%; }
+.sp-page.sp-big .sp-character { margin-left: 38%; }
+.sp-page.sp-big .sp-parenthetical { margin-left: 31%; max-width: 44%; }
