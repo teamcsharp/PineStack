@@ -40,7 +40,9 @@
     <div class="sep"></div>
     <button id="undoBtn" class="act" title="Undo (Ctrl+Z)">&#8630;</button>
     <button id="redoBtn" class="act" title="Redo (Ctrl+Shift+Z)">&#8631;</button>
-    <button id="deleteBtn" class="act" title="Delete what is selected (Del)">&#128465;</button>
+    <button id="deleteBtn" class="act" data-pine-icon="c:trash-can"
+            aria-label="Delete what is selected"
+            title="Delete what is selected (Del)"></button>
     <button id="clearBtn" class="act" title="Remove every mark">clear</button>
 
     <div class="grow"></div>
@@ -59,6 +61,12 @@
   </div>
 
   <p id="say" class="say"></p>
+  <!-- The station's vendored Carbon sprite, so the bin is a monochrome
+       icon rather than a colour emoji. It upgrades data-pine-icon on
+       load by itself. The drawing tools above keep their geometric
+       glyphs: a rectangle tool drawn as a rectangle IS the icon, and
+       Carbon has no drawing-tool glyphs vendored here. -->
+  <script src="pine-icons.js"></script>
   <script src="shot-editor.js"></script>
 </body>
 </html>

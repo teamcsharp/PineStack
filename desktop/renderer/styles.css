@@ -210,7 +210,11 @@ body.resizing-rail .rail-resizer::before {
 .glass-row.busy { pointer-events: none; opacity: .55; }
 
 .glass-btn {
-  padding: 7px 0;
+  /* A Carbon <svg> rather than a character, so the box is sized for a glyph
+     that is 1em on its own baseline and centred rather than sitting on it. */
+  display: grid;
+  place-items: center;
+  padding: 8px 0;
   font-size: 15px;
   line-height: 1;
   background: var(--panel-2, #17222b);

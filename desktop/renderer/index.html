@@ -84,12 +84,17 @@
            happening on that screen can be pasted into a conversation
            instead of described. See terminal-glass.cjs. -->
       <div id="glassRow" class="glass-row">
+        <!-- Carbon, through pine-icons.js, which upgrades data-pine-icon on
+             load. Never emoji. -->
         <button id="glassStill" class="glass-btn" type="button"
-                title="Take a picture of the Pine Box tablet's screen and put it on this clipboard.&#10;Ctrl+click to open it for mark-up as well.">&#128247;</button>
+                data-pine-icon="c:image" aria-label="Take a picture of the screen"
+                title="Take a picture of the Pine Box tablet's screen and put it on this clipboard.&#10;Ctrl+click to open it for mark-up as well."></button>
         <button id="glassClip" class="glass-btn" type="button"
-                title="Record the Pine Box tablet's screen and save it as an MP4">&#127909;</button>
+                data-pine-icon="c:recording--filled" aria-label="Record the screen"
+                title="Record the Pine Box tablet's screen and save it as an MP4"></button>
         <button id="glassReport" class="glass-btn" type="button"
-                title="Copy a written account of what the tablet is doing right now to this clipboard">&#128203;</button>
+                data-pine-icon="c:copy--to-clipboard" aria-label="Copy the diagnostics"
+                title="Copy a written account of what the tablet is doing right now to this clipboard"></button>
         <input id="glassSeconds" class="glass-secs" type="number"
                min="3" max="30" step="1" value="10"
                title="How long the clip records, in seconds. Up to 30.">

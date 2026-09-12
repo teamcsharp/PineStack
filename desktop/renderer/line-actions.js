@@ -140,19 +140,23 @@
      * this?" - and on a screen of six near-identical rap couplets that is
      * the question the hand is usually asking. It is also the only choice
      * here that changes nothing. */
-    choice(list, '\u25B6\uFE0F', 'Play it',
+    /* CARBON, from the station's own vendored sprite - never emoji. The two
+     * downloads are told apart by their DESTINATION, which is the only thing
+     * that differs between them; a download arrow on both would say nothing.
+     * There is no c:play in the set, so hearing a line takes the speaker. */
+    choice(list, 'c:volume--up--filled', 'Play it',
       'hear this line, here', function (say) { playIt(line, say); });
-    choice(list, '\uD83C\uDF9B\uFE0F', 'Put it on a sampler pad',
+    choice(list, 'c:audio-console', 'Put it on a sampler pad',
       'the next free pad, ready to fire', function (say, bar) { toPad(line, say, bar); });
-    choice(list, '\uD83D\uDCF1', 'Download it to the tablet',
+    choice(list, 'c:screen', 'Download it to the tablet',
       'into Downloads / Pine Box', function (say, bar) {
         keep(line, 'downloads', say, bar);
       });
-    choice(list, '\uD83D\uDCC1', 'Download it to the recording folder',
+    choice(list, 'c:folder', 'Download it to the recording folder',
       'the working folder you extract into', function (say, bar) {
         keep(line, 'recordings', say, bar);
       });
-    choice(list, '\uD83D\uDD0E', 'Examine it in depth',
+    choice(list, 'c:microscope', 'Examine it in depth',
       'where it came from, how often it airs, and why', function () {
         if (root.PineLineDeep) root.PineLineDeep.open(line);
       });
@@ -198,13 +202,25 @@
     }, bad ? 6000 : 3200);
   }
 
+  /* ONE CARBON GLYPH, inheriting the colour of the text beside it.
+   *
+   * pineIcon() hands back an <svg><use href="#pi-..."> against a sprite the
+   * icon script injects at load. If that script is not on the page - a bare
+   * host, a test harness - the data attribute is left for pineIconUpgrade()
+   * to fill in later, and until then the row simply has no picture, which is
+   * the right way to fail. */
+  function icon(name) {
+    var node = document.createElement('span');
+    node.className = 'la-ico';
+    if (typeof root.pineIcon === 'function') node.innerHTML = root.pineIcon(name);
+    else node.setAttribute('data-pine-icon', name);
+    return node;
+  }
+
   function choice(into, mark, title, why, run) {
     var row = make('button', 'la-choice');
     row.type = 'button';
-    /* THE MARK. Emoji rather than geometric glyphs: this is pressed with a
-     * thumb on a nine-inch screen, where ▦ and ▤ are the same shape and a
-     * mixing desk and a folder are not. */
-    row.appendChild(make('span', 'la-ico', mark));
+    row.appendChild(icon(mark));
     row.appendChild(make('b', '', title));
     row.appendChild(make('i', '', why));
     row.addEventListener('click', function (event) {
