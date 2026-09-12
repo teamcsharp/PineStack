@@ -512,6 +512,40 @@
 .sp-crawl-rate { width: 108px; accent-color: #46a273; }
 .sp-right { position: relative; }
 
+/* --- #1285 SEGMENTS THAT FOLD -------------------------------------
+ *
+ * "Every segment is a script to me... after a segment has completed, I
+ *  want that script to collapse... and then go on to the next script
+ *  that's currently being generated and played out."
+ *
+ * A finished segment folds to its heading; the one on air stays open.
+ * The heading is the handle, so it has to read as pressable, and a
+ * closed one is dimmed and tightened so a stack of them takes little
+ * room above the script being performed.
+ */
+.sp-el.sp-fold { cursor: pointer; }
+.sp-el.sp-fold::before {
+  content: "▾ ";
+  opacity: .55;
+  font-weight: 400;
+}
+.sp-el.sp-fold.sp-shut::before { content: "▸ "; }
+.sp-el.sp-fold.sp-shut {
+  margin: 6px 0 6px;
+  opacity: .62;
+}
+.sp-el.sp-fold.sp-shut::after {
+  content: attr(data-inside);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--sp-muted);
+  font-size: 11px;
+}
+.sp-el.sp-fold:active { opacity: .85; }
+/* The paper setting keeps the same behaviour in ink. */
+.sp-page.sp-look-paper .sp-el.sp-fold.sp-shut::after { color: #7b6a4e; }
+
 /* --- #1272 THE SCRIPT-DOCUMENT SETTING -----------------------------
  *
  * "If i tripple tap it, show it with the colorings and display style of

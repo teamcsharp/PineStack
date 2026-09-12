@@ -90,6 +90,10 @@
   var nowLineId = '';               /* the one line being said */
   var follow = true;                /* keep it on screen */
   var selfScrollUntil = 0;          /* a scroll WE started, not the operator */
+  var adrift = 0;                   /* #1282: consecutive off-screen reads */
+  var folded = Object.create(null);   /* #1285: seg id -> folded? */
+  var byHand = Object.create(null);   /* #1285: the operator said so */
+  var liveSeg = '';                   /* #1285: the segment on air */
   var beat = 0;
 
   function api() { return root.pineDesktop || {get: function () { return Promise.reject(new Error('no bridge')); }}; }
@@ -653,6 +657,9 @@
       if (!held) nowLineId = '';
       else if (!held.classList.contains('sp-now')) held.classList.add('sp-now');
     }
+    /* #1285: re-assert the folds, so a line arriving into a folded
+       segment arrives folded rather than springing it open. */
+    segApply();
     tick();
   }
 
@@ -701,12 +708,91 @@
     }
   }
 
+  /* #1285: fold a finished segment, leave the one on air open.
+   *
+   * Done by hiding members rather than nesting them: the reconciler
+   * (#1273) stitches a FLAT list, and that is the fix that stopped this
+   * page destroying a few hundred nodes a poll and losing the highlight
+   * with them. A tree would undo it. */
+  function segApply() {
+    var box = el('spScript');
+    if (!box) return;
+    var all = box.querySelectorAll('.sp-el');
+    for (var i = 0; i < all.length; i += 1) {
+      var node = all[i];
+      var seg = node.getAttribute('data-seg') || '';
+      var head = /sp-scene/.test(node.className);
+      var shut = !!(seg && folded[seg] && seg !== liveSeg);
+      /* The heading is how a folded segment is reopened, so it is the
+         one thing that must never be hidden by its own fold. */
+      node.hidden = shut && !head;
+      if (head) {
+        node.classList.toggle('sp-shut', shut);
+        /* #1285b: what is inside, so a closed segment can be chosen
+           without opening it. On an attribute and shown through
+           ::after - the reconciler re-dresses a changed element with
+           textContent and would wipe a child span every repaint. */
+        if (shut) {
+          var got = segCount(seg);
+          node.setAttribute('data-inside', got
+            ? ('  ▸ ' + got.lines + (got.lines === 1 ? ' line' : ' lines')
+               + (got.seconds >= 1
+                  ? '  ·  ' + Math.round(got.seconds) + 's' : ''))
+            : '  ▸');
+        } else {
+          node.setAttribute('data-inside', '');
+        }
+      }
+    }
+  }
+
+  /* What is inside a fold, so it can be chosen without opening it. */
+  function segCount(seg) {
+    var box = el('spScript');
+    if (!box || !seg) return null;
+    var all = box.querySelectorAll('.sp-el[data-seg="' + seg + '"]');
+    var lines = 0, secs = 0;
+    for (var i = 0; i < all.length; i += 1) {
+      if (!/sp-dialogue/.test(all[i].className)) continue;
+      lines += 1;
+      secs += Number(all[i].getAttribute('data-secs') || 0) || 0;
+    }
+    return {lines: lines, seconds: secs};
+  }
+
+  function segToggle(seg) {
+    if (!seg) return;
+    folded[seg] = !folded[seg];
+    byHand[seg] = true;              /* the operator's choice outranks */
+    segApply();
+  }
+
+  /* The air moved on: fold what it left, unless a hand opened it. */
+  function segFollow(seg) {
+    if (!seg || seg === liveSeg) return;
+    var was = liveSeg;
+    liveSeg = seg;
+    if (was && !byHand[was]) folded[was] = true;
+    folded[seg] = false;
+    segApply();
+  }
+
   function scriptBlock(item) {
     var type = String(item.type || 'action');
     var node = make('div', 'sp-el sp-' + type);
     node.textContent = String(item.text || '');
     if (item.id) node.dataset.el = String(item.id);
     if (item.line) node.dataset.line = String(item.line);
+    if (item.seg) node.dataset.seg = String(item.seg);        /* #1285 */
+    if (item.seconds) node.dataset.secs = String(item.seconds);
+    if (type === 'scene') {
+      /* #1285: the heading is the fold's handle. */
+      node.classList.add('sp-fold');
+      node.addEventListener('click', function (ev) {
+        ev.stopPropagation();        /* not a pane gesture (#1272) */
+        segToggle(String(item.seg || item.id || ''));
+      });
+    }
     /* A line that has not aired yet is the interesting one - it can still
      * be changed before the room hears it. ONLY 'prepared' is that line;
      * 'published' and 'stream' have both already been heard. */
@@ -946,6 +1032,7 @@
     nowLineId = id || '';
     if (!node) return;
     node.classList.add('sp-now');
+    segFollow(node.getAttribute('data-seg') || '');          /* #1285 */
     if (follow) {
       /* Centred, not merely visible: the operator is reading the
        * conversation, and the next line wants to be under it.
@@ -955,8 +1042,31 @@
        * events all the way down, the handler below read "the line is not
        * visible yet" from one of them and switched following OFF - the
        * auto-scroll cancelled itself on its first frame, every time. */
-      selfScrollUntil = Date.now() + 900;
-      try { node.scrollIntoView({block: 'center', behavior: 'smooth'}); }
+      /* #1282: MOVE ONLY IF IT HAS TO, AND DO NOT CANCEL YOURSELF.
+       *
+       * `block:'center'` re-centred on every line change - about ten
+       * full animations a minute at a 6.4s median dwell, each one a
+       * chance for the page to move under a finger. `nearest` moves
+       * only when the line is actually outside the pane, and
+       * `.sp-now`'s scroll-margin keeps it off the edge when it does.
+       *
+       * And the 900ms guard was a fixed window against a scroll whose
+       * duration grows with distance - 21.9% of movements were still
+       * running two samples later. When it expired mid-flight the
+       * animation's own scroll events reached the handler, which read
+       * geometry that had not settled and switched following off. The
+       * scroll cancelled itself, which is the very fault the guard
+       * exists to prevent. `scrollend` says when it is really over. */
+      selfScrollUntil = Date.now() + 2400;        /* backstop only */
+      try {
+        if ('onscrollend' in script) {
+          script.addEventListener('scrollend', function done() {
+            script.removeEventListener('scrollend', done);
+            selfScrollUntil = 0;
+          }, {once: true});
+        }
+      } catch (err) { /* the backstop still covers it */ }
+      try { node.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
       catch (err) { node.scrollIntoView(false); }
     }
   }
@@ -1206,12 +1316,25 @@
       stick = script.scrollTop + script.clientHeight >= script.scrollHeight - 40;
       /* Scrolling by hand means "let me read"; following would yank the
          page back every quarter second. Tapping the readout resumes it. */
+      /* #1282: TWICE, NOT ONCE. Following used to end the first time
+         the lit node looked off-screen, which a long smooth scroll
+         guarantees mid-flight. Two consecutive readings means a single
+         unsettled frame cannot end it - but a real hand-scroll, which
+         produces many, still does. */
       var node = nowLineId
         && document.querySelector('.sp-el[data-line="' + nowLineId + '"]');
       if (node) {
         var box = script.getBoundingClientRect();
         var seat = node.getBoundingClientRect();
-        follow = seat.bottom > box.top && seat.top < box.bottom;
+        var here = seat.bottom > box.top && seat.top < box.bottom;
+        if (here) { adrift = 0; follow = true; }
+        else if ((adrift += 1) >= 2) { follow = false; }
+      } else if (nowLineId === '') {
+        /* #1270 leaves this empty while the line has not arrived. The
+           old code reconsidered nothing here, so scrolling away during
+           that window did not count as "let me read" and the page
+           yanked back the moment the line landed. */
+        if ((adrift += 1) >= 2) { follow = false; }
       }
       var chip = el('spNow');
       if (chip) chip.classList.toggle('adrift', !follow);
