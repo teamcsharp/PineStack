@@ -65481,7 +65481,11 @@ def _ready_slot_window(kind: str) -> dict[str, Any] | None:
     """Read the running occurrence without advancing or consuming its clock."""
     system2 = globals().get("_system2")
     if system2 and system2().enabled:
-        slot = system2().current_clock()
+        # #1224: the BRIEF read. This is asked on every cupboard check
+        # for every road, and it read a clock that deep-copied the whole
+        # slot - prompt, allocations, candidates and all - twice, to
+        # answer four fields.
+        slot = system2().current_slot_brief()
         # A missing System2 occurrence is unavailable, not unrestricted.
         road = str(slot.get("kind") or "")
         return {"occurrence": str(slot.get("occurrence") or ""),

@@ -438,7 +438,7 @@ class System2Store:
         hour['all_segments_present'] = all(s.get('coverage_seconds', s['ready_seconds']) > .001 or s['target_seconds'] == 0 for s in hour['slots'])
         return hour
 
-    def explain_hour(self, identity):
+    def explain_hour(self, identity, live_slots=None):
         """#1222: why each slot of an hour is bound, or is not.
 
         Read-only, and deliberately a REPLAY of plan_hour's own filters
@@ -450,6 +450,16 @@ class System2Store:
             hour = self._hour(db, identity)
             if not hour:
                 return {}
+            # #1224: READ WHAT THE DISPATCHER READS. The first cut of this
+            # walked s2_slots, while dispatch() and status() both work off
+            # the runtime's IN-MEMORY plans - so the view reported "0 of 18
+            # bound" for an hour the planner had 1,018s allocated in, and
+            # an explanation that disagrees with the thing it explains is
+            # worse than none. The caller hands in the live slots.
+            if live_slots:
+                by_id = {str(s.get('id')): s for s in live_slots}
+                hour['slots'] = [by_id.get(str(slot.get('id')), slot)
+                                 for slot in hour['slots']]
             catalogue = [json.loads(raw[0]) for raw in
                          db.execute('SELECT body FROM s2_candidates')]
             bookings = []
