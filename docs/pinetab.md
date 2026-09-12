@@ -434,6 +434,16 @@ stock `boot.img` needed to patch is already on disk from the Lenovo package.
    polled by the tablet, so every install on the network shares one master
    configuration, as the station already does for its other settings.
 
+---
+
+## 10. What has been put on it since
+
+* **The slideshow** — [slideshow-tablet.md](slideshow-tablet.md). `~/bin/media-slideshow`,
+  the Spark's own 25,000-line PySide6 glass, ported to the **SLIDES** tab:
+  the same `/comfy-output` folder, the same `favorites.md`, the same twenty
+  transitions, and the SC stack's console folded into one poll because
+  eleven subprocesses cannot run here.
+
 ## 9. Things that cost time, recorded so they do not again
 
 - No adb on the machine means **no RSA prompt ever appears**. The empty device

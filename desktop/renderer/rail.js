@@ -51,13 +51,34 @@
     {id: 'music', cls: 'pb-music', label: 'MUSIC',
       mount: ['PineMusicView', 'PineMusic']},
     {id: 'presentation', cls: 'pv-view', label: 'PRESENT',
-      mount: ['PinePresentation', 'PinePresentationView']}
+      mount: ['PinePresentation', 'PinePresentationView']},
+    /* THE BOX'S OWN GLASS. A port of ~/bin/media-slideshow, the 25,000-line
+     * PySide6 application that has been the slideshow on the Spark since
+     * May. Not a second gallery: it plays the SAME /comfy-output folder,
+     * writes the SAME favorites.md, and reads the same settings file when
+     * the ~/bin mount is present. See slideshow.js. */
+    /* `sl-host`, NOT `sl`. The view's own wrapper inside it is `.sl`, and
+     * two elements answering one selector is not a tidiness point here: the
+     * stylesheet's `.sl{padding-right:0}` would land on the HOST, which is
+     * the element reserving the strip this rail sits in. It is only saved
+     * by RAIL_CSS being concatenated after the views' CSS - source order,
+     * which is not something a stylesheet should depend on. */
+    {id: 'slideshow', cls: 'sl-host', label: 'SLIDES',
+      mount: ['PineSlideshow']}
   ];
 
   var RAIL_CSS = [
     '#pineViewRail{position:fixed;right:0;top:50%;transform:translateY(-50%);',
     'z-index:2147483001;display:flex;flex-direction:column;gap:4px;',
+    /* THE RAIL MUST NOT RUN OFF THE GLASS. Eight tabs of vertical text
+     * measure about 780px; this tablet is 800px tall in landscape, so the
+     * ninth one added would have put a tab somewhere no thumb can reach -
+     * silently, because a rail centred with translateY overflows equally
+     * at both ends. It scrolls instead, with no visible scrollbar. */
+    'max-height:100vh;overflow-y:auto;overscroll-behavior:contain;',
+    'scrollbar-width:none;',
     'font-family:Inter,Segoe UI,system-ui,sans-serif}',
+    '#pineViewRail::-webkit-scrollbar{display:none}',
     '.pine-view-tab{background:#1c242c;color:#edf3f5;border:1px solid #35414c;',
     'border-right:none;border-radius:10px 0 0 10px;padding:14px 9px;',
     'font-size:11px;letter-spacing:.09em;writing-mode:vertical-rl;',

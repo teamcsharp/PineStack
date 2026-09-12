@@ -34,6 +34,8 @@
   <link rel="stylesheet" href="./listen-music.css">
   <link rel="stylesheet" href="./terminal.css">
   <link rel="stylesheet" href="./presentation.css">
+  <link rel="stylesheet" href="./slideshow.css">
+  <link rel="stylesheet" href="./spark-overlays.css">
   <!-- The SVG sprite, for icon-only buttons that need a real <svg> with an
        aria-label rather than a bare character. -->
   <script src="./pine-icons.js"></script>
@@ -653,6 +655,15 @@
   <script src="./line-deep.js"></script>
   <script src="./line-actions.js"></script>
   <script src="./lock.js"></script>
+  <!-- ~/bin/media-slideshow, on this glass. The source file is the
+       view's whole traffic budget and must be evaluated first, or the
+       view's IIFE closes over an undefined global. -->
+  <!-- The Spark readouts. Mountable on their own (the drawer's
+       monitor), or over the slideshow. Loaded before it so the
+       view finds the global when its tab is first pressed. -->
+  <script src="./spark-overlays.js"></script>
+  <script src="./slideshow-source.js"></script>
+  <script src="./slideshow.js"></script>
   <script src="./rail.js"></script>
   <!-- THE STARTUP ASSEMBLY. The tablet gets this from rail.js when the
        rail goes up; the desktop has no rail boot step of its own, so it is

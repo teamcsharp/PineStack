@@ -37081,7 +37081,7 @@ def cupboard_short() -> list[dict[str, Any]]:
     within its horizon, audio present. This is the debt the station
     carries until it is paid.
 
-    #1233: MEMOIZED 3s, the same medicine as dialogue_flow_state (#1149)
+    #1250: MEMOIZED 3s, the same medicine as dialogue_flow_state (#1149)
     and for the same reason. This walks every row of every reusable road
     and asks the filesystem about each one (`pantry_get` stats the clip),
     and it is reached from /api/orchestrator/asks - which the panel was
@@ -37102,7 +37102,7 @@ def cupboard_short() -> list[dict[str, Any]]:
             return out
         horizon = cupboard_horizon()
         now = time.time()
-        # #1233: ONE cast signature for the whole walk. It was being
+        # #1250: ONE cast signature for the whole walk. It was being
         # rebuilt inside shelf_cast_stale for every row of every road -
         # each rebuild taking the settings lock through dj_settings - so
         # a few hundred rows meant a few hundred lock acquisitions to
@@ -37117,7 +37117,7 @@ def cupboard_short() -> list[dict[str, Any]]:
             for row in road_source(kind):
                 was_cast = str(row.get("cast") or "")
                 if was_cast and was_cast != cast_now:
-                    continue          # #1233: shelf_cast_stale, hoisted
+                    continue          # #1250: shelf_cast_stale, hoisted
                 # 2026-09-10: AGE NO LONGER DISQUALIFIES STOCK, and the
                 # loop it was caught in is why.
                 #
@@ -40219,7 +40219,7 @@ def coordinator_hourly_state(refresh: bool = False) -> dict[str, Any]:
 
 
 def _coordinator_hourly_brief() -> dict[str, Any]:
-    """#1233: the hour contract without the archive behind it.
+    """#1250: the hour contract without the archive behind it.
 
     Same object as `coordinator_hourly_state`, with `latest` cut from the
     last twelve closed hours to the last one. See the call site in
@@ -41678,7 +41678,7 @@ def coordinator_state() -> dict[str, Any]:
             # #1131: the exact active-hour contract, its pause yield and the
             # bounded corrections learned from prior closed hours.
             #
-            # #1233: WITHOUT THE TWELVE CLOSED HOURS. `coordinator_state`
+            # #1250: WITHOUT THE TWELVE CLOSED HOURS. `coordinator_state`
             # is read through exactly one door - `dialogue_flow`, which
             # rides every /api/dj poll - and measured on the tablet
             # 2026-09-12 that one field was 233 kB of the route's 310 kB,
@@ -62932,6 +62932,8 @@ async def _sting_over_record(track: dict[str, Any] | None) -> None:
 # ~23,000 pre-rendered samples and the SFX Guy's recorded liners were never
 # drawn from a silence path.
 _SFX_GAP: dict[str, Any] = {"at": 0.0, "turn": 0, "count": 0, "why": "", "went": ""}
+# #1249: how often each gate has refused him, since the process started.
+_SFX_GATES: dict[str, int] = {}
 # 2026-09-08 (the flow scan): six, not nine. The operator's rule is a
 # ten-second maximum intermission; with a nine-second rest plus detection
 # and the announce the first filler cannot land inside ten. The bank can
@@ -63323,7 +63325,16 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
     def _no(gate: str) -> str:
         # #1245: eight silent returns, and no way to answer "why am I
         # not hearing clips" but to guess which one fired.
+        # #1249: ...and a TALLY, because one field is overwritten by
+        # whichever of the three callers touched it last - it read "a
+        # line was queued less than 2.5s ago" while talk_quiet was 55
+        # seconds, which was another caller's answer entirely.
         _SFX_GAP["gate"] = gate
+        try:
+            key = gate.split(" - ")[0].split(" (")[0][:48]
+            _SFX_GATES[key] = int(_SFX_GATES.get(key) or 0) + 1
+        except Exception:  # noqa: BLE001
+            pass
         return ""
     try:
         if radio_paused() or not _RADIO.get("on"):
@@ -63358,7 +63369,16 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
             # dial, the watch and seven thousand clips were all sitting
             # behind one `return`.
             _ahead = float(_PAGE_AIR_UNTIL[0] or 0) - time.time()
-            if _ahead > sfx_sold_tolerance():
+            # #1249: SOLD IS NOT HEARD. This cursor advances as clips are
+            # handed over and nothing walks it back when a page takes one
+            # and never starts it - the failure this station actually
+            # has - so a page that stops playing makes it run AWAY from
+            # reality. Measured: 84 seconds "sold" while the room had
+            # been silent for 34. When the room says otherwise, the
+            # cursor is describing audio that is not happening and it
+            # does not get a vote.
+            if _ahead > sfx_sold_tolerance() \
+                    and talk_quiet_for() < sfx_gap_notice():
                 return _no("the air is already sold %.0fs ahead (allowing "
                            "%.0fs)" % (_ahead, sfx_sold_tolerance()))
             _deep = sfx_queue_deep()
@@ -63482,6 +63502,8 @@ def sfx_gap_status() -> dict[str, Any]:
     # it used to report - which was never the rest in force anyway.
     anx = sfx_anxiety()
     return {**_SFX_GAP, "watch": dict(_SFX_WATCH),      # #1245
+            "gates": dict(sorted(_SFX_GATES.items(),
+                                 key=lambda kv: -kv[1])[:10]),   # #1249
             "talk_quiet": round(talk_quiet_for(), 1),
             "rest": round(sfx_gap_rest(), 2),
             "anxiety": int(round(anx * 100)),
@@ -100066,7 +100088,12 @@ async def slideshow_stack_api(
         gpu = dict(_GPU_TEMP or {})
         out["gpu"] = {
             "c": gpu.get("c") or 0.0,
-            "util": gpu.get("util"),
+            # NO UTILISATION FIELD, deliberately. _gpu_temp_blocking asks
+            # nvidia-smi for it, but gpu_temp_refresh copies only c/zone/how
+            # into the slot - so a `util` here would have been permanently
+            # null dressed as a reading. The desktop app's NvidiaSampler has
+            # a real one because it runs its own subprocess; this does not,
+            # and says nothing rather than showing an empty dial.
             "zone": gpu.get("zone") or "",
             "how": gpu.get("how") or "",
             "age": (max(0.0, now - float(gpu.get("at") or 0.0))
@@ -100093,10 +100120,24 @@ async def slideshow_stack_api(
 
         # The loop's own health, which is what the desktop's py-spy pane was
         # really for: not a flamegraph, but "is the box wedged".
+        # TRIMMED, not passed whole. pulse_report carries `recent` and `top`
+        # with full stack frames - kilobytes of them - and the panel shows a
+        # sentence and four numbers. `reading` is already written in English
+        # by the report itself, which is better than anything assembled here.
         try:
-            out["pulse"] = pulse_report(600)
+            pulse = pulse_report(600)
+            out["pulse"] = {
+                "ok": pulse.get("ok"),
+                "reading": pulse.get("reading") or "",
+                "stalls": pulse.get("stalls"),
+                "worst_s": pulse.get("worst_s"),
+                "stalled_s": pulse.get("stalled_s"),
+                "stalling_now": pulse.get("stalling_now"),
+                "window_s": pulse.get("window_s"),
+                "top": [row.get("frame") for row in (pulse.get("top") or [])[:3]],
+            }
         except Exception as exc:  # noqa: BLE001
-            out["pulse"] = {"ok": False, "why": str(exc)}
+            out["pulse"] = {"ok": False, "reading": str(exc)}
 
         try:
             out["system"] = await asyncio.to_thread(system_stats)
@@ -100121,6 +100162,664 @@ async def slideshow_stack_api(
         _SLIDESHOW_STACK["payload"] = out
         _SLIDESHOW_STACK["at"] = time.time()
         return dict(out)
+
+
+# ---------------------------------------------------------------------------
+# #1241: THE OVERLAYS — what the slideshow is actually for.
+#
+# "The slideshow is one thing, but the overlays of the elements is the most
+#  important component... Whenever I would be looking at that slideshow, I
+#  would be getting overlays that would be telling me everything that was
+#  happening with backend components in a detailed fashion."
+#
+# #1240 put the pictures on the tablet and folded the telemetry into one
+# summary sheet. That was backwards. The desktop app is a WALL OF READOUTS
+# with renders playing behind it, and this is the door those readouts need:
+#
+#   PerformanceGraph   rolling FPS / RAM / CPU plots, per-core sparklines,
+#                      per-GPU utilisation sparklines            (top left)
+#   StatsPanel         bar gauges + per-core CPU + the NVIDIA section:
+#                      util, memory, temperature, power, fan, clocks
+#                                                               (top right)
+#   TopActivityBanner  what is BUSY right now — a ComfyUI render with its
+#                      node progress, or OpenWebUI streaming   (top centre)
+#   ServiceLogPanel    three lines from each service in turn  (bottom centre)
+#   TempReadout        the hottest sensor, huge                (bottom right)
+#   RamCircle          system RAM ring + the marquee of live figures
+#   TempCircle         the hottest sensor as a ring, with its contributors
+#
+# ONE ROUTE FOR ALL OF IT. Seven overlays asking seven questions on their own
+# timers is the shape that produced a 46-second media stall on this glass
+# (pine-media-origin.js). Every number below is gathered once, cached for two
+# seconds, and handed over together.
+#
+# WHAT THIS CAN SEE, AND WHAT IT CANNOT — measured, because half the desktop
+# app's readouts are about a process on the host and this is a container:
+#
+#   IT CAN see the WHOLE BOX's cpu, memory, load, thermals and disk. There is
+#   no CPU or memory namespace here, so /proc/stat and /proc/meminfo are the
+#   host's own — MemTotal reads 121.7 GB and /proc/stat has all 20 cores.
+#   nvidia-smi is present because compose reserves the GPU with the `utility`
+#   capability.
+#
+#   IT CANNOT see host PROCESSES. There is no shared PID namespace, so the
+#   /proc here is this container's own. That is the whole of TaskPopup, the
+#   RAM circle's "kill the biggest hog" and the temp circle's "kill the
+#   thermal contributors" — three features that cannot be ported and are
+#   reported as unavailable with that reason rather than drawn empty.
+#
+#   IT CANNOT read container logs. The docker socket proxy is deliberately
+#   restarts-only (compose.yaml: "Do NOT re-add CONTAINERS=1"), so the
+#   desktop's `docker logs` tailers have no road. What replaces them is
+#   services_census() (#1153), which probes each service live and says what
+#   it is DOING — ollama's resident models and their VRAM, ComfyUI's queue
+#   and board, searxng's live engine count. For a readout that is better
+#   than a log tail, not worse.
+# ---------------------------------------------------------------------------
+
+_SLIDESHOW_BACKEND: dict[str, Any] = {"at": 0.0, "payload": {}}
+_SLIDESHOW_BACKEND_TTL = 2.0
+_SLIDESHOW_BACKEND_LOCK = asyncio.Lock()
+
+# Previous /proc/stat jiffies, so per-core CPU is a DELTA between two polls
+# rather than the average since boot — which is what a "per-core CPU" bar
+# that never moves actually is.
+_SLIDESHOW_CPU_LAST: dict[str, Any] = {"at": 0.0, "cores": {}}
+
+# The census is expensive (it queries five services and runs a real search),
+# so it rides a slower clock than the numbers do. The desktop's own service
+# panel rotates one service every six seconds; nothing is lost by reading
+# them every twenty.
+_SLIDESHOW_CENSUS: dict[str, Any] = {"at": 0.0, "services": {}}
+_SLIDESHOW_CENSUS_TTL = 20.0
+
+
+def _slideshow_cpu_blocking() -> dict[str, Any]:
+    """Total and per-core CPU, as a delta between this call and the last.
+
+    /proc/stat is not namespaced, so these are the box's twenty cores and
+    not this container's share of them."""
+    # `per_core` is the LIST and `cores` is the COUNT, and they are two
+    # names because they were one: os.cpu_count() was written over the top
+    # of the array by the caller, so every per-core bar was handed the
+    # integer 20 and drew nothing at all.
+    out: dict[str, Any] = {"per_core": [], "pct": None}
+    try:
+        lines = Path("/proc/stat").read_text().splitlines()
+    except OSError:
+        return out
+
+    now: dict[str, tuple[int, int]] = {}
+    for line in lines:
+        if not line.startswith("cpu"):
+            break
+        parts = line.split()
+        name = parts[0]
+        try:
+            values = [int(v) for v in parts[1:11]]
+        except ValueError:
+            continue
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        now[name] = (sum(values), idle)
+
+    previous = _SLIDESHOW_CPU_LAST.get("cores") or {}
+    busy: dict[str, float] = {}
+    for name, (total, idle) in now.items():
+        was = previous.get(name)
+        if not was:
+            continue
+        d_total = total - was[0]
+        d_idle = idle - was[1]
+        if d_total <= 0:
+            continue
+        busy[name] = max(0.0, min(100.0, 100.0 * (d_total - d_idle) / d_total))
+
+    _SLIDESHOW_CPU_LAST["cores"] = now
+    _SLIDESHOW_CPU_LAST["at"] = time.time()
+
+    if "cpu" in busy:
+        out["pct"] = round(busy["cpu"], 1)
+    ordered = sorted((k for k in busy if k != "cpu"),
+                     key=lambda k: int(k[3:] or 0))
+    out["per_core"] = [round(busy[k], 1) for k in ordered]
+    # The FIRST call after a restart has no previous sample, so it has no
+    # honest answer. `null` rather than zero: a row of empty bars reads as a
+    # sleeping box, which is the opposite of unknown.
+    return out
+
+
+def _slideshow_memory_blocking() -> dict[str, Any]:
+    mem = _read_meminfo()          # kB, the host's own /proc/meminfo
+    total = mem.get("MemTotal", 0)
+    avail = mem.get("MemAvailable", 0)
+    swap_total = mem.get("SwapTotal", 0)
+    swap_free = mem.get("SwapFree", 0)
+    gb = 1048576.0
+    return {
+        "total_gb": round(total / gb, 1) if total else None,
+        "used_gb": round((total - avail) / gb, 1) if total else None,
+        "avail_gb": round(avail / gb, 1) if total else None,
+        "cached_gb": round(mem.get("Cached", 0) / gb, 1),
+        "pct": round(100 * (total - avail) / total, 1) if total else None,
+        "swap_used_gb": round((swap_total - swap_free) / gb, 1)
+        if swap_total else 0.0,
+        "swap_total_gb": round(swap_total / gb, 1) if swap_total else 0.0,
+    }
+
+
+# Every column the desktop's StatsPanel draws in its NVIDIA section. Asked
+# for in one call, because a second nvidia-smi is a second process.
+_SLIDESHOW_GPU_QUERY = (
+    "name,utilization.gpu,utilization.memory,temperature.gpu,"
+    "power.draw,power.limit,fan.speed,clocks.sm,clocks.mem,"
+    "memory.used,memory.total"
+)
+
+
+def _slideshow_gpu_blocking() -> list[dict[str, Any]]:
+    """Per-device NVIDIA figures, one row per GPU.
+
+    A FIELD THAT IS NOT REPORTED COMES BACK null, NOT ZERO. This board is a
+    GB10 with unified memory: it answers `[N/A]` for VRAM, and on some builds
+    for fan and power too (there is no fan to report, and it is not a card
+    with its own rail). The desktop app draws those bars because it runs on a
+    box where they exist; drawing them here as zero would say the GPU is
+    idling at 0 W with a stopped fan, which is worse than an empty row that
+    says "not reported"."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={_SLIDESHOW_GPU_QUERY}",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=6)
+        if out.returncode != 0:
+            return []
+    except Exception:  # noqa: BLE001
+        return []
+
+    def number(cell: str) -> float | None:
+        cell = (cell or "").strip()
+        if not cell or cell.lower().startswith(("n/a", "[n/a", "[not")):
+            return None
+        try:
+            return float(cell)
+        except ValueError:
+            return None
+
+    rows: list[dict[str, Any]] = []
+    for line in (out.stdout or "").strip().splitlines():
+        cells = [c.strip() for c in line.split(",")]
+        if len(cells) < 11:
+            continue
+        used, total = number(cells[9]), number(cells[10])
+        rows.append({
+            "name": cells[0],
+            "util": number(cells[1]),
+            "mem_util": number(cells[2]),
+            "temp_c": number(cells[3]),
+            "power_w": number(cells[4]),
+            "power_cap_w": number(cells[5]),
+            "fan_pct": number(cells[6]),
+            "clock_sm_mhz": number(cells[7]),
+            "clock_mem_mhz": number(cells[8]),
+            "vram_used_mb": used,
+            "vram_total_mb": total,
+            # Said out loud, because "no VRAM figure" on this board is a
+            # fact about the architecture and not a failed reading.
+            "unified_memory": used is None and total is None,
+        })
+    return rows
+
+
+def _slideshow_thermal_blocking() -> dict[str, Any]:
+    """Every thermal zone the box exposes, and which one is hottest."""
+    zones: list[dict[str, Any]] = []
+    for probe in ("/host-thermal", "/sys/class/thermal"):
+        root = Path(probe)
+        if not root.is_dir():
+            continue
+        for zone in sorted(root.glob("thermal_zone*")):
+            try:
+                milli = int((zone / "temp").read_text().strip())
+            except (OSError, ValueError):
+                continue
+            if not (1000 < milli < 150000):
+                continue
+            try:
+                label = (zone / "type").read_text().strip()
+            except OSError:
+                label = zone.name
+            zones.append({"zone": label, "c": round(milli / 1000.0, 1)})
+        if zones:
+            break
+    hottest = max(zones, key=lambda z: z["c"]) if zones else None
+    return {"zones": zones, "hottest": hottest, "count": len(zones)}
+
+
+def _slideshow_disk_blocking() -> dict[str, Any]:
+    try:
+        import shutil
+
+        usage = shutil.disk_usage("/")
+        gb = 1e9
+        return {"total_gb": round(usage.total / gb),
+                "used_gb": round(usage.used / gb),
+                "free_gb": round(usage.free / gb),
+                "pct": round(100 * usage.used / usage.total, 1)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _slideshow_comfy_read(prompt: Any) -> dict[str, Any]:
+    """What a running ComfyUI graph is actually making.
+
+    The banner wants a headline, and a prompt graph is a dict of nodes with
+    a `class_type` each — so this reads the graph rather than being told.
+    The desktop app has its own, larger version of this (its
+    `_analyze_comfy_workflow`); that file is not importable from here and
+    copying 70 lines of it to fill one line of banner would be the wrong
+    trade. What is taken is what the banner shows: the model, the size, and
+    the positive prompt.
+
+    THE POSITIVE PROMPT IS THE LONGER ONE. A graph carries at least two
+    CLIPTextEncode nodes and nothing in them says which is negative; the
+    negative is almost always the short boilerplate list. Guessing by length
+    is honest about being a guess and is right in practice — and a banner
+    showing the negative prompt would be wrong in a way nobody would notice.
+    """
+    out: dict[str, Any] = {"nodes": None, "model": "", "size": "",
+                           "positive": ""}
+    if not isinstance(prompt, dict):
+        return out
+    out["nodes"] = len(prompt)
+    texts: list[str] = []
+    width = height = None
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        kind = str(node.get("class_type") or "")
+        inputs = node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            continue
+        if kind.startswith("CLIPTextEncode"):
+            text = inputs.get("text")
+            if isinstance(text, str) and text.strip():
+                texts.append(text.strip())
+        elif "Loader" in kind:
+            for field in ("ckpt_name", "unet_name", "model_name", "lora_name"):
+                value = inputs.get(field)
+                if isinstance(value, str) and value and not out["model"]:
+                    out["model"] = value
+        elif "LatentImage" in kind or kind.endswith("EmptyLatent"):
+            if isinstance(inputs.get("width"), (int, float)):
+                width = int(inputs["width"])
+            if isinstance(inputs.get("height"), (int, float)):
+                height = int(inputs["height"])
+    if width and height:
+        out["size"] = f"{width}x{height}"
+    if texts:
+        out["positive"] = max(texts, key=len)[:400]
+    return out
+
+
+async def _slideshow_comfy_activity() -> dict[str, Any]:
+    """What ComfyUI is doing RIGHT NOW — the TopActivityBanner's subject.
+
+    The desktop banner watches a render node by node. ComfyUI publishes that
+    over a websocket, which a poll cannot join without holding a connection
+    open against a station this view is already rationing requests to. What
+    /queue and /history DO give is honest and enough for a banner: whether
+    something is running, what it is, how deep the queue is, and — from the
+    history — how long the last one took, which is what makes an elapsed
+    figure mean anything."""
+    out: dict[str, Any] = {"up": False, "running": 0, "pending": 0,
+                           "why": "", "now": None, "last": None}
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            queue = (await client.get(f"{COMFYUI_URL}/queue")).json() or {}
+            running = queue.get("queue_running") or []
+            out.update(up=True, running=len(running),
+                       pending=len(queue.get("queue_pending") or []))
+            if running:
+                # [number, prompt_id, prompt, extra, outputs]
+                entry = running[0]
+                prompt_id = entry[1] if len(entry) > 1 else ""
+                prompt = entry[2] if len(entry) > 2 else {}
+                out["now"] = dict(_slideshow_comfy_read(prompt),
+                                  id=str(prompt_id)[:12])
+            history = (await client.get(
+                f"{COMFYUI_URL}/history", params={"max_items": 1})).json() or {}
+            for _pid, record in list(history.items())[:1]:
+                status = (record or {}).get("status") or {}
+                messages = status.get("messages") or []
+                stamps = [m[1].get("timestamp") for m in messages
+                          if isinstance(m, list) and len(m) > 1
+                          and isinstance(m[1], dict) and m[1].get("timestamp")]
+                out["last"] = {
+                    "ok": bool(status.get("status_str") == "success"),
+                    "seconds": (round((max(stamps) - min(stamps)) / 1000.0, 1)
+                                if len(stamps) > 1 else None),
+                }
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+async def _slideshow_services() -> dict[str, Any]:
+    """The census, on its own slower clock. See the header for why this
+    stands in for the desktop's `docker logs` tailers."""
+    if (time.time() - float(_SLIDESHOW_CENSUS.get("at") or 0.0)
+            < _SLIDESHOW_CENSUS_TTL):
+        return dict(_SLIDESHOW_CENSUS.get("services") or {})
+    try:
+        got = await services_census() or {}
+        # It carries more than the service rows: `ops` is the station's own
+        # working figures, `marquee` the one-line facts the panel scrolls,
+        # and `restartable` which of them this box may actually bounce. The
+        # desktop's service panel had a STOP button per row; this is the
+        # honest equivalent of that list.
+        _SLIDESHOW_CENSUS["services"] = {
+            "services": got.get("services") or {},
+            "ops": got.get("ops") or {},
+            "marquee": got.get("marquee") or [],
+            "restartable": got.get("restartable") or [],
+            "stats_text": got.get("stats_text") or "",
+        }
+        _SLIDESHOW_CENSUS["at"] = time.time()
+    except Exception as exc:  # noqa: BLE001
+        _SLIDESHOW_CENSUS["services"] = {
+            "services": {"census": {"ok": False, "detail": str(exc)[:120],
+                                    "facts": []}}}
+        _SLIDESHOW_CENSUS["at"] = time.time()
+    return dict(_SLIDESHOW_CENSUS.get("services") or {})
+
+
+@app.get("/api/slideshow/backend")
+async def slideshow_backend_api(
+    census: int = 1,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Everything the overlays draw, in one answer.
+
+    Cached for two seconds. The desktop app's own panels tick at 4 Hz off
+    local psutil; nothing here is a local read, so two seconds is the honest
+    floor — and it is still five times faster than the folder scan and ten
+    times faster than the census behind it.
+
+    `census=0` skips the service probes for a caller that only wants the
+    numbers (the graph and the gauges), which is most of them most of the
+    time."""
+    require_read_auth(authorization)
+    async with _SLIDESHOW_BACKEND_LOCK:
+        held = _SLIDESHOW_BACKEND.get("payload") or {}
+        if (time.time() - float(_SLIDESHOW_BACKEND.get("at") or 0.0)
+                < _SLIDESHOW_BACKEND_TTL) and held:
+            if census and not held.get("services"):
+                pass            # the held copy has no census; fall through
+            else:
+                return held
+
+        now = time.time()
+        out: dict[str, Any] = {"at": now, "ok": True}
+
+        # The four cheap file reads, off the loop together.
+        cpu, memory, thermal, disk = await asyncio.gather(
+            asyncio.to_thread(_slideshow_cpu_blocking),
+            asyncio.to_thread(_slideshow_memory_blocking),
+            asyncio.to_thread(_slideshow_thermal_blocking),
+            asyncio.to_thread(_slideshow_disk_blocking),
+        )
+
+        try:
+            load = Path("/proc/loadavg").read_text().split()
+            cores = os.cpu_count() or 1
+            cpu.update(load1=float(load[0]), load5=float(load[1]),
+                       load15=float(load[2]), cores=cores,
+                       running=load[3] if len(load) > 3 else "")
+        except Exception:  # noqa: BLE001
+            cpu.setdefault("cores", os.cpu_count() or 1)
+        out["cpu"] = cpu
+        out["ram"] = memory
+        out["thermal"] = thermal
+        out["disk"] = disk
+
+        out["gpu"] = await asyncio.to_thread(_slideshow_gpu_blocking)
+        out["comfy"] = await _slideshow_comfy_activity()
+
+        try:
+            uptime = float(Path("/proc/uptime").read_text().split()[0])
+            out["uptime_s"] = round(uptime)
+        except Exception:  # noqa: BLE001
+            out["uptime_s"] = None
+
+        # The station itself, which is a backend component like any other -
+        # and the one whose stalls this tablet can actually be affected by.
+        try:
+            pulse = pulse_report(600)
+            out["station"] = {
+                "reading": pulse.get("reading") or "",
+                "stalls": pulse.get("stalls"),
+                "worst_s": pulse.get("worst_s"),
+                "stalled_s": pulse.get("stalled_s"),
+                "stalling_now": pulse.get("stalling_now"),
+                "window_s": pulse.get("window_s"),
+                "top": [r.get("frame") for r in (pulse.get("top") or [])[:3]],
+            }
+        except Exception as exc:  # noqa: BLE001
+            out["station"] = {"reading": str(exc)[:120]}
+
+        scan = await slideshow_scan()
+        rows = list(scan.get("rows") or [])
+        out["folder"] = {
+            "total": scan.get("total", 0),
+            "newest_file": rows[0]["file"] if rows else "",
+            "newest_age": (max(0.0, now - float(scan.get("newest") or 0.0))
+                           if scan.get("newest") else None),
+            "last_hour": sum(1 for r in rows if now - r["at"] < 3600),
+        }
+
+        if census:
+            got = await _slideshow_services()
+            out["services"] = got.get("services") or {}
+            out["ops"] = got.get("ops") or {}
+            out["marquee"] = got.get("marquee") or []
+            out["restartable"] = got.get("restartable") or []
+
+        # THE THREE THAT CANNOT BE PORTED, named rather than missing. An
+        # overlay that is simply absent reads as a bug in the overlay; one
+        # that says why reads as a fact about the box.
+        out["unavailable"] = {
+            "processes": "this station runs in a container with no shared PID "
+                         "namespace, so the host's processes are invisible "
+                         "from here — the task list, 'kill the biggest RAM "
+                         "hog' and 'kill the thermal contributors' have no "
+                         "road from the tablet",
+            "container_logs": "the docker socket proxy is restarts-only by "
+                              "design (compose.yaml: do NOT re-add "
+                              "CONTAINERS=1), so container logs cannot be "
+                              "tailed; the service census below probes each "
+                              "one live instead",
+            "process_fps_ram": "the desktop app graphs ITS OWN process — on "
+                               "the tablet that would be the WebView's, which "
+                               "is not a fact about the Spark",
+        }
+
+        _SLIDESHOW_BACKEND["payload"] = out
+        _SLIDESHOW_BACKEND["at"] = time.time()
+        return out
+
+
+# ---------------------------------------------------------------------------
+# #1241: THE STANDALONE MONITOR — /spark
+#
+# "I wanted it to be a standalone app because this app would be the
+#  management system for interacting with the DGX Spark, but it would also be
+#  something that would be able to pop up inside of the app and also inside of
+#  the application itself, the Electron app as well."
+#
+# So the overlays are ONE module with three hosts, and this is the third of
+# them: a page anything with a browser can open — a phone, the tablet outside
+# the kiosk, a laptop on the desk — and get the whole readout.
+#
+# THE FILES ARE SERVED FROM THE REPOSITORY, NOT COPIED INTO THIS ONE.
+# desktop/renderer is bind-mounted at /app/desktop/renderer, so this page and
+# the Electron app read the SAME spark-overlays.js. There is exactly one more
+# copy in the world — the tablet's, bundled into the APK, because its WebView
+# refuses the file:///android_asset → http:// crossing (BootAssets.kt) — and
+# that one is a build artefact rather than a second source.
+#
+# A WHITELIST, NOT A STATIC MOUNT. /app is the whole application: app.py, the
+# data directory, the keys in the environment. A route that served an
+# arbitrary path under it would be a file-read primitive for anyone who can
+# reach the station, which on this box is everyone on the LAN.
+# ---------------------------------------------------------------------------
+
+_SPARK_ASSET_DIR = Path("/app/desktop/renderer")
+_SPARK_ASSETS = {
+    "spark-overlays.js": "application/javascript; charset=utf-8",
+    "spark-overlays.css": "text/css; charset=utf-8",
+    "slideshow.js": "application/javascript; charset=utf-8",
+    "slideshow-source.js": "application/javascript; charset=utf-8",
+    "slideshow.css": "text/css; charset=utf-8",
+}
+
+
+@app.get("/spark/asset/{name}")
+async def spark_asset(name: str) -> Response:
+    """One of the overlay files, by exact name. Open: it is the same code
+    the panel already serves to every browser that loads it."""
+    kind = _SPARK_ASSETS.get(name)
+    if kind is None:
+        raise HTTPException(status_code=404, detail="No such asset")
+    path = _SPARK_ASSET_DIR / name
+    try:
+        body = await asyncio.to_thread(path.read_bytes)
+    except OSError:
+        raise HTTPException(
+            status_code=503,
+            detail=(f"{name} is not on the mount. desktop/renderer reaches "
+                    "this container at /app/desktop/renderer; if the "
+                    "repository moved, this route moved with it."))
+    return Response(content=body, media_type=kind,
+                    # Short, because these are edited and the page is
+                    # reloaded to see the edit — the whole point of serving
+                    # them rather than bundling them.
+                    headers={"Cache-Control": "no-cache"})
+
+
+_SPARK_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Spark — the box</title>
+<link rel="stylesheet" href="/spark/asset/spark-overlays.css">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #05080b; }
+  body {
+    font-family: Inter, "Segoe UI", system-ui, sans-serif;
+    color: #edf3f5;
+    overflow-x: hidden;
+  }
+  /* THE BAR IS THE ONLY FURNITURE THIS PAGE ADDS. Everything else on screen
+     is a widget out of the shared module, so a change there shows here with
+     no edit to this file. */
+  #sparkBar {
+    position: fixed; left: 0; right: 0; top: 0; height: 40px; z-index: 30;
+    display: flex; align-items: center; gap: 12px; padding: 0 12px;
+    background: #05080bf2; border-bottom: 1px solid #1b2630;
+  }
+  #sparkBar b { font-size: 12px; letter-spacing: .16em; color: #65c7da; font-weight: 600; }
+  #sparkBar span { font-size: 11px; color: #8fa0ad; margin-left: auto; }
+  #sparkBar a {
+    font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+    color: #8fa0ad; text-decoration: none; border: 1px solid #2b3742;
+    border-radius: 999px; padding: 4px 10px;
+  }
+  #sparkBar a.on { color: #05131a; background: #65c7da; border-color: #65c7da; }
+  #sparkHost { min-height: 100%; }
+  /* WITH PICTURES BEHIND IT (?pictures=1): the slideshow view fills the
+     screen and the overlays float at their own corners on top, which is the
+     desktop application's arrangement exactly. */
+  body.pictures #sparkHost { position: fixed; inset: 0; }
+  #sparkPictures { position: fixed; inset: 0; z-index: 0; }
+  body.pictures .so { z-index: 5; }
+  #sparkFallback { padding: 70px 20px 20px; max-width: 620px; line-height: 1.7; color: #8fa0ad; }
+</style>
+</head>
+<body>
+<div id="sparkBar">
+  <b>SPARK</b>
+  <a id="sparkPicturesTab" href="?pictures=1">Pictures behind</a>
+  <span id="sparkWhen">connecting…</span>
+</div>
+<section id="sparkPictures" hidden></section>
+<section id="sparkHost"></section>
+<div id="sparkFallback">Loading the overlays…</div>
+
+<script src="/spark/asset/spark-overlays.js"></script>
+<script src="/spark/asset/slideshow-source.js"></script>
+<script src="/spark/asset/slideshow.js"></script>
+<script>
+(function () {
+  'use strict';
+  var params = new URLSearchParams(location.search);
+  var pictures = params.get('pictures') === '1';
+  var fallback = document.getElementById('sparkFallback');
+
+  if (!window.SparkOverlays) {
+    /* Said plainly rather than left as a blank page: the one thing that can
+       fail here is the asset route, and it fails for exactly one reason. */
+    fallback.textContent = 'spark-overlays.js did not load. The station '
+      + 'serves it from desktop/renderer on the /app mount — open '
+      + '/spark/asset/spark-overlays.js directly to see what it says.';
+    return;
+  }
+  fallback.remove();
+
+  if (pictures) {
+    document.body.classList.add('pictures');
+    document.getElementById('sparkPicturesTab').classList.add('on');
+    document.getElementById('sparkPicturesTab').setAttribute('href', '?');
+    var stage = document.getElementById('sparkPictures');
+    stage.hidden = false;
+    if (window.PineSlideshow) {
+      try { window.PineSlideshow.mount(stage); } catch (err) { stage.hidden = true; }
+    }
+  }
+
+  var live = window.SparkOverlays.mount(
+    document.getElementById('sparkHost'),
+    {mode: pictures ? 'overlay' : 'dashboard'});
+
+  /* The clock in the bar is the honest "is this live" signal: it is the
+     timestamp the STATION put on the reading, not this page's own clock,
+     so a frozen number means the answers stopped rather than the page did. */
+  setInterval(function () {
+    var data = live.data();
+    var when = document.getElementById('sparkWhen');
+    if (!data || !data.at) { when.textContent = 'connecting…'; return; }
+    var age = Math.max(0, (Date.now() / 1000) - data.at);
+    when.textContent = age < 5 ? 'live' : Math.round(age) + 's ago';
+    when.style.color = age < 10 ? '#54d18b' : '#ff6b7f';
+  }, 1000);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/spark", response_class=HTMLResponse)
+async def spark_page() -> HTMLResponse:
+    """The Spark monitor as a page of its own.
+
+    `?pictures=1` puts the slideshow behind the readouts, which is the
+    desktop application's own arrangement. Without it the widgets take the
+    screen as a grid, which is what a monitor on a second display wants."""
+    return HTMLResponse(_SPARK_PAGE)
 
 
 @app.post("/api/listen/transcribe")
@@ -106313,7 +107012,7 @@ async def dj_pending(
     require_read_auth(authorization)
     want_full = bool(full)
 
-    # #1233: THE SIGNATURE PASS, and why `have` exists.
+    # #1250: THE SIGNATURE PASS, and why `have` exists.
     #
     # #1160 above cut the payload from 2.1 MB to 758 kB and named the
     # real constraint while doing it: "that mattered because of the
@@ -106392,7 +107091,7 @@ async def dj_pending(
                 _seat["turns"] += 1
         # chunks / made / state / the row id were all worked out in the
         # signature pass above; this loop reuses them rather than asking
-        # the shelf the same questions twice (#1233).
+        # the shelf the same questions twice (#1250).
         # #1030: names and voices onto the seats, and the live ones
         # marked - a caller's phone line is drawn per call, so those
         # turns cannot be recorded ahead and the listing should say so
@@ -106462,7 +107161,7 @@ async def dj_pending(
         })
     return {
         "pending": rows,
-        "sig": mark,                             # #1233: send it back next time
+        "sig": mark,                             # #1250: send it back next time
         "buffered_seconds": buffered,            # #1048
         "pantry_clips": len(_PANTRY),
         "window": window,
@@ -116249,7 +116948,7 @@ async def health_details(
     """Everything the health popup shows: per-service state, loaded models,
     system stats, and recent operation timings.
 
-    #1233: BEHIND A 20-SECOND MEMO, AND ONE PROBE AT A TIME.
+    #1250: BEHIND A 20-SECOND MEMO, AND ONE PROBE AT A TIME.
 
     This is the most expensive read on the station and it was the most
     frequent. `services_census` knocks on five services over the network
@@ -153571,7 +154270,7 @@ var djPendTimer = null;
 var djPendFrame = 0;
 /* #1160: one request at a time. See djPendingTick below. */
 var djPendBusy = false;
-/* #1233: the signature of the listing this panel last painted. It rides
+/* #1250: the signature of the listing this panel last painted. It rides
  * up with the next request so the station can answer "same" instead of
  * resending three quarters of a megabyte. */
 var djPendSig = "";
@@ -153612,7 +154311,7 @@ async function djPendingTick(force) {
    * pvPending() above has carried exactly this guard all along; this is
    * the same one. Skipping a tick costs nothing - the next is 1.6s away
    * and repaints from fresher data than the one we dropped. */
-  /* #1233: AND THE ANSWER IS STILL 758 kB, SO ASK FOR IT ONLY WHEN IT
+  /* #1250: AND THE ANSWER IS STILL 758 kB, SO ASK FOR IT ONLY WHEN IT
    * HAS CHANGED.
    *
    * #1160 above cut the payload and named the real constraint while
@@ -175691,7 +176390,7 @@ let orchTimer = null;
 let orchPicks = {};
 let orchLastOpen = -1;
 
-/* #1233: ONE READER FOR /api/orchestrator/asks, AND THE TAP NEVER WAITS
+/* #1250: ONE READER FOR /api/orchestrator/asks, AND THE TAP NEVER WAITS
  * ON IT.
  *
  * Measured on the tablet 2026-09-12. Four separate places fetched this
@@ -175741,7 +176440,7 @@ function orchAsksHeld() {
   return ORCH_ASKS.data;
 }
 
-/* #1233: THE ANSWER GOES AT ONCE, THE STATION CATCHES UP.
+/* #1250: THE ANSWER GOES AT ONCE, THE STATION CATCHES UP.
  *
  * The old handler disabled the button, said "applying…", awaited the
  * POST, and then waited a further 1,700 ms on a timer before closing.
@@ -175811,6 +176510,23 @@ function orchAnswerSend(row, picks) {
   return api("/api/orchestrator/asks/" + encodeURIComponent(row.id),
              {method: "POST", body: JSON.stringify({picks: picks})})
     .then((got) => {
+      /* An answer the station REFUSED is not an answer applied. The old
+       * handler already drew this line ("the orchestrator could not
+       * apply that") and it matters more now that the popup has already
+       * gone: the chip is the only place left to say so. */
+      if (got && got.ok === false) {
+        if (putBack && ORCH_ASKS.data
+            && Array.isArray(ORCH_ASKS.data.rows)) {
+          ORCH_ASKS.data.rows.splice(putBack.at, 0, putBack.row);
+          ORCH_ASKS.data.open = Number(ORCH_ASKS.data.open || 0) + 1;
+        }
+        orchChip("the orchestrator would not apply that: "
+                 + String(got.why || "it did not say why")
+                 + " — tap to send it again", "#ff7a3c",
+                 () => orchAnswerSend(row, picks));
+        try { orchBell(); } catch (e) {}
+        return got;
+      }
       const did = ((got || {}).did || []).join("; ");
       orchChip("the orchestrator did: " + (did || "nothing it could name"),
                "#5fd8a4", null);
@@ -176585,7 +177301,7 @@ async function fixResume() {
 }
 
 async function orchToast() {
-  const data = await orchAsks();          /* #1233: the shared reader */
+  const data = await orchAsks();          /* #1250: the shared reader */
   if (!data) return;
   const rows = data.rows || [];
   if (!rows.length || Date.now() < orchSnooze) { orchCardHide(); return; }
@@ -180733,7 +181449,7 @@ async function orchPlexusOpen() {
     document.head.appendChild(tag);
     return;
   }
-  /* #1233: NO NETWORK BETWEEN THE FINGER AND THE POPUP.
+  /* #1250: NO NETWORK BETWEEN THE FINGER AND THE POPUP.
    *
    * This used to `await fetch("/api/orchestrator/asks")` here, before
    * drawing a single pixel. On the tablet that fetch was timed at 3.4 to
@@ -180944,7 +181660,7 @@ async function orchPlexusOpen() {
       send.textContent = "pick one for each of the " + want;
       return;
     }
-    /* #1233: closes on the tap. The POST rides on behind it and the chip
+    /* #1250: closes on the tap. The POST rides on behind it and the chip
      * says honestly what became of it - see orchAnswerSend. */
     orchPlexusClose();
     orchAnswerSend(row, Object.assign({}, picks)).catch(() => {});
@@ -180988,7 +181704,7 @@ async function lineReviewOpen(id) {
 }
 
 async function orchBell() {
-  const data = await orchAsks();          /* #1233: the shared reader */
+  const data = await orchAsks();          /* #1250: the shared reader */
   if (!data) return;
   const open = Number(data.open || 0);
   let bell = document.getElementById("orchBell");
@@ -181032,7 +181748,7 @@ async function orchBell() {
 async function orchPaint(force) {
   if (!orchBox) return;
   const body = orchBox.querySelector("#orchBody");
-  /* #1233: the shared reader. `force` is for the moment after an answer
+  /* #1250: the shared reader. `force` is for the moment after an answer
    * has been applied, when the three-second rest would otherwise show
    * the question that was just answered. */
   const data = await orchAsks(force);
@@ -181125,7 +181841,7 @@ async function orchPaint(force) {
         + want + " questions";
       return;
     }
-    /* #1233: the same contract as the plexus popup above - the answer
+    /* #1250: the same contract as the plexus popup above - the answer
      * leaves on the tap and the chip reports what the station made of
      * it. This panel stays open (it is a dock, not a popup), so it
      * repaints straight away onto the next question rather than sitting
@@ -189103,7 +189819,7 @@ async function sparkShowInit() {
   sparkShow.timer = setInterval(
     () => { if (sparkShow.playing) sparkShowNext(); }, 5000);
   clearInterval(sparkShow.stats);
-  /* #1233: TWENTY SECONDS, NOT FOUR.
+  /* #1250: TWENTY SECONDS, NOT FOUR.
    *
    * This one line of text - "RAM 62% - GPU 51C - services 5 up" - was
    * the single most expensive read on the station. /api/health/details
@@ -189323,12 +190039,12 @@ function mpxBuildTip() {
 }
 async function mpxPoll() {
   try {
-    /* #1233: THE SECOND /api/dj POLLER, AND IT DOES NOT NEED TO BE ONE.
+    /* #1250: THE SECOND /api/dj POLLER, AND IT DOES NOT NEED TO BE ONE.
      *
      * pollDJ already fetches this exact route every four seconds and
      * leaves the answer in djLastState with djStateAt stamped beside it.
      * This meter was fetching the whole state again every TWO seconds -
-     * measured 2026-09-12 at 88 kB a time after the #1233 trim, 310 kB
+     * measured 2026-09-12 at 88 kB a time after the #1250 trim, 310 kB
      * before it - to read `s.activity`, which is about 200 bytes and
      * whose own freshness test below allows six seconds.
      *
