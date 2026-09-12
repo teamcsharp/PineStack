@@ -871,7 +871,9 @@ class Glass {
 }
 
 module.exports = {
-  Glass, GLASS_QUESTION, GLASS_PORT,
+  /* broadcastQuestion is exported for main.js's LOCAL recorder: the desktop
+   * renderer runs PineAir too, so the very same ring slice works here. */
+  Glass, GLASS_QUESTION, GLASS_PORT, broadcastQuestion,
   CLIP_DEFAULT, CLIP_MIN, CLIP_MAX,
   clampSeconds, looksPng, pngSize, memFree, diskFree, appPss, interestingLog,
   humanBytes, humanSpan

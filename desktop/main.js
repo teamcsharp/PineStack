@@ -8,6 +8,10 @@ const { LcdFirmware } = require("./lcd-firmware.cjs");
 const { saveLcdSample } = require("./lcd-samples.cjs");
 const { TerminalHost } = require("./terminal-host.cjs");
 const clipMux = require("./clip-mux.cjs");
+const glassParts = require("./terminal-glass.cjs");
+/* For the local report: facts about THIS machine, where the tablet's
+ * report has getprop and a battery. */
+const os = require("node:os");
 
 let win;
 let backend = null;
@@ -1073,14 +1077,144 @@ ipcMain.handle("shot:save", async (event, dataUrl) => {
   }
 });
 
+/* IS THERE A TABLET ON THE END OF ADB AT ALL? Asked BEFORE a capture is
+ * attempted rather than after it has failed, so the button can fall back
+ * instead of reporting an error the operator can do nothing about. */
+async function tabletIsThere() {
+  try { return !!(await terminalHost.glassSerial()); }
+  catch (error) { return false; }
+}
+
+/* Which machine a capture should be of. `want` is the renderer's reading of
+ * the roster - who owns the air - and the fallback is this process's reading
+ * of the cable. */
+async function captureTarget(want) {
+  if (want === "app") return { where: "app", why: "chosen" };
+  if (await tabletIsThere()) return { where: "tablet", why: "" };
+  return { where: "app", why: "the tablet is not reachable" };
+}
+
+/* The window's own composited output: what is actually on the glass here,
+ * including anything drawn over the page. */
+async function localStill() {
+  if (!win || win.isDestroyed()) throw new Error("there is no window to capture");
+  const image = await win.webContents.capturePage();
+  if (!image || image.isEmpty()) throw new Error("the window would not capture");
+  return image;
+}
+
+/* THIS APP'S OWN ACCOUNT OF ITSELF, in the same shape as the tablet's so the
+ * two can be read side by side. The machine facts differ - there is no
+ * battery, no jack, no logcat - and saying so is better than inventing
+ * equivalents. */
+async function localReport() {
+  const stamp = new Date().toLocaleString();
+  const L = [];
+  L.push("PINE BOX DESKTOP - what this window is doing");
+  L.push("taken " + stamp + " from the Pine Box app itself");
+  L.push("");
+  L.push("MACHINE");
+  L.push("  host        " + os.hostname() + "  (" + process.platform + " "
+    + os.release() + ")");
+  L.push("  electron    " + process.versions.electron
+    + "   chromium " + process.versions.chrome);
+  L.push("  memory      " + Math.round(os.freemem() / 1048576) + " MB free of "
+    + Math.round(os.totalmem() / 1048576) + " MB");
+  L.push("  up          " + Math.round(os.uptime() / 60) + " min");
+  const bounds = win && !win.isDestroyed() ? win.getBounds() : null;
+  if (bounds) L.push("  window      " + bounds.width + "x" + bounds.height);
+  L.push("");
+  L.push("ON THE GLASS");
+  try {
+    const raw = await win.webContents.executeJavaScript(glassParts.GLASS_QUESTION, true);
+    const state = JSON.parse(String(raw));
+    if (state.page) {
+      L.push("  showing     " + (state.page.title || "(untitled)")
+        + "  " + (state.page.size || ""));
+    }
+    if (state.views) {
+      L.push("  view open   " + (state.views.open || "panel")
+        + "   (of: " + (state.views.all || "") + ")");
+    }
+    if (state.sampler && state.sampler.mounted) {
+      L.push("  sampler     " + (state.sampler.onScreen ? "on screen"
+        : "mounted but NOT on screen")
+        + " - bank " + state.sampler.bank + ", " + state.sampler.padsFilled
+        + " pads loaded, engine " + state.sampler.engine);
+      L.push("              feed " + state.sampler.feedRows + " rows"
+        + (state.sampler.tally ? " - " + state.sampler.tally : ""));
+    } else if (state.sampler) {
+      L.push("  sampler     not mounted");
+    }
+    if (state.station && state.station.present) {
+      L.push("  station     " + (state.station.rows != null
+        ? state.station.rows + " feed rows" : "feed present"));
+      if (state.station.now) L.push("              now: " + state.station.now);
+      if (state.station.speaking) L.push("              speaking: " + state.station.speaking);
+    }
+    if (state.sound) {
+      L.push("  sound       " + state.sound.playing + " of " + state.sound.elements
+        + " players going, context " + state.sound.context);
+      for (const what of (state.sound.what || [])) L.push("              " + what);
+    }
+  } catch (error) {
+    L.push("  (this window could not be asked: " + error.message + ")");
+  }
+  L.push("");
+  L.push("WHAT THIS APP HAS BEEN COMPLAINING ABOUT");
+  const log = (backendLog || []).slice(-14);
+  if (!log.length) L.push("  nothing in this session's log");
+  for (const line of log) L.push("  " + String(line).slice(0, 200));
+  return L.join("\n");
+}
+
+/* THE LOCAL RECORDER. No encoder here, so stills are taken off the window on
+ * a timer and ffmpeg is handed the sequence.
+ *
+ * JPEG rather than PNG on purpose: a 1480x940 PNG is around a megabyte and
+ * takes long enough to write that the timer starts slipping, which shows up
+ * as a clip that runs short. The frames are an intermediate that is thrown
+ * away after encoding, so the quality that matters is the x264 pass. */
+async function localClipFrames(seconds, dir) {
+  const fps = 10;
+  const every = Math.round(1000 / fps);
+  const want = Math.max(1, Math.round(seconds * fps));
+  let taken = 0;
+  const startedAt = Date.now();
+  while (taken < want) {
+    const due = startedAt + taken * every;
+    const wait = due - Date.now();
+    if (wait > 0) await new Promise((done) => setTimeout(done, wait));
+    if (!win || win.isDestroyed()) break;
+    let image;
+    try { image = await win.webContents.capturePage(); }
+    catch (error) { break; }
+    if (!image || image.isEmpty()) break;
+    fs.writeFileSync(path.join(dir, "f" + String(taken + 1).padStart(6, "0") + ".jpg"),
+      image.toJPEG(82));
+    taken += 1;
+  }
+  return { frames: taken, fps, seconds: taken / fps, startedAt,
+    endedAt: Date.now() };
+}
+
 ipcMain.handle("glass:still", async (_event, options) => {
   const { clipboard, nativeImage } = require("electron");
   try {
-    const shot = await (await terminalHost.glass()).still();
-    if (!shot.ok) return shot;
-    const image = nativeImage.createFromBuffer(shot.png);
+    const aim = await captureTarget(options && options.target);
+    let image = null;
+    let shot = { bytes: 0, how: "", size: null };
+    if (aim.where === "app") {
+      image = await localStill();
+      const png = image.toPNG();
+      shot = { bytes: png.length, how: "this window", size: image.getSize() };
+    } else {
+      shot = await (await terminalHost.glass()).still();
+      if (!shot.ok) return shot;
+      image = nativeImage.createFromBuffer(shot.png);
+    }
     if (!image || image.isEmpty()) {
-      return { ok: false, why: "the tablet sent a picture this machine could not decode" };
+      return { ok: false, why: "the picture could not be decoded" };
     }
     clipboard.writeImage(image);
     if (clipboard.readImage().isEmpty()) {
@@ -1093,11 +1227,12 @@ ipcMain.handle("glass:still", async (_event, options) => {
      * done what a plain click would have done. */
     let edited = false;
     if (options && options.edit) {
-      try { openShotEditor(shot.png); edited = true; }
+      try { openShotEditor(aim.where === "app" ? image.toPNG() : shot.png); edited = true; }
       catch (error) { edited = false; }
     }
     return { ok: true, width: size.width, height: size.height,
-      bytes: shot.bytes, how: shot.how, edited };
+      bytes: shot.bytes, how: shot.how, edited,
+      where: aim.where, why: aim.why };
   } catch (error) {
     return { ok: false, why: error.message };
   }
@@ -1230,17 +1365,80 @@ ipcMain.handle("clip:export", async (event, choices) => {
   }
 });
 
+/* THE LOCAL RECORDING, assembled into the same shape the tablet's comes back
+ * in - an mp4 buffer plus whatever audio was caught - so the export window
+ * cannot tell the two apart and needed no change at all. */
+async function localClip(seconds) {
+  const dir = clipMux.stash();
+  const notes = [];
+  try {
+    const took = await localClipFrames(seconds, dir);
+    if (!took.frames) throw new Error("the window would not give up any frames");
+    if (took.frames < Math.round(seconds * took.fps) * 0.8) {
+      notes.push("the window could not be captured fast enough - "
+        + took.seconds.toFixed(1) + "s of the " + seconds + "s asked for");
+    }
+    const out = path.join(dir, "screen.mp4");
+    try {
+      await clipMux.fromFrames({ dir, pattern: "f%06d.jpg", fps: took.fps, out },
+        { ffmpeg: (readConfig() || {}).ffmpeg });
+    } catch (error) {
+      /* Say what was on disk when the encoder refused it. "No packets" reads
+       * like the frames are missing, and every time so far they were not. */
+      let listed = [];
+      try { listed = fs.readdirSync(dir).slice(0, 3); } catch (e) { listed = ["unreadable"]; }
+      let first = 0;
+      try { first = fs.statSync(path.join(dir, listed[0] || "")).size; } catch (e) { first = 0; }
+      throw new Error(error.message + "  [" + took.frames + " frames, first "
+        + listed[0] + " " + first + " bytes, in " + dir + "]");
+    }
+    const mp4 = fs.readFileSync(out);
+
+    /* The broadcast comes out of PineAir's ring, exactly as it does on the
+     * tablet - the module runs in this renderer too. */
+    const audio = { broadcast: null, mic: null };
+    try {
+      const askedAt = Date.now();
+      const fromAgo = (askedAt - took.startedAt) / 1000;
+      const toAgo = Math.max(0, (askedAt - took.endedAt) / 1000);
+      const raw = await win.webContents.executeJavaScript(
+        glassParts.broadcastQuestion(fromAgo.toFixed(3), toAgo.toFixed(3)), true);
+      const got = JSON.parse(String(raw));
+      if (got && got.ok) {
+        audio.broadcast = { wav: Buffer.from(got.b64, "base64"), offset: 0 };
+      } else {
+        notes.push("no broadcast audio: " + ((got && got.why) || "the ring did not answer"));
+      }
+    } catch (error) {
+      notes.push("no broadcast audio: " + error.message);
+    }
+    notes.push("this window was recorded, not the tablet");
+    return { ok: true, mp4, bytes: mp4.length, seconds: took.seconds,
+      at: Date.now(), audio, notes };
+  } finally {
+    clipMux.forget(dir);
+  }
+}
+
 ipcMain.handle("glass:clip", async (_event, seconds, options) => {
   try {
-    const made = await (await terminalHost.glass()).clip(seconds, options);
+    const aim = await captureTarget(options && options.target);
+    const made = aim.where === "app"
+      ? await localClip(seconds)
+      : await (await terminalHost.glass()).clip(seconds, options);
     if (!made.ok) return made;
+    /* Only a FALLBACK is worth saying. "chosen" is the operator's own
+     * decision handed back to them as news. */
+    if (aim.why && aim.why !== "chosen") {
+      (made.notes = made.notes || []).push(aim.why);
+    }
     /* Straight into the export window rather than into a save dialog. The
      * cutting, the channels and the gains are all decisions that need the
      * recording in front of you, and a file written before any of them is a
      * file that has to be written again. */
     openClipExport(made);
     return { ok: true, seconds: made.seconds, bytes: made.bytes,
-      notes: made.notes || [],
+      notes: made.notes || [], where: aim.where,
       broadcast: !!(made.audio && made.audio.broadcast),
       mic: !!(made.audio && made.audio.mic) };
   } catch (error) {
@@ -1248,14 +1446,22 @@ ipcMain.handle("glass:clip", async (_event, seconds, options) => {
   }
 });
 
-ipcMain.handle("glass:report", async () => {
+ipcMain.handle("glass:report", async (_event, options) => {
   const { clipboard } = require("electron");
   try {
+    const aim = await captureTarget(options && options.target);
+    if (aim.where === "app") {
+      const text = await localReport();
+      clipboard.writeText(text);
+      return { ok: true, lines: text.split("\n").length, bytes: text.length,
+        page: true, where: aim.where, why: aim.why };
+    }
     const said = await (await terminalHost.glass()).report();
     if (!said.ok) return said;
     clipboard.writeText(said.text);
     return { ok: true, lines: said.text.split("\n").length,
-      bytes: said.text.length, page: said.page, pid: said.pid };
+      bytes: said.text.length, page: said.page, pid: said.pid,
+      where: aim.where, why: aim.why };
   } catch (error) {
     return { ok: false, why: error.message };
   }

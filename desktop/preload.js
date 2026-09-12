@@ -71,7 +71,7 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   clipPending: () => ipcRenderer.invoke("clip:pending"),
   clipExport: (choices) => ipcRenderer.invoke("clip:export", choices),
   clipDone: () => ipcRenderer.invoke("clip:done"),
-  glassReport: () => ipcRenderer.invoke("glass:report"),
+  glassReport: (options) => ipcRenderer.invoke("glass:report", options),
 
   terminalAudioTable: () => ipcRenderer.invoke("terminal-audio:table"),
   terminalAudioSet: (id, patch) => ipcRenderer.invoke("terminal-audio:set", id, patch),

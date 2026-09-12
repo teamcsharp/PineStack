@@ -886,6 +886,40 @@ function wireFrame(frame) {
  * does it, and the row locks so two of them cannot be talking to adb at
  * once. adb serialises anyway; it just does it without telling anybody. */
 
+/* WHICH DEVICE THE CAPTURE BUTTONS MEAN.
+ *
+ * "These buttons should correspond to whatever device is mapped. As long as
+ *  it's an application that has a GUI. Obviously the Pine Box and the Nabu
+ *  don't have GUIs to capture."
+ *
+ * The roster's audio_owner is whichever player the operator gave the air to.
+ * If that is THIS app, the thing they are looking at is this window, and a
+ * picture of the tablet answers a question nobody asked.
+ *
+ * Anything else - the tablet, a speaker, nobody - means the tablet, because
+ * it is the only other thing with a screen. main.js falls back to this window
+ * on its own when the tablet is not reachable, and says which it used; that
+ * half cannot be decided here, because only the main process can see whether
+ * adb has a device. */
+function glassTarget() {
+  try {
+    const owner = String((playersRoster || {}).audio_owner || "");
+    if (owner && owner === desktopListenerId) return "app";
+  } catch (err) { /* the roster has not arrived yet */ }
+  return "tablet";
+}
+
+/* Said when the capture was not of what the button implies - either because
+ * the app was chosen or because the tablet could not be reached. Never
+ * silent: a screenshot of the wrong machine that looks right is worse than
+ * no screenshot. */
+function glassWhere(result) {
+  if (!result || result.where !== "app") return "";
+  return result.why === "chosen"
+    ? " (this window)"
+    : " (this window \u2014 " + (result.why || "the tablet was not reachable") + ")";
+}
+
 const GLASS_SECONDS_KEY = "pineDesktopGlassSeconds";
 const GLASS_MIN = 3, GLASS_MAX = 30, GLASS_DEFAULT = 10;
 
@@ -934,11 +968,12 @@ $("glassStill")?.addEventListener("click", (event) => {
   const edit = !!(event.ctrlKey || event.metaKey);
   glassDo(edit ? "Taking the picture to mark up\u2026" : "Taking the tablet's picture\u2026",
     async () => {
-      const shot = await api.glassStill({ edit });
+      const shot = await api.glassStill({ edit, target: glassTarget() });
       if (!shot || !shot.ok) {
         return glassSay(shot && shot.why ? shot.why : "the picture did not come back", true);
       }
-      glassSay(`On the clipboard \u2014 ${shot.width}\u00d7${shot.height}.`
+      glassSay(`On the clipboard \u2014 ${shot.width}\u00d7${shot.height}`
+        + glassWhere(shot) + "."
         + (edit ? (shot.edited ? " Marking-up window opened."
           : " The mark-up window would not open.") : ""));
     });
@@ -958,7 +993,7 @@ $("glassClip")?.addEventListener("click", () => {
         : "Fetching the clip from the tablet\u2026");
     }, 1000);
     try {
-      const made = await api.glassClip(seconds);
+      const made = await api.glassClip(seconds, { target: glassTarget() });
       if (!made || !made.ok) {
         return glassSay(made && made.why ? made.why : "the clip did not come back", true);
       }
@@ -968,7 +1003,9 @@ $("glassClip")?.addEventListener("click", () => {
        * late. */
       const heard = [made.broadcast ? "broadcast" : null, made.mic ? "mic" : null]
         .filter(Boolean).join(" + ") || "no audio";
-      glassSay(`Recorded ${made.seconds}s with ${heard}. Choose what to export.`
+      glassSay(`Recorded ${Number(made.seconds).toFixed(1)}s with ${heard}`
+        + (made.where === "app" ? " from this window" : "")
+        + ". Choose what to export."
         + ((made.notes || []).length ? " \u2014 " + made.notes.join("; ") : ""),
         !made.broadcast && !made.mic);
     } finally {
@@ -979,14 +1016,14 @@ $("glassClip")?.addEventListener("click", () => {
 
 $("glassReport")?.addEventListener("click", () => glassDo(
   "Asking the tablet what it is doing\u2026", async () => {
-    const said = await api.glassReport();
+    const said = await api.glassReport({ target: glassTarget() });
     if (!said || !said.ok) {
       return glassSay(said && said.why ? said.why : "the tablet did not answer", true);
     }
     /* Said plainly when the WebView could not be reached: the report is
      * still worth pasting, but the half that says what is ON the screen is
      * missing from it, and that is the half that was asked for. */
-    glassSay(`On the clipboard \u2014 ${said.lines} lines`
+    glassSay(`On the clipboard \u2014 ${said.lines} lines` + glassWhere(said)
       + (said.page ? "." : ", but the page itself could not be read."));
   }));
 

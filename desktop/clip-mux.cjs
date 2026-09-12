@@ -42,6 +42,12 @@ const FFMPEG_LIKELY = [
   '/usr/local/bin/ffmpeg'
 ];
 
+/* Round both dimensions DOWN to even. See the note beside its use in
+ * planArgs: libx264 refuses odd dimensions under yuv420p and reports it
+ * as a generic encoder failure. Down rather than up, because padding
+ * adds a one-pixel band of black that shows on a screen recording. */
+const EVEN = 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+
 function findFfmpeg(configured) {
   const tried = [];
   for (const guess of [configured, ...FFMPEG_LIKELY].filter(Boolean)) {
@@ -83,7 +89,14 @@ function run(exe, args, timeoutMs) {
 function lastReal(text) {
   const lines = String(text || '').split('\n').map((l) => l.trim())
     .filter((l) => l && !/^(frame|size|video:|Press \[q\])/.test(l));
-  return lines.slice(-2).join(' ').slice(0, 300);
+  /* SIX LINES, NOT TWO. ffmpeg's closing complaint is usually a symptom -
+   * "at least one of its streams received no packets" - while the sentence
+   * that says WHY sits several lines above it. Two lines was enough to know
+   * that something had failed and never enough to know what. */
+  const said = lines.slice(-6);
+  const useful = said.filter(
+    (l) => !/^(ffmpeg version|built with|configuration:)/.test(l));
+  return (useful.length ? useful : said).join(' | ').slice(0, 600);
 }
 
 function dbToLinear(db) {
@@ -146,8 +159,15 @@ function planArgs(plan) {
     index += 1;
   }
 
+  /* EVEN DIMENSIONS, ALWAYS. libx264 with yuv420p cannot encode an odd width
+   * or height, and it does not say so: it fails with "Could not open encoder
+   * before EOF" and a generic library error, which reads as though the frames
+   * were the problem. The desktop window this may be recording is whatever
+   * size the operator dragged it to - measured at 1983x1234 on the run that
+   * found this - so roughly half of all window sizes would have failed. The
+   * tablet is 1340x800 and would never have shown it. */
   parts.push('[0:v]trim=start=' + inAt.toFixed(3) + ':end=' + outAt.toFixed(3)
-    + ',setpts=PTS-STARTPTS[v]');
+    + ',setpts=PTS-STARTPTS,' + EVEN + '[v]');
 
   let audioOut = '';
   if (sources.length === 2) {
@@ -215,4 +235,32 @@ function forget(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (error) { /* temp */ }
 }
 
-module.exports = { planArgs, mux, findFfmpeg, dbToLinear, stash, forget, lastReal };
+/* FRAMES INTO A VIDEO. The local recorder has no encoder of its own - it
+ * takes stills off the window on a timer - so ffmpeg is handed the sequence
+ * and told how fast it was taken.
+ *
+ * `-framerate` BEFORE the input, which is the rate the stills were TAKEN at;
+ * `-r 30` after it, which is the rate the file plays at. Giving only the
+ * first produces a file whose timebase is 10fps, and several players will
+ * show that as a slideshow or refuse to scrub it. */
+async function fromFrames({ dir, pattern, fps, out }, options) {
+  const tool = findFfmpeg((options || {}).ffmpeg);
+  const args = ['-y', '-framerate', String(fps || 10),
+    /* THE NUMBERING STARTS AT ONE. Without this the image2 demuxer looks for
+     * frame zero, finds nothing, and ffmpeg exits with "at least one of its
+     * streams received no packets" - which reads like the frames are missing
+     * when every one of them is sitting right there. */
+    '-start_number', '1',
+    '-i', path.join(dir, pattern || 'f%06d.jpg'),
+    '-r', '30', '-vf', EVEN,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+    '-pix_fmt', 'yuv420p', '-movflags', '+faststart', out];
+  await run(tool.path, args, 600000);
+  let bytes = 0;
+  try { bytes = fs.statSync(out).size; } catch (error) { bytes = 0; }
+  if (!bytes) throw new Error('the frames would not encode');
+  return { ok: true, path: out, bytes };
+}
+
+module.exports = { planArgs, mux, findFfmpeg, dbToLinear, stash, forget, lastReal,
+  fromFrames };
