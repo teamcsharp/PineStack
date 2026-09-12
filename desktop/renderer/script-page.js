@@ -44,6 +44,7 @@
   var stop = null;
   var elements = [];
   var hourKey = '';
+  var painted = [];                 /* #1269: what is already on the page */
   var fetchedAt = 0;
   var fetching = false;
   var pinned = null;                /* the element the operator tapped */
@@ -380,12 +381,52 @@
       var hours = (index && index.hours) || [];
       if (!hours.length) throw new Error('no hours written yet');
       hourKey = String(hours[0].key || '');
-      return api().get('/api/screenplay/' + encodeURIComponent(hourKey));
-    }).then(function (page) {
-      elements = (page && page.elements) || [];
+      /* #1268: THE READING DOES NOT END BECAUSE THE HOUR DID.
+       *
+       * "I want to put on my reading glasses and watch the pine box go
+       *  through an endless reading that is endlessly streamed."
+       *
+       * This asked for hours[0] and nothing else, so at the top of
+       * every hour the whole script was replaced by a nearly empty
+       * page - measured at the 3 PM turn, 350 entries down to 0 - and
+       * the reader's place went with it. Worse, a burst that straddles
+       * the turn is still SOUNDING while the lines it is saying have
+       * just left the page, so the highlight has nothing to land on.
+       *
+       * The hour before is carried too, above it and in order. The
+       * window stays bounded: as the clock rolls, hours[1] becomes the
+       * hour that just ended and the one before it drops off the top,
+       * so this is always one to two hours of script and never grows.
+       */
+      var before = hours[1] && Number(hours[1].lines || 0) > 0
+        ? String(hours[1].key || '') : '';
+      var want = [api().get('/api/screenplay/' + encodeURIComponent(hourKey))];
+      if (before) {
+        want.push(api().get('/api/screenplay/' + encodeURIComponent(before))
+          .then(null, function () { return null; }));  /* its loss is survivable */
+      }
+      return Promise.all(want).then(function (got) {
+        return {now: got[0] || {}, was: got[1] || null,
+          nowKey: hourKey, wasKey: before};
+      });
+    }).then(function (both) {
+      var page = both.now;
+      /* Each element remembers WHICH HOUR it belongs to, so a note put
+         on a line from the earlier hour is filed against that hour and
+         not against the one on screen. */
+      function stamp(list, key) {
+        var out = [];
+        for (var i = 0; i < (list || []).length; i += 1) {
+          var it = list[i];
+          if (it && typeof it === 'object') { it.hour = key; out.push(it); }
+        }
+        return out;
+      }
+      elements = stamp(both.was && both.was.elements, both.wasKey)
+        .concat(stamp(page.elements, both.nowKey));
       fetchedAt = Date.now();
       fetching = false;
-      paintScript(page);
+      paintScript(page, both.was);
     }, function (err) {
       fetching = false;
       var box = el('spScript');
@@ -399,19 +440,57 @@
   /* Hollywood layout: each element type is its own block, and the CSS does
    * the indenting the way a script does - character centred over dialogue,
    * parentheticals tucked inside it, action full width. */
-  function paintScript(page) {
+  function paintScript(page, before) {
     var box = el('spScript');
     if (!box) return;
     var head = el('spScriptHead');
     if (head && page) {
+      /* #1268: the count is of what is ON THE PAGE, both hours of it,
+         because that is what the reader can scroll through. */
+      var lines = (page.counts && page.counts.lines) || 0;
+      var back = (before && before.counts && before.counts.lines) || 0;
       head.textContent = (page.title || 'the broadcast')
-        + '  ·  ' + ((page.counts && page.counts.lines) || 0) + ' lines'
+        + '  ·  ' + (lines + back) + ' lines'
+        + (back ? '  (with the hour before)' : '')
         + (page.live ? '  ·  live' : '');
     }
     var atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
-    box.replaceChildren();
+    /* #1269: REBUILD ONLY WHAT CHANGED.
+     *
+     * "keep an eye on how it is jumping around"
+     *
+     * This used to replaceChildren() and re-append EVERY element on
+     * every poll - twenty seconds, a few hundred nodes, and with the
+     * hour before it now carried too (#1268) a few hundred more. Every
+     * node the reader was looking at was destroyed and rebuilt, which
+     * throws the scroll offset and drops the highlight (nowLineId was
+     * cleared just below, unconditionally), so the page re-seated
+     * itself three times a minute whether anything had changed or not.
+     *
+     * A script only ever grows at the END. So the painted list is
+     * compared with the new one, element by element, and everything
+     * that still matches is LEFT ALONE - the same DOM nodes, the same
+     * scroll, the same highlight. Only from the first real difference
+     * down is anything touched.
+     *
+     * The comparison carries the text as well as the id, because an
+     * element can be revised in place without changing its id: the
+     * scene heading gains its "- N MIN" as the hour runs on, and that
+     * one really does have to be repainted.
+     */
+    var fresh = [];
     for (var i = 0; i < elements.length; i += 1) {
-      box.appendChild(scriptBlock(elements[i]));
+      fresh.push(String(elements[i].id || i) + ' '
+        + String(elements[i].text || ''));
+    }
+    var keep = 0;
+    while (keep < painted.length && keep < fresh.length
+        && painted[keep] === fresh[keep]) keep += 1;
+    while (box.childNodes.length > keep) box.removeChild(box.lastChild);
+    painted.length = keep;
+    for (var k = keep; k < elements.length; k += 1) {
+      box.appendChild(scriptBlock(elements[k]));
+      painted.push(fresh[k]);
     }
     /* FOLLOWING BEATS STICKING TO THE END.
      * The live line sits wherever the conversation has got to, and the end
@@ -419,9 +498,13 @@
      * every repaint would drag the operator away from the line being said
      * twenty seconds after it arrived. */
     if (stick && atEnd && !(follow && nowLineId)) box.scrollTop = box.scrollHeight;
-    /* The script was just rebuilt, so the marked node is gone. Forget it
-       and let the next tick put the class back where it belongs. */
-    nowLineId = '';
+    /* #1269: the mark is only forgotten if its node actually went. It
+       usually survives now, and forgetting it unconditionally was what
+       made the highlight re-seat on every poll. */
+    if (nowLineId
+        && !box.querySelector('.sp-el[data-line="' + nowLineId + '"]')) {
+      nowLineId = '';
+    }
     tick();
   }
 
@@ -743,7 +826,8 @@
     if (!text.trim()) { button.textContent = 'write something first'; return; }
     var was = button.textContent;
     button.textContent = 'keeping...';
-    api().post('/api/screenplay/' + encodeURIComponent(hourKey) + '/note', {
+    api().post('/api/screenplay/'                      /* #1268 */
+      + encodeURIComponent((item && item.hour) || hourKey) + '/note', {
       kind: 'line', target_id: item.line || item.id, text: text,
       who: 'operator'
     }).then(function () {
@@ -759,7 +843,8 @@
     button.textContent = 'sending...';
     /* The note first, so the request and the reason are stored together
      * even if the rewrite is refused. */
-    api().post('/api/screenplay/' + encodeURIComponent(hourKey) + '/note', {
+    api().post('/api/screenplay/'                      /* #1268 */
+      + encodeURIComponent((item && item.hour) || hourKey) + '/note', {
       kind: 'rework', target_id: item.line || item.id,
       text: text || 'Do this one again.', who: 'operator'
     }).then(function () {
