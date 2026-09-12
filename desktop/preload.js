@@ -34,6 +34,33 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   lcdFirmware: (body = {}) => ipcRenderer.invoke("lcd:firmware", body),
   lcdSampleDirectory: () => ipcRenderer.invoke("lcd:sample-directory"),
   lcdDownload: (id, at) => ipcRenderer.invoke("lcd:download", {id, at}),
+  /* The terminal provisioner - turning a stock tablet into a Pine Box
+   * kiosk. Read-only up to terminalUnlock, which erases the tablet and
+   * therefore demands the exact confirmation string its gate expects; the
+   * renderer cannot trip it by accident. */
+  terminalTools: () => ipcRenderer.invoke("terminal:tools"),
+  terminalSurvey: () => ipcRenderer.invoke("terminal:survey"),
+  terminalSnapshot: (serial) => ipcRenderer.invoke("terminal:snapshot", serial),
+  terminalBootloader: () => ipcRenderer.invoke("terminal:bootloader"),
+  terminalReboot: (mode) => ipcRenderer.invoke("terminal:reboot", mode),
+  terminalVerifyFirmware: (dir) => ipcRenderer.invoke("terminal:verify-firmware", dir),
+  terminalVerifyGsi: (file) => ipcRenderer.invoke("terminal:verify-gsi", file),
+  terminalUnlock: (confirm) => ipcRenderer.invoke("terminal:unlock", confirm),
+  terminalDiscover: (options) => ipcRenderer.invoke("terminal:discover", options),
+  terminalWirelessEnable: (port) => ipcRenderer.invoke("terminal:wireless-enable", port),
+  terminalWirelessConnect: (host, port) => ipcRenderer.invoke("terminal:wireless-connect", host, port),
+  terminalWirelessDisconnect: (host) => ipcRenderer.invoke("terminal:wireless-disconnect", host),
+  terminalToolchain: () => ipcRenderer.invoke("terminal:toolchain"),
+  terminalBuildApk: (options) => ipcRenderer.invoke("terminal:build-apk", options),
+  terminalInstallApk: (options) => ipcRenderer.invoke("terminal:install-apk", options),
+  /* Where the broadcast goes. The PineTab is not a station route - it is
+   * which page-side client stays quiet - so it lives here, not in the
+   * Broadcast picker's own values. */
+  pinetabWhere: () => ipcRenderer.invoke("pinetab:where"),
+  pinetabSend: (key) => ipcRenderer.invoke("pinetab:send", key),
+  /* Who is making the noise, and how loud on each device. */
+  terminalAudioTable: () => ipcRenderer.invoke("terminal-audio:table"),
+  terminalAudioSet: (id, patch) => ipcRenderer.invoke("terminal-audio:set", id, patch),
   /* #990: THE COPY BUTTON DID NOTHING.
    *
    * The window is loaded from file://, which is not a secure context, so

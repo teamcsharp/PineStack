@@ -1,0 +1,309 @@
+/* THE SCRIPT VIEW CARRIES ITS OWN PALETTE, for the reason sampler.css
+ * carries its own: these were var(--cyan) and friends, which exist in the
+ * Pine Box desktop's stylesheet and DO NOT exist in the station panel the
+ * tablet injects a view into. There, an undefined var() collapses to
+ * nothing and a lit button becomes near-black text on a transparent
+ * background - which reads as the control having vanished.
+ *
+ * Defining them on the host means this view looks the same wherever it is
+ * mounted; the fallbacks keep a host theme winning where it does define
+ * them. */
+#script, .sc-view {
+  --bg: #101419;
+  --panel: #1c242c;
+  --panel-2: #222b35;
+  --text: #edf3f5;
+  --muted: #8fa0ad;
+  --line: #35414c;
+  --green: #54d18b;
+  --amber: #e3be63;
+  --red: #e46b6b;
+  --cyan: #65c7da;
+}
+
+/* Two columns: the feed you tap, and the paperwork behind what you tapped.
+ * The right column scrolls; the left one scrolls independently, because
+ * reading a 9,000-character prompt must not lose your place in the feed. */
+.view.sc-view.active {
+  display: grid;
+  grid-template-columns: minmax(240px, 26%) 1fr;
+  gap: 14px;
+  padding: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* --------------------------------------------------------------- feed */
+
+.sc-left {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 0;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.sc-feed-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.sc-feed-head b { font-size: 14px; }
+.sc-tally { color: var(--muted); font-size: 10.5px; }
+
+.sc-feed { overflow-y: auto; min-height: 0; padding: 6px; }
+
+.sc-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "who tag" "text text";
+  gap: 2px 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  font-size: 12px;
+  line-height: 1.35;
+  cursor: pointer;
+}
+.sc-row + .sc-row { margin-top: 4px; }
+.sc-row b { grid-area: who; color: var(--cyan); font-weight: 600; }
+.sc-row em {
+  grid-area: tag; color: var(--muted); font-style: normal; font-size: 10.5px;
+}
+.sc-row span {
+  grid-area: text; color: var(--text);
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.sc-row:hover { border-color: var(--cyan); }
+.sc-row.playing b { color: var(--green); }
+.sc-row.playing { border-color: var(--green); }
+/* A sting keeps no paperwork, so it is drawn thin - but it is still
+ * tappable, because the pane saying "a sting has no provenance to keep"
+ * is a better answer than a row that ignores a finger. */
+.sc-row.thin { opacity: .5; }
+.sc-row.dead { opacity: .3; cursor: default; }
+.sc-row.picked { border-color: var(--cyan); background: #1b2a33; }
+
+/* -------------------------------------------------------------- right */
+
+.sc-right {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 0;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.sc-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.sc-head {
+  font-size: 12.5px; color: var(--text); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sc-modes { display: flex; gap: 6px; flex: none; }
+.sc-mode {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 11px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.sc-mode.on { color: #05131a; background: var(--cyan); border-color: var(--cyan); }
+.sc-mode.sc-act { color: var(--text); }
+.sc-mode, .sc-btn { -webkit-tap-highlight-color: transparent; }
+
+.sc-body { overflow-y: auto; min-height: 0; padding: 12px 14px; }
+
+.sc-note-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 7px 12px; border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+.sc-note { color: var(--muted); }
+.sc-note.bad { color: var(--red); }
+.sc-stagelabel { color: var(--amber); font-size: 10.5px; }
+
+/* ------------------------------------------------------------- blocks */
+
+.sc-block { margin: 0 0 14px 0; }
+.sc-block h4 {
+  margin: 0 0 5px 0; font-size: 11.5px; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--muted);
+}
+.sc-block pre {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font: 12px/1.5 ui-monospace, Consolas, monospace;
+  /* The prompt as sent is the thing the operator came here for, so it is
+   * never clipped - it wraps, and it scrolls inside its own box rather
+   * than stretching the page sideways. */
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 42vh;
+  overflow: auto;
+}
+.sc-block.sc-said pre { color: var(--cyan); font-size: 13px; }
+.sc-block.quiet pre { color: var(--muted); font-style: italic; }
+.sc-foot { margin: 5px 0 0 0; font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+.sc-foot.warn { color: var(--amber); }
+
+.sc-block.sc-fail pre { border-color: var(--amber); color: var(--amber); }
+.sc-block.sc-fail.unreachable pre,
+.sc-block.sc-fail.unknown pre { border-color: var(--red); color: var(--red); }
+
+/* ----------------------------------------------------------- stations */
+
+.sc-station {
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 6px;
+  padding: 8px 11px;
+  margin: 0 0 8px 0;
+  background: var(--panel-2);
+}
+.sc-station.lit { border-left-color: var(--cyan); }
+.sc-station.dark { border-left-color: var(--line); opacity: .68; }
+/* Amber, dashed: not empty, not broken - not answerable yet. */
+.sc-station.pending { border-left-color: var(--amber); border-style: dashed; }
+
+.sc-station-head { display: flex; align-items: baseline; gap: 8px; }
+.sc-n {
+  display: inline-block; min-width: 18px; text-align: center;
+  font: 600 10px ui-monospace, Consolas, monospace;
+  color: var(--muted);
+}
+.sc-station-head b { font-size: 12.5px; color: var(--text); }
+.sc-station.lit .sc-station-head b { color: var(--cyan); }
+.sc-station.pending .sc-station-head b { color: var(--amber); }
+.sc-station-head i { font-size: 10.5px; color: var(--muted); font-style: normal; }
+
+.sc-lead { margin: 5px 0 0 0; font-size: 12px; color: var(--text); }
+.sc-station ul { margin: 5px 0 0 0; padding-left: 18px; }
+.sc-station li { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+/* Material that actually reached the prompt against material that was
+ * merely staged nearby. This distinction is the whole value of the
+ * crystal and document lists, so it is the one thing the eye should get
+ * for free. */
+.sc-leaves li.on { color: var(--text); }
+.sc-leaves li.on::marker { color: var(--cyan); }
+.sc-leaves li.off { color: var(--muted); opacity: .7; }
+.sc-pending { margin: 6px 0 0 0; font-size: 10.5px; color: var(--amber); line-height: 1.5; }
+.sc-empty { margin: 5px 0 0 0; font-size: 10.5px; color: var(--muted); font-style: italic; }
+
+/* --------------------------------------------------------- transcript */
+
+.sc-transcript { margin: 8px 0 0 0; }
+.sc-turn {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "who when" "text text";
+  gap: 2px 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  cursor: pointer;
+}
+.sc-turn + .sc-turn { margin-top: 4px; }
+.sc-turn b { grid-area: who; font-size: 11.5px; color: var(--cyan); }
+.sc-turn em {
+  grid-area: when; font-style: normal; font-size: 10.5px; color: var(--muted);
+}
+.sc-turn span { grid-area: text; font-size: 12px; color: var(--text); line-height: 1.45; }
+.sc-turn.here { border-color: var(--green); cursor: default; }
+.sc-turn.here b { color: var(--green); }
+
+/* --------------------------------------------------------------- 3D */
+
+/* The stage takes the height it is given rather than a fixed one: the
+ * same scene has to be whole on a 32" monitor and on a 9" tablet in
+ * landscape, and the camera fit in script-stage.js does the rest. */
+.sc-stage {
+  width: 100%;
+  height: min(62vh, 620px);
+  min-height: 260px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: #04070b;
+}
+
+/* ------------------------------------------------------------- notes */
+
+.sc-notebox {
+  margin: 16px 0 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+.sc-notebox h4 {
+  margin: 0 0 7px 0; font-size: 11.5px; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--muted);
+}
+.sc-field {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 7px 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: 12px/1.5 system-ui, "Segoe UI", sans-serif;
+  resize: vertical;
+}
+.sc-field:focus { outline: none; border-color: var(--cyan); }
+
+.sc-notebar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sc-btn {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.sc-btn:hover { border-color: var(--cyan); }
+/* Visibly present, visibly not available, and the title says why. A
+ * hidden control leaves the operator hunting for a button that is not
+ * there; a live one that did nothing would be worse. */
+.sc-btn.off, .sc-btn:disabled {
+  opacity: .45; cursor: not-allowed; border-style: dashed;
+}
+.sc-btn.off:hover { border-color: var(--line); }
+
+/* A 9" tablet in landscape is about 1000x600 CSS px. Below that the feed
+ * and the pane stack rather than shrinking the prompt to a column of
+ * hyphens. */
+@media (max-width: 860px) {
+  .view.sc-view.active {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(120px, 28%) 1fr;
+  }
+}

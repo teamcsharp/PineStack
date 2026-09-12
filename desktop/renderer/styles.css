@@ -21,7 +21,10 @@ body {
   grid-template-columns: min(var(--rail-width, 260px), 35vw) 6px 1fr;
   background: var(--bg);
   color: var(--text);
-  font-family: Inter, Segoe UI, system-ui, sans-serif;
+  /* 'PineIcons' last: its unicode-range covers only the pictographs the
+     panel draws as icons, so it can never touch a letter of text. It turns
+     every one of them from a colour emoji into a single-colour vector. */
+  font-family: Inter, Segoe UI, system-ui, sans-serif, 'PineIcons';
   overflow: hidden;
 }
 
@@ -445,7 +448,7 @@ body.rail-compact .sched-list { display: none !important; }
   position: fixed; left: 0; right: 0; bottom: 0; height: 26px; z-index: 90;
   display: flex; align-items: center; gap: 10px; padding: 0 10px;
   background: #0a0f16; border-top: 1px solid var(--border, #2a3644);
-  font: 11px/1.2 ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font: 11px/1.2 ui-monospace, Consolas, "Cascadia Mono", monospace, 'PineIcons';
 }
 body { padding-bottom: 28px; }
 #sbTermLine {
@@ -487,7 +490,7 @@ body { padding-bottom: 28px; }
 #crystalPopup .cp-row input[type=range] { flex: 1; }
 #crystalPopup .cp-spacer { flex: 1; }
 #crystalPopup .cp-name { color: #f2dcff; }
-#crystalPopup .cp-pct { font: 11.5px ui-monospace, Consolas, monospace;
+#crystalPopup .cp-pct { font: 11.5px ui-monospace, Consolas, monospace, 'PineIcons';
   color: #c98fe0; min-width: 4ch; text-align: right; }
 #crystalPopup .cp-on { min-width: 64px; }
 #crystalPopup .cp-card.on .cp-on { border-color: #c98fe0; color: #f2dcff;
@@ -510,7 +513,7 @@ body { padding-bottom: 28px; }
 #crystalPopup .cp-md-name { overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }
 #crystalPopup .cp-md-n { text-align: right;
-  font: 11px ui-monospace, Consolas, monospace; color: #9b8fb8; }
+  font: 11px ui-monospace, Consolas, monospace, 'PineIcons'; color: #9b8fb8; }
 #crystalPopup .cp-md-read { padding: 1px 6px; }
 #crystalPopup .cp-mindnode > summary { list-style: none; }
 #crystalPopup .cp-mindnode > summary::-webkit-details-marker {
@@ -541,7 +544,7 @@ body { padding-bottom: 28px; }
 #crystalPopup .cp-obsconsole { flex: 0 0 92px; overflow: auto;
   border: 1px solid #1d3a2a; border-radius: 8px; padding: 5px 8px;
   background: #04070d; color: #7ce8a9; white-space: pre-wrap;
-  font: 10px ui-monospace, Consolas, monospace; line-height: 1.5; }
+  font: 10px ui-monospace, Consolas, monospace, 'PineIcons'; line-height: 1.5; }
 #crystalPopup .cp-obs { filter: grayscale(.4); }
 #crystalPopup .cp-siphon { flex: 0 0 auto; font-size: 12px;
   animation: sbPulse 1.6s ease-in-out infinite; }
@@ -550,7 +553,7 @@ body { padding-bottom: 28px; }
   border-radius: 20px; padding: 2px 8px; cursor: pointer; color: #8ba0b5; }
 #crystalPopup .cp-mind.in { border-color: #c98fe0; color: #f2dcff; }
 #crystalPopup .cp-mind i { font-style: normal; color: #5d6d7e;
-  font: 10.5px ui-monospace, Consolas, monospace; }
+  font: 10.5px ui-monospace, Consolas, monospace, 'PineIcons'; }
 #crystalPopup .cp-tint { width: 100%; }
 #crystalPopup .cp-chunks { overflow: auto; min-height: 120px; flex: 1;
   border: 1px solid var(--border, #2a3644); border-radius: 8px;
@@ -558,7 +561,7 @@ body { padding-bottom: 28px; }
 #crystalPopup .cp-chunk { border-bottom: 1px solid #1c2735;
   padding-bottom: 5px; white-space: pre-wrap; overflow-wrap: anywhere; }
 #crystalPopup .cp-file { color: #5d7189; display: block;
-  font: 10.5px ui-monospace, Consolas, monospace; }
+  font: 10.5px ui-monospace, Consolas, monospace, 'PineIcons'; }
 #crystalPopup .cp-mind i { cursor: pointer; }
 #crystalPopup .cp-mind i:hover { color: #f2dcff; }
 #crystalPopup .cp-back { margin-right: 2px; }
@@ -582,7 +585,7 @@ body { padding-bottom: 28px; }
   padding-bottom: 5px; white-space: pre-wrap;
   overflow-wrap: anywhere; cursor: pointer; }
 .cp-datawin .cp-file { color: #5d7189; display: block;
-  font: 10.5px ui-monospace, Consolas, monospace; }
+  font: 10.5px ui-monospace, Consolas, monospace, 'PineIcons'; }
 
 #crystalPopup .cp-srcgroup summary { cursor: pointer; color: #c98fe0;
   font-size: 11.5px; padding: 3px 0; user-select: none; }
@@ -651,7 +654,7 @@ body { padding-bottom: 28px; }
 #crystalPopup .cp-src-name { flex: 1; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
 #crystalPopup .cp-source i { font-style: normal; color: #5d6d7e;
-  font: 10.5px ui-monospace, Consolas, monospace; }
+  font: 10.5px ui-monospace, Consolas, monospace, 'PineIcons'; }
 #crystalPopup .cp-chunk.hot { border-left: 2px solid #f2dcff;
   padding-left: 6px; background: rgba(75, 29, 94, .3); }
 #crystalPopup .cp-chunk { cursor: pointer; }
@@ -692,7 +695,7 @@ body { padding-bottom: 28px; }
   display: flex; flex-direction: column;
   background: #03070c; border: 1px solid var(--border, #2a3644);
   border-radius: 8px; padding: 6px 10px 8px;
-  font: 11.5px/1.55 ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font: 11.5px/1.55 ui-monospace, Consolas, "Cascadia Mono", monospace, 'PineIcons';
   color: #9fd8b5; box-shadow: 0 10px 44px rgba(0, 0, 0, .7);
 }
 #sbTermPopup .sb-tabs { display: flex; gap: 4px; flex: 0 0 auto;
@@ -719,7 +722,7 @@ body { padding-bottom: 28px; }
   flex-wrap: wrap; }
 #samplePopup .sp-row input[type=text] { flex: 1; min-width: 0; }
 #samplePopup .sp-range { display: flex; gap: 6px; align-items: center;
-  font: 11.5px ui-monospace, Consolas, monospace; color: #9fd8b5; }
+  font: 11.5px ui-monospace, Consolas, monospace, 'PineIcons'; color: #9fd8b5; }
 #samplePopup .sp-bar { position: relative; height: 14px; background: #0a1118;
   border: 1px solid var(--border, #2a3644); border-radius: 4px;
   cursor: pointer; }
@@ -728,11 +731,11 @@ body { padding-bottom: 28px; }
 /* #838: the fetch loader — the hexagon assembling out of data streams,
    npx-style spinner bar under it. */
 #samplePopup .sp-hex { margin: 4px auto 0; padding: 8px 10px;
-  font: 12px/1.25 ui-monospace, Consolas, monospace; color: #9b8fe0;
+  font: 12px/1.25 ui-monospace, Consolas, monospace, 'PineIcons'; color: #9b8fe0;
   background: #05070d; border: 1px solid #2a2450; border-radius: 8px;
   text-shadow: 0 0 8px rgba(155, 143, 224, .45); white-space: pre;
   user-select: none; }
-#samplePopup .sp-hexbar { font: 11.5px ui-monospace, Consolas, monospace;
+#samplePopup .sp-hexbar { font: 11.5px ui-monospace, Consolas, monospace, 'PineIcons';
   color: #7ce8a9; text-align: center; white-space: pre; overflow: hidden;
   text-overflow: ellipsis; }
 #samplePopup .sp-batch { display: flex; flex-direction: column; gap: 5px;
@@ -870,7 +873,7 @@ body.rail-compact .threejs-list button span { display: none; }
 .drawer-body input[type="range"] { width: 100%; accent-color: var(--cyan); }
 #stDiagOut {
   white-space: pre-wrap;
-  font: 11px/1.5 Consolas, ui-monospace, monospace;
+  font: 11px/1.5 Consolas, ui-monospace, monospace, 'PineIcons';
   max-height: 180px;
   overflow-y: auto;
   margin: 8px 0 0;
@@ -1074,7 +1077,7 @@ webview { width: 100%; height: 100%; border: 0; background: #111; }
   padding: 16px;
   min-height: 100%;
   white-space: pre-wrap;
-  font: 12px/1.45 Consolas, ui-monospace, monospace;
+  font: 12px/1.45 Consolas, ui-monospace, monospace, 'PineIcons';
   color: #d9e1e5;
 }
 .settings-panel { max-width: 760px; margin: 18px; }
@@ -1241,7 +1244,7 @@ body.immersive main {
   border-radius: 7px;
   background: #03070c;
   color: #cfe8ef;
-  font: 12px/1.55 Consolas, ui-monospace, monospace;
+  font: 12px/1.55 Consolas, ui-monospace, monospace, 'PineIcons';
   white-space: pre-wrap;
 }
 
@@ -1837,3 +1840,43 @@ body.slides-dragging webview { pointer-events: none; }
 }
 .mark.stale { animation: pineStaleMark 2s ease-out infinite;
   border-radius: 8px; }
+
+/* WHO IS PLAYING THE SHOW.
+ *
+ * Route says where the station sends a stream; this says which of the pages
+ * receiving it is actually the room. Both this app and the tablet are
+ * page-side clients, so without it the show plays twice, a few hundred
+ * milliseconds apart - which is what "a different broadcast coming out of
+ * the application than out of the Pine Box tab" is. #1008 on the station.
+ */
+.players { margin-top: 10px; }
+.players-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); margin-bottom: 5px;
+}
+.players-head b { text-transform: none; letter-spacing: 0; font-size: 11px; }
+.players-head b.good { color: var(--green, #58c184); }
+.players-head b.bad { color: var(--red, #e46b6b); }
+.player {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; margin-bottom: 4px; padding: 6px 8px;
+  background: transparent; border: 1px solid var(--line);
+  border-radius: 6px; color: inherit; cursor: pointer;
+  text-align: left; font: inherit;
+}
+.player:hover { border-color: var(--muted); }
+/* The one making the noise. Solid, so it reads across the room. */
+.player.owns { border-color: var(--green, #58c184); background: rgba(88, 193, 132, .08); }
+.player i { font-style: normal; width: 14px; color: var(--muted); }
+.player.owns i { color: var(--green, #58c184); }
+.player b { font-size: 12px; font-weight: 600; flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.player span { font-size: 10px; color: var(--muted); flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+
+/* A destination that is not open. Dimmed rather than hidden: "the PineTab is
+   not open" is information the operator needs, and a device that vanishes
+   from the list looks like a bug in the list. */
+.player.away { opacity: .45; cursor: default; }
+.player.away:hover { border-color: var(--line); }

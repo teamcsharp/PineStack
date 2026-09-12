@@ -7,7 +7,36 @@
        overrides the BrowserWindow `title` option the moment the
        document loads, so the application is named here too. -->
   <title>Pine Box</title>
+  <!-- Every icon in this window is a single-colour vector, not a colour
+       emoji. pineicons.css carries the font inline as a data: URI, so it
+       loads off disk with no network and no second request; its
+       unicode-range confines it to pictographs, so appending 'PineIcons'
+       to a font stack cannot change one letter of text.
+       Both files are built by tools/icons_build.py - do not hand-edit. -->
+  <link rel="stylesheet" href="./pineicons.css">
   <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./sampler.css">
+  <link rel="stylesheet" href="./script.css">
+  <!-- Listen and Music share one stylesheet: two arrangements of the same
+       components, so one palette and one breakpoint between them. Like
+       sampler.css it defines its own tokens on its own hosts, because
+       these views are also injected into the station panel on the tablet,
+       where the desktop's --cyan and friends do not exist. -->
+  <link rel="stylesheet" href="./boot-splash.css">
+  <link rel="stylesheet" href="./view-chrome.css">
+  <link rel="stylesheet" href="./console-trace.css">
+  <link rel="stylesheet" href="./lock.css">
+  <link rel="stylesheet" href="./vote-arrows.css">
+  <link rel="stylesheet" href="./line-actions.css">
+  <link rel="stylesheet" href="./three-full.css">
+  <link rel="stylesheet" href="./busy.css">
+  <link rel="stylesheet" href="./script-page.css">
+  <link rel="stylesheet" href="./listen-music.css">
+  <link rel="stylesheet" href="./terminal.css">
+  <link rel="stylesheet" href="./presentation.css">
+  <!-- The SVG sprite, for icon-only buttons that need a real <svg> with an
+       aria-label rather than a bare character. -->
+  <script src="./pine-icons.js"></script>
 </head>
 <!-- agent-down until the first health check proves otherwise: the compact
      rail's mark ring is the only state indicator, and it must not open green
@@ -121,10 +150,39 @@
         <span>Monitor here</span>
       </label>
       <audio id="desktopRadioPlayer" class="desktop-radio" controls preload="auto"></audio>
+
+      <!-- WHICH DEVICE IS THE ROOM.
+           Route says where the station SENDS each stream; "App" and "Web
+           page" are both page-side, and this desktop and the tablet are
+           both page-side clients - so routing to a page plays the show in
+           two rooms at once, a few hundred milliseconds apart. This lists
+           every page that is currently receiving it and hands the air to
+           one of them (#1008 /api/radio/solo); everything else gags
+           itself. The same list is in the tablet's drawer, off the same
+           two documents, so the two cannot disagree. -->
+      <div class="players" id="playersBox">
+        <div class="players-head">
+          <span>Playing it</span>
+          <b id="playersState"></b>
+        </div>
+        <div id="playersList"></div>
+        <p class="muted" id="playersNote"></p>
+      </div>
     </section>
     <nav class="tabs" aria-label="Desktop views">
       <button class="tab active" data-view="control" title="Full Pine Box Agent">#<span>Agent</span></button>
       <button class="tab" data-view="radio" title="Radio player">&gt;<span>Radio</span></button>
+      <!-- Listen and Music sit beside Radio because that is the group they
+           belong to, not with the instruments further down. Radio is the
+           station's own web player in a frame; these two are the terminal's
+           own views of the same broadcast, built once in this renderer so
+           the tablet's WebView gets them too. Neither opens an audio
+           stream - the shell owns the player (app.py:154643, ONE
+           DESTINATION) and these read the clock and move the level. -->
+      <button class="tab" id="listenTabBtn" data-view="listen"
+              title="Listen - the station lean-back: what is on, what is next, the gallery behind it, a sleep timer, and one tap to keep the moment">◐<span>Listen</span></button>
+      <button class="tab" id="musicTabBtn" data-view="music"
+              title="Music - the queue, what just played, the shelf to ask from, and the running order for the next two hours">♪<span>Music</span></button>
       <button class="tab" data-view="system2" title="Hourly plans, scripts and line diagnostics">2<span>System2</span></button>
       <!-- #1073: the scheduler's controls, dropped under the rail - which
            engine writes the hour and its dials. Compact rail: the same
@@ -143,14 +201,26 @@
               title="The station — public broadcast, the DJs, troubleshooting">○<span>Station</span></button>
       <button class="tab" id="sampleTabBtn"
               title="Add sample — paste a link, clip moments into the DJs' rotation">🎬<span>Sample</span></button>
+      <button class="tab" id="terminalTabBtn" data-view="terminal"
+              title="Terminal - survey, verify and provision a Pine Box tablet over USB">□<span>Terminal</span></button>
+      <button class="tab" id="samplerTabBtn" data-view="sampler"
+              title="Sampler - drag moments off the air onto sixteen pads and play them back from here">▦<span>Sampler</span></button>
+      <button class="tab" id="presentationTabBtn" data-view="presentation"
+              title="Presentation - the station on a wall: playlist, running order, the script following itself, the feed, the gallery and the video wall">▤<span>Present</span></button>
+      <button class="tab" id="scriptTabBtn" data-view="script"
+              title="Script - tap a line in the feed and see how that moment came to be: the prompt as sent, the script that came back, and every system that fed them">✎<span>Script</span></button>
       <button class="tab" id="callInBtn"
               title="Call the booth — hold to talk, let go and you are on air with the DJs">☎<span>Call in</span></button>
       <button class="tab" id="lcdBtn"
               title="LCD — find USB or Wi-Fi displays; switch Quanta avatars and Pine Box">▣<span>LCD</span></button>
     </nav>
     <div class="rail-actions">
-      <button id="wakeBtn" class="wake-btn"
-              title="Wake words — what the box listens for after the button: turn them off, add new ones, remove them">🗣</button>
+      <!-- Icon-only controls carry the icon as a real <svg> from the sprite
+           and name themselves with aria-label: the glyph is not a word, so
+           without it the button has nothing to announce. -->
+      <button id="wakeBtn" class="wake-btn" aria-label="Wake words"
+              data-pine-icon="c:user--speaker"
+              title="Wake words — what the box listens for after the button: turn them off, add new ones, remove them"></button>
       <button id="launchBtn">Launch</button>
       <button id="attachBtn">Attach</button>
     </div>
@@ -205,8 +275,9 @@
       <!-- #968: the booth, from the marquee. The transcript window lives
            inside the control panel, so this reaches into that frame and
            toggles it - the same door the panel's own header opens. -->
-      <button id="dxBoothBtn" class="dx-booth"
-              title="Show or hide the In the booth window - every line as it airs, with play and download on each">🎙</button>
+      <button id="dxBoothBtn" class="dx-booth" aria-label="In the booth"
+              data-pine-icon="c:microphone"
+              title="Show or hide the In the booth window - every line as it airs, with play and download on each"></button>
       <button id="dxSelling" class="dx-selling" style="display:none"
               title="What the station is selling right now — click to hold it up big">
         <img id="dxSellingArt" alt="">
@@ -381,6 +452,32 @@
         </div>
       </section>
     </section>
+    <!-- The Terminal provisioner. Built on first visit by terminal.js. -->
+    <section id="terminal" class="view tm-view"></section>
+
+    <!-- The Sampler. Built on first visit by sampler.js, so an unopened
+         view costs neither a decode nor a subscription to the feed. -->
+    <section id="sampler" class="view pb-sampler"></section>
+
+    <!-- The Presentation view: six panes off ONE poll. Built on first
+         visit by presentation.js, so an unopened wall subscribes to
+         nothing and asks the station nothing. -->
+    <section id="presentation" class="view pv-view"></section>
+
+    <!-- The Script view. Built on first visit by script.js. Stage 1: the
+         paperwork behind a line that is still in the booth ring, fetched
+         once on the tap. It adds no poller - the feed on its left is the
+         shared PineStationFeed, and the pane itself never polls at all. -->
+    <section id="script" class="view sc-view"></section>
+
+    <!-- Listen and Music. Both built on first visit, both subscribing to
+         the ONE shared feed and nothing else - measured 2026-09-11, 38
+         concurrent requests to the station stalled the tablet's media for
+         46 seconds, so an unopened view here must cost exactly nothing
+         and an opened one must cost one subscription. -->
+    <section id="listen" class="view pb-listen"></section>
+    <section id="music" class="view pb-music"></section>
+
     <!-- #1043b: the endless press. The webview is left without a src
          until the split is opened, and pointed back at about:blank
          when it closes, so nothing scrolls in the dark. -->
@@ -483,12 +580,15 @@
     <div id="sbTermLine"
          title="Everything the Spark is running — click for the live terminal">booting…</div>
     <div id="sbRight">
-      <button id="crystalBtn"
-              title="Crystals — click to let the active crystal tint the whole universe of Pine Box FM; click again to lift it">🔮</button>
-      <button id="sampleBtn"
-              title="Add sample — paste a link (or Ctrl+V one over this button), watch it, cut moments into the DJs' rotation">🎬</button>
-      <button id="sbLiveBtn"
-              title="Go LIVE — mint a public listen link for the station">📡</button>
+      <button id="crystalBtn" aria-label="Crystals"
+              data-pine-icon="c:gem"
+              title="Crystals — click to let the active crystal tint the whole universe of Pine Box FM; click again to lift it"></button>
+      <button id="sampleBtn" aria-label="Add sample"
+              data-pine-icon="m:movie"
+              title="Add sample — paste a link (or Ctrl+V one over this button), watch it, cut moments into the DJs' rotation"></button>
+      <button id="sbLiveBtn" aria-label="Go live"
+              data-pine-icon="c:satellite"
+              title="Go LIVE — mint a public listen link for the station"></button>
       <div id="sbMarquee"><span id="sbMarqueeInner"></span></div>
     </div>
   </footer>
@@ -501,6 +601,77 @@
 
   <script src="./renderer.js"></script>
   <script src="./lcd-dialogue.js"></script>
+  <script src="./terminal.js"></script>
+  <script src="./sampler-engine.js"></script>
+  <script src="./sampler-feed.js"></script>
+  <script src="./sampler.js"></script>
+  <script src="./sampler-trim.js"></script>
+  <!-- THE TERMINAL VIEWS, IN THE APP TOO.
+       "I wanna be able to access all of these views, these tabs, the
+       interface, and continue refining it with you in the application
+       itself even when I'm not using the Pinebox tab."
+
+       These were written for the tablet and only ever loaded there, so the
+       desktop had Listen, Music, Script and Presentation but none of the
+       furniture around them - no view rail, no console strip, no trace
+       popup, no talk dot, no audio law. Same files, same order as the
+       tablet's bundle (ViewAssets.kt), because the order is load-bearing:
+       a view's model must be evaluated before the view that reads it, and
+       rail.js goes last because it looks for all of the globals above. -->
+  <script src="./pine-logo.js"></script>
+  <script src="./boot-splash.js"></script>
+  <script src="./pine-dismiss.js"></script>
+  <script src="./view-chrome.js"></script>
+  <script src="./console-line.js"></script>
+  <script src="./console-trace.js"></script>
+  <script src="./audio-law.js"></script>
+  <script src="./talk-dot.js"></script>
+  <script src="./pine-meters.js"></script>
+  <script src="./wall-transition.js"></script>
+  <!-- Listen and Music. The model goes first: both views read it, and
+       sampler.js's one-tap grab asks it for the next free pad. It carries
+       no DOM and no timers, which is what lets node:test exercise the
+       clock-skew arithmetic without a browser. -->
+  <!-- The up and down arrows, mounted on every player. -->
+  <script src="./vote-arrows.js"></script>
+  <script src="./listen-model.js"></script>
+  <script src="./listen.js"></script>
+  <script src="./music.js"></script>
+  <script src="./video-wall.js"></script>
+  <script src="./presentation-source.js"></script>
+  <script src="./presentation.js"></script>
+  <!-- The Script view. script-lineage.js is the part with the tests
+       (tests/test_script_view_2026_09_11.cjs); script-stage.js loads
+       three.js itself, on the view's first open. -->
+  <script src="./script-lineage.js"></script>
+  <script src="./script-stage.js"></script>
+  <script src="./script.js"></script>
+  <script src="./script-page.js"></script>
+  <!-- Last: it looks for every global above and welds the tab rail on. -->
+  <script src="./busy.js"></script>
+  <script src="./three-full.js"></script>
+  <script src="./line-deep.js"></script>
+  <script src="./line-actions.js"></script>
+  <script src="./lock.js"></script>
+  <script src="./rail.js"></script>
+  <!-- THE STARTUP ASSEMBLY. The tablet gets this from rail.js when the
+       rail goes up; the desktop has no rail boot step of its own, so it is
+       kicked here. Guarded by the same flag, so a build that ends up with
+       both roads still only ever plays it once. -->
+  <script>
+    (function () {
+      var go = function () {
+        if (!window.PineBootSplash || !window.__pineLogo) return;
+        if (window.__pineSplashShown) return;
+        window.__pineSplashShown = true;
+        try { window.PineBootSplash.show({src: window.__pineLogo}); }
+        catch (err) { /* decoration must never stop the app */ }
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', go);
+      } else { go(); }
+    })();
+  </script>
   <script src="./lcd-frame.js"></script>
   <script src="./lcd-controls.js"></script>
   <script src="./lcd-gallery.js"></script>

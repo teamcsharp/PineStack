@@ -718,7 +718,7 @@
     const shade = node('div'); shade.id = 'pineLcdPanel';
     shade.style.cssText = 'position:fixed;inset:0;background:#02080ce8;z-index:720;display:grid;place-items:center;padding:18px';
     const card = node('section'); card.tabIndex = -1;
-    card.style.cssText = 'background:#101e29;border:1px solid #3e687b;border-radius:12px;padding:18px;width:min(860px,96vw);max-height:94vh;overflow:auto;color:#e5eff5;font:13px/1.5 sans-serif';
+    card.style.cssText = 'background:#101e29;border:1px solid #3e687b;border-radius:12px;padding:18px;width:min(860px,96vw);max-height:94vh;overflow:auto;color:#e5eff5;font:13px/1.5 sans-serif,PineIcons';
     const heading = node('div'); heading.style.cssText = 'display:flex;justify-content:space-between;align-items:center';
     heading.appendChild(node('h2', 'Pine Box LCD'));
     const close = node('button', 'Close'); close.onclick = () => { shade.remove(); panel = null; }; heading.appendChild(close); card.appendChild(heading);

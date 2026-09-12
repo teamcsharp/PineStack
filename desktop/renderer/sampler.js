@@ -1,0 +1,1109 @@
+/* The Sampler - the station played back as an instrument.
+ *
+ * The station makes audio the operator likes and then loses it to air.
+ * This is the net: drag a moment out of the live feed onto a pad and it is
+ * DOWNLOADED to this machine, decoded once, and held resident. From then on
+ * the pad plays it locally with no round trip and no broadcast involvement -
+ * which is also the only way it can still work in 48 hours, because the
+ * station sweeps its own media after that (AIRLOG_KEEP_S) and a pad that
+ * pointed at a line id rather than holding bytes would simply go dead.
+ *
+ * Audio never happens in here. Everything goes through window.pineSampler,
+ * which is Web Audio on the desktop and native Oboe on the tablet.
+ */
+(function (root) {
+  "use strict";
+
+  const BANKS = 5;
+  const PADS = 16;
+  const DB_NAME = "pinebox-sampler";
+  const DB_STORE = "pads";
+
+  const api = () => root.pineDesktop;
+  const engine = () => root.pineSampler;
+
+  let config = null;
+  let bank = 0;
+  let selected = 0;
+  let layout = [];              /* layout[bank][pad] = meta | null */
+  let unsubscribe = null;
+  let mounted = false;
+  let feedRows = [];
+  let grabWhole = false;        /* the line, or the whole welded round */
+
+  const modes = {
+    poly: true, gate: false, full: false,
+    sixteen: false, repeat: false, division: 4, bpm: 90
+  };
+
+  const held = new Map();       /* padIndex -> {voiceId, repeatTimer} */
+  let tapTimes = [];
+
+  const el = (id) => document.getElementById(id);
+  const padKey = (b, p) => b + ":" + p;
+
+  function blank() {
+    return Array.from({ length: BANKS }, () => new Array(PADS).fill(null));
+  }
+
+  /* ---------------------------------------------------------------- store */
+  /* Bytes live in IndexedDB rather than on the filesystem so the same code
+   * runs unchanged in a plain browser tab; the tablet swaps this half for
+   * Room + a PCM cache. The ORIGINAL compressed bytes are what we keep - a
+   * spoken line is mono 24 kHz, so a typical one is 25-70 KB. */
+
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function dbPut(key, value) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, "readwrite");
+      tx.objectStore(DB_STORE).put(value, key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function dbGet(key) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, "readonly");
+      const request = tx.objectStore(DB_STORE).get(key);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function dbDelete(key) {
+    const db = await openDb();
+    return new Promise((resolve) => {
+      const tx = db.transaction(DB_STORE, "readwrite");
+      tx.objectStore(DB_STORE).delete(key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    });
+  }
+
+  function saveLayout() {
+    try { localStorage.setItem("pineSamplerLayout", JSON.stringify(layout)); }
+    catch (err) { /* a full quota must not stop the pad from sounding */ }
+  }
+
+  function loadLayout() {
+    try {
+      const raw = localStorage.getItem("pineSamplerLayout");
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (Array.isArray(parsed) && parsed.length === BANKS) return parsed;
+    } catch (err) { /* fall through to a clean set of banks */ }
+    return blank();
+  }
+
+  /* ------------------------------------------------------------- fetching */
+
+  function absolute(url) {
+    const path = String(url || "");
+    if (/^https?:/i.test(path)) return path;
+    return String(config.baseUrl).replace(/\/+$/, "") + path;
+  }
+
+  /* Reads are open on this station today (SPARK_AGENT_LOCK_READS is unset),
+   * so these URLs answer with no header at all. The bearer goes on anyway:
+   * the day someone locks reads, /api/booth/clip is the ONE audio route
+   * with no ?t= signature fallback, so it would be the first thing to break. */
+  /* MEASURED, and it shapes the whole feel of this screen: the same clip
+   * came back in 1,099 ms once and 13,540 ms the next time. That is not a
+   * cold cache - it is STATION LOAD. The box is a live radio station
+   * writing and recording audio, and a cut queues behind that work.
+   *
+   * Nothing here can make it faster. What it can do is never look broken
+   * while it waits, never block another grab, and give up with a sentence
+   * rather than hanging forever. */
+  const FETCH_CEILING = 90000;
+
+  async function fetchBytes(url) {
+    const headers = config.apiKey ? { Authorization: "Bearer " + config.apiKey } : {};
+    const response = await fetch(absolute(url), {
+      headers,
+      signal: AbortSignal.timeout ? AbortSignal.timeout(FETCH_CEILING) : undefined
+    });
+    if (!response.ok) {
+      throw new Error("The station could not provide that sample (HTTP "
+        + response.status + ").");
+    }
+    const type = response.headers.get("content-type") || "";
+    if (!/^audio\//i.test(type) && !/^application\/octet-stream/i.test(type)) {
+      throw new Error("That was not audio.");
+    }
+    return {
+      bytes: await response.arrayBuffer(),
+      type,
+      /* X-Pine-Exact 0 means we were handed the surrounding moment or a near
+       * miss rather than this row alone; X-Pine-Cut says so in prose. The pad
+       * shows it, because "that is not the bit I wanted" should be visible
+       * before it goes to air, not after. */
+      exact: response.headers.get("x-pine-exact") === "1",
+      cut: response.headers.get("x-pine-cut") || ""
+    };
+  }
+
+  /* CAN THIS ROW BE TAKEN, AND FROM WHERE?
+   *
+   * The LCD asks a different question - "has this been on air?" - and the
+   * sampler inherited its answer, which was badly wrong here. Measured
+   * against the live station: of 240 rows in the ring, only SEVEN were
+   * `aired`, but 212 carried `clip_media`/`clip_sig` (the welded round they
+   * sit in) and 23 carried `media`/`sig` (their own recorded take). The
+   * sampler was offering 7 of ~220 takeable moments.
+   *
+   * A line that is recorded and waiting has audio on disk. That it has not
+   * reached the air yet is no reason the operator cannot have it - it is
+   * arguably the most interesting time to grab one.
+   *
+   * Order matters: prefer the most exact cut available.
+   *   1. a sting carries its own signed url - no round trip at all
+   *   2. an advert is produced whole
+   *   3. /api/booth/clip cuts THIS turn out of the welded round, which is
+   *      better than the whole round, and the station caches the cut
+   *   4. a row with only its own take is fetched directly
+   */
+  function sourceFor(row) {
+    if (!row) return null;
+    if (row.sfx && row.url) return { url: row.url, kind: "sfx", exactish: true };
+    if (row.url && !row.text) return { url: row.url, kind: "media", exactish: true };
+
+    const line = "/api/booth/clip?line=" + encodeURIComponent(row.id)
+      + (grabWhole ? "&whole=1" : "");
+
+    /* The clip route can cut it: either the turn's own span out of the
+     * welded round, or the row's own media, or an advert. */
+    if (row.clip_media && row.clip_sig) return { url: line, kind: "round" };
+    if (row.ad_audio) return { url: line, kind: "advert" };
+    if (row.media && row.sig) {
+      /* When asked for the whole moment there is nothing wider than the
+       * take itself, so go straight to the file and skip the cut. */
+      return grabWhole
+        ? { url: "/media/" + encodeURIComponent(row.media)
+              + "?t=" + encodeURIComponent(row.sig), kind: "take", exactish: true }
+        : { url: line, kind: "take" };
+    }
+    if (["box", "stream", "both", "airing"].indexOf(String(row.aired)) >= 0) {
+      return { url: line, kind: "line" };
+    }
+    return null;
+  }
+
+  /* Shown greyed rather than hidden: "why is that not here" is a worse
+   * question than "why is that greyed out". */
+  function takeable(row) { return !!sourceFor(row); }
+
+  /* Why the last import failed, in prose, for a caller that cannot see
+   * #pbNote. Read immediately after the await that returned null; grab()
+   * below is the only reader and it serialises itself so two grabs can
+   * never interleave over this one slot. */
+  let lastImportWhy = "";
+
+  async function importRow(row, targetBank, targetPad) {
+    lastImportWhy = "";
+    const key = padKey(targetBank, targetPad);
+    const cell = el("pad-" + targetPad);
+    /* A pad that just sits there is indistinguishable from a pad that has
+     * failed. Count up on its face so the wait is legibly a wait - and it
+     * can be a long one, so this is not decoration. */
+    let ticker = 0;
+    if (cell) {
+      cell.classList.add("loading");
+      const label = cell.querySelector(".pb-pad-label");
+      const sub = cell.querySelector(".pb-pad-sub");
+      if (label) label.textContent = (row.text || row.name || "take").slice(0, 60);
+      const began = Date.now();
+      const tick = () => {
+        if (sub) sub.textContent = "fetching… " + Math.round((Date.now() - began) / 1000) + "s";
+      };
+      tick();
+      ticker = setInterval(tick, 1000);
+    }
+    try {
+      const source = sourceFor(row);
+      if (!source) throw new Error("There is no audio behind that line yet.");
+      const got = await fetchBytes(source.url);
+      await dbPut(key, { bytes: got.bytes, type: got.type });
+      const meta = {
+        label: (row.text || row.name || row.who || "take").slice(0, 90),
+        who: row.name || row.who || "",
+        kind: source.kind,
+        srcId: row.id || "",
+        exact: got.exact,
+        cut: got.cut,
+        at: Date.now(),
+        gain: 1, pitch: 1, loop: false, reverse: false, trim: null, choke: ""
+      };
+      await engine().load(key, got.bytes);
+      meta.seconds = engine().seconds(key);
+      layout[targetBank][targetPad] = meta;
+      saveLayout();
+      paintPads();
+      note(meta.exact
+        ? "Pad " + (targetPad + 1) + " - " + meta.seconds.toFixed(2) + "s"
+        : "Pad " + (targetPad + 1) + " - " + (meta.cut || "not an exact cut"));
+      /* Handed back so a caller OUTSIDE this view can say what happened.
+       * note() writes into #pbNote, which lives in the sampler host - and
+       * the Listen view's one-tap grab fires while the sampler is not on
+       * screen, so its operator would never see a word of it. */
+      return meta;
+    } catch (err) {
+      const why = err && err.name === "TimeoutError"
+        ? "The station did not answer in time - it is busy making the show. Try that one again."
+        : (err.message || String(err));
+      note("Pad " + (targetPad + 1) + " - " + why, true);
+      lastImportWhy = why;
+      /* Leave nothing half-written on the pad. */
+      if (!layout[targetBank][targetPad]) {
+        const label = cell && cell.querySelector(".pb-pad-label");
+        const sub = cell && cell.querySelector(".pb-pad-sub");
+        if (label) label.textContent = "";
+        if (sub) sub.textContent = "";
+      }
+    } finally {
+      if (ticker) clearInterval(ticker);
+      if (cell) cell.classList.remove("loading");
+    }
+  }
+
+  /* ONE-TAP GRAB, FOR A VIEW THAT HAS NO DRAG.
+   *
+   * The Listen view is lean-back: no feed list to drag from, no pad to
+   * drop on, one button that means "keep that". It must not grow its own
+   * copy of any of this - sourceFor() is the only place that knows where
+   * a row's audio lives, and a second opinion about it would rot the
+   * moment the station changes.
+   *
+   * Two things this has to do that a drag does not:
+   *
+   *   1. MOUNT. The sampler is built on first visit so an unopened view
+   *      costs neither a decode nor a feed subscription - which means
+   *      config is null and layout is [] until then, and importRow would
+   *      throw on the first of those. A grab from elsewhere builds the
+   *      view (into the hidden #sampler host) before it takes anything.
+   *   2. SPEAK FOR ITSELF. Every message importRow writes goes to #pbNote
+   *      inside a view the operator is not looking at, so the outcome
+   *      comes back as a value instead.
+   *
+   * Serialised on purpose: a second tap while a clip is still coming down
+   * is answered with "still fetching" rather than queued. The measured
+   * fetch for one clip ranged from 1.1 s to 13.5 s against a busy
+   * station, and two of them racing for "the next free pad" would both
+   * pick the same one. */
+  let grabbing = false;
+
+  async function grab(row) {
+    if (!row) return {ok: false, why: "there is nothing to take."};
+    if (grabbing) return {ok: false, why: "still fetching the last one."};
+    grabbing = true;
+    try {
+      if (!mounted) {
+        const host = document.getElementById("sampler");
+        if (!host) {
+          return {ok: false, why: "the sampler is not on this page."};
+        }
+        await mount(host);
+      }
+      if (!sourceFor(row)) {
+        return {ok: false, why: "there is no audio behind that line yet."};
+      }
+      const free = root.PineListenModel
+        ? root.PineListenModel.firstFreePad(layout, bank)
+        : null;
+      if (!free) {
+        return {ok: false,
+          why: "every pad in every bank is full - clear one first."};
+      }
+      const meta = await importRow(row, free.bank, free.pad);
+      if (!meta) {
+        return {ok: false, why: lastImportWhy || "the station would not cut it."};
+      }
+      return {ok: true, bank: free.bank, pad: free.pad, meta,
+        why: "bank " + (free.bank + 1) + ", pad " + (free.pad + 1)};
+    } catch (err) {
+      return {ok: false, why: (err && err.message) || String(err)};
+    } finally {
+      grabbing = false;
+    }
+  }
+
+  /* Bring a bank's bytes back off disk and into the engine, so a pad is
+   * instant the moment the app opens rather than on its first press. */
+  async function preload(which) {
+    const jobs = [];
+    for (let p = 0; p < PADS; p += 1) {
+      const meta = layout[which][p];
+      if (!meta) continue;
+      const key = padKey(which, p);
+      if (engine().loaded(key)) { applySettings(key, meta); continue; }
+      jobs.push(dbGet(key).then(async (record) => {
+        if (!record || !record.bytes) return;
+        try {
+          await engine().load(key, record.bytes);
+          applySettings(key, meta);
+        } catch (err) { /* one bad pad never stops the bank */ }
+      }));
+    }
+    await Promise.all(jobs);
+    paintPads();
+  }
+
+  function applySettings(key, meta) {
+    engine().set(key, {
+      gain: meta.gain == null ? 1 : meta.gain,
+      pitch: meta.pitch == null ? 1 : meta.pitch,
+      loop: !!meta.loop, reverse: !!meta.reverse,
+      trim: meta.trim || null, choke: meta.choke || ""
+    });
+  }
+
+  /* -------------------------------------------------------------- playing */
+
+  /* The M9 reports no usable pressure, and neither does a mouse. Vertical
+   * position inside the pad is the honest stand-in: strike high for loud. */
+  function velocityFrom(event, element) {
+    if (modes.full) return 1;
+    const box = element.getBoundingClientRect();
+    const y = (event.clientY - box.top) / Math.max(1, box.height);
+    return Math.max(0.25, Math.min(1, 1 - (y * 0.75)));
+  }
+
+  /* 16 Level: one sample across the whole grid. Tune is the default
+   * parameter, so the pads play it chromatically, low at pad 1. */
+  function sixteenPitch(index) {
+    return Math.pow(2, (index - 8) / 12);
+  }
+
+  function repeatInterval() {
+    const beat = 60 / Math.max(20, Math.min(300, modes.bpm));
+    return (beat * 4 / Math.max(1, modes.division)) * 1000;
+  }
+
+  function press(index, event) {
+    const audio = engine();
+    if (!audio) return;
+    const element = el("pad-" + index);
+    const sourceIndex = modes.sixteen ? selected : index;
+    const key = padKey(bank, sourceIndex);
+    if (!audio.loaded(key)) return;
+
+    const options = {
+      velocity: velocityFrom(event, element),
+      gate: modes.gate,
+      pitch: modes.sixteen ? sixteenPitch(index) : undefined
+    };
+
+    const fire = () => audio.fire(key, options);
+    const voiceId = fire();
+    const record = { voiceId, repeatTimer: null };
+    if (modes.repeat) {
+      record.repeatTimer = setInterval(() => {
+        const previous = held.get(index);
+        if (previous && previous.voiceId && modes.gate) audio.release(previous.voiceId);
+        const next = fire();
+        if (previous) previous.voiceId = next;
+      }, repeatInterval());
+    }
+    held.set(index, record);
+    if (element) element.classList.add("lit");
+    if (!modes.sixteen) select(index);
+  }
+
+  function lift(index) {
+    const record = held.get(index);
+    held.delete(index);
+    const element = el("pad-" + index);
+    if (element) element.classList.remove("lit");
+    if (!record) return;
+    if (record.repeatTimer) clearInterval(record.repeatTimer);
+    if (modes.gate && record.voiceId) engine().release(record.voiceId);
+  }
+
+  function select(index) {
+    selected = index;
+    document.querySelectorAll(".pb-pad").forEach((element) => {
+      element.classList.toggle("selected", Number(element.dataset.pad) === index);
+    });
+  }
+
+  /* ---------------------------------------------------------------- chop */
+
+  /* CHOP IS NOT A MODE, AND THAT WAS THE BUG.
+   *
+   * "On the sampler, I am stuck in chop mode. I need the ability to exit
+   * chop mode and go back to general sampler mode."
+   *
+   * There never was a chop mode to be in. CHOP is one destructive action:
+   * it takes the selected pad and writes sixteen slices of it across the
+   * whole bank, over whatever was there. But it sat in the row of toggles
+   * wearing the same button as POLY and GATE, so it READ as a mode - and
+   * once every pad said "[3/16]" there was no way back, which is exactly
+   * what being stuck in a mode feels like.
+   *
+   * Two things fix it, and both are needed:
+   *
+   *   1. The bank is snapshotted first, so a second press puts it back.
+   *      A destructive action with no undo does not belong under a thumb.
+   *   2. The button says what it will do next - CHOP, then UNCHOP - and is
+   *      drawn as an action rather than a toggle, so it never again looks
+   *      like a state the sampler is sitting in.
+   *
+   * The snapshot holds the bytes, not just the labels: the chop overwrites
+   * the other pads' records in the store, so a layout-only undo would
+   * restore fifteen names in front of the wrong audio. */
+  let chopUndo = null;
+
+  /* Is this bank chopped RIGHT NOW?
+   *
+   * Read off the layout rather than remembered, because a remembered answer
+   * is gone after a reload and the operator is still looking at sixteen
+   * slices. Two or more pads carrying choke "chop" is the signature the
+   * chop itself writes, and nothing else writes it. */
+  function choppedBank(which) {
+    const rows = layout[which] || [];
+    const slices = [];
+    for (let p = 0; p < PADS; p += 1) {
+      const meta = rows[p];
+      if (meta && meta.choke === "chop") slices.push(p);
+    }
+    return slices.length > 1 ? slices : null;
+  }
+
+  function chopping() {
+    if (chopUndo && chopUndo.bank === bank) return true;
+    return !!choppedBank(bank);
+  }
+
+  async function snapshotBank(which) {
+    const shot = {bank: which, layout: JSON.parse(JSON.stringify(layout[which])),
+      records: []};
+    for (let p = 0; p < PADS; p += 1) {
+      const key = padKey(which, p);
+      /* An empty pad is recorded as a null, not skipped: putting the bank
+       * back means emptying what the chop filled, too. */
+      shot.records.push({pad: p, record: layout[which][p] ? await dbGet(key) : null});
+    }
+    return shot;
+  }
+
+  /* Collapse a chopped bank back to the one piece of audio it was made of.
+   *
+   * Used when there is no snapshot - after a reload, or for a chop made
+   * before the snapshot existed. Every slice shares the same bytes, so the
+   * whole recording is still there: keep the first pad, give it back the
+   * full trim, and clear the other fifteen. The pads that the chop
+   * OVERWROTE cannot come back this way - that is what the snapshot is for -
+   * and the note says so rather than implying a full undo. */
+  async function unchopByShape(slices) {
+    const keep = slices[0];
+    const meta = layout[bank][keep] || {};
+    const whole = Object.assign({}, meta, {
+      label: String(meta.label || "chop").replace(/\s*\[\d+\/\d+\]\s*$/, ""),
+      trim: null,
+      seconds: 0,
+      choke: ""
+    });
+    for (const p of slices) {
+      if (p === keep) continue;
+      const key = padKey(bank, p);
+      engine().clear(key);
+      await dbDelete(key);
+      layout[bank][p] = null;
+    }
+    layout[bank][keep] = whole;
+    saveLayout();
+    await preload(bank);
+    applySettings(padKey(bank, keep), whole);
+    paintPads();
+    paintControls();
+    note("Out of chop. Pad " + (keep + 1) + " holds the whole recording again; "
+      + "the other slices are cleared.");
+  }
+
+  async function unchop() {
+    const shot = chopUndo;
+    if (!shot) {
+      /* No snapshot - but the bank still says it is chopped, and the
+       * operator still needs a way out. */
+      const slices = choppedBank(bank);
+      if (slices) await unchopByShape(slices);
+      return;
+    }
+    chopUndo = null;
+    for (const {pad, record} of shot.records) {
+      const key = padKey(shot.bank, pad);
+      engine().clear(key);
+      if (record && record.bytes) {
+        await dbPut(key, record);
+      } else {
+        await dbDelete(key);
+      }
+    }
+    layout[shot.bank] = shot.layout;
+    saveLayout();
+    /* preload re-decodes from the restored records and repaints. */
+    await preload(shot.bank);
+    paintControls();
+    note("Put the bank back the way it was before the chop.");
+  }
+
+  /* Slice the selected pad across the whole grid. This is how thirty
+   * seconds of air becomes sixteen playable pieces. */
+  async function chop() {
+    if (chopping()) { await unchop(); return; }
+    const from = padKey(bank, selected);
+    const meta = layout[bank][selected];
+    if (!meta || !engine().loaded(from)) {
+      note("Select a loaded pad to chop.", true);
+      return;
+    }
+    const record = await dbGet(from);
+    if (!record) { note("That pad's bytes are missing.", true); return; }
+    const undo = await snapshotBank(bank);
+    const total = engine().seconds(from);
+    const segment = total / PADS;
+    for (let p = 0; p < PADS; p += 1) {
+      const key = padKey(bank, p);
+      if (p !== selected) {
+        engine().copy(from, key);
+        await dbPut(key, record);
+      }
+      const slice = Object.assign({}, meta, {
+        label: (meta.label || "chop") + " [" + (p + 1) + "/" + PADS + "]",
+        trim: { start: p * segment, end: (p + 1) * segment },
+        seconds: segment,
+        choke: "chop"
+      });
+      layout[bank][p] = slice;
+      applySettings(key, slice);
+    }
+    chopUndo = undo;
+    saveLayout();
+    paintPads();
+    paintControls();
+    note("Chopped " + total.toFixed(2) + "s across " + PADS
+      + " pads. Press UNCHOP to put the bank back.");
+  }
+
+
+  /* ---------------------------------------------------------------- carry
+   *
+   * DRAGGING A CLIP ONTO A PAD, WITH A FINGER.
+   *
+   * The first version used HTML5 drag-and-drop - draggable="true",
+   * dragstart, dragover, drop. That works with a mouse and is COMPLETELY
+   * INERT under touch: those events are mouse-only, so on the tablet - the
+   * one device this is for - not a single clip could be moved.
+   *
+   * Pointer events cover both, so there is one path here and the mouse gets
+   * the same code the finger does.
+   *
+   * The awkward part is that the feed is a scrolling list, and a finger
+   * dragging across a row is ambiguous: scroll, or carry? Resolved by
+   * DIRECTION, decided once, on the first few pixels of movement:
+   *
+   *   mostly vertical  -> it is a scroll. Let go of it entirely; the list
+   *                       scrolls natively, which is smoother than anything
+   *                       re-implemented here.
+   *   mostly horizontal -> it is a carry. The pads are to the right of the
+   *                       feed, so this is the direction the operator is
+   *                       already moving in.
+   *
+   * `touch-action: pan-y` on a row tells the browser the same thing, so the
+   * vertical case never waits on JavaScript.
+   */
+
+  const CARRY_SLOP = 8;          /* px before a gesture commits either way */
+  let carry = null;
+
+  function carryGhost(row) {
+    const ghost = document.createElement("div");
+    ghost.className = "pb-ghost";
+    ghost.textContent = (row.text || row.name || row.who || "take").slice(0, 60);
+    document.body.appendChild(ghost);
+    return ghost;
+  }
+
+  function padUnder(x, y) {
+    /* The ghost follows the finger, so it is what elementFromPoint would
+     * find. Hide it for the hit test rather than offsetting guesses. */
+    if (carry && carry.ghost) carry.ghost.style.display = "none";
+    const under = document.elementFromPoint(x, y);
+    if (carry && carry.ghost) carry.ghost.style.display = "";
+    return under ? under.closest(".pb-pad") : null;
+  }
+
+  function carryMove(event) {
+    if (!carry) return;
+    const dx = event.clientX - carry.x0;
+    const dy = event.clientY - carry.y0;
+
+    if (!carry.committed) {
+      if (Math.abs(dx) < CARRY_SLOP && Math.abs(dy) < CARRY_SLOP) return;
+      if (Math.abs(dy) > Math.abs(dx)) { carry.scrolling = true; }
+      else {
+        carry.committed = true;
+        carry.ghost = carryGhost(carry.row);
+        carry.item.classList.add("lifting");
+      }
+    }
+
+    /* MEASURED, and the reason the rows own their gesture outright.
+     *
+     * With `touch-action: pan-y` the browser may pan, and once it decides
+     * to it TAKES THE WHOLE GESTURE: a real finger drag across a row
+     * delivered 14 touchmove events but only ONE pointermove and no
+     * pointerup at all - Chromium had fired pointercancel and gone
+     * scrolling. Nothing could ever be carried.
+     *
+     * So the rows are `touch-action: none` and the vertical case is done
+     * here by hand. It is a few lines, and it is the difference between a
+     * list you can drag from and one you cannot. */
+    if (carry.scrolling) {
+      const list = el("pbFeed");
+      if (list) {
+        list.scrollTop = carry.scroll0 - dy;
+        carry.item.classList.remove("lifting");
+      }
+      return;
+    }
+
+    event.preventDefault();
+    carry.ghost.style.transform =
+      "translate(" + (event.clientX + 12) + "px," + (event.clientY - 18) + "px)";
+
+    const pad = padUnder(event.clientX, event.clientY);
+    if (pad !== carry.over) {
+      if (carry.over) carry.over.classList.remove("over");
+      if (pad) pad.classList.add("over");
+      carry.over = pad;
+    }
+  }
+
+  function carryEnd(event) {
+    if (!carry) return;
+    const held = carry;
+    carry = null;
+    if (held.ghost) held.ghost.remove();
+    held.item.classList.remove("lifting");
+    if (held.over) held.over.classList.remove("over");
+    try { held.item.releasePointerCapture(held.pointerId); } catch (err) { /* gone */ }
+    if (!held.committed || !event) return;
+    const pad = padUnder(event.clientX, event.clientY);
+    if (pad) importRow(held.row, bank, Number(pad.dataset.pad));
+  }
+
+  function carryStart(event, item, row) {
+    if (!sourceFor(row)) return;            /* nothing behind it to carry */
+    if (event.button !== undefined && event.button !== 0) return;
+    const list = el("pbFeed");
+    carry = {
+      row, item, over: null, ghost: null, committed: false, scrolling: false,
+      x0: event.clientX, y0: event.clientY, pointerId: event.pointerId,
+      scroll0: list ? list.scrollTop : 0
+    };
+    /* Capture so the gesture survives leaving the row - which it must, or
+     * the carry dies the moment the finger crosses into the pad grid. */
+    try { item.setPointerCapture(event.pointerId); } catch (err) { /* mouse */ }
+  }
+
+  /* --------------------------------------------------------------- paint */
+
+  function note(text, bad) {
+    const element = el("pbNote");
+    if (!element) return;
+    element.textContent = text;
+    element.classList.toggle("bad", !!bad);
+  }
+
+  /* The footprint is on screen because it is genuinely surprising: a
+   * single booth turn off this station measured 62.97s, which decodes to
+   * roughly 12 MB. Sixteen of those is a quarter of a gigabyte, and the
+   * operator should be able to see that coming rather than meet it as a
+   * stall. Trimming a pad does not shrink it - the decode is full length -
+   * so the honest answer to a heavy bank is to clear pads, not to trim. */
+  function footprintLine() {
+    const shape = engine().footprint();
+    if (!shape.pads) return "";
+    const mb = shape.bytes / (1024 * 1024);
+    return shape.pads + " pad" + (shape.pads === 1 ? "" : "s")
+      + " resident · " + mb.toFixed(0) + " MB";
+  }
+
+  function paintBanks() {
+    for (let b = 0; b < BANKS; b += 1) {
+      const element = el("pbBank-" + b);
+      if (!element) continue;
+      element.classList.toggle("active", b === bank);
+      const filled = layout[b].filter(Boolean).length;
+      element.title = filled ? filled + " of " + PADS + " pads loaded" : "empty bank";
+    }
+  }
+
+  /* The controls that change what they will do next. Only CHOP does, so
+   * far - but it is called from the chop, the undo and every bank change,
+   * because a bank is chopped or not INDEPENDENTLY of the one on screen. */
+  function paintControls() {
+    const button = document.getElementById("pbChop");
+    if (!button) return;
+    const undoable = chopping();
+    button.textContent = undoable ? "UNCHOP" : "CHOP";
+    button.title = undoable
+      ? "Put this bank back the way it was before the chop"
+      : "Slice the selected pad across all sixteen pads";
+    button.classList.toggle("armed", undoable);
+  }
+
+  function paintPads() {
+    for (let p = 0; p < PADS; p += 1) {
+      const element = el("pad-" + p);
+      if (!element) continue;
+      const meta = layout[bank][p];
+      const loaded = !!meta && engine().loaded(padKey(bank, p));
+      element.classList.toggle("filled", !!meta);
+      element.classList.toggle("cold", !!meta && !loaded);
+      element.classList.toggle("inexact", !!meta && meta.exact === false);
+      const label = element.querySelector(".pb-pad-label");
+      const sub = element.querySelector(".pb-pad-sub");
+      if (label) label.textContent = meta ? meta.label : "";
+      if (sub) {
+        sub.textContent = meta
+          ? [meta.who, meta.seconds ? meta.seconds.toFixed(1) + "s" : "",
+             meta.loop ? "loop" : "", meta.reverse ? "rev" : ""]
+            .filter(Boolean).join(" · ")
+          : "";
+      }
+      element.title = meta
+        ? (meta.label + (meta.cut ? "\n\n" + meta.cut : ""))
+        : "Drag a moment from the feed onto this pad";
+    }
+    const foot = el("pbFoot");
+    if (foot) foot.textContent = footprintLine();
+
+    paintBanks();
+  }
+
+  let feedPrint = "";
+
+  function paintFeed(rows) {
+    const list = el("pbFeed");
+    if (!list) return;
+    feedRows = rows;
+
+    /* The shared feed ticks at 250ms so the playhead can move between
+     * polls. Rebuilding 120 rows four times a second is wasted work on a
+     * tablet AND it throws away scroll position and any drag in progress -
+     * you cannot drag a row that is replaced underneath your finger.
+     * Repaint only when the feed actually changed. */
+    /* NEVER rebuild mid-carry. `replaceChildren` destroys the very row the
+     * finger is holding; the captured element is detached, the pointer
+     * stream stops dead, and the carry dies silently a few pixels in.
+     * Measured as 14 touchmoves reaching the row but only one pointermove -
+     * which reads exactly like a browser gesture conflict and is not one. */
+    if (carry) return;
+
+    const print = rows.length + ":" + rows.map(
+      (row) => row.id + (row.lcdStatus === "Playing" ? "*" : "")).join(",");
+    if (print === feedPrint) return;
+    feedPrint = print;
+
+    const fragment = document.createDocumentFragment();
+    /* Newest at the top: the thing worth grabbing almost always just
+     * happened, and reaching for it should not mean scrolling.
+     *
+     * The whole ring is shown, not a slice of it. The station already caps
+     * itself at 240 rows (app.py:25061), so this is bounded by something
+     * that has thought about it - and halving that again only hid takeable
+     * moments from the operator. The list grows as the broadcast runs and
+     * rolls off the bottom when the station's own ring does. */
+    const newestFirst = rows.slice().reverse();
+    for (const row of newestFirst) {
+      const source = sourceFor(row);
+      const item = document.createElement("div");
+      item.className = "pb-row" + (source ? " grabbable" : " quiet");
+      item.dataset.rowId = row.id;
+      if (row.lcdStatus === "Playing") item.classList.add("playing");
+      const who = document.createElement("b");
+      who.textContent = row.name || row.who || row.kind || "booth";
+      const text = document.createElement("span");
+      text.textContent = row.text || "";
+      const tag = document.createElement("em");
+      tag.textContent = row.lcdStatus || "";
+      item.appendChild(who);
+      item.appendChild(text);
+      item.appendChild(tag);
+      if (source) {
+        item.title = "Drag onto a pad — " + source.kind;
+        item.addEventListener("pointerdown", (event) => carryStart(event, item, row));
+        item.addEventListener("pointermove", carryMove);
+        item.addEventListener("pointerup", carryEnd);
+        item.addEventListener("pointercancel", () => carryEnd(null));
+      }
+      fragment.appendChild(item);
+    }
+    list.replaceChildren(fragment);
+
+    const tally = el("pbTally");
+    if (tally) {
+      const takeables = rows.filter(takeable).length;
+      tally.textContent = rows.length
+        ? takeables + " of " + rows.length + " takeable" : "";
+    }
+  }
+
+  /* --------------------------------------------------------------- build */
+
+  function build(host) {
+    host.innerHTML = "";
+
+    const left = document.createElement("div");
+    left.className = "pb-left";
+    left.innerHTML =
+      '<div class="pb-feed-head">'
+      + '<b>Feed</b>'
+      + '<span id="pbTally" class="pb-tally"></span>'
+      + '<button id="pbWhole" class="pb-toggle" title="Grab this line alone, '
+      + 'or the whole welded round it aired in">line</button>'
+      + '</div><div id="pbFeed" class="pb-feed"></div>'
+      + '<div class="pb-note-bar"><span id="pbNote" class="pb-note"></span>'
+      + '<span id="pbFoot" class="pb-foot" title="What the loaded pads cost '
+      + 'in memory. A whole round decodes to far more than its download '
+      + 'suggests; trimming does not shrink it, clearing does."></span></div>';
+
+    const right = document.createElement("div");
+    right.className = "pb-right";
+
+    const banks = document.createElement("div");
+    banks.className = "pb-banks";
+    for (let b = 0; b < BANKS; b += 1) {
+      const button = document.createElement("button");
+      button.id = "pbBank-" + b;
+      button.className = "pb-bank";
+      button.textContent = String(b + 1);
+      button.addEventListener("click", async () => {
+        bank = b;
+        paintPads();
+        /* A chop can be undone only on the bank it happened to, so the
+         * button follows the bank rather than the session. */
+        paintControls();
+        await preload(b);
+      });
+      banks.appendChild(button);
+    }
+
+    const grid = document.createElement("div");
+    grid.className = "pb-grid";
+    for (let p = 0; p < PADS; p += 1) {
+      const pad = document.createElement("div");
+      pad.id = "pad-" + p;
+      pad.className = "pb-pad";
+      pad.dataset.pad = String(p);
+      pad.innerHTML = '<span class="pb-pad-num">' + (p + 1) + '</span>'
+        + '<span class="pb-pad-label"></span><span class="pb-pad-sub"></span>';
+
+      pad.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        try { pad.setPointerCapture(event.pointerId); } catch (err) { /* mouse */ }
+        press(p, event);
+      });
+      const up = () => lift(p);
+      pad.addEventListener("pointerup", up);
+      pad.addEventListener("pointercancel", up);
+      pad.addEventListener("pointerleave", () => { if (held.has(p)) lift(p); });
+
+
+      /* Right-click / long-press opens the trim editor for that pad. */
+      pad.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        select(p);
+        if (root.PineSamplerTrim) root.PineSamplerTrim.open(bank, p);
+      });
+      grid.appendChild(pad);
+    }
+
+    const controls = document.createElement("div");
+    controls.className = "pb-controls";
+    const toggles = [
+      ["pbPoly", "POLY", "Let pads ring together. Off, a new hit cuts the last one.",
+        () => modes.poly,
+        () => { modes.poly = !modes.poly; engine().setPolyphonic(modes.poly); }],
+      ["pbGate", "GATE", "Hold to play - the sound stops when you lift.",
+        () => modes.gate, () => { modes.gate = !modes.gate; }],
+      ["pbFull", "FULL", "Every hit at maximum, whatever the touch.",
+        () => modes.full, () => { modes.full = !modes.full; }],
+      ["pb16", "16 LVL", "The selected pad across all sixteen, played chromatically.",
+        () => modes.sixteen, () => { modes.sixteen = !modes.sixteen; }],
+      ["pbRpt", "NOTE RPT", "Hold a pad and it retriggers in time.",
+        () => modes.repeat, () => { modes.repeat = !modes.repeat; }]
+    ];
+    for (const spec of toggles) {
+      const button = document.createElement("button");
+      button.id = spec[0];
+      button.className = "pb-mode";
+      button.textContent = spec[1];
+      button.title = spec[2];
+      button.addEventListener("click", () => {
+        spec[4]();
+        button.classList.toggle("on", spec[3]());
+      });
+      controls.appendChild(button);
+    }
+    /* POLY is on at boot, so its light is on at boot. */
+    controls.querySelector("#pbPoly").classList.add("on");
+
+    /* TAP, CHOP and STOP DO something; POLY, GATE, FULL, 16 LVL and NOTE
+     * RPT ARE something. Wearing the same button made the first three read
+     * as states the sampler was stuck in - which is how a one-press chop
+     * became "chop mode". `.pb-act` draws them as the actions they are. */
+    const tap = document.createElement("button");
+    tap.className = "pb-mode pb-act";
+    tap.textContent = "TAP";
+    tap.title = "Tap the tempo Note Repeat runs at";
+    tap.addEventListener("click", () => {
+      const now = performance.now();
+      tapTimes = tapTimes.filter((t) => now - t < 2500).concat(now);
+      if (tapTimes.length >= 2) {
+        const gaps = tapTimes.slice(1).map((t, i) => t - tapTimes[i]);
+        const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+        modes.bpm = Math.round(60000 / mean);
+        note("Tempo " + modes.bpm + " bpm");
+      }
+    });
+    controls.appendChild(tap);
+
+    const chopBtn = document.createElement("button");
+    chopBtn.id = "pbChop";
+    chopBtn.className = "pb-mode pb-act";
+    chopBtn.textContent = "CHOP";
+    chopBtn.title = "Slice the selected pad across all sixteen pads";
+    chopBtn.addEventListener("click", chop);
+    controls.appendChild(chopBtn);
+
+    const stop = document.createElement("button");
+    stop.className = "pb-mode pb-act danger";
+    stop.textContent = "STOP";
+    stop.title = "Silence every pad at once";
+    stop.addEventListener("click", () => engine().stopAll());
+    controls.appendChild(stop);
+
+    right.appendChild(banks);
+    /* A PAD IS SQUARE. It is a thing you hit with a thumb, and a 4x4 of
+     * rectangles is a spreadsheet. The grid stretches to whatever box it is
+     * handed, which is square in neither orientation, so it is wrapped in
+     * an element it can MEASURE: .pb-padwrap is a size container, and the
+     * grid takes the smaller of that box's two sides. See sampler.css. */
+    const padwrap = document.createElement("div");
+    padwrap.className = "pb-padwrap";
+    padwrap.appendChild(grid);
+    right.appendChild(padwrap);
+    right.appendChild(controls);
+    host.appendChild(left);
+    host.appendChild(right);
+
+    el("pbWhole").addEventListener("click", () => {
+      grabWhole = !grabWhole;
+      el("pbWhole").textContent = grabWhole ? "round" : "line";
+      el("pbWhole").classList.toggle("on", grabWhole);
+    });
+  }
+
+  /* --------------------------------------------------------------- mount */
+
+  async function mount(host) {
+    if (!host || mounted) return;
+    layout = loadLayout();
+    config = await api().readConfig();
+    build(host);
+    engine().warm();
+    engine().setPolyphonic(modes.poly);
+    paintPads();
+    /* SAY WHAT THE BUTTON WILL DO, FROM THE FIRST FRAME.
+     *
+     * This was the whole of "I am stuck in chop mode". The layout persists,
+     * so the sampler opens onto whatever state it was left in - and it was
+     * measured on the tablet opening onto bank 1 with 15 of 16 pads carrying
+     * choke "chop" while the button still read CHOP. chopping() detected the
+     * chopped bank perfectly well; paintControls simply was never called at
+     * mount, only after a chop, an unchop or a bank change.
+     *
+     * So the one control that could undo it was labelled as the thing that
+     * caused it, and pressing it chopped the bank AGAIN. Three presses, three
+     * chops, no way out. */
+    paintControls();
+    /* A trim overlay left open by the previous session sits over the whole
+     * grid, which is the other half of "stuck": measured on the tablet with
+     * one .pb-trim still in the document at mount. The editor is per-pad and
+     * transient - nothing is lost by starting closed. */
+    document.querySelectorAll(".pb-trim").forEach((node) => node.remove());
+    await preload(bank);
+    if (!unsubscribe) {
+      unsubscribe = root.PineStationFeed.subscribe((payload) => paintFeed(payload.rows));
+    }
+    mounted = true;
+  }
+
+  /* Mounted on first visit, not at boot. Decoding a bank costs real work
+   * and the operator may never open this view in a given session; the
+   * shared feed is likewise only subscribed to once the view exists, so an
+   * unopened sampler adds nothing to what the station is being asked. */
+  function bootstrap() {
+    const tab = document.getElementById("samplerTabBtn");
+    const host = document.getElementById("sampler");
+    if (!tab || !host) return;
+    tab.addEventListener("click", () => {
+      mount(host).catch((err) => {
+        const target = document.getElementById("pbNote");
+        if (target) { target.textContent = String(err.message || err); target.classList.add("bad"); }
+      });
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootstrap);
+  } else {
+    bootstrap();
+  }
+
+  root.PineSampler = {
+    mount,
+    isMounted: () => mounted,
+    /* The trim editor and any future panel reach the same state through
+     * here rather than keeping a second copy of it. */
+    layout: () => layout,
+    bankIndex: () => bank,
+    selectedPad: () => selected,
+    padKey,
+    /* The seam the Listen view takes its one-tap grab through. sourceFor
+     * and takeable are published so another view can GREY ITS OWN BUTTON
+     * with the same answer this one uses, rather than guessing from
+     * `aired` - which is the exact mistake that once offered 7 of ~220
+     * takeable moments. */
+    sourceFor,
+    takeable,
+    grab,
+    applySettings,
+    save: saveLayout,
+    repaint: paintPads,
+    bytes: dbGet,
+    forget: async (b, p) => {
+      await dbDelete(padKey(b, p));
+      engine().unload(padKey(b, p));
+      layout[b][p] = null;
+      saveLayout();
+      paintPads();
+    }
+  };
+})(typeof window !== "undefined" ? window : globalThis);

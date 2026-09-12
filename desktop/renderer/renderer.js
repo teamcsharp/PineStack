@@ -496,6 +496,18 @@ function initTipDelay(ms) {
   if (Number(box.value) !== secs) box.value = String(secs);
 }
 
+/* #984: the record playing, kept for the cell's own popup. Assigned from
+ * every status poll and never declared, which in this non-strict file made
+ * it an implicit global rather than an error - so it has been leaking onto
+ * window since #984 landed. Declared here, beside the cell that owns it.
+ *
+ * OUTSTANDING: nowCellOpen(), the click this cell is wired to, was never
+ * written. Clicking "Now" throws a ReferenceError today. What it owes, per
+ * the markup in index.html:320, is "the artist, the album, a search, and a
+ * corner of the shelf put on for however long you say" - a request-desk
+ * popup, not a one-liner, so it is left named rather than guessed at. */
+let nowCellTrack = null;
+
 function initNowCell() {
   const cell = document.getElementById("nowCell");
   if (!cell || cell.dataset.wired) return;
@@ -1252,12 +1264,337 @@ function syncDesktopRadio(clock) {
   }
 }
 
+/* ---------------------------------------------------------- who is playing
+ *
+ * "I'm still having audio come out of the application on a computer, despite
+ * telling it on the tablet that I'm only broadcasting through the tablet's
+ * IP address."
+ *
+ * Route says where the station SENDS a stream. "App" and "Web page" are both
+ * page-side, and this desktop and the tablet are BOTH page-side clients - so
+ * routing to a page plays the show in two rooms a few hundred milliseconds
+ * apart, which is what "a different broadcast" sounds like. The station's own
+ * answer is #1008: one listener holds the air and every other page gags
+ * itself. This is that switch, put where the routing controls already are.
+ *
+ * The same list is in the tablet's drawer (rail/AirOwners.kt) reading the
+ * same two documents, so the two surfaces cannot disagree about who is the
+ * room.
+ *
+ * NOT A NEW POLLER. /api/radio/clock already runs at 1.5s; the roster is
+ * fetched on every fourth tick (6s) and the names come from settings, which
+ * changes rarely and is re-read every thirty seconds. */
+let playersRoster = null;
+/* The station's current routing, so the box and the Nabu can show whether
+ * they are the destination. They hold no listener id, so presence cannot be
+ * read from the roster for them. */
+let playersState = null;
+let playersTerminals = {};
+let playersTick = 0;
+let playersTerminalsAt = 0;
+
+/* Which `terminals` row a player is.
+ *
+ * MEASURED MISLABEL, and the reason the app is special-cased. Three players
+ * sat on one machine - the Electron app and two browser tabs - and the
+ * `desktop` row carries that machine's ADDRESS. So every tab on the PC
+ * matched it and was drawn as "This app - a Pine Box terminal", including
+ * pages that were nothing of the kind.
+ *
+ * An address identifies a MACHINE; the app is a PROCESS. The Electron app
+ * mints `desktop-<rand>` (desktopListenerId, top of this file), so it names
+ * itself exactly - and nothing that is not the app may claim the app's row
+ * by sharing its machine. */
+const APP_ROW = "desktop";
+
+function playersDeviceFor(addr, listener) {
+  const isApp = listener.startsWith("desktop-");
+  let byAddr = "";
+  for (const [key, row] of Object.entries(playersTerminals || {})) {
+    const pinned = String((row || {}).listener || "");
+    if (pinned) {
+      if (pinned === listener) return key;
+      continue;                       /* spoken for, and not by this one */
+    }
+    /* The app's row belongs to the app, and only to the app. */
+    if (key === APP_ROW) {
+      if (isApp) return key;
+      continue;
+    }
+    if (isApp) continue;              /* the app is never another device */
+    if (addr && String((row || {}).addr || "") === addr && !byAddr) byAddr = key;
+  }
+  return byAddr;
+}
+
+/* WHAT a player is, not just where it is.
+ *
+ * "When there's an application instance, also refer to an application
+ * instance in the list of instances that's running. So that way I know that
+ * a page is a web page or that someone's running the Electron Pine Box app."
+ *
+ * The station says "a browser tab" for every one of them, because from its
+ * side that is all they are: a page polling /api/dj. But they are not the
+ * same thing to operate - one is this app with a sidebar and a provisioner
+ * in it, one is a tablet across the room, one is a browser window somebody
+ * left open - and telling them apart is the difference between handing the
+ * air to the right room and guessing.
+ *
+ * Two discriminators, both measured against the live roster: the Electron
+ * app mints `desktop-<rand>` (desktopListenerId, top of this file), so it is
+ * self-identifying wherever it runs; everything else is placed by address
+ * against the `terminals` table. */
+function playersKind(listener, device) {
+  if (listener.startsWith("desktop-")) return "the Pine Box app";
+  if (device === "pinetab") return "the PineTab";
+  if (device) return "a Pine Box terminal";
+  return "a web page";
+}
+
+/* Which devices the operator has chosen to play, from the table. */
+function playersChosen() {
+  return Object.entries(playersTerminals || {})
+    .filter(([, row]) => (row || {}).play)
+    .map(([key]) => key);
+}
+
+/* Write the table back. PUT /api/settings REPLACES the document, so this is
+ * read-modify-write and the whole thing goes back every time. */
+async function playersWrite(mutate) {
+  const settings = await api.get("/api/settings");
+  const table = Object.assign({}, settings.terminals || {});
+  mutate(table);
+  settings.terminals = table;
+  await api.put("/api/settings", settings);
+  playersTerminals = table;
+  playersTerminalsAt = Date.now();
+}
+
+/* Plain click: this device alone. */
+async function playersSetOnly(row) {
+  if (!row.device) return;
+  await playersWrite((table) => {
+    for (const key of Object.keys(table)) {
+      table[key] = Object.assign({}, table[key], {play: key === row.device});
+    }
+  });
+}
+
+/* Shift-click: add this device to the set, or drop it if it is already in.
+ *
+ * The station's solo gate can only say "one" or "everybody", so as soon as
+ * the set is bigger than one the gate is RELEASED and the per-device table
+ * does the work - every terminal mutes itself unless its own row says play
+ * (terminal-audio-client.js). Releasing is safe: a device with play:false
+ * still silences itself. */
+async function playersAdd(row) {
+  if (!row.device) return;
+  await playersWrite((table) => {
+    const was = table[row.device] || {};
+    table[row.device] = Object.assign({}, was, {play: !was.play});
+  });
+  if (playersChosen().length > 1) {
+    playersRoster = await api.post("/api/radio/solo", {clear: true});
+  }
+}
+
+async function pollPlayers(force) {
+  const box = $("playersList");
+  if (!box) return;
+  playersTick += 1;
+  if (!force && playersTick % 4 !== 0) return;
+  try {
+    if (!playersTerminalsAt || Date.now() - playersTerminalsAt > 30000) {
+      const settings = await api.get("/api/settings");
+      playersTerminals = (settings && settings.terminals) || {};
+      playersTerminalsAt = Date.now();
+    }
+    playersRoster = await api.get("/api/radio/listeners");
+    playersState = await api.get("/api/dj/state").catch(() => playersState);
+  } catch (err) {
+    return;                           /* a dropped poll is not a change */
+  }
+  paintPlayers();
+}
+
+/* The four places the show can come out of.
+ *
+ * `page` devices are browsers holding a listener id; `box` and `nabu` are
+ * station routes and have no listener at all, which is why presence is
+ * decided differently for them. Order is fixed rather than sorted - a list
+ * that reshuffles under a thumb every poll is unusable. */
+const PLAYERS_DEVICES = [
+  {id: "app", row: "desktop", label: "Pine app", page: true,
+   why: "The Pine Box application on this computer."},
+  {id: "pinetab", row: "pinetab", label: "PineTab", page: true,
+   why: "The tablet."},
+  {id: "box", row: "", label: "Pine Box", page: false,
+   why: "The box speaker."},
+  {id: "nabu", row: "", label: "Nabu", page: false,
+   why: "The Nabu device."}
+];
+
+/* Which listener id a page device is using right now, or "" if it is not
+ * looking. The app names itself by its id prefix; the tablet is placed by
+ * address. One row per device, however many tabs that machine has open. */
+function playersListenerFor(device) {
+  const rows = (playersRoster && playersRoster.listeners) || [];
+  for (const row of rows) {
+    const listener = String(row.listener || "");
+    const addr = String(row.addr || "");
+    if (device.id === "app") {
+      if (listener.startsWith("desktop-")) return {listener, addr, seen: row.seen};
+      continue;
+    }
+    const want = String((playersTerminals[device.row] || {}).addr || "");
+    if (want && addr === want && !listener.startsWith("desktop-")) {
+      return {listener, addr, seen: row.seen};
+    }
+  }
+  return null;
+}
+
+function paintPlayers() {
+  const box = $("playersList");
+  if (!box || !playersRoster) return;
+  const owner = String(playersRoster.audio_owner || "");
+  const routed = String((playersState && playersState.music_to) || "");
+  const voiceDevice = String((playersState && playersState.voice_device) || "");
+  const rows = PLAYERS_DEVICES.map((device) => {
+    const here = device.page ? playersListenerFor(device) : null;
+    const listener = here ? here.listener : "";
+    /* A page device sounds when it holds the air; the box and the Nabu
+     * sound when the station's route points at them. Different questions,
+     * asked of different documents - so they are asked separately rather
+     * than forced into one rule that would be wrong for half of them. */
+    /* BOX AND NABU ARE THE SAME ROUTES. They differ only by voice_device:
+     * ROUTES.box is music/voice/reply "box" with voice_device "pine", and
+     * ROUTES.nabu is the identical routing with voice_device "nabu" (#786 -
+     * the Nabu is the CORE broadcast device, so it takes the whole station,
+     * not a route of its own). Reading music_to alone cannot tell them
+     * apart, which is why this list said "Pine Box - routed here" while the
+     * operator was plainly sending to the Nabu. */
+    const toBox = routed === "box" || routed === "both";
+    const owns = device.page
+      ? (!!owner && listener === owner)
+      : device.id === "nabu"
+        ? (routed === "nabu" || (toBox && voiceDevice === "nabu"))
+        : (toBox && voiceDevice !== "nabu");
+    const detail = device.page
+      ? (here
+          ? [here.addr, Number.isFinite(here.seen)
+              ? Math.round(here.seen) + "s ago" : ""].filter(Boolean).join(" · ")
+          : "not open")
+      : (owns ? "routed here" : "not routed");
+    return {
+      listener, device: device.row, id: device.id,
+      label: device.label,
+      why: device.why,
+      page: device.page,
+      present: device.page ? !!here : true,
+      detail, owns,
+      me: !!listener && listener === desktopListenerId
+    };
+  });
+
+  box.replaceChildren();
+  for (const row of rows) {
+    const line = document.createElement("button");
+    line.className = "player" + (row.owns ? " owns" : "") + (row.me ? " me" : "");
+    if (!row.present) line.classList.add("away");
+    line.title = row.present
+      ? (row.owns ? row.why + " Click another device to move the show."
+                  : "Send the broadcast to " + row.label + ". "
+                    + "Shift-click to add it alongside the others.")
+      : row.label + " is not open, so the show cannot be sent there.";
+    line.innerHTML = '<i></i><b></b><span></span>';
+    line.querySelector("i").textContent = row.owns ? "◉" : "○";
+    line.querySelector("b").textContent = row.label;
+    line.querySelector("span").textContent = row.detail;
+    line.onclick = async (event) => {
+      /* PLAIN CLICK PICKS ONE. SHIFT-CLICK ADDS ANOTHER.
+       *
+       * Two mechanisms, because the station has exactly one: #1008 hands ONE
+       * listener the air and gags every other page - which is perfect for
+       * the single case and cannot express a subset at all.
+       *
+       * So for one device the station's own gate is used, because it is the
+       * most robust thing available: it survives a client that is not
+       * running our code. For two or more the gate is RELEASED - it can only
+       * say "one" or "everybody" - and the per-device table takes over, each
+       * client muting itself unless its own row says play. That is what
+       * terminal-audio-client.js does on every terminal. */
+      try {
+        if (!row.present) return;
+        if (!row.page) {
+          /* The box and the Nabu are station ROUTES. Sending the show there
+           * moves all three streams and releases the page-side gate, since
+           * no page is the destination any more. */
+          /* Post the canonical preset rather than a route guess - the two
+           * differ ONLY by voice_device, so sending {music:"nabu"} would
+           * leave the device pointed at the pine satellite and the Nabu
+           * silent. ROUTES is the same map the Broadcast picker uses. */
+          const preset = ROUTES[row.id === "box" ? "box" : "nabu"];
+          await api.post("/api/dj/output", {
+            music: preset.music, voice: preset.voice, reply: preset.reply,
+            voice_device: preset.voice_device, box_talk: preset.box_talk
+          });
+          playersRoster = await api.post("/api/radio/solo", {clear: true});
+        } else if (event.shiftKey) {
+          await playersAdd(row);
+        } else {
+          /* A page destination needs the route pointed at a page as well as
+           * the air claimed, or the station is still sending to the box and
+           * nothing the browser does matters. */
+          await api.post("/api/dj/output",
+            {music: "here", voice: "here", reply: "here"});
+          playersRoster = await api.post("/api/radio/solo", {listener: row.listener});
+          await playersSetOnly(row);
+        }
+        await pollPlayers(true);
+      } catch (err) { /* the next poll will tell the truth */ }
+    };
+    box.appendChild(line);
+  }
+
+  const state = $("playersState");
+  const note = $("playersNote");
+  const held = rows.find((r) => r.owns);
+  if (state) {
+    state.textContent = held ? held.label : (rows.length > 1 ? "all of them" : "");
+    state.className = held ? "good" : (rows.length > 1 ? "bad" : "");
+  }
+  if (note) {
+    note.textContent = !rows.length ? "nothing is listening"
+      : held ? "Only " + held.label + " is sounding."
+      : rows.length === 1 ? "One player, no overlap possible."
+      : rows.length + " players, all sounding at once. Click one to give it the air.";
+  }
+}
+
 async function pollDesktopRadio() {
   if (!config) return;
   try {
     const clock = await api.get(`/api/radio/clock?listener=${desktopListenerId}`);
     desktopClockAt = Date.now();
+    /* #1008, THE HALF THIS SHELL WAS MISSING.
+     *
+     * The volume pass above reads window.__pineGagged to decide whether
+     * another listener owns the air - but nothing in this file ever SET
+     * it. pineSoloGate (app.py:154557) sets it inside the station page,
+     * which is a <webview> and therefore a different JS context, so the
+     * shell's own players never learned they had been gagged and kept
+     * sounding: "I'm hearing a different broadcast coming out of the
+     * application on the computer than I am hearing come out of the Pine
+     * Box tab."
+     *
+     * The clock already carries the owner - the panel reads it from the
+     * same field - so the shell only has to answer the same question
+     * about itself. */
+    window.__pineGagged = !!(clock && clock.audio_owner)
+      && clock.audio_owner !== desktopListenerId;
     syncDesktopRadio(clock);
+    pollPlayers();
   } catch {
     const player = $("desktopRadioPlayer");
     if (player) player.pause();
@@ -3632,6 +3969,69 @@ function initWorksPopup() {
     box.appendChild(tally);
   }
 
+  /* #1030: THE MEMBERS IN THIS ROUND, before anything else on the row.
+   *
+   * "list what these scripts are being written FOR" (#987) gave the row a
+   * purpose; this gives it a cast. Twelve banked rounds in the reserve all
+   * read the same, and who SPEAKS in one is the fastest way to tell them
+   * apart - it is also exactly what a banked phone call was missing when
+   * it showed only Host and Skip and not the person who called.
+   *
+   * The rows come from round_line_plan (app.py:28322): one entry per turn
+   * in script order, each carrying who, whether its audio is drawn LIVE,
+   * and - for a caller - their name. Speakers fold in first-spoken order,
+   * because a round is told apart by who opens it, not by who has most.
+   *
+   * This was called at the reserve row and never written, inside a try
+   * that let the row still read - so the call threw on every round that
+   * had a cast, the throw was swallowed, and this half of #1030 has never
+   * once appeared on screen. */
+  function wkCastRow(cast) {
+    const rows = Array.isArray(cast) ? cast : [];
+    const box = mk("div", "");
+    box.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;align-items:center;"
+      + "margin:0 0 3px 0;font-size:9.5px;line-height:1.5";
+    const order = [];
+    const by = Object.create(null);
+    rows.forEach((row) => {
+      if (!row) return;
+      const who = String(row.who || "").trim();
+      if (!who) return;
+      if (!by[who]) { by[who] = {turns: 0, live: false, name: ""}; order.push(who); }
+      by[who].turns += 1;
+      if (row.live) by[who].live = true;
+      if (!by[who].name && row.name) by[who].name = String(row.name);
+    });
+    if (!order.length) {
+      const none = mk("span", "wk-note", "no cast recorded for this round");
+      none.style.cssText = "opacity:.55";
+      box.appendChild(none);
+      return box;
+    }
+    const SEAT = {dj: "Host", cohost: "Co-host", third: "Third",
+                  caller: "Caller", caller2: "Second caller"};
+    order.forEach((who) => {
+      const one = by[who];
+      const name = one.name || SEAT[who] || who;
+      const tag = mk("span", "", "");
+      /* A live turn is a phone line drawn at air time; a prepared one
+       * already has its takes in the pantry. Outlined against filled says
+       * which, without spending a second word on a crowded row. */
+      tag.style.cssText = "padding:0 5px;border-radius:8px;white-space:nowrap;"
+        + "border:1px solid " + (one.live ? "#c79a4a" : "#3f7fa8") + ";"
+        + "color:" + (one.live ? "#f0c987" : "#9fd8ff") + ";"
+        + "background:" + (one.live ? "transparent" : "rgba(63,127,168,.15)");
+      tag.textContent = name + (one.turns > 1 ? " ×" + one.turns : "");
+      tag.title = name + " — " + one.turns + " turn(s) in this round"
+        + (one.live
+           ? "\ndrawn live when the round airs, so it has no banked takes"
+           : "\nprepared: its takes are banked in the pantry");
+      box.appendChild(tag);
+    });
+    return box;
+  }
+
+
   function stage(flow, title, num, note, cls, frac, key, fill_) {
     /* #883/#887: made once, keyed, and updated in place from then on.
      * The drawer is moved in ONCE - re-adopting it on every paint is what
@@ -3710,7 +4110,7 @@ function initWorksPopup() {
     b.style.cssText = "font-size:10px;line-height:1.5;white-space:pre-wrap;"
       + "max-height:26vh;overflow:auto;padding:5px 7px;border-radius:6px;"
       + "background:#05090f;border:1px solid #24384a"
-      + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
+      + (mono ? ";font-family:ui-monospace,Consolas,monospace,PineIcons" : "");
     drawer.appendChild(b);
   }
 
@@ -6815,7 +7215,7 @@ function worksSchedule(anchorPop) {
     d.appendChild(mk("div", "wk-note", "THE SYSTEM PROMPT"));
     const ta = mk("textarea", "");
     ta.style.cssText = "width:100%;height:170px;font-size:10.5px;"
-      + "font-family:ui-monospace,Consolas,monospace";
+      + "font-family:ui-monospace,Consolas,monospace,PineIcons";
     d.appendChild(ta);
 
     /* STORE IT. A name AND the scenario it suits, because that is the
@@ -7119,7 +7519,7 @@ function worksSchedule(anchorPop) {
     d.appendChild(mk("div", "wk-note", "THE SYSTEM PROMPT FOR THIS ENTRY"));
     const ta = mk("textarea", "");
     ta.style.cssText = "width:100%;height:150px;font-size:10.5px;"
-      + "font-family:ui-monospace,Consolas,monospace";
+      + "font-family:ui-monospace,Consolas,monospace,PineIcons";
     ta.placeholder = "Leave empty to use whatever is armed for a "
       + slot.kind + " round.";
     d.appendChild(ta);
@@ -7851,7 +8251,7 @@ function wkPutInto(box, label, text, mono) {
   b.style.cssText = "font-size:10px;line-height:1.5;white-space:pre-wrap;"
     + "max-height:26vh;overflow:auto;padding:5px 7px;border-radius:6px;"
     + "background:#05090f;border:1px solid #24384a"
-    + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
+    + (mono ? ";font-family:ui-monospace,Consolas,monospace,PineIcons" : "");
   box.appendChild(b);
 }
 
@@ -8651,7 +9051,7 @@ function wkReviewPopup(kind, id) {
     scriptBox.style.cssText = "width:100%;min-height:170px;font-size:10px;"
       + "line-height:1.55;background:#05090f;color:#cfe3f4;"
       + "border:1px solid #24384a;border-radius:6px;padding:6px 8px;"
-      + "font-family:ui-monospace,Consolas,monospace";
+      + "font-family:ui-monospace,Consolas,monospace,PineIcons";
     body.appendChild(scriptBox);
 
     const note = document.createElement("input");
@@ -12649,6 +13049,7 @@ if (typeof api.onSupportProgress === "function") {
   await applyDefaultBroadcast();
   await refresh();
   await pollDesktopRadio();
+  await pollPlayers(true);
   setInterval(refresh, 6000);
   /* 2026-09-10: is this app the newest? Asked once at boot and then
    * rarely - the answer only changes when somebody writes to the share,
