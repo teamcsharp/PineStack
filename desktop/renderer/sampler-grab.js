@@ -35,6 +35,10 @@
   var view = null;       /* {buffer, rate, fromAir, label, who, cut}  */
   var sel = {a: 0, b: 1};/* selection, as fractions of the view       */
   var audition = null;
+  /* The unwatch PineDismiss hands back. Ignoring it leaves a dead entry
+   * behind on every open, walked on every pointerdown for the life of the
+   * page. */
+  var unwatch = null;
 
   function make(tag, cls, text) {
     var node = document.createElement(tag);
@@ -133,10 +137,36 @@
     showAir();
     fillList(list);
 
-    if (root.PineDismiss) root.PineDismiss.watch(sheet, close, []);
+    if (root.PineDismiss) unwatch = root.PineDismiss.watch(sheet, close, []);
+  }
+
+  /* THE TWENTY SECONDS EITHER SIDE, drawn as reachable ground.
+   *
+   * The operator asked for "time in front of the broadcast up to 20 seconds"
+   * - room to push the playhead forward into what has aired since, and back
+   * into what came before. Both are only ever as large as the ring actually
+   * holds, and the band says which: a window that offered twenty seconds the
+   * buffer does not have would be a control that does nothing. */
+  var WIDEN_S = 20;
+
+  function showWiden(mark, have) {
+    var lane = document.getElementById('sgLane');
+    if (!lane) return;
+    var old = lane.querySelector('.sg-widen');
+    if (old) old.remove();
+    var band = make('i', 'sg-widen');
+    var backTo = Math.min(have, mark.older + WIDEN_S);
+    var onTo = Math.max(0, mark.newer - WIDEN_S);
+    var left = Math.max(0, (have - backTo) / have);
+    var right = Math.min(1, (have - onTo) / have);
+    band.style.left = (left * 100).toFixed(2) + '%';
+    band.style.width = ((right - left) * 100).toFixed(2) + '%';
+    band.title = 'up to ' + WIDEN_S + 's either side of the take';
+    lane.insertBefore(band, lane.firstChild);
   }
 
   function close() {
+    if (unwatch) { unwatch(); unwatch = null; }
     stopAudition();
     if (sheet) { sheet.remove(); sheet = null; }
     view = null;
@@ -167,12 +197,47 @@
        * the selection defaulting to the whole of it would make the common
        * case - "that bit just now" - the one that needs the most dragging.
        * The last eight seconds is where a hand reaches. */
-      var want = Math.min(8, buffer.duration);
-      sel.a = 1 - (want / buffer.duration);
-      sel.b = 1;
-      if (said) {
-        said.textContent = have.toFixed(0) + 's held · drag the handles';
+      /* REOPENING A TAKE, RATHER THAN STARTING A NEW ONE.
+       *
+       * "Show time in front of the broadcast up to 20 seconds. I want to be
+       *  able to grab time that has played SINCE I grabbed the sample as
+       *  well, and time before I grabbed the sample."
+       *
+       * The pad stored the window it was cut from as "seconds ago", measured
+       * at a moment that has since passed - so both edges have drifted
+       * further into the past by however long it has been, and the window is
+       * re-derived rather than reused. Whatever has aired since sits in the
+       * ring to the RIGHT of it, which is exactly the material needed to
+       * finish a sentence that was caught halfway. */
+      var mark = null;
+      if (host && host.widen && buffer.duration > 0) {
+        var since = (Date.now() - Number(host.widen.at || 0)) / 1000;
+        var older = Number(host.widen.from || 0) + since;
+        var newer = Number(host.widen.to || 0) + since;
+        if (older > 0 && older <= have) {
+          /* The ring holds `have` seconds and 0 is now, so a point `x`
+           * seconds ago sits at (have - x) / have along the picture. */
+          sel.a = Math.max(0, (have - older) / have);
+          sel.b = Math.min(1, (have - newer) / have);
+          mark = {older: older, newer: newer, since: since};
+        }
       }
+      if (!mark) {
+        /* THE NEWEST END IS THE INTERESTING END. Two minutes of history with
+         * the selection defaulting to the whole of it would make the common
+         * case - "that bit just now" - the one that needs the most dragging.
+         * The last eight seconds is where a hand reaches. */
+        var want = Math.min(8, buffer.duration);
+        sel.a = 1 - (want / buffer.duration);
+        sel.b = 1;
+      }
+      if (said) {
+        said.textContent = mark
+          ? 'the take you grabbed ' + mark.since.toFixed(0) + 's ago - drag out '
+            + 'either side to widen it (' + have.toFixed(0) + 's held)'
+          : have.toFixed(0) + 's held · drag the handles';
+      }
+      if (mark) showWiden(mark, have);
       paint();
     }, function (err) {
       view = null;

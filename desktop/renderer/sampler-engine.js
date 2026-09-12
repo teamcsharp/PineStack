@@ -331,7 +331,24 @@
       }
 
       const voiceId = "v" + (voiceSeq += 1);
-      voices.set(voiceId, { source, gain, padId: pad.id, group: pad.choke });
+      /* WHEN IT STARTED AND HOW LONG IT RUNS, so the view can draw a
+       * playhead. The clock is the AudioContext's, not the wall's: that is
+       * the clock the sound is actually scheduled against, so a bar drawn
+       * from it cannot drift away from what is being heard.
+       *
+       * `duration` is the window in the BUFFER, so it is divided by the
+       * playback rate to get the time it will really take - a pad played an
+       * octave up finishes in half the time, and a timeline that ignored
+       * that would be wrong by a factor of two exactly when 16 LEVEL is on.
+       * A looping or gated voice has no end, and says so with `until: 0`. */
+      const realLength = duration / pitch;
+      voices.set(voiceId, {
+        source, gain, padId: pad.id, group: pad.choke,
+        from: now,
+        until: (loop || gate) ? 0 : now + realLength,
+        length: realLength,
+        label: pad.label || ""
+      });
       cutSiblings(pad, voiceId);
 
       source.onended = () => reap(voiceId);
@@ -415,6 +432,34 @@
      * finger lifts - a one-shot outlives the press that started it, and
      * reference-counting presses would unduck over the top of it. */
     playing() { return voices.size; },
+
+    /**
+     * EVERY VOICE STILL SOUNDING, AND HOW FAR THROUGH IT IS.
+     *
+     * For the timeline across the sampler. `at` is 0..1 for a one-shot and
+     * -1 for a voice with no end - a loop or a held gate - because a
+     * progress bar for something that does not end is a lie, and the view
+     * draws those as a running stripe instead.
+     */
+    active() {
+      const audio = ctx;
+      if (!audio) return [];
+      const now = audio.currentTime;
+      const out = [];
+      voices.forEach((voice, id) => {
+        const open = !voice.until;
+        out.push({
+          id,
+          padId: voice.padId,
+          at: open ? -1 : Math.max(0, Math.min(1,
+            (now - voice.from) / Math.max(0.001, voice.until - voice.from))),
+          seconds: open ? (now - voice.from) : voice.length,
+          done: open ? 0 : now - voice.from,
+          open
+        });
+      });
+      return out;
+    },
 
     backend: "webaudio"
   };

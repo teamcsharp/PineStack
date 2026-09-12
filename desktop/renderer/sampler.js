@@ -470,6 +470,14 @@
     return Math.pow(2, sixteenSemitone(index) / 12);
   }
 
+  /* The pad's stored tune, for the ledger. A pad can be tuned in the trim
+   * editor and it changes how long it takes to play. */
+  function padPitch(index) {
+    const meta = layout[bank][index];
+    const pitch = meta && Number(meta.pitch);
+    return isFinite(pitch) && pitch > 0 ? pitch : 1;
+  }
+
   function repeatInterval() {
     const beat = 60 / Math.max(20, Math.min(300, modes.bpm));
     return (beat * 4 / Math.max(1, modes.division)) * 1000;
@@ -494,14 +502,22 @@
      * audio interference." On by default - see sampler-air.js. */
     duckForPads();
 
+    const pitch = modes.sixteen ? sixteenPitch(index) : undefined;
     const fire = () => audio.fire(key, options);
     const voiceId = fire();
+    began(voiceId, sourceIndex, key,
+      pitch === undefined ? padPitch(sourceIndex) : pitch,
+      modes.gate || (layout[bank][sourceIndex] || {}).loop);
     const record = { voiceId, repeatTimer: null };
     if (modes.repeat) {
       record.repeatTimer = setInterval(() => {
         const previous = held.get(index);
         if (previous && previous.voiceId && modes.gate) audio.release(previous.voiceId);
+        if (previous) ended(previous.voiceId);
         const next = fire();
+        began(next, sourceIndex, key,
+          pitch === undefined ? padPitch(sourceIndex) : pitch,
+          modes.gate || (layout[bank][sourceIndex] || {}).loop);
         if (previous) previous.voiceId = next;
       }, repeatInterval());
     }
@@ -521,10 +537,7 @@
     air.duck('pad');
     if (unduckTimer) return;
     unduckTimer = setInterval(() => {
-      const audio = engine();
-      const still = audio && typeof audio.playing === 'function'
-        ? audio.playing() : 0;
-      if (still > 0 || held.size > 0) return;
+      if (stillSounding().length > 0 || held.size > 0) return;
       clearInterval(unduckTimer);
       unduckTimer = 0;
       air.release('pad');
@@ -538,7 +551,10 @@
     if (element) element.classList.remove("lit");
     if (!record) return;
     if (record.repeatTimer) clearInterval(record.repeatTimer);
-    if (modes.gate && record.voiceId) engine().release(record.voiceId);
+    if (modes.gate && record.voiceId) {
+      engine().release(record.voiceId);
+      ended(record.voiceId);
+    }
   }
 
   function select(index) {
@@ -913,8 +929,15 @@
    * can be exported, and an imported file can be kept as a preset, without
    * any conversion step for the operator to think about. */
   let kitSheet = null;
+  /* PineDismiss.watch hands back an unwatch and it must be used: every open
+   * would otherwise leave a live entry behind holding this sheet and its
+   * close. They are inert (showing() checks isConnected) but they accumulate
+   * for the life of the page, and a list of dead watchers is walked on every
+   * pointerdown in the app. */
+  let unwatchKits = null;
 
   function closeKits() {
+    if (unwatchKits) { unwatchKits(); unwatchKits = null; }
     if (kitSheet) { kitSheet.remove(); kitSheet = null; }
   }
 
@@ -972,6 +995,62 @@
       const got = await kits.exportKit(null, kits.defaultName(null));
       note(got.ok ? "Exported to " + got.where : "It would not export.");
     }));
+    /* THE HARDWARE DOOR. A folder of WAVs beside an .xpm program, which is
+     * what an MPC reads - see sampler-kits.js for what is certain about it
+     * and what is not. Seventeen files and tens of megabytes, so it reports
+     * as it goes rather than appearing to hang. */
+    acts.appendChild(kitAct("Export as an MPC kit", async () => {
+      const name = prompt("Name this kit (it becomes the MPC program name)",
+        "Pine Box bank " + (bank + 1));
+      if (!name) return;
+      note("Building the MPC kit…");
+      const got = await root.PineSamplerKits.exportMpc(bank, name, (where) => {
+        note("MPC kit: " + where);
+      });
+      note(got.ok
+        ? "MPC kit written: " + got.pads + " pads in Downloads/" + got.folder
+          + " - copy the whole folder to the MPC and open " + got.program
+        : "The MPC kit could not be written.");
+    }));
+    /* STRAIGHT ONTO THE MPC. It exports first and then copies: the kit is
+     * built and verified on local storage either way, and a card that is
+     * unplugged halfway through leaves the good copy behind. */
+    acts.appendChild(kitAct("Send this bank to the MPC over USB", async () => {
+      const bridge = root.pineDesktop;
+      if (!bridge || typeof bridge.usbState !== "function") {
+        note("This terminal cannot reach a USB disk.");
+        return;
+      }
+      let state = await bridge.usbState();
+      if (!state.chosen) {
+        if (!state.anyRemovable) {
+          note("No USB disk is attached. Put the MPC in USB mode and connect "
+            + "it with an OTG or USB-C cable, then try again.");
+          return;
+        }
+        note("Point at the MPC’s disk…");
+        const picked = await bridge.usbPick();
+        if (!picked.ok) { note("No disk was chosen."); return; }
+        state = await bridge.usbState();
+      }
+      const name = prompt("Name this kit (it becomes the MPC program name)",
+        "Pine Box bank " + (bank + 1));
+      if (!name) return;
+      note("Building the kit…");
+      const built = await root.PineSamplerKits.exportMpc(bank, name, (where) => {
+        note("MPC kit: " + where);
+      });
+      if (!built.ok) {
+        note("The kit could not be built: " + (built.detail || "unknown"));
+        return;
+      }
+      note("Copying to " + (state.name || "the disk") + "…");
+      const sent = await bridge.usbSend({folder: built.folder});
+      note(sent.ok
+        ? "Sent " + sent.files + " files to " + sent.where
+          + " - open " + built.program + " on the MPC"
+        : "The copy failed: " + (sent.detail || "unknown"));
+    }));
     acts.appendChild(kitAct("Import a kit file", async () => {
       try {
         const kit = await kits.importFile();
@@ -988,7 +1067,7 @@
     kitSheet.appendChild(acts);
 
     document.body.appendChild(kitSheet);
-    if (root.PineDismiss) root.PineDismiss.watch(kitSheet, closeKits, []);
+    if (root.PineDismiss) unwatchKits = root.PineDismiss.watch(kitSheet, closeKits, []);
     await fillKits(saved);
   }
 
@@ -1056,6 +1135,162 @@
     }
   }
 
+  /* ------------------------------------------------------- what is sounding
+   *
+   * THE VIEW KEEPS ITS OWN LIST OF VOICES, and it has to, because there are
+   * TWO engines behind this seam and only one of them can answer.
+   *
+   *   web audio   sampler-engine.js, used on the desktop. Knows everything.
+   *   oboe        the native terminal engine, which is what the TABLET runs
+   *               (measured: window.pineSampler.backend === "oboe"). Its
+   *               bridge publishes 24 methods and none of them is `active`
+   *               or `playing` - levels() reports a voice COUNT and nothing
+   *               per voice.
+   *
+   * So the timeline and the pad-solo duck were both written against methods
+   * that do not exist on the device they were written for. Rather than push
+   * a per-voice report down through the JNI and the C++ core for a progress
+   * bar, the view records what it started: it knows the pad, the length, the
+   * pitch and the moment, which is everything a playhead needs.
+   *
+   * THE CLOCK IS performance.now(), not the audio clock. A few milliseconds
+   * of drift over an eight-second bar is invisible; reaching for the audio
+   * clock would mean having one, and the native engine does not lend one. */
+  const sounding = new Map();   /* voiceId -> {padId, at, length, open} */
+
+  /* How long this pad will actually take at this pitch. `seconds()` is the
+   * whole recording; a trimmed pad plays only its window, and a pad played
+   * an octave up finishes in half the time - a bar that ignored either would
+   * be wrong exactly when 16 LEVEL or the trim editor is in use. */
+  function willTake(key, index, pitch) {
+    const audio = engine();
+    let length = 0;
+    try { length = Number(audio.seconds(key)) || 0; } catch (err) { length = 0; }
+    const meta = layout[bank][index];
+    if (meta && meta.trim) {
+      const from = Math.max(0, Number(meta.trim.start) || 0);
+      const to = Math.min(length || Infinity, Number(meta.trim.end) || length);
+      if (to > from) length = to - from;
+    }
+    const rate = isFinite(pitch) && pitch > 0 ? pitch : 1;
+    return length / rate;
+  }
+
+  function began(voiceId, index, key, pitch, open) {
+    if (!voiceId) return;
+    sounding.set(voiceId, {
+      padId: index,
+      at: performance.now(),
+      length: willTake(key, index, pitch),
+      open: !!open
+    });
+    startTimeline();
+  }
+
+  function ended(voiceId) {
+    if (voiceId) sounding.delete(voiceId);
+  }
+
+  /* Everything still sounding, in the shape the timeline draws. A one-shot
+   * retires itself when its length is up: nothing tells the view that a
+   * voice finished, and a lane that never cleared would say a pad was
+   * playing long after the room went quiet. */
+  function stillSounding() {
+    const now = performance.now();
+    const out = [];
+    sounding.forEach((voice, id) => {
+      const done = (now - voice.at) / 1000;
+      if (!voice.open && done >= voice.length + 0.08) {
+        sounding.delete(id);
+        return;
+      }
+      out.push({
+        id: id,
+        padId: voice.padId,
+        open: voice.open,
+        done: done,
+        seconds: voice.open ? done : voice.length,
+        at: voice.open ? -1 : Math.max(0, Math.min(1, done / Math.max(0.001, voice.length)))
+      });
+    });
+    return out;
+  }
+
+  /* ----------------------------------------------------------- timeline */
+
+  /* ONE rAF LOOP, AND ONLY WHILE SOMETHING IS SOUNDING.
+   *
+   * This panel already keeps about eleven WebGL canvases running, which is
+   * the whole of its remaining input delay - measured at 40-210 ms per
+   * touch. A twelfth animation that ran all day for a grid that is silent
+   * most of the time would be a straight subtraction from that. So the loop
+   * starts on the first press and stops itself the moment the engine reports
+   * no voices.
+   *
+   * The clock is the ENGINE's, read through active(): the AudioContext clock
+   * is what the sound is actually scheduled against, so a bar driven by it
+   * cannot drift away from what is being heard - which a Date.now() bar
+   * would, and worst on a busy main thread, exactly when it is most visible. */
+  let timeTimer = 0;
+
+  function startTimeline() {
+    if (timeTimer) return;
+    const strip = el("pbTime");
+    if (!strip) return;
+    const step = () => {
+      const live = stillSounding();
+      paintTimeline(strip, live);
+      if (!live.length) {
+        timeTimer = 0;
+        strip.hidden = true;
+        strip.innerHTML = "";
+        return;
+      }
+      timeTimer = requestAnimationFrame(step);
+    };
+    timeTimer = requestAnimationFrame(step);
+  }
+
+  function paintTimeline(strip, live) {
+    if (!live.length) return;
+    strip.hidden = false;
+    /* A LANE PER SOUNDING PAD. Pads layer - that is what POLY is for - and
+     * one bar showing only the newest would hide the fact. Lanes are keyed
+     * by voice id so a retrigger does not make the bar jump backwards
+     * through a lane that belongs to a voice still running. */
+    const want = Object.create(null);
+    for (const voice of live) want[voice.id] = voice;
+
+    for (const node of [].slice.call(strip.children)) {
+      if (!want[node.dataset.voice]) node.remove();
+    }
+    for (const voice of live) {
+      let lane = strip.querySelector('[data-voice="' + voice.id + '"]');
+      if (!lane) {
+        lane = document.createElement("div");
+        lane.className = "pb-time-lane";
+        lane.dataset.voice = voice.id;
+        lane.innerHTML = '<span class="pb-time-name"></span>'
+          + '<i class="pb-time-rail"><b class="pb-time-fill"></b></i>'
+          + '<span class="pb-time-clock"></span>';
+        strip.appendChild(lane);
+      }
+      const pad = Number(voice.padId);
+      const meta = isFinite(pad) ? layout[bank][pad] : null;
+      lane.querySelector(".pb-time-name").textContent =
+        (isFinite(pad) ? (pad + 1) + " " : "") + (meta ? meta.label : "").slice(0, 38);
+      /* A voice with no end - a loop, or a gate still held - gets a running
+       * stripe rather than a percentage. A progress bar for something that
+       * does not end is a lie, and this sampler has had enough of those. */
+      lane.classList.toggle("open", voice.open);
+      const fill = lane.querySelector(".pb-time-fill");
+      fill.style.width = voice.open ? "100%" : (voice.at * 100).toFixed(2) + "%";
+      lane.querySelector(".pb-time-clock").textContent = voice.open
+        ? voice.seconds.toFixed(1) + "s"
+        : voice.done.toFixed(1) + " / " + voice.seconds.toFixed(1) + "s";
+    }
+  }
+
   /* ------------------------------------------------------- pad gestures */
 
   const HOLD_MS = 600;    /* the same hold line-actions.js uses */
@@ -1063,8 +1298,48 @@
   let gesture = null;
   let bin = null;
 
+  /* HAS SOMETHING ON IT - which is NOT the same as "ready to sound".
+   *
+   * A pad can carry a recording that is not decoded yet: the bank is
+   * preloaded from IndexedDB at mount, a bank switch reloads in the
+   * background, and a pad whose decode failed once stays cold until it is
+   * pressed. paintPads has always drawn those with `.cold`.
+   *
+   * The gesture must key on CONTENT, not on readiness. Keying it on
+   * `engine().loaded` - which is what this did at first - meant tapping a
+   * pad that visibly holds a line opened the "put something on this pad"
+   * window, and dragging it produced no bin. Measured exactly that on the
+   * tablet: pad 1 held a line and answered loaded=false. */
+  function hasContent(index) {
+    return !!layout[bank][index];
+  }
+
   function loadedAt(index) {
-    return !!layout[bank][index] && engine().loaded(padKey(bank, index));
+    return hasContent(index) && engine().loaded(padKey(bank, index));
+  }
+
+  /* WARM A COLD PAD AND PLAY IT, so a press is never silently ignored.
+   * The bytes are on disk; the only thing missing is the decode. */
+  async function warmAndFire(index, event) {
+    const key = padKey(bank, index);
+    const cell = el("pad-" + index);
+    const bar = root.PineBusy ? root.PineBusy.attach(cell, "warming") : null;
+    try {
+      const record = await dbGet(key);
+      if (!record || !record.bytes) {
+        if (bar) bar.finish(false);
+        note("Pad " + (index + 1) + " has lost its audio - clear it and take it again.");
+        return;
+      }
+      await engine().load(key, record.bytes);
+      applySettings(key, layout[bank][index]);
+      if (bar) bar.finish(true);
+      paintPads();
+      press(index, event);
+    } catch (err) {
+      if (bar) bar.finish(false);
+      note("Pad " + (index + 1) + " would not load: " + ((err && err.message) || err));
+    }
   }
 
   /* THE BIN.
@@ -1197,7 +1472,19 @@
       await putBytesOnPad(index, bytes, {
         label: "air " + take.toFixed(1) + "s",
         who: "broadcast", kind: "air",
-        cut: "the last " + take.toFixed(1) + " seconds as it played"
+        cut: "the last " + take.toFixed(1) + " seconds as it played",
+        /* WHERE IN THE RING THIS CAME FROM, so it can be widened afterwards.
+         *
+         * "In the event that I am tapping and holding it when audio is
+         * already playing, I want to be able to retroactively go into that
+         * sample and expand the play head forward and grab the full sentence
+         * that was being said."
+         *
+         * A ring offset is only meaningful together with the moment it was
+         * measured - "eight seconds ago" means something different a minute
+         * later - so the wall clock is stamped beside it and the window is
+         * re-derived from the two. */
+        air: {from: take, to: 0, at: Date.now()}
       });
       if (bar) bar.finish(true);
       note("Pad " + (index + 1) + " - " + take.toFixed(1)
@@ -1232,7 +1519,7 @@
 
   /* TAP AN EMPTY PAD: the grab window - scrub back through what just played,
    * or pick one of the clips listed beside it. Lives in sampler-grab.js. */
-  function openGrab(index) {
+  function openGrab(index, widen) {
     if (!root.PineSamplerGrab) {
       note("The grab window is not loaded on this terminal.");
       return;
@@ -1240,6 +1527,9 @@
     root.PineSamplerGrab.open({
       bank: bank,
       pad: index,
+      /* The window this pad was cut from, when it came off the air, so the
+       * selection opens on it instead of on the last few seconds. */
+      widen: widen || null,
       put: (bytes, extra) => putBytesOnPad(index, bytes, extra),
       note: note
     });
@@ -1465,8 +1755,22 @@
           pad: p, x: event.clientX, y: event.clientY,
           moved: false, dragging: false, took: false, timer: 0
         };
-        if (loadedAt(p)) {
-          press(p, event);
+        if (hasContent(p)) {
+          if (loadedAt(p)) press(p, event);
+          else warmAndFire(p, event);
+          /* A HOLD ON A PAD THAT CAME OFF THE AIR REOPENS ITS WINDOW, so the
+           * half-sentence that was caught can be widened into the whole one.
+           * Only for air takes: a station clip has no ring behind it, and
+           * holding it still means the trim editor. */
+          const meta = layout[bank][p];
+          if (meta && meta.air) {
+            gesture.timer = setTimeout(() => {
+              gesture.timer = 0;
+              gesture.took = true;
+              lift(p);
+              openGrab(p, meta.air);
+            }, HOLD_MS);
+          }
         } else {
           gesture.timer = setTimeout(() => {
             gesture.timer = 0;
@@ -1483,7 +1787,7 @@
         if (dx <= SLOP && dy <= SLOP) return;
         gesture.moved = true;
         if (gesture.timer) { clearTimeout(gesture.timer); gesture.timer = 0; }
-        if (loadedAt(p) && !gesture.dragging) {
+        if (hasContent(p) && !gesture.dragging) {
           gesture.dragging = true;
           lift(p);                     /* it is being carried, not played */
           showBin(p);
@@ -1497,7 +1801,7 @@
         if (!g || g.pad !== p) { lift(p); return; }
         if (g.timer) clearTimeout(g.timer);
         if (g.dragging) { dropOnBin(p, event); return; }
-        if (loadedAt(p)) { lift(p); return; }
+        if (hasContent(p)) { lift(p); return; }
         if (!g.took && !g.moved) openGrab(p);
       };
       pad.addEventListener("pointerup", finish);
@@ -1510,7 +1814,7 @@
        * operator's "sample the broadcast now", and the two would fight. */
       pad.addEventListener("contextmenu", (event) => {
         event.preventDefault();
-        if (!loadedAt(p)) return;
+        if (!hasContent(p)) return;
         select(p);
         if (root.PineSamplerTrim) root.PineSamplerTrim.open(bank, p);
       });
@@ -1594,7 +1898,14 @@
     stop.className = "pb-mode pb-act danger";
     stop.textContent = "STOP";
     stop.title = "Silence every pad at once";
-    stop.addEventListener("click", () => engine().stopAll());
+    stop.addEventListener("click", () => {
+      engine().stopAll();
+      /* The ledger is the view's own record and nothing tells it the engine
+       * went quiet, so STOP has to say so - otherwise the timeline keeps
+       * drawing lanes for voices that were cut a moment ago. */
+      sounding.clear();
+      if (root.PineAir) root.PineAir.release('pad');
+    });
     controls.appendChild(stop);
 
     /* ---- the second row: the dials the toggles above need ---------------
@@ -1694,7 +2005,22 @@
     const padwrap = document.createElement("div");
     padwrap.className = "pb-padwrap";
     padwrap.appendChild(grid);
+    /* THE TIMELINE, ACROSS THE SAMPLER.
+     *
+     * "When playing a song on a sampler pad show a timeline going across the
+     * sampler as the clip is playing, illustrating that the clip is playing."
+     *
+     * Directly under the grid, so the eye travels from the pad it just hit
+     * to the bar that pad started. It is empty and takes no height until
+     * something sounds - a permanent empty strip under a 4x4 on a nine-inch
+     * screen is height spent on nothing. */
+    const timeline = document.createElement("div");
+    timeline.className = "pb-time";
+    timeline.id = "pbTime";
+    timeline.hidden = true;
+
     right.appendChild(padwrap);
+    right.appendChild(timeline);
     right.appendChild(controls);
     right.appendChild(dials);
     host.appendChild(left);

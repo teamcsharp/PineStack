@@ -90,7 +90,11 @@
   var filled = 0;           /* how much of the ring is real            */
   var loudest = 0;          /* peak since the last level() read        */
 
-  var taps = new WeakMap(); /* element -> {gain, source}               */
+  var taps = new WeakMap(); /* element -> {joined}                     */
+  /* Declared up here because tap() reads them: a player that starts while
+   * the broadcast is ducked has to be caught on arrival. */
+  var ducked = false;
+  var silenced = [];
   var known = [];           /* every element we have seen play         */
   var reason = 'not started';
   var live = false;
@@ -176,6 +180,14 @@
   function tap(element) {
     if (!element || taps.has(element)) return taps.get(element) || null;
     if (known.indexOf(element) < 0) known.push(element);
+
+    /* A PLAYER THAT ARRIVES MID-DUCK IS DUCKED TOO. The broadcast is a
+     * stream of separate players - a record, a voice, a sting - and one that
+     * starts while a pad is sounding would otherwise talk straight over it.
+     * Measured: three players muted, a fourth started, and it was audible. */
+    if (ducked && !element.muted) {
+      try { element.muted = true; silenced.push(element); } catch (err) { /* fine */ }
+    }
 
     /* THE PANEL'S OWN SCOPE FIRST. audioScope memoises one analyser per
      * player and is what every meter in the panel already reads, so joining
@@ -294,7 +306,6 @@
    * I am hearing just the sound of that sample pad." */
   var duckOn = true;
   var holders = Object.create(null);
-  var ducked = false;
 
   function setDuckEnabled(on) {
     duckOn = !!on;
@@ -342,8 +353,6 @@
    * blanket `muted = false` on release would undo that and put the house back
    * into exactly the fault the gate exists to prevent. So the duck remembers
    * which players it silenced and gives back only those. */
-  var silenced = [];
-
   function lower(down) {
     if (down === ducked) return;
     ducked = down;

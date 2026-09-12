@@ -745,3 +745,85 @@
     max-height: 34vh;
   }
 }
+
+/* --- the timeline across the sampler ------------------------------------
+ *
+ * "When playing a song on a sampler pad show a timeline going across the
+ * sampler as the clip is playing, illustrating that the clip is playing."
+ *
+ * One lane per sounding voice, directly under the grid, and absent entirely
+ * when nothing is playing - a permanent empty strip under a 4x4 on a
+ * nine-inch screen is height spent on nothing. */
+.pb-time {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.pb-time[hidden] { display: none !important; }
+.pb-time-lane {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(34, 43, 53, .55);
+}
+.pb-time-name {
+  flex: 0 0 auto;
+  max-width: 40%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+.pb-time-rail {
+  flex: 1;
+  position: relative;
+  height: 7px;
+  border-radius: 4px;
+  background: #141b21;
+  overflow: hidden;
+}
+.pb-time-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #54d18b, #65c7da);
+}
+/* A voice with no end - a loop, or a gate still held - travels instead of
+ * filling. A progress bar for something that does not end is a lie. */
+.pb-time-lane.open .pb-time-fill {
+  width: 100% !important;
+  background: repeating-linear-gradient(
+    90deg, #54d18b 0 14px, rgba(84, 209, 139, .25) 14px 28px);
+  animation: pb-time-run .7s linear infinite;
+}
+@keyframes pb-time-run {
+  from { background-position: 0 0; }
+  to   { background-position: 28px 0; }
+}
+.pb-time-clock {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pb-time-lane.open .pb-time-fill { animation: none; }
+}
+
+/* The ground a re-grab may be dragged over: twenty seconds either side of
+ * the take, or as much of it as the ring actually holds. Drawn UNDER the
+ * selection so the selection stays the bright thing. */
+.sg-widen {
+  position: absolute; top: 0; bottom: 0;
+  background: rgba(227, 190, 99, .13);
+  border-left: 1px dashed rgba(227, 190, 99, .5);
+  border-right: 1px dashed rgba(227, 190, 99, .5);
+  pointer-events: none;
+}
