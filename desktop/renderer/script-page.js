@@ -75,7 +75,7 @@
   var flow = null;                  /* dialogue_flow: why it is waiting */
   var stationPaused = false;
   var skewMs = 0;                   /* server clock minus ours */
-  var driftMs = 0;                  /* playout minus the handover stamp */
+  var lastOffMs = 0;                /* #1267: watched, no longer applied */
   var nowLineId = '';               /* the one line being said */
   var follow = true;                /* keep it on screen */
   var selfScrollUntil = 0;          /* a scroll WE started, not the operator */
@@ -449,7 +449,11 @@
    * between the two machines cancels instead of accumulating. */
   function streamAt() {
     if (!liveStream || !liveStream.at) return -1;
-    return ((Date.now() + skewMs + driftMs) / 1000) - Number(liveStream.at || 0);
+    /* #1267: NO SECOND CLOCK. `skewMs` is re-read from `server_ms` on
+     * every poll and is the same correction the station feed itself
+     * uses; `driftMs` was a THIRD term on top, and it is what made the
+     * highlight trail the audio. See correct() below. */
+    return ((Date.now() + skewMs) / 1000) - Number(liveStream.at || 0);
   }
 
   /* The row the room is hearing. stream_now first - it is exact to the
@@ -508,7 +512,33 @@
     /* Held SEPARATELY from the clock skew, which is re-read from
      * `server_ms` on every poll and would otherwise wipe this out four
      * seconds after it was learned. */
-    driftMs += off * 0.5;   /* off is already milliseconds; take half the gap */
+    /* #1267: AND IT IS NO LONGER CARRIED. Measured on the tablet
+     * against the station, 21 samples where the room was saying a
+     * named line: the highlight was the right line in 16, and in the
+     * other 5 it was BEHIND - one entry twice, two once, three twice -
+     * and never once ahead. A one-directional error is a bias, not
+     * drift.
+     *
+     * This is why. `driftMs` starts at 0 on every new burst (the
+     * subscriber resets it whenever `liveStream.at` moves), is only
+     * touched when the interpolated position falls OUTSIDE the row the
+     * station names, and then closes just HALF the gap. So each burst
+     * began with the error back at zero and converged in halves, which
+     * on lines of five to seven seconds means it is still catching up
+     * when the burst ends.
+     *
+     * The comment above justified it by 2 disagreements in 30 samples
+     * at burst boundaries. It is now costing 5 in 21 across the whole
+     * line - the cure was worse than the fault.
+     *
+     * The station's own feed has no such term: sampler-feed.js reads
+     * `Date.now() + skew` and picks the row whose window contains it,
+     * full stop. With this gone the two arithmetics are identical, and
+     * the page agrees with the feed by construction rather than by
+     * chasing it. `off` is still measured and reported below, because a
+     * number worth fixing is worth watching.
+     */
+    lastOffMs = off;
   }
 
   /* ONE line carries the mark. The class is removed from whatever had it
@@ -966,7 +996,7 @@
         var state = (payload && payload.station) || payload || {};
         var wasAt = liveStream && liveStream.at;
         liveStream = state.stream_now || null;
-        if (!liveStream || liveStream.at !== wasAt) driftMs = 0;
+        if (!liveStream || liveStream.at !== wasAt) lastOffMs = 0;
         speakingNow = state.speaking_now || null;
         flow = state.dialogue_flow || null;
         /* talk_next_in rides at the top of the payload, not inside
