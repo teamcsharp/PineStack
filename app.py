@@ -121447,6 +121447,49 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                  for e in actions])
     events.sort(key=lambda e: (e["at"], e["sort"]))
 
+    # #1259: AND THEN THE SCRIPT DECIDES. The sort above orders rounds
+    # against each other and places the interjections, which is what a
+    # timestamp is good for. It is NOT what a script is: a screenplay
+    # assembled from the air log and ordered by a clock is a transcript
+    # with a screenplay's typography, and it can be wrong.
+    #
+    # A round's turn numbers cannot be wrong - they are what was
+    # written and what the welded audio plays in - so within one round
+    # the spoken lines are put in TURN order, in the positions they
+    # already hold. The interjections do not move: they stay between
+    # the turns they actually interrupted.
+    #
+    # Bursts are kept apart. A multi-burst round honestly numbers
+    # 1,2,3 ... 1,2 ... 1,2,3 (#1257), so a descent to at-or-below the
+    # run's start opens a new burst and each is ordered within itself.
+    try:
+        _slots: dict[str, list[int]] = {}
+        for _i, _e in enumerate(events):
+            if _e.get("what") != "line":
+                continue
+            _r = _e.get("row") or {}
+            if _r.get("turn") is None or not str(_r.get("sid") or ""):
+                continue
+            _slots.setdefault(str(_r["sid"]), []).append(_i)
+        for _sid, _where in _slots.items():
+            if len(_where) < 2:
+                continue
+            _rows = [events[_i] for _i in _where]
+            _burst = 0
+            _last = None
+            for _e in _rows:
+                _t = int((_e.get("row") or {}).get("turn") or 0)
+                if _last is not None and _t <= _last:
+                    _burst += 1          # the next burst of this round
+                _e["_key"] = (_burst, _t)
+                _last = _t
+            _rows.sort(key=lambda e: e["_key"])
+            for _i, _e in zip(_where, _rows):
+                _e.pop("_key", None)
+                events[_i] = _e
+    except Exception:  # noqa: BLE001
+        pass                # a script that will not re-order still reads
+
     elements: list[dict[str, Any]] = []
     scenes: list[tuple[int, float]] = []    # (subheader index, scene start)
     scene_round = None
