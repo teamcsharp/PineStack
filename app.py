@@ -93867,6 +93867,36 @@ async def media_spectrogram(
                         headers={"Cache-Control": "private, max-age=86400"})
 
 
+# #1214: a clip small enough to answer in one body does, because the
+# loop it has to cross is frozen 13.6% of the time in blocks of up to
+# eight seconds (measured: 26 stalls, 81.7s, in 600s) and a chunked
+# response waits in every one of them. Above this, streaming again -
+# holding a 40 MB tape in memory per listener trades one fault for worse.
+MEDIA_WHOLE_MAX = 12 * 1024 * 1024
+
+
+async def _media_slice(path: Path, start: int, length: int) -> bytes | None:
+    """`length` bytes from `start`, read OFF THE LOOP in one go.
+
+    None when it cannot be read that way, and the caller streams instead.
+    The read must stay in a thread: #883 and #999 both had to undo a
+    synchronous read_bytes() on this very route, which blocked every
+    listener at once. One await, in a thread, then a body."""
+    if length <= 0 or length > MEDIA_WHOLE_MAX:
+        return None
+
+    def work() -> bytes:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            return handle.read(length)
+
+    try:
+        got = await asyncio.to_thread(work)
+    except Exception:  # noqa: BLE001
+        return None
+    return got if len(got) == length else None
+
+
 @app.get("/media/{key}")
 async def media(
     key: str,
@@ -93960,9 +93990,20 @@ async def media(
         start, end = window
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         headers["Content-Length"] = str(end - start + 1)
+        # #1214: ONE CROSSING OF THE LOOP, NOT ONE PER CHUNK.
+        blob = await _media_slice(served, start, end - start + 1)
+        if blob is not None:
+            return Response(content=blob, status_code=206,
+                            headers=headers, media_type=media_type)
         return StreamingResponse(_range_stream(served, start, end),
                                  status_code=206, headers=headers,
                                  media_type=media_type)
+    if size <= MEDIA_WHOLE_MAX:
+        blob = await _media_slice(served, 0, size)
+        if blob is not None:
+            headers["Content-Length"] = str(len(blob))
+            return Response(content=blob, headers=headers,
+                            media_type=media_type)
     return FileResponse(served, media_type=media_type, headers=headers)
 
 
@@ -111927,6 +111968,10 @@ BROADCAST_STEPS: list[dict[str, str]] = [
      "say": "Lifts a pause. The booth banks material while the door is "
             "shut, so there is always something to say on the way back.",
      "tone": "air"},
+    {"key": "speed", "label": "Why are clips not starting?",
+     "say": "Times a real clip and reads what the event loop is stuck "
+            "in. The one fault with no error anywhere (#1214). Changes "
+            "nothing.", "tone": "look"},
     {"key": "reload_pages", "label": "Reload every page",
      "say": "A stale pause, a stuck player, yesterday's code - all live "
             "in the tab, where no restart can reach them.", "tone": "do"},
@@ -112087,6 +112132,22 @@ async def broadcast_step(step: str) -> dict[str, Any]:
             said.append("suggest    the queue is deep but nothing has "
                         "failed yet - give it a moment before pulling a "
                         "lever")
+
+    elif step == "speed":
+        said.append("$ time a clip, and read the loop")
+        got = await media_speed_probe()
+        said.append("  clip       %s, %s KB in %dms = %d KB/s"
+                    % (got.get("clip") or "?", got.get("kb"),
+                       int(got.get("ms") or 0), int(got.get("kbps") or 0)))
+        said.append("  loop       %d stall(s) in 10 min, %.1fs total, "
+                    "worst %.1fs"
+                    % (int(got.get("stalls") or 0),
+                       float(got.get("stalled_seconds") or 0),
+                       float(got.get("worst_seconds") or 0)))
+        if got.get("stuck_in"):
+            said.append("  stuck in   " + ", ".join(got["stuck_in"]))
+        said.append("")
+        said.append("  " + str(got.get("say") or ""))
 
     elif step == "reload_pages":
         said.append("$ ask every page to reload")
@@ -112317,7 +112378,22 @@ async def air_watch() -> None:
                                   say="reaching listeners (last heard %ds ago)"
                                       % int(quiet))
                 continue
-            # Silent, on, and unpaused. Which rung is due?
+            # #1213: SILENCE IS NOT A FAULT ON ITS OWN. `quiet` counts
+            # from the last audible VOICE report, and a record playing
+            # with no talk due produces none - measured at 60s+ between
+            # lines on a perfectly healthy station. The fault is clips
+            # STACKED UP AND NOT STARTING, so the ladder only fires when
+            # the page is holding work it has not begun. Without this the
+            # watchdog would flush the feed in the middle of every quiet
+            # musical stretch, which is worse than the fault it is for.
+            waiting = int((page_wedge_state() or {}).get("waiting") or 0)
+            if waiting < PAGE_WEDGE_WAITING:
+                _AIR_WATCH.update(
+                    rung=-1,
+                    say=("quiet %ds, but nothing is queued for the page - "
+                         "that is the schedule, not a fault" % int(quiet)))
+                continue
+            # Silent, on, unpaused, and holding work. Which rung is due?
             due = -1
             for index, (after, _step, _said) in enumerate(AIR_LADDER):
                 if quiet >= after:
@@ -112345,7 +112421,19 @@ async def air_watch() -> None:
             pipeline_log("air", "nothing has been heard for %ds - %s (#1213)"
                          % (int(quiet), said))
             note = {"at": time.time(), "event": "tried", "step": step,
-                    "quiet": round(quiet, 1), "said": said}
+                    "quiet": round(quiet, 1), "said": said,
+                    "waiting": waiting}
+            # #1215: MEASURE BEFORE PULLING A LEVER. #1214 was a fault
+            # with no error anywhere - every lever on this ladder would
+            # have run and failed, which is what happened for two days.
+            # The measurement rides along so a silent hour leaves
+            # something behind even when the cure does not work.
+            try:
+                note["delivery"] = await media_speed_probe()
+                pipeline_log("air", str(note["delivery"].get("say") or "")
+                             + " (#1215)")
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 if step == "reload":
                     pages_reload("nothing heard for %ds" % int(quiet))
@@ -112368,6 +112456,75 @@ async def air_watch() -> None:
 @app.on_event("startup")
 async def _startup_air_watch() -> None:
     fire_and_forget(air_watch())
+
+
+async def media_speed_probe() -> dict[str, Any]:
+    """#1215: how fast is a voice clip actually served, and why not.
+
+    Reads a real recent clip the way the route now does - one threaded
+    read - and sets that beside what the event loop has been stuck in.
+    Those two numbers together are the whole of #1214, and neither of
+    them alone says anything."""
+    out: dict[str, Any] = {"at": time.time(), "kb": 0, "ms": 0,
+                           "kbps": 0, "clip": "", "say": ""}
+    try:
+        pick = ""
+        for row in list(_RADIO.get("voice_clips") or [])[-12:]:
+            name = str(row.get("url") or "").split("?")[0].rsplit("/", 1)[-1]
+            if name and MEDIA_KEY_SHAPE.match(name):
+                pick = name
+        if not pick:
+            out["say"] = "no clip has been offered yet - nothing to time"
+            return out
+        path = VOICE_MEDIA_DIR / pick
+        began = time.time()
+        blob = await asyncio.to_thread(path.read_bytes)
+        took = max(0.001, time.time() - began)
+        out.update(clip=pick[:12], kb=round(len(blob) / 1024.0, 1),
+                   ms=int(took * 1000),
+                   kbps=int(len(blob) / 1024.0 / took))
+    except Exception as exc:  # noqa: BLE001
+        out["say"] = "could not time a clip: " + type(exc).__name__
+        return out
+    try:
+        pulse = pulse_report(600) or {}
+    except Exception:  # noqa: BLE001
+        pulse = {}
+    out["stalls"] = int(pulse.get("stalls") or 0)
+    out["stalled_seconds"] = round(float(pulse.get("stalled_s") or 0), 1)
+    out["worst_seconds"] = round(float(pulse.get("worst_s") or 0), 1)
+    out["stuck_in"] = [str((r or {}).get("frame") or "")
+                       for r in (pulse.get("top") or [])[:4]]
+    frozen = out["stalled_seconds"] / 6.0          # percent of ten minutes
+    if out["kbps"] and out["kbps"] < 200 and out["stalls"] > 6:
+        out["say"] = ("a clip reads at %d KB/s and the loop stalled %d "
+                      "time(s) in ten minutes (%.1fs, worst %.1fs, %.0f%% "
+                      "of the window) - a streamed response waits in every "
+                      "one of those, which is #1214. Look at %s."
+                      % (out["kbps"], out["stalls"], out["stalled_seconds"],
+                         out["worst_seconds"], frozen,
+                         ", ".join(out["stuck_in"][:2]) or "the pulse"))
+    elif out["stalls"] > 12:
+        out["say"] = ("clips read fine (%d KB/s) but the loop stalled %d "
+                      "time(s) in ten minutes (%.1fs, worst %.1fs) - "
+                      "anything paced or streamed will be late. Look at %s."
+                      % (out["kbps"], out["stalls"], out["stalled_seconds"],
+                         out["worst_seconds"],
+                         ", ".join(out["stuck_in"][:2]) or "the pulse"))
+    else:
+        out["say"] = ("a clip reads at %d KB/s with %d loop stall(s) in "
+                      "ten minutes - delivery is not the problem."
+                      % (out["kbps"], out["stalls"]))
+    return out
+
+
+@app.get("/api/broadcast/speed")
+async def broadcast_speed_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1215: is the air slow because of DELIVERY, and if so, why."""
+    require_read_auth(authorization)
+    return await media_speed_probe()
 
 
 @app.get("/api/broadcast/watch")
