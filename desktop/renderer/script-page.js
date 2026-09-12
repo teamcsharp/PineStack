@@ -1161,6 +1161,12 @@
     var row = activeRow();
     markNow(row ? row.id : '');
     markFeedLive(row ? row.id : '');            /* #1279 */
+    /* #1286: say when the room is quiet, instead of leaving a page full
+       of `pending` and `tinted` marks to be read as though one of them
+       were live. */
+    try {
+      host.classList.toggle('sp-quiet', !(row && row.id));
+    } catch (err) { /* the mark still stands on its own */ }
     paintStatus();
   }
 

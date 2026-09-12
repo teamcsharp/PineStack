@@ -19880,8 +19880,7 @@ def _replay_save() -> None:
 
 
 async def voice_generate(text: str, voice: str, engine: str,
-                         fx: dict[str, float] | None = None,
-                         line: str = "") -> dict[str, Any]:
+                         fx: dict[str, float] | None = None) -> dict[str, Any]:
     """text + voice in, a stored audio path out. Nothing is created unless
     synthesis succeeds. `fx` wets the line — echo and a room — for the callers
     that want the pair to sound like they are in a booth rather than a
@@ -19964,11 +19963,7 @@ async def voice_generate(text: str, voice: str, engine: str,
     # The attempt and the success are different facts; only success
     # resets the clock (stamped after the engine answers, below).
     _SYNTH_TRIED[0] = time.time()
-    # #1277: WITH THE LINE'S OWN NAME ON IT. Optional, because fifteen
-    # other callers render things that are not script lines; when it is
-    # given, the feed can show the words and point at the script.
-    note_activity("voicing", f"{engine} · {len(text)} chars",
-                  line=line, text=text)
+    note_activity("voicing", f"{engine} · {len(text)} chars")
     pipeline_log("voice", f"{engine} · {voice or 'default voice'} · "
                           f"{len(text)} chars in",
                  extra=(f"INPUT to {engine} "
@@ -22905,32 +22900,14 @@ def radio_state() -> dict[str, Any]:
 # What the desk is doing RIGHT NOW (#305): writing, voicing, speaking —
 # breadcrumbs the panel draws as an activity spectrograph, so a quiet
 # moment is visibly a pause and not a mystery.
-def note_activity(stage: str, detail: str = "",
-                  line: str = "", text: str = "") -> None:
-    """#1277: ...and WHICH LINE it is, and what the line says.
-
-    The feed used to show `voicing · xtts · 163 chars` while the station
-    was talking - true, and useless, because the row had no identity and
-    no words. It could not be matched to the script, could not be
-    clicked through to, and could not be told apart from the row above
-    it. `line` is the id the air log will file this same line under, so
-    every surface can say the same thing about the same line."""
-    now = {"stage": stage, "detail": str(detail)[:80], "at": time.time()}
-    if line:
-        now["line"] = str(line)
-    if text:
-        now["text"] = str(text)[:400]
-    _RADIO["activity"] = now
+def note_activity(stage: str, detail: str = "") -> None:
+    _RADIO["activity"] = {"stage": stage, "detail": str(detail)[:80],
+                          "at": time.time()}
     log = _RADIO.setdefault("activity_log", [])
     # #790: the detail rides in the log too, so the Route cell's history can
     # expand each notification to what was actually said/done.
-    row = {"stage": stage, "detail": str(detail)[:200],
-           "at": int(time.time())}
-    if line:
-        row["line"] = str(line)
-    if text:
-        row["text"] = str(text)[:400]
-    log.append(row)
+    log.append({"stage": stage, "detail": str(detail)[:200],
+                "at": int(time.time())})
     del log[:-120]
 
 
@@ -26496,152 +26473,6 @@ def _ensure_chat_ids() -> None:
 _BUILD_MS = int(time.time() * 1000)
 
 
-# #1283: below this many rows in the ring, the feed door recovers the
-# rest from the durable log. The ring holds 240; a healthy hour fills it
-# in about twenty-four minutes, and the station restarts about every
-# twelve, so it is thin far more often than it is full.
-FEED_WARM_ROWS = 160
-FEED_WARM_SECONDS = 3600.0
-
-
-def feed_warm_rows(held: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The hour behind a thin ring, recovered from the durable log.
-
-    #1283: `_RADIO["chat"]` is emptied on every restart, and the station
-    restarts about every twelve minutes - measured 117 times in 24
-    hours, once from 55 rows to 3 with none carried across, and five
-    times inside one seventeen-minute window. At one such moment the
-    durable log held 50 of the last 50 aired lines while the ring held
-    15, so the script pane showed a full hour and the feed pane beside
-    it showed three rows.
-
-    Everything the ring loses is already in the air log - the keeper
-    writes it FROM the ring, upserted by id, every ten seconds. This
-    fills the hole behind a thin ring and does nothing when there is no
-    hole.
-
-    Read with quiet=True, which is what the screenplay reads: the
-    default read hides stings and analyses, and those are about a third
-    of what a feed shows."""
-    if len(held) >= FEED_WARM_ROWS:
-        return held
-    try:
-        now = time.time()
-        older = airlog_rows(now - FEED_WARM_SECONDS, now + 60.0, quiet=True)
-    except Exception:  # noqa: BLE001
-        return held                      # a feed without history still reads
-    if not older:
-        return held
-    have = {str(r.get("id") or "") for r in held}
-    out: list[dict[str, Any]] = []
-    for row in older:
-        rid = str(row.get("id") or "")
-        if not rid or rid in have:
-            continue
-        got = dict(row)
-        # Not the same thing as a live row: the render dossier and the
-        # provenance die with the process and cannot be recovered.
-        got["from_log"] = True
-        out.append(got)
-    if not out:
-        return held
-    out.extend(held)
-    return out[-240:]
-
-
-def timeline_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """THE canonical order of the station's lines. One function, so that
-    every surface showing a timeline shows the SAME timeline.
-
-    #1280. Each feed used to sort for itself, and all but the script
-    sorted on `air_at` - the most rewritten field in the file. Measured
-    over 32 consecutive polls: 59% of rows had it move, median +47.9s,
-    the last correction landing a median of 104 seconds after the row
-    was already on screen, and the booth's visible order changing on
-    53% of its polls. `ts` moved for none of them.
-
-    The rules are the script's, because the script is the timeline:
-
-      * a conversation (`sid`) is ONE BLOCK, anchored on the earliest
-        `ts` in it - written once, never rewritten;
-      * blocks run in anchor order, `air_at` breaking ties because `ts`
-        is whole seconds;
-      * inside a block, lines run in `turn` order, and a descent to
-        at-or-below the run's start opens the next BURST rather than
-        reading as a jump backwards (#1257);
-      * an interjection - a quip, a sting, a gold bar, `turn` absent or
-        negative - keeps its place against the turn it followed, so it
-        still cuts in where it cut in;
-      * a row with no `sid` is its own block on its own stamps, which is
-        what stops a single-shot line being shuffled into the middle of
-        somebody else's conversation.
-
-    Pure, and total: every row in goes out exactly once, so a caller can
-    never lose a line to this."""
-    def stamps(row: dict[str, Any]) -> tuple[float, float]:
-        at = float(row.get("air_at") or row.get("ts") or 0)
-        ts = float(row.get("ts") or 0) or at
-        return (ts, at)
-
-    blocks: dict[str, list[dict[str, Any]]] = {}
-    order: list[str] = []                  # blocks in first-seen order
-    for at_ix, row in enumerate(rows):
-        if not isinstance(row, dict):
-            continue
-        sid = str(row.get("sid") or "")
-        key = sid or ("\x00solo:%d" % at_ix)   # a lone line is its own block
-        if key not in blocks:
-            blocks[key] = []
-            order.append(key)
-        blocks[key].append(row)
-
-    def anchor(key: str) -> tuple[float, float]:
-        best: tuple[float, float] | None = None
-        for row in blocks[key]:
-            got = stamps(row)
-            if best is None or got < best:
-                best = got
-        return best or (0.0, 0.0)
-
-    out: list[dict[str, Any]] = []
-    for key in sorted(order, key=anchor):
-        held = blocks[key]
-        if len(held) > 1:
-            burst = 0
-            low: int | None = None
-            last: int | None = None
-            keyed: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
-            for seat, row in enumerate(held):
-                raw = row.get("turn")
-                turn = None
-                try:
-                    turn = int(raw) if raw is not None else None
-                except (TypeError, ValueError):
-                    turn = None
-                if turn is None or turn < 0:
-                    # An interjection: it follows the turn it cut into.
-                    keyed.append(((burst, last if last is not None else -1,
-                                   1, seat), row))
-                    continue
-                if low is None:
-                    low = turn
-                elif last is not None and turn <= low and turn <= last:
-                    burst += 1              # the next burst of this round
-                    low = turn
-                last = turn
-                keyed.append(((burst, turn, 0, seat), row))
-            keyed.sort(key=lambda pair: pair[0])
-            held = [row for _, row in keyed]
-        out.extend(held)
-
-    for seat, row in enumerate(out):
-        try:
-            row["seq"] = seat               # #1280: the position itself
-        except Exception:  # noqa: BLE001
-            pass
-    return out
-
-
 def dj_state() -> dict[str, Any]:
     base = radio_state()
     base["build"] = _BUILD_MS
@@ -26842,18 +26673,9 @@ def dj_state() -> dict[str, Any]:
         # whole burst before any of it is audible, so insertion order is not
         # broadcast order and never was. Stable, so anything sharing a moment
         # keeps the order it was written in.
-        # #1280: THE SAME TIMELINE THE SCRIPT SHOWS. This sorted on
-        # `air_at` alone, and every surface downstream - the booth, the
-        # LCD, the sampler, the wall, the marquee, the public page and
-        # the Script view's feed - inherited that order. `air_at` is
-        # rewritten after publication (59% of rows over 32 polls, median
-        # +47.9s, the last correction a median of 104s after the row was
-        # on screen), so those surfaces re-sorted themselves on 53% of
-        # polls while the script sat still. One order, computed once.
-        # #1283: ...and the hour behind it, when the ring is thin
-        # because the station restarted. Costs nothing above
-        # FEED_WARM_ROWS, which is the ordinary case.
-        "chat": timeline_order(feed_warm_rows(chat_rows)),
+        "chat": sorted(chat_rows,
+                       key=lambda m: float(m.get("air_at")
+                                           or m.get("ts") or 0)),
         # #772: the whole per-turn timeline of the round that is playing, so
         # the panel can follow the clip continuously instead of finding out
         # where it has got to on a four-second poll. On an eight-second turn
@@ -43859,7 +43681,7 @@ async def _torrent_talk() -> None:
                             "air", "(#1263) %s -> %s: the %s entry is on "
                             "air and has a finished round waiting - it "
                             "gets its own turn"
-                            % (kind, _groad, SHELF_LABEL.get(_groad, _groad)))
+                            % (kind, _groad, road_face(_groad)))
                         if (_sched_row is not None
                                 and _sched_row.get("kind")
                                 and str(SCHED_PREP_KIND.get(
@@ -45110,6 +44932,17 @@ _ENTRY_GUARD_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
 _ENTRY_GUARD_LOG: dict[str, Any] = {"held": 0, "road": "", "at": 0.0}
 
 
+def road_face(road: str) -> str:
+    """#1263: a road's name with its article stripped, for sentences that
+    supply their own. SHELF_LABEL carries "a phone call", which reads as
+    "the a phone call entry" the moment anything puts "the" in front."""
+    got = str(SHELF_LABEL.get(str(road), str(road)) or "")
+    for lead in ("an ", "a ", "the "):
+        if got.lower().startswith(lead):
+            return got[len(lead):]
+    return got
+
+
 def entry_guard_on() -> bool:
     """#1263: is the sheet allowed to hold its own entry?"""
     try:
@@ -45157,7 +44990,7 @@ def entry_guard_road() -> str:
             pipeline_log(
                 "air", "the %s entry is on air with a finished round "
                 "waiting - it gets its own turn before anything else "
-                "takes the floor (#1263)" % SHELF_LABEL.get(road, road))
+                "takes the floor (#1263)" % road_face(road))
         except Exception:  # noqa: BLE001
             pass
     return road
@@ -45182,7 +45015,7 @@ def entry_guard_state() -> dict[str, Any]:
             "held": int(_ENTRY_GUARD_LOG.get("held") or 0),
             "say": ("the %s entry is holding its own turn - it has a "
                     "finished round ready and nothing else may take the "
-                    "floor until it airs" % SHELF_LABEL.get(road, road))
+                    "floor until it airs" % road_face(road))
             if road else ("nothing is guarded: no entry is on air with a "
                           "finished round of its own waiting"
                           if entry_guard_on() else
@@ -62985,13 +62818,74 @@ def sfx_short(path: Path) -> bool:
         return False
 
 
+# #1265: THE BLANK MOMENT, MEASURED.
+#
+# "I don't know what it's doing sitting on this blank moment here." The
+# gap ledger answers it, and the answer is not the running order. Over six
+# hours: 131 gaps of 8s or more attributed to `event-loop stall`, totalling
+# 5,394 seconds - an hour and a half of blank in six - with stall_s median
+# 18.1s, p90 35.7s, worst 67.8s.
+#
+# The stall attribution names the frame, and top of the list by a distance
+# is `sfx_id`: 38 stacks, 900 seconds attributed. sfx_id is a sha1 of a
+# string. It is not slow - it is the innermost frame while a caller walks
+# the WHOLE SAMPLE LIBRARY hashing every path. That caller is this
+# function, whose own docstring has said what to do about it since it was
+# written: "globbed per pick, no index... add a cache when someone points
+# this at a library."
+#
+# Somebody has pointed it at a library. The pools measured here run to
+# 3,588 and 1,183 files, over CIFS. #1199 built exactly this cure
+# (sfx_pool_cached, refreshed off-loop every sixty seconds) for the SFX
+# desk, and the air path never started using it - the same shape as
+# #1238b's "the same three roads in four places": the fix exists and is
+# bypassed. Indexing HERE fixes every caller at once, including the ones
+# the stacks could not name.
+#
+# WHAT THE INDEX COSTS. sfx_list deliberately ROTATES a folder past
+# SFX_MAX_FILES (random.sample per pick, #817) so the whole library stays
+# in play. A TTL freezes that rotation for its length; at 45 seconds the
+# draw still reshuffles about eighty times an hour, which keeps #817's
+# intent and takes the walk off the air path. The key carries the folder
+# set, so the self-check at the foot of this file - which swaps
+# sfx_folders between calls - misses the index rather than reading a stale
+# answer.
+SFX_ALL_TTL = float(os.getenv("SFX_ALL_TTL", "45"))
+_SFX_ALL_MEMO: dict[str, Any] = {"at": 0.0, "key": None, "value": None}
+
+
+def sfx_all_index_reset() -> None:
+    """Drop the index - a new pack, or a scratch just made."""
+    _SFX_ALL_MEMO.update({"at": 0.0, "key": None, "value": None})
+
+
+def _sfx_all_walk() -> list[Path]:
+    made = scratch_stock() if dj_settings()["sfx_make"] else []
+    return made + [p for folder in sfx_folders() for p in sfx_list(folder)]
+
+
 def sfx_all() -> list[Path]:
     """Every sample they may reach for: the packs you named, plus the
     scratches this box makes for itself (#211).
-    ponytail: globbed per pick, no index. One folder of stingers reads in
-    0.01s over the wire; add a cache when someone points this at a library."""
-    made = scratch_stock() if dj_settings()["sfx_make"] else []
-    return made + [p for folder in sfx_folders() for p in sfx_list(folder)]
+
+    #1265: indexed for SFX_ALL_TTL seconds - see the note above. This was
+    the single largest attributed cause of dead air on this station."""
+    try:
+        key = (tuple(str(f) for f in sfx_folders()),
+               bool(dj_settings()["sfx_make"]))
+        now = time.time()
+        if (_SFX_ALL_MEMO["value"] is not None
+                and _SFX_ALL_MEMO["key"] == key
+                and now - float(_SFX_ALL_MEMO["at"]) < SFX_ALL_TTL):
+            return list(_SFX_ALL_MEMO["value"])
+        got = _sfx_all_walk()
+        _SFX_ALL_MEMO.update({"at": now, "key": key, "value": list(got)})
+        return list(got)
+    except Exception:  # noqa: BLE001
+        # An index is an optimisation. Anything going wrong with it means
+        # answer the question the slow way, never answer it wrongly: a
+        # station with no samples is worse than a slow walk.
+        return _sfx_all_walk()
 
 
 # Samples are mastered hot — a pack is meant to be mixed, not played raw next
@@ -78970,7 +78864,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             playlist.append({"who": take["who"], "voice": take["voice"],
                              "chunk": take["text"], "turn_text": take["text"],
                              "ready_clip": dict(clip), "turn_end": True,
-                             "line_id": uuid.uuid4().hex,      # #1277
                              "vec": {}, "big": False})
         turns = []
         recorded, whole, render_stream = True, True, True
@@ -79214,9 +79107,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 "who": who,
                 "chunk": inject_disfluencies(
                     chunk, vec, seed=f"{who}{len(playlist)}"),
-                # #1277: the line is named HERE, before it is rendered,
-                # and the air log files it under this same name.
-                "line_id": uuid.uuid4().hex,
                 "vec": vec, "turn_end": False, "big": False,
             })
         if len(playlist) > first_at:
@@ -79606,7 +79496,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # aired_items turn (-1 for stings and quips).
             seg_ix: list[int] = []
             turn_ix: list[int] = []
-            line_ids: list[str] = []        # #1277: one name per row
             # #no-repeats: the playlist item behind each transcript row, kept in step
             # with it, so the ledger below can be written from the item's
             # turn_text — the whole clean turn the gate tested — instead of
@@ -79661,8 +79550,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     try:
                         clip = await voice_generate(
                             spoken_text(item["chunk"]), v,
-                            voice_engine_for(v), fx=_turn_fx(item),
-                            line=str(item.get("line_id") or ""))   # #1277
+                            voice_engine_for(v), fx=_turn_fx(item))
                     except Exception:
                         clip = None
                     # A clone that fails must NOT drop the turn from the call —
@@ -79707,8 +79595,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                        _clip_seconds(clip["path"])))
                     seg_ix.append(len(seg) - 1)
                     turn_ix.append(len(aired_items))
-                    line_ids.append(str(item.get("line_id")             # #1277
-                                        or uuid.uuid4().hex))
                     aired_items.append(item)                          # #no-repeats
                     _DIALOGUE_AT[0] = time.time()                     # 2026-09-07
                     # Gold: a rhymed turn with its take is kept to fire again.
@@ -79740,7 +79626,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         transcript.append((_extra["who"], _extra["text"], _extra["seconds"]))
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
-                        line_ids.append(uuid.uuid4().hex)               # #1277
                         _sfx_extra_seconds += _extra["seconds"] + max(CONCAT_BEAT)
                     _sting = "" if _keep_mic else sting_due()
                     if _sting:
@@ -79755,7 +79640,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                                float(_gold.get("seconds") or 0)))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
-                            line_ids.append(uuid.uuid4().hex)           # #1277
                             gold_fired(_gold)
                             pipeline_log("air", "a gold bar fires again, sting to "
                                          f"follow: {str(_gold.get('text') or '')[:70]}")
@@ -79769,7 +79653,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                            sfx_seconds(_sting)))
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
-                        line_ids.append(uuid.uuid4().hex)               # #1277
                         pipeline_log("air", f"sting: {_sting.stem} "
                                      "dropped between lines (#833)")
                     # #835: the SFX Guy's MOUTH — at the slider's rate a
@@ -79822,7 +79705,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                  _clip_seconds(_qc["path"])))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
-                            line_ids.append(uuid.uuid4().hex)           # #1277
                             pipeline_log("air", "the SFX guy pipes up: "
                                          f"{_quip[:60]} (#835)")
                     # #748/#830: the turn's transcript row was appended
@@ -80012,15 +79894,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     _ti = turn_ix[_row] if _row < len(turn_ix) else -1
                     _turn = str((aired_items[_ti].get("turn_text") or "")
                                 if 0 <= _ti < len(aired_items) else "")
-                    # #1277: THE NAME IT WAS GIVEN BEFORE IT WAS MADE.
-                    # This used to mint a fresh uuid here, after the
-                    # audio existed - so the thing being rendered and
-                    # the thing that aired never shared an identity, and
-                    # no surface could connect them. The fallback keeps
-                    # a row that somehow arrived without a name airing
-                    # rather than failing.
-                    rid = (line_ids[_row] if _row < len(line_ids)
-                           else uuid.uuid4().hex)
+                    rid = uuid.uuid4().hex  # durable receipt identity across station restarts
                     _kind = "sfx" if who == "board" else "call"
                     if who == "drop" and _row in _sfx_meta:
                         _kind = "sfxguy"
@@ -123855,9 +123729,7 @@ def _screenplay_actions(d: dict[str, Any], since: float,
     for r in d.get("records") or []:
         title = r.get("title") or "an untitled record"
         by = f" by {r['artist']}" if r.get("artist") else ""
-        # #1281: named after the record, not the moment. `at` is
-        # air_at and air_at moves; the id does not.
-        add(r["at"], f"ac-rec-{r.get('id') or int(r['at'])}",
+        add(r["at"], f"ac-{int(r['at'])}-rec-{r.get('id') or 'x'}",
             f"A record drops: \"{title}\"{by} "
             f"({screenplay_mmss(r.get('length') or r.get('seconds'))}"
             + (f", cut to {screenplay_mmss(r['seconds'])}"
@@ -123865,16 +123737,16 @@ def _screenplay_actions(d: dict[str, Any], since: float,
                < float(r.get("length") or 0) else "")
             + ").", "record", seconds=r.get("seconds"))
     for a in d.get("ads") or []:
-        add(a["at"], f"ac-ad-{a.get('id') or int(a['at'])}",   # #1281
+        add(a["at"], f"ac-{int(a['at'])}-ad-{a.get('id') or 'x'}",
             "The advert airs" + (f" - {a['product']}" if a.get("product")
                                  else "") + ".", "advert")
     for c in d.get("calls") or []:
-        add(c["at"], f"ac-call-{c.get('id') or int(c['at'])}",  # #1281
+        add(c["at"], f"ac-{int(c['at'])}-call-{c.get('id') or 'x'}",
             f"The phone rings. {c['name']} is on "
             + (c["line"] or "the line")
             + (f", about {c['topic']}" if c.get("topic") else "") + ".",
             "call")
-        add(c["ends"], f"ac-hang-{c.get('id') or int(c['ends'])}",  # #1281
+        add(c["ends"], f"ac-{int(c['ends'])}-hang-{c.get('id') or 'x'}",
             f"{c['name']} hangs up after "
             f"{screenplay_mmss(c.get('seconds'))} and "
             f"{c.get('turns') or 0} turns"
@@ -123905,13 +123777,7 @@ def _screenplay_actions(d: dict[str, Any], since: float,
         at = float(row.get("air_at") or row.get("ts") or 0)
         if kind == "sfx" or who in SCREENPLAY_BOARD:
             got = " ".join(str(row.get("text") or "").split())
-            # #1281: THE STING'S OWN ROW ID. This was
-            # `ac-{int(at)}-sting-{id}` and `at` is restamped, so the
-            # same sting came back under a new element id and the
-            # viewer had to destroy the node instead of keeping it -
-            # 46 `ac-` removals measured over 35 minutes, with the row
-            # disappearing under the operator's finger.
-            add(at, f"ac-sting-{row.get('id')}",
+            add(at, f"ac-{int(at)}-sting-{row.get('id')}",
                 f"A sting off the board: {got or 'a cue'}"
                 + (f" ({screenplay_mmss(row.get('seconds'))})"
                    if float(row.get("seconds") or 0) >= 1 else "") + ".",
@@ -123920,7 +123786,7 @@ def _screenplay_actions(d: dict[str, Any], since: float,
         elif kind == "marker":
             got = " ".join(str(row.get("text") or "").split())
             if got:
-                add(at, f"ac-mark-{row.get('id')}",            # #1281
+                add(at, f"ac-{int(at)}-mark-{row.get('id')}",
                     got if got[-1] in ".!?…" else got + ".", "marker")
     out.sort(key=lambda e: (e["at"], e["id"]))
     return out
@@ -124086,17 +123952,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     counts = {"lines": 0, "tinted": 0, "clips": 0, "scenes": 0,
               "actions": 0, "seconds": 0.0}
 
-    # #1284: WHICH SEGMENT THIS ELEMENT IS IN. The id of the scene
-    # that opens it - so a completed segment can be folded up as one
-    # script and the live one left open. Deliberately the scene rather
-    # than the round's sid: a segment is what sits under one heading,
-    # stings and quips included, and sid would leave those orphaned
-    # outside the fold.
-    seg_now = [""]
-
     def push(etype: str, text: str, eid: str, **more: Any) -> None:
-        if "seg" not in more and seg_now[0]:
-            more["seg"] = seg_now[0]
         elements.append({"id": eid, "type": etype, "text": text, **more})
 
     for ev in events:
@@ -124156,21 +124012,12 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         if _want:
             scene_round = round_kind
             scene_mark = (slug, label)
-            # #1281: A SCENE IS NAMED AFTER THE LINE THAT OPENS IT.
-            # These were `sc-{int(at)}-{round}` / `sh-{int(at)}-{round}`
-            # and `at` is air_at, which is rewritten after publication -
-            # so the heading of a scene the operator was reading got a
-            # new id and the viewer destroyed and rebuilt it. Measured:
-            # 34 `sc-` and 34 `sh-` removals in 35 minutes. The opening
-            # line's id is unique, and it does not move.
-            _scene_key = line_id or f"{int(at)}-{round_kind or 'air'}"
-            seg_now[0] = f"sc-{_scene_key}"            # #1284
             push("scene", slug,
-                 f"sc-{_scene_key}", at=at,
-                 round=round_kind, seg=seg_now[0])
+                 f"sc-{int(at)}-{round_kind or 'air'}", at=at,
+                 round=round_kind)
             push("subheader", label.upper(),
-                 f"sh-{_scene_key}", at=at,
-                 round=round_kind, seg=seg_now[0])
+                 f"sh-{int(at)}-{round_kind or 'air'}", at=at,
+                 round=round_kind)
             scenes.append((len(elements) - 1, at))
             counts["scenes"] += 1
             speaker = ""

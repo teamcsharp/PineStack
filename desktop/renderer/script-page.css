@@ -332,21 +332,42 @@
    reach the room before the audience does. */
 /* NOT YET SAID. A quiet marker, not a highlight - there can be a dozen of
    these on screen and only one line is actually being spoken. */
-.sp-el.pending { border-left-style: dotted; border-left-color: var(--sp-amber); opacity: .82; }
+/* #1286: written but not yet heard - useful, but it was drawn in the
+   same gutter as the live mark, which is the one place it must not be.
+   Quiet now: dimmed, and italic on the speech itself. */
+.sp-el.pending { opacity: .58; }
+.sp-el.pending.sp-dialogue { font-style: italic; }
 
 /* THE LINE BEING SAID, RIGHT NOW.
    One at a time, and unmistakable: the eye should find it without reading.
    The bar on the left pulses at roughly the pace of speech so a still
    screenshot and a live screen look different. */
+/* #1286: THE ONE MARK THAT MEANS "SOUNDING NOW".
+   It was a 22% wash and a 3px rule, competing with 114 `pending`
+   gutters and 433 `tinted` lines - 547 decorations, one of which
+   meant on air. It is not subtle any more, and it says what it is. */
 .sp-el.sp-now {
   background: linear-gradient(90deg,
-    rgba(101, 199, 218, .22), rgba(101, 199, 218, .05));
+    rgba(101, 199, 218, .40), rgba(101, 199, 218, .10));
   border-left: 3px solid var(--sp-on, #65c7da);
+  box-shadow: -4px 0 0 0 var(--sp-on, #65c7da),
+              0 0 0 1px rgba(101, 199, 218, .45) inset;
   border-radius: 4px;
   padding-left: 7px;
-  color: var(--sp-text, #edf3f5);
-  box-shadow: 0 0 0 1px rgba(101, 199, 218, .18) inset;
+  color: #ffffff;
+  font-weight: 600;
   scroll-margin: 40vh 0;
+}
+.sp-el.sp-now::before {
+  content: "ON AIR";
+  position: absolute;
+  left: -66px;
+  top: 1px;
+  font-size: 9px;
+  letter-spacing: .16em;
+  font-weight: 700;
+  color: var(--sp-on, #65c7da);
+  opacity: .95;
 }
 .sp-el.sp-now::after {
   content: '';
@@ -381,6 +402,10 @@
 /* Scrolled away from the live line: say so, and offer the way back. */
 .sp-now-line.adrift::before { content: '↩ '; color: var(--sp-on, #65c7da); }
 .sp-now-line.adrift::after { content: '  · tap to follow'; opacity: .7; }
+/* #1286: the crystal's rhyme mark rides on 433 of 693 dialogue
+   elements - 63%, nearly every line - so as a highlight it carried no
+   information and only crowded the one that did. Silent in the reading
+   view; it keeps its ink in the paper setting below. */
 .sp-el.tinted { }
 
 .sp-empty { color: var(--sp-muted); font-family: inherit; }
@@ -523,6 +548,13 @@
  * closed one is dimmed and tightened so a stack of them takes little
  * room above the script being performed.
  */
+/* #1286: nothing is being said. The screenshot that prompted this was
+   taken over a music bed - no line was sounding, and with 547
+   decorations on screen the page looked exactly as it does mid
+   sentence. Now it can show the difference. */
+.sp-page.sp-quiet #spScript { opacity: .72; }
+.sp-page.sp-quiet #spScript .sp-el.sp-now { opacity: 1; }
+
 .sp-el.sp-fold { cursor: pointer; }
 .sp-el.sp-fold::before {
   content: "▾ ";
