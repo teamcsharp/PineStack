@@ -566,10 +566,39 @@ def scan(folders: Iterable[str | Path]) -> dict[str, dict[str, Any]]:
     return found
 
 
+# #1255: how long a FAILED read waits before it is tried again. A
+# skipped one is never retried at all - see below.
+RETRY_FAILED_REST = 3600.0
+
+
 def _fresh(row: dict[str, Any], seen: dict[str, Any]) -> bool:
-    return (int(row.get("size") or -1) == seen["size"]
-            and int(row.get("mtime") or -1) == seen["mtime"]
-            and row.get("state") == "ready")
+    """Is this row settled for the file on disk right now?
+
+    #1255: it used to accept only `ready`, so a SKIPPED document came
+    back in `todo` on every single pass and was unzipped, parsed and
+    skipped again for ever - a subprocess-and-parse loop with no rest
+    in it. Measured on the live station: the same archive read
+    continuously for hours, /healthz at a p90 of eleven to twenty
+    seconds, and the host watchdog restarting the container seven times
+    an hour. ingest_one's own docstring names that exact cost.
+
+    A `skipped` verdict is a fact about the CONTENT - "every document
+    inside is already on the shelf" - and re-reading the same bytes
+    cannot change it, so the row is settled until size or mtime moves,
+    which the two tests below already watch.
+
+    `failed` may be transient, so it is retried, but on a clock rather
+    than on every pass. `queued` is left alone: the embedder being cold
+    is meant to be picked up next time."""
+    if (int(row.get("size") or -1) != seen["size"]
+            or int(row.get("mtime") or -1) != seen["mtime"]):
+        return False                     # the file itself changed
+    state = str(row.get("state") or "")
+    if state in ("ready", "skipped"):
+        return True
+    if state == "failed":
+        return time.time() - float(row.get("at") or 0) < RETRY_FAILED_REST
+    return False
 
 
 def plan(folders: Iterable[str | Path]) -> dict[str, Any]:
