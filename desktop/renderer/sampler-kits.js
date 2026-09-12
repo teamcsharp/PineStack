@@ -636,6 +636,203 @@
     };
   }
 
+
+  /* ======================================================================
+     READING A KIT BACK OFF THE MPC
+     ======================================================================
+
+     "I want to connect the MPC Live 3 to this Pine tab through USB and have
+      it viewed as a mass media drive where I can access the presets and
+      preferences we are creating for the MPC, and then load those up as pads
+      or presets."
+
+     exportMpc writes a kit onto the card. This brings one back - ours, or one
+     the MPC made itself, which is the more interesting case: a kit built on
+     the hardware can be dropped onto these pads and played here.
+
+     THE PAD ORDER IS UNDONE, NOT RE-APPLIED. An MPC counts its pads from the
+     BOTTOM-LEFT (instrument 0 is pad A01) and this grid is laid out from the
+     top-left. exportMpc walks that mapping one way; this walks it back, so a
+     kit that goes out and comes home lands on the pads it started on.
+
+     AN MPC'S OWN PROGRAM IS NOT SHAPED LIKE OURS, and that is the whole
+     difficulty. Ours fills layer 1 of each instrument and nothing else. A real
+     one can have four velocity layers, samples named with or without their
+     extension, and instruments whose sample sits in a shared folder rather
+     than beside the program. So: the FIRST non-empty layer of each instrument
+     is taken (a pad here is one sound, and the loudest-velocity layer is the
+     one a finger hits), the name is matched case-insensitively with and
+     without an extension, and an instrument whose file cannot be found is
+     reported rather than silently skipped - a kit that loads eleven of
+     sixteen pads and says nothing is a kit you cannot trust.
+  */
+
+  function bridge() { return root.pineDesktop || null; }
+
+  /** Everything in a folder on the chosen disk. */
+  function browse(path) {
+    var api = bridge();
+    if (!api || typeof api.usbList !== 'function') {
+      return Promise.resolve({ok: false, detail: 'this terminal cannot read a USB disk'});
+    }
+    return Promise.resolve(api.usbList({path: path || ''}));
+  }
+
+  /**
+   * A whole file off the disk, assembled from chunks.
+   *
+   * @param say optional progress reporter - a 5 MB sample is five round trips
+   *            and the operator should see it moving
+   */
+  async function pull(path, say) {
+    var api = bridge();
+    if (!api || typeof api.usbRead !== 'function') {
+      throw new Error('this terminal cannot read a USB disk');
+    }
+    var pieces = [];
+    var at = 0;
+    var total = 0;
+    for (var guard = 0; guard < 4096; guard += 1) {
+      var got = await api.usbRead({path: path, offset: at});
+      if (!got || !got.ok) {
+        throw new Error((got && got.detail) || 'the disk would not give up that file');
+      }
+      total = Number(got.size) || total;
+      var raw = root.atob(got.base64 || '');
+      var part = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i += 1) part[i] = raw.charCodeAt(i);
+      pieces.push(part);
+      at += part.length;
+      if (say && total) say(Math.round(at / 1024) + ' of ' + Math.round(total / 1024) + ' kB');
+      if (got.eof || !part.length) break;
+    }
+    var out = new Uint8Array(at);
+    var write = 0;
+    for (var p = 0; p < pieces.length; p += 1) {
+      out.set(pieces[p], write);
+      write += pieces[p].length;
+    }
+    return out.buffer;
+  }
+
+  /* ---- the program ------------------------------------------------------ */
+
+  /** The sample each MPC pad wants, from an .xpm. Index 0 is pad A01. */
+  function readProgram(xml) {
+    var doc = new DOMParser().parseFromString(xml, 'application/xml');
+    if (doc.querySelector('parsererror')) {
+      throw new Error('that .xpm is not readable XML');
+    }
+    var name = (doc.querySelector('ProgramName') || {}).textContent || '';
+    var instruments = doc.querySelectorAll('Instruments > Instrument');
+    var want = [];
+    for (var i = 0; i < instruments.length && i < MPC_PADS; i += 1) {
+      var layers = instruments[i].querySelectorAll('Layers > Layer');
+      var sample = '';
+      var volume = 1;
+      for (var L = 0; L < layers.length; L += 1) {
+        var said = layers[L].querySelector('SampleName');
+        var text = said && said.textContent ? said.textContent.trim() : '';
+        if (!text) continue;
+        /* The first layer that names a sample. See the header: a pad here is
+         * one sound, so velocity layers beyond the first are not loaded. */
+        sample = text;
+        var vol = Number((layers[L].querySelector('Volume') || {}).textContent);
+        if (isFinite(vol) && vol > 0) volume = Math.min(1, vol);
+        break;
+      }
+      want.push({sample: sample, gain: volume});
+    }
+    return {name: name, pads: want};
+  }
+
+  /* A name from a program matched against what is actually on the disk. The
+   * MPC writes SampleName WITHOUT an extension; a hand-built kit may not. */
+  function findFile(files, wanted) {
+    if (!wanted) return null;
+    var target = String(wanted).toLowerCase();
+    var bare = target.replace(/\.(wav|aif|aiff|flac|mp3)$/, '');
+    for (var i = 0; i < files.length; i += 1) {
+      var name = String(files[i].name || '');
+      var low = name.toLowerCase();
+      if (low === target) return name;
+      if (low.replace(/\.(wav|aif|aiff|flac|mp3)$/, '') === bare) return name;
+    }
+    return null;
+  }
+
+  /**
+   * LOAD A KIT FOLDER FROM THE MPC ONTO A BANK.
+   *
+   * @param folder path on the disk, e.g. "Expansions/Pine Box bank 1"
+   * @param onto   which bank to fill
+   * @param say    progress
+   */
+  async function importMpc(folder, onto, say) {
+    var api = sampler();
+    if (!api) throw new Error('the sampler is not loaded');
+
+    var listing = await browse(folder);
+    if (!listing || !listing.ok) {
+      throw new Error((listing && listing.detail) || 'that folder would not open');
+    }
+    var files = [];
+    for (var i = 0; i < (listing.files || []).length; i += 1) files.push(listing.files[i]);
+    var program = null;
+    for (var f = 0; f < files.length; f += 1) {
+      if (/\.xpm$/i.test(files[f].name)) { program = files[f].name; break; }
+    }
+    if (!program) throw new Error('there is no .xpm program in that folder');
+
+    if (say) say('reading ' + program + '…');
+    var xml = new TextDecoder().decode(await pull(folder + '/' + program));
+    var kit = readProgram(xml);
+
+    var order = mpcOrder();          /* MPC pad -> screen index */
+    var landed = 0;
+    var missing = [];
+    var engine = root.PineSamplerEngine || root.pineSampler;
+
+    for (var pad = 0; pad < MPC_PADS; pad += 1) {
+      var slot = kit.pads[pad];
+      if (!slot || !slot.sample) continue;
+      var file = findFile(files, slot.sample);
+      if (!file) { missing.push(slot.sample); continue; }
+      if (say) say('pad ' + (pad + 1) + ' · ' + file);
+      var bytes;
+      try {
+        bytes = await pull(folder + '/' + file, function (where) {
+          if (say) say('pad ' + (pad + 1) + ' · ' + where);
+        });
+      } catch (err) { missing.push(slot.sample); continue; }
+
+      var screen = order[pad];
+      var key = api.padKey(onto, screen);
+      try {
+        await api.put(key, {bytes: bytes, type: 'audio/wav'});
+        await engine.load(key, bytes);
+      } catch (err) { missing.push(slot.sample); continue; }
+      var meta = {
+        label: file.replace(/\.[^.]+$/, ''),
+        who: kit.name || 'MPC',
+        kind: 'mpc',
+        srcId: '',
+        exact: true,
+        cut: 'from ' + folder + ' on the MPC',
+        at: Date.now(),
+        gain: slot.gain, pitch: 1, loop: false, reverse: false,
+        trim: null, choke: ''
+      };
+      meta.seconds = engine.seconds(key);
+      api.layout()[onto][screen] = meta;
+      api.applySettings(key, meta);
+      landed += 1;
+    }
+    api.save();
+    api.repaint();
+    return {ok: landed > 0, pads: landed, missing: missing, name: kit.name || program};
+  }
+
   var api = {
     build: build, apply: apply,
     save: async function (name, which) {
@@ -647,6 +844,12 @@
     load: get, forget: drop, list: names,
     exportKit: exportKit, importFile: importFile,
     exportMpc: exportMpc,
+    importMpc: importMpc, browse: browse, pull: pull,
+    /* Published so the program parser and the pad-order inversion can be
+     * checked against a real .xpm without an MPC on the other end of a
+     * cable - which is the only part of this road that can be wrong in a way
+     * nobody notices until the hardware says no. */
+    readProgram: readProgram, mpcOrder: mpcOrder,
     defaultName: defaultName
   };
   root.PineSamplerKits = api;

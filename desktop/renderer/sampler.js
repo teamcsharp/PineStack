@@ -1118,6 +1118,12 @@
           + " - open " + built.program + " on the MPC"
         : "The copy failed: " + (sent.detail || "unknown"));
     }));
+    /* THE DISK ITSELF. Browsing it is the other half of "have it viewed as a
+     * mass media drive" - writing to it was never enough on its own, because
+     * the kits worth loading are the ones already on the card. */
+    acts.appendChild(kitAct("Open the MPC disk", async () => {
+      await openMpcDisk();
+    }));
     acts.appendChild(kitAct("Import a kit file", async () => {
       try {
         const kit = await kits.importFile();
@@ -1136,6 +1142,163 @@
     document.body.appendChild(kitSheet);
     if (root.PineDismiss) unwatchKits = root.PineDismiss.watch(kitSheet, closeKits, []);
     await fillKits(saved);
+  }
+
+  /* ------------------------------------------------- browsing the MPC disk */
+
+  let diskSheet = null;
+  let unwatchDisk = null;
+
+  function closeDisk() {
+    if (unwatchDisk) { unwatchDisk(); unwatchDisk = null; }
+    if (diskSheet) { diskSheet.remove(); diskSheet = null; }
+  }
+
+  async function openMpcDisk() {
+    const api = root.pineDesktop;
+    if (!api || typeof api.usbList !== "function") {
+      note("This terminal cannot read a USB disk.");
+      return;
+    }
+    const state = await api.usbState();
+
+    /* THREE DIFFERENT "NOTHING HAPPENED"s, each with its own cure. Guessing
+     * between them is what makes a USB feature feel broken. */
+    if (!state.canHost) {
+      note("This tablet cannot act as a USB host, so it cannot read the MPC.");
+      return;
+    }
+    if (!state.chosen) {
+      if (!state.anyRemovable) {
+        note("No disk is mounted. Put the MPC in USB mode, connect it with an "
+          + "OTG or USB-C cable, and give it a moment to appear.");
+        return;
+      }
+      note("Point at the MPC\u2019s disk\u2026");
+      const picked = await api.usbPick();
+      if (!picked.ok) { note("No disk was chosen."); return; }
+    }
+    closeKits();
+    showDisk("");
+  }
+
+  async function showDisk(path) {
+    closeDisk();
+    diskSheet = document.createElement("div");
+    diskSheet.className = "pb-kits pb-disk";
+
+    const head = document.createElement("div");
+    head.className = "pb-kits-head";
+    const title = document.createElement("b");
+    title.textContent = path ? path : "the MPC disk";
+    const shut = document.createElement("button");
+    shut.className = "pb-kits-x";
+    shut.textContent = "\u00d7";
+    shut.addEventListener("click", closeDisk);
+    head.appendChild(title);
+    head.appendChild(shut);
+    diskSheet.appendChild(head);
+
+    const say = document.createElement("p");
+    say.className = "pb-kits-say";
+    say.textContent = "reading\u2026";
+    diskSheet.appendChild(say);
+
+    const list = document.createElement("div");
+    list.className = "pb-kits-list";
+    diskSheet.appendChild(list);
+
+    document.body.appendChild(diskSheet);
+    if (root.PineDismiss) unwatchDisk = root.PineDismiss.watch(diskSheet, closeDisk, []);
+
+    let got;
+    try { got = await root.PineSamplerKits.browse(path); }
+    catch (err) { got = {ok: false, detail: (err && err.message) || err}; }
+    if (!got || !got.ok) {
+      say.textContent = (got && got.detail) || "that folder would not open";
+      return;
+    }
+
+    const folders = got.folders || [];
+    const files = got.files || [];
+    const kits = folders.filter((row) => row.program);
+    say.textContent = kits.length
+      ? kits.length + " kit" + (kits.length === 1 ? "" : "s") + " here"
+      : folders.length + " folders, " + files.length + " files";
+
+    /* Up one, unless we are already at the top of the disk. */
+    if (path) {
+      const up = document.createElement("button");
+      up.className = "pb-kits-load";
+      up.textContent = "\u2191 up";
+      up.addEventListener("click", () => showDisk(path.split("/").slice(0, -1).join("/")));
+      list.appendChild(up);
+    }
+
+    for (const row of folders) {
+      const here = path ? path + "/" + row.name : row.name;
+      const line = document.createElement("div");
+      line.className = "pb-kits-row";
+      const open = document.createElement("button");
+      open.className = "pb-kits-load";
+      /* A FOLDER THAT HOLDS A PROGRAM IS LABELLED AS A KIT, so the operator
+       * is not opening folders one at a time to find out which are kits -
+       * the listing already answered that question. */
+      open.textContent = (row.program ? "\u25a0 " : "\u25b8 ") + row.name
+        + (row.program ? "  \u00b7 " + row.program : "");
+      open.addEventListener("click", () => showDisk(here));
+      line.appendChild(open);
+      if (row.program) {
+        const load = document.createElement("button");
+        load.className = "pb-kits-drop";
+        load.style.width = "68px";
+        load.textContent = "load";
+        load.title = "Load this kit onto bank " + (bank + 1);
+        load.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          await loadFromDisk(here, load);
+        });
+        line.appendChild(load);
+      }
+      list.appendChild(line);
+    }
+
+    if (!folders.length && !files.length) {
+      const none = document.createElement("p");
+      none.className = "pb-kits-none";
+      none.textContent = "Nothing here.";
+      list.appendChild(none);
+    }
+  }
+
+  async function loadFromDisk(folder, button) {
+    const held = layout[bank].filter(Boolean).length;
+    if (held && !root.confirm(
+      "Load this kit onto bank " + (bank + 1) + "?\n\n"
+      + "It has " + held + " pad" + (held === 1 ? "" : "s") + " on it, and any "
+      + "pad the kit fills will be replaced.")) return;
+    button.disabled = true;
+    const bar = root.PineBusy ? root.PineBusy.attach(button, "loading") : null;
+    try {
+      const got = await root.PineSamplerKits.importMpc(folder, bank, (where) => {
+        note("MPC: " + where);
+      });
+      if (bar) bar.finish(got.ok);
+      await preload(bank);
+      note(got.ok
+        ? "Loaded " + got.pads + " pads from " + got.name
+          + (got.missing.length
+            ? " \u00b7 " + got.missing.length + " sample"
+              + (got.missing.length === 1 ? "" : "s") + " were not on the disk"
+            : "")
+        : "Nothing in that kit could be loaded.", !got.ok);
+      if (got.ok) closeDisk();
+    } catch (err) {
+      if (bar) bar.finish(false);
+      note("That kit would not load: " + ((err && err.message) || err), true);
+    } finally {
+      button.disabled = false;
+    }
   }
 
   function kitAct(words, run) {

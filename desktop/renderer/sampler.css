@@ -911,3 +911,13 @@
   border-radius: 4px;
   background: rgba(20, 27, 33, .75);
 }
+
+/* The disk browser is the preset sheet in a taller frame: a card can hold
+ * hundreds of folders and scrolling a 420px box through them is miserable. */
+.pb-disk { width: min(560px, 94vw); max-height: 88vh; }
+.pb-disk .pb-kits-load {
+  font-family: inherit;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
