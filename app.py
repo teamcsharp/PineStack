@@ -519,6 +519,41 @@ SFX_DEFAULT_FOLDERS = (
     "DJ_SAPPO_ROLLING_JUNGLE_&_DnB/SAP_SOUNDS_&_FX/SAP_FX",
 )
 SFX_DEFAULT_FOLDER = SFX_DEFAULT_FOLDERS[0]     # what the panel offers first
+# #1263: THE CLIPS THE SFX GUY COULD SEE BUT NEVER REACH.
+#
+# "ensure that the SFX guy is playing all media that he's able to locate
+#  in the SFX directory. So if he's able to locate MP4s, he's playing that
+#  in little pop up windows. If he's playing MP3s, he's playing that as
+#  sound effects."
+#
+# Every gate on the sample draw asked `suffix in MUSIC_TYPES` - which is
+# the MUSIC LIBRARY's table, audio only, because that is the question it
+# was written to answer. So a video clip in a sample folder was not
+# rejected anywhere: it was never a candidate in the first place, and
+# nothing anywhere said so. Measured the day this went in: 2,779 .mp4 in
+# samples_grabbed/mwc alone, none of them reachable by any road.
+#
+# A clip with a picture is punctuation you can SEE. It rides the PAGE as a
+# little CRT set and never the satellite - the Nabu has no screen, and an
+# announce there would be the soundtrack of something nobody can watch.
+SFX_VIDEO_TYPES = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+    ".mov": "video/quicktime", ".mkv": "video/x-matroska",
+    ".ogv": "video/ogg",
+}
+# What the SFX draw accepts. MUSIC_TYPES is left exactly as it was - it
+# still answers "is this a radio track" - and this answers the different
+# question "is this a clip the SFX guy may play".
+SFX_TYPES = {**MUSIC_TYPES, **SFX_VIDEO_TYPES}
+
+
+def sfx_is_video(path: Any) -> bool:
+    """Whether this sample has a picture as well as a sound."""
+    try:
+        return Path(path).suffix.lower() in SFX_VIDEO_TYPES
+    except Exception:  # noqa: BLE001
+        return False
+
 # #1251: "any clip that's in the clip folders are allowed to be
 # played, and I want to hear each and every clip". This was 400 - of
 # 7,180 - so a clip had to win a 1-in-18 lottery to be CONSIDERED. The
@@ -62795,7 +62830,7 @@ def sfx_list(folder: Path) -> list[Path]:
     and the pack tree above it holds 23,000 files."""
     try:
         found = [p for p in folder.iterdir()
-                 if p.is_file() and p.suffix.lower() in MUSIC_TYPES]
+                 if p.is_file() and p.suffix.lower() in SFX_TYPES]
     except OSError:
         return []                       # the share went away; carry on
     if len(found) <= SFX_MAX_FILES:
@@ -62895,6 +62930,42 @@ def sfx_level(path: Path, measure: bool = True) -> Any:
     return peak
 
 
+def _media_duration_probe(path: Path) -> float:
+    """#1263: length in seconds from ffmpeg's own header read. 0.0 = no
+    answer.
+
+    mutagen opens an .mp4 container and nothing else in the family, so a
+    .webm/.mkv/.mov measured zero and sfx_short refused it as
+    unmeasurable - the clip was there, we simply never asked the one
+    tool on this box that can read it. One short subprocess, reached
+    only for a container mutagen could not open, and only ever from the
+    worker thread that walks the share."""
+    try:
+        # A drop share is full of zero-byte downloads that never finished
+        # - 2,779 of them in samples_grabbed/mwc the day this went in -
+        # and one subprocess each to be told so is a walk that never ends.
+        # Nothing this small holds a moving picture.
+        if path.stat().st_size < 4096:
+            return 0.0
+    except OSError:
+        return 0.0
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        out = subprocess.run(
+            [exe, "-hide_banner", "-nostats", "-i", str(path)],
+            capture_output=True, timeout=20, text=True, errors="replace")
+        for line in (out.stderr or "").splitlines():
+            if "Duration:" in line:
+                stamp = line.split("Duration:")[1].split(",")[0].strip()
+                hours, minutes, seconds = stamp.split(":")
+                return (int(hours) * 3600 + int(minutes) * 60
+                        + float(seconds))
+    except Exception:  # noqa: BLE001
+        return 0.0             # "Duration: N/A", no ffmpeg, a dead share
+    return 0.0
+
+
 def sfx_is_silent(path: Path) -> bool:
     """#1199: measured, and too quiet to be a sting. Unmeasured is not."""
     got = sfx_level(path, measure=False)
@@ -62989,6 +63060,8 @@ def sfx_seconds(path: Path) -> float:
             secs = float(getattr(getattr(info, "info", None), "length", 0) or 0)
         except Exception:
             secs = 0.0
+    if secs <= 0 and sfx_is_video(path):
+        secs = _media_duration_probe(path)      # #1263
     while len(_SFX_LEN_CACHE) >= SFX_LEN_CACHE_MAX:
         _SFX_LEN_CACHE.pop(next(iter(_SFX_LEN_CACHE)), None)
     _SFX_LEN_CACHE[key] = secs
@@ -63038,7 +63111,11 @@ def sfx_short(path: Path) -> bool:
         # #1199: ...and it has to make a SOUND. Only a measured silence
         # refuses; a file nobody has measured yet still plays and is
         # offered to the operator on the SFX desk instead.
-        return not sfx_is_silent(path)
+        # #1263: ...unless it has a PICTURE. A video clip's point is what
+        # you see; a silent one is still something to watch, and the
+        # sound gate would have binned exactly the clips the little CRT
+        # set exists for.
+        return sfx_is_video(path) or not sfx_is_silent(path)
     try:
         return SFX_MADE_DIR in path.parents
     except Exception:
@@ -63854,6 +63931,12 @@ def sfx_levelled(path: Path) -> Path:
     import audioop
     import wave
 
+    # #1263: a clip with a picture is served as it was shot. Levelling
+    # DECODES TO WAV, and handing the page a wav where it asked for a
+    # picture is how you get a CRT set with nothing in it. The page holds
+    # its volume the same way it holds every other live element (#789).
+    if sfx_is_video(path):
+        return path
     try:
         stamp = path.stat().st_mtime_ns
     except OSError:
@@ -64609,7 +64692,7 @@ def _sfx_pool_warm(folders: list[Path], cap: float, valid: Any, publish: Any) ->
         try:
             raw, stamp = key.rsplit(":", 1)
             path, duration = Path(raw), float(seconds)
-            if (path.parent in parents and path.suffix.lower() in MUSIC_TYPES
+            if (path.parent in parents and path.suffix.lower() in SFX_TYPES
                     and _math.isfinite(duration) and 0 < duration <= cap):
                 candidates.append((path, int(stamp)))
         except (TypeError, ValueError):
@@ -64717,7 +64800,7 @@ async def _sfx_pool_refresh() -> None:
                     found = []
                     for one in folder.iterdir():
                         if one.is_file() \
-                                and one.suffix.lower() in MUSIC_TYPES:
+                                and one.suffix.lower() in SFX_TYPES:
                             seen.add(str(one))
                             found.append(one)
                     # Keep the rotating per-folder cap without walking every
@@ -64818,9 +64901,15 @@ def _sfx_cadence_pick() -> Path | None:
              for root in (SFX_ROOT, SFX_LOCAL_ROOT)
              for folder in (settings.get("sfx_drop_folders") or [])]
     banned, weights = sfx_bans(), sfx_weights()
+    # #1263: AUDIO ONLY on this road. Cadence punctuation is WELDED into
+    # the round's own wav by the concat graph - there is no picture in a
+    # rendered round for a video clip to be seen in, and its soundtrack
+    # alone is not what the operator asked for. Video airs through
+    # dj_sting, which can open the set.
     pool = [Path(p) for p in _SFX_POOL_CACHE
             if any(Path(p).is_relative_to(root) for root in roots)
             and sfx_id(Path(p)) not in banned
+            and not sfx_is_video(Path(p))
             and weights.get(sfx_id(Path(p)), 1.0) > 0.05]
     last = str(_SFX_CADENCE_STATUS.get("last_sample") or "")
     fresh = [p for p in pool if str(p) != last]
@@ -65089,8 +65178,16 @@ async def _sfx_verdict(about: str) -> None:
 def _sfx_any() -> Path | None:
     """A short unbanned sample, ignoring the rate/gap gate (#464) — for
     places that WANT a sound effect every time, like a custom ad."""
+    # #1263: AUDIO ONLY. This is the road sfx_fill_gap takes, and its
+    # whole job is that silence gets answered - a picture on the panel
+    # answers nothing on the box, or in a car, or anywhere the operator
+    # actually hears the hole. Video reaches the air through the ordinary
+    # draw (sting_due), where a picture instead of a sting is a choice
+    # rather than a dropped rescue.
     banned = sfx_bans()
-    pool = [p for p in sfx_all() if sfx_short(p) and sfx_id(p) not in banned]
+    pool = [p for p in sfx_all()
+            if sfx_short(p) and not sfx_is_video(p)
+            and sfx_id(p) not in banned]
     if not pool:
         return None
     names = unrepeated([str(p) for p in pool], "sting",
@@ -65807,6 +65904,13 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     _STING_AT[0] = time.time()
     key = sfx_id(sample)
     signature = media_sign(key)
+    # #1263: a clip with a PICTURE goes to the page, always, and never to
+    # the satellite - the Nabu has no screen, so an announce there would
+    # be the soundtrack of something nobody can see. The page opens a
+    # little CRT set for it (djVideoTv).
+    is_video = sfx_is_video(sample)
+    if is_video:
+        to_box = False
     # On the record like any spoken line (#269): which sample, from which
     # folder, with enough identity for the panel to vote it off the air.
     # #903 (#848): this row was written BEFORE any attempt to play, and
@@ -65818,6 +65922,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         "who": "board", "kind": "sfx",
         "text": sample.stem, "sfx": key,
         "sfx_dir": sample.parent.name or "sfx",
+        "video": is_video,              # #1263: it has a picture
         # #704: how long it ran, on the entry — the point of seeing them
         # listed is being able to weed the ones that do not fit.
         "seconds": round(sfx_seconds(sample), 2),
@@ -65831,7 +65936,12 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     sfx_history_add(sample, who)
     # The stings are part of the broadcast, so the episode recording keeps them
     # too (#560) — staged from the SFX store, which lives outside /media.
-    _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}", src_path=sample)
+    # #1263: a video is not staged into the episode. The episode is
+    # assembled by a concat graph that maps ONE audio output; an input
+    # with no audio stream at all fails the whole build, and losing the
+    # night's recording is a far worse trade than losing one sting off it.
+    if not is_video:
+        _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}", src_path=sample)
     _sting_started = time.monotonic()
     # Only where the line itself went. Queued for a browser in box-only mode
     # it would arrive as a scratch with no DJ in front of it, because the
@@ -65840,11 +65950,16 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # ride along or the page hears talk with no punctuation.
     _sfx_box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                      or len(_BOX_HOLD) >= 6)
-    if ((_RADIO.get("voice_to") or "box") != "box" or _sfx_box_down
-            or _RADIO.get("monitor")):     # #825
+    if (is_video or (_RADIO.get("voice_to") or "box") != "box"
+            or _sfx_box_down or _RADIO.get("monitor")):     # #825, #1263
         page_feed_append({              # #1147: honest broadcast stamp
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": sample.stem,
+            # #1263: the flag the set watches for, and an honest length
+            # so page_clip_seconds reserves the air the picture takes
+            # instead of guessing from a text that is empty.
+            "video": is_video,
+            "seconds": round(sfx_seconds(sample), 2),
         })
     # A sting is MEANT to land over the DJ's own line it punctuates, so the
     # show's own just-finished announce tail must not block it (#559: "the
@@ -98971,6 +99086,46 @@ async def dj_voice_api(
             "reservation_updates": reservation_updates}
 
 
+@app.get("/api/dj/video")
+async def dj_video_api(
+    since: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1263: the stings that have a PICTURE, and nothing else.
+
+    The set needs its own door. A video sting never goes to the
+    satellite, so the panel is the only surface that can air one - and
+    in the ORDINARY arrangement here (voice to the box) the panel does
+    not poll /api/dj/voice at all: djVoicePoll returns on its first
+    line. Widening that road to carry pictures would have meant
+    unpicking the routing rule three separate audits have already got
+    right. This is the same ring, the same cut and the same staleness
+    rule, filtered to video - and the voice road is untouched.
+
+    A clip that has missed its moment is NOT offered: the set coming on
+    over whatever is airing now is worse than the clip being missed."""
+    require_read_auth(authorization)
+    server_ms = int(time.time() * 1000)
+    cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
+    if radio_paused():
+        return {"clips": [], "server_ms": server_ms,
+                "cut_ms": cut_ms, "paused": True}
+    out = []
+    for clip in list(_RADIO.get("voice_clips") or [])[-80:]:
+        if not clip.get("video"):
+            continue
+        stamp = int(clip.get("ts") or 0)
+        if stamp <= int(since or 0) or stamp <= cut_ms:
+            continue
+        broadcast = int(clip.get("broadcast_ms")
+                        or stamp + VOICE_BROADCAST_LEAD_MS)
+        grace = int(max(5.0, float(clip.get("seconds") or 0)) * 1000)
+        if server_ms > broadcast + grace:
+            continue
+        out.append({**clip, "broadcast_ms": broadcast})
+    return {"clips": out, "server_ms": server_ms, "cut_ms": cut_ms}
+
+
 @app.post("/api/dj/voice/ack")
 async def dj_voice_ack_api(
     request: Request,
@@ -115525,7 +115680,12 @@ async def api_sfx_review(
                 lvl = sfx_level(path, measure=False)
                 if lvl is not None:
                     counts["measured"] += 1
-                if lvl is not None and float(lvl) <= SFX_SILENT_DB:
+                # #1263: a video is exempt from the silence bucket for
+                # the same reason sfx_short exempts it - the picture is
+                # the point - so the desk never offers one for deletion
+                # on the grounds that it is quiet.
+                if (lvl is not None and float(lvl) <= SFX_SILENT_DB
+                        and not sfx_is_video(path)):
                     why, bucket = "silent", "silent"
                 elif 0 < secs < floor:
                     why, bucket = "too short", "short"
@@ -115817,7 +115977,7 @@ async def sfx_dir_api(
     bans = sfx_bans()
     try:
         kin = sorted((p for p in sample.parent.iterdir()
-                      if p.suffix.lower() in (".wav", ".mp3")),
+                      if p.suffix.lower() in SFX_TYPES),   # #1263
                      key=lambda p: p.name.lower())
     except OSError:
         kin = [sample]
@@ -115826,6 +115986,7 @@ async def sfx_dir_api(
         sid = sfx_id(path)
         samples.append({"id": sid, "name": path.stem,
                         "banned": sid in bans,
+                        "video": sfx_is_video(path),        # #1263
                         "url": f"/sfx/{sid}?t={media_sign(sid)}"})
     return {"dir": sample.parent.name or "sfx", "samples": samples,
             "banned_total": len(bans)}
@@ -117724,7 +117885,10 @@ async def sfx_file(
     # Levelled on the way out, so a hot sample does not out-shout the DJ who
     # set it up (#220). Both outputs fetch through here, so both get it.
     path = await asyncio.to_thread(sfx_levelled, path)
-    media_type = MUSIC_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    # #1263: SFX_TYPES, not MUSIC_TYPES - a video served as
+    # application/octet-stream under the nosniff header below is a clip
+    # the browser refuses to decode.
+    media_type = SFX_TYPES.get(path.suffix.lower(), "application/octet-stream")
     try:
         size = await asyncio.to_thread(lambda: path.stat().st_size)
     except Exception:
@@ -142614,6 +142778,66 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   max-height: calc(100dvh - 8px) !important;
 }
 
+/* ---- #1263 The SFX guy's television ---------------------------------
+   A sting with a picture pops a little set on the glass, and it comes on
+   the way a CRT does: a dot, opened out into a line, the line pulled
+   open into a picture. When the clip ends it goes the other way - the
+   picture collapses into a line, the line into a dot, and the dot fades.
+
+   The animation lives on an INNER element, never on the frame, so the
+   window's own geometry is untouched: dragging and resizing keep working
+   while the tube is coming up or going down, and the operator's saved
+   position is never overwritten by an animation frame. */
+#pineWin-sfxTv { z-index: 420; }
+#pineWin-sfxTv .pine-win-host { background: #000; }
+.sfx-tv-tube {
+  position: absolute; inset: 0; background: #000;
+  transform-origin: 50% 50%;
+  will-change: transform, filter, opacity;
+}
+.sfx-tv-tube video {
+  display: block; width: 100%; height: 100%;
+  object-fit: contain; background: #000;
+}
+/* The scan lines, the glow and the white pop are what make it read as a
+   tube rather than a <video> in a box. All three are inert to the
+   pointer, so the frame underneath still takes every drag. */
+.sfx-tv-glass {
+  position: absolute; inset: 0; pointer-events: none; opacity: .5;
+  background: repeating-linear-gradient(to bottom,
+    rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px,
+    rgba(0,0,0,.34) 2px, rgba(0,0,0,.34) 3px);
+}
+.sfx-tv-vignette {
+  position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse at 50% 46%,
+    rgba(255,255,255,.07) 0%, rgba(0,0,0,0) 52%, rgba(0,0,0,.6) 100%);
+}
+.sfx-tv-flash {
+  position: absolute; inset: 0; pointer-events: none;
+  background: #fff; opacity: 0;
+}
+@keyframes sfxTvOn {
+  0%   { transform: scale(.004, .004); filter: brightness(4); opacity: 1; }
+  34%  { transform: scale(1, .006);    filter: brightness(3.4); opacity: 1; }
+  58%  { transform: scale(1, .06);     filter: brightness(2); opacity: 1; }
+  100% { transform: scale(1, 1);       filter: brightness(1); opacity: 1; }
+}
+@keyframes sfxTvOff {
+  0%   { transform: scale(1, 1);       filter: brightness(1); opacity: 1; }
+  40%  { transform: scale(1, .014);    filter: brightness(3.2); opacity: 1; }
+  62%  { transform: scale(1, .006);    filter: brightness(5); opacity: 1; }
+  100% { transform: scale(.004, .004); filter: brightness(7); opacity: 0; }
+}
+@keyframes sfxTvFlash { 0% { opacity: .8; } 100% { opacity: 0; } }
+.sfx-tv-tube.on  { animation: sfxTvOn .42s cubic-bezier(.18,.9,.3,1) both; }
+.sfx-tv-tube.off { animation: sfxTvOff .46s cubic-bezier(.7,0,.9,.35) both; }
+.sfx-tv-flash.pop { animation: sfxTvFlash .3s ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .sfx-tv-tube.on, .sfx-tv-tube.off, .sfx-tv-flash.pop { animation: none; }
+  .sfx-tv-tube.off { opacity: 0; }
+}
+
 /* ---- Voice Studio ---- */
 #studioWin {
   position: fixed; z-index: 168; display: flex; flex-direction: column;
@@ -145076,6 +145300,13 @@ function pineWin(key, title, opts) {
       try { hostRo.disconnect(); } catch (e) {}
       if (callScene !== false && opts.onClose) {
         try { opts.onClose(); } catch (e) {}
+      }
+      /* #1263: ...and a hook the OPENER may set after the frame exists,
+       * for a scene whose teardown is built around the box it was handed
+       * (the television has to silence its clip). opts.onClose is set at
+       * open time and stays what it always was. */
+      if (callScene !== false && typeof entry.onClosed === "function") {
+        try { entry.onClosed(); } catch (e) {}
       }
       box.remove();
       if (PINE_WINS[key] === entry) delete PINE_WINS[key];
@@ -166524,6 +166755,12 @@ function djVoicePlay(clip) {
       if (++n >= 300) break;
     }
   }
+  /* #1263: a clip with a PICTURE never joins this queue. It is a
+   * scheduler for SPEECH built on two alternating <audio> elements - a
+   * picture has nowhere to go in one, and borrowing a slot would put a
+   * sting in front of a presenter. It opens the little CRT set instead,
+   * which carries its own sound. */
+  if (clip.video) { djVideoTv(clip); return; }
   /* #1147: a REPLY is a person being answered and outranks the queue -
    * it goes to the head (the same #206 rule the floor honours), so an
    * ack never waits out a 45-second announce hold behind a burst. */
@@ -166533,6 +166770,243 @@ function djVoicePlay(clip) {
     djVoiceQueue.push(clip);
   }
   djVoiceNext();
+}
+
+/* ---- #1263: THE SFX GUY'S TELEVISION ---------------------------------
+ *
+ * "If the SFX guy plays an MP4 clip, I wanna see a pop up of that in a
+ *  little pop up window ... And then I want it to close out like a CRT
+ *  television where it just closes into a line and disappears ... as a
+ *  little pop in window that I'm able to drag and move around."
+ *
+ * ONE set, not one per clip. A second clip arriving while the first is
+ * on waits its turn in the same tube and gives up if its moment has
+ * gone - which is how a television behaves, and also what stops a busy
+ * hour from growing a wall of windows nobody asked for.
+ *
+ * The frame is an ordinary pine-win (key "sfxTv"), so it drags, resizes
+ * and remembers wherever it was left; the tube animation is on an inner
+ * element so none of that is ever what is being animated.
+ */
+function pineInsideDesktopShell() {
+  return !!(window.pineDesktop
+            && typeof window.pineDesktop.clipboardReady === "function");
+}
+
+const djTvQueue = [];
+let djTvOn = false;                      // a clip is in the tube right now
+let djTvTimer = null;                    // #1147's shape: ONE deduped hold
+const DJ_TV_LATE = 8;                    // seconds past air before we skip
+
+function djVideoTv(clip) {
+  if (!clip || !clip.url) return;
+  /* INSIDE THE PINE BOX APP THE SHELL OWNS THE SET.
+   *
+   * "I want it to pop up ... in the view or in any view." This document
+   * is one TAB of that window - a set opened here exists on the Agent
+   * tab and nowhere else, which is the arrangement the operator asked
+   * against. desktop/renderer/sfx-tv.js draws it over every view off the
+   * same /api/dj/video road; two sets would be two pictures and two
+   * soundtracks. clipboardReady is webview-preload.js's own signal and
+   * the one thing that says "this page is inside the app". */
+  try {
+    if (pineInsideDesktopShell()) return;
+  } catch (e) { /* a plain browser: the set is this page's */ }
+  /* Two roads reach here - the voice feed when the show is routed to
+   * this page, and djVideoPoll when it is routed to the box - and both
+   * see the same clip. One mark, so the set comes on once. */
+  const mark = "tv|" + String(clip.ts || "") + "|" + String(clip.url || "");
+  if (djVoiceMarks.has(mark)) return;
+  djVoiceMarks.add(mark);
+  djTvQueue.push(clip);
+  if (djTvQueue.length > 4) djTvQueue.splice(0, djTvQueue.length - 4);
+  djTvNext();
+}
+
+function djTvLate(clip) {
+  return (Date.now() - Number(clip.broadcastAt || Date.now())) / 1000;
+}
+
+function djTvRelease() {
+  djTvOn = false;
+  /* The duck belongs to whatever is still sounding. Releasing it while a
+   * line is mid-word is how the music jumps back over a presenter. */
+  if (!djVoiceLive && !djVoiceQueue.length) { djSpeaking = false; djApplyGain(); }
+  setTimeout(djTvNext, 120);
+}
+
+function djTvNext() {
+  if (djTvOn) return;
+  /* A paused station shows nothing, and the cache popup's mute switch
+   * holds the set exactly as it holds the talk. */
+  if (pineAirPaused || window.cacheHold) return;
+  let clip = djTvQueue.shift();
+  while (clip && djTvLate(clip) > DJ_TV_LATE) {
+    djVoiceAck(clip, "error", null,
+               "the clip's moment passed before the set could come on");
+    clip = djTvQueue.shift();
+  }
+  if (!clip) return;
+  /* Early is not late: the station stamps an air moment a lead ahead of
+   * delivery, and a picture that jumps the gun lands over the line it
+   * was meant to punctuate. */
+  const wait = Number(clip.broadcastAt || 0) - Date.now();
+  if (wait > 250) {
+    djTvQueue.unshift(clip);
+    if (djTvTimer) clearTimeout(djTvTimer);
+    djTvTimer = setTimeout(() => { djTvTimer = null; djTvNext(); }, wait);
+    return;
+  }
+  djTvOn = true;
+  djTvShow(clip);
+}
+
+function djTvShow(clip) {
+  let win = null;
+  /* Any set still standing is torn down THROUGH its own hook, so its
+   * clip is silenced. pineWin's own one-frame-per-key close is silent by
+   * design, and a video element goes on playing after it leaves the DOM. */
+  try { pineWinClose("sfxTv", true); } catch (e) {}
+  djTvOn = true;          // ...and that hook releases the flag we hold
+  try {
+    win = pineWin("sfxTv", String(clip.sting || clip.text || "SFX"),
+                  {width: 420, height: 272, minWidth: 200, minHeight: 140});
+  } catch (e) { win = null; }
+  if (!win) {
+    djVoiceAck(clip, "error", null, "the set would not open");
+    djTvRelease();
+    return;
+  }
+
+  const tube = document.createElement("div");
+  tube.className = "sfx-tv-tube";
+  const video = document.createElement("video");
+  video.playsInline = true;
+  video.preload = "auto";
+  video.controls = false;
+  /* #789/#981: the desktop shell owns live element volume and the booth
+   * monitor switch governs anything tagged pine-live; #1008's solo gate
+   * reads "audio,video" and reaches this too. A sting that skipped the
+   * tag would be the one sound on the page nobody could turn down. */
+  video.dataset.pineLive = "voice";
+  /* No br=: that road is an AUDIO transcode (#1210). The signature in
+   * the url is what gets it past the guard, so it is passed through
+   * exactly as the station wrote it. */
+  video.src = clip.url;
+  tube.appendChild(video);
+  const glass = document.createElement("div");
+  glass.className = "sfx-tv-glass";
+  const vignette = document.createElement("div");
+  vignette.className = "sfx-tv-vignette";
+  const flash = document.createElement("div");
+  flash.className = "sfx-tv-flash";
+  win.host.appendChild(tube);
+  win.host.appendChild(glass);
+  win.host.appendChild(vignette);
+  win.host.appendChild(flash);
+  tube.classList.add("on");              // dot -> line -> picture
+  flash.classList.add("pop");
+
+  let finished = false;
+  const quiet = () => {
+    try { video.pause(); video.removeAttribute("src"); video.load(); }
+    catch (e) {}
+  };
+  /* The operator's own ✕ takes the frame away under us: stop the clip
+   * and let the queue move on, with no animation to run on a box that
+   * is already gone. */
+  win.onClosed = () => {
+    if (finished) return;
+    finished = true;
+    quiet();
+    djTvRelease();
+  };
+  const closeSet = () => {
+    if (finished) return;
+    finished = true;
+    try {
+      tube.classList.remove("on");
+      void tube.offsetWidth;             // restart the animation, not resume it
+      tube.classList.add("off");
+    } catch (e) {}
+    /* Longer than the animation, so the last frame is seen; the clip is
+     * silenced FIRST so a tail cannot outlive the picture. */
+    setTimeout(() => {
+      quiet();
+      try { win.close(false); } catch (e) {}
+      djTvRelease();
+    }, 520);
+  };
+
+  video.onplaying = () => {
+    if (finished) return;
+    djSpeaking = true; djApplyGain();
+    clip.ackAt = 0;
+    djVoiceAck(clip, "playing", video);
+  };
+  video.ontimeupdate = () => {
+    if (!finished && !video.paused) djVoiceAck(clip, "playing", video);
+  };
+  video.onended = () => {
+    djVoiceAck(clip, "ended", video);
+    closeSet();
+  };
+  video.onerror = () => {
+    /* A zero-byte or unreadable clip is the common case on a drop share,
+     * and it must cost the set one blink, not the rest of the hour. */
+    djVoiceAck(clip, "error", video,
+               (video.error && video.error.message) || "the clip would not play");
+    closeSet();
+  };
+  /* THE WATCHDOG. onerror does not fire for every way a clip can fail to
+   * begin (a stalled range request, a container the build cannot
+   * decode), and a set left on with a black tube holds the queue behind
+   * it forever. */
+  setTimeout(() => {
+    if (!finished && (video.paused || !Number(video.currentTime))) {
+      djVoiceAck(clip, "error", video, "the clip never started");
+      closeSet();
+    }
+  }, 12000);
+
+  video.play().catch((e) => {
+    if (e && e.name === "NotAllowedError") {
+      /* The picture is still worth having: run it silent and put up the
+       * ordinary one-tap unlock, exactly as the voice road does. */
+      try { video.muted = true; video.play().catch(() => {}); } catch (err) {}
+      try { pineAudioPrompt(video); } catch (err) {}
+      return;
+    }
+    djVoiceAck(clip, "error", video, e);
+    closeSet();
+  });
+}
+
+/* The set's own poll. In the ordinary arrangement here the DJs talk out
+ * of the box and djVoicePoll returns on its first line - so without this
+ * the one surface a picture CAN air on is the one surface never asking
+ * for it. Small, unconditional, and it advances its own marker so the
+ * voice feed's `since` is never touched by it. */
+let djVideoSeen = 0;
+let djVideoPollLive = 0;
+async function djVideoPoll() {
+  /* Inside the app the shell polls this road for the whole window; a
+   * second poll from this tab would be traffic for a set that is never
+   * opened here. */
+  if (pineInsideDesktopShell()) return;
+  if (djVideoPollLive && Date.now() - djVideoPollLive < 15000) return;
+  djVideoPollLive = Date.now();
+  try {
+    const data = await api("/api/dj/video?since=" + djVideoSeen);
+    const serverMs = Number(data.server_ms || Date.now());
+    (data.clips || []).forEach((clip) => {
+      djVideoSeen = Math.max(djVideoSeen, Number(clip.ts || 0));
+      clip.broadcastAt = Date.now()
+        + Number(clip.broadcast_ms || clip.ts) - serverMs;
+      djVideoTv(clip);
+    });
+  } catch (e) { /* the show goes on */
+  } finally { djVideoPollLive = 0; }
 }
 
 // #185: two elements, alternating, because one cannot play two clips at
@@ -193645,6 +194119,7 @@ function startLiveActivity() {
     });
   } catch (e) {}
   setInterval(djVoicePoll, 4000);
+  setInterval(djVideoPoll, 2500);        // #1263: the SFX guy's television
   setInterval(() => { if (djOn) djMiniRender({now: djNowTrack || {}}); }, 500);
   const savedOutput = document.getElementById("djOutput");
   if (savedOutput) savedOutput.value = djOutputMode();
@@ -195539,6 +196014,10 @@ async function pollOnce() {
       clip.keepWhole = !!(clip.speech || clip.stream) && (voicePrimed
         || clip.broadcastAt + Number((clip.stream || {}).length || 15) * 1000 > Date.now());
       if (clip.url) {
+        /* #1263: a clip with a PICTURE belongs to the panel's little CRT
+         * set. Handed to a listener's <audio> element it is a transport
+         * error, a retry, and then a hole where a sting should have been. */
+        if (clip.video) return;
         // #1146: ts+url, so two clips stamped the same millisecond both
         // still play while a re-delivered twin does not.
         const mark = String(clip.ts || "") + "|" + String(clip.url);
