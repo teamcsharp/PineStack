@@ -1,0 +1,312 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- PINE APP RECORDER. The rolling recording is a background system task
+         on this terminal, not something an activity happens to be doing, so
+         it runs as a foreground service: started at boot, restarted by the
+         system if it dies, and outliving every activity in the app.
+         SPECIAL_USE rather than mediaProjection because there is no
+         projection - CAPTURE_VIDEO_OUTPUT and the platform key make the
+         VirtualDisplay direct. See replay/PineAppRecorder.kt. -->
+    <!-- THE MIRROR CAME BACK BLANK WITHOUT THIS. This tablet's built-in
+         display carries FLAG_SECURE (see `dumpsys display`), and a
+         VirtualDisplay that is not itself marked secure is handed a blanked
+         copy of it - not an error, not a log line, just a flat grey surface
+         that encodes to almost nothing. Measured: ten seconds of "recording"
+         came to 3,834 bytes and one colour, RGB(47,47,47), across 267,576 of
+         268,000 pixels.
+         signature-level from `android`, so the platform key grants it. -->
+    <uses-permission android:name="android.permission.CAPTURE_SECURE_VIDEO_OUTPUT" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- THE HEADPHONE JACK, AND WHY THIS PERMISSION IS HERE.
+
+         Measured on this tablet with a cable in the socket:
+             kernel        SwitchValues: 4      (it sees the plug)
+             framework     mMainType=0x0        (it does not)
+             audio policy  Speaker only
+
+         InputManagerService detects the plug and then steps over the one
+         call that would tell the rest of Android, because this GSI ships
+         config_useDevInputEventForAudioJack as false. A /data overlay
+         cannot fix that - measured, the overlay is applied a second AFTER
+         IMS reads the value - and no mixer setting substitutes for it,
+         because the amplifier is powered by whichever path the HAL opens
+         and the HAL only opens the headphone path when the framework
+         announces a wired device.
+
+         So the terminal makes that announcement itself, with the same call
+         WiredAccessoryManager would have made. It is gated on
+         MODIFY_AUDIO_ROUTING, which is signature|privileged - this APK is
+         signed with the platform key, so the signature half is satisfied.
+         The operator asked for this road explicitly after the five that
+         need no new privilege were each tested and found dead. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_ROUTING"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- READING THE SWITCH, which is the other half of the jack.
+         The terminal can now ANNOUNCE the cable, but it cannot see it:
+         `getSwitchState` exists on neither InputManager nor
+         InputManagerGlobal on this Android 14 build (the code enumerates
+         both and reports what it finds, rather than guessing), and
+         /dev/input belongs to root:input, which a platform signature does
+         not change. What DOES know is the input service's own dump -
+         `dumpsys input` prints `SwitchValues: 4` with a cable in and 0
+         without. Reading a service dump is gated on DUMP, which is
+         signature|privileged, and this APK is platform-signed. -->
+    <uses-permission android:name="android.permission.DUMP"
+        tools:ignore="ProtectedPermissions" />
+    <!-- THE GALLERY ON THE GLASS. Every five minutes the terminal hangs
+         whatever the station is currently selling on both the home screen
+         and the keyguard - see WallpaperWatch. SET_WALLPAPER is a normal
+         permission, granted at install, no prompt. -->
+    <!-- THE ROLLING REPLAY, AND WHY THIS PERMISSION RATHER THAN THE DIALOG.
+
+         "Always have the application saving the last thirty seconds of
+          activity... I just want it recording the tablet in general with a
+          rolling history that I'm able to always extract."
+
+         The ordinary road to screen capture is MediaProjection, and it
+         raises a consent dialog EVERY time a projection starts - which on a
+         terminal that must be recording continuously means a tap after every
+         reboot, every app restart, every crash. A rolling buffer that stops
+         whenever nobody is looking at the tablet is not a rolling buffer.
+
+         Measured on this device: CAPTURE_VIDEO_OUTPUT is `prot=signature`
+         (not signature|privileged like MODIFY_AUDIO_ROUTING) and its
+         sourcePackage is `android`. This APK is signed with the platform
+         key, so the signature matches and it is granted at install with no
+         prompt and no dialog - the same road the headphone jack took.
+
+         It allows a VirtualDisplay mirroring the screen without a projection
+         token. That is a real capability and worth being plain about: this
+         app can see the whole screen, not only its own window, which is
+         exactly what "recording the tablet in general" asked for. -->
+    <uses-permission android:name="android.permission.CAPTURE_VIDEO_OUTPUT"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.SET_WALLPAPER" />
+    <!-- The station is on the LAN; without this the tablet's Wi-Fi state is
+         unreadable and the "why is the panel blank" banner cannot say
+         "no network" as opposed to "station down". -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- The talk dot. This terminal has NO speech recognizer of its own -
+         measured: `cmd package query-services -a
+         android.speech.RecognitionService` returns "No services found" on
+         this GApps-less GSI - so the clip is recorded here and the STATION
+         hears it, through /api/listen/transcribe to wyoming-whisper. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- No Play Services on this device, and nothing here wants a camera,
+         a SIM or a touchscreen stylus. Declared so a future Play listing
+         (unlikely) would not silently widen the device list. -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="true" />
+    <uses-feature android:name="android.hardware.wifi" android:required="true" />
+
+    <application
+        android:name=".PineApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="false"
+        android:hardwareAccelerated="true"
+        android:largeHeap="true"
+        android:theme="@style/Theme.PineBoxKiosk"
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:targetApi="34">
+
+        <!-- EVERY ORIENTATION. screenOrientation was sensorLandscape, which
+             was right while the tablet was only ever going on a wall; the
+             operator picks it up. fullSensor rather than "sensor" so the two
+             REVERSE orientations come too - a tablet handed across a desk
+             arrives upside down as often as not, and "sensor" leaves it stuck.
+
+             The turn is HANDLED, not recreated: orientation, screenSize,
+             screenLayout, smallestScreenSize and density are all in
+             configChanges below, so the system calls
+             MainActivity.onConfigurationChanged instead of destroying the
+             activity. That is not tidiness - a recreate throws the WebView
+             away, and the panel at :8096 is one very large document, so the
+             operator would watch the show reload every time they turned the
+             tablet. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullSensor"
+            android:resizeableActivity="false"
+            android:excludeFromRecents="false"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale"
+            android:theme="@style/Theme.PineBoxKiosk">
+
+            <!-- The ordinary launcher entry, so the app can be started by
+                 hand while the tablet is still a normal tablet. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- THE KIOSK. Registering as HOME is what makes the tablet a
+                 terminal rather than a tablet running an app: the system
+                 hands HOME back here on every Back-out and every boot, with
+                 no dependency on the boot receiver (which Android 10+
+                 restricts from starting activities in the background).
+                 Until a device owner pins us with
+                 addPersistentPreferredActivity, the first press of Home
+                 shows the usual chooser. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- THE SC STACK, AS ITS OWN APPLICATION.
+
+             "SC stack should be its own application that I'm able to
+              access... while also being able to access it as a pop up
+              inside of Pinebox tab."
+
+             Its own LAUNCHER entry with its own label, so it appears in the
+             app list beside Pine Box rather than being a screen inside it.
+             Deliberately NOT a HOME app and not lock-tasked: the terminal is
+             the thing that must never show a blank screen, and this is an app
+             the operator opened and is allowed to leave.
+
+             `singleTop` rather than `singleTask`: reopening it from the
+             launcher, or from the panel's pop-up, should come back to the
+             monitor that is already running instead of building a second
+             WebView on a tablet with 148 MB free.
+
+             It carries `exported=true` because a LAUNCHER filter requires it,
+             and `taskAffinity` of its own so Android treats it as a separate
+             entry in Recents — otherwise it stacks into the kiosk's task and
+             backing out of it lands on the kiosk rather than where the
+             operator came from.
+
+             AND ITS OWN ICON. An activity with no android:icon inherits the
+             <application>'s, so this first shipped wearing the Pine Box pine
+             and the two were indistinguishable on the launcher - which is
+             exactly how an operator ends up in the wrong one. The mark is a
+             row of gauges in the overlays' own colours, on their blue-black
+             rather than Pine Box's green-black. -->
+        <activity
+            android:name=".SparkActivity"
+            android:exported="true"
+            android:label="@string/spark_name"
+            android:icon="@mipmap/ic_spark"
+            android:roundIcon="@mipmap/ic_spark_round"
+            android:launchMode="singleTop"
+            android:taskAffinity="com.pinebox.kiosk.spark"
+            android:screenOrientation="fullSensor"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale"
+            android:theme="@style/Theme.PineBoxKiosk">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- DGX TERMINAL, AS ITS OWN APPLICATION.
+
+             "I want to be able to SSH into the Spark... and work through a
+              terminal in a separate app called DGX Terminal."
+
+             The same shape as SparkActivity: its own LAUNCHER entry, its own
+             label and its own taskAffinity, so it sits beside Pine Box in the
+             app list and backing out of it lands where the operator came from
+             rather than on the kiosk.
+
+             Deliberately NOT a HOME app and not lock-tasked. The terminal is
+             a thing you open, use and leave; the one screen that must never go
+             blank is the radio.
+
+             `singleTask` rather than singleTop: an SSH session is expensive to
+             build and there must only ever be one of them, so reopening from
+             the launcher comes back to the shell that is already running
+             instead of opening a second connection to the Spark. -->
+        <activity
+            android:name=".terminal.DgxTerminalActivity"
+            android:exported="true"
+            android:label="@string/dgx_name"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.pinebox.kiosk.dgx"
+            android:screenOrientation="fullSensor"
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale"
+            android:theme="@style/Theme.PineBoxKiosk">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".replay.PineAppRecorder"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Continuous rolling capture of this terminal's own screen, for the operator to extract from the Pine Box desktop application." />
+        </service>
+
+        <receiver
+            android:name=".kiosk.BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- HTC/Lenovo "quick boot" resume paths; harmless elsewhere
+                     and the M9's stock ROM used one before LineageOS. -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Device-owner admin. Needed for startLockTask() without the
+             "screen pinned" toast/gesture, for setLockTaskPackages, and for
+             making this the persistent HOME. Provisioned once with:
+               adb shell dpm set-device-owner \
+                 com.pinebox.kiosk/.kiosk.PineDeviceAdminReceiver
+             (see README - it must be the ONLY account on the device). -->
+        <receiver
+            android:name=".kiosk.PineDeviceAdminReceiver"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                <action android:name="android.app.action.PROFILE_PROVISIONING_COMPLETE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- copyImage has to hand the system a content:// URI: Android's
+             clipboard cannot carry a bitmap the way Electron's can. The PNG
+             is written to cache/clipboard/ and shared read-only from there. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.clipboard"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

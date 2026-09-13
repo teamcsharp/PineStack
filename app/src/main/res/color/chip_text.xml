@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Amber fill wants dark ink on it; everything else wants pine ink. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_activated="true" android:color="@color/pine_ground" />
+    <item android:color="@color/pine_ink" />
+</selector>

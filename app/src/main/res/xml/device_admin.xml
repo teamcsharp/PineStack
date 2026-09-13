@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Deliberately minimal. Lock task mode and persistent-HOME need the app
+     to BE the device owner; they do not need any of the wipe/password
+     policies, so none are requested. -->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <force-lock />
+    </uses-policies>
+</device-admin>

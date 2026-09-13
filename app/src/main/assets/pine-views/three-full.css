@@ -1,0 +1,141 @@
+/* THE PANEL'S 3JS WINDOWS, MADE USABLE ON A TABLET.
+ *
+ * "I'm tapping these windows and they're not popping up and I need them to
+ * be instantaneous and responsive on the tablet."
+ *
+ * THEY WERE POPPING UP. Measured: `pineShow3JS("phone")` returned "phone"
+ * and the window was really there - `pine-win #pineWin-phone`, 1039x593 at
+ * (58,49) - and it was INVISIBLE, because the panel's windows live at
+ * z-index 382 and the terminal's view hosts sit at 2147483000. Whatever
+ * view was open covered the window completely. Nothing was broken; one
+ * number was three million too small.
+ *
+ * So the windows are lifted above the views. Everything else here is the
+ * full-screen promotion the operator asked for.
+ */
+
+/* THE LIFT. Above every view host, below the talk dot and the trace popup,
+   which must stay reachable while a scene is up. */
+.pine-win,
+.pine-win-shade,
+#pineWinLayer { z-index: 2147483020 !important; }
+
+/* ------------------------------------------------- the full-screen mode */
+
+/* Promoted: the panel's own modal, given the whole glass. !important
+   throughout because these dialogs are sized by inline style from the
+   panel's own code, and a class cannot out-specify an inline rule. */
+.p3-full {
+  position: fixed !important;
+  inset: 0 !important;
+  left: 0 !important; top: 0 !important;
+  right: 0 !important; bottom: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: none !important;
+  max-height: none !important;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  z-index: 2147483030 !important;
+  background: #0b0f14 !important;
+  display: block !important;
+  overflow: hidden !important;
+  /* A 3D scene wants the gesture, not the page's scroll. */
+  touch-action: none;
+}
+/* The dialog inside it carries the card look - the width, the corners, the
+   shadow - and full screen wants none of that. */
+.p3-full-card,
+.p3-full > .pine-win-body,
+.p3-full > .panel {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: none !important;
+  max-height: none !important;
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+/* Canvases inside a promoted scene fill it. */
+.p3-full canvas { width: 100% !important; height: 100% !important; }
+
+/* While one is up, the rail and the console strip would only be in the
+   way - the X is the way out. */
+body.p3-on #pineViewRail,
+body.p3-on #pineConsoleLine,
+body.p3-on #pineSamplerTab { display: none !important; }
+/* The talk dot stays: the station can still be spoken to. */
+body.p3-on .pine-talk-dot { z-index: 2147483090 !important; }
+
+/* THE X. Thumb-sized, always the same corner, above the scene it closes -
+   the lesson from the lock screen, which covered its own way out. */
+/* FIXED, not absolute: it is a child of <body> now, not of the scene -
+   see addExit() for the eleven scenes that deleted it when it was not. */
+.p3-exit {
+  position: fixed;
+  top: max(10px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
+  width: 48px; height: 48px;
+  border: 1px solid rgba(255, 255, 255, .3);
+  border-radius: 50%;
+  background: rgba(0, 0, 0, .62);
+  color: #edf3f5;
+  font-size: 18px; line-height: 1;
+  cursor: pointer;
+  z-index: 2147483035;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ---------------------------------------------------------- the chooser */
+
+.p3-sheet {
+  position: fixed;
+  z-index: 2147483040;
+  left: 50%; bottom: 20px;
+  transform: translateX(-50%);
+  width: min(560px, calc(100vw - 20px));
+  max-height: 76vh; overflow-y: auto;
+  padding: 14px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 14px;
+  background: var(--panel, #161d24);
+  box-shadow: 0 26px 64px rgba(0, 0, 0, .72);
+  color: var(--text, #edf3f5);
+}
+.p3-head { display: flex; justify-content: space-between; align-items: baseline; }
+.p3-head b { font-size: 13px; }
+.p3-head i { font-style: normal; font-size: 11px; color: var(--muted, #8fa0ad); }
+.p3-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.p3-pick {
+  min-height: 56px;
+  padding: 10px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 10px;
+  background: var(--panel-2, #222b35);
+  color: var(--text, #edf3f5);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.p3-pick:disabled { opacity: .55; cursor: default; }
+.p3-pick b { display: block; font-size: 12.5px; }
+.p3-pick i {
+  display: block; font-style: normal; font-size: 10.5px;
+  color: var(--muted, #8fa0ad); margin-top: 3px;
+}
+.p3-dim, .p3-note {
+  margin: 8px 0 0; font-size: 11px; color: var(--muted, #8fa0ad);
+}
+.p3-close {
+  width: 100%; margin-top: 12px; padding: 10px;
+  border: 1px solid var(--line, #35414c); border-radius: 10px;
+  background: transparent; color: var(--muted, #8fa0ad);
+  font: inherit; cursor: pointer;
+}

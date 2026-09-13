@@ -1,0 +1,504 @@
+/* The slideshow view. Class prefix `sl-`, like every other view's file.
+ *
+ * THE TRANSITIONS ARE THE POINT OF THE BOTTOM HALF. The desktop app has
+ * twenty, built on QGraphicsView items and QVariantAnimation. Several have
+ * no CSS equivalent at all, so each block below says what it actually does
+ * — a transition merely NAMED after the original is how two screens
+ * quietly stop being the same screen.
+ *
+ * EVERY ONE IS transform + opacity + clip-path, and nothing else. This is a
+ * MediaTek MT6768 driving a 9-inch panel with 148 MB free; an animation
+ * that touches width, top or filter on a full-screen image is a repaint of
+ * the whole glass per frame. The two exceptions are deliberate and cheap:
+ * `sand` blurs (it is the effect), and `crt` uses drop-shadow for the
+ * colour split that RGBSplitItem does on the box.
+ */
+
+.sl {
+  position: absolute;
+  inset: 0;
+  background: #05080b;
+  overflow: hidden;
+  font-family: Inter, Segoe UI, system-ui, sans-serif;
+  color: #edf3f5;
+  /* NO padding-right here. The rail's host (.pine-view-host, class sl-host)
+   * already reserves the strip the tabs sit in, and this element is
+   * positioned against that host's PADDING box - so inset:0 is already
+   * clear of the rail. Setting it here once put a second 40px on top and
+   * pushed the bar out of reach of the buttons it labels. */
+  -webkit-tap-highlight-color: transparent;
+}
+
+.sl-stage {
+  position: absolute;
+  inset: 0;
+  /* Cube and flip need a camera; without it rotateY is a squash. */
+  perspective: 1400px;
+  transform-style: preserve-3d;
+}
+
+.sl-layer {
+  position: absolute;
+  inset: 0;
+  display: block;
+  backface-visibility: hidden;
+  will-change: transform, opacity;
+}
+
+.sl-media {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  /* A render is rarely the panel's aspect; the box letterboxes too. */
+  background: #05080b;
+}
+
+.sl-canvas { image-rendering: pixelated; }
+
+.sl-note {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  text-align: center;
+  font-size: 14px;
+  line-height: 1.7;
+  color: #8fa0ad;
+}
+
+/* ---- the caption, the flash, the bar, the strip ---------------------- */
+
+.sl-caption {
+  position: absolute;
+  left: 0;
+  /* The rail paints over anything under it — see measureRail(). */
+  right: var(--sl-rail, 0px);
+  top: 0;
+  padding: 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: linear-gradient(#05080bcc, #05080b00);
+  opacity: 0;
+  transition: opacity .25s ease;
+  pointer-events: none;
+  z-index: 6;
+}
+.sl.awake .sl-caption { opacity: 1; }
+.sl-cap-name { font-size: 13px; letter-spacing: .02em; }
+.sl-cap-meta { font-size: 11px; color: #8fa0ad; }
+
+/* One line, centre screen, for an act that just happened. The desktop
+ * flashes the same acknowledgements over the picture. */
+.sl-flash {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 12px 22px;
+  border-radius: 999px;
+  background: #0b1219e6;
+  border: 1px solid #35414c;
+  font-size: 15px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 8;
+}
+.sl-flash.on { animation: sl-flash 1500ms ease forwards; }
+@keyframes sl-flash {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(.92); }
+  12% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.sl-bar {
+  position: absolute;
+  left: 0;
+  right: var(--sl-rail, 0px);
+  bottom: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  /* THE CONSOLE LINE OWNS THE BOTTOM OF EVERY SCREEN. console-line.js puts
+   * a fixed one-line backend readout across the foot of the panel and every
+   * view, including this one — MEASURED at 26px on the tablet, with the bar
+   * sitting under it and the key letters clipped off the buttons. Its real
+   * height is read at mount and published as --sl-console, so a change to
+   * that file moves this bar rather than breaking it; the 26px is only the
+   * fallback for a host that has no console line at all. */
+  padding: 10px 12px calc(12px + var(--sl-console, 26px));
+  background: linear-gradient(#05080b00, #05080be6 35%);
+  transform: translateY(110%);
+  transition: transform .28s cubic-bezier(.2, .8, .3, 1);
+  z-index: 7;
+}
+.sl.awake .sl-bar { transform: translateY(0); }
+
+.sl-btn {
+  min-width: 46px;
+  min-height: 44px;          /* a thumb, not a mouse */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 4px 8px;
+  background: #1c242c;
+  color: #edf3f5;
+  border: 1px solid #35414c;
+  border-radius: 10px;
+  font: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.sl-btn.on { background: #65c7da; color: #05131a; border-color: #65c7da; }
+.sl-btn-face { font-size: 13px; line-height: 1.1; }
+.sl-btn-key {
+  font-size: 8px;
+  letter-spacing: .08em;
+  color: #6d7f8c;
+}
+.sl-btn.on .sl-btn-key { color: #0a2730; }
+
+.sl-strip {
+  position: absolute;
+  right: calc(12px + var(--sl-rail, 0px));
+  /* Clear of the bar, which is itself clear of the console line. */
+  bottom: calc(74px + var(--sl-console, 26px));
+  left: 12px;
+  display: flex;
+  gap: 5px;
+  opacity: 0;
+  transition: opacity .25s ease;
+  pointer-events: none;
+  z-index: 6;
+}
+.sl.awake .sl-strip { opacity: 1; pointer-events: auto; }
+
+.sl-cell {
+  position: relative;
+  width: 64px;               /* QUEUE_THUMB_SIZE */
+  height: 64px;
+  flex: 0 0 auto;
+  padding: 0;
+  overflow: hidden;
+  background: #0b1219;
+  border: 1px solid #35414c;
+  border-radius: 8px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.sl-cell.now { border-color: #65c7da; }
+.sl-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.sl-cell-video {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  font-size: 20px;
+  color: #65c7da;
+}
+.sl-cell-fav {
+  position: absolute;
+  right: 3px;
+  bottom: 1px;
+  font-size: 11px;
+  color: #ff7a90;
+  text-shadow: 0 1px 2px #000;
+}
+
+/* ---- the sheets ------------------------------------------------------ */
+
+.sl-sheet {
+  position: absolute;
+  inset: 0 var(--sl-rail, 0px) 0 0;
+  overflow-y: auto;
+  padding: 18px 20px 28px;
+  background: #080d12f2;
+  z-index: 9;
+}
+.sl-sheet-close {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  width: 38px;
+  height: 38px;
+  background: #1c242c;
+  color: #edf3f5;
+  border: 1px solid #35414c;
+  border-radius: 10px;
+  font-size: 15px;
+  cursor: pointer;
+}
+.sl-sheet-title { margin: 2px 44px 10px 0; font-size: 15px; font-weight: 600; }
+.sl-sheet-note { margin: 0 0 14px; font-size: 12px; line-height: 1.65; color: #8fa0ad; }
+
+.sl-sheet-row {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 14px;
+  text-align: left;
+  background: #131c24;
+  color: #edf3f5;
+  border: 1px solid #35414c;
+  border-radius: 10px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+/* The unlink is red before it is pressed, and says so again after. */
+.sl-sheet-row.danger { border-color: #6b2b33; color: #ff9aab; }
+.sl-sheet-row.armed { background: #61212b; color: #fff; border-color: #ff7a90; }
+
+.sl-help { display: flex; flex-direction: column; gap: 7px; }
+.sl-help-row { display: flex; gap: 12px; font-size: 12.5px; }
+.sl-help-key { flex: 0 0 130px; color: #65c7da; }
+.sl-help-what { color: #b9c6cf; }
+
+
+/* ======================================================================
+ * THE TWENTY TRANSITIONS
+ * ==================================================================== */
+
+.sl-in, .sl-out { animation-duration: 600ms; animation-fill-mode: both; }
+.sl-in { z-index: 2; }
+.sl-out { z-index: 1; }
+
+/* SLIDE — the box's, exactly: the new one comes in from the right and
+ * pushes the old one out to the left. */
+.sl-t-slide.sl-in { animation-name: sl-slide-in; animation-timing-function: cubic-bezier(.2,.8,.3,1); }
+.sl-t-slide.sl-out { animation-name: sl-slide-out; animation-timing-function: cubic-bezier(.2,.8,.3,1); }
+@keyframes sl-slide-in { from { transform: translateX(100%); } to { transform: none; } }
+@keyframes sl-slide-out { from { transform: none; } to { transform: translateX(-100%); } }
+
+/* SWIRL — two full turns in and out, scaling through zero. */
+.sl-t-swirl.sl-in { animation-name: sl-swirl-in; }
+.sl-t-swirl.sl-out { animation-name: sl-swirl-out; }
+@keyframes sl-swirl-in {
+  from { transform: rotate(-720deg) scale(0); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes sl-swirl-out {
+  from { transform: none; opacity: 1; }
+  to { transform: rotate(720deg) scale(0); opacity: 0; }
+}
+
+/* ROTATE — a half turn, no scale through zero. */
+.sl-t-rotate.sl-in { animation-name: sl-rotate-in; }
+.sl-t-rotate.sl-out { animation-name: sl-rotate-out; }
+@keyframes sl-rotate-in {
+  from { transform: rotate(-180deg) scale(.55); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes sl-rotate-out {
+  from { transform: none; opacity: 1; }
+  to { transform: rotate(180deg) scale(.55); opacity: 0; }
+}
+
+/* FLIP — a card turning on its vertical axis. Needs the stage's
+ * perspective, which is why it is set there and not here. */
+.sl-t-flip.sl-in { animation-name: sl-flip-in; }
+.sl-t-flip.sl-out { animation-name: sl-flip-out; }
+@keyframes sl-flip-in {
+  from { transform: rotateY(-92deg); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes sl-flip-out {
+  from { transform: none; opacity: 1; }
+  to { transform: rotateY(92deg); opacity: 0; }
+}
+
+/* MOSAIC is not here — it is real resampling through a canvas, in
+ * slideshow.js. CSS has no pixelate and a blur is a different effect. The
+ * canvas hands over to `sand` for the incoming half, which is what these
+ * two lines are for. */
+
+/* FOLD — the box folds the outgoing frame away like paper. This is that
+ * fold, hinged at the top and bottom edges; the paper-AIRPLANE flight the
+ * desktop adds afterwards is not attempted, because a plane made of one
+ * flat element is a rectangle tumbling, which looks like a mistake. */
+.sl-t-fold.sl-in { animation-name: sl-fold-in; transform-origin: top center; }
+.sl-t-fold.sl-out { animation-name: sl-fold-out; transform-origin: bottom center; }
+@keyframes sl-fold-in {
+  from { transform: rotateX(-88deg); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes sl-fold-out {
+  from { transform: none; opacity: 1; }
+  to { transform: rotateX(88deg); opacity: 0; }
+}
+
+/* UNFOLD — the same hinge, the other way round. */
+.sl-t-unfold.sl-in { animation-name: sl-fold-in; transform-origin: bottom center; }
+.sl-t-unfold.sl-out { animation-name: sl-fold-out; transform-origin: top center; }
+
+/* BUMP — the new one lands and settles. */
+.sl-t-bump.sl-in { animation-name: sl-bump-in; animation-timing-function: cubic-bezier(.18,1.5,.4,1); }
+.sl-t-bump.sl-out { animation-name: sl-fade-out; }
+@keyframes sl-bump-in {
+  from { transform: scale(1.45); opacity: 0; }
+  60% { transform: scale(.97); opacity: 1; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes sl-fade-out { from { opacity: 1; } to { opacity: 0; } }
+
+/* BASH — the old one is knocked out of the way. */
+.sl-t-bash.sl-in { animation-name: sl-bash-in; }
+.sl-t-bash.sl-out { animation-name: sl-bash-out; }
+@keyframes sl-bash-in {
+  0% { transform: translateX(24%) scale(1.1); opacity: 0; }
+  40% { transform: translateX(-3%) scale(1); opacity: 1; }
+  60% { transform: translateX(2%); }
+  80% { transform: translateX(-1%); }
+  100% { transform: none; }
+}
+@keyframes sl-bash-out {
+  from { transform: none; opacity: 1; }
+  to { transform: translateX(-38%) rotate(-9deg) scale(.86); opacity: 0; }
+}
+
+/* UNROLL — the new picture is drawn down like a blind. clip-path, so the
+ * image never moves and the GPU only re-rasterises the clip. */
+.sl-t-unroll.sl-in { animation-name: sl-unroll-in; animation-timing-function: cubic-bezier(.3,.7,.2,1); }
+.sl-t-unroll.sl-out { animation-name: sl-fade-out; }
+@keyframes sl-unroll-in {
+  from { clip-path: inset(0 0 100% 0); }
+  to { clip-path: inset(0 0 0 0); }
+}
+
+/* ORIGAMI — the fold with a second crease across it. */
+.sl-t-origami.sl-in { animation-name: sl-origami-in; transform-origin: top left; }
+.sl-t-origami.sl-out { animation-name: sl-origami-out; transform-origin: bottom right; }
+@keyframes sl-origami-in {
+  from { transform: rotateX(-70deg) rotateY(48deg) scale(.72); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes sl-origami-out {
+  from { transform: none; opacity: 1; }
+  to { transform: rotateX(70deg) rotateY(-48deg) scale(.72); opacity: 0; }
+}
+
+/* SAND — the picture disperses. A blur, which is the one filter worth its
+ * cost here because dispersal without it is just a fade. */
+.sl-t-sand.sl-in { animation-name: sl-sand-in; }
+.sl-t-sand.sl-out { animation-name: sl-sand-out; }
+@keyframes sl-sand-in {
+  from { opacity: 0; filter: blur(20px); transform: scale(1.06); }
+  to { opacity: 1; filter: blur(0); transform: none; }
+}
+@keyframes sl-sand-out {
+  from { opacity: 1; filter: blur(0); }
+  to { opacity: 0; filter: blur(20px); transform: scale(.96); }
+}
+
+/* SHATTER is not here either — eight genuinely clipped shards, built in
+ * slideshow.js. These are the two rules those shards use. */
+.sl-shard {
+  will-change: transform, opacity;
+  transition: transform 600ms cubic-bezier(.4,0,.6,1), opacity 600ms ease;
+}
+.sl-shattering .sl-shard {
+  transform: translate(var(--sl-fly-x), var(--sl-fly-y)) rotate(var(--sl-spin)) scale(.7);
+  opacity: 0;
+}
+
+/* CUBE — the two frames are faces of one box turning. */
+.sl-t-cube.sl-in { animation-name: sl-cube-in; transform-origin: left center; }
+.sl-t-cube.sl-out { animation-name: sl-cube-out; transform-origin: right center; }
+@keyframes sl-cube-in {
+  from { transform: rotateY(88deg) translateZ(40px); opacity: .3; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes sl-cube-out {
+  from { transform: none; opacity: 1; }
+  to { transform: rotateY(-88deg) translateZ(40px); opacity: .3; }
+}
+
+/* DELETE — the box's own removal animation: rotate, scale, bounce out.
+ * 900ms, its DELETE_MS, and the only transition here that is not 600. */
+.sl-t-delete.sl-in { animation-name: sl-bump-in; animation-duration: 900ms; }
+.sl-t-delete.sl-out { animation-name: sl-delete-out; animation-duration: 900ms; }
+@keyframes sl-delete-out {
+  0% { transform: none; opacity: 1; }
+  25% { transform: rotate(-8deg) scale(1.06); }
+  100% { transform: rotate(28deg) scale(.1) translateY(120%); opacity: 0; }
+}
+
+/* TV — the CRT collapse: the frame falls to a line, then the line closes. */
+.sl-t-tv.sl-in { animation-name: sl-tv-in; }
+.sl-t-tv.sl-out { animation-name: sl-tv-out; }
+@keyframes sl-tv-out {
+  0% { transform: none; opacity: 1; }
+  55% { transform: scaleY(.004); opacity: 1; }
+  100% { transform: scaleY(.004) scaleX(0); opacity: .8; }
+}
+@keyframes sl-tv-in {
+  0% { transform: scaleY(.004) scaleX(0); opacity: .8; }
+  45% { transform: scaleY(.004) scaleX(1); opacity: 1; }
+  100% { transform: none; opacity: 1; }
+}
+
+/* CRT — the same collapse with the colour split the box draws with
+ * RGBSplitItem. drop-shadow rather than three stacked copies: one filtered
+ * layer instead of three composited ones, on a GPU that has to spare. */
+.sl-t-crt.sl-in { animation-name: sl-crt-in; }
+.sl-t-crt.sl-out { animation-name: sl-tv-out; }
+@keyframes sl-crt-in {
+  0% { transform: scaleY(.004) scaleX(0); opacity: .8;
+       filter: drop-shadow(6px 0 0 #ff003c) drop-shadow(-6px 0 0 #00e5ff); }
+  45% { transform: scaleY(.004) scaleX(1); opacity: 1; }
+  80% { filter: drop-shadow(3px 0 0 #ff003c) drop-shadow(-3px 0 0 #00e5ff); }
+  100% { transform: none; opacity: 1; filter: none; }
+}
+
+/* VAPORWAVE — the hue drifts and the channels part. */
+.sl-t-vaporwave.sl-in { animation-name: sl-vapor-in; }
+.sl-t-vaporwave.sl-out { animation-name: sl-vapor-out; }
+@keyframes sl-vapor-in {
+  0% { opacity: 0; transform: translateY(6%) scale(1.04); filter: hue-rotate(-70deg) saturate(2.2); }
+  100% { opacity: 1; transform: none; filter: none; }
+}
+@keyframes sl-vapor-out {
+  0% { opacity: 1; filter: none; }
+  100% { opacity: 0; transform: translateY(-6%) scale(.97); filter: hue-rotate(70deg) saturate(2.2); }
+}
+
+/* LIQUID — the frame goes soft at the edges and pours out. A border-radius
+ * morph, which is the closest a flat element gets to surface tension. */
+.sl-t-liquid.sl-in { animation-name: sl-liquid-in; }
+.sl-t-liquid.sl-out { animation-name: sl-liquid-out; }
+@keyframes sl-liquid-in {
+  0% { border-radius: 46% 54% 60% 40% / 55% 45% 55% 45%; transform: scale(.7); opacity: 0; }
+  60% { border-radius: 18% 22% 16% 24% / 20% 18% 22% 20%; opacity: 1; }
+  100% { border-radius: 0; transform: none; opacity: 1; }
+}
+@keyframes sl-liquid-out {
+  0% { border-radius: 0; transform: none; opacity: 1; }
+  100% { border-radius: 54% 46% 40% 60% / 45% 55% 45% 55%; transform: scale(.7); opacity: 0; }
+}
+.sl-t-liquid.sl-in, .sl-t-liquid.sl-out { overflow: hidden; }
+
+/* A tablet held in portrait is 9 inches of glass with a rail down one edge:
+ * the bar wraps rather than scrolling sideways, and the strip shows what
+ * fits instead of overflowing under it. */
+@media (max-width: 620px) {
+  .sl-strip { bottom: calc(118px + var(--sl-console, 26px)); overflow: hidden; }
+  .sl-btn { min-width: 42px; }
+  .sl-help-key { flex-basis: 100px; }
+}
+
+/* The operator may have the system set to reduce motion; twenty
+ * transitions is exactly the kind of thing that setting exists for. */
+@media (prefers-reduced-motion: reduce) {
+  .sl-in { animation-name: sl-sand-in !important; animation-duration: 220ms !important; }
+  .sl-out { animation-name: sl-fade-out !important; animation-duration: 220ms !important; }
+  .sl-t-sand.sl-in { filter: none; }
+}

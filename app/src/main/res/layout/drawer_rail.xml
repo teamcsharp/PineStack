@@ -1,0 +1,637 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- THE RAIL, mirrored from desktop/renderer/index.html lines 16-159.
+     Only the half that means anything on a tablet is here. What was left
+     out and why:
+       - the Electron view tabs (Agent / Radio / Deck / Recover / Settings)
+         switch between <webview> elements that exist only in the desktop
+         shell; on the terminal there is ONE WebView and the panel does its
+         own navigation, so those became the Jump-to list below;
+       - "Monitor here", "App volume" and the shell's own <audio> player
+         gate audio inside the Electron shell, which is not this process;
+       - the LCD, Sampler, Terminal and Call-in tabs drive hardware wired to
+         the BOX (see PineDesktopBridge.WHY_LCD / WHY_TERMINAL).
+     What is here is what actually changes the STATION: the FM switch, the
+     air pause, the broadcast preset, the three independent stream routes
+     with their levels, the jumps, and a log. -->
+<androidx.core.widget.NestedScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/railScroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/pine_rail"
+    android:clickable="true"
+    android:focusable="true"
+    android:fillViewport="true"
+    android:scrollbars="none">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/rail_title"
+            android:textColor="@color/pine_ink"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/railConn"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/rail_checking"
+            android:textColor="@color/pine_dim"
+            android:textSize="12sp" />
+
+        <!-- What is sounding right now. Free: it comes off the SAME feed
+             snapshot the terminal already polls, so the rail costs the
+             station nothing extra (see StationFeed - do not add a poller). -->
+        <TextView
+            android:id="@+id/railNow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:layout_marginBottom="@dimen/rail_gap"
+            android:ellipsize="end"
+            android:maxLines="2"
+            android:textColor="@color/pine_amber"
+            android:textSize="12sp"
+            tools:text="Quanta: and that is the whole of it" />
+
+        <!-- #1212/#1213: REINITIALISE, AND IT IS FIRST FOR A REASON.
+             The one cure no server can perform is reloading this page, and
+             over two days it had to be asked for in words four times: a
+             stale pause flag, a stuck player, a page running yesterday's
+             code - all of them live in the WebView, where no restart of
+             the station can reach them. One tap walks the whole ladder,
+             cheapest first, and stops the moment sound comes back. -->
+        <LinearLayout
+            android:id="@+id/fixCard"
+            style="@style/PineCard">
+
+            <TextView style="@style/PineCaption" android:text="@string/rail_fix" />
+
+            <Button
+                android:id="@+id/fixGo"
+                style="@style/PineChip"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/rail_fix_go" />
+
+            <TextView
+                android:id="@+id/fixNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/rail_fix_idle"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <!-- THE BATTERY, AND HOW LONG THE RADIO HAS LEFT.
+             At the TOP because it is the only thing in this rail that can
+             end the broadcast without anybody touching a control, and
+             because a number you have to scroll to is a number you find out
+             about too late. Tapping the card opens the detail: the draw,
+             the temperature, what the processor and memory are doing, and
+             what - if anything - is choking the tablet. -->
+        <LinearLayout
+            android:id="@+id/powerCard"
+            style="@style/PineCard"
+            android:clickable="true"
+            android:focusable="true">
+
+            <TextView style="@style/PineCaption" android:text="@string/rail_power" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:id="@+id/powerPercent"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/pine_ink"
+                    android:textSize="30sp"
+                    android:textStyle="bold"
+                    tools:text="47%" />
+
+                <TextView
+                    android:id="@+id/powerLeft"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="10dp"
+                    android:textColor="@color/pine_ink"
+                    android:textSize="13sp"
+                    tools:text="3h 12m of radio left" />
+            </LinearLayout>
+
+            <!-- A bar, because a percentage is read faster as a length. -->
+            <ProgressBar
+                android:id="@+id/powerBar"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="6dp"
+                android:layout_marginTop="6dp"
+                android:max="100"
+                tools:progress="47" />
+
+            <TextView
+                android:id="@+id/powerNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp"
+                tools:text="drawing 420 mA · 31°C · power saver off" />
+
+            <!-- The detail, folded away until asked for. -->
+            <TextView
+                android:id="@+id/powerDetail"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:lineSpacingExtra="3dp"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp"
+                android:visibility="gone"
+                tools:text="the detail" />
+
+            <Button
+                android:id="@+id/powerSaver"
+                style="@style/PineChip"
+                android:layout_height="@dimen/tap"
+                android:layout_marginTop="8dp"
+                android:layout_marginEnd="0dp"
+                android:visibility="gone"
+                android:text="@string/rail_power_saver" />
+        </LinearLayout>
+
+        <!-- OFF AIR, WHICH IS NOT OFF. The desktop's own words, and the
+             reason these two sit together and are not one switch: FM stops
+             the station and every service under it; the pause shuts only the
+             door to the air and the booth keeps banking. -->
+        <LinearLayout style="@style/PineCard">
+
+            <TextView style="@style/PineCaption" android:text="@string/rail_air" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/fmSwitch"
+                    style="@style/PineChip"
+                    android:layout_height="@dimen/tap"
+                    android:text="@string/rail_fm" />
+
+                <Button
+                    android:id="@+id/airPause"
+                    style="@style/PineChip"
+                    android:layout_height="@dimen/tap"
+                    android:layout_weight="2"
+                    android:layout_marginEnd="0dp"
+                    android:text="@string/rail_pause" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/airNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp"
+                tools:text="on air - 418m banked" />
+        </LinearLayout>
+
+        <!-- The preset. It moves music, DJs and replies together; the three
+             cards under it move one without disturbing the others (#980). -->
+        <LinearLayout style="@style/PineCard">
+
+            <TextView style="@style/PineCaption" android:text="@string/rail_broadcast" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/broadcast_nabu"
+            style="@style/PineChip"
+            android:text="@string/rail_nabu" />
+        <Button
+            android:id="@+id/broadcast_box"
+            style="@style/PineChip"
+            android:text="@string/rail_pinebox" />
+        <Button
+            android:id="@+id/broadcast_web"
+            style="@style/PineChip"
+            android:text="@string/rail_web" />
+        <Button
+            android:id="@+id/broadcast_app"
+            style="@style/PineChip"
+            android:layout_marginEnd="0dp"
+            android:text="@string/rail_app" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/routeNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/rail_route_unknown"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <LinearLayout style="@style/PineCard">
+
+            <TextView style="@style/PineCaption" android:text="@string/rail_players" />
+
+            <!-- Every page that is currently receiving the broadcast, and
+                 which one of them is actually sounding. The station keeps
+                 this: #1008 hands ONE listener the air and every other page
+                 gags itself, so this list is the switch, not a report.
+                 Filled on drawer open, not polled - see RailController. -->
+            <LinearLayout
+                android:id="@+id/playerList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+
+            <!-- Where the sound leaves THIS tablet: speaker, aux, USB,
+                 Bluetooth. Which device is playing and which socket it
+                 comes out of are different questions, and from across the
+                 room a tablet playing to its own speaker looks exactly like
+                 one playing to a cable. -->
+            <TextView
+                android:id="@+id/outputNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="@color/chip_text"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/playerNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/rail_players_waiting"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <TextView style="@style/PineCaption" android:text="@string/rail_streams" />
+
+        <!-- KILL THE MUSIC IN ONE TAP, and put it back at the level it was.
+             Dragging to zero takes a second and a steady hand; the per-
+             stream OFF chip is a ROUTE change, not a level. This is for
+             talking over the record, so it leaves the DJs alone. -->
+        <Button
+            android:id="@+id/hushMusic"
+            style="@style/PineChip"
+            android:layout_height="@dimen/tap"
+            android:layout_marginEnd="0dp"
+            android:layout_marginBottom="6dp"
+            android:text="@string/rail_music_off" />
+
+    <LinearLayout style="@style/PineCard">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/rail_music"
+                android:textColor="@color/pine_ink"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/route_music_state"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="box" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/route_music_here"
+            style="@style/PineChip"
+            android:text="@string/rail_here" />
+        <Button
+            android:id="@+id/route_music_box"
+            style="@style/PineChip"
+            android:text="@string/rail_box" />
+        <Button
+            android:id="@+id/route_music_both"
+            style="@style/PineChip"
+            android:text="@string/rail_both" />
+        <Button
+            android:id="@+id/route_music_off"
+            style="@style/PineChip"
+            android:layout_marginEnd="0dp"
+            android:text="@string/rail_off" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <SeekBar
+                android:id="@+id/vol_music"
+                android:layout_width="0dp"
+                android:layout_height="@dimen/tap"
+                android:layout_weight="1"
+                android:max="100"
+                android:progress="100" />
+
+            <TextView
+                android:id="@+id/vol_music_value"
+                android:layout_width="44dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="100%" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout style="@style/PineCard">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/rail_voice"
+                android:textColor="@color/pine_ink"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/route_voice_state"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="box" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/route_voice_here"
+            style="@style/PineChip"
+            android:text="@string/rail_here" />
+        <Button
+            android:id="@+id/route_voice_box"
+            style="@style/PineChip"
+            android:text="@string/rail_box" />
+        <Button
+            android:id="@+id/route_voice_both"
+            style="@style/PineChip"
+            android:text="@string/rail_both" />
+        <Button
+            android:id="@+id/route_voice_off"
+            style="@style/PineChip"
+            android:layout_marginEnd="0dp"
+            android:text="@string/rail_off" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <SeekBar
+                android:id="@+id/vol_voice"
+                android:layout_width="0dp"
+                android:layout_height="@dimen/tap"
+                android:layout_weight="1"
+                android:max="100"
+                android:progress="100" />
+
+            <TextView
+                android:id="@+id/vol_voice_value"
+                android:layout_width="44dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="100%" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout style="@style/PineCard">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/rail_reply"
+                android:textColor="@color/pine_ink"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/route_reply_state"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="box" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/route_reply_here"
+            style="@style/PineChip"
+            android:text="@string/rail_here" />
+        <Button
+            android:id="@+id/route_reply_box"
+            style="@style/PineChip"
+            android:text="@string/rail_box" />
+        <Button
+            android:id="@+id/route_reply_both"
+            style="@style/PineChip"
+            android:text="@string/rail_both" />
+        <Button
+            android:id="@+id/route_reply_off"
+            style="@style/PineChip"
+            android:layout_marginEnd="0dp"
+            android:text="@string/rail_off" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <SeekBar
+                android:id="@+id/vol_reply"
+                android:layout_width="0dp"
+                android:layout_height="@dimen/tap"
+                android:layout_weight="1"
+                android:max="100"
+                android:progress="100" />
+
+            <TextView
+                android:id="@+id/vol_reply_value"
+                android:layout_width="44dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="100%" />
+        </LinearLayout>
+    </LinearLayout>
+
+        <!-- THE ONE THAT MADE THE TABLET LOOK BROKEN.
+             2026-09-10: every route was set to "here", the panel's
+             <audio id="musicPlayer" data-pine-live="music"> was playing
+             (paused:false, readyState:4, muted:false) - and its volume was 0,
+             so the terminal sat in silence with a healthy-looking station.
+             Nothing was wrong with the station or with autoplay.
+             musicVolumeRemember (app.py:142170) persists every volumechange
+             into localStorage under `pineMusicVolume`, and the WebView is a
+             fresh browser profile whose copy of that key was "0". Per-client,
+             per-browser, invisible from the station.
+             MainActivity heals absent-or-zero on load; this slider is how the
+             operator moves it afterwards without a keyboard or a devtools
+             socket, which is what "self-service" has to mean on a wall
+             tablet. -->
+        <LinearLayout style="@style/PineCard">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/rail_monitor"
+                    android:textColor="@color/pine_ink"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/vol_monitor_value"
+                    android:layout_width="44dp"
+                    android:layout_height="wrap_content"
+                    android:gravity="end"
+                    android:textColor="@color/pine_dim"
+                    android:textSize="12sp"
+                    tools:text="100%" />
+            </LinearLayout>
+
+            <SeekBar
+                android:id="@+id/vol_monitor"
+                android:layout_width="match_parent"
+                android:layout_height="@dimen/tap"
+                android:max="100"
+                android:progress="100" />
+
+            <TextView
+                android:id="@+id/monitorNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/rail_monitor_note"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <!-- The jumps. Filled from QuickJumps.ALL in code rather than listed
+             here: every entry is a key the PANEL already knows (pineShow3JS,
+             app.py:135073) and keeping the list in Kotlin is what lets a JVM
+             test assert the built script and URL without a device. -->
+        <LinearLayout style="@style/PineCard">
+
+            <TextView style="@style/PineCaption" android:text="@string/rail_jumps" />
+
+            <LinearLayout
+                android:id="@+id/jumpList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+        </LinearLayout>
+
+        <LinearLayout style="@style/PineCard">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    style="@style/PineCaption"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:text="@string/rail_logs" />
+
+                <Button
+                    android:id="@+id/logsFull"
+                    style="@style/PineChip"
+                    android:layout_width="wrap_content"
+                    android:layout_weight="0"
+                    android:layout_marginEnd="0dp"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:text="@string/rail_logs_full" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/railLogs"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textColor="@color/pine_dim"
+                android:textIsSelectable="true"
+                android:textSize="10sp"
+                tools:text="writing - intro" />
+        </LinearLayout>
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

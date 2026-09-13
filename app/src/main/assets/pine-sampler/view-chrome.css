@@ -1,0 +1,196 @@
+/* The furniture every terminal view wears. See view-chrome.js for why it
+ * exists at all - in short, all three of the operator's sketches draw the
+ * same view bar, pine tree and transport in the same corner, and none of
+ * them had been built.
+ *
+ * THE PALETTE IS DEFINED ON THE HOST, not inherited. On the tablet these
+ * views are injected into the station's own panel, where the desktop's
+ * tokens do not exist: `var(--cyan)` resolves to nothing and a control ends
+ * up near-black on transparent. sampler.css learned that by having its mode
+ * buttons disappear; this does not repeat it. The fallbacks in every var()
+ * below let the desktop's own theme win where it does define them. */
+.vc {
+  --vc-bg: #101419;
+  --vc-panel: #1c242c;
+  --vc-panel-2: #222b35;
+  --vc-text: #edf3f5;
+  --vc-muted: #8fa0ad;
+  --vc-line: #35414c;
+  --vc-on: #65c7da;
+  --vc-green: #54d18b;
+
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* 1 - the view bar. It scrolls rather than wraps: six labels on a narrow
+   portrait tablet would otherwise become two rows and push the tree, the
+   transport and the feed down with them. */
+.vc-bar {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  border: 1px solid var(--line, var(--vc-line));
+  border-radius: 8px;
+  padding: 3px;
+  background: var(--panel, var(--vc-panel));
+}
+.vc-bar::-webkit-scrollbar { height: 0; }
+
+.vc-tab {
+  flex: 0 0 auto;
+  min-height: 34px;            /* a thumb, not a mouse */
+  padding: 0 11px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted, var(--vc-muted));
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
+}
+.vc-tab.on {
+  background: var(--panel-2, var(--vc-panel-2));
+  color: var(--text, var(--vc-text));
+  box-shadow: inset 0 0 0 1px var(--cyan, var(--vc-on));
+}
+
+/* 2 - the pine tree. Monochrome and drawn, per the standing instruction
+   that every colour or emoji icon is replaced by a single-colour one: an
+   emoji tree is neither monochrome nor the same shape on two devices. */
+.vc-tree {
+  align-self: flex-start;
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  padding: 0;
+  border: 1px solid var(--line, var(--vc-line));
+  border-radius: 10px;
+  background: var(--panel, var(--vc-panel));
+  color: var(--text, var(--vc-text));
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.vc-tree:active { background: var(--panel-2, var(--vc-panel-2)); }
+.vc-tree svg { width: 34px; height: 34px; fill: currentColor; }
+
+/* 3 - the transport. */
+.vc-transport {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--line, var(--vc-line));
+  border-radius: 999px;
+  background: var(--panel, var(--vc-panel));
+}
+.vc-btn {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid var(--line, var(--vc-line));
+  border-radius: 50%;
+  background: var(--panel-2, var(--vc-panel-2));
+  color: var(--text, var(--vc-text));
+  font-size: 13px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.vc-btn:active { border-color: var(--cyan, var(--vc-on)); }
+.vc-play { width: 42px; height: 42px; font-size: 15px; }
+
+/* The position readout. Deliberately NOT a slider: the station owns the
+   playhead and there is no route to move it, so this is drawn as a line
+   with a mark on it rather than as something that invites a drag. */
+.vc-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line, var(--vc-line));
+}
+.vc-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: 2px;
+  background: var(--cyan, var(--vc-on));
+}
+.vc-knob {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 9px;
+  height: 9px;
+  margin: -4.5px 0 0 -4.5px;
+  border-radius: 50%;
+  background: var(--text, var(--vc-text));
+}
+.vc-time {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--muted, var(--vc-muted));
+  font-variant-numeric: tabular-nums;
+}
+
+/* A terminal the operator has silenced says so, because a silent room and
+   a broken one look identical otherwise. */
+.vc.vc-quiet .vc-play { border-color: var(--vc-green); color: var(--vc-green); }
+
+/* The last-resort menu, for a host with neither the tablet's native rail
+   nor the desktop's station drawer. */
+.vc-sheet {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 2147483200;
+  min-width: 210px;
+  padding: 12px;
+  border: 1px solid var(--vc-line);
+  border-radius: 12px;
+  background: var(--vc-bg);
+  color: var(--vc-text);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, .5);
+}
+.vc-sheet h4 { margin: 0 0 8px; font-size: 13px; }
+.vc-sheet-row {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  margin-bottom: 4px;
+  padding: 0 10px;
+  border: 1px solid var(--vc-line);
+  border-radius: 8px;
+  background: var(--vc-panel);
+  color: var(--vc-text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.vc-sheet-note {
+  margin: 8px 0 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--vc-muted);
+}
+
+/* Portrait: the tree and the transport share a row so the feed below them
+   keeps its height. Height is the scarce axis on this tablet - measured at
+   598 CSS px in landscape before the layout was widened. */
+@media (max-width: 760px) {
+  .vc-tree { width: 52px; height: 52px; }
+  .vc-tree svg { width: 28px; height: 28px; }
+}

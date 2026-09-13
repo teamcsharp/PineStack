@@ -1,0 +1,13 @@
+<!-- THE SC STACK'S OWN GROUND, and it is deliberately not Pine Box's.
+
+     Pine Box is #0B0F0C, a green-black, with an amber pine on it. This is
+     #05080B, the blue-black the overlays are drawn on
+     (spark-overlays.css), so the two icons do not read as the same app at a
+     glance on a launcher page. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#05080B" android:pathData="M0,0 L108,0 L108,108 L0,108 Z" />
+</vector>

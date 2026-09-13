@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- THE SC STACK, AS ITS OWN APPLICATION.
+
+     Deliberately almost nothing: a WebView and a status panel. No drawer, no
+     rail, no lock screen. The Pine Box terminal is a kiosk that owns HOME and
+     carries the whole station; this is an ordinary app with an icon, which
+     opens on the Spark's own readouts and can be closed again.
+
+     Everything it shows comes from the station at /spark — the overlays, the
+     slideshow and the twenty transitions are all served, not bundled. So a
+     change to desktop/renderer/spark-overlays.js appears here on the next
+     launch with NO rebuild of this APK, which is the opposite of how the
+     kiosk's injected views work and is the reason this activity is thin. -->
+<FrameLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/sparkRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/pine_ground"
+    android:keepScreenOn="true">
+
+    <WebView
+        android:id="@+id/sparkPanel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- An app with no address bar has no other way to say what went wrong;
+         a blank screen is indistinguishable from a dead tablet. -->
+    <LinearLayout
+        android:id="@+id/sparkStatus"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:background="@color/pine_ground"
+        android:padding="32dp">
+
+        <TextView
+            android:id="@+id/sparkStatusText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="#8fa0ad"
+            android:textSize="16sp"
+            android:gravity="center"
+            android:text="@string/status_connecting" />
+
+        <Button
+            android:id="@+id/sparkRetry"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:visibility="gone"
+            android:text="@string/spark_retry" />
+    </LinearLayout>
+</FrameLayout>

@@ -1,0 +1,48 @@
+/* The startup splash. Covers everything while it plays and gets out of
+   the way completely when it is done - including its own pointer events,
+   so a stuck frame can never make the app unusable. */
+.pine-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483100;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(ellipse at 50% 45%, #16202a 0%, #0b0f14 70%);
+  transition: opacity .6s ease;
+}
+.pine-splash.gone { opacity: 0; pointer-events: none; }
+
+.pine-splash-fx {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  display: block;
+}
+
+/* The real artwork, underneath the points, brought up at the flash. */
+.pine-splash-logo {
+  position: relative;
+  width: min(280px, 46vw);
+  max-height: 46vh;
+  object-fit: contain;
+  opacity: 0;
+  transform: scale(.94);
+  transition: opacity .5s ease, transform .5s ease;
+  pointer-events: none;
+}
+.pine-splash-logo.lit { opacity: 1; transform: scale(1); }
+
+@media (prefers-reduced-motion: reduce) {
+  /* Someone who has asked for less motion gets the mark, not the show. */
+  .pine-splash-fx { display: none; }
+  .pine-splash-logo { opacity: 1; transform: none; transition: none; }
+}
+
+/* Riding inside the kiosk's boot screen rather than covering the app: no
+   ground of its own (the boot screen has one), and it must not eat the
+   taps the boot screen uses for "skip". */
+.pine-splash.inside {
+  position: absolute;
+  background: none;
+  pointer-events: none;
+}
+.pine-splash.inside .pine-splash-logo { width: min(220px, 34vw); }

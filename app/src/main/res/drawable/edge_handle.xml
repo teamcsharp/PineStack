@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The left-bezel ribbon. Barely there on purpose: it is a hint, not
+     chrome. A gradient rather than a flat fill so it reads as "the edge of
+     something" and not as a stray border on the panel. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:startColor="#66E3B341"
+        android:centerColor="#22E3B341"
+        android:endColor="#00000000"
+        android:angle="0" />
+</shape>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One row of the Jump-to list. Inflated once per QuickJumps.ALL entry.
+     Full 48dp tall and left-aligned: these are read down a column with a
+     thumb, not scanned like chips. -->
+<Button xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="@dimen/tap"
+    android:layout_marginBottom="4dp"
+    style="?android:attr/borderlessButtonStyle"
+    android:background="@drawable/chip"
+    android:gravity="center_vertical|start"
+    android:paddingStart="12dp"
+    android:paddingEnd="12dp"
+    android:stateListAnimator="@null"
+    android:textAllCaps="false"
+    android:textColor="@color/chip_text"
+    android:textSize="14sp" />

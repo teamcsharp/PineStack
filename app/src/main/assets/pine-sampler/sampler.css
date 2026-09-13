@@ -1,0 +1,1312 @@
+/* THE SAMPLER CARRIES ITS OWN PALETTE.
+ *
+ * These were `var(--cyan)`, `var(--panel)` and friends, which exist in the
+ * Pine Box desktop's stylesheet. Injected into the STATION PANEL on the
+ * tablet they resolve to nothing - so `.pb-mode.on { background:
+ * var(--cyan); color:#05131a }` became near-black text on a transparent
+ * background and the mode buttons LOOKED LIKE THEY VANISHED when tapped.
+ *
+ * Defining them on the host means the sampler looks the same wherever it
+ * is mounted, and cannot be broken by whatever page it lands in. The
+ * fallbacks in the var() calls below keep the desktop's own theme winning
+ * where it does define them. */
+#sampler, .pb-sampler {
+  --bg: #101419;
+  --panel: #1c242c;
+  --panel-2: #222b35;
+  --text: #edf3f5;
+  --muted: #8fa0ad;
+  --line: #35414c;
+  --green: #54d18b;
+  --amber: #e3be63;
+  --red: #e46b6b;
+  --cyan: #65c7da;
+}
+
+/* A pad is struck, never selected. Long-press was raising the text
+   selection handles and the context menu over the grid, which is the
+   opposite of an instrument. */
+/* NOTHING ON THIS PAGE IS TEXT TO BE SELECTED.
+ *
+ * "Whenever I am dragging and dropping a pad to the sampler, I do not want
+ *  to select text accidentally. Selecting text should be blocked on this
+ *  page because this page is about selecting the tiles and dragging them."
+ *
+ * It was scoped to the pads and the mode buttons, which left the FEED - the
+ * one part of this view you actually drag from - selectable. So a carry
+ * across the feed painted half the column blue and handed the browser its
+ * own text drag, which is what the operator was fighting. The whole host is
+ * now unselectable and undraggable; the carry is pointer-driven and wants
+ * neither. */
+#sampler, .pb-sampler, #sampler *, .pb-sampler * {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+/* The one exception: a field you are meant to type into. */
+#sampler input[type="text"], #sampler input[type="search"], #sampler textarea,
+.pb-sampler input[type="text"], .pb-sampler input[type="search"],
+.pb-sampler textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.pb-pad, .pb-mode, .pb-bank, .pb-toggle, .pb-pad * {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.pb-pad, .pb-mode, .pb-bank { touch-action: none; }
+
+/* The Sampler view.
+ *
+ * Two columns: the feed you take from, and the instrument you play. The
+ * pads are deliberately large and deliberately square - this is the one
+ * surface in the whole app meant to be hit rather than clicked, and it has
+ * to survive being hit with a thumb on a 9" tablet as well as a mouse here.
+ */
+
+.view.pb-sampler.active {
+  display: grid;
+  /* minmax(0, …) ON BOTH TRACKS. A bare `1fr` still refuses to go below
+     its content's min-content width, so a wide thing in either column
+     pushes the other one off the glass instead of scrolling inside itself.
+     30% rather than 22% because the feed is where the words are - measured,
+     the pad side had 838px for a 468px grid. */
+  grid-template-columns: minmax(240px, 30%) minmax(0, 1fr);
+  gap: 14px;
+  padding: 14px;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* THE RAIL GUTTER, ON THE TABLET HOST ONLY.
+ *
+ * pine-sampler/boot.js restates the layout rule above against `#sampler`,
+ * because `.view.pb-sampler.active` can never match the standalone host -
+ * and it restated the `padding:14px` with it. But the tablet has a view
+ * rail welded to the RIGHT edge (rail.js, 34px wide, z-index above every
+ * host), and 14px of padding does not clear it. Measured in all three
+ * orientations: .pb-right, .pb-banks, .pb-padwrap, .pb-controls and the
+ * fourth bank button each sat 20px (34 - 14) underneath the rail, so the
+ * last bank button could not be pressed.
+ *
+ * `#sampler.open` is an id AND a class, which out-specifies boot.js's bare
+ * `#sampler`, so the fix lives in the stylesheet rather than in the
+ * injected string. Only the right side is restated: view-chrome.css owns
+ * the 26px bottom for the console strip and must keep it. */
+#sampler.open { padding-right: 48px; }
+
+/* ------------------------------------------------------------ the feed */
+
+.pb-left {
+  display: grid;
+  /* THE ONE THAT WAS CUTTING THE FEED OFF. With rows declared and no
+     columns, the single implicit column is `auto`, and an `auto` track never
+     shrinks below its min-content - so when the head grew past the column
+     the TRACK grew with it and every row was laid out 320px wide inside a
+     240px box that clips. Measured before this line: width 240,
+     scrollWidth 320. */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto 1fr auto;
+  min-height: 0;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.pb-feed-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  /* IT WRAPS RATHER THAN CLIPS. Four controls and a count do not fit a
+     240px rail at every font size, and a head that cannot wrap is a head
+     that decides how wide the whole column is. */
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.pb-feed-head b { font-size: 14px; }
+
+.pb-toggle {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.pb-toggle.on { color: #05131a; background: var(--cyan); border-color: var(--cyan); }
+
+.pb-feed { overflow-y: auto; min-height: 0; padding: 6px; }
+
+.pb-row {
+  display: grid;
+  /* Same trap one level down: a long speaker name would otherwise set the
+     row's width and push the status off the edge. */
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "who tag" "text text";
+  gap: 2px 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  line-height: 1.35;
+}
+.pb-row b { grid-area: who; color: var(--cyan); font-weight: 600; }
+.pb-row em { grid-area: tag; color: var(--muted); font-style: normal; font-size: 10.5px; }
+.pb-row span {
+  grid-area: text; color: var(--text);
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* A row you can take is obviously liftable; a row with no audio behind it
+ * is shown but visibly inert, rather than hidden - "why is that not here"
+ * is a worse question than "why is that greyed out". */
+.pb-row.grabbable { cursor: grab; background: var(--panel-2); border-color: var(--line); }
+.pb-row.grabbable:hover { border-color: var(--cyan); }
+.pb-row.grabbable:active { cursor: grabbing; }
+.pb-row.quiet { opacity: .45; }
+.pb-row.playing { border-color: var(--green); }
+.pb-row.playing b { color: var(--green); }
+.pb-row + .pb-row { margin-top: 4px; }
+
+.pb-note-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  min-height: 34px;
+  font-size: 11.5px;
+}
+.pb-note {
+  color: var(--muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pb-note.bad { color: var(--red); }
+.pb-foot { color: var(--muted); opacity: .7; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+
+/* ------------------------------------------------------ the instrument */
+
+/* A COLUMN WHERE ONLY THE PAD GRID GROWS.
+ *
+ * This was `grid-template-rows: auto 1fr auto`, which assigns the free space
+ * BY POSITION - and the column has gained children since it was written: the
+ * dial row, the playing timeline, and then the knob row. Each addition shifts
+ * whatever lands in slot two into the 1fr and pushes the pads out of it. The
+ * knob row was the one that finally showed it: the pads collapsed to a sliver
+ * behind the mode buttons while an empty band sat where they should be.
+ *
+ * A flex column says the thing that was meant all along - everything takes
+ * the height it needs and THE GRID TAKES THE REST - and it does not care how
+ * many children arrive later or which of them are hidden. */
+.pb-right {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  min-width: 0;
+}
+.pb-right > * { flex: 0 0 auto; }
+/* min-height:0 so it can be SMALLER than its content: without it a flex item
+ * refuses to shrink below its intrinsic size and the pads push the controls
+ * off the bottom instead of scaling down. */
+.pb-right > .pb-padwrap { flex: 1 1 auto; min-height: 0; }
+
+.pb-banks { display: flex; gap: 8px; }
+.pb-bank {
+  flex: 1;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 0;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pb-bank.active { background: var(--panel-2); color: var(--text); border-color: var(--cyan); }
+
+/* SQUARE PADS, IN BOTH ORIENTATIONS.
+ *
+ * "Make sure the sampler pads have a square resolution even when the tablet
+ * is in portrait mode or landscape mode. The point of the sampler's pads is
+ * that they are square pads that I tap on."
+ *
+ * The grid used to be 4x4 of `1fr` stretched across whatever box it was
+ * handed - and that box is square in neither orientation, so the pads came
+ * out wide in landscape and tall in portrait. A 4x4 of rectangles is a
+ * spreadsheet; a pad is a thing you hit with a thumb.
+ *
+ * The fix is to give the grid something it can MEASURE. `.pb-padwrap` is a
+ * SIZE CONTAINER, which means `cqh` inside it resolves to that box's own
+ * height - so `min(100%, 100cqh)` is "the smaller of this box's two sides",
+ * which is the largest square that fits. The four columns and four rows are
+ * equal fractions of a square with equal gaps in both axes, so every cell
+ * comes out square without any per-pad rule.
+ *
+ * `place-items: center` puts the slack on both sides of whichever axis has
+ * it, rather than all of it at the bottom.
+ *
+ * The `aspect-ratio` is not redundant: it is the fallback. Without container
+ * query support the width falls back to 100% and the ratio at least keeps
+ * the pads square, at the cost of the grid running past a short box. Square
+ * and clipped beats correct and rectangular - the pads are the instrument.
+ */
+.pb-padwrap {
+  container-type: size;
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  min-width: 0;
+}
+
+.pb-grid {
+  display: grid;
+  /* A FLOOR UNDER THE CONTAINER QUERY.
+   *
+   * `container-type: size` on .pb-padwrap forces `contain: size`, which means
+   * the wrap sizes itself AS IF EMPTY - it takes no height from the pads at
+   * all. So 100cqh is only meaningful when something OUTSIDE has given the
+   * wrap a height, and when nothing has, this whole grid computes to zero and
+   * sixteen pads collapse into a row of dots behind the mode buttons. That is
+   * exactly what happened on both screens when a new child took the free row
+   * out of the column.
+   *
+   * The column now hands the wrap its height (see .pb-right), so the query
+   * works - but a grid that can silently become zero is a trap waiting for
+   * the next child, and max() costs nothing. */
+  width: min(100%, max(240px, 100cqh));
+  aspect-ratio: 1;
+  grid-template-columns: repeat(4, 1fr);
+  grid-template-rows: repeat(4, 1fr);
+  gap: 10px;
+  min-height: 0;
+}
+
+.pb-pad {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 2px;
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  overflow: hidden;
+  cursor: pointer;
+  user-select: none;
+  /* The pad must never scroll, pan or select under a finger - every
+     gesture on it is a strike. */
+  touch-action: none;
+  transition: background 90ms linear, border-color 90ms linear;
+}
+
+.pb-pad-num {
+  position: absolute; top: 7px; left: 9px;
+  font-size: 11px; color: var(--muted); font-weight: 600;
+}
+.pb-pad-label {
+  font-size: 11.5px; line-height: 1.3; color: var(--text);
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.pb-pad-sub { font-size: 10px; color: var(--muted); }
+
+.pb-pad.filled { background: var(--panel-2); border-color: #3f5666; }
+/* Loaded on disk but not yet decoded into the engine - it will play, but
+   not instantly, so say so rather than let the first press disappoint. */
+.pb-pad.cold { opacity: .6; }
+/* The station could not cut this line exactly; the pad's tooltip carries
+   X-Pine-Cut saying what was actually taken. */
+.pb-pad.inexact { border-color: var(--amber); }
+.pb-pad.selected { box-shadow: inset 0 0 0 2px var(--cyan); }
+.pb-pad.over { border-color: var(--green); background: #1f3a2c; }
+/* Fetching. The station can take ten seconds or more when it is busy, so
+   this has to read as "working", not as "broken". */
+.pb-pad.loading { opacity: .72; border-color: var(--cyan); }
+.pb-pad.loading .pb-pad-sub { color: var(--cyan); }
+@keyframes pb-working { 0%,100% { opacity: .55 } 50% { opacity: .95 } }
+.pb-pad.loading { animation: pb-working 1.4s ease-in-out infinite; }
+
+/* The strike light. Short, bright, and driven by the press rather than by
+   the audio finishing, so the surface feels immediate even if a sample is
+   long. */
+.pb-pad.lit {
+  background: #2f4a5c;
+  border-color: var(--cyan);
+  transition: none;
+}
+
+.pb-controls { display: flex; flex-wrap: wrap; gap: 8px; }
+.pb-mode {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px 13px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  cursor: pointer;
+}
+.pb-mode:hover { color: var(--text); }
+.pb-mode.on { background: var(--cyan); border-color: var(--cyan); color: #05131a; }
+.pb-mode.danger.on, .pb-mode.danger:hover { border-color: var(--red); color: var(--red); }
+
+/* ----------------------------------------------------- the trim editor */
+
+/* Above the sampler host, which sits at 2147483000 when injected into
+   the station panel. At z-index 80 the trim editor opened UNDERNEATH
+   the pads and looked like nothing had happened. */
+.pb-trim {
+  position: fixed; inset: 0; z-index: 2147483100;
+  background: rgba(4, 8, 12, .68);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.pb-trim[hidden] { display: none; }
+
+.pb-trim-box {
+  width: min(760px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .55);
+}
+.pb-trim-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pb-trim-head b { font-size: 13.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pb-trim-head button {
+  background: none; border: 1px solid var(--line); color: var(--muted);
+  border-radius: 6px; padding: 3px 9px; cursor: pointer;
+}
+.pb-trim-cut { margin: 0; color: var(--amber); font-size: 11.5px; }
+.pb-trim-cut[hidden] { display: none; }
+
+.pb-trim-canvas {
+  width: 100%; height: 170px;
+  background: #0c1116;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  touch-action: none;
+  cursor: ew-resize;
+}
+.pb-trim-readout { margin: 0; color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.pb-trim-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.pb-trim-row label { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); }
+.pb-trim-row input[type="range"] { width: 150px; }
+
+/* --------------------------------------------------------- small glass */
+/* The tablet lands here in landscape at roughly 1000x600 CSS px, which is
+   narrower than this desktop but the same shape. Below that the feed goes
+   on top and the pads keep the room. */
+@media (max-width: 900px) {
+  .view.pb-sampler.active {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(120px, 26%) 1fr;
+  }
+  .pb-pad-label { -webkit-line-clamp: 2; }
+}
+
+/* How much of the feed can actually be taken. Answers "is it expanding?"
+   and "why is that row grey?" without the operator having to ask. */
+/* THE HEAD CARRIES FOUR THINGS NOW, on a nine-inch screen. The tally is the
+ * one that gives way, because it is the only one whose meaning survives
+ * being cut short - the buttons must stay whole and stay tappable. */
+.pb-tally {
+  /* `1 1 0` rather than `1 1 auto`: from a zero basis it is the first thing
+     to give up room, which is what should happen - "38 of 38" cut short
+     still reads, and half a button does not. */
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 10.5px;
+  text-align: right;
+  padding-right: 6px;
+}
+.pb-feed-head b, .pb-feed-head .pb-toggle { flex: 0 0 auto; }
+
+/* +5 and the arrow back. Taller than the `line` toggle beside them, because
+ * these two are meant to be tapped repeatedly with a thumb and the 22px a
+ * .pb-toggle comes to is a target you have to aim at. */
+.pb-step {
+  min-width: 36px;
+  padding: 7px 10px;
+  color: var(--cyan);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.pb-step:active { background: var(--cyan); color: #05131a; border-color: var(--cyan); }
+
+/* Carrying a clip to a pad.
+   pan-y tells the browser a vertical drag is ITS gesture (the list scrolls
+   natively, which beats anything re-implemented here) while leaving the
+   horizontal one to us. */
+/* none, not pan-y. With pan-y the browser may pan, and once it decides to
+   it takes the WHOLE gesture - measured on the tablet as 14 touchmoves but
+   one pointermove and no pointerup. The list's vertical scrolling is done
+   in carryMove() instead. */
+.pb-row.grabbable { touch-action: none; }
+.pb-row.lifting { opacity: .45; border-color: var(--cyan); }
+.pb-ghost {
+  position: fixed; left: 0; top: 0; z-index: 2147483002;
+  max-width: 230px; pointer-events: none;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  border: 1px solid var(--cyan, #65c7da); border-radius: 8px;
+  padding: 7px 10px; font-size: 11.5px; line-height: 1.35;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, .55);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ONE-SHOT ACTIONS ARE NOT TOGGLES.
+ *
+ * "I am stuck in chop mode." There was no chop mode - CHOP is a single
+ * destructive press - but it sat in the row wearing the same button as
+ * POLY and GATE, so it read as a state, and with every pad relabelled
+ * "[3/16]" and no way back, that is exactly what it became.
+ *
+ * Actions are drawn hollow with a dashed edge: nothing about them suggests
+ * a light that could be left on. `.armed` is the exception and means the
+ * press is now an UNDO, which is a real state and looks like one. */
+#sampler .pb-mode.pb-act,
+.pb-sampler .pb-mode.pb-act {
+  border-style: dashed;
+  font-weight: 500;
+  letter-spacing: .04em;
+}
+#sampler .pb-mode.pb-act.armed,
+.pb-sampler .pb-mode.pb-act.armed {
+  border-style: solid;
+  border-color: var(--pb-warn, #e0b341);
+  color: var(--pb-warn, #e0b341);
+  font-weight: 700;
+}
+
+/* ==========================================================================
+   THE BIN, THE DIALS, SIXTEEN LEVELS, PRESETS AND THE GRAB WINDOW
+   ========================================================================== */
+
+/* --- the bin -------------------------------------------------------------
+ *
+ * It exists only while a pad is being carried. Fixed to the bottom of the
+ * screen rather than floating under the finger: a target you drag TO has to
+ * stay still, and the thumb is already covering wherever it started. */
+.pb-bin {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translate(-50%, 24px);
+  z-index: 2147483030;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-radius: 14px;
+  background: #1c242c;
+  border: 1px solid #35414c;
+  color: #8fa0ad;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+  opacity: 0;
+  transition: opacity .12s ease, transform .12s ease,
+              background .12s ease, border-color .12s ease, color .12s ease;
+  pointer-events: none;   /* a drop target, never a click target */
+}
+.pb-bin.up { opacity: 1; transform: translate(-50%, 0); }
+.pb-bin.over {
+  background: #3a1f22;
+  border-color: #e46b6b;
+  color: #ffd9d9;
+  transform: translate(-50%, -4px) scale(1.04);
+}
+.pb-bin-can { font-size: 22px; line-height: 1; }
+.pb-bin-say { font-size: 12px; font-weight: 600; letter-spacing: .02em; }
+
+.pb-undo {
+  margin-left: 10px;
+  background: #222b35;
+  color: #65c7da;
+  border: 1px solid #35414c;
+  border-radius: 6px;
+  padding: 2px 9px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* --- the dial row --------------------------------------------------------
+ *
+ * Below the toggles, and only while a toggle that needs it is on. */
+.pb-dials {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(34, 43, 53, .5);
+}
+.pb-dials[hidden] { display: none !important; }
+.pb-dial { display: flex; align-items: center; gap: 7px; }
+.pb-dial[hidden] { display: none !important; }
+.pb-dial-name {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .09em;
+  color: var(--muted);
+}
+.pb-dial-said {
+  min-width: 42px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--cyan);
+  font-variant-numeric: tabular-nums;
+}
+.pb-dial input[type="range"] { width: 148px; accent-color: var(--cyan); }
+.pb-dial select {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 7px;
+  font-size: 12px;
+}
+
+/* --- sixteen levels ------------------------------------------------------
+ *
+ * "I want the pads to be illuminated in a gradient going up the pads,
+ * showing the sixteen levels in action."
+ *
+ * --lvl is the PITCH of that pad normalised across the grid, set in
+ * paintSixteen, so a chord shows its steps rather than a flat ramp. */
+.pb-grid.sixteen .pb-pad {
+  background:
+    linear-gradient(0deg,
+      rgba(101, 199, 218, calc(.10 + (var(--lvl, 0) * .52))) 0%,
+      rgba(101, 199, 218, calc(.02 + (var(--lvl, 0) * .20))) 100%),
+    var(--panel);
+  border-color: rgba(101, 199, 218, calc(.22 + (var(--lvl, 0) * .55)));
+}
+.pb-grid.sixteen .pb-pad.unity {
+  border-color: var(--amber);
+  box-shadow: inset 0 0 0 1px rgba(227, 190, 99, .55);
+}
+.pb-pad-tone {
+  position: absolute;
+  top: 7px; right: 9px;
+  font-size: 10px;
+  font-weight: 700;
+  color: rgba(237, 243, 245, .82);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.pb-grid.sixteen .pb-pad.unity .pb-pad-tone { color: var(--amber); }
+
+/* --- presets ------------------------------------------------------------ */
+
+.pb-kit {
+  flex: 0 0 auto;
+  width: 42px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 0;
+  font-size: 15px;
+  cursor: pointer;
+}
+.pb-kit:hover { border-color: var(--cyan); }
+
+.pb-kits {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2147483040;
+  width: min(420px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel, #1c242c);
+  color: var(--text, #edf3f5);
+  border: 1px solid var(--line, #35414c);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+  padding: 16px 18px 18px;
+}
+.pb-kits-head { display: flex; align-items: center; justify-content: space-between; }
+.pb-kits-head b { font-size: 15px; }
+.pb-kits-x {
+  background: none; border: 0; color: var(--muted, #8fa0ad);
+  font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px;
+}
+.pb-kits-say {
+  margin: 7px 0 13px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted, #8fa0ad);
+}
+.pb-kits-list { display: flex; flex-direction: column; gap: 6px; }
+.pb-kits-row { display: flex; gap: 6px; }
+.pb-kits-load {
+  flex: 1;
+  text-align: left;
+  background: var(--panel-2, #222b35);
+  color: var(--text, #edf3f5);
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 12.5px;
+  cursor: pointer;
+  position: relative;
+}
+.pb-kits-load:hover { border-color: var(--cyan, #65c7da); }
+.pb-kits-drop {
+  width: 34px;
+  background: none;
+  color: var(--muted, #8fa0ad);
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  font-size: 16px;
+  cursor: pointer;
+}
+.pb-kits-drop:hover { color: var(--red, #e46b6b); border-color: var(--red, #e46b6b); }
+.pb-kits-none { font-size: 12px; color: var(--muted, #8fa0ad); margin: 2px 0 0; }
+.pb-kits-acts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 14px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line, #35414c);
+}
+.pb-kits-act {
+  position: relative;
+  text-align: left;
+  background: none;
+  color: var(--cyan, #65c7da);
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.pb-kits-act:hover { background: var(--panel-2, #222b35); }
+.pb-kits-act:disabled { opacity: .55; cursor: default; }
+
+/* --- the grab window -----------------------------------------------------
+ *
+ * Two columns where there is room, stacked on the tablet in portrait. The
+ * waveform is the thing being worked on, so it gets the width. */
+.sg-sheet {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2147483040;
+  width: min(880px, 96vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  background: #1c242c;
+  color: #edf3f5;
+  border: 1px solid #35414c;
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+  overflow: hidden;
+}
+.sg-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 13px 16px;
+  border-bottom: 1px solid #35414c;
+}
+.sg-head b { font-size: 14.5px; }
+.sg-x {
+  background: none; border: 0; color: #8fa0ad;
+  font-size: 23px; line-height: 1; cursor: pointer; padding: 0 4px;
+}
+.sg-body { display: flex; gap: 0; min-height: 0; flex: 1; }
+.sg-side {
+  width: 258px;
+  flex: 0 0 auto;
+  border-right: 1px solid #35414c;
+  padding: 12px;
+  overflow: auto;
+}
+.sg-side h4 {
+  margin: 0 0 9px;
+  font-size: 10px;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: #8fa0ad;
+}
+.sg-list { display: flex; flex-direction: column; gap: 5px; }
+.sg-clip {
+  position: relative;
+  display: flex; flex-direction: column; gap: 3px;
+  text-align: left;
+  background: #222b35;
+  border: 1px solid #35414c;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  color: inherit;
+}
+.sg-clip b { font-size: 10.5px; color: #65c7da; letter-spacing: .04em; }
+.sg-clip span {
+  font-size: 11.5px; line-height: 1.35; color: #c6d2d8;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.sg-clip:hover { border-color: #65c7da; }
+.sg-clip.on { border-color: #65c7da; background: #27333f; }
+.sg-none { font-size: 11.5px; color: #8fa0ad; line-height: 1.5; }
+
+.sg-stage { flex: 1; min-width: 0; padding: 12px 16px 16px; }
+.sg-pick { display: flex; align-items: center; gap: 11px; margin-bottom: 10px; }
+.sg-src {
+  background: #222b35; color: #8fa0ad;
+  border: 1px solid #35414c; border-radius: 8px;
+  padding: 7px 13px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.sg-src.on { color: #edf3f5; border-color: #65c7da; }
+.sg-said { font-size: 11.5px; color: #8fa0ad; }
+.sg-wave {
+  display: block;
+  width: 100%;
+  height: 118px;
+  background: #141b21;
+  border: 1px solid #35414c;
+  border-radius: 8px;
+}
+/* The handles get their own strip under the picture: dragging ON the
+ * waveform on a touch screen means the finger covers the thing being aimed
+ * at, and this is the one part of the window that has to be precise. */
+.sg-lane {
+  position: relative;
+  height: 30px;
+  margin-top: 5px;
+  border-radius: 6px;
+  background: #141b21;
+  border: 1px solid #35414c;
+  touch-action: none;
+  cursor: ew-resize;
+}
+.sg-sel {
+  position: absolute; top: 0; bottom: 0;
+  background: rgba(101, 199, 218, .22);
+  border-left: 1px solid rgba(101, 199, 218, .7);
+  border-right: 1px solid rgba(101, 199, 218, .7);
+  pointer-events: none;
+}
+.sg-handle {
+  position: absolute; top: -3px; bottom: -3px;
+  width: 12px;
+  margin-left: -6px;
+  border-radius: 4px;
+  background: #65c7da;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .5);
+  pointer-events: none;
+}
+.sg-read {
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: #8fa0ad;
+  font-variant-numeric: tabular-nums;
+}
+.sg-acts { display: flex; gap: 8px; margin-top: 13px; flex-wrap: wrap; }
+.sg-act {
+  background: #222b35; color: #edf3f5;
+  border: 1px solid #35414c; border-radius: 8px;
+  padding: 9px 15px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.sg-act:hover { border-color: #65c7da; }
+.sg-act.go { background: #1d3b44; border-color: #65c7da; color: #d8f4fa; }
+
+@media (max-width: 720px) {
+  .sg-body { flex-direction: column; }
+  .sg-side {
+    width: auto;
+    border-right: 0;
+    border-bottom: 1px solid #35414c;
+    max-height: 34vh;
+  }
+}
+
+/* --- the timeline across the sampler ------------------------------------
+ *
+ * "When playing a song on a sampler pad show a timeline going across the
+ * sampler as the clip is playing, illustrating that the clip is playing."
+ *
+ * One lane per sounding voice, directly under the grid, and absent entirely
+ * when nothing is playing - a permanent empty strip under a 4x4 on a
+ * nine-inch screen is height spent on nothing. */
+.pb-time {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.pb-time[hidden] { display: none !important; }
+.pb-time-lane {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(34, 43, 53, .55);
+}
+.pb-time-name {
+  flex: 0 0 auto;
+  max-width: 40%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+.pb-time-rail {
+  flex: 1;
+  position: relative;
+  height: 7px;
+  border-radius: 4px;
+  background: #141b21;
+  overflow: hidden;
+}
+.pb-time-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #54d18b, #65c7da);
+}
+/* A voice with no end - a loop, or a gate still held - travels instead of
+ * filling. A progress bar for something that does not end is a lie. */
+.pb-time-lane.open .pb-time-fill {
+  width: 100% !important;
+  background: repeating-linear-gradient(
+    90deg, #54d18b 0 14px, rgba(84, 209, 139, .25) 14px 28px);
+  animation: pb-time-run .7s linear infinite;
+}
+@keyframes pb-time-run {
+  from { background-position: 0 0; }
+  to   { background-position: 28px 0; }
+}
+.pb-time-clock {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pb-time-lane.open .pb-time-fill { animation: none; }
+}
+
+/* The ground a re-grab may be dragged over: twenty seconds either side of
+ * the take, or as much of it as the ring actually holds. Drawn UNDER the
+ * selection so the selection stays the bright thing. */
+.sg-widen {
+  position: absolute; top: 0; bottom: 0;
+  background: rgba(227, 190, 99, .13);
+  border-left: 1px dashed rgba(227, 190, 99, .5);
+  border-right: 1px dashed rgba(227, 190, 99, .5);
+  pointer-events: none;
+}
+
+/* THE CARRIED TILE.
+ *
+ * What the hand carries should look like what it is about to become, so the
+ * ghost is a PAD - square, the label at the foot, the speaker's name where a
+ * pad puts its number. It used to be a strip of text, which read as a
+ * selection being dragged rather than a sample being placed. */
+.pb-ghost {
+  position: fixed;
+  left: 0; top: 0;
+  z-index: 2147483031;
+  width: 132px;
+  height: 132px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 3px;
+  padding: 9px;
+  border-radius: 10px;
+  background: #222b35;
+  border: 1px solid #65c7da;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .6);
+  color: #edf3f5;
+  pointer-events: none;
+  opacity: .95;
+  transform-origin: top left;
+}
+.pb-ghost i {
+  position: absolute;
+  top: 7px; left: 9px;
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: #65c7da;
+}
+.pb-ghost span {
+  font-size: 11px;
+  line-height: 1.3;
+  color: #c6d2d8;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* The spectrum on the row that is actually sounding. */
+.pb-spec {
+  display: block;
+  width: 100%;
+  height: 22px;
+  margin: 4px 0 2px;
+  border-radius: 4px;
+  background: rgba(20, 27, 33, .75);
+}
+
+/* The disk browser is the preset sheet in a taller frame: a card can hold
+ * hundreds of folders and scrolling a 420px box through them is miserable. */
+.pb-disk { width: min(560px, 94vw); max-height: 88vh; }
+.pb-disk .pb-kits-load {
+  font-family: inherit;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ==========================================================================
+   THE FACE: a photograph behind the pads, waveform tiles, knobs, edit sheet
+   ========================================================================== */
+
+/* THE BACKDROP.
+ *
+ * Fixed rather than scrolled, and covered rather than contained: the picture
+ * is a room the instrument sits in, not a tile. The dark wash over it is not
+ * decoration - a gallery render is a full-contrast photograph and white pad
+ * text on top of one is unreadable perhaps a third of the time. The wash
+ * makes the type legible against ANY picture, which is the only way a
+ * changing backdrop can be allowed. */
+#sampler.pb-skinned, .pb-sampler.pb-skinned {
+  background-size: cover;
+  background-position: center;
+  background-attachment: local;
+  background-repeat: no-repeat;
+}
+/* POSITION ONLY WHEN IT IS NOT THE RAIL'S OVERLAY, and this `:not` is the
+ * whole of a bug that made the SAMPLER TAB STOP OPENING.
+ *
+ * The kiosk rail gives every view `.pine-view-host { position: fixed; inset: 0 }`
+ * so it covers the screen. This rule is `#sampler.pb-skinned` - an id AND a
+ * class - which out-specifies that bare class, so a plain `position: relative`
+ * here knocked the host out of `fixed` and dropped it back into the document
+ * flow. Measured: the tab lit up, the host reported display:grid, and its box
+ * was at y=11558 in a page 11238 tall - open, correct, and far below the fold.
+ *
+ * The wash below needs a positioned ancestor, but `fixed` is one, so the host
+ * only needs `relative` where it is NOT the overlay - the desktop renderer,
+ * where the sampler is an ordinary section. */
+#sampler.pb-skinned:not(.open), .pb-sampler.pb-skinned:not(.open) {
+  position: relative;
+}
+#sampler.pb-skinned::before, .pb-sampler.pb-skinned::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(9,13,17,.74), rgba(9,13,17,.86));
+  pointer-events: none;
+  z-index: 0;
+}
+#sampler.pb-skinned > *, .pb-sampler.pb-skinned > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* Pads let the room through. A solid tile over a photograph looks like a
+ * sticker; a translucent one looks like glass on top of it. */
+#sampler.pb-skinned .pb-pad, .pb-sampler.pb-skinned .pb-pad {
+  background: rgba(28, 36, 44, .58);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  border-color: rgba(255, 255, 255, .22);
+}
+#sampler.pb-skinned .pb-pad.filled, .pb-sampler.pb-skinned .pb-pad.filled {
+  background: rgba(34, 43, 53, .72);
+}
+#sampler.pb-skinned .pb-left, .pb-sampler.pb-skinned .pb-left,
+#sampler.pb-skinned .pb-dials, .pb-sampler.pb-skinned .pb-dials {
+  background: rgba(16, 20, 25, .72);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  border-radius: 10px;
+}
+
+/* The waveform each pad carries, behind its own label. */
+.pb-pad-wave {
+  position: absolute;
+  left: 6px; right: 6px; top: 50%;
+  transform: translateY(-58%);
+  width: calc(100% - 12px);
+  height: 44px;
+  opacity: .85;
+  pointer-events: none;
+}
+.pb-pad.filled .pb-pad-label { position: relative; }
+
+/* --- the knob row --------------------------------------------------------
+ *
+ * Above the grid and below the banks, which is where the reference puts it:
+ * the knobs act on the SELECTED pad, so they belong between the thing that
+ * chooses a pad and the thing that plays it. */
+.pb-face {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: rgba(16, 20, 25, .66);
+  border: 1px solid var(--line);
+}
+.pb-face.empty { opacity: .45; pointer-events: none; }
+
+.pb-knob {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  width: 56px;
+  touch-action: none;
+  cursor: ns-resize;
+}
+.pb-knob-dial {
+  position: relative;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 38% 32%, #fdfdfd, #d8dee2 62%, #b9c2c8);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, .5), inset 0 -2px 5px rgba(0, 0, 0, .18);
+}
+.pb-knob.turning .pb-knob-dial { box-shadow: 0 0 0 2px var(--cyan), 0 2px 6px rgba(0,0,0,.5); }
+/* The pointer is drawn from the centre so a rotate() about the middle puts
+ * its tip on the rim - a mark positioned at the rim and rotated about itself
+ * would orbit instead of turn. */
+.pb-knob-mark {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2px;
+  height: 46%;
+  margin-left: -1px;
+  background: #2a333a;
+  border-radius: 2px;
+  transform-origin: 50% 100%;
+  transform: translateY(-100%) rotate(0deg);
+}
+.pb-knob-mark { transform-origin: 1px 100%; }
+.pb-knob-dial .pb-knob-mark { top: 4%; height: 46%; }
+.pb-knob-name {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: .1em;
+  color: var(--red, #e46b6b);
+}
+.pb-knob-said {
+  font-size: 10.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The three buttons sit in a ROW beside the knobs, not a column above them:
+ * stacked they made the bar three buttons tall and stole the height the pads
+ * needed. */
+.pb-face-acts {
+  margin-left: auto;
+  display: flex;
+  flex-direction: row;
+  gap: 5px;
+}
+.pb-face-act {
+  min-width: 84px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f2f5f6;
+  color: #c4444f;
+  border: 1px solid rgba(0, 0, 0, .25);
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  cursor: pointer;
+}
+.pb-face-act:hover { background: #fff; }
+.pb-face-skin { background: #222b35; color: var(--cyan); border-color: var(--line); }
+
+/* --- the edit sheet ------------------------------------------------------
+ *
+ * It drops over the pads rather than opening beside them: on a nine-inch
+ * screen there is no beside, and the reference does the same. */
+.pb-edit {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 8px;
+  z-index: 40;
+  padding: 10px;
+  border-radius: 14px;
+  background: #7fd4ea;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, .55);
+}
+.pb-edit-stage {
+  position: relative;
+  border-radius: 10px;
+  background: #7d2b33;
+  border: 2px solid #e46b6b;
+  overflow: hidden;
+}
+.pb-edit-wave { display: block; width: 100%; height: 150px; }
+.pb-edit-lane {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 100%;
+  touch-action: none;
+  cursor: ew-resize;
+}
+.pb-edit-band {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: rgba(127, 212, 234, .16);
+  pointer-events: none;
+}
+.pb-edit-handle {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 3px;
+  margin-left: -1px;
+  background: #fff;
+  box-shadow: 0 0 6px rgba(0, 0, 0, .6);
+  pointer-events: none;
+}
+.pb-edit-tabs { display: flex; justify-content: flex-end; margin: 6px 2px 0; }
+.pb-edit-tab {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .14em;
+  color: #0d3a46;
+  opacity: .75;
+}
+.pb-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.pb-edit-arrow {
+  flex: 0 0 auto;
+  width: 46px;
+  padding: 10px 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #0d3a46;
+  font-size: 17px;
+  cursor: pointer;
+}
+.pb-edit-arrow:hover { background: rgba(255, 255, 255, .35); }
+.pb-edit-modes { flex: 1; display: flex; gap: 8px; }
+.pb-edit-mode {
+  flex: 1;
+  padding: 11px 6px;
+  border-radius: 8px;
+  background: #fff;
+  color: #c4444f;
+  border: 1px solid rgba(0, 0, 0, .18);
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  cursor: pointer;
+}
+.pb-edit-mode.on { background: #e4525f; color: #fff; border-color: #b93b47; }
+.pb-edit-said {
+  margin: 8px 2px 2px;
+  font-size: 10.5px;
+  color: #0d3a46;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- the backdrop picker -------------------------------------------------- */
+
+.pb-skins {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2147483041;
+  width: min(640px, 94vw);
+  max-height: 86vh;
+  overflow: auto;
+  padding: 16px 18px 18px;
+  border-radius: 14px;
+  background: #1c242c;
+  color: #edf3f5;
+  border: 1px solid #35414c;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+}
+.pb-skins-head { display: flex; align-items: center; justify-content: space-between; }
+.pb-skins-x {
+  background: none; border: 0; color: #8fa0ad;
+  font-size: 22px; line-height: 1; cursor: pointer;
+}
+.pb-skins-acts { display: flex; gap: 6px; margin: 10px 0 12px; flex-wrap: wrap; }
+.pb-skins-act {
+  flex: 1 1 auto;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: none;
+  color: #65c7da;
+  border: 1px solid #35414c;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.pb-skins-act:hover { background: #222b35; }
+.pb-skins-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+}
+.pb-skins-tile {
+  aspect-ratio: 1 / 1;
+  border-radius: 8px;
+  border: 1px solid #35414c;
+  background-size: cover;
+  background-position: center;
+  cursor: pointer;
+  padding: 0;
+}
+.pb-skins-tile:hover { border-color: #65c7da; }
+.pb-skins-none { font-size: 12px; color: #8fa0ad; }

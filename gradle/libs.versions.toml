@@ -1,0 +1,50 @@
+[versions]
+agp = "8.5.2"
+kotlin = "1.9.24"
+coreKtx = "1.13.1"
+appcompat = "1.7.0"
+# SAF, for writing a sampler kit onto the MPC's disk over USB.
+documentfile = "1.0.1"
+activity = "1.9.1"
+lifecycle = "2.8.4"
+coroutines = "1.8.1"
+okhttp = "4.12.0"
+datastore = "1.1.1"
+webkit = "1.11.0"
+# The rail drawer. 1.0.0 is the version appcompat 1.7.0 already pulls in
+# transitively, so naming it here costs no new artifact - it only moves
+# DrawerLayout onto the COMPILE classpath, which a transitive runtime
+# dependency does not do.
+drawerlayout = "1.0.0"
+# THE TERMINAL'S SSH. mwiede's fork rather than com.jcraft:jsch, which was
+# last released in 2018 and cannot speak any algorithm a 2024 OpenSSH will
+# agree to. This one is maintained, is pure JCE (no BouncyCastle, which sshj
+# drags in at several megabytes) and is small enough to sit in a kiosk APK.
+jsch = "0.2.18"
+junit = "4.13.2"
+# org.json ships INSIDE Android, but the android.jar used for JVM unit tests
+# is a stub whose every method throws "not mocked". Putting the real
+# implementation on the unit-test classpath is the standard cure and is the
+# only reason this version exists.
+orgJson = "20240303"
+
+[libraries]
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
+androidx-appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }
+androidx-documentfile = { module = "androidx.documentfile:documentfile", version.ref = "documentfile" }
+androidx-activity-ktx = { module = "androidx.activity:activity-ktx", version.ref = "activity" }
+androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "datastore" }
+androidx-webkit = { module = "androidx.webkit:webkit", version.ref = "webkit" }
+androidx-drawerlayout = { module = "androidx.drawerlayout:drawerlayout", version.ref = "drawerlayout" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
+jsch = { module = "com.github.mwiede:jsch", version.ref = "jsch" }
+okhttp-mockwebserver = { module = "com.squareup.okhttp3:mockwebserver", version.ref = "okhttp" }
+junit = { module = "junit:junit", version.ref = "junit" }
+org-json = { module = "org.json:json", version.ref = "orgJson" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

@@ -1,0 +1,21 @@
+<resources>
+    <color name="pine_ground">#0B0F0C</color>
+    <color name="pine_ink">#D8E6DA</color>
+    <color name="pine_amber">#E3B341</color>
+
+    <!-- The rail. Sampled off desktop/renderer/styles.css so the native
+         sidebar and the web panel behind it read as one program rather than
+         two. -->
+    <color name="pine_rail">#0E1512</color>
+    <color name="pine_card">#131C18</color>
+    <color name="pine_chip">#17221D</color>
+    <color name="pine_press">#2B3A32</color>
+    <color name="pine_rule">#243029</color>
+    <color name="pine_dim">#8FA396</color>
+    <color name="pine_bad">#E46B6B</color>
+    <!-- The drawer scrim. Dark enough to say "the panel is not the live
+         surface right now", light enough that the show stays readable
+         behind it - this is a broadcast terminal and the operator is often
+         opening the rail BECAUSE of what they can see on air. -->
+    <color name="pine_scrim">#99000000</color>
+</resources>

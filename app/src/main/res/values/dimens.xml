@@ -1,0 +1,8 @@
+<resources>
+    <!-- 48dp is the Android touch-target minimum and the whole rail is built
+         to it: at density 200 that is 60 physical px, about 7mm, which is
+         what a thumb actually needs on a wall-mounted tablet. -->
+    <dimen name="tap">48dp</dimen>
+    <dimen name="chip_height">40dp</dimen>
+    <dimen name="rail_gap">10dp</dimen>
+</resources>

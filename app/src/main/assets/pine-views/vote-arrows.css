@@ -1,0 +1,61 @@
+/* The vote arrows. MONOCHROMATIC, as asked: they carry their state in
+   brightness and fill, not in colour - a green thumb and a red thumb on a
+   screen that is already amber, cyan and pink is one more thing competing
+   for the eye, and these are meant to sit quietly beside a player until
+   they are wanted. */
+
+.pv-votes {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 0 0 auto;
+  position: relative;
+}
+
+.pv-vote {
+  width: 34px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  /* Dim until touched: an unvoted record should not look like it is
+     shouting at you. */
+  color: rgba(255, 255, 255, .42);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: color .16s ease, background .16s ease, transform .1s ease;
+}
+.pv-vote:hover:not(:disabled) { color: rgba(255, 255, 255, .78); }
+.pv-vote:active:not(:disabled) { transform: scale(.92); }
+.pv-vote:disabled { opacity: .25; cursor: default; }
+
+/* Voted: filled, still monochrome. The two directions are told apart by
+   the arrow itself, which is what an arrow is for. */
+.pv-vote.on {
+  color: #ffffff;
+  background: rgba(255, 255, 255, .16);
+}
+.pv-up.on { box-shadow: inset 0 1px 0 rgba(255, 255, 255, .35); }
+.pv-down.on { box-shadow: inset 0 -1px 0 rgba(255, 255, 255, .35); }
+
+/* What just happened, when the host view has nowhere else to say it. */
+.pv-votes[data-said]:not([data-said=""])::after {
+  content: attr(data-said);
+  position: absolute;
+  right: 40px;
+  top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, .72);
+  background: rgba(0, 0, 0, .62);
+  padding: 3px 7px;
+  border-radius: 5px;
+  pointer-events: none;
+}
+
+/* On the lock screen the type is bigger and so are the targets. */
+.lk-screen .pv-vote { width: 40px; height: 32px; font-size: 13px; }

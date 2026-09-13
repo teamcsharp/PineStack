@@ -1,0 +1,555 @@
+/* The hold-a-line sheet, and the deep examination behind it.
+ *
+ * Both sit above every view and below the talk dot, which must stay
+ * reachable. Sized for a thumb throughout: these are reached by holding a
+ * line of dialogue, which is already a deliberate gesture, and the answer
+ * should not then demand precision.
+ */
+
+.la-sheet {
+  position: fixed;
+  z-index: 2147483060;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  width: min(520px, calc(100vw - 24px));
+  max-height: 72vh;
+  overflow-y: auto;
+  padding: 14px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 14px;
+  background: var(--panel, #161d24);
+  box-shadow: 0 26px 64px rgba(0, 0, 0, .7);
+  color: var(--text, #edf3f5);
+}
+.la-head b { font-size: 13px; }
+.la-said {
+  margin: 6px 0 12px;
+  font-size: 12px; line-height: 1.5;
+  color: var(--muted, #8fa0ad);
+  overflow-wrap: anywhere;
+}
+.la-list { display: grid; gap: 8px; }
+/* The mark itself. */
+.la-ico {
+  grid-area: ico;
+  align-self: center;
+  font-size: 19px;
+  line-height: 1;
+  text-align: center;
+}
+
+/* THE WORD FROM THE WORK, after the menu has gone. Fixed to the foot of the
+ * screen so it is in the same place whichever script view raised it, and
+ * above everything, because it is the answer to something just asked. */
+.la-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translate(-50%, 12px);
+  z-index: 2147483046;
+  max-width: min(560px, 88vw);
+  padding: 10px 16px;
+  border-radius: 10px;
+  background: #18241d;
+  color: #eaf0eb;
+  border: 1px solid #799066;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, .55);
+  font-size: 13px;
+  line-height: 1.4;
+  opacity: 0;
+  transition: opacity .18s linear, transform .18s ease-out;
+  pointer-events: none;
+}
+.la-toast.up { opacity: 1; transform: translate(-50%, 0); }
+.la-toast.bad { border-color: #a8563f; color: #ffcdbc; }
+
+.la-choice {
+  /* A COLUMN FOR THE MARK. This was `display: block` with the title and the
+     why simply stacked; the icon needs a column of its own beside both of
+     them, spanning the two rows, or it sits above the title and the row
+     grows by a line. */
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  grid-template-areas: "ico title" "ico why";
+  align-items: center;
+  column-gap: 10px;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 10px;
+  background: var(--panel-2, #222b35);
+  color: var(--text, #edf3f5);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.la-choice:disabled { opacity: .55; cursor: default; }
+.la-choice b { grid-area: title; display: block; font-size: 13px; }
+.la-choice i {
+  grid-area: why;
+  display: block; font-style: normal; font-size: 11px;
+  color: var(--muted, #8fa0ad); margin-top: 2px;
+}
+.la-note {
+  display: block; margin-top: 5px;
+  font-size: 11px; color: var(--cyan, #65c7da);
+}
+.la-note.bad { color: #e9a08f; }
+.la-close {
+  width: 100%; margin-top: 12px; padding: 10px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 10px;
+  background: transparent; color: var(--muted, #8fa0ad);
+  font: inherit; cursor: pointer;
+}
+
+/* ------------------------------------------------ the deep examination */
+
+.ld-box {
+  position: fixed;
+  z-index: 2147483062;
+  left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(900px, calc(100vw - 24px));
+  max-height: calc(100vh - 48px);
+  display: flex; flex-direction: column;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 12px;
+  background: var(--panel, #161d24);
+  box-shadow: 0 28px 70px rgba(0, 0, 0, .75);
+  color: var(--text, #edf3f5);
+  overflow: hidden;
+}
+.ld-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line, #35414c);
+}
+.ld-head b { font-size: 13px; color: var(--cyan, #65c7da); }
+.ld-close {
+  width: 30px; height: 30px; padding: 0;
+  border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  font-size: 16px; line-height: 1; cursor: pointer;
+}
+.ld-said {
+  flex: 0 0 auto; margin: 0;
+  padding: 10px 13px;
+  font-size: 13px; line-height: 1.5;
+  border-bottom: 1px solid var(--line, #35414c);
+  overflow-wrap: anywhere;
+}
+
+/* The path. A fixed slice, so the record below is never pushed off. */
+.ld-flow {
+  flex: 0 0 auto;
+  position: relative;
+  height: clamp(110px, 20vh, 175px);
+  border-bottom: 1px solid var(--line, #35414c);
+  background: radial-gradient(ellipse at 50% 45%,
+    rgba(101, 199, 218, .07), transparent 70%);
+}
+.ld-flow canvas { display: block; width: 100%; height: 100%; }
+.ld-flow.flat canvas { display: none; }
+.ld-flowwhy {
+  position: absolute; left: 10px; right: 10px; bottom: 5px;
+  text-align: center; font-size: 10px; line-height: 1.5;
+  color: var(--muted, #8fa0ad); pointer-events: none;
+}
+
+.ld-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  padding: 12px 13px; font-size: 12px; line-height: 1.55;
+}
+.ld-wait, .ld-dim { color: var(--muted, #8fa0ad); margin: 0 0 6px; }
+.ld-sec { margin-top: 15px; }
+.ld-sec h4 {
+  margin: 0 0 7px;
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--muted, #8fa0ad); font-weight: 600;
+}
+.ld-sec h5 {
+  margin: 10px 0 4px; font-size: 10px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--muted, #8fa0ad); font-weight: 600;
+}
+
+.ld-facts { list-style: none; margin: 0; padding: 0; }
+.ld-facts li {
+  display: flex; gap: 12px; justify-content: space-between;
+  padding: 5px 0; border-bottom: 1px solid rgba(255, 255, 255, .06);
+}
+.ld-facts li b { color: var(--muted, #8fa0ad); font-weight: 500; }
+.ld-facts li span { text-align: right; font-variant-numeric: tabular-nums; }
+
+.ld-steps { margin: 0; padding-left: 20px; }
+.ld-steps li { margin-bottom: 6px; }
+.ld-steps li.unseen { opacity: .45; }
+
+.ld-fold { margin-bottom: 7px; }
+.ld-fold summary {
+  cursor: pointer; display: flex; gap: 10px; align-items: baseline;
+  flex-wrap: wrap;
+}
+.ld-fold summary i {
+  font-style: normal; font-size: 10.5px; color: var(--muted, #8fa0ad);
+}
+/* The evidence, verbatim - paraphrasing it would remove the only reason
+   to open it. Capped and scrolling, because one of these is thousands of
+   characters. */
+.ld-pre {
+  margin: 5px 0 0; max-height: 220px; overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #35414c); border-radius: 6px;
+  background: var(--bg, #101419);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px; line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+.ld-retire {
+  display: block; width: 100%; margin-top: 8px; padding: 10px 12px;
+  border: 1px solid var(--amber, #e3be63); border-radius: 10px;
+  background: transparent; color: var(--text, #edf3f5);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.ld-retire:disabled { opacity: .55; cursor: default; }
+.ld-retire b { display: block; font-size: 12.5px; }
+.ld-retire i {
+  font-style: normal; font-size: 11px; color: var(--muted, #8fa0ad);
+}
+.ld-note { display: block; margin-top: 4px; font-size: 11px; color: var(--cyan, #65c7da); }
+.ld-note.bad { color: #e9a08f; }
+
+@media (orientation: portrait), (max-height: 620px) {
+  .ld-flow { height: clamp(90px, 16vh, 130px); }
+  .ld-pre { max-height: 150px; }
+}
+
+/* ==========================================================================
+   THE PERFORMANCE
+
+   "Animate the command being performed on the option in the pop-up."
+
+   The chosen row is promoted: the others fold away and it becomes the stage
+   the work happens on. Everything below is transform and opacity only - no
+   layout is animated - because this runs on the tablet while the station is
+   speaking, and an animation that reflows the page is an animation that
+   drops frames on the thing it is decorating.
+   ========================================================================== */
+
+/* The rows that were not chosen. They collapse rather than vanish, so the
+   sheet closes around the choice instead of jumping. */
+.la-choice.la-gone, .la-close.la-gone {
+  max-height: 0;
+  margin: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-width: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: all .26s cubic-bezier(.4, 0, .2, 1);
+  pointer-events: none;
+}
+.la-choice, .la-close { transition: all .26s cubic-bezier(.4, 0, .2, 1); }
+
+.la-choice.la-acting {
+  grid-template-areas: "ico title" "ico why" "scene scene" "said said";
+  border-color: var(--cyan, #65c7da);
+  cursor: default;
+}
+.la-choice.la-acting i { opacity: .6; }
+
+.la-scene {
+  grid-area: scene;
+  position: relative;
+  height: 74px;
+  margin-top: 10px;
+  overflow: hidden;
+}
+.la-progress-said {
+  grid-area: said;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted, #8fa0ad);
+  font-variant-numeric: tabular-nums;
+}
+.la-progress-said.bad { color: var(--red, #e46b6b); }
+
+/* ---- the sampler, sliding in from the side ---------------------------- */
+
+.la-rig {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  transform: translateX(38%);
+  opacity: 0;
+  transition: transform .42s cubic-bezier(.16, 1, .3, 1), opacity .3s linear;
+}
+.la-rig.in { transform: translateX(0); opacity: 1; }
+
+.la-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 15px);
+  grid-auto-rows: 15px;
+  gap: 3px;
+  margin-left: auto;
+}
+.la-cell {
+  border-radius: 3px;
+  background: #222b35;
+  border: 1px solid #35414c;
+}
+/* The one it is going into, lit before the clip arrives so the eye is
+   already there when it lands. */
+.la-cell.target {
+  border-color: var(--cyan, #65c7da);
+  box-shadow: 0 0 0 2px rgba(101, 199, 218, .18);
+}
+.la-cell.filled {
+  background: var(--cyan, #65c7da);
+  animation: la-thump .34s ease-out;
+}
+@keyframes la-thump {
+  0% { transform: scale(1); }
+  40% { transform: scale(1.5); }
+  100% { transform: scale(1); }
+}
+
+/* The clip itself, flying. */
+.la-chip {
+  width: 26px;
+  height: 18px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #65c7da, #7fd46a);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, .5);
+  flex: none;
+}
+.la-chip.flying { transition: transform .42s cubic-bezier(.16, 1, .3, 1); }
+.la-chip.landed { opacity: 0; transition: opacity .18s linear .06s; }
+
+/* ---- a download, travelling ------------------------------------------- */
+
+.la-move {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 4px;
+}
+.la-end { font-size: 22px; color: var(--muted, #8fa0ad); flex: none; }
+.la-scene.running .la-end:last-of-type { color: var(--cyan, #65c7da); }
+.la-track {
+  position: relative;
+  flex: 1;
+  height: 2px;
+  border-radius: 2px;
+  background: #2b3a46;
+}
+.la-parcel {
+  position: absolute;
+  top: -5px;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--cyan, #65c7da);
+}
+.la-scene.running .la-parcel { animation: la-travel 1.25s ease-in-out infinite; }
+@keyframes la-travel {
+  0% { left: 0; opacity: 0; }
+  12% { opacity: 1; }
+  88% { opacity: 1; }
+  100% { left: calc(100% - 12px); opacity: 0; }
+}
+
+/* THE BAR SWEEPS RATHER THAN COUNTS. The clip is fetched natively and
+   answers once, with a byte count and nothing along the way - so a
+   percentage here would be invented. It fills only when the bytes landed. */
+.la-bar {
+  position: absolute;
+  left: 4px; right: 4px; bottom: 8px;
+  height: 4px;
+  border-radius: 3px;
+  background: #222b35;
+  overflow: hidden;
+}
+.la-bar > i {
+  display: block;
+  width: 34%;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--cyan, #65c7da);
+  transform: translateX(-100%);
+}
+.la-scene.running .la-bar > i { animation: la-sweep 1.15s ease-in-out infinite; }
+@keyframes la-sweep {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(330%); }
+}
+.la-scene.la-ok .la-bar > i {
+  animation: none;
+  width: 100%;
+  transform: none;
+  background: #7fd46a;
+}
+.la-scene.la-ok .la-parcel { animation: none; opacity: 0; }
+.la-scene.la-bad .la-bar > i {
+  animation: none;
+  width: 100%;
+  transform: none;
+  background: var(--red, #e46b6b);
+}
+.la-scene.la-bad .la-parcel { animation: none; opacity: 0; }
+
+/* ---- the magnifier ----------------------------------------------------- */
+
+.la-glass {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  font-size: 26px;
+  color: var(--cyan, #65c7da);
+  transform: translate(-50%, -50%) scale(.7);
+  opacity: 0;
+}
+.la-scene.running .la-glass { animation: la-peer .9s cubic-bezier(.16, 1, .3, 1) forwards; }
+@keyframes la-peer {
+  0% { transform: translate(-50%, -50%) scale(.6) rotate(-18deg); opacity: 0; }
+  55% { transform: translate(-50%, -50%) scale(1.5) rotate(6deg); opacity: 1; }
+  100% { transform: translate(-50%, -50%) scale(1.25) rotate(0deg); opacity: 1; }
+}
+
+/* ---- hearing it -------------------------------------------------------- */
+
+.la-wave {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+.la-wave > i {
+  width: 4px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--cyan, #65c7da);
+}
+.la-scene.running .la-wave > i { animation: la-bounce .9s ease-in-out infinite; }
+.la-wave > i:nth-child(2) { animation-delay: .08s; }
+.la-wave > i:nth-child(3) { animation-delay: .16s; }
+.la-wave > i:nth-child(4) { animation-delay: .24s; }
+.la-wave > i:nth-child(5) { animation-delay: .32s; }
+.la-wave > i:nth-child(6) { animation-delay: .40s; }
+.la-wave > i:nth-child(7) { animation-delay: .48s; }
+@keyframes la-bounce {
+  0%, 100% { height: 8px; opacity: .55; }
+  50% { height: 30px; opacity: 1; }
+}
+
+/* A screen that has asked for less movement gets the outcome without the
+   journey. The information is in the final state, not the travel. */
+@media (prefers-reduced-motion: reduce) {
+  .la-rig, .la-chip.flying { transition: none; }
+  .la-scene.running .la-parcel,
+  .la-scene.running .la-bar > i,
+  .la-scene.running .la-wave > i,
+  .la-scene.running .la-glass { animation: none; }
+  .la-glass { opacity: 1; transform: translate(-50%, -50%) scale(1.2); }
+}
+
+/* ---- the orb: work that outlived its sheet ---------------------------- */
+
+/* Bottom LEFT, which is the one corner of this layout holding nothing: the
+   view rail is on the right, the note bar is bottom centre, and the feed's
+   own head is top left. */
+.la-orb {
+  position: fixed;
+  left: 18px;
+  bottom: 18px;
+  z-index: 2147483047;
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #18241d;
+  border: 1px solid #799066;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+  color: #eaf0eb;
+  cursor: pointer;
+  /* It arrives from where the sheet was - up and to the right - so it reads
+     as the task gathering itself into the corner rather than as a new thing
+     appearing there. */
+  transform: translate(40px, -30px) scale(.4);
+  opacity: 0;
+  transition: transform .34s cubic-bezier(.16, 1, .3, 1), opacity .26s linear;
+}
+.la-orb.up { transform: translate(0, 0) scale(1); opacity: 1; }
+
+.la-orb-face {
+  position: relative;
+  z-index: 1;
+  font-size: 20px;
+  line-height: 1;
+  color: #9db4c8;
+}
+
+/* The ring turns while the cut is being made. One transform, no layout. */
+.la-orb-ring {
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: #65c7da;
+  border-right-color: rgba(101, 199, 218, .35);
+  animation: la-orb-spin 1s linear infinite;
+}
+@keyframes la-orb-spin { to { transform: rotate(360deg); } }
+
+/* What it landed on, or why it did not. Sits beside the orb rather than in
+   it: a pad number does not fit inside 56px and still read. */
+.la-orb-said {
+  position: absolute;
+  left: 66px;
+  bottom: 8px;
+  white-space: nowrap;
+  font-size: 11.5px;
+  line-height: 1.3;
+  color: #bccac1;
+  background: #18241d;
+  border: 1px solid #52675c;
+  border-radius: 8px;
+  padding: 5px 9px;
+  opacity: 0;
+  transform: translateX(-6px);
+  transition: opacity .2s linear, transform .2s ease-out;
+  pointer-events: none;
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.la-orb.done .la-orb-said, .la-orb.bad .la-orb-said {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.la-orb.done { border-color: #7fd46a; }
+.la-orb.done .la-orb-ring {
+  animation: none;
+  border-color: #7fd46a;
+}
+.la-orb.done .la-orb-face { color: #a5ef8f; }
+.la-orb.bad { border-color: #a8563f; }
+.la-orb.bad .la-orb-ring { animation: none; border-color: #a8563f; }
+.la-orb.bad .la-orb-face { color: #ffcdbc; }
+.la-orb.bad .la-orb-said { color: #ffcdbc; border-color: #a8563f; }
+
+@media (prefers-reduced-motion: reduce) {
+  .la-orb { transition: opacity .2s linear; transform: none; }
+  .la-orb.up { transform: none; }
+  .la-orb-ring { animation: none; border-color: #65c7da; }
+}
