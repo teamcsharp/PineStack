@@ -2018,6 +2018,55 @@ async function boothCut(id, whole) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Changing a line: rewrite, revise, tint, re-record, vote              */
+/* ------------------------------------------------------------------ */
+
+/* Each of these is a thin pass-through. The station owns what they mean;
+ * this only carries them and hands back what it said, so a refusal arrives
+ * as the station's own words rather than as a shrug from here. */
+function lineDoor(name, road, body) {
+  ipcMain.handle(name, async (_event, what) => {
+    try {
+      const cfg = readConfig();
+      const base = String(cfg.baseUrl || "").replace(/\/+$/, "");
+      const sid = String((what && what.sid) || "");
+      if (road.includes("{sid}") && !sid) {
+        return { ok: false, why: "that line carries no round to change" };
+      }
+      const said = await fetchJson(
+        base + road.replace("{sid}", encodeURIComponent(sid)),
+        { method: "POST", body: JSON.stringify(body(what || {})) });
+      return Object.assign({ ok: true }, said || {});
+    } catch (error) {
+      return { ok: false, why: error.message };
+    }
+  });
+}
+
+lineDoor("line:edit", "/api/director/script/{sid}/turn", (w) => ({
+  index: Number(w.index) || 0, text: String(w.text || ""),
+  /* The text being REPLACED, so the station can refuse if the round moved
+   * underneath rather than overwriting somebody else's edit. */
+  was: String(w.was || "")
+}));
+
+lineDoor("line:revise", "/api/director/script/{sid}/revise", (w) => ({
+  note: String(w.note || ""), standing: w.standing !== false
+}));
+
+lineDoor("line:tint", "/api/director/script/{sid}/tint", (w) => ({
+  index: Number(w.index) || 0
+}));
+
+lineDoor("line:record", "/api/director/script/{sid}/record", (w) => ({
+  bypass: !!w.bypass, who: "operator"
+}));
+
+lineDoor("line:vote", "/api/dj/line/vote", (w) => ({
+  id: String(w.id || ""), vote: w.up ? "up" : "down"
+}));
+
 ipcMain.handle("inspect:play", async (_event, what) => {
   try {
     const id = String((what && what.id) || "");

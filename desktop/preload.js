@@ -123,6 +123,14 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   /* The inspector's script sidebar: hear one, or save one, a round, or the
    * run of air around it. */
   inspectPlay: (what) => ipcRenderer.invoke("inspect:play", what),
+
+  /* Changing how a line is put together and put on the air. Each is a thin
+   * pass-through to a route the station already has - see line-edit.js. */
+  lineEdit: (what) => ipcRenderer.invoke("line:edit", what),
+  lineRevise: (what) => ipcRenderer.invoke("line:revise", what),
+  lineTint: (what) => ipcRenderer.invoke("line:tint", what),
+  lineRecord: (what) => ipcRenderer.invoke("line:record", what),
+  lineVote: (what) => ipcRenderer.invoke("line:vote", what),
   inspectExport: (what) => ipcRenderer.invoke("inspect:export", what),
 
   /* WHAT THE PROMPTS ARE NO LONGER ALLOWED TO CARRY. The X in the flow

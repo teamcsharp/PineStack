@@ -39,9 +39,68 @@
         <svg id="spine" xmlns="http://www.w3.org/2000/svg"></svg>
       </div>
 
+      <!-- READING IT, AND CHANGING IT, are different jobs and get
+           different panes - so nothing that alters the air is one stray
+           click away from somebody who opened this to understand a line. -->
+      <nav id="leftTabs">
+        <span class="leftTab on" data-pane="detail">How it came to be</span>
+        <span class="leftTab" data-pane="edit">Change it</span>
+      </nav>
+
       <section id="detail">
         <h3 id="detailWhat">Pick a stage</h3>
         <div id="detailBody"></div>
+      </section>
+
+      <section id="edit" hidden>
+        <p id="editWhy" class="none" hidden></p>
+        <p class="editWhere">This line sits in <b id="editWhere"></b>.</p>
+
+        <h3>Rewrite it yourself</h3>
+        <p class="editHint">Sent with the words it replaces, so if the round
+          moved underneath you the station refuses rather than overwriting
+          somebody else&rsquo;s edit.</p>
+        <textarea id="editText" rows="4"></textarea>
+        <div class="editRow">
+          <button id="editRewrite" type="button">Rewrite this turn</button>
+        </div>
+
+        <h3>Send it back to the writer room</h3>
+        <p class="editHint">The note fixes this line now. Kept as standing it
+          rides every future round of this road &mdash; which is the
+          difference between correcting a line and correcting a habit.</p>
+        <textarea id="editNote" rows="3"
+          placeholder="what should change, and why"></textarea>
+        <div class="editRow">
+          <label><input type="checkbox" id="editStanding" checked>
+            keep it as a standing note</label>
+          <button id="editRevise" type="button">Send it back</button>
+        </div>
+
+        <h3>Try a tint</h3>
+        <p class="editHint">Asks for a tinted version and applies nothing, so
+          the two can be read against each other first.</p>
+        <div class="editRow">
+          <button id="editTintBtn" type="button">Tint just this line</button>
+        </div>
+        <div id="editTint" hidden></div>
+
+        <h3>Record it again</h3>
+        <div class="editRow">
+          <label><input type="checkbox" id="editBypass">
+            skip the tint pass for this round</label>
+          <button id="editRecord" type="button">Send to the recording room</button>
+        </div>
+
+        <h3>Say what you thought of it</h3>
+        <p class="editHint">Bounds what gets written next. The only one of
+          these that still works on a line with no round.</p>
+        <div class="editRow">
+          <button id="editUp" type="button">Good</button>
+          <button id="editDown" type="button">Poor</button>
+        </div>
+
+        <p id="editSaid" class="editSaid"></p>
       </section>
 
       <p id="note" class="note"></p>
@@ -64,6 +123,7 @@
 
   <script src="pine-icons.js"></script>
   <script src="line-script.js"></script>
+  <script src="line-edit.js"></script>
   <script src="script-flow.js"></script>
 </body>
 </html>

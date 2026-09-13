@@ -552,6 +552,23 @@ function pick(id) {
   region = held.region || null;
   prov = held.provenance || null;
 
+  /* CHANGING IT is a separate pane, reached by a tab, so nothing that
+   * alters the air sits under the hand of somebody who opened this window
+   * to read. */
+  if (window.pineEdit) window.pineEdit.fill(held);
+  for (const tab of document.querySelectorAll('.leftTab')) {
+    tab.addEventListener('click', () => {
+      for (const other of document.querySelectorAll('.leftTab')) {
+        other.classList.toggle('on', other === tab);
+      }
+      const want = tab.dataset.pane;
+      const detail = document.getElementById('detail');
+      const edit = document.getElementById('edit');
+      if (detail) detail.hidden = want !== 'detail';
+      if (edit) edit.hidden = want !== 'edit';
+    });
+  }
+
   /* THE SCRIPT BESIDE IT. Handed the same payload rather than fetching its
    * own - one read of the feed, for a window that is opened on a whim. */
   if (window.pineScript) {

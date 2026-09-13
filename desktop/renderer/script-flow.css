@@ -241,6 +241,92 @@ body {
 
 .none { color: #ffc95c; }
 
+/* ------------------------------------------------- reading versus changing */
+
+#leftTabs {
+  display: flex;
+  gap: 14px;
+  padding: 6px 16px 0;
+  border-bottom: 1px solid #1b2730;
+}
+
+.leftTab {
+  cursor: pointer;
+  color: #7e94a6;
+  font-size: 12px;
+  padding-bottom: 5px;
+  border-bottom: 2px solid transparent;
+}
+
+.leftTab.on { color: #cfe0ea; border-bottom-color: #46c2a0; }
+.leftTab:hover { color: #cfe0ea; }
+
+#edit { padding: 10px 16px 18px; }
+
+#edit h3 {
+  margin: 16px 0 4px;
+  color: #7e94a6;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+#edit h3:first-of-type { margin-top: 6px; }
+
+.editWhere { margin: 0 0 4px; color: #55697a; font-size: 11px; }
+.editWhere b { color: #9fb3c2; font-weight: 500; }
+
+.editHint { margin: 0 0 6px; color: #55697a; font-size: 11px;
+  line-height: 1.45; }
+
+#edit textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: #0b1319;
+  border: 1px solid #24323f;
+  border-radius: 4px;
+  color: #cfe0ea;
+  font: inherit;
+  font-size: 12px;
+  padding: 7px 9px;
+  resize: vertical;
+}
+
+#edit textarea:focus { outline: none; border-color: #2a7d66; }
+
+.editRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.editRow label { color: #7e94a6; font-size: 11px; cursor: pointer; }
+
+.editRow button {
+  background: #16242c;
+  border: 1px solid #2a3b47;
+  border-radius: 4px;
+  color: #cfe0ea;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 5px 11px;
+}
+
+.editRow button:hover:not(:disabled) { border-color: #2a7d66; }
+.editRow button:disabled { color: #4a5b68; cursor: not-allowed;
+  border-color: #1e2c36; }
+
+/* The tint, offered and not applied. */
+#editTint { margin-top: 8px; font-size: 12px; line-height: 1.5; }
+.tintWas { color: #7e94a6; padding: 4px 0; }
+.tintNow { color: #cfe0ea; padding: 4px 0; border-top: 1px solid #1a262e; }
+
+.editSaid { margin: 14px 0 0; color: #46c2a0; font-size: 11px; }
+.editSaid.bad { color: #ff8f86; }
+
 /* ------------------------------------------------------------ the chunks */
 
 /* One contribution to the prompt: what it is, whether it got there, and a
