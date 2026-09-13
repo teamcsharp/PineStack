@@ -1550,6 +1550,56 @@ something happening now.
 
 ---
 
+### 19.8 The script highlight, and which document the audio is in
+
+The SCRIPT view places its live mark by matching a position against each
+row's `from`/`until` window. Those windows are offsets into one welded
+file, so the position has to be the DJ voice element's `currentTime` — the
+same coordinate — and not a clock estimate. Measured over 308 samples, the
+clock estimate was behind the sound in **81.3%** of them, off by more than
+three seconds in 58.5%, median −2.99 s; 29.8% of its moves were skips and
+20.5% were backward.
+
+It looked for that element with `document.querySelectorAll('audio')`. On
+**this tablet that works**, because the panel *is* the document and
+`djVoiceAudio0/1` are in it. On the **desktop it never worked at all**: the
+SCRIPT view runs in the Electron chrome, whose document holds exactly one
+`<audio>` (`desktopRadioPlayer`), while the panel runs inside
+`<webview id="radioFrame">` — a separate DOM the chrome cannot reach. So the
+scan returned `null` *every* time, not sometimes, and the view silently ran
+on the estimator that three tickets had been written to replace.
+
+The tell is that it is **not intermittent**. A timing bug wanders; this one
+was a clean 0%. When a renderer feature works on the tablet and never on the
+desktop, ask which document it is running in before you measure anything
+else.
+
+The cure is a bridge: `webview-preload.js` posts `{id, t, file, duration}`
+every 250 ms, `renderer.js` stamps it on arrival, and `window.pinePlayhead()`
+returns `null` once the reading is older than 1200 ms.
+
+> **Stale must mean absent.** A bridge that keeps handing back its last value
+> pins the mark to one line and *looks* like it is working. That is strictly
+> worse than no bridge, because falling back to the clock at least keeps
+> moving. The same rule as §19.1: the failure that imitates health is the
+> expensive one.
+
+The tablet needs no bridge — it has the elements — but it shares the rest of
+the chain, so a script that will not follow on the tablet is a real fault and
+not this one.
+
+**The order comes from a ledger, not a clock.** `data/script_ledger.jsonl` is
+written *before* a round is audible, keyed `(block, ord)`, assigned once and
+never rewritten. The screenplay applies it last, after the older corrective
+passes, so what you read is the order the round was written in — including
+the SFX guy, who sits where he was rolled in rather than being placed
+afterwards by a timestamp. An element that carries `block`/`ord` was
+scripted; one that does not (a rescue sting, an emergency filler, a record,
+an advert, a call) was not, and keeps its clock slot. That absence is a
+useful signal, not a gap.
+
+---
+
 ## 20. Building something new for this tablet
 
 1. Write the view as a plain IIFE hanging one global off `window`
@@ -1615,3 +1665,97 @@ adb $D shell "cmd statusbar collapse"
 - **Ruling something out is worth writing down.** Half of §19.1 is a list of
   things that were *not* the cause, and that list is what makes the next
   occurrence a ten-minute job instead of a night.
+
+---
+
+## 23. Getting the broadcast back
+
+The `⟳` tab on the left edge of the panel (or a 24 px swipe from that edge)
+opens **Reinitialise**. One button. It is the thing to press when the room
+has gone quiet and you do not yet know why.
+
+It exists because the fault is almost never where it looks. A wedge presents
+as silence whether the cause is a shut pause door, a page that gagged itself,
+a dead voice engine, a deadlocked floor or a stalling event loop — and the
+first four of those survive a restart, which is the reflex it is there to
+replace.
+
+### What one tap does
+
+Every rung re-checks and **stops the moment sound comes back**, so a healthy
+station pays for almost none of this.
+
+| # | Rung | What it reaches |
+|---|---|---|
+| 0 | IDENTIFY | Reads every page's own acknowledgments, names the one fault, runs its cure, checks, escalates once |
+| 1 | ON AIR | Lifts a pause. Only if one is set |
+| 2 | RELIEVE | Stands the writing and recording rooms down so the loop can serve the air |
+| 3 | UNGAG | Local: drops this page's own hold, bumps the voice epoch, restarts the player |
+| 4 | FLOOR | Takes the floor back from a hold that has gone silent |
+| 5 | FLUSH | Advances the feed epoch — every page abandons the clip it cannot start |
+| 6 | RELEASE | Releases the audio exclusive so every player may sound |
+| 7 | PAGES | Asks **every** page in the house to reload, not just this one |
+|   | *listens for eight seconds* | |
+| 8 | DEEP | The whole repair tree: engines, the box, routing, the writer's lifeboat, the deaf-device reboot |
+| 9 | SERVICES | Steward census — restarts xtts, ollama, comfy, a sick container; warms the music library |
+| 10 | RELOAD | Reloads this page, and resumes the ladder afterwards |
+| 11 | RESTART | Restarts the station process. About twenty seconds of silence |
+
+### Four of those rungs were unreachable before #1331
+
+Worth knowing, because each one was a night:
+
+- **RELIEVE** was missing although the station's own `AIR_LADDER` puts it
+  *first*, with the note: *"the only rung that touches a congested loop —
+  every other one assumes the clip never arrived, and a stalling loop
+  delivers it late instead."*
+- **PAGES** was a `location.reload()` of the operator's own tab. The wedged
+  listener is frequently a *different* tablet, and it was never touched.
+- **DEEP** and **SERVICES** were never called at all, so a dead voice engine
+  got "cured" by restarting the station around it, indefinitely.
+- **FLOOR** (`_floor_break`) had exactly one caller — the silence branch of
+  `dead_air_watch`, which needs 20 s of quiet *and* nothing speaking *and* the
+  station unpaused before it will even look. There was no operator path to it.
+  It is the cure for the deadlock that put the station off the air for six
+  minutes with 134 finished rounds sitting on the shelf.
+
+RELEASE had a fifth, quieter problem: it read `health.gagged`, and
+`/api/broadcast/health` never returned that key. In JavaScript a missing key
+is `undefined`, so the condition collapsed to `!health.holding_the_air` — it
+fired only when *nobody* held the air, which is the one case where releasing
+does nothing, and was skipped whenever a page really was holding the exclusive
+and gagging the others. That is the tablet fault in §19.1's neighbourhood, and
+the rung written for it had never once run.
+
+> **A cure the operator cannot reach during the fault it cures is not a cure
+> the station has.** Four of these existed as working code for months.
+
+### Reaching past the button
+
+Every rung is also a step you can run alone, which is what to do when you
+already know the answer:
+
+```sh
+B=http://10.89.1.246:8096
+K=$(curl -s $B/ | grep -o 'SERVER_KEY = "[^"]*"' | cut -d'"' -f2)
+
+curl -s $B/api/broadcast/health          | jq .   # is anyone hearing it
+curl -s $B/api/broadcast/console         | jq .   # the whole step table + log
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/look
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/floor
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/steward
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/deep
+```
+
+`look`, `speed` and `triangulate` change nothing and are always safe.
+
+**The tune-in page has no rail.** `RADIO_PAGE_HTML` carries no Reinitialise
+drawer — a listener there has `retime()` and the one-way unpause and nothing
+else. If the tablet is on the tune page rather than the panel, the button you
+want is not on the screen you are looking at.
+
+**The Electron shell has a second, separate one-tap.** `panicRecover()` in
+`renderer.js` walks `/api/service/restart` → `/api/pinebox/initialize` →
+`/api/pinebox/recover`. It does not touch `/api/broadcast/*`, and Reinitialise
+does not touch `/api/pinebox/*`. Two buttons, two disjoint trees; if one has
+not helped, the other is not a repeat.

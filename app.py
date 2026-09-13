@@ -119798,6 +119798,10 @@ async def api_broadcast_health(
                                   if heard_at else None),
             "clips_waiting": int(state.get("waiting") or 0),
             "stall_reports": int(state.get("stalls") or 0),
+            # #1331: the solo gate, on every branch. See the note on the
+            # final return - a key that only sometimes exists reads as
+            # false everywhere it does not.
+            "gagged": bool(state.get("gagged")),
             "holding_the_air": str(state.get("owner") or ""),
             "detail": str(state.get("why") or ""),
             "fix_with": "POST /api/radio/pause with paused false",
@@ -119825,6 +119829,10 @@ async def api_broadcast_health(
                                   if heard_at else None),
             "clips_waiting": int(state.get("waiting") or 0),
             "stall_reports": int(state.get("stalls") or 0),
+            # #1331: the solo gate, on every branch. See the note on the
+            # final return - a key that only sometimes exists reads as
+            # false everywhere it does not.
+            "gagged": bool(state.get("gagged")),
             "holding_the_air": str(state.get("owner") or ""),
             "detail": str(state.get("why") or ""),
             "fix_with": "POST /api/broadcast/fix/{step}",
@@ -119871,6 +119879,19 @@ async def api_broadcast_health(
         "clips_waiting": int(state.get("waiting") or 0),
         "stall_reports": int(state.get("stalls") or 0),
         "holding_the_air": str(state.get("owner") or ""),
+        # #1331: WHETHER THE SOLO GATE IS GAGGING ANYBODY.
+        #
+        # The Reinitialise ladder's RELEASE rung reads `health.gagged`,
+        # and this endpoint never returned it - only /console did. In
+        # JavaScript a missing key is undefined, so
+        # `health.gagged || !health.holding_the_air` collapsed to
+        # `!health.holding_the_air`: RELEASE fired only when NOBODY held
+        # the air, which is the one case where releasing does nothing,
+        # and was skipped whenever a page really was holding the
+        # exclusive and gagging the others - the #1240c fault the rung
+        # was written for. Measured live: holding_the_air was a real
+        # terminal id and the rung did not run.
+        "gagged": bool(state.get("gagged")),
         "detail": str(state.get("why") or ""),
         "fix_with": "POST /api/broadcast/unwedge",
     }
@@ -120182,6 +120203,14 @@ BROADCAST_STEPS: list[dict[str, str]] = [
     {"key": "replay_hour", "label": "Go back the last hour",
      "say": "Re-airs up to three rounds from the last hour, oldest "
             "first, to refill a starved broadcast.", "tone": "air"},
+    {"key": "floor", "label": "Take the floor back",
+     "say": "A round that took the floor and never gave it back deadlocks "
+            "every other one behind it (#1316). Nothing else the operator "
+            "can press reaches this.", "tone": "do"},
+    {"key": "steward", "label": "Repair the services",
+     "say": "Census every service, restart the sick ones, census again - "
+            "the voice engines, the writer, the image box, the music "
+            "library. The only rung that bounces them.", "tone": "deep"},
     {"key": "deep", "label": "Run the repair ladder",
      "say": "The whole triage tree (#836) - engines, services, the box, "
             "the wire. Slow.", "tone": "deep"},
@@ -120495,6 +120524,58 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                         % (str(row.get("name") or "")[:22],
                            str(row.get("finding") or "")[:90]))
         said.append("  verdict    " + str(got.get("verdict") or ""))
+
+    elif step == "floor":
+        # #1331: TAKE THE FLOOR BACK.
+        #
+        # _floor_break is the cure for the #1316 deadlock - "six minutes
+        # off the air with 134 finished rounds on the shelf" - and it had
+        # exactly ONE caller: the silence branch of dead_air_watch, which
+        # needs 20s of quiet AND nothing speaking AND the station
+        # unpaused before it will even look. There was no operator path
+        # to it at all: no API, no console rung, nothing to press. A cure
+        # the operator cannot reach during the fault it cures is not a
+        # cure the station has.
+        said.append("$ take the floor back")
+        _held = 0.0
+        try:
+            _held = round(time.time()
+                          - float(_FLOOR_OWNER.get("at") or 0), 1)
+        except Exception:  # noqa: BLE001
+            _held = 0.0
+        _label = str(_FLOOR_OWNER.get("label") or "")
+        _broke = False
+        try:
+            _broke = _floor_break("the wedge console")
+        except Exception as err:  # noqa: BLE001
+            said.append("  the floor would not break: %s" % err)
+        if _broke:
+            changed = True
+            said.append("  took it back from %s after %ss"
+                        % (_label or "a round", _held))
+            said.append("  every round queued behind it may run again")
+        else:
+            said.append("  the floor is not wedged - nothing to take back")
+
+    elif step == "steward":
+        # #1331: THE SERVICES, WHICH NOTHING ELSE RESTARTS.
+        #
+        # service_steward is the only rung that bounces xtts, ollama,
+        # comfyui or a sick container, and warms the music library. It
+        # has no timer and only two entry points - POST /api/steward and
+        # a spoken command - so a station whose voice engine is down
+        # could be restarted all day without anyone touching the thing
+        # that was actually broken.
+        said.append("$ repair the services")
+        try:
+            asyncio.create_task(service_steward("the wedge console"))
+            changed = True
+            said.append("  census running - every sick service gets "
+                        "restarted, then counted again")
+            said.append("  the engines, the writer, the image box, the "
+                        "music library")
+        except Exception as err:  # noqa: BLE001
+            said.append("  the steward would not start: %s" % err)
 
     elif step == "restart":
         said.append("$ restart the station")
@@ -184693,30 +184774,86 @@ async function fixRun(from) {
       }
       step = 2;
     }
+    /* #1331: EVERY CURE THE STATION OWNS, IN THE ORDER THE STATION
+     * ITSELF USES.
+     *
+     * The ladder below used to be five rungs against a station that has
+     * dozens of cures, and the audit of what it could NOT reach was
+     * longer than what it could:
+     *
+     *   - RELIEVE was missing entirely, though AIR_LADDER puts it FIRST
+     *     with the note "the only rung that touches a congested loop -
+     *     every other one assumes the clip never arrived, and a stalling
+     *     loop delivers it late instead".
+     *   - RELOAD reloaded THIS page only. A second tablet that was the
+     *     actually-wedged listener was never touched.
+     *   - DEEP - the whole engines/box/routing/writer tree - was never
+     *     called, so a dead voice engine was "cured" by restarting the
+     *     station around it, forever.
+     *   - The SERVICES steward has no timer and two entry points, and
+     *     neither of them was this button.
+     *   - _floor_break, the cure for the deadlock that put the station
+     *     off the air for six minutes with 134 finished rounds on the
+     *     shelf, had ONE caller and no operator path at all.
+     *
+     * Every rung still exits the moment sound comes back, so a healthy
+     * station pays for none of it. */
     if (step <= 2) {
-      const did = fixUngag();
-      fixSay("2 UNGAG     " + (did.length ? did.join("; ")
-             : "this page was not holding anything"));
+      fixSay("2 RELIEVE   standing the writing and recording rooms down");
+      fixSay("            so the loop can get the air out");
+      try {
+        const got = await api("/api/broadcast/fix/relieve", {method: "POST"});
+        (got.lines || []).slice(1).forEach((l) => fixSay("            " + l));
+      } catch (e) { fixSay("            the station would not answer"); }
       step = 3;
     }
     if (step <= 3) {
-      try {
-        const got = await api("/api/broadcast/fix/flush", {method: "POST"});
-        fixSay("3 FLUSH     " + ((got.lines || [])[1] || "feed epoch advanced"));
-      } catch (e) { fixSay("3 FLUSH     the station would not answer"); }
+      const did = fixUngag();
+      fixSay("3 UNGAG     " + (did.length ? did.join("; ")
+             : "this page was not holding anything"));
       step = 4;
     }
     if (step <= 4) {
+      try {
+        const got = await api("/api/broadcast/fix/floor", {method: "POST"});
+        fixSay("4 FLOOR     " + ((got.lines || [])[1]
+               || "asked for the floor back"));
+      } catch (e) { fixSay("4 FLOOR     the station would not answer"); }
+      step = 5;
+    }
+    if (step <= 5) {
+      try {
+        const got = await api("/api/broadcast/fix/flush", {method: "POST"});
+        fixSay("5 FLUSH     " + ((got.lines || [])[1] || "feed epoch advanced"));
+      } catch (e) { fixSay("5 FLUSH     the station would not answer"); }
+      step = 6;
+    }
+    if (step <= 6) {
       health = await fixHealth();
+      /* #1331: `gagged` is now actually on /health. It never was, so
+       * this read undefined and the condition collapsed to
+       * `!holding_the_air` - firing only when NOBODY held the air, which
+       * is the one case where releasing does nothing, and skipping the
+       * case it exists for. */
       if (health && (health.gagged || !health.holding_the_air)) {
         try {
           await api("/api/broadcast/fix/release", {method: "POST"});
-          fixSay("4 RELEASE   the exclusive is released - every player may sound");
-        } catch (e) { fixSay("4 RELEASE   the station would not answer"); }
+          fixSay("6 RELEASE   the exclusive is released - every player may sound");
+        } catch (e) { fixSay("6 RELEASE   the station would not answer"); }
       } else {
-        fixSay("4 RELEASE   the air is held by a page that is answering - left alone");
+        fixSay("6 RELEASE   the air is held by a page that is answering - left alone");
       }
-      step = 5;
+      step = 7;
+    }
+    if (step <= 7) {
+      /* Every page, not just this one. A stale pause, a stuck player and
+       * yesterday's code all live in the tab, and the tab that is wedged
+       * is frequently not the tab the operator is standing at. */
+      try {
+        await api("/api/broadcast/fix/reload_pages", {method: "POST"});
+        fixSay("7 PAGES     asked every page in the house to reload itself");
+      } catch (e) { fixSay("7 PAGES     the station would not answer"); }
+      step = 8;
     }
 
     fixSay("            listening for eight seconds…");
@@ -184729,24 +184866,59 @@ async function fixRun(from) {
       return;
     }
 
-    if (step <= 5) {
+    if (step <= 8) {
+      /* The whole triage tree: remembered cures, the box, routing, the
+       * writer's lifeboat, the DJ rung, the deaf-device reboot. Slow on
+       * purpose - and it keeps running server-side even if this request
+       * gives up waiting, which is why a timeout here is not a failure. */
+      fixSay("8 DEEP      running the repair ladder - engines, the box,");
+      fixSay("            routing, the writer. This takes a minute.");
+      try {
+        const got = await api("/api/broadcast/fix/deep", {method: "POST"});
+        (got.lines || []).slice(1, 12).forEach((l) => fixSay("            " + l));
+      } catch (e) {
+        fixSay("            still running at the station - it reports");
+        fixSay("            into the repair log. Carrying on.");
+      }
+      step = 9;
+    }
+    if (step <= 9) {
+      /* The only rung in the building that bounces xtts, ollama, comfy
+       * or a sick container, and warms the music library. */
+      try {
+        await api("/api/broadcast/fix/steward", {method: "POST"});
+        fixSay("9 SERVICES  census running - every sick service restarted,");
+        fixSay("            then counted again. Watch /api/steward.");
+      } catch (e) { fixSay("9 SERVICES  the station would not answer"); }
+      step = 10;
+    }
+
+    health = await fixHealth();
+    if (fixHeard(health, 12)) {
+      fixSay("");
+      fixSay("*** sound is back - stopping here. ***");
+      fixMarkWrite(null);
+      return;
+    }
+
+    if (step <= 10) {
       const mark = fixMarkRead();
       if (mark && mark.reloaded) {
-        fixSay("5 RELOAD    already reloaded once this run - moving on");
+        fixSay("10 RELOAD   already reloaded once this run - moving on");
       } else {
-        fixSay("5 RELOAD    reloading this page - the one cure the station");
+        fixSay("10 RELOAD   reloading this page - the one cure the station");
         fixSay("            cannot perform from its end. Back in a moment.");
-        fixMarkWrite({at: Date.now(), step: 6, reloaded: true,
+        fixMarkWrite({at: Date.now(), step: 11, reloaded: true,
                       lines: fixLines.slice(-40)});
         setTimeout(() => { try { location.reload(); } catch (e) {} }, 1200);
         return;
       }
-      step = 6;
+      step = 11;
     }
-    if (step <= 6) {
-      fixSay("6 RESTART   restarting the station process - about twenty");
+    if (step <= 11) {
+      fixSay("11 RESTART  restarting the station process - about twenty");
       fixSay("            seconds of silence, then every page reconnects.");
-      fixMarkWrite({at: Date.now(), step: 7, reloaded: true,
+      fixMarkWrite({at: Date.now(), step: 12, reloaded: true,
                     restarted: true, lines: fixLines.slice(-40)});
       try { await api("/api/broadcast/fix/restart", {method: "POST"}); }
       catch (e) { /* the process is going down; a dropped reply is normal */ }
