@@ -1322,9 +1322,140 @@ ipcMain.handle("camera:open", async (_event, want) => {
   }
 });
 
+/* A CAMERA FRAME ON THE CLIPBOARD, through the same mill the screenshots
+ * use so the two look like each other. */
+ipcMain.handle("camera:grab", async (_event, want) => {
+  const { clipboard, nativeImage } = require("electron");
+  try {
+    const body = String((want && want.dataUrl) || "").split(",")[1] || "";
+    if (!body) return { ok: false, why: "there was no frame" };
+    const big = await shotEnhance.enlarge(Buffer.from(body, "base64"),
+      { times: Number((want && want.times) || 1),
+        ffmpeg: (readConfig() || {}).ffmpeg });
+    const image = nativeImage.createFromBuffer(big.png);
+    if (!image || image.isEmpty()) {
+      return { ok: false, why: "the frame could not be decoded" };
+    }
+    clipboard.writeImage(image);
+    if (clipboard.readImage().isEmpty()) {
+      return { ok: false, why: "the clipboard would not take it" };
+    }
+    const size = image.getSize();
+    return { ok: true, width: size.width, height: size.height,
+      times: big.times, why: big.why || "" };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* A CAMERA CLIP, handed to the export window that already knows how to trim,
+ * crop and write it. The frames arrive as discrete JPEGs, so they are written
+ * as an image sequence and assembled - the road clip-mux.fromFrames exists
+ * for, and the one this app's own window recordings already take. */
+ipcMain.handle("camera:clip", async (_event, want) => {
+  try {
+    const frames = (want && want.frames) || [];
+    if (!frames.length) return { ok: false, why: "no frames were recorded" };
+    const dir = clipMux.stash();
+    let at = 0;
+    for (const one of frames) {
+      const body = String(one || "").split(",")[1] || "";
+      if (!body) continue;
+      at += 1;
+      fs.writeFileSync(path.join(dir, "f" + String(at).padStart(6, "0") + ".jpg"),
+        Buffer.from(body, "base64"));
+    }
+    if (!at) { clipMux.forget(dir); return { ok: false, why: "no frames decoded" }; }
+
+    const seconds = Math.max(0.5, Number(want.seconds) || (at / 10));
+    const out = path.join(dir, "camera.mp4");
+    await clipMux.fromFrames({ dir, out, fps: at / seconds },
+      { ffmpeg: (readConfig() || {}).ffmpeg });
+
+    /* Into the export window as a recording with no audio: the camera has
+     * none of its own, and inventing a track for it would be a lie in the
+     * channel list. */
+    openClipExport({ mp4: fs.readFileSync(out), seconds,
+      audio: {}, notes: ["from the tablet\u2019s camera", at + " frames"] });
+    clipMux.forget(dir);
+    return { ok: true, frames: at, seconds };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* RECORD AND SAVE, with no editor in between.
+ *
+ * The ask was for a thing that counts down, records, and saves - so putting
+ * the export window in front of the file would be answering a different
+ * question. The clip is assembled by the same mill as everything else, so it
+ * can still be opened and trimmed afterwards like any other recording. */
+ipcMain.handle("camera:record", async (event, want) => {
+  const { dialog } = require("electron");
+  try {
+    const frames = (want && want.frames) || [];
+    if (!frames.length) return { ok: false, why: "no frames were recorded" };
+    const dir = clipMux.stash();
+    let at = 0;
+    for (const one of frames) {
+      const body = String(one || "").split(",")[1] || "";
+      if (!body) continue;
+      at += 1;
+      fs.writeFileSync(path.join(dir, "f" + String(at).padStart(6, "0") + ".jpg"),
+        Buffer.from(body, "base64"));
+    }
+    if (!at) { clipMux.forget(dir); return { ok: false, why: "no frames decoded" }; }
+
+    const seconds = Math.max(0.5, Number(want.seconds) || (at / 10));
+    const made = path.join(dir, "camera.mp4");
+    await clipMux.fromFrames({ dir, out: made, fps: at / seconds },
+      { ffmpeg: (readConfig() || {}).ffmpeg });
+
+    const when = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    let folder = app.getPath("videos");
+    try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
+    catch { folder = app.getPath("downloads"); }
+    const picked = await dialog.showSaveDialog(
+      BrowserWindow.fromWebContents(event.sender), {
+        title: "Save the camera recording",
+        defaultPath: path.join(folder, `pinecam-${when}.mp4`),
+        filters: [{ name: "MP4 video", extensions: ["mp4"] }]
+      });
+    if (picked.canceled || !picked.filePath) {
+      clipMux.forget(dir);
+      return { ok: false, canceled: true };
+    }
+    fs.copyFileSync(made, picked.filePath);
+    const bytes = fs.statSync(picked.filePath).size;
+    clipMux.forget(dir);
+    shell.showItemInFolder(picked.filePath);
+    return { ok: true, path: picked.filePath, bytes, frames: at, seconds };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
 ipcMain.handle("camera:where", () => {
   if (!camera) return { ok: false, why: "the camera is not open" };
   return Object.assign({ ok: true }, camera.where(), camera.how());
+});
+
+/* THE SENSOR'S DIALS, passed through to the tablet. Gamma and the look stay
+ * on the desktop - see pine-looks.js - because they are a decision about the
+ * picture rather than about the exposure. */
+ipcMain.handle("camera:tune", async (_event, want) => {
+  try {
+    const glass = await terminalHost.glass();
+    const said = await glass.say(
+      "(async function () { var b = window.pineDesktop;"
+      + " if (!b || !b.cameraTune) return JSON.stringify({ok:false,"
+      + " why:'this terminal has no camera dials'});"
+      + " return JSON.stringify(await b.cameraTune("
+      + JSON.stringify(want || {}) + ")); })()");
+    return said || { ok: false, why: "the tablet did not answer" };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
 });
 
 ipcMain.handle("camera:face", async (_event, facing) => {
@@ -2164,6 +2295,9 @@ ipcMain.handle("clip:export", async (event, choices) => {
       /* Null unless the operator actually moved the box - see the note in
        * clip-mux.cjs on why a crop that does nothing is still a risk. */
       crop: choices.crop || null,
+      /* Denoise, motion-compensated interpolation and upres - see the chain
+       * note in clip-mux.cjs on why the order is not arbitrary. */
+      enhance: choices.enhance || null,
       gains: choices.gains || {},
       mono: !!choices.mono,
       out: picked.filePath

@@ -23,6 +23,9 @@
   <div id="shell">
     <div id="glass">
       <img id="live" alt="The Pine Box tablet's camera" />
+      <!-- The countdown, over the picture and large: the operator is IN the
+           shot and is looking at the lens, not at a status line. -->
+      <div id="count" hidden></div>
       <div id="veil">Opening the camera&hellip;</div>
     </div>
 
@@ -34,23 +37,76 @@
       </div>
 
       <div class="group">
-        <button id="grab" type="button"
-                data-pine-icon="c:image" aria-label="Copy this frame"
-                title="Copy the current frame to the clipboard"></button>
+        <span class="tag">Grab</span>
+        <button id="grab1" type="button" title="Copy this frame at its own size">1&times;</button>
+        <button id="grab2" type="button" title="Copy this frame enlarged twice, sharpened">2&times;</button>
+        <button id="grab3" type="button" title="Copy this frame enlarged three times, sharpened">3&times;</button>
+        <span class="rec">
+          <button id="film" type="button"
+                  data-pine-icon="c:recording--filled" aria-label="Record"
+                  title="Five to get ready, then record, then save it where you say"></button><button
+                  id="filmFor" type="button" class="caret"
+                  aria-label="How long to record"
+                  title="How long it records after the countdown">&#9662;</button>
+          <span id="filmSaid" class="dim">10s</span>
+        </span>
+        <div id="filmMenu" class="menu" hidden></div>
+      </div>
+
+      <div class="group">
+        <span class="tag">Look</span>
+        <select id="look" title="A view transform over the picture. Applied to what you capture, not only to what you see."></select>
+        <button id="dials" type="button" class="toggle"
+                data-pine-icon="c:settings--adjust" aria-label="Camera settings"
+                title="Shutter, ISO, exposure and gamma"></button>
       </div>
 
       <div class="group right">
         <button id="ontop" type="button" class="toggle on"
                 data-pine-icon="c:pin--filled"
                 title="Keep this window above the others" aria-label="Keep on top"></button>
+        <button id="copyUrl" type="button"
+                data-pine-icon="c:link" aria-label="Copy the stream address"
+                title="Copy this camera's address, for ComfyUI or anything else on this machine"></button>
         <span id="how" class="dim"></span>
       </div>
+    </div>
+
+    <!-- The sensor's dials and the picture's, folded away: most of the time
+         the automatic exposure is the right answer. -->
+    <div id="tray" class="tray" hidden>
+      <label>Exposure
+        <input id="ev" type="range" min="-12" max="12" step="1" value="0">
+        <span id="evSaid" class="dim">0</span>
+      </label>
+      <label>Shutter
+        <input id="shutter" type="range" min="0" max="100" step="1" value="0">
+        <span id="shutterSaid" class="dim">auto</span>
+      </label>
+      <label>ISO
+        <input id="iso" type="range" min="0" max="100" step="1" value="0">
+        <span id="isoSaid" class="dim">auto</span>
+      </label>
+      <label>Gamma
+        <input id="gamma" type="range" min="40" max="260" step="5" value="100">
+        <span id="gammaSaid" class="dim">1.00</span>
+      </label>
+      <label>Lift
+        <input id="stops" type="range" min="-30" max="30" step="1" value="0">
+        <span id="stopsSaid" class="dim">0.0 EV</span>
+      </label>
+      <label class="tick">
+        <input id="slow" type="checkbox">
+        <span>Slow shutter for low light &mdash; costs frame rate</span>
+      </label>
+      <button id="autoBtn" class="on" type="button" title="Let the sensor decide">Auto</button>
     </div>
 
     <p id="said" class="said"></p>
   </div>
 
   <script src="pine-icons.js"></script>
+  <script src="pine-looks.js"></script>
   <script src="tablet-camera.js"></script>
 </body>
 </html>

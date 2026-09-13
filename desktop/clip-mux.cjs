@@ -177,6 +177,45 @@ function planArgs(plan) {
     cut.push('crop=' + Math.round(crop.w) + ':' + Math.round(crop.h)
       + ':' + Math.round(crop.x) + ':' + Math.round(crop.y));
   }
+
+  /* THE ENHANCEMENT CHAIN, IN THE ONLY ORDER THAT MAKES SENSE.
+   *
+   *   denoise first - motion estimation FOLLOWS noise and will invent
+   *     motion that is not there, so cleaning before interpolating is the
+   *     difference between smoothing and smearing.
+   *   interpolate second - mi_mode=mci with aobmc is real motion
+   *     compensation, optical flow doing the work, rather than frames being
+   *     duplicated. This is "fill in the frames", and it is what makes a
+   *     12 fps screen recording watchable.
+   *   upres last - enlarging first would make every filter above it pay
+   *     four times the pixels for no more information. */
+  const fix = plan.enhance || {};
+
+  if (fix.denoise) {
+    /* hqdn3d and not nlmeans: nlmeans is better and is MINUTES per clip,
+     * which is the wrong trade for something somebody wants to paste. The
+     * numbers are luma/chroma, spatial then temporal - gentle, because a
+     * screen recording's "noise" is compression mush and over-denoising it
+     * turns text into wax. */
+    cut.push(fix.denoise === 'strong'
+      ? 'hqdn3d=4:3:6:4.5' : 'hqdn3d=2:1.5:3:2.5');
+  }
+
+  const toFps = Number(fix.fps) || 0;
+  if (toFps > 0) {
+    /* mci = motion-compensated interpolation. aobmc = adaptive overlapped
+     * block motion compensation, which is what stops the block edges from
+     * showing. vsbmc lets the block size vary, which matters on a screen
+     * where a cursor moves against a still background. */
+    cut.push('minterpolate=fps=' + toFps
+      + ':mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1');
+  }
+
+  const bigger = Number(fix.times) || 1;
+  if (bigger > 1) {
+    cut.push('scale=iw*' + bigger + ':ih*' + bigger + ':flags=lanczos');
+    cut.push('unsharp=5:5:0.8:5:5:0.0');
+  }
   parts.push('[0:v]trim=start=' + inAt.toFixed(3) + ':end=' + outAt.toFixed(3)
     + ',setpts=PTS-STARTPTS,' + (cut.length ? cut.join(',') + ',' : '')
     + EVEN + '[v]');

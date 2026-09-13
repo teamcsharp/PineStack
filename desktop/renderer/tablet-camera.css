@@ -85,5 +85,104 @@ button.on { background: #1c5f4d; border-color: #2a7d66; color: #eafff8; }
 .dim { color: #64798a; font-variant-numeric: tabular-nums; }
 .pi-icon { width: 14px; height: 14px; }
 
+/* THE RECORD CLUSTER. The triangle is attached to the button so there is
+   never a question of which control is armed - the button always does the
+   same thing, the triangle only says for how long. */
+.rec { display: inline-flex; align-items: center; gap: 0; }
+.rec .caret {
+  border-left: 0;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  padding: 4px 5px;
+  min-width: 0;
+}
+.rec > button:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.rec .dim { margin-left: 6px; }
+
+.menu {
+  position: absolute;
+  z-index: 30;
+  background: #0f1720;
+  border: 1px solid #2a3946;
+  border-radius: 5px;
+  padding: 4px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .6);
+}
+.menu[hidden] { display: none; }
+.menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  padding: 5px 10px;
+  color: #cfe0ea;
+}
+.menu button:hover { background: #1b2a36; }
+.menu button.on { color: #46c2a0; }
+
+/* THE COUNTDOWN. Large enough to read from wherever the operator had to walk
+   to, which is the entire reason the countdown exists. */
+#count {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 160px;
+  font-weight: 600;
+  color: #eafff8;
+  text-shadow: 0 6px 40px rgba(0, 0, 0, .85);
+  pointer-events: none;
+}
+#count[hidden] { display: none; }
+#count.rolling {
+  font-size: 92px;
+  color: #ff6b5c;
+  align-items: flex-start;
+  justify-content: flex-end;
+  padding: 18px 24px;
+}
+
+/* The dial tray. One row, wrapping, because it is consulted rarely and
+   should not take room from the picture when it is not. */
+.tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  align-items: center;
+  padding: 8px 10px;
+  background: #0b1015;
+  border-top: 1px solid #1b2831;
+}
+
+.tray[hidden] { display: none; }
+
+.tray label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #9fb3c2;
+  font-size: 11px;
+}
+
+.tray input[type="range"] { width: 110px; }
+.tray .dim { min-width: 58px; }
+.tray .tick { gap: 5px; }
+
+select {
+  font: inherit;
+  color: #cfe0ea;
+  background: #16212b;
+  border: 1px solid #2a3946;
+  border-radius: 4px;
+  padding: 3px 6px;
+  max-width: 210px;
+}
+
 .said { margin: 0; padding: 0 10px 8px; min-height: 16px; color: #7e94a6; }
 .said.bad { color: #ff8f80; }

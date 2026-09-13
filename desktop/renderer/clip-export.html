@@ -88,6 +88,21 @@
 
     <div class="bar">
       <button id="monoBtn" class="toggle" title="Sum both channels into one. Off keeps them apart — broadcast left, microphone right — so they can be separated again later.">mix to mono</button>
+
+      <!-- THE ENHANCEMENT CHAIN. Order is fixed and deliberate: clean, then
+           fill in, then enlarge. See clip-mux.cjs. -->
+      <button id="denoiseBtn" class="toggle" title="Smooth out compression mush before anything else touches it.&#10;Gentle: text stays readable.">denoise</button>
+      <select id="smoothSel" title="Fill in frames with motion compensation — real optical flow, not duplication.&#10;Slow: minutes on a long clip.">
+        <option value="0">no interpolation</option>
+        <option value="24">fill to 24 fps</option>
+        <option value="30">fill to 30 fps</option>
+        <option value="60">fill to 60 fps</option>
+      </select>
+      <select id="upresSel" title="Enlarge on the way out, lanczos then sharpened — the same mill the stills use.">
+        <option value="1">1&times;</option>
+        <option value="2">2&times;</option>
+        <option value="3">3&times;</option>
+      </select>
       <span id="note" class="note"></span>
       <div class="grow"></div>
       <button id="cancelBtn" class="act">Cancel</button>

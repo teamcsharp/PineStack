@@ -494,6 +494,14 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
       /* Null unless the box was actually moved: a crop at the full frame is
        * a filter that does nothing and can still fail. */
       crop: cropped && crop ? crop : null,
+      /* Clean, fill in, enlarge - in that order, for the reasons in
+       * clip-mux.cjs. */
+      enhance: {
+        denoise: document.getElementById('denoiseBtn')?.classList.contains('on')
+          ? 'gentle' : '',
+        fps: Number(document.getElementById('smoothSel')?.value || 0),
+        times: Number(document.getElementById('upresSel')?.value || 1)
+      },
       mono: mono && bothIn(),
       use: {
         broadcast: tracks.broadcast.use && tracks.broadcast.there,
@@ -680,6 +688,27 @@ cropBox.addEventListener('pointercancel', cropLetGo);
  * it - it is stored against the SOURCE, so nothing is lost, but the overlay
  * would be left behind. */
 window.addEventListener('resize', paintCrop);
+
+/* THE CHAIN'S OWN CONTROLS. The interpolation warning sits next to the
+ * switch rather than arriving as a progress bar that looks stuck: mci on a
+ * long clip is minutes, and an operator who was not told assumes a hang. */
+document.getElementById('denoiseBtn')?.addEventListener('click', function () {
+  const on = document.getElementById('denoiseBtn').classList.toggle('on');
+  say(on ? 'Denoise on — applied before anything else, so motion estimation '
+    + 'does not follow the noise.' : 'Denoise off.');
+});
+
+document.getElementById('smoothSel')?.addEventListener('change', function (event) {
+  const fps = Number(event.target.value) || 0;
+  say(fps ? 'Filling in to ' + fps + ' fps with motion compensation. This is '
+    + 'the slow one — minutes on a long clip.' : 'No interpolation.');
+});
+
+document.getElementById('upresSel')?.addEventListener('change', function (event) {
+  const times = Number(event.target.value) || 1;
+  say(times > 1 ? 'Exporting at ' + times + '\u00d7, sharpened.'
+    : 'Exporting at the recorded size.');
+});
 
 function close() {
   try { api.clipDone(); } catch (error) { window.close(); }

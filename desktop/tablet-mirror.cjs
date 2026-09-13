@@ -68,6 +68,14 @@ const ASSUMED = { width: 1340, height: 800 };
 
 const DEFAULTS = { size: 'half', fps: 15 };
 
+/* THE CAMERA'S KNOWN DOOR.
+ *
+ * Fixed so that anything else on this machine - ComfyUI, OBS, ffmpeg, a
+ * browser - can be told where the tablet's camera is and still find it
+ * tomorrow. Loopback only: this is a camera in a studio, and a listening
+ * socket nobody remembered opening is how that stops being true. */
+const KNOWN_CAMERA_PORT = 8791;
+
 class Mirror {
   constructor({ adb, serial, ffmpeg } = {}) {
     this.adb = adb || 'adb';
@@ -499,15 +507,41 @@ class CameraGlass {
   }
 
   where() {
-    return { ok: true, facing: this.facing,
-      url: 'http://127.0.0.1:' + this.port + '/camera.mjpg', port: this.port };
+    const at = 'http://127.0.0.1:' + this.port;
+    return { ok: true, facing: this.facing, port: this.port,
+      url: at + '/camera.mjpg',
+      /* Both said plainly, because the whole point of a fixed port is that
+       * these can be copied into something else. */
+      stream: at + '/camera.mjpg',
+      still: at + '/camera.jpg',
+      known: this.port === KNOWN_CAMERA_PORT };
   }
 
+  /**
+   * A PORT THAT CAN BE WRITTEN DOWN.
+   *
+   * The OS picking one is fine for a window that is handed the number; it is
+   * no use at all to a ComfyUI workflow that has to name the source. So the
+   * known port is tried first and a random one is only the fallback - which
+   * means a graph built yesterday still finds the camera today.
+   */
   listen() {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       this.server = http.createServer((request, response) => this.serve(request, response));
-      this.server.on('error', reject);
-      this.server.listen(0, '127.0.0.1', () => {
+      const anywhere = () => {
+        this.server.listen(0, '127.0.0.1', () => {
+          this.port = this.server.address().port;
+          resolve();
+        });
+      };
+      this.server.once('error', () => {
+        /* Something already holds it - another Pine Box, or a leftover.
+         * Taking any port beats refusing to show the camera. */
+        this.server.removeAllListeners('error');
+        this.server.on('error', () => {});
+        anywhere();
+      });
+      this.server.listen(KNOWN_CAMERA_PORT, '127.0.0.1', () => {
         this.port = this.server.address().port;
         resolve();
       });
@@ -515,7 +549,25 @@ class CameraGlass {
   }
 
   serve(request, response) {
-    if (!String(request.url || '').startsWith('/camera.mjpg')) {
+    const path_ = String(request.url || '').split('?')[0];
+
+    /* ONE FRAME, for the many things that want a picture rather than a
+     * stream - ComfyUI's image loaders among them. Same bytes, no
+     * multipart. */
+    if (path_ === '/camera.jpg') {
+      if (!this.latest) {
+        response.writeHead(503, { 'Content-Type': 'text/plain' });
+        return response.end('no frame yet');
+      }
+      response.writeHead(200, {
+        'Content-Type': 'image/jpeg',
+        'Content-Length': this.latest.length,
+        'Cache-Control': 'no-store'
+      });
+      return response.end(this.latest);
+    }
+
+    if (path_ !== '/camera.mjpg') {
       response.writeHead(404, { 'Content-Type': 'text/plain' });
       return response.end('not here');
     }

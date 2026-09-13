@@ -87,6 +87,13 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   tabletWake: (want) => ipcRenderer.invoke("tablet:wake", want),
   cameraWhere: () => ipcRenderer.invoke("camera:where"),
   cameraFace: (facing) => ipcRenderer.invoke("camera:face", facing),
+  /* Grabbing and clipping from the camera, through the same mills the screen
+   * captures use. */
+  cameraGrab: (want) => ipcRenderer.invoke("camera:grab", want),
+  cameraClip: (want) => ipcRenderer.invoke("camera:clip", want),
+  /* Countdown, record, save where you say - see camera:record in main.js. */
+  cameraRecord: (want) => ipcRenderer.invoke("camera:record", want),
+  cameraTune: (want) => ipcRenderer.invoke("camera:tune", want),
   /* The speaker on the mirror. null asks, true/false sets - and what comes
    * back is what is AUDIBLE, not what was asked for. */
   mirrorSound: (want) => ipcRenderer.invoke("mirror:sound", want),
