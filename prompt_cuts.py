@@ -149,6 +149,27 @@ def _forget_cache() -> None:
     _CACHE_AT = 0.0
 
 
+def add_many(kind: str, name: str, texts: Iterable[str],
+             why: str = "") -> Dict[str, Any]:
+    """Cut several passages at once, each on its own fingerprint.
+
+    THIS IS WHAT A DOCUMENT SWATH NEEDS. A swath is assembled fresh every
+    round out of whichever consecutive lines are still unused, so the joined
+    passage on screen will almost never recur - cutting it whole would record
+    something that never matches again. What recurs is the LINE, so one click
+    on a swath cuts each of its lines.
+    """
+    last: Dict[str, Any] = {"ok": True, "cuts": all_cuts(fresh=True)}
+    for one in texts:
+        line = str(one or "").strip()
+        if len(line) < 12:
+            continue
+        last = add(kind, name, "", line, why)
+        if not last.get("ok"):
+            return last
+    return last
+
+
 def add(kind: str, name: str, mark: str = "", text: str = "",
         why: str = "") -> Dict[str, Any]:
     """Cut a passage out of every future prompt."""

@@ -134,15 +134,21 @@ body {
   cursor: pointer;
 }
 
+/* The chevron is the affordance for "expand each of these sections", so it
+ * is sized to be seen rather than to be tidy. The whole header row is
+ * clickable too - this is the indicator, not the only target. */
 .twist {
   flex: none;
   background: none;
   border: 0;
-  color: #7e94a6;
+  color: #8fa6b6;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 13px;
+  line-height: 1;
   padding: 0 2px;
 }
+
+.chunkHead:hover .twist { color: #cfe0ea; }
 
 .chunkName {
   color: #cfe0ea;

@@ -238,8 +238,15 @@ function reachedPrompt(text) {
  */
 function chunk(into, spec) {
   const text = String(spec.text || '');
+  /* WHEN A CHUNK IS CUT BY ITS LINES, the row's own state follows the FIRST
+   * line rather than the joined passage - because the joined passage is not
+   * what was stored, and a row that could never see its own cut would offer
+   * to make it again every time the window opened. */
+  const byLine = Array.isArray(spec.lines) && spec.lines.length
+    ? spec.lines.map((one) => String(one || '')).filter((one) => one.trim())
+    : null;
   const key = { kind: spec.kind, name: String(spec.name || ''),
-    mark: fingerprint(text) };
+    mark: fingerprint(byLine ? byLine[0] : text) };
 
   const row = document.createElement('div');
   row.className = 'chunk';
@@ -362,8 +369,10 @@ function chunk(into, spec) {
     said.hidden = false;
     said.textContent = gone ? 'Putting it back\u2026' : 'Cutting it\u2026';
     try {
-      const done = gone ? await api.promptKeep(key)
-        : await api.promptCut(Object.assign({ text: text.slice(0, 4000) }, key));
+      const done = gone
+        ? await api.promptKeep(Object.assign({ lines: byLine }, key))
+        : await api.promptCut(Object.assign(
+          { text: text.slice(0, 4000), lines: byLine }, key));
       if (!done || !done.ok) {
         said.className = 'chunkSaid bad';
         said.textContent = (done && done.why) || 'the station would not take it';
@@ -434,7 +443,12 @@ function pick(id) {
     for (const doc of (p.documents || [])) {
       chunk(body, { kind: 'document', name: doc.file || 'document',
         note: doc.how || '', flagged: doc.quoted,
-        text: doc.text || doc.passage || doc.swath || doc.quote || '' });
+        text: doc.text || doc.passage || doc.swath || doc.quote || '',
+        /* CUT BY THE LINE. A swath is assembled fresh each round out of
+         * whichever lines are still unused, so the joined passage on screen
+         * would never recur - cutting it whole would record something that
+         * never matches again. See add_many() in prompt_cuts.py. */
+        lines: doc.lines || null });
     }
     for (const bit of (p.material || [])) {
       const words = typeof bit === 'string' ? bit

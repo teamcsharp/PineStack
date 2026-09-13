@@ -18749,6 +18749,32 @@ def _media_prune_now() -> None:
         pass
 
 
+# #1312: a window at or under this is read in ONE trip through the
+# executor instead of streamed. See _range_once.
+RANGE_WHOLE_MOST = 8 << 20
+
+
+async def _range_once(path: Path, start: int, end: int) -> bytes:
+    """The whole window, in one executor hop.
+
+    #1312: _range_stream pays open + seek + a read per 256 kB + close,
+    and every one of those is an asyncio.to_thread through the DEFAULT
+    pool that every other to_thread call in this file shares. When the
+    loop is stalling - measured at 180s of a 600s window - a 400 kB
+    sting waits its turn five times over. A <video> element always
+    opens with a Range, so every clip took that road: measured from
+    the desk, the same clip served whole in 0.11s and, ranged, 20s
+    without finishing.
+
+    #883's streaming stays for big files, where reading a 90 MB tape
+    into memory first is the worse trade. A sting is not a big file."""
+    def _read() -> bytes:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            return handle.read(end - start + 1)
+    return await asyncio.to_thread(_read)
+
+
 async def _range_stream(path: Path, start: int, end: int,
                         chunk: int = 262144):
     """#883: hand the bytes over as they come off the disk.
@@ -61650,6 +61676,15 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
             # the question that keeps a shelf moving rather than just
             # keeping it honest. Adjacency still decides the swath - this
             # only chooses where in the document to stand.
+            # CROSSED OUT IN THE FLOW CHART, dropped before the swath is
+            # assembled rather than after - a cut line must not compete for
+            # the swath, and must not sit in front of a fresher line that
+            # could have been drawn instead. Per LINE, because a swath is
+            # never the same twice; see prompt_cuts.py.
+            fresh = [_l for _l in fresh
+                     if not prompt_cuts.is_cut("document", doc.name, _l)]
+            if not fresh:
+                continue
             fresh = chunk_rank(fresh, lambda ln: ln)
             lines = speakbox_swath_lines(fresh, most=most, cap=cap,
                                          deep=_depth)
@@ -61667,6 +61702,16 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                         "marked heard and will not repeat until the "
                         "shelf runs dry."))
             _crystal_influence_note(key, doc.name, " ".join(lines))
+            # THE SWATH ITSELF, so the flow chart can show what was grabbed
+            # and the operator can cut it. Provenance records a document as
+            # {file, how, quoted} and keeps no passage, which is why the X
+            # was disabled on those rows. Same shape and same cap as
+            # vector_access above it.
+            _swaths = _RADIO.setdefault("swath_served", [])
+            _swaths.insert(0, {"ts": int(time.time()), "file": doc.name,
+                               "text": " ".join(lines)[:1200],
+                               "lines": [str(_l)[:400] for _l in lines[:12]]})
+            del _swaths[24:]
             # #941: which document, how many lines, and how hard the box
             # was being pushed when this swath was drawn.
             round_mark(seed_file=doc.name, seed_lines=len(lines),
@@ -65624,21 +65669,39 @@ def sfx_video_warm() -> bool:
 
 
 def sfx_video_kick() -> None:
-    """Build it in the background, once, and never wait for it here."""
+    """Build it in the background, once, and never wait for it here.
+
+    #1311c: ON ITS OWN THREAD, not the shared executor.
+
+    This used asyncio.to_thread, which hands the work to the default
+    ThreadPoolExecutor - the same one every other to_thread call in
+    this file competes for, and this station makes a great many. The
+    build is a walk of 9,404 files over CIFS and takes a MINUTE AND A
+    HALF here (measured: 92.9s when forced inline through the old
+    road), so it sat at the back of that queue and never finished.
+    Every tap therefore found an empty list and answered "still
+    warming" - which is exactly what the operator reported as a dead
+    button, over and over, while the road itself was perfectly well.
+
+    A daemon thread of its own cannot be starved by the show, and one
+    at a time is still guaranteed by the flag - which is now set
+    BEFORE the thread starts, so two taps in the same second cannot
+    both start a walk."""
     if _SFX_VIDEO_BUILDING[0] or sfx_video_warm():
         return
+    _SFX_VIDEO_BUILDING[0] = True
 
     def _go() -> None:
-        _SFX_VIDEO_BUILDING[0] = True
         try:
             _sfx_video_pool()
+            _sfx_deck_fill()
         except Exception:  # noqa: BLE001
             pass
         finally:
             _SFX_VIDEO_BUILDING[0] = False
 
     try:
-        fire_and_forget(asyncio.to_thread(_go))
+        Thread(target=_go, name="sfx-video-warm", daemon=True).start()
     except Exception:  # noqa: BLE001
         _SFX_VIDEO_BUILDING[0] = False
 
@@ -101010,12 +101073,22 @@ async def dj_provenance_api(
 
     documents: list[dict[str, Any]] = []
 
+    # THE SWATHS THIS LINE WAS ACTUALLY HANDED, so a document row can show
+    # the passage rather than only the file name - and so it can be cut.
+    swaths = _near(_RADIO.get("swath_served"))
+
     def _doc(name: Any, how_found: str) -> None:
         got = str(name or "").strip()
         if not got or any(d["file"] == got for d in documents):
             return
-        documents.append({"file": got, "how": how_found,
-                          "quoted": bool(prompt and got in prompt)})
+        row: dict[str, Any] = {"file": got, "how": how_found,
+                               "quoted": bool(prompt and got in prompt)}
+        for one in swaths:
+            if str(one.get("file") or "") == got:
+                row["text"] = str(one.get("text") or "")
+                row["lines"] = list(one.get("lines") or [])
+                break
+        documents.append(row)
 
     _doc(row.get("source"), "the swath this line was seeded from")
     _doc((row.get("vec") or {}).get("file"),
@@ -101132,6 +101205,18 @@ async def prompt_cuts_add(
     """
     require_auth(authorization)
     body = await request.json()
+    # A SWATH ARRIVES AS LINES. It is assembled fresh every round out of
+    # whichever consecutive lines are unused, so the joined passage would
+    # never match again - each line is cut on its own fingerprint instead.
+    # See add_many() in prompt_cuts.py.
+    lines = body.get("lines")
+    if isinstance(lines, list) and lines:
+        return prompt_cuts.add_many(
+            kind=str(body.get("kind") or ""),
+            name=str(body.get("name") or ""),
+            texts=[str(one or "") for one in lines],
+            why=str(body.get("why") or ""),
+        )
     return prompt_cuts.add(
         kind=str(body.get("kind") or ""),
         name=str(body.get("name") or ""),
@@ -101149,6 +101234,16 @@ async def prompt_cuts_remove(
     """Put a passage back. Every cut is reversible from the same window."""
     require_auth(authorization)
     body = await request.json()
+    # The same in reverse, so the put-back arrow undoes exactly what the X
+    # did rather than leaving most of a swath cut.
+    lines = body.get("lines")
+    if isinstance(lines, list) and lines:
+        kind = str(body.get("kind") or "")
+        said: dict[str, Any] = {"ok": True, "cuts": prompt_cuts.all_cuts(True)}
+        for one in lines:
+            said = prompt_cuts.remove(
+                kind, "", prompt_cuts.fingerprint(str(one or "")))
+        return said
     return prompt_cuts.remove(
         kind=str(body.get("kind") or ""),
         name=str(body.get("name") or ""),
@@ -118692,6 +118787,13 @@ async def sfx_file(
         # tape that is the whole file in RAM and a listener stalled.
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         headers["Content-Length"] = str(end - start + 1)
+        # #1312: a sting-sized window is ONE read, not a stream - see
+        # _range_once. The clip a <video> is waiting on must not queue
+        # five times behind the show's own thread work.
+        if (end - start + 1) <= RANGE_WHOLE_MOST:
+            return Response(await _range_once(path, start, end),
+                            status_code=206, headers=headers,
+                            media_type=media_type)
         return StreamingResponse(_range_stream(path, start, end),
                                  status_code=206, headers=headers,
                                  media_type=media_type)
