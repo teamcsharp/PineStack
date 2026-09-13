@@ -119913,6 +119913,13 @@ async def api_broadcast_health(
             # final return - a key that only sometimes exists reads as
             # false everywhere it does not.
             "gagged": bool(state.get("gagged")),
+            # #1334: on EVERY branch. It existed only on the final return,
+            # and a key that is present on some answers and absent on
+            # others reads as false on the others - which is precisely the
+            # bug #1331 was written to kill, reintroduced two branches
+            # over. Both of these are live "nothing is reaching the room"
+            # answers that the ladder reads.
+            "solo_gagged": bool(_triage_cause_is_gagged()),
             "holding_the_air": str(state.get("owner") or ""),
             "detail": str(state.get("why") or ""),
             "fix_with": "POST /api/radio/pause with paused false",
@@ -119944,6 +119951,13 @@ async def api_broadcast_health(
             # final return - a key that only sometimes exists reads as
             # false everywhere it does not.
             "gagged": bool(state.get("gagged")),
+            # #1334: on EVERY branch. It existed only on the final return,
+            # and a key that is present on some answers and absent on
+            # others reads as false on the others - which is precisely the
+            # bug #1331 was written to kill, reintroduced two branches
+            # over. Both of these are live "nothing is reaching the room"
+            # answers that the ladder reads.
+            "solo_gagged": bool(_triage_cause_is_gagged()),
             "holding_the_air": str(state.get("owner") or ""),
             "detail": str(state.get("why") or ""),
             "fix_with": "POST /api/broadcast/fix/{step}",
@@ -120501,8 +120515,24 @@ async def broadcast_step(step: str) -> dict[str, Any]:
 
     if step == "onair":
         said.append("$ put it back on air")
+        # #1334: THE SWITCH, NOT ONLY THE PAUSE.
+        #
+        # broadcast_triangulate returns cause "off_air" -> cure "onair"
+        # when `_RADIO["on"]` is false, and this step only ever looked at
+        # radio_paused(). So the one cure named for a switched-off station
+        # printed "already on air - nothing to do" and changed nothing,
+        # every time. The ladder's rung 1 then gates on `health.paused`,
+        # which is also false in that state, so nothing anywhere in twelve
+        # rungs turned the station back on except a full restart.
+        if not _RADIO.get("on"):
+            _RADIO["on"] = True
+            changed = True
+            said.append("  the station was switched OFF - back on now")
         if not radio_paused():
-            said.append("  the station is already on air - nothing to do")
+            if changed:
+                said.append("  it was not paused, only off")
+            else:
+                said.append("  the station is already on air - nothing to do")
         else:
             said.append("  it has been off air for %.1f hour(s)"
                         % (radio_paused_for() / 3600.0))
@@ -185063,6 +185093,22 @@ async function fixRun(from) {
       step = 6;
     }
     if (step <= 6) {
+      /* #1334: THE CAUSE BEFORE THE SYMPTOM.
+       *
+       * This ran after RELEASE. For the #1187 fault that is backwards:
+       * `terminals` fixes why nothing can sound, `release` only decides
+       * which silent device holds the air. Releasing first hands the
+       * exclusive to a second device whose switch is also off, so the
+       * "sound is back" check after RELEASE could never pass on the one
+       * fault the pair exists for. */
+      try {
+        const got = await api("/api/broadcast/fix/terminals", {method: "POST"});
+        const lines = (got.lines || []);
+        fixSay("6 DEVICES   " + (lines[lines.length - 1] || "switches read"));
+      } catch (e) { fixSay("6 DEVICES   the station would not answer"); }
+      step = 7;
+    }
+    if (step <= 7) {
       health = await fixHealth();
       /* #1331c: AND THEN IT STOPPED ASKING PERMISSION.
        *
@@ -185085,31 +185131,36 @@ async function fixRun(from) {
                      || health.solo_gagged)) {
         try {
           await api("/api/broadcast/fix/release", {method: "POST"});
-          fixSay("6 RELEASE   the exclusive is released - every player may sound");
-        } catch (e) { fixSay("6 RELEASE   the station would not answer"); }
+          fixSay("7 RELEASE   the exclusive is released - every player may sound");
+        } catch (e) { fixSay("7 RELEASE   the station would not answer"); }
       } else {
-        fixSay("6 RELEASE   nobody holds the air - nothing to release");
+        fixSay("7 RELEASE   nobody holds the air - nothing to release");
       }
-      step = 7;
-    }
-    if (step <= 7) {
-      /* #1331: nothing else in any ladder reads the out-loud switches,
-       * and a house where every one is off is silent no matter what the
-       * station does or how often the exclusive is released. */
-      try {
-        const got = await api("/api/broadcast/fix/terminals", {method: "POST"});
-        const lines = (got.lines || []);
-        fixSay("7 DEVICES   " + (lines[lines.length - 1] || "switches read"));
-      } catch (e) { fixSay("7 DEVICES   the station would not answer"); }
       step = 8;
     }
     if (step <= 8) {
       /* Every page, not just this one. A stale pause, a stuck player and
        * yesterday's code all live in the tab, and the tab that is wedged
        * is frequently not the tab the operator is standing at. */
+      /* #1334: WRITE THE MARK FIRST, BECAUSE THIS RUNG RELOADS US TOO.
+       *
+       * pages_reload stamps _RADIO["reload_at"]; every open page sees it
+       * on its next poll and reloads itself 0.8-4.8s later - and THIS
+       * page is one of them. fixRun was sitting in the eight second wait
+       * below when that happened, with no mark written, so fixResume
+       * found nothing and the run simply ended. DEEP, SERVICES, RELOAD
+       * and RESTART never ran, and the transcript's last line was "8
+       * PAGES asked every page in the house to reload itself" - which
+       * reads like success.
+       *
+       * That is why the deep repair had to be run by hand against a real
+       * wedge today: the button could not reach its own rung 9. */
+      fixMarkWrite({at: Date.now(), step: 9, reloaded: true,
+                    lines: fixLines.slice(-40)});
       try {
         await api("/api/broadcast/fix/reload_pages", {method: "POST"});
         fixSay("8 PAGES     asked every page in the house to reload itself");
+        fixSay("            (including this one - the run picks up at 9)");
       } catch (e) { fixSay("8 PAGES     the station would not answer"); }
       step = 9;
     }
