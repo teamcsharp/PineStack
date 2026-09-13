@@ -377,10 +377,24 @@
     }
     if (want.length) {
       want.sort(function (a, b) { return a.pineAt - b.pineAt; });
-      var cursor = box.firstChild;
-      for (var w = 0; w < want.length; w += 1) {
-        if (want[w] === cursor) { cursor = cursor.nextSibling; continue; }
-        box.insertBefore(want[w], cursor);
+      /* #1287: an insertBefore on an attached node is a detach and an
+         attach, so stitching an already-correct list still takes every
+         row out of the document for an instant. Check first: with the
+         treadmill above gone, the order matches on nearly every paint
+         and this loop does nothing at all. */
+      var settled = true;
+      var walk = box.firstChild;
+      for (var c2 = 0; c2 < want.length; c2 += 1) {
+        while (walk && /sp-msg-ev/.test(walk.className)) walk = walk.nextSibling;
+        if (walk !== want[c2]) { settled = false; break; }
+        walk = walk.nextSibling;
+      }
+      if (!settled) {
+        var cursor = box.firstChild;
+        for (var w = 0; w < want.length; w += 1) {
+          if (want[w] === cursor) { cursor = cursor.nextSibling; continue; }
+          box.insertBefore(want[w], cursor);
+        }
       }
     }
     /* The station also does things that are not speech. */
@@ -393,22 +407,45 @@
       box.appendChild(eventRow(ev));
       added += 1;
     }
-    if (!added) return;
-    /* Endless, but not unbounded: this screen runs for hours. */
-    /* #1279: a trimmed row must be FORGOTTEN as well as removed. The
-       node map would otherwise still hold it, and the next paint would
-       put it straight back - an unbounded pane that resurrects its own
-       history. `seen` is left alone: it is what stops a trimmed row
-       being counted as newly arrived. */
-    while (box.children.length > FEED_MAX) {
-      var old = box.firstChild;
+    /* #1287: THE TRIM STOPS EVICTING ROWS IT STILL WANTS.
+     *
+     * #1279 trimmed on `box.children.length > FEED_MAX`, and the pane
+     * holds activity rows and orphans as well as chat rows - so
+     * several WANTED rows never fit inside the 240. The trim evicted
+     * them from the front, forgot them, and the next paint recreated
+     * them, re-inserted them at the front, and the trim evicted six
+     * again. Measured: 65,023 detach/re-attach events in 9.2 minutes,
+     * 7,055 a minute, at 3.67 paints a second - the largest single
+     * reason a row moves under the operator's finger, and my own.
+     *
+     * Orphans go first, the cap counts only what is wanted, and a row
+     * still in `want` is never evicted. */
+    var keep = Object.create(null);
+    for (var w2 = 0; w2 < want.length; w2 += 1) {
+      var wid = want[w2].getAttribute('data-line');
+      if (wid) keep[wid] = 1;
+    }
+    var kids = [].slice.call(box.children);
+    for (var k2 = 0; k2 < kids.length; k2 += 1) {
+      var kid = kids[k2];
+      var kidId = kid.getAttribute && kid.getAttribute('data-line');
+      if (!kidId || keep[kidId]) continue;
+      if (/sp-msg-ev/.test(kid.className)) continue;   /* an event row */
+      box.removeChild(kid);                            /* an orphan */
+      delete feedNodes[kidId];
+      if (feedLive === kidId) feedLive = '';
+    }
+    var over = want.length - FEED_MAX;
+    for (var t2 = 0; t2 < over; t2 += 1) {
+      var old = want[t2];
       var oldId = old && old.getAttribute && old.getAttribute('data-line');
-      box.removeChild(old);
+      if (old && old.parentNode === box) box.removeChild(old);
       if (oldId) {
         delete feedNodes[oldId];
         if (feedLive === oldId) feedLive = '';
       }
     }
+    if (!added && over <= 0) return;
     if (feedStick) box.scrollTop = box.scrollHeight;
   }
 
@@ -858,18 +895,54 @@
    * quarter second - and speaking_now only as a fallback, since it is
    * refreshed every four seconds and a four second lag on a four second
    * line points at the wrong one. */
+  /* #1287: the basename of the file the player is actually sounding,
+     so a row can be asked whether it belongs to it. `from`/`until` are
+     offsets into a row's OWN file, and matching them without checking
+     the file is how a row 99 seconds away wins - 23 of the 24
+     wrong-line samples were exactly that. */
+  function soundingFile() {
+    var a = soundingPlayer();
+    if (!a) return '';
+    var src = String(a.currentSrc || a.src || '').split('?')[0];
+    return src.split('/').pop() || '';
+  }
+
+  function rowFile(row) {
+    return String(row.clip_media || row.media || '');
+  }
+
   function activeRow() {
     var t = streamAt();
     var rows = (liveStream && liveStream.rows) || [];
+    var file = soundingFile();
     function within(list, of) {
+      var lone = null, loneAt = -1;
       for (var i = 0; i < list.length; i += 1) {
         var row = list[i];
+        var mine = rowFile(row);
+        /* #1287: only rows of the file that is sounding. */
+        if (file && mine && mine !== file) continue;
         var from = Number(row.from), until = Number(row.until);
-        if (!isFinite(from) || !isFinite(until)) continue;
+        if (!isFinite(from) || !isFinite(until)) {
+          /* #1287: A ROW THAT IS THE WHOLE FILE HAS NO WINDOW.
+           * Measured: 0 of 25 `interject` rows carry from/until - they
+           * are a clip of one line, so there is nothing to offset
+           * into - and interject was lit correctly 0 of 37 times. My
+           * #1278 note claimed the wider search would catch them; it
+           * could not, because the field its loop needs does not
+           * exist on them. If the sounding file IS this row's file,
+           * this row is the line. */
+          if (file && mine === file) { lone = row; loneAt = i; }
+          continue;
+        }
         if (t >= from && t < until) {
           return {id: String(row.id || ''), from: from, until: until,
             at: t, index: i, of: of};
         }
+      }
+      if (lone) {
+        return {id: String(lone.id || ''), from: 0,
+          until: Number(lone.seconds) || 0, at: t, index: loneAt, of: of};
       }
       return null;
     }
