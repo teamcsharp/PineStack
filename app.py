@@ -2542,6 +2542,24 @@ SETTINGS_STAT_REST = 1.0
 
 
 def load_settings() -> dict[str, Any]:
+    # #1292: A WARM CACHE IS ANSWERED WITHOUT THE LOCK.
+    #
+    # This took SETTINGS_LOCK on every call, and save_settings held the
+    # same lock across a mkdir, a file write and a rename on the data
+    # share. dj_settings() calls this constantly from the event loop,
+    # so saving one dial stalled the loop for the length of a share
+    # write - measured in /api/pulse's blocking frames at 8.81s for a
+    # single call, 15.92s at worst, on a station where 90% of dead-air
+    # seconds are loop stalls.
+    #
+    # Reading two dict fields is atomic under the GIL, and the worst a
+    # torn read can do is send this call down the slow path below -
+    # which is what it would have done anyway.
+    now = time.time()
+    warm = _SETTINGS_CACHE["value"]
+    if (warm is not None
+            and now - float(_SETTINGS_CACHE["at"] or 0) < SETTINGS_STAT_REST):
+        return warm
     with SETTINGS_LOCK:
         now = time.time()
         if (_SETTINGS_CACHE["value"] is not None
@@ -2572,14 +2590,27 @@ def load_settings() -> dict[str, Any]:
 def save_settings(data: Any) -> dict[str, Any]:
     normalized = validate_settings(data)
 
+    # #1292: THE SLOW PART HAPPENS OUTSIDE THE LOCK. Serialising, the
+    # mkdir and the temp write are all unlocked; only the rename and
+    # the cache swap need to be atomic against a reader, and both are
+    # fast. Holding the lock across a write to this share is what
+    # stalled every reader on the event loop.
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(normalized, indent=2) + "\n")
     with SETTINGS_LOCK:
-        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary = SETTINGS_PATH.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(normalized, indent=2) + "\n"
-        )
         temporary.replace(SETTINGS_PATH)
-        _SETTINGS_CACHE.update({"key": None, "value": None, "at": 0.0})
+        # And the cache is REPLACED, not blanked. It used to be set to
+        # None, so the next reader - often the loop - had to go and
+        # read the file back; the value is already parsed and
+        # validated right here.
+        try:
+            stat = SETTINGS_PATH.stat()
+            _SETTINGS_CACHE.update({
+                "key": (stat.st_mtime_ns, stat.st_size),
+                "value": normalized, "at": time.time()})
+        except Exception:  # noqa: BLE001
+            _SETTINGS_CACHE.update({"key": None, "value": None, "at": 0.0})
 
     # #1158: a changed shelf list takes effect now, not at the next restart.
     if globals().get("library_settings_changed"):
