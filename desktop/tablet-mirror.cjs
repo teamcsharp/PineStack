@@ -607,4 +607,28 @@ class CameraGlass {
     const still = this.lastFrameAt ? Date.now() - this.lastFrameAt : 0;
     return { running: this.running, facing: this.facing, frames: this.frames,
       watchers: this.watchers.size, sinceFrameMs: still,
-      live: this.frames > 0 && still < 2500, why: this.lastE
+      live: this.frames > 0 && still < 2500, why: this.lastError };
+  }
+
+  async close() {
+    this.running = false;
+    try { this.pipe && this.pipe.destroy(); } catch (error) { /* gone */ }
+    this.pipe = null;
+    for (const watcher of this.watchers) {
+      try { watcher.end(); } catch (error) { /* gone */ }
+    }
+    this.watchers.clear();
+    if (this.server) {
+      try { this.server.close(); } catch (error) { /* gone */ }
+      this.server = null;
+    }
+    if (this.tap) {
+      try { await this.run(this.target(['forward', '--remove', 'tcp:' + this.tap]), 10000); }
+      catch (error) { /* the forward outlives us at worst */ }
+      this.tap = 0;
+    }
+    this.latest = null;
+  }
+}
+
+module.exports = { Mirror, DEFAULTS, SIZES, CameraGlass };
