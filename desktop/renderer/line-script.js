@@ -120,7 +120,10 @@ function openMenu(atX, atY, row) {
 async function play(row) {
   try {
     say('Playing…');
-    const done = await api.inspectPlay({ id: row.id });
+    /* THE WHOLE ROW, not just its id: regionAudio in main.js can use a
+     * clip_media path or a music track directly when the row carries
+     * one, rather than asking the booth to cut what it already has. */
+    const done = await api.inspectPlay(row);
     say(done && done.ok ? '' : ((done && done.why) || 'it would not play'),
       !(done && done.ok));
   } catch (error) { say(error.message, true); }

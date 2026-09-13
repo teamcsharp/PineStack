@@ -2067,22 +2067,11 @@ lineDoor("line:vote", "/api/dj/line/vote", (w) => ({
   id: String(w.id || ""), vote: w.up ? "up" : "down"
 }));
 
-ipcMain.handle("inspect:play", async (_event, what) => {
-  try {
-    const id = String((what && what.id) || "");
-    if (!id) return { ok: false, why: "no line was named" };
-    const got = await boothCut(id, false);
-    const dir = clipMux.stash();
-    const file = path.join(dir, "line." + got.ext);
-    fs.writeFileSync(file, got.bytes);
-    /* Handed to whatever the operator plays audio with, rather than this
-     * window growing a second player beside the one the station has. */
-    await shell.openPath(file);
-    return { ok: true, path: file, exact: got.exact, cut: got.cut };
-  } catch (error) {
-    return { ok: false, why: error.message };
-  }
-});
+/* inspect:play is registered ABOVE, at the shot editor's inspection
+ * mode, and plays the line in the panel where this application's
+ * volume and routing live. A second handler for one channel makes
+ * Electron throw in the main process, which takes the whole app down
+ * before any window opens - so there is deliberately not one here. */
 
 ipcMain.handle("inspect:export", async (event, what) => {
   const { dialog } = require("electron");
