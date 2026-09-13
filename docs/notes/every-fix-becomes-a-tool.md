@@ -37,5 +37,27 @@ Hard-won constraints on that ladder:
 - The process restart rung is rate-limited to once an hour, and when the
   ladder is spent it must NAME what needs hands rather than loop.
 
+**The canonical example is now the Reinitialise ladder (#1331/#1335)** —
+one button, thirteen rungs, each one named in `docs/pinetab.md` §23. Auditing
+it against the code found **five cures that already existed as working code
+with no button anywhere to reach them**: RELIEVE (which the station's own
+`AIR_LADDER` puts *first*), a station-wide PAGES (the rung was a
+`location.reload()` of the operator's own tab, and the wedged listener is
+usually a different tablet), DEEP and SERVICES (never called at all, so a
+dead voice engine got "cured" by restarting the station around it), and
+`_floor_break`, which had exactly one caller — the silence branch of
+`dead_air_watch` — and no operator path at all.
+
+Then the ladder could not reach its own **rung nine**: rung 8 PAGES called
+`reload_pages`, which reloaded the operator's own page with no resume mark
+written, so the run died there and nothing below it was ever seen. And the
+whole client-side vocabulary was **a page reload** — until #1335 added a real
+client restart (rung 9 TERMINAL stamps `kiosk_kick`; the desktop sees it on
+its `/api/dj` poll and force-stops and relaunches the kiosk over adb, which
+is the one cure a reload cannot be).
+
+The rule that came out of it: **"A cure the operator cannot reach during the
+fault it cures is not a cure the station has."**
+
 Surfaces: `GET /api/broadcast/watch`, `GET /api/broadcast/console`,
 `POST /api/broadcast/fix/{step}`, `data/air_fixes.jsonl`.

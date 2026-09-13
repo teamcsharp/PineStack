@@ -67,3 +67,20 @@ the stall ledger that names the frame that held the loop.
 `desktop/lcd-agent.cjs` and `desktop/lcd-firmware.cjs` (the box's LCD pages and firmware pushes),
 `desktop/lcd-stream.cjs`. The runner cache lives in `%LOCALAPPDATA%`; a stale runner means an old
 `main.js` until relaunch (the #1148 white-popup lesson).
+
+**The chrome and the panel are TWO DOCUMENTS, not one.** The panel is not drawn by the desktop; it
+is loaded from :8096 into `<webview id="radioFrame">`, and the Electron chrome cannot reach into
+that DOM. This is a topology fact with consequences, not an implementation detail: the chrome's own
+document holds exactly one `<audio>` (`desktopRadioPlayer`) while the DJ voice elements
+(`djVoiceAudio0/1`) live inside the webview, so a chrome-side `document.querySelectorAll('audio')`
+finds none of them — measured at a clean 0%, never intermittent. Anything the chrome must know
+about the panel has to be posted out across that boundary by a preload:
+`desktop/renderer/webview-preload.js` exists only for this, and it is how the SCRIPT view gets the
+playhead. A preload is attached when the webview is created, so a change to it needs a full desktop
+relaunch, not a page reload.
+
+**The desktop is the only thing carrying `adb`.** The station container has no route to the tablet's
+debug bridge, so it cannot force-stop or relaunch the kiosk itself. It reaches the tablet only by
+stamping state — `kiosk_kick` on `/api/dj` (#1335) — which the desktop sees on its ordinary poll and
+turns into `adb am force-stop com.pinebox.kiosk` + `am start`. Any future cure that needs a command
+on the tablet takes the same shape: the station writes a mark, the desktop is the hand.

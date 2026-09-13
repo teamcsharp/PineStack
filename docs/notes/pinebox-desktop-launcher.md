@@ -65,6 +65,16 @@ media_sign-passed progress page: three plexus clouds + byte bar, polls
 window — any future page that should open in-app instead of bouncing to
 the external browser must be added to that same carve-out.
 
+**The preload is in the same class (#1330, 2026-09-13):**
+`desktop/renderer/webview-preload.js` is a PRELOAD, attached to
+`<webview id="radioFrame">`, and like `main.js` the running shell takes it
+from the runner mirror — so a change on the share is invisible until the app
+is relaunched. **A page reload will NOT pick it up**; reloading the panel
+just re-runs the preload the running shell already has. It fails the same
+silent way as the stale runner: the feature behaves like the old code with no
+error anywhere. The DJ playhead bridge is the first thing to depend on it —
+see [the-chrome-cannot-see-the-panel](the-chrome-cannot-see-the-panel.md).
+
 The PB-logo "rebuild" flow (main.js reconstituteDesktop) exits the app and
 runs a detached `pinebox-rebuild.cmd` from `%APPDATA%\pinebox-desktop\`.
 Fixed 2026-08-17: node spawn args must NOT be pre-quoted (cmd choked on the

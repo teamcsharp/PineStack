@@ -73,7 +73,11 @@ mouths, all client/feed side; server logs were clean throughout:**
    non-live mutes).
 3. Tune players were DETACHED Audio objects — invisible to every
    querySelectorAll (solo gate AND shell gating). Now stamped
-   `data-pine-live` and appended to document.body.
+   `data-pine-live` and appended to document.body. The SAME CLASS of bug bit
+   the SCRIPT view a month later, one boundary further out: its playhead scan
+   ran `querySelectorAll('audio')` in the Electron chrome, which cannot see
+   into the panel's `<webview>` at all — a clean 0%, never intermittent. See
+   [the-chrome-cannot-see-the-panel](the-chrome-cannot-see-the-panel.md).
 4. No feed epoch at boot → open clients straddled two schedules. Boot
    stamps `voice_cut_ms` like resume; `/api/dj/voice` returns `cut_ms`;
    clients flush queue + sounding clip past it; `djVoiceEpoch` orphans

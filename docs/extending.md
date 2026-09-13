@@ -117,6 +117,15 @@ Follow `segment_audit()`:
 - pair it with a reader in `desktop/renderer/renderer.js` if the operator needs
   it, and remember the desktop app must be **relaunched** to pick up renderer
   changes, while `app.py` changes need a service restart
+- there is a **third surface** now. The panel runs inside
+  `<webview id="radioFrame">`, a separate document the Electron chrome cannot
+  reach into, so anything that must read state the chrome's own document does
+  not hold belongs in the webview preload,
+  `desktop/renderer/webview-preload.js`, which posts it out. A **preload
+  change is not picked up by a page reload** — only a full desktop relaunch
+  loads it, because the preload is attached when the webview is created. The
+  DJ voice playhead is the worked example; see
+  `notes/the-chrome-cannot-see-the-panel.md`
 
 ## 5. Working on this codebase
 
@@ -159,9 +168,11 @@ commit.
 | the control panel | `CONTROL_PANEL_HTML` inside `app.py` |
 | the radio page | `RADIO_PAGE_HTML` inside `app.py` |
 | the desktop shell | `desktop/main.js`, `desktop/preload.js` |
-| the desk UI | `desktop/renderer/{index.html,renderer.js,styles.css}` |
+| the desk UI | `desktop/renderer/` — **many files, not three**: `index.html`, `renderer.js`, `styles.css`, plus `webview-preload.js` (the webview bridge), `script-page.js`/`script-page.css` (the SCRIPT view), `sampler.js` (the sample forge), `sfx-tv.js` (the CRT set) and the rest |
 | persisted state | `data/` — `prep_shelf.json`, `settings.json`, `pine_requests.md`, `crystals/`, `speakbox/` |
 
 The booth window, the hour view and The Works all live in
 `desktop/renderer/renderer.js`. The top status strip is
-`desktop/renderer/index.html`.
+`desktop/renderer/index.html`. Everything else has been split out into its
+own file beside them — look there first, `renderer.js` is no longer the whole
+desk.

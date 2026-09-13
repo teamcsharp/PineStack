@@ -109,6 +109,16 @@ Guards now on the host: `pinebox-uma.timer` (5min) and
 to launching engines directly). Autonomous: `dialogue_watchdog` (#857)
 runs _deep_repair when no host line has been VERIFIED audible in 7 min.
 
+**THERE ARE TWO LADDERS AND THEY ARE DISJOINT** — know which one you are on.
+`POST /api/broadcast/fix/*` is **Reinitialise**: thirteen rungs, the
+operator's own drawer (the ⟳ tab on the panel), all of them named in
+`docs/pinetab.md` §23 — it works on the pause, the pages, the floor, the
+exclusive and the station process. `/api/pinebox/*` is the **BOX road**, the
+ladder described here, reached by the Electron shell's panic button — it
+works on the device, the engines and the wire. **Neither calls the other.**
+So if one of them has not helped, the other is not a repeat of it; it is the
+half of the fault you have not touched yet.
+
 **Rescue ladder, all rungs (#827/#836/#839)**: L1 the agent's
 `is_radio_rescue` in generate_answer — formal phrases (_RESCUE_RX) PLUS
 short shouts ≤70 chars (noun regex radio/station/pine fm/broadcast +

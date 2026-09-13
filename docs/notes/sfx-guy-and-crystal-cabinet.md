@@ -28,6 +28,17 @@ one-upper streak. Three parts:
   react to his heckles, set up punchlines, call out the one-upping;
   seek_verdict raised 0.2→0.35.
 
+**His POSITION is committed now (#1330/#1333, 2026-09-13).** The cadence gate
+and the random roll always happened at ASSEMBLY time, but that was never
+recorded anywhere — so the script had to work out afterwards where he landed
+from a timestamp, and he kept turning up as one half of the worst
+out-of-order pair. He is written into `data/script_ledger.jsonl` with his own
+`(block, ord)` at the point the running order is final and nothing is audible
+yet, and it is never rewritten. The script AHEAD of the needle therefore
+already shows where he drops in. Measured: 23 of 23 SFX rows inside their own
+conversation. See
+[script-ledger-and-the-reading-order](script-ledger-and-the-reading-order.md).
+
 **Crystal cabinet (#836)** — the desktop 🔮 (crystalBtn) opens
 `#crystalPopup`: draggable header, CSS `resize: both`, per-crystal card with
 ON AIR toggle, strength slider (5–100), album-mind chips (from

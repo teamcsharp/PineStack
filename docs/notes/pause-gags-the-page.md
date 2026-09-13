@@ -41,6 +41,14 @@ spark-agent can reach:
 flush the feed epoch → release the exclusive → reload the page →
 restart the process. See [every-fix-becomes-a-tool](every-fix-becomes-a-tool.md).
 
+That sequence is **one button** now. The ⟳ Reinitialise ladder runs it as
+rungs **1 ON AIR** (lift the pause), **3 UNGAG** (drop this page's own hold),
+**5 FLUSH** (advance the feed epoch) and **7 RELEASE** (release the audio
+exclusive), re-checking after each and stopping the moment sound comes back;
+**12 RELOAD** and **13 RESTART** are the two expensive rungs at the bottom.
+All thirteen are documented in `docs/pinetab.md` §23. Nothing in this list
+should be pulled by hand any more.
+
 Pages now follow the box's code (#1209 build stamp) and honour an
 asked-for reload (#1213 `reload_at`), so this should never again need a
 human to be told "reload the tab" — but a page that predates those cannot
