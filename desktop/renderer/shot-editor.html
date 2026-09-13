@@ -28,12 +28,12 @@
       <input id="colour" type="color" value="#ff3b30">
     </label>
     <div class="stack" title="How thick the line is">
-      <input id="weight" type="range" min="1" max="24" step="1" value="4">
+      <input id="weight" type="range" min="1" max="200" step="1" value="4">
       <span id="weightSaid" class="said">4</span>
     </div>
     <button id="fillBtn" class="toggle" title="Draw shapes filled instead of outlined">fill</button>
     <div class="stack" title="Text size">
-      <input id="fontSize" type="range" min="10" max="96" step="1" value="28">
+      <input id="fontSize" type="range" min="10" max="600" step="1" value="28">
       <span id="fontSaid" class="said">28</span>
     </div>
 
@@ -44,6 +44,24 @@
             aria-label="Delete what is selected"
             title="Delete what is selected (Del)"></button>
     <button id="clearBtn" class="act" title="Remove every mark">clear</button>
+
+    <div class="sep"></div>
+    <!-- THE RESOLUTION, resampled from the picture the tablet actually sent
+         rather than from the copy on screen. The ceiling is capped from the
+         source: a canvas past about 268 megapixels comes back blank. -->
+    <div class="stack" title="How far the picture is enlarged. Resampled from the original every time.">
+      <input id="times" type="range" min="1" max="8" step="1" value="2">
+      <span id="timesSaid" class="said">2&times;</span>
+    </div>
+    <select id="how" title="How the extra pixels are worked out"></select>
+
+    <div class="sep"></div>
+    <!-- Wheel to zoom, middle button to pan, 0 to fit. The readout is here
+         rather than in the status line because the status line is where the
+         picture talks about itself, and this is about the view. -->
+    <button id="fitBtn" class="act"
+            title="Fit the whole picture in the window (0).&#10;Roll the wheel over the picture to zoom, middle-drag to pan.">fit</button>
+    <span id="zoomSaid" class="said" title="How far in the view is zoomed">100%</span>
 
     <div class="grow"></div>
     <button id="copyBtn" class="go" title="Copy the marked-up picture to the clipboard (Ctrl+C)">Copy</button>

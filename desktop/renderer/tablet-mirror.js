@@ -233,11 +233,42 @@ glass.addEventListener('wheel', function (event) {
   sharpenSoon();
 }, { passive: false });
 
-/* THE MIDDLE BUTTON PANS. auxclick is swallowed as well, because Windows
- * otherwise starts its own autoscroll on the middle button and the picture
- * fights it. */
+/* HOLD SPACE TO PAN, the same as the mark-up window - "Photoshop level
+ * controls for basic functionality whenever I'm using any of the editors".
+ *
+ * While TOUCH is on, space belongs to the tablet: it is a character being
+ * typed into whatever is on the terminal's screen, and stealing it would
+ * make a space impossible to send. */
+let spaceHeld = false;
+
+document.addEventListener('keydown', function (event) {
+  if (event.code !== 'Space' || touching) return;
+  /* Auto-repeat fires for as long as it is held: arm once, but suppress the
+   * default every time or the window scrolls under the pan. */
+  event.preventDefault();
+  if (spaceHeld) return;
+  spaceHeld = true;
+  glass.classList.add('handy');
+});
+
+document.addEventListener('keyup', function (event) {
+  if (event.code !== 'Space') return;
+  spaceHeld = false;
+  glass.classList.remove('handy');
+});
+
+/* Alt-tab away with space down and the keyup never arrives, leaving the
+ * window armed in a mode with nothing on screen to explain it. */
+window.addEventListener('blur', function () {
+  spaceHeld = false;
+  glass.classList.remove('handy');
+});
+
+/* THE MIDDLE BUTTON PANS, and so does the left one while space is held.
+ * auxclick is swallowed as well, because Windows otherwise starts its own
+ * autoscroll on the middle button and the picture fights it. */
 glass.addEventListener('pointerdown', function (event) {
-  if (event.button !== 1) return;
+  if (event.button !== 1 && !(event.button === 0 && spaceHeld)) return;
   event.preventDefault();
   panning = { x: event.clientX, y: event.clientY };
   glass.classList.add('panning');

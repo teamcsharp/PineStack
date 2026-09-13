@@ -15931,6 +15931,14 @@ async def unheard_stock_air() -> str:
     said = await _ready_shelf_air(kind, _RADIO.get("now"), rescue=True,
                                   pick=row)
     if not said:
+        # #1304: and it says WHICH refusal, because "the door refused"
+        # was the sentence 120 unheard rounds hid behind.
+        door = ""
+        try:
+            if time.time() - float(_READY_SHELF_WHY.get("at") or 0) < 30:
+                door = str(_READY_SHELF_WHY.get("why") or "")
+        except Exception:  # noqa: BLE001
+            door = ""
         # #1301: A REFUSAL IS NOT WORTH SEVEN MINUTES.
         #
         # The stamp above is taken before the pick on purpose - the
@@ -15941,7 +15949,9 @@ async def unheard_stock_air() -> str:
         # sat in the cupboard. Pacing a walk is worth an interval;
         # failing once is not.
         _UNHEARD_AT[0] = min(now, now - rest + UNHEARD_RETRY_EVERY)
-        return _unheard_no("the air's own door refused the row it picked")
+        return _unheard_no(
+            ("%s refused: %s" % (SHELF_LABEL.get(kind, kind), door)) if door
+            else "the air's own door refused the row it picked")
     _RESCUE_AT[0] = time.time()
     _UNHEARD_SWEEP.update({"at": time.time(), "why": "aired",
                            "aired": int(_UNHEARD_SWEEP.get("aired") or 0) + 1})
@@ -65128,6 +65138,15 @@ async def _sfx_pool_refresh() -> None:
         _SFX_SEEN.update(seen)
         publish(tuple(pool))
         _SFX_POOL_AT[0] = time.time()
+        # #1303c: WARM THE VIDEO LIST HERE, in this same worker thread.
+        # The operator's button must be instant - "the SFX guy should
+        # be on the ball with it" - and a memo that is cold on the
+        # first tap is not. Built off-loop the moment the pool lands,
+        # so the tap is a list index and never a share walk.
+        try:
+            await asyncio.to_thread(_sfx_video_pool)
+        except Exception:  # noqa: BLE001
+            pass
         if arrived:
             pipeline_log("air", f"{len(arrived)} new sample(s) turned "
                          "up on the share and are in the rotation now - "
@@ -65509,6 +65528,54 @@ def _sfx_any() -> Path | None:
     names = unrepeated([str(p) for p in pool], "sting",
                        keep=min(12, max(1, len(pool) - 1)))
     return Path(names) if names else None
+
+
+# #1303c: the airable video clips, built once per pool version.
+_SFX_VIDEO_MEMO: dict[str, Any] = {"key": None, "pool": []}
+
+
+def _sfx_video_pool() -> list[Path]:
+    """Every video clip that could carry the air, memoised.
+
+    #1303c: this walk asks sfx_short() of all 9,404 samples, and
+    sfx_short calls sfx_seconds, which PROBES anything unmeasured - on
+    a CIFS share. Run inside the operator's button press it never came
+    back (HTTP 000). It is in a thread so the loop survived, but a
+    thumb does not wait for a share walk.
+
+    Same shape as _sting_draw_sets and sfx_pool_ids: keyed on the
+    pool's own refresh stamp, so a repointed pack rebuilds it and
+    nothing else does. Never walk the share inside something somebody
+    is waiting on - #826, #1199 and #1265 all say so already."""
+    banned = sfx_bans()
+    key = (_SFX_POOL_AT[0], len(_SFX_POOL_CACHE), len(banned))
+    if _SFX_VIDEO_MEMO["key"] == key and _SFX_VIDEO_MEMO["pool"]:
+        return list(_SFX_VIDEO_MEMO["pool"])
+    pool = [p for p in sfx_all()
+            if sfx_is_video(p) and sfx_short(p)
+            and sfx_id(p) not in banned
+            and not sfx_is_silent(p)]
+    _SFX_VIDEO_MEMO.update({"key": key, "pool": list(pool)})
+    return pool
+
+
+def _sfx_any_video() -> Path | None:
+    """#1303: a random video clip that can carry the air.
+
+    The same population #1302 opened to the gap filler - short enough
+    to go out, unbanned, and NOT a measured silence. A picture is the
+    point of this road, but a clip with no sound would still leave the
+    stream and the car with the hole they already had, so the sound
+    test stands.
+
+    Unrepeated against the ordinary sting ring, so tapping the button
+    twice does not play the same clip twice."""
+    pool = _sfx_video_pool()
+    if not pool:
+        return None
+    got = unrepeated([str(p) for p in pool], "sting",
+                     keep=min(12, max(1, len(pool) - 1)))
+    return Path(got) if got else None
 
 
 async def _sting_over_record(track: dict[str, Any] | None) -> None:
@@ -69380,6 +69447,23 @@ def _ready_shelf_row(kind: str, rescue: bool = False,
     return shelf_take(kind, peek=True, predicate=eligible)
 
 
+# #1304: WHY THE DOOR LAST SAID NO.
+#
+# _ready_shelf_air has five ways to hand back nothing and they are five
+# different faults with five different cures. Its callers could only
+# ever report "the door refused", which is the absence of an
+# explanation - and the number of never-heard rounds climbed to 120
+# behind that sentence.
+_READY_SHELF_WHY: dict[str, Any] = {"at": 0.0, "kind": "", "why": ""}
+
+
+def _shelf_no(kind: str, why: str) -> list[str]:
+    """Record which refusal this was, and refuse."""
+    _READY_SHELF_WHY.update({"at": time.time(), "kind": str(kind),
+                             "why": str(why)})
+    return []
+
+
 async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
                            rescue: bool = False,
                            pick: dict[str, Any] | None = None) -> list[str]:
@@ -69397,16 +69481,21 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     window = None if rescue else _ready_slot_window(kind)
     row = _ready_shelf_row(kind, rescue, pick)      # #1168/#1260
     if row is None:
-        return []
+        return _shelf_no(kind, "the shelf would not give up the row that "
+                               "was picked")                      # #1304
     takes = _ready_round_takes(kind, row)
     # #1260: `free` is "this may air out of turn" - the dead-air rescue
     # as before, or an unheard round past the dial. Everything below that
     # asked `rescue` asks this instead, so the selection and the handoff
     # proof cannot disagree about which rules the round is under.
     free = bool(rescue) or unheard_free(kind, row)
-    if not takes or (not free
-                     and not _ready_round_fits(kind, takes, window)):
-        return []
+    if not takes:                                                 # #1304
+        return _shelf_no(kind, "the round has no takes - there is no "
+                               "finished audio behind it")
+    if not free and not _ready_round_fits(kind, takes, window):
+        return _shelf_no(kind, "the running order is standing on somebody "
+                               "else's slot and this round may not air "
+                               "out of turn")
     if free and not rescue:
         try:
             pipeline_log(
@@ -69474,11 +69563,15 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     try:
         owned = await _floor_take("a ready " + kind + " round")
         if not any(held is row for held in shelf_rows(kind)):
-            return []
+            return _shelf_no(kind, "the row left the shelf while we waited "
+                                   "for the floor")               # #1304
         takes = _ready_round_takes(kind, row)
-        if not takes or (not free
-                         and not _ready_round_fits(kind, takes, window)):
-            return []
+        if not takes:                                             # #1304
+            return _shelf_no(kind, "its takes went while we waited for "
+                                   "the floor")
+        if not free and not _ready_round_fits(kind, takes, window):
+            return _shelf_no(kind, "the slot moved on while we waited for "
+                                   "the floor")
         entry = dict(dialogue_entry(row) or {})
         entry["prep_kind"] = kind
         entry["_ready_slot"] = window
@@ -69489,6 +69582,8 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
             if kind == "gallery":
                 pics = [p for p in entry.get("prep_gallery") or [] if isinstance(p, dict)]
                 _RADIO["gallery_now"] = {"at": time.time(), "images": pics[:3]}
+        else:
+            _shelf_no(kind, "the booth did not put it out")        # #1304
         return said
     finally:
         _READY_SHELF_BUSY.discard(id(row))
@@ -120346,6 +120441,30 @@ async def sfx_fill_now_api(
         except Exception as exc:  # noqa: BLE001
             return {**sfx_gap_status(), "went": "",
                     "say": "the soundboard refused: " + type(exc).__name__}
+    elif road == "video":
+        # #1303: THE OPERATOR'S THUMB, ON A PICTURE.
+        #
+        # `clip` above draws from the whole pool and may land on audio.
+        # This one always lands on a video. dj_sting already accepts
+        # the sample as an argument (#1034), so this takes no new
+        # powers and opens no second player - it picks, and hands the
+        # pick to the door that already knows how to open the set.
+        pick = await asyncio.to_thread(_sfx_any_video)
+        if pick is None:
+            return {**sfx_gap_status(), "went": "", "road": road,
+                    "say": "no video clip is free - the library has none "
+                           "short enough, unbanned and carrying sound"}
+        try:
+            went = "video" if await dj_sting(
+                _RADIO.get("voice_to") in ("box", "both"),
+                who="gap", force=True, sample=pick) else ""
+        except Exception as exc:  # noqa: BLE001
+            return {**sfx_gap_status(), "went": "", "road": road,
+                    "say": "the soundboard refused: " + type(exc).__name__}
+        if went:
+            return {**sfx_gap_status(), "went": went, "road": road,
+                    "clip": pick.name,
+                    "say": "%s went out on the set" % pick.name}
     else:
         went = await sfx_fill_gap(why, under_floor=True)
     return {**sfx_gap_status(), "went": went, "road": road, "say": (

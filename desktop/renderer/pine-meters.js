@@ -63,6 +63,37 @@
   function tap(el) {
     if (!el) return null;
     if (taps[el.id]) return taps[el.id].analyser;
+    /* #1305: THE ONE OWNER FIRST.
+     *
+     * An element may have exactly one MediaElementSource, and on this
+     * station the panel's `audioScope` already holds it - for the
+     * music player and for both DJ voices. This function used to go
+     * straight to createMediaElementSource, which THREW every time,
+     * and its catch returned null, so both meters read null forever
+     * and the spectrum the operator was looking at stayed blank.
+     *
+     * Probed live with music playing: ctx running, audioScope
+     * (musicPlayer) a working analyser with energy 59, and
+     * read('musicPlayer') null.
+     *
+     * sampler-air.js wrote this rule down when it hit the same wall -
+     * "THE PANEL'S OWN SCOPE FIRST. audioScope memoises one analyser
+     * per element". There is one owner; everybody else borrows.
+     *
+     * `borrowed` so nothing here ever tries to free a node it does not
+     * own. The panel's fftSize is larger than this module's, which
+     * only means more bins folded into the same bars - read() already
+     * folds by a computed step. */
+    if (typeof root.audioScope === 'function') {
+      var lent = null;
+      try { lent = root.audioScope(el); } catch (err) { lent = null; }
+      if (lent && lent.analyser) {
+        taps[el.id || ('el' + Object.keys(taps).length)] = {
+          el: el, source: null, analyser: lent.analyser, borrowed: true,
+          data: new Uint8Array(lent.analyser.frequencyBinCount)};
+        return lent.analyser;
+      }
+    }
     /* Somebody else got here first; a second source on one element throws
      * and would take the audio with it. */
     if (el[TAPPED]) return null;

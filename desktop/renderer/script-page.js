@@ -155,8 +155,33 @@
       try { root.dispatchEvent(new Event('resize')); } catch (err) { /* old engine */ }
     });
 
+    /* #1303: THE SFX GUY, ON A PICTURE, ON THE OPERATOR'S THUMB.
+     *
+     * Carbon out of the vendored set through pineIcon() - the house
+     * rule is monochromatic Carbon and never an emoji, and the set is
+     * checked before choosing. It posts the `video` road #1303 built
+     * and reports what the air actually did with it: a button that
+     * cues the broadcast must not be silent about whether it took. */
+    var reel = make('button', 'sp-btn sp-reel', '');
+    reel.title = 'Cue the SFX guy to play a random video on the broadcast';
+    reel.setAttribute('aria-label', 'Play a random video clip');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        reel.innerHTML = root.pineIcon('m:video_library',
+                                       'Play a random video clip');
+      }
+    } catch (err) { /* the title still names it */ }
+    if (!reel.innerHTML) reel.textContent = 'video';
+    reel.addEventListener('click', function () {
+      if (reel.disabled) return;
+      reel.disabled = true;
+      reel.classList.add('sp-firing');
+      fireVideo(reel);
+    });
+
     bar.appendChild(back);
     bar.appendChild(pick);
+    bar.appendChild(reel);                                   /* #1303 */
     bar.appendChild(again);
     return bar;
   }
@@ -184,11 +209,69 @@
     scope.id = 'spSayingScope';
     box.appendChild(body);
     box.appendChild(scope);
-    /* Tapping the strip takes the reader to the line it is quoting. */
-    box.addEventListener('click', function () {
+    /* #1303b: TAP JUMPS, HOLD OPENS.
+     *
+     * A tap takes the reader to the line the strip is quoting; a hold
+     * opens that line's own detail panel - the same one the script's
+     * elements open, so "manage this clip, inspect it" is the surface
+     * that already exists rather than a second one that would drift
+     * from it.
+     *
+     * Told apart by time AND by movement, because on a tablet every
+     * tap begins as a touch that might become a scroll: 500ms without
+     * wandering more than a few pixels is a hold, a drag cancels
+     * both, and the click that follows a fired hold is swallowed. */
+    var holdTimer = 0;
+    var heldAt = null;
+    var holdFired = false;
+
+    function holdOff() {
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
+      heldAt = null;
+    }
+
+    box.addEventListener('pointerdown', function (ev) {
+      holdFired = false;
+      heldAt = {x: ev.clientX, y: ev.clientY};
+      if (holdTimer) clearTimeout(holdTimer);
+      holdTimer = setTimeout(function () {
+        holdTimer = 0;
+        holdFired = true;
+        openSaying();
+      }, 500);
+    });
+    box.addEventListener('pointermove', function (ev) {
+      if (!heldAt) return;
+      if (Math.abs(ev.clientX - heldAt.x) > 8
+          || Math.abs(ev.clientY - heldAt.y) > 8) holdOff();
+    });
+    box.addEventListener('pointerup', holdOff);
+    box.addEventListener('pointercancel', function () {
+      holdOff(); holdFired = false;
+    });
+    box.addEventListener('click', function (ev) {
+      if (holdFired) {                 /* the hold already answered */
+        holdFired = false;
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
       if (nowLineId) jumpToLine(nowLineId);
     });
     return box;
+  }
+
+  /* #1303b: the live line's own detail panel, off the strip.
+   *
+   * The node carries the current item (see paintScript), so this opens
+   * what the line says NOW rather than what it said when its node was
+   * first built. */
+  function openSaying() {
+    if (!nowLineId) return;
+    var node = document.querySelector('.sp-el[data-line="' + nowLineId + '"]');
+    if (!node || !node.pineItem) return;
+    jumpToLine(nowLineId);
+    openLine(node.pineItem, node);
   }
 
   /* Who says this line, the way the screenplay says it: the nearest
@@ -295,6 +378,40 @@
       ctx2d.fillRect(Math.round(b * span), Math.round(scopeHigh - tall),
         Math.max(1, Math.round(span) - gap), Math.round(tall));
     }
+  }
+
+  /* #1303: cue a video, and say what came back.
+   *
+   * Through the bridge's own post(), the way sendNote and sendBack
+   * already talk to the station - not a hand-rolled fetch that would
+   * have to re-derive the base URL and the key for itself. The answer
+   * lands on the strip, because a button that cues the air should
+   * never be silent about whether the air took it. */
+  function fireVideo(btn) {
+    function done(text, bad) {
+      btn.disabled = false;
+      btn.classList.remove('sp-firing');
+      btn.classList.toggle('sp-fired-bad', !!bad);
+      say(text);
+      setTimeout(function () { btn.classList.remove('sp-fired-bad'); }, 2600);
+    }
+    api().post('/api/sfx/fill',
+      {road: 'video', why: 'the operator asked for a video'}
+    ).then(function (got) {
+      var went = String((got && got.went) || '');
+      if (went) done((got.clip ? got.clip + ' - ' : '') + 'on the set');
+      else done(String((got && got.say) || 'the air refused it'), true);
+    }, function (err) {
+      done(String((err && err.message) || err).slice(0, 60), true);
+    });
+  }
+
+  /* A short word on the strip, so an action has an answer. */
+  function say(text) {
+    var line = el('spSayingText');
+    if (!line) return;
+    sayingSaid = '';                  /* let the next tick repaint it */
+    line.textContent = String(text || '');
   }
 
   /* ---------------------------------------------------------------- 4 */
@@ -807,6 +924,12 @@
         node.pinePrint = print;
         scriptNodes.set(key, node);
       }
+      /* #1303b: THE NODE CARRIES THE CURRENT ITEM.
+         The click handler scriptBlock attaches closes over the item the
+         node was BUILT with, and a re-dress does not refresh it. Anything
+         reading the node later - the strip's hold, for one - should get
+         what this line says now. */
+      node.pineItem = item;
       order.push(node);
     }
     scriptNodes.forEach(function (held, key) {
@@ -1794,6 +1917,55 @@
     paintStatus();
   }
 
+  /* #1303b: the row the sampler's own sourceFor() expects. A clip line
+     carries its url and is taken exactly; a spoken line carries its id
+     and the clip route cuts it out of the welded round. */
+  function samplerRow(item) {
+    if (!item) return null;
+    var id = String(item.line || item.id || '');
+    var url = String(item.clip || '');
+    if (!id && !url) return null;
+    var row = {id: id, text: String(item.text || ''),
+               who: String(item.name || item.who || '')};
+    if (url) { row.url = url; row.sfx = true; }
+    return row;
+  }
+
+  function padRow(item) {
+    var row = samplerRow(item);
+    if (!row) return null;
+    var sampler = root.PineSampler;
+    if (!sampler || typeof sampler.grab !== 'function') return null;
+    try {
+      if (typeof sampler.takeable === 'function' && !sampler.takeable(row)) {
+        return null;                 /* nothing behind it: no button */
+      }
+    } catch (err) { return null; }
+    var btn = make('button', 'sp-btn wide', 'Send to a sampler pad');
+    btn.title = 'Put this on the first free pad of the sampler';
+    btn.addEventListener('click', function () {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = 'taking it...';
+      Promise.resolve(sampler.grab(row)).then(function (got) {
+        var ok = got && got.ok;
+        btn.textContent = ok ? 'on a pad' : ((got && got.why) || 'it refused');
+        btn.disabled = !!ok;
+        if (!ok) setTimeout(function () {
+          btn.textContent = 'Send to a sampler pad';
+          btn.disabled = false;
+        }, 2600);
+      }).catch(function (err) {
+        btn.textContent = 'it refused: ' + (err && err.message);
+        setTimeout(function () {
+          btn.textContent = 'Send to a sampler pad';
+          btn.disabled = false;
+        }, 2600);
+      });
+    });
+    return btn;
+  }
+
   function jumpToLine(id) {
     if (!id) return;
     var node = document.querySelector('.sp-el[data-line="' + id + '"]');
@@ -1838,6 +2010,17 @@
       sendNote(item, note.value, keep);
     });
     row.appendChild(keep);
+
+    /* #1303b: ASSIGN IT TO A PAD.
+     *
+     * Through PineSampler.grab, the published seam - whose own comment
+     * says it exists so "another view can GREY ITS OWN BUTTON with the
+     * same answer this one uses, rather than guessing from `aired` -
+     * which is the exact mistake that once offered 7 of ~220 takeable
+     * moments". So this asks takeable() and simply is not there when
+     * there is nothing behind the line. */
+    var take = padRow(item);
+    if (take) row.appendChild(take);
 
     var back = make('button', 'sp-btn wide', 'Send to the recording room');
     /* Honest about the limit rather than failing in the operator's hand:

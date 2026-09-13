@@ -116,6 +116,13 @@
 
 .sp-treerow { display: flex; align-items: center; gap: 10px; }
 
+/* #1303: the video cue, beside the view picker. Sized like the other
+   two buttons on that bar so the row still reads as one control. */
+.sp-btn.sp-reel { display: inline-flex; align-items: center; justify-content: center; }
+.sp-btn.sp-reel .pi-icon { width: 18px; height: 18px; }
+.sp-btn.sp-reel.sp-firing { opacity: .55; }
+.sp-btn.sp-reel.sp-fired-bad { border-color: #d86b57; color: #e9b5aa; }
+
 /* #1300: THE HAND-OFF, SHOWN.
  *
  * One segment shuts and the next opens out, so the moment the show

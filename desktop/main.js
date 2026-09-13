@@ -8,6 +8,8 @@ const { LcdFirmware } = require("./lcd-firmware.cjs");
 const { saveLcdSample } = require("./lcd-samples.cjs");
 const { TerminalHost } = require("./terminal-host.cjs");
 const clipMux = require("./clip-mux.cjs");
+/* Twice the size and sharpened, for every picture taken of the tablet. */
+const shotEnhance = require("./shot-enhance.cjs");
 const glassParts = require("./terminal-glass.cjs");
 /* For the local report: facts about THIS machine, where the tablet's
  * report has getprop and a battery. */
@@ -1017,7 +1019,15 @@ const terminalHost = new TerminalHost({ readConfig, writeConfig }).install(ipcMa
  * all afternoon. The entry is dropped when the window closes. */
 const shotWaiting = new Map();
 
-function openShotEditor(png) {
+/**
+ * Open the mark-up window on [png].
+ *
+ * [original] is the picture as it came off the tablet, BEFORE any enlarging,
+ * and it is kept so the editor's resolution slider can resample from it.
+ * Re-enlarging the enlarged copy would compound the interpolation: 2x of a 2x
+ * is not 4x of the original.
+ */
+function openShotEditor(png, original, times, how) {
   const editor = new BrowserWindow({
     width: 1280,
     height: 860,
@@ -1042,7 +1052,8 @@ function openShotEditor(png) {
    * webContents is gone by then - which Electron turns into a crash dialog
    * in the operator's face every time they shut the window. */
   const editorId = editor.webContents.id;
-  shotWaiting.set(editorId, png);
+  shotWaiting.set(editorId, { png, original: original || png,
+    times: times || 1, how: how || '' });
   editor.on("closed", () => shotWaiting.delete(editorId));
   editor.loadFile(path.join(__dirname, "renderer", "shot-editor.html"));
   return editor;
@@ -1347,12 +1358,18 @@ ipcMain.handle("frame:done", (event) => {
  * clipboard, and into the mark-up window if that is what was asked for. The
  * picker closes behind it - it has done its job, and leaving it open would
  * put a second window between the operator and the drawing. */
-ipcMain.handle("frame:pick", (event, choice) => {
+ipcMain.handle("frame:pick", async (event, choice) => {
   const { clipboard, nativeImage } = require("electron");
   try {
     const body = String((choice && choice.dataUrl) || "").split(",")[1] || "";
     if (!body) return { ok: false, why: "there was no picture in the frame" };
-    const png = Buffer.from(body, "base64");
+    /* THE SAME DOUBLING AS A LIVE SCREENSHOT, and it matters more here: the
+     * rolling recorder films at half size to be cheap, so a picked frame is
+     * 670x400. Doubling brings it to 1340x800 - parity with a screenshot
+     * rather than half of one. */
+    const big = await shotEnhance.enlarge(Buffer.from(body, "base64"),
+      { times: 2, ffmpeg: (readConfig() || {}).ffmpeg });
+    const png = big.png;
     const image = nativeImage.createFromBuffer(png);
     if (!image || image.isEmpty()) {
       return { ok: false, why: "the frame could not be decoded" };
@@ -1363,13 +1380,16 @@ ipcMain.handle("frame:pick", (event, choice) => {
     }
     let edited = false;
     if (choice && choice.edit) {
-      try { openShotEditor(png); edited = true; }
-      catch (error) { edited = false; }
+      try {
+        openShotEditor(png, Buffer.from(body, "base64"), big.times, big.how);
+        edited = true;
+      } catch (error) { edited = false; }
     }
     const window_ = BrowserWindow.fromWebContents(event.sender);
     if (window_ && !window_.isDestroyed()) window_.close();
     const size = image.getSize();
     return { ok: true, edited, width: size.width, height: size.height,
+      grew: big.times, grewWhy: big.why || "",
       back: Number(choice && choice.back) || 0 };
   } catch (error) {
     return { ok: false, why: error.message };
@@ -1377,9 +1397,38 @@ ipcMain.handle("frame:pick", (event, choice) => {
 });
 
 ipcMain.handle("shot:image", (event) => {
-  const png = shotWaiting.get(event.sender.id);
-  if (!png) return { ok: false, why: "there is no picture waiting for this window" };
-  return { ok: true, dataUrl: "data:image/png;base64," + png.toString("base64") };
+  const held = shotWaiting.get(event.sender.id);
+  if (!held) return { ok: false, why: "there is no picture waiting for this window" };
+  const { nativeImage } = require("electron");
+  /* The ORIGINAL's size, because that is what the resolution slider
+   * multiplies - and what the editor needs to work out how far it can go
+   * before the canvas area limit bites. */
+  const source = nativeImage.createFromBuffer(held.original).getSize();
+  return { ok: true,
+    dataUrl: "data:image/png;base64," + held.png.toString("base64"),
+    times: held.times,
+    how: held.how || shotEnhance.WAYS[0].id,
+    source,
+    ways: shotEnhance.WAYS.map((way) =>
+      ({ id: way.id, name: way.name, note: way.note })) };
+});
+
+/* THE SLIDER AND THE DROPDOWN, answered from the ORIGINAL every time. */
+ipcMain.handle("shot:resample", async (event, want) => {
+  const held = shotWaiting.get(event.sender.id);
+  if (!held) return { ok: false, why: "there is no picture waiting for this window" };
+  try {
+    const times = Math.max(1, Math.min(8, Math.round(Number(want && want.times) || 1)));
+    const big = await shotEnhance.enlarge(held.original,
+      { times, how: want && want.how, ffmpeg: (readConfig() || {}).ffmpeg });
+    held.png = big.png;
+    held.times = big.times;
+    held.how = big.how;
+    return { ok: true, times: big.times, how: big.how, why: big.why || "",
+      dataUrl: "data:image/png;base64," + big.png.toString("base64") };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
 });
 
 ipcMain.handle("shot:save", async (event, dataUrl) => {
@@ -1535,6 +1584,8 @@ async function plainStill(options, aim) {
   const { clipboard, nativeImage } = require("electron");
   let image = null;
   let shot = { bytes: 0, how: "", size: null };
+  let grew = 0;
+  let grewWhy = "";
   if (aim.where === "app") {
     image = await localStill();
     const png = image.toPNG();
@@ -1542,6 +1593,34 @@ async function plainStill(options, aim) {
   } else {
     shot = await (await terminalHost.glass()).still();
     if (!shot.ok) return shot;
+    /* TWICE THE SIZE, SHARPENED. The tablet's panel is 1340x800, which is a
+     * small picture to paste into a conversation and a smaller one to draw
+     * arrows on. Nothing is added that was not there - but the viewer's own
+     * scaler stops being the thing that decides how the text reads, and the
+     * mark-up window gets four times the room. See shot-enhance.cjs for why
+     * lanczos-then-unsharp and not something else.
+     *
+     * This window's own capture is deliberately NOT enlarged: it is already
+     * at this monitor's real resolution. */
+    /* THE CALLER CHOOSES HOW FAR. A plain click asks for two - generous for
+     * pasting into a conversation. Shift+click asks for three, because that
+     * is the road that ends in the mark-up window and an arrow head wants
+     * pixels to sit in. */
+    /* Kept for the editor's resolution slider - see openShotEditor. */
+    shot.raw = shot.png;
+    const big = await shotEnhance.enlarge(shot.png,
+      { times: Number((options && options.times) || 2),
+        ffmpeg: (readConfig() || {}).ffmpeg });
+    shot.how = big.how;
+    if (big.times > 1) {
+      shot.png = big.png;
+      shot.bytes = big.png.length;
+      /* The size now comes from the image itself - the one the tablet
+       * reported describes the frame before it was enlarged. */
+      shot.size = null;
+      grew = big.times;
+    }
+    grewWhy = big.why || "";
     image = nativeImage.createFromBuffer(shot.png);
   }
   if (!image || image.isEmpty()) {
@@ -1558,11 +1637,17 @@ async function plainStill(options, aim) {
    * done what a plain click would have done. */
   let edited = false;
   if (options && options.edit) {
-    try { openShotEditor(aim.where === "app" ? image.toPNG() : shot.png); edited = true; }
-    catch (error) { edited = false; }
+    try {
+      openShotEditor(aim.where === "app" ? image.toPNG() : shot.png,
+        aim.where === "app" ? image.toPNG() : shot.raw, grew || 1, shot.how);
+      edited = true;
+    } catch (error) { edited = false; }
   }
   return { ok: true, width: size.width, height: size.height,
     bytes: shot.bytes, how: shot.how, edited,
+    /* What it was enlarged by, and why it was not - the status line says
+     * both rather than quietly handing over a smaller picture. */
+    grew, grewWhy,
     where: aim.where, why: aim.why };
 }
 

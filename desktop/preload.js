@@ -91,6 +91,9 @@ contextBridge.exposeInMainWorld("pineDesktop", {
    * back a marked-up one to be saved. Copying is copyImage, below. */
   shotImage: () => ipcRenderer.invoke("shot:image"),
   shotSave: (dataUrl) => ipcRenderer.invoke("shot:save", dataUrl),
+  /* The editor's resolution slider and algorithm picker. Always resampled
+   * from the ORIGINAL, never from the copy already on screen. */
+  shotResample: (want) => ipcRenderer.invoke("shot:resample", want),
   glassClip: (seconds, options) => ipcRenderer.invoke("glass:clip", seconds, options),
   /* The export window: what is waiting, and what to make of it. */
   clipPending: () => ipcRenderer.invoke("clip:pending"),

@@ -54,7 +54,9 @@ html, body {
 /* Zoomed in, the middle button is a hand. Said with the cursor rather than
  * with a hint, because there is nowhere to put a hint. */
 #glass.zoomed { cursor: grab; }
-#glass.panning { cursor: grabbing; }
+/* Space held: the hand tool, whatever else the cursor would have been. */
+#glass.handy, #glass.handy.touching { cursor: grab; }
+#glass.panning, #glass.panning.touching { cursor: grabbing; }
 
 #veil {
   position: absolute;

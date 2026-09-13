@@ -977,21 +977,30 @@ async function glassDo(saying, work) {
   }
 }
 
-/* CTRL+CLICK FINDS THE MOMENT FIRST, THEN MARKS IT UP.
+/* THREE GESTURES, A LADDER OF HOW MUCH DECIDING YOU WANT TO DO FIRST.
  *
- * A plain click is the fast road - picture, clipboard, done. Holding Ctrl
- * opens the tablet's rolling recording to scrub through, because the moment
- * worth drawing on has almost always just passed: the dialog has closed, the
- * meter has fallen back, the finger has lifted. The frame chosen there goes
- * to the clipboard and into the mark-up window, which is exactly where a
- * Ctrl+click's picture went before - it is simply picked rather than
- * whatever happened to be on the glass. */
+ *   click        the screen, now, on the clipboard. Done.
+ *   SHIFT+click  the same, and open it for drawing.
+ *   CTRL+click   scrub back through the tablet's rolling recording, pick the
+ *                moment, then draw on that - because the moment worth
+ *                drawing on has almost always just passed: the dialog has
+ *                closed, the meter has fallen back, the finger has lifted.
+ *
+ * Shift+click is the road Ctrl+click used to be, before Ctrl grew the
+ * scrubber and left it with nowhere to live. */
 $("glassStill")?.addEventListener("click", (event) => {
-  const edit = !!(event.ctrlKey || event.metaKey);
-  glassDo(edit ? "Fetching the tablet's recording to scrub\u2026"
-               : "Taking the tablet's picture\u2026",
+  const scrub = !!(event.ctrlKey || event.metaKey);
+  /* Scrubbing ends in the editor too, so the picker's own Mark up button and
+   * this flag are the same intent arriving by different roads. */
+  const edit = scrub || !!event.shiftKey;
+  glassDo(scrub ? "Fetching the tablet's recording to scrub\u2026"
+                : edit ? "Taking the tablet's picture to draw on\u2026"
+                       : "Taking the tablet's picture\u2026",
     async () => {
-      const shot = await api.glassStill({ edit, scrub: edit,
+      const shot = await api.glassStill({ edit, scrub,
+        /* Three when it is going to be drawn on, two when it is going
+         * straight to the clipboard - see the note in main.js. */
+        times: (edit && !scrub) ? 3 : 2,
         seconds: glassSeconds(), target: glassTarget() });
       if (!shot || !shot.ok) {
         return glassSay(shot && shot.why ? shot.why : "the picture did not come back", true);
@@ -1001,9 +1010,14 @@ $("glassStill")?.addEventListener("click", (event) => {
           + `${Number(shot.seconds).toFixed(1)}s and pick the frame.`);
       }
       glassSay(`On the clipboard \u2014 ${shot.width}\u00d7${shot.height}`
+        /* SAY IT WAS ENLARGED. The number on its own looks like the tablet
+         * grew a screen, and the operator should know the pixels were made
+         * rather than measured. */
+        + (shot.grew > 1 ? ` (${shot.grew}\u00d7, sharpened)` : "")
         + glassWhere(shot) + "."
         + (edit ? (shot.edited ? " Marking-up window opened."
           : " The mark-up window would not open.") : "")
+        + (shot.grewWhy ? " " + shot.grewWhy + "." : "")
         /* The scrub was asked for and did not happen. Say why. */
         + (shot.instead ? " No timeline to scrub: " + shot.instead + "." : ""),
         !!shot.instead);

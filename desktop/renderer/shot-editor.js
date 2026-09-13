@@ -35,9 +35,19 @@ let future = [];
 
 let tool = 'select';
 let selected = null;
+/* THE LABEL CURRENTLY IN THE TEXT BOX. Declared up here with the rest of the
+ * state rather than beside the typing code, because redraw() skips it - and a
+ * `let` read before its declaration runs is a dead-zone throw, not an
+ * undefined. */
+let typingMark = null;
+/* SPACE HELD = the hand tool, for as long as it is held. See the listeners
+ * near the keyboard shortcuts. */
+let spaceHeld = false;
 let drag = null;
 let steps = 0;             /* the running number for the step counter */
 let scale = 1;             /* picture pixels per screen pixel */
+let fitScale = 1;          /* what `scale` is when the whole picture shows */
+let zoomedByHand = false;  /* has the operator taken the wheel to it */
 
 const style = { colour: '#ff3b30', weight: 4, fill: false, fontSize: 28 };
 
@@ -56,7 +66,7 @@ const TOOLS = [
   { id: 'rect', glyph: '▭', title: 'Rectangle (R)' },
   { id: 'ellipse', glyph: '◯', title: 'Ellipse (E)' },
   { id: 'pen', glyph: '✎', title: 'Freehand (P)' },
-  { id: 'text', glyph: 'A', title: 'Text - drag a corner afterwards to scale it (T)' },
+  { id: 'text', glyph: 'A', title: 'Text - click for a label, or DRAG A BOX and the type fills it (T)' },
   { id: 'highlight', glyph: '▬', title: 'Highlighter (H)' },
   { id: 'blur', glyph: '▒', title: 'Pixelate - for hiding something (B)' },
   { id: 'step', glyph: '①', title: 'Numbered step, for pointing things out in order (S)' },
@@ -148,6 +158,13 @@ function boundsOf(mark) {
       w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
   }
   if (mark.kind === 'text') {
+    /* A FITTED LABEL IS ITS BOX. The handles and the selection outline then
+     * describe the thing that was drawn, so dragging a corner resizes what
+     * the operator thinks they are resizing rather than the glyphs. */
+    if (mark.fit) {
+      return { x: mark.x, y: mark.y,
+        w: Math.max(8, mark.fit.w), h: Math.max(8, mark.fit.h) };
+    }
     const size = textSize(mark);
     return { x: mark.x, y: mark.y, w: size.w, h: size.h };
   }
@@ -156,6 +173,41 @@ function boundsOf(mark) {
     return { x: mark.x - r, y: mark.y - r, w: r * 2, h: r * 2 };
   }
   return norm(mark);
+}
+
+/**
+ * THE LARGEST TYPE THAT FILLS `mark.fit`.
+ *
+ * Arithmetic rather than a search, because both limits are linear:
+ *
+ *   width   text width is proportional to font size, so measuring the widest
+ *           line once at 100px gives the width per pixel of font size. The
+ *           +0.4 is the side padding textSize() already adds.
+ *   height  line height is a fixed 1.25 of the font size, so N rows fit
+ *           exactly when the size is box.h / (N * 1.25).
+ *
+ * The answer is the smaller, and it is exact at every size rather than
+ * converging to nearly right.
+ */
+function fitFont(mark) {
+  const box = mark.fit;
+  if (!box || !(box.w > 0) || !(box.h > 0)) return mark.fontSize;
+  const lines = String(mark.text || '').split('\n');
+  const rows = Math.max(1, lines.length);
+
+  ctx.save();
+  ctx.font = '100px "Segoe UI", system-ui, sans-serif';
+  let widest = 0;
+  for (const line of lines) widest = Math.max(widest, ctx.measureText(line).width);
+  ctx.restore();
+
+  /* Drawn width per 1px of font size. Never zero, so an empty line cannot
+   * divide by it - an empty box is then governed by its height, which is
+   * what an operator who has drawn a box and not yet typed expects to see. */
+  const perPixel = (widest / 100) + 0.4;
+  const byWidth = box.w / perPixel;
+  const byHeight = box.h / (rows * 1.25);
+  return Math.max(6, Math.min(400, Math.min(byWidth, byHeight)));
 }
 
 function textSize(mark) {
@@ -317,7 +369,14 @@ function redraw() {
   if (!base) return;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(base, 0, 0);
-  for (const mark of marks) drawMark(mark);
+  for (const mark of marks) {
+    /* NOT THE ONE BEING TYPED. It is already on screen in the text box
+     * sitting over this exact spot, and drawing it here as well showed the
+     * OLD wording ghosted behind the new - same colour, offset by the box
+     * padding, and read as a rendering fault rather than as two copies. */
+    if (mark === typingMark) continue;
+    drawMark(mark);
+  }
   if (selected) drawHandles(selected);
 }
 
@@ -387,6 +446,10 @@ function at(event) {
 
 canvas.addEventListener('pointerdown', (event) => {
   if (event.button !== 0) return;
+  /* SPACE HELD MEANS PAN, NOT DRAW. Yielded before the pointer is captured,
+   * so the stage's own handler below gets a clean drag - and before
+   * commitTyping(), because panning is not a reason to finish a label. */
+  if (spaceHeld) return;
   commitTyping();
   /* Capture so a stroke survives the pointer leaving the canvas - drawing an
    * arrow that ends past the edge of the picture is normal, and without this
@@ -416,7 +479,23 @@ canvas.addEventListener('pointerdown', (event) => {
   }
 
   if (tool === 'text') {
-    startTyping(p.x, p.y);
+    /* A LABEL ALREADY HERE IS EDITED, NOT BURIED. Starting a new one on top
+     * of an existing label is never what was meant, and having to switch to
+     * the select tool and double-click to change a word is the kind of thing
+     * that makes a tool feel like it is arguing with you.
+     *
+     * It is selected as well as opened, so Delete works on it the moment the
+     * editing is finished, without changing tools. */
+    const already = markAt(p.x, p.y);
+    if (already && already.kind === 'text') {
+      select(already);
+      startTyping(already.x, already.y, already);
+      return;
+    }
+    /* Not startTyping yet: a DRAG here means "this big", and that cannot be
+     * known until the button comes up. A click still lands a caret - see
+     * endDrag. */
+    drag = { how: 'textbox', from: p, box: { x: p.x, y: p.y, w: 0, h: 0 } };
     return;
   }
 
@@ -497,6 +576,19 @@ canvas.addEventListener('pointermove', (event) => {
     return;
   }
 
+  if (drag.how === 'textbox') {
+    drag.box = { x: Math.min(drag.from.x, p.x), y: Math.min(drag.from.y, p.y),
+      w: Math.abs(p.x - drag.from.x), h: Math.abs(p.y - drag.from.y) };
+    redraw();
+    ctx.save();
+    ctx.strokeStyle = style.colour;
+    ctx.setLineDash([6 / scale, 4 / scale]);
+    ctx.lineWidth = 1 / scale;
+    ctx.strokeRect(drag.box.x, drag.box.y, drag.box.w, drag.box.h);
+    ctx.restore();
+    return;
+  }
+
   if (drag.how === 'crop') {
     drag.box = { x: Math.min(drag.from.x, p.x), y: Math.min(drag.from.y, p.y),
       w: Math.abs(p.x - drag.from.x), h: Math.abs(p.y - drag.from.y) };
@@ -547,11 +639,20 @@ function resize(mark, was, handle, p) {
     return;
   }
   if (mark.kind === 'text') {
+    mark.x = left; mark.y = top;
+    if (was.fit) {
+      /* A BOX-FITTED LABEL KEEPS FITTING ITS BOX. Scaling the font by the
+       * height ratio instead would leave it no longer filling the box the
+       * operator drew, the first time they touched it. */
+      mark.fit = { w: w, h: h };
+      mark.fontSize = fitFont(mark);
+      setFont(Math.round(mark.fontSize), true);
+      return;
+    }
     /* TEXT SCALES, it does not stretch - a screenshot label set in squashed
      * type reads as a mistake. The font follows the height being dragged. */
     const grew = b.h ? h / b.h : 1;
     mark.fontSize = Math.max(8, Math.min(400, Math.round(was.fontSize * grew)));
-    mark.x = left; mark.y = top;
     setFont(mark.fontSize, true);
     return;
   }
@@ -567,6 +668,19 @@ function endDrag(event) {
   if (!drag) return;
   const held = drag;
   drag = null;
+
+  if (held.how === 'textbox') {
+    /* A BOX, OR A CARET. Small enough and it was a click, not a drag -
+     * and a click is the right gesture for a quick label at the slider's
+     * size, so it is kept exactly as it was. */
+    if (held.box.w > 12 && held.box.h > 12) {
+      startTyping(held.box.x, held.box.y, null, held.box);
+    } else {
+      startTyping(held.from.x, held.from.y);
+    }
+    return;
+  }
+
   if (held.how === 'crop') {
     if (held.box.w > 8 && held.box.h > 8) applyCrop(held.box);
     else redraw();
@@ -596,27 +710,47 @@ canvas.addEventListener('pointercancel', endDrag);
 
 /* -------------------------------------------------------------------- text */
 
-let typingMark = null;
-
-function startTyping(x, y, existing) {
+function startTyping(x, y, existing, fitBox) {
   commitTyping();
   typingMark = existing || { kind: 'text', x, y, text: '', colour: style.colour,
     fontSize: style.fontSize, box: style.fill };
+  /* A BOX WAS DRAWN: it, and not the slider, is the size from here on. */
+  if (fitBox) {
+    typingMark.fit = { w: fitBox.w, h: fitBox.h };
+    typingMark.fontSize = fitFont(typingMark);
+  }
   const rect = canvas.getBoundingClientRect();
   const holderRect = holder.getBoundingClientRect();
   typing.hidden = false;
   typing.value = typingMark.text;
   typing.style.left = ((rect.left - holderRect.left) + typingMark.x * scale) + 'px';
   typing.style.top = ((rect.top - holderRect.top) + typingMark.y * scale) + 'px';
-  typing.style.fontSize = (typingMark.fontSize * scale) + 'px';
-  typing.style.lineHeight = (typingMark.fontSize * 1.25 * scale) + 'px';
   typing.style.color = typingMark.colour;
   sizeTyping();
   typing.focus();
-  say('Type the label. Enter commits it, Shift+Enter makes a new line, Escape throws it away.');
+  say(typingMark.fit
+    ? 'Type the label \u2014 it grows to fill the box you drew. Enter commits it, '
+      + 'Shift+Enter makes a new line, Escape throws it away.'
+    : 'Type the label. Enter commits it, Shift+Enter makes a new line, Escape throws it away.');
 }
 
 function sizeTyping() {
+  /* REFIT AS IT IS TYPED, so what is on screen while typing is what will be
+   * drawn - the whole point of drawing a box was to stop guessing. */
+  if (typingMark.fit) {
+    typingMark.text = typing.value;
+    typingMark.fontSize = fitFont(typingMark);
+  }
+  typing.style.fontSize = (typingMark.fontSize * scale) + 'px';
+  typing.style.lineHeight = (typingMark.fontSize * 1.25 * scale) + 'px';
+
+  if (typingMark.fit) {
+    /* The box itself, so the operator is typing inside the thing they drew
+     * rather than inside a field that happens to be near it. */
+    typing.style.width = (typingMark.fit.w * scale) + 'px';
+    typing.style.height = (typingMark.fit.h * scale) + 'px';
+    return;
+  }
   const lines = typing.value.split('\n');
   const longest = lines.reduce((n, l) => Math.max(n, l.length), 1);
   typing.style.width = Math.max(40, longest * typingMark.fontSize * scale * 0.62 + 14) + 'px';
@@ -645,6 +779,10 @@ function commitTyping() {
   }
   remember();
   mark.text = text;
+  /* One last fit: the trailing whitespace stripped just above can change
+   * which line is the widest, and the committed label must match what was
+   * on screen a moment ago. */
+  if (mark.fit) mark.fontSize = fitFont(mark);
   if (already < 0) marks.push(mark);
   select(mark);
 }
@@ -656,6 +794,9 @@ function cancelTyping() {
 }
 
 /* Double-click a label to edit its words rather than redrawing it. */
+/* Double-click edits a label from ANY tool. The text tool reaches the same
+ * place with a single click - see pointerdown - so this is the road for when
+ * the select tool is in hand. */
 canvas.addEventListener('dblclick', (event) => {
   const p = at(event);
   const hit = markAt(p.x, p.y);
@@ -783,9 +924,53 @@ async function saveOut() {
 document.getElementById('copyBtn').addEventListener('click', copyOut);
 document.getElementById('saveBtn').addEventListener('click', saveOut);
 
+/* HOLD SPACE TO PAN, the convention every drawing tool shares - and the one
+ * that matters here now that a 2680x1600 screenshot rarely fits the window.
+ *
+ * Its own pair of listeners rather than a branch in the shortcut handler
+ * below, because this is a HELD gesture and not a keypress: it has to be
+ * disarmed by a keyup, and by a blur, which a shortcut table has no place
+ * for. */
+window.addEventListener('keydown', (event) => {
+  if (event.code !== 'Space') return;
+  /* While a label is being typed, space is a SPACE. Stealing it would make
+   * text with spaces in it impossible to write. */
+  if (typingMark) return;
+  /* Auto-repeat fires this for as long as the key is down. Arm once, but
+   * suppress the default every time or the window scrolls under the pan. */
+  event.preventDefault();
+  if (spaceHeld) return;
+  spaceHeld = true;
+  stage.classList.add('handy');
+});
+
+window.addEventListener('keyup', (event) => {
+  if (event.code !== 'Space') return;
+  spaceHeld = false;
+  stage.classList.remove('handy');
+});
+
+/* Alt-tab away with space down and the keyup never arrives, leaving the
+ * editor armed in a mode with nothing on screen to explain it. */
+window.addEventListener('blur', () => {
+  spaceHeld = false;
+  stage.classList.remove('handy');
+});
+
+/* Fit, from the toolbar and from the keyboard. `0` is what every other
+ * viewer in this application uses for "show me the whole thing again". */
+document.getElementById('fitBtn')?.addEventListener('click', () => {
+  if (base) fit();
+});
+
 window.addEventListener('keydown', (event) => {
   if (typingMark) return;
   const meta = event.ctrlKey || event.metaKey;
+  if (!meta && event.key === '0') {
+    event.preventDefault();
+    if (base) fit();
+    return;
+  }
   if (meta && event.key.toLowerCase() === 'z') {
     event.preventDefault();
     if (event.shiftKey) redo(); else undo();
@@ -809,6 +994,120 @@ function say(text, bad) {
   note.classList.toggle('err', !!bad);
 }
 
+/* ------------------------------------------------------- the resolution */
+
+/* THE SLIDER AND THE DROPDOWN.
+ *
+ * Every change resamples from the ORIGINAL bytes, never from what is on
+ * screen: 2x of a 2x is not 4x of the original, it is a double
+ * interpolation, and moving a slider back and forth would soften the picture
+ * a little more each time.
+ *
+ * THE CEILING IS CAPPED FROM THE SOURCE. A canvas past roughly 268
+ * megapixels - 2^28, the area limit - is created without complaint and comes
+ * back BLANK. Measured in this build: a 1340x800 screenshot survives 14x
+ * (210 MP) and fails at 16x (274 MP). Eight is the operator's ceiling and
+ * fits comfortably, but the cap is computed anyway so a larger picture one
+ * day cannot walk off the same cliff.
+ */
+const AREA = 240 * 1000 * 1000;      /* a margin under the 268 MP limit */
+let source = { width: 0, height: 0 };
+let times = 1;
+let how = '';
+let resampling = false;
+
+function mostTimes() {
+  const px = (source.width || 1) * (source.height || 1);
+  const fits = Math.floor(Math.sqrt(AREA / px));
+  return Math.max(1, Math.min(8, fits));
+}
+
+/* EVERY MARK MOVES WITH THE PICTURE.
+ *
+ * Marks are stored in picture coordinates, so changing the resolution
+ * underneath them without touching them would leave every arrow pointing a
+ * screen-width from the thing it was drawn against. Stroke weights and font
+ * sizes go too, or the drawing would appear to thin out as it sharpened. */
+function rescaleMarks(by) {
+  if (!(by > 0) || by === 1) return;
+  const FLAT = ['x', 'y', 'w', 'h', 'x1', 'y1', 'x2', 'y2',
+    'radius', 'fontSize', 'weight'];
+  for (const mark of marks) {
+    for (const key of FLAT) {
+      if (typeof mark[key] === 'number') mark[key] *= by;
+    }
+    if (Array.isArray(mark.pts)) {
+      mark.pts = mark.pts.map((q) => [q[0] * by, q[1] * by]);
+    }
+    if (mark.fit) mark.fit = { w: mark.fit.w * by, h: mark.fit.h * by };
+  }
+  /* And the tool defaults, so the NEXT mark looks like the last one rather
+   * than a hairline on a picture eight times the size. */
+  setWeight(Math.max(1, Math.min(200, Math.round(style.weight * by))), true);
+  setFont(Math.max(10, Math.min(600, Math.round(style.fontSize * by))), true);
+}
+
+function sayTimes() {
+  const said = document.getElementById('timesSaid');
+  if (said) said.textContent = times + '\u00d7';
+  const slider = document.getElementById('times');
+  if (slider) {
+    slider.max = String(mostTimes());
+    if (Number(slider.value) !== times) slider.value = String(times);
+  }
+}
+
+async function resample(wantTimes, wantHow) {
+  if (resampling) return;
+  const asked = Math.max(1, Math.min(mostTimes(), Math.round(wantTimes)));
+  const nextHow = wantHow || how;
+  if (asked === times && nextHow === how) return;
+  resampling = true;
+  const wasTimes = times;
+  say('Resampling to ' + asked + '\u00d7\u2026');
+  try {
+    const got = await api.shotResample({ times: asked, how: nextHow });
+    if (!got || !got.ok) {
+      say((got && got.why) || 'It could not be resampled.', true);
+      return;
+    }
+    await new Promise((resolve, reject) => {
+      const next = new Image();
+      next.onload = () => { base = next; resolve(); };
+      next.onerror = () => reject(new Error('the resampled picture would not load'));
+      next.src = got.dataUrl;
+    });
+    times = got.times;
+    how = got.how;
+    /* The marks are in the OLD picture's coordinates until this runs. */
+    rescaleMarks(times / wasTimes);
+    fit();
+    sayTimes();
+    say(base.naturalWidth + '\u00d7' + base.naturalHeight + ' at ' + times
+      + '\u00d7' + (got.why ? ' \u2014 ' + got.why : '')
+      + ' \u00b7 Copy again to put it on the clipboard.', !!got.why);
+  } catch (error) {
+    say(error.message, true);
+  } finally {
+    resampling = false;
+  }
+}
+
+document.getElementById('times')?.addEventListener('change', (event) => {
+  resample(Number(event.target.value), how);
+});
+
+document.getElementById('times')?.addEventListener('input', (event) => {
+  /* The readout follows the thumb; the work waits for it to be let go -
+   * eight times a screenshot is a real amount of ffmpeg. */
+  const said = document.getElementById('timesSaid');
+  if (said) said.textContent = Math.round(Number(event.target.value)) + '\u00d7';
+});
+
+document.getElementById('how')?.addEventListener('change', (event) => {
+  resample(times, event.target.value);
+});
+
 /* --------------------------------------------------------------------- fit */
 
 /* Shown whole, always. A screenshot opened at 100% in a window smaller than
@@ -818,14 +1117,111 @@ function fit() {
   canvas.width = base.naturalWidth || base.width;
   canvas.height = base.naturalHeight || base.height;
   const room = stage.getBoundingClientRect();
-  scale = Math.min(1, (room.width - 28) / canvas.width, (room.height - 28) / canvas.height);
-  if (!isFinite(scale) || scale <= 0) scale = 1;
+  fitScale = Math.min(1, (room.width - 28) / canvas.width,
+    (room.height - 28) / canvas.height);
+  if (!isFinite(fitScale) || fitScale <= 0) fitScale = 1;
+  zoomedByHand = false;
+  apply(fitScale);
+}
+
+/* ------------------------------------------------------------------- zoom */
+
+/* THE SAME `scale` THE WHOLE EDITOR ALREADY USES, moved.
+ *
+ * at() divides by it to turn a pointer into a picture coordinate, handles are
+ * sized 1/scale so they stay constant on screen, and the selection dashes the
+ * same. A CSS transform laid over the top would leave every one of those
+ * describing the old size, and marks would land somewhere plausible and
+ * wrong. */
+const DEEPEST = 8;
+
+function apply(next) {
+  scale = Math.max(0.02, Math.min(DEEPEST, next));
   canvas.style.width = Math.round(canvas.width * scale) + 'px';
   canvas.style.height = Math.round(canvas.height * scale) + 'px';
   redraw();
+  const said = document.getElementById('zoomSaid');
+  if (said) {
+    said.textContent = Math.round(scale * 100) + '%';
+  }
 }
 
-window.addEventListener('resize', () => { if (base) fit(); });
+/* Never smaller than the whole picture: below that there is nothing to see
+ * and no way back that is obvious. */
+function zoomTo(next, holdX, holdY) {
+  const was = scale;
+  const want = Math.max(fitScale, Math.min(DEEPEST, next));
+  if (Math.abs(want - was) < 0.0001) return;
+
+  /* Which picture pixel is under the cursor right now. */
+  const before = canvas.getBoundingClientRect();
+  const px = (holdX - before.left) / was;
+  const py = (holdY - before.top) / was;
+
+  apply(want);
+  zoomedByHand = Math.abs(want - fitScale) > 0.0001;
+
+  /* And scroll by however far that pixel moved. The stage scrolls already,
+   * so the browser keeps this inside the picture for us. */
+  const after = canvas.getBoundingClientRect();
+  stage.scrollLeft += (after.left + px * scale) - holdX;
+  stage.scrollTop += (after.top + py * scale) - holdY;
+}
+
+stage.addEventListener('wheel', (event) => {
+  event.preventDefault();
+  const room = stage.getBoundingClientRect();
+  /* A fixed ratio per notch, so in and straight back out lands exactly where
+   * it started rather than drifting. */
+  const step = event.deltaY < 0 ? 1.25 : 1 / 1.25;
+  zoomTo(scale * step,
+    event.clientX || (room.left + room.width / 2),
+    event.clientY || (room.top + room.height / 2));
+}, { passive: false });
+
+/* THE MIDDLE BUTTON PANS. The canvas's own pointerdown already ignores
+ * anything but button 0, so this cannot start a stroke by accident. */
+let scrolling = null;
+
+stage.addEventListener('pointerdown', (event) => {
+  /* Two ways in, one pan: the middle button any time, and the left button
+   * while space is held. */
+  if (event.button !== 1 && !(event.button === 0 && spaceHeld)) return;
+  event.preventDefault();
+  scrolling = { x: event.clientX, y: event.clientY,
+    left: stage.scrollLeft, top: stage.scrollTop };
+  stage.classList.add('panning');
+  try { stage.setPointerCapture(event.pointerId); } catch (error) { /* fine */ }
+});
+
+stage.addEventListener('pointermove', (event) => {
+  if (!scrolling) return;
+  stage.scrollLeft = scrolling.left - (event.clientX - scrolling.x);
+  stage.scrollTop = scrolling.top - (event.clientY - scrolling.y);
+});
+
+function stopScroll(event) {
+  if (!scrolling) return;
+  scrolling = null;
+  stage.classList.remove('panning');
+  try { stage.releasePointerCapture(event.pointerId); } catch (error) { /* fine */ }
+}
+
+stage.addEventListener('pointerup', stopScroll);
+stage.addEventListener('pointercancel', stopScroll);
+stage.addEventListener('auxclick', (event) => {
+  /* Windows starts its own autoscroll on the middle button otherwise. */
+  if (event.button === 1) event.preventDefault();
+});
+
+/* A HAND-SET ZOOM SURVIVES A RESIZE. Re-fitting on every resize would throw
+ * away the view the operator had just framed, and dragging a window edge is
+ * not a request to zoom out. */
+window.addEventListener('resize', () => {
+  if (!base) return;
+  if (zoomedByHand) return;
+  fit();
+});
 
 (async function open() {
   try {
@@ -834,12 +1230,32 @@ window.addEventListener('resize', () => { if (base) fit(); });
       say((got && got.why) || 'There was no picture to mark up.', true);
       return;
     }
+    /* What the slider multiplies, what it is currently at, and the ways
+     * it can be done - all three come from the main process so there is one
+     * list of algorithms rather than two that drift. */
+    source = got.source || { width: 0, height: 0 };
+    times = got.times || 1;
+    how = got.how || '';
+    const picker = document.getElementById('how');
+    if (picker && Array.isArray(got.ways)) {
+      picker.textContent = '';
+      for (const way of got.ways) {
+        const choice = document.createElement('option');
+        choice.value = way.id;
+        choice.textContent = way.name;
+        choice.title = way.note || '';
+        picker.appendChild(choice);
+      }
+      picker.value = how;
+    }
+    sayTimes();
+
     const image = new Image();
     image.onload = () => {
       base = image;
       fit();
       paintButtons();
-      say(image.width + '×' + image.height
+      say(image.width + '×' + image.height + ' at ' + times + '×'
         + ' · already on your clipboard · draw on it, then Copy again.');
     };
     image.onerror = () => say('The picture would not decode.', true);

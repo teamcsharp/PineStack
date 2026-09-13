@@ -104,8 +104,15 @@ html, body {
   position: absolute;
   inset: 43px 0 22px;
   overflow: auto;
-  display: grid;
-  place-items: center;
+  /* FLEX WITH `margin: auto` ON THE ITEM, not `place-items: center`.
+     Centring an item that is LARGER than its scroll container makes the
+     overflow spill in both directions, and the top-left of it becomes
+     unreachable - scrollLeft/scrollTop simply clamp. Measured: zooming to
+     305% and correcting the scroll to hold the pixel under the cursor put
+     it 229 px out, because the correction was being clamped away.
+     Auto margins resolve to zero when there is no room, so this centres a
+     small picture and keeps every edge of a large one reachable. */
+  display: flex;
   padding: 12px;
   /* The chequerboard says where the picture ends, which matters the moment
    * anything is cropped. */
@@ -119,7 +126,7 @@ html, body {
   background-position: 0 0, 0 9px, 9px -9px, -9px 0;
 }
 
-.holder { position: relative; line-height: 0; }
+.holder { position: relative; line-height: 0; margin: auto; }
 
 canvas {
   display: block;
@@ -128,6 +135,13 @@ canvas {
 }
 canvas.picking { cursor: default; }
 canvas.moving { cursor: move; }
+
+/* Panning, by the middle button or by holding space. On the stage rather
+   than the canvas because the stage is what scrolls - and the canvas's own
+   crosshair has to be overridden explicitly, or the hand never appears over
+   the one place it matters. */
+.stage.handy, .stage.handy canvas { cursor: grab; }
+.stage.panning, .stage.panning canvas { cursor: grabbing; }
 
 /* The live text box, sitting exactly where its mark will be drawn. It is
  * deliberately transparent with no border: what you type is what you get,
