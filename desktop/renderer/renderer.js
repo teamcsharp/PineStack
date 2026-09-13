@@ -968,11 +968,28 @@ function wireFrame(frame) {
  * on its own when the tablet is not reachable, and says which it used; that
  * half cannot be decided here, because only the main process can see whether
  * adb has a device. */
+/* #1346: AND IT IS ALWAYS THE TABLET.
+ *
+ * "When I use these icons they are to correspond with the Pine tablet.
+ *  I am clicking them and they are showing me screenshots of the
+ *  application itself. Pine box. I need them to always give me a
+ *  screenshot of the application on the tablet."
+ *
+ * This used to read the roster: if the desktop held the air, it captured
+ * the desktop, reasoning that the operator must be looking at whatever
+ * is playing. That infers intent from an audio routing decision, and the
+ * two have nothing to do with each other - the desktop holds the air for
+ * long stretches, so the buttons quietly became a screenshot of the
+ * window they are already in. The operator can see this window. The
+ * whole point of the row is the screen across the room.
+ *
+ * The FALLBACK stays, and still announces itself: main.js captures this
+ * window when the tablet cannot be reached, because a picture of the
+ * wrong machine that says so is recoverable and a silent one is not.
+ * What is gone is ever choosing it on purpose - so main.js's "chosen"
+ * branch, and the note that reads "(this window)" with no reason, are
+ * both now unreachable. */
 function glassTarget() {
-  try {
-    const owner = String((playersRoster || {}).audio_owner || "");
-    if (owner && owner === desktopListenerId) return "app";
-  } catch (err) { /* the roster has not arrived yet */ }
   return "tablet";
 }
 
