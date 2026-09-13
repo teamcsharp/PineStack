@@ -19,6 +19,9 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   put: (route, body) => ipcRenderer.invoke("agent:put", route, body),
   del: (route, body) => ipcRenderer.invoke("agent:del", route, body),
   openExternal: (url) => ipcRenderer.invoke("open:external", url),
+  /* #1356: pull a still or a cut clip off the camera and put a Save As
+     in front of it. The route is checked on the other side. */
+  camSave: (opts) => ipcRenderer.invoke("cam:save", opts),
   lcdState: () => ipcRenderer.invoke("lcd:state"),
   lcdConfigure: (cfg) => ipcRenderer.invoke("lcd:configure", cfg),
   lcdDiscover: () => ipcRenderer.invoke("lcd:discover"),

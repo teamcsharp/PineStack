@@ -2201,6 +2201,63 @@ ipcMain.handle("inspect:export", async (event, what) => {
   }
 });
 
+/* #1356: A STILL, OR A CLIP, OFF THE CAMERA - SAVED WHERE YOU WANT IT.
+ *
+ * The renderer cannot do this itself. It is a file:// document, so a
+ * fetch to the station needs the key that lives out here; and a
+ * download started by a page is a download into the browser's own
+ * folder, which is not what "save a video from the camera" means.
+ *
+ * So the page names a station route and a filename, and this fetches
+ * the bytes with the key attached and puts a Save As in front of them.
+ * Deliberately generic over the route: the still and the cut clip are
+ * the same act with a different extension, and two near-identical
+ * handlers is how they drift apart.
+ */
+ipcMain.handle("cam:save", async (event, opts) => {
+  const { dialog } = require("electron");
+  try {
+    const cfg = readConfig();
+    const route = String((opts && opts.url) || "");
+    if (!route.startsWith("/api/pinelink/")) {
+      return { ok: false, why: "that is not a camera route" };
+    }
+    const response = await fetch(`${cfg.baseUrl}${route}`, {
+      headers: authHeaders(cfg)
+    });
+    if (!response.ok) {
+      return { ok: false,
+        why: `the station said ${response.status} ${response.statusText}` };
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length) {
+      return { ok: false, why: "the station sent nothing" };
+    }
+    const video = String((opts && opts.kind) || "") === "video";
+    const ext = video ? "mp4" : "jpg";
+    const when = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    let folder = app.getPath(video ? "videos" : "pictures");
+    try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
+    catch { folder = app.getPath("downloads"); }
+    const picked = await dialog.showSaveDialog(
+      BrowserWindow.fromWebContents(event.sender), {
+        title: video ? "Save the camera clip" : "Save the camera picture",
+        defaultPath: path.join(folder,
+          String((opts && opts.name) || `pinecam-${when}.${ext}`)),
+        filters: [{ name: video ? "MP4 video" : "JPEG image",
+          extensions: [ext] }]
+      });
+    if (picked.canceled || !picked.filePath) {
+      return { ok: true, canceled: true };
+    }
+    fs.writeFileSync(picked.filePath, bytes);
+    shell.showItemInFolder(picked.filePath);
+    return { ok: true, path: picked.filePath, bytes: bytes.length };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
 ipcMain.handle("flow:pending", (event) => {
   const held = flowWaiting.get(event.sender.id);
   if (!held) return { ok: false, why: "there is nothing waiting for this window" };

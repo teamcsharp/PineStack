@@ -78,6 +78,13 @@
 /* The camera's own controls, under its stats, folding with them. */
 .pine-cam-tools { padding: 6px 8px 8px; display: grid; gap: 6px; }
 .pine-cam-tools[hidden] { display: none !important; }
+/* #1356: a clip being marked. Red, and it counts - the operator has to
+   be able to tell at a glance that something is running. */
+.pine-cam-tools button.on {
+  border-color: #e46b6b;
+  color: #e46b6b;
+}
+.pine-cam-tools button[hidden] { display: none !important; }
 .pine-cam-tools button {
   height: 28px;
   font-size: 11px;

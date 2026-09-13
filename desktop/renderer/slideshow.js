@@ -78,6 +78,13 @@
   var BAR_HIDE_MS = 4000;
   var PAGE = 300;
 
+  /* #1357: how often to ask whether the camera is on the air, and how
+   * often to pull a frame while it is. Four a second is what the link
+   * writes, so asking faster buys nothing but requests. */
+  var CAM_ASK_MS = 5000;
+  var CAM_FRAME_MS = 250;
+  var CAM_OFF_KEY = 'pineSlideshowCamOff';
+
   function el(tag, cls, text) {
     var node = document.createElement(tag);
     if (cls) node.className = cls;
@@ -114,6 +121,11 @@
        * random.Random - so page two of the playlist continues the same
        * deal rather than re-shuffling the deck. */
       seed: Math.floor(Math.random() * 1000000) + 1,
+      /* #1357: is there a camera on the air, and has the operator sent
+       * it away? Two separate answers - the station decides the first
+       * and only the person looking at this screen decides the second. */
+      camLive: false,
+      camOff: false,
       newest: 0,
       shown: 0,            /* "items shown total" in the box's diagnostic */
       fresh: 0,            /* what the hot-load queue has brought in */
@@ -123,6 +135,8 @@
     };
 
     var timer = null;
+    var camTimer = null;
+    var camFrameTimer = null;
     var hotTimer = null;
     var barTimer = null;
     var destroyed = false;
@@ -135,6 +149,31 @@
     stage.appendChild(layers[0]);
     stage.appendChild(layers[1]);
     wrap.appendChild(stage);
+
+    /* #1357: THE CAMERA TAKES THE GALLERY'S PLACE.
+     *
+     * "If the station is present, then on the station broadcast I want
+     *  to replace the slideshow with the broadcast of what's being
+     *  broadcasted from the camera. And I also want the ability to
+     *  toggle it off and toggle it back to being the gallery."
+     *
+     * A layer over the stage rather than an item in the playlist. The
+     * playlist is a list of files on disk with favourites, likes and a
+     * shuffle seed; a live camera is none of those things, and pushing
+     * it in there would mean every road that steps, likes or deletes an
+     * item has to learn about a row that has no file behind it.
+     *
+     * The gallery STOPS while the camera covers it. Cross-fading
+     * pictures nobody can see costs the tablet real bandwidth - the
+     * measured figure that made ?w= necessary was 6.7 MB of PNG in
+     * thirty seconds - and it would be spent on a hidden layer.
+     */
+    var cam = el('div', 'sl-cam');
+    var camShot = el('img', 'sl-cam-shot');
+    camShot.alt = 'the Pine Cam';
+    cam.appendChild(camShot);
+    cam.appendChild(el('div', 'sl-cam-tag', 'PINE CAM \u00b7 LIVE'));
+    stage.appendChild(cam);
 
     var flash = el('div', 'sl-flash');           /* the like / action flash */
     wrap.appendChild(flash);
@@ -202,6 +241,18 @@
       remember({media_filter: S.filter});
       reload();
     });
+    /* #1357: the toggle. Hidden until there is a camera to toggle - a
+     * button that can only ever say 'no camera' is furniture. */
+    var camBtn = button('C', '\u25c9',
+      'Show the camera instead of the gallery', function () {
+        S.camOff = !S.camOff;
+        try { localStorage.setItem(CAM_OFF_KEY, S.camOff ? '1' : '0'); }
+        catch (err) { /* a forgotten choice still works this session */ }
+        paintCam();
+        say(S.camOff ? 'the gallery' : 'the camera');
+      });
+    camBtn.hidden = true;
+
     var speedBtn = button('', '10s', 'How long each picture stays', function () {
       var ladder = [3, 5, 10, 20, 30, 60];
       var at = ladder.indexOf(S.seconds);
@@ -221,6 +272,62 @@
       say(overlaysOn ? 'overlays on' : 'overlays off');
     });
     button('H', '?', 'What the controls do', function () { openSheet('help'); });
+
+    /* ---- the camera (#1357) ----------------------------------------- */
+
+    function camUrl() {
+      var b = '';
+      try { b = src.base ? src.base() : ''; } catch (err) { b = ''; }
+      return b + '/api/pinelink/frame.jpg?_=' + Date.now();
+    }
+
+    function camShowing() { return !!(S.camLive && !S.camOff); }
+
+    function paintCam() {
+      var on = camShowing();
+      camBtn.hidden = !S.camLive;
+      camBtn.classList.toggle('on', on);
+      cam.classList.toggle('show', on);
+      if (on) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        camDraw();
+      } else {
+        camShot.removeAttribute('src');
+        schedule();
+      }
+    }
+
+    function camDraw() {
+      if (!camShowing() || destroyed) return;
+      /* A hidden view is a view nobody is watching. visible() is the
+       * same check the step timer uses. */
+      if (!visible()) return;
+      camShot.src = camUrl();
+    }
+
+    function camAsk() {
+      if (destroyed) return;
+      var b = '';
+      try { b = src.base ? src.base() : ''; } catch (err) { b = ''; }
+      var road = b + '/api/pinelink/look';
+      var got;
+      try {
+        got = (root.pineDesktop && root.pineDesktop.get)
+          ? root.pineDesktop.get('/api/pinelink/look')
+          : fetch(road, {credentials: 'same-origin'}).then(function (r) {
+            return r.ok ? r.json() : null;
+          });
+      } catch (err) { return; }
+      Promise.resolve(got).then(function (d) {
+        /* on_air_now is the station's own answer and already folds in
+         * both halves of the question - the link being live AND the
+         * operator's on-air preference. Reading the two separately here
+         * would be a second copy of a rule that has one home. */
+        var was = S.camLive;
+        S.camLive = !!(d && d.on_air_now);
+        if (was !== S.camLive) paintCam();
+      }).catch(function () { /* asked again on the next sweep */ });
+    }
 
     function paintBar() {
       pauseBtn.firstChild.textContent = S.paused ? '▶' : '❚❚';
@@ -997,6 +1104,11 @@
     applyOverlays();
     restore().then(reload);
     hotTimer = setInterval(hotLoad, HOT_LOAD_MS);
+    try { S.camOff = localStorage.getItem(CAM_OFF_KEY) === '1'; }
+    catch (err) { S.camOff = false; }
+    camAsk();
+    camTimer = setInterval(camAsk, CAM_ASK_MS);
+    camFrameTimer = setInterval(camDraw, CAM_FRAME_MS);
 
     return {
       node: wrap,
@@ -1011,6 +1123,8 @@
         destroyed = true;
         if (timer) clearTimeout(timer);
         if (retryTimer) clearTimeout(retryTimer);
+        if (camTimer) clearInterval(camTimer);
+        if (camFrameTimer) clearInterval(camFrameTimer);
         if (hotTimer) clearInterval(hotTimer);
         if (barTimer) clearTimeout(barTimer);
         document.removeEventListener('keydown', onKey);

@@ -155,6 +155,13 @@
                   title="Watch the camera when it is linked, or look for it again when it is not">Look</button>
           <button id="pineCamFix" type="button"
                   title="Work out why the camera is not here, and what to do about it">Troubleshoot</button>
+          <!-- #1356: a still, and a clip. Both only appear once the
+               camera is linked - a save button over a camera that is
+               not there can only ever produce an error. -->
+          <button id="pineCamShot" type="button" hidden
+                  title="Save what the camera can see right now">Snapshot</button>
+          <button id="pineCamRec" type="button" hidden
+                  title="Mark the start of a clip; press again to end it and save it">Record</button>
           <!-- #1351: the camera on the air, when there is air to be on.
                Defaults to on: turning the camera on is a deliberate act,
                and the overwhelmingly likely reason for it is to show

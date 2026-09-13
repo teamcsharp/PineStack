@@ -181,6 +181,18 @@
        * avoid. Both, or it is not there. */
       live = !!(got && got.state === 'live' && got.fresh);
       showButton(live);
+      /* #1356: both save buttons follow the link, for the same reason
+       * the watch button does - a control that can only fail is worse
+       * than no control. */
+      var shotBtn = document.getElementById('pineCamShot');
+      var recBtn = document.getElementById('pineCamRec');
+      if (shotBtn) shotBtn.hidden = !live;
+      if (recBtn) recBtn.hidden = !live;
+      if (!live && recFrom) {
+        /* The camera went mid-clip. Cut what was actually recorded
+         * rather than dropping the mark on the floor. */
+        record();
+      }
       var why = document.getElementById('pineCamWhy');
       if (why && got) {
         why.textContent = live ? 'live' : String(got.state || '');
@@ -328,6 +340,101 @@
       }).catch(function () { say('the station did not answer'); });
   }
 
+  /* ------------------------------------- a still, and a clip (#1356) */
+
+  /* WHY RECORDING IS A CUT, NOT A CAPTURE.
+   *
+   * The link records continuously in five-minute segments whenever the
+   * camera is joined, so pressing Record does not have to ask the
+   * camera for anything. It marks a moment; pressing it again marks
+   * another; the station cuts exactly that span out of what is already
+   * on disk.
+   *
+   * Three things that buys, each of which a fresh capture loses:
+   * nothing is missed at the head while a stream opens, stopping is
+   * instant rather than waiting for a flush, and the camera is never
+   * asked for a second client - these access-point cameras commonly
+   * allow exactly one, and the second one costs you the first.
+   */
+  var recFrom = 0;
+  var recTick = 0;
+
+  function save(opts) {
+    try {
+      if (root.pineDesktop && root.pineDesktop.camSave) {
+        return root.pineDesktop.camSave(opts);
+      }
+    } catch (e) { /* fall through */ }
+    return Promise.resolve({ok: false,
+      why: 'saving to disk needs the desktop app'});
+  }
+
+  function stamp() {
+    var d = new Date();
+    function two(n) { return (n < 10 ? '0' : '') + n; }
+    return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-'
+      + two(d.getDate()) + '_' + two(d.getHours()) + '-'
+      + two(d.getMinutes()) + '-' + two(d.getSeconds());
+  }
+
+  function snapshot() {
+    say('saving the picture…');
+    Promise.resolve(save({url: '/api/pinelink/frame.jpg',
+      name: 'pinecam-' + stamp() + '.jpg'})).then(function (r) {
+      if (!r) { say('the app did not answer'); return; }
+      if (r.canceled) { say(''); return; }
+      say(r.ok ? ('saved to ' + r.path) : ('could not save: ' + r.why));
+    });
+  }
+
+  function recPaint() {
+    var b = document.getElementById('pineCamRec');
+    if (!b) return;
+    if (!recFrom) { b.textContent = 'Record'; b.classList.remove('on'); return; }
+    var s = Math.max(0, Math.round(Date.now() / 1000 - recFrom));
+    b.classList.add('on');
+    b.textContent = 'Stop ' + Math.floor(s / 60) + ':'
+      + (s % 60 < 10 ? '0' : '') + (s % 60);
+  }
+
+  function record() {
+    if (!recFrom) {
+      recFrom = Date.now() / 1000;
+      recPaint();
+      if (!recTick) recTick = setInterval(recPaint, 500);
+      say('marking - press again to end the clip and save it');
+      return;
+    }
+    var from = recFrom;
+    var to = Date.now() / 1000;
+    recFrom = 0;
+    if (recTick) { clearInterval(recTick); recTick = 0; }
+    recPaint();
+    if (to - from < 1) { say('that was too short to cut'); return; }
+    say('cutting ' + Math.round(to - from) + 's out of the recording…');
+    Promise.resolve(post('/api/pinelink/cut', {from: from, to: to}))
+      .then(function (r) {
+        if (!r || !r.ok) {
+          say((r && r.say) || 'the cut did not come back');
+          return;
+        }
+        say('saving the clip…');
+        return save({url: r.url, kind: 'video',
+          name: 'pinecam-' + stamp() + '.mp4'}).then(function (s) {
+          if (!s) { say('the app did not answer'); return; }
+          if (s.canceled) {
+            /* The cut is kept on the station either way, so a cancelled
+             * Save As is not a lost recording - say so, or it reads
+             * like one. */
+            say('not saved here - the cut is still on the station');
+            return;
+          }
+          say(s.ok ? ('saved to ' + s.path)
+            : ('could not save: ' + s.why));
+        });
+      }).catch(function () { say('the station did not answer'); });
+  }
+
   /* ------------------------------------------------ the troubleshooter */
 
   /* 'Not on the network' covers three faults with different cures - a
@@ -396,6 +503,22 @@
       fixBtn.addEventListener('click', function (ev) {
         ev.stopPropagation();
         troubleshoot();
+      });
+    }
+    var shotBtn = document.getElementById('pineCamShot');
+    if (shotBtn && !shotBtn.__wired) {
+      shotBtn.__wired = true;
+      shotBtn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        snapshot();
+      });
+    }
+    var recBtn = document.getElementById('pineCamRec');
+    if (recBtn && !recBtn.__wired) {
+      recBtn.__wired = true;
+      recBtn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        record();
       });
     }
     var row = document.getElementById('pineCamRow');

@@ -57,6 +57,41 @@
 
 .sl-canvas { image-rendering: pixelated; }
 
+/* #1357: the camera, over the gallery.
+
+   Above the layers and below the furniture, so the bar, the caption and
+   the filmstrip all still work while it is up - the operator has to be
+   able to reach the button that sends it away again. */
+.sl-cam {
+  position: absolute;
+  inset: 0;
+  display: none;
+  background: #05080b;
+  z-index: 3;
+}
+.sl-cam.show { display: block; }
+.sl-cam-shot {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  /* contain, like .sl-media: the camera is 848x480 and the panel is
+     not, and cropping a body camera is cropping the thing being
+     pointed at. */
+  object-fit: contain;
+}
+.sl-cam-tag {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgba(228, 107, 107, .92);
+  color: #fff;
+  font: 600 10px/1.4 Inter, Segoe UI, system-ui, sans-serif;
+  letter-spacing: .08em;
+}
+
 .sl-note {
   position: absolute;
   inset: 0;
