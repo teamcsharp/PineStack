@@ -72,6 +72,9 @@ from sfx_cadence import SfxCadence, due_after as sfx_due_after
 from station_stream import StationStream, icy_block
 import library
 import library_extract
+# What the prompts may no longer carry - see prompt_cuts.py for why a cut is
+# keyed by {kind, name, fingerprint} and not by the line it was noticed on.
+import prompt_cuts
 # #1241: the detail behind the overlays' top and bottom panels —
 # what ComfyUI is rendering right now, and OpenWebUI's whole rolodex.
 import spark_overlays
@@ -57624,6 +57627,13 @@ def banter_material(limit: int = 12) -> str:
     except Exception:
         pass
 
+    # WHAT THE OPERATOR HAS CROSSED OUT, dropped on the way to the prompt.
+    # Here rather than at each of the half-dozen places a bullet is added,
+    # because this is the one point they all pass through - and because the
+    # flow chart shows these as bullet TEXT (provenance reconstructs them out
+    # of the prompt itself), so this is where the two agree on what a chunk
+    # is. Failing open: is_cut answers False rather than raising.
+    bits = [b for b in bits if not prompt_cuts.is_cut("material", "", b)]
     return "\n".join(f"- {b}" for b in bits[:limit])
 
 
@@ -60971,6 +60981,9 @@ async def speakbox_search(query: str, k: int = 5, exclude: str = "",
             rows = []
             for i, c in enumerate(chunks):
                 score = float(_scores[i])
+                # Crossed out in the flow chart - see prompt_cuts.py.
+                if prompt_cuts.is_cut("document", c["file"], c["text"]):
+                    continue
                 v = _votes.get(chunk_key(c["file"], c["text"]))
                 if v:
                     net = int(v.get("up") or 0) - int(v.get("down") or 0)
@@ -60986,6 +60999,10 @@ async def speakbox_search(query: str, k: int = 5, exclude: str = "",
         rows = []
         for c in chunks:
             score = sum(a * b for a, b in zip(q, c["vec"]))
+            # The same cut as the numpy road above, or it would apply only
+            # where numpy happens to be installed.
+            if prompt_cuts.is_cut("document", c["file"], c["text"]):
+                continue
             # #815: operator votes bend the draw — capped, and a heavily
             # buried chunk stops surfacing entirely.
             v = _votes.get(chunk_key(c["file"], c["text"]))
@@ -91722,6 +91739,12 @@ def _crystal_material_sample(most: int = 3, cap: int = 700,
                     text = str((row or {}).get("text") or "").strip()
                     if len(text) < 40 or crystal_noise(text):    # #1044
                         continue
+                    # CROSSED OUT IN THE FLOW CHART, so it is not offered
+                    # again. See prompt_cuts.py - the match is on the
+                    # passage, not on what this road happens to call it.
+                    if prompt_cuts.is_cut("crystal", str(c.get("name") or ""),
+                                          text):
+                        continue
                     pool.append({"crystal": str(c.get("name") or ""),
                                  "mind": str(rid),
                                  "file": str(row.get("file") or ""),
@@ -101064,6 +101087,73 @@ async def dj_provenance_api(
         "burst": int(trace.get("burst") or 0),
         "requests": (request_history().get("top") or [])[:6],
     }
+
+
+# ---------------------------------------------------------------------------
+# WHAT THE PROMPTS MAY NO LONGER CARRY
+#
+# "For each of these sections, I want to see what data is being given to the
+#  system prompt from these, and I want an X that allows me to actually remove
+#  this data from being part of the data chunking that's being added in there
+#  ... going forward, I can maybe remove some of this stuff from being weight
+#  on the system prompt, maybe simplifying things a little bit."
+#
+# The flow chart above this shows every chunk a line was built from. These are
+# what happens when one of them is crossed out: a standing instruction that the
+# passage is not to be added to prompts again.
+#
+# THEY LIVE HERE, NEXT TO PROVENANCE, because that is where their data comes
+# from - the chart reads a line's provenance and these act on what it shows.
+# Everything about how a cut is keyed, and why, is in prompt_cuts.py.
+#
+# EVERY ANSWER CARRIES THE WHOLE LIST, so the window never has to guess what
+# the station now holds: one round trip, one truth.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/prompt/cuts")
+async def prompt_cuts_list(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Everything currently excluded from future prompts."""
+    require_read_auth(authorization)
+    cuts = prompt_cuts.all_cuts(fresh=True)
+    return {"ok": True, "cuts": cuts, "count": len(cuts)}
+
+
+@app.post("/api/prompt/cuts")
+async def prompt_cuts_add(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Stop a passage being added to prompts from now on.
+
+    FULL AUTH, not read auth: this changes how every future round is written.
+    """
+    require_auth(authorization)
+    body = await request.json()
+    return prompt_cuts.add(
+        kind=str(body.get("kind") or ""),
+        name=str(body.get("name") or ""),
+        mark=str(body.get("mark") or ""),
+        text=str(body.get("text") or ""),
+        why=str(body.get("why") or ""),
+    )
+
+
+@app.post("/api/prompt/cuts/remove")
+async def prompt_cuts_remove(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Put a passage back. Every cut is reversible from the same window."""
+    require_auth(authorization)
+    body = await request.json()
+    return prompt_cuts.remove(
+        kind=str(body.get("kind") or ""),
+        name=str(body.get("name") or ""),
+        mark=str(body.get("mark") or ""),
+    )
 
 
 # #787: "hey DJ …" said to the box — the booth's own wake. A request if

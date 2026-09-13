@@ -119,6 +119,20 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   /* The flow chart window, and what it opens with. */
   inspectFlow: (region) => ipcRenderer.invoke("inspect:flow", region),
   flowPending: () => ipcRenderer.invoke("flow:pending"),
+
+  /* WHAT THE PROMPTS ARE NO LONGER ALLOWED TO CARRY. The X in the flow
+   * chart - a standing decision about every future round, so it is kept on
+   * the station rather than here. */
+  promptCuts: () => ipcRenderer.invoke("prompt:cuts"),
+  promptCut: (what) => ipcRenderer.invoke("prompt:cut", what),
+  promptKeep: (what) => ipcRenderer.invoke("prompt:keep", what),
+
+  /* WHAT THE PROMPTS ARE NO LONGER ALLOWED TO CARRY. The X in the flow
+   * chart - a standing decision about every future round, so it is kept on
+   * the station rather than here. */
+  promptCuts: () => ipcRenderer.invoke("prompt:cuts"),
+  promptCut: (what) => ipcRenderer.invoke("prompt:cut", what),
+  promptKeep: (what) => ipcRenderer.invoke("prompt:keep", what),
   inspectDeep: (region) => ipcRenderer.invoke("inspect:deep", region),
   glassClip: (seconds, options) => ipcRenderer.invoke("glass:clip", seconds, options),
   /* Stop a pull in flight and take a complete, shorter clip instead. */

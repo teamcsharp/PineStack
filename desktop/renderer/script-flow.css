@@ -113,9 +113,98 @@ body {
 
 .none { color: #ffc95c; }
 
+/* ------------------------------------------------------------ the chunks */
+
+/* One contribution to the prompt: what it is, whether it got there, and a
+ * way to stop it getting there again. */
+.chunk {
+  border: 1px solid #1e2c36;
+  border-radius: 4px;
+  margin: 4px 0;
+  background: #101a21;
+}
+
+.chunk.isCut { opacity: 0.55; border-style: dashed; }
+
+.chunkHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 7px;
+  cursor: pointer;
+}
+
+.twist {
+  flex: none;
+  background: none;
+  border: 0;
+  color: #7e94a6;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+}
+
+.chunkName {
+  color: #cfe0ea;
+  font-weight: 500;
+  word-break: break-word;
+}
+
+.chunkNote { color: #7e94a6; font-size: 11px; }
+
+/* Pushed hard right so the eye can run down the column and see at a glance
+ * what is actually costing the prompt its room. */
+.chunkMark {
+  margin-left: auto;
+  flex: none;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.chunkMark.in { color: #46c2a0; }
+.chunkMark.out { color: #64798a; }
+.chunkMark.dim { color: #55697a; }
+
+/* The station's flag disagreeing with the prompt as sent. */
+.chunkOdd { color: #ffc95c; font-size: 11px; }
+
+.cut {
+  flex: none;
+  background: none;
+  border: 1px solid #2a3b47;
+  border-radius: 3px;
+  color: #9fb3c2;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.cut:hover { border-color: #c4574f; color: #ff8f86; }
+
+.chunkBody {
+  margin: 0;
+  padding: 6px 9px 9px 24px;
+  color: #a9c0ce;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 340px;
+  overflow: auto;
+  border-top: 1px solid #1a262e;
+}
+
+.chunkSaid { padding: 4px 9px 7px 24px; color: #46c2a0; font-size: 11px; }
+.chunkSaid.bad { color: #ff8f86; }
+
 .note {
   margin: 0;
   padding: 6px 16px 10px;
   color: #64798a;
   min-height: 16px;
 }
+
+/* A chunk the station kept only the name of - see the note on `cuttable`. */
+.cut:disabled { opacity: 0.3; cursor: not-allowed; border-color: #1e2c36; }
+.cut:disabled:hover { border-color: #1e2c36; color: #9fb3c2; }

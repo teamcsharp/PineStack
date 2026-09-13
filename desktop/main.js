@@ -1903,6 +1903,51 @@ ipcMain.handle("inspect:flow", async (_event, region) => {
   return { ok: true, had: !!provenance, why };
 });
 
+/* ------------------------------------------------------------------ */
+/* What the prompts may no longer carry                                 */
+/* ------------------------------------------------------------------ */
+
+/* "I want an X that allows me to actually remove this data from being part
+ *  of the data chunking that's being added in there... going forward, I can
+ *  maybe remove some of this stuff from being weight on the system prompt."
+ *
+ * THE STATION HOLDS THE LIST, not this app. It is a standing decision about
+ * every future round, and it has to outlive this window, this desktop, and
+ * the forty-eight hours a line's paperwork survives.
+ *
+ * All three answer with the whole list afterwards, so the window never has
+ * to guess what the station now holds. */
+ipcMain.handle("prompt:cuts", async () => {
+  try {
+    const cfg = readConfig();
+    return await fetchJson(`${cfg.baseUrl}/api/prompt/cuts`);
+  } catch (error) {
+    return { ok: false, why: error.message, cuts: [] };
+  }
+});
+
+ipcMain.handle("prompt:cut", async (_event, what) => {
+  try {
+    const cfg = readConfig();
+    return await fetchJson(`${cfg.baseUrl}/api/prompt/cuts`, {
+      method: "POST", body: JSON.stringify(what || {})
+    });
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("prompt:keep", async (_event, what) => {
+  try {
+    const cfg = readConfig();
+    return await fetchJson(`${cfg.baseUrl}/api/prompt/cuts/remove`, {
+      method: "POST", body: JSON.stringify(what || {})
+    });
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
 ipcMain.handle("flow:pending", (event) => {
   const held = flowWaiting.get(event.sender.id);
   if (!held) return { ok: false, why: "there is nothing waiting for this window" };
