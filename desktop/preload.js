@@ -79,6 +79,11 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   mirrorTouch: (act) => ipcRenderer.invoke("mirror:touch", act),
   /* The tablet's own camera, put on its screen so the mirror carries it. */
   tabletCamera: (want) => ipcRenderer.invoke("tablet:camera", want),
+  /* The camera in a window of its own, streamed - the tablet keeps the
+   * station on its screen. */
+  cameraOpen: (want) => ipcRenderer.invoke("camera:open", want),
+  cameraWhere: () => ipcRenderer.invoke("camera:where"),
+  cameraFace: (facing) => ipcRenderer.invoke("camera:face", facing),
   /* The speaker on the mirror. null asks, true/false sets - and what comes
    * back is what is AUDIBLE, not what was asked for. */
   mirrorSound: (want) => ipcRenderer.invoke("mirror:sound", want),

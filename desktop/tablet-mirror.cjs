@@ -436,4 +436,175 @@ class Mirror {
   }
 }
 
-module.exports = { Mirror, DEFAULTS, SIZES };
+/* ======================================================= the camera =====
+ *
+ * THE TABLET'S CAMERA, WITHOUT ITS SCREEN.
+ *
+ * The tablet streams JPEGs on a local socket - see camera/PineCameraService -
+ * and this forwards that socket to a port here and re-serves it as the same
+ * multipart an <img> understands. Deliberately the same wire format and the
+ * same splitter as the screen mirror above: one of those is enough.
+ *
+ * NOTHING IS ENCODED, SCALED OR CONVERTED ON THIS SIDE. The frames arrive
+ * already compressed because an ImageReader can be asked for JPEG directly,
+ * so there is no ffmpeg in this path at all - which is why it starts in a
+ * fraction of the time the screen mirror does.
+ */
+class CameraGlass {
+  constructor({ adb, serial } = {}) {
+    this.adb = adb || 'adb';
+    this.serial = serial || '';
+    this.server = null;
+    this.port = 0;
+    this.tap = null;              /* the tcp port adb is forwarding */
+    this.pipe = null;             /* the socket to the tablet */
+    this.watchers = new Set();
+    this.latest = null;
+    this.frames = 0;
+    this.lastError = '';
+    this.running = false;
+    this.spare = Buffer.alloc(0);
+    this.facing = 'rear';
+  }
+
+  target(args) {
+    return this.serial ? ['-s', this.serial, ...args] : args;
+  }
+
+  run(args, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      require('node:child_process').execFile(this.adb, args,
+        { timeout: timeoutMs || 15000, windowsHide: true },
+        (error, stdout, stderr) => {
+          const said = String(stdout || '') + String(stderr || '');
+          if (error && !said) return reject(error);
+          resolve(said);
+        });
+    });
+  }
+
+  async open(facing) {
+    this.facing = facing === 'front' ? 'front' : 'rear';
+    if (this.running) return this.where();
+    await this.listen();
+    /* A port of the OS's choosing on this side, so two terminals cannot
+     * collide, forwarded to the abstract socket the service opened. */
+    const picked = 9230 + Math.floor(Math.random() * 400);
+    await this.run(this.target(['forward', 'tcp:' + picked,
+      'localabstract:pine_camera']), 20000);
+    this.tap = picked;
+    this.running = true;
+    this.draw();
+    return this.where();
+  }
+
+  where() {
+    return { ok: true, facing: this.facing,
+      url: 'http://127.0.0.1:' + this.port + '/camera.mjpg', port: this.port };
+  }
+
+  listen() {
+    return new Promise((resolve, reject) => {
+      this.server = http.createServer((request, response) => this.serve(request, response));
+      this.server.on('error', reject);
+      this.server.listen(0, '127.0.0.1', () => {
+        this.port = this.server.address().port;
+        resolve();
+      });
+    });
+  }
+
+  serve(request, response) {
+    if (!String(request.url || '').startsWith('/camera.mjpg')) {
+      response.writeHead(404, { 'Content-Type': 'text/plain' });
+      return response.end('not here');
+    }
+    response.writeHead(200, {
+      'Content-Type': 'multipart/x-mixed-replace; boundary=' + BOUNDARY,
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+      'Connection': 'close'
+    });
+    this.watchers.add(response);
+    if (this.latest) this.push(response, this.latest);
+    const drop = () => this.watchers.delete(response);
+    request.on('close', drop);
+    response.on('close', drop);
+    response.on('error', drop);
+  }
+
+  push(response, jpeg) {
+    try {
+      response.write('--' + BOUNDARY + '\r\n');
+      response.write('Content-Type: image/jpeg\r\n');
+      response.write('Content-Length: ' + jpeg.length + '\r\n\r\n');
+      response.write(jpeg);
+      response.write('\r\n');
+    } catch (error) {
+      this.watchers.delete(response);
+    }
+  }
+
+  /* Connect to the forwarded port and read frames until it ends. The tablet
+   * only opens its camera while somebody is connected, so this connection IS
+   * the thing that turns the lens on. */
+  draw() {
+    if (!this.running) return;
+    const net = require('node:net');
+    const pipe = net.connect(this.tap, '127.0.0.1');
+    this.pipe = pipe;
+    pipe.on('data', (bytes) => this.chew(bytes));
+    pipe.on('error', (error) => {
+      this.lastError = error.message;
+      this.again();
+    });
+    pipe.on('close', () => this.again());
+  }
+
+  again() {
+    if (!this.running || this.mending) return;
+    this.mending = true;
+    this.spare = Buffer.alloc(0);
+    setTimeout(() => {
+      this.mending = false;
+      if (this.running) this.draw();
+    }, 800);
+  }
+
+  /* BY LENGTH, NOT BY MARKERS - and the mirror's splitter above is exactly
+   * what cannot be used here.
+   *
+   * An ImageReader's JPEG carries EXIF, and Android's EXIF routinely embeds
+   * a THUMBNAIL, which is itself a JPEG: there is a second ff d8 ... ff d9
+   * pair inside the header of the first. Scanning for markers stops at the
+   * thumbnail's end and yields a truncated frame that ends in a correct ff d9
+   * and will not decode. Measured: 12,658 bytes, valid tail, refused by the
+   * decoder, every single frame.
+   *
+   * So the tablet sends four bytes of big-endian length first and this never
+   * has to guess. */
+  chew(bytes) {
+    this.spare = this.spare.length ? Buffer.concat([this.spare, bytes]) : bytes;
+    for (;;) {
+      if (this.spare.length < 4) return;
+      const size = this.spare.readUInt32BE(0);
+      /* A length that could not be a frame means the stream is out of step;
+       * dropping what is held is the only way back that does not loop. */
+      if (size <= 0 || size > 16 * 1024 * 1024) {
+        this.lastError = 'the camera stream lost its place';
+        this.spare = Buffer.alloc(0);
+        return;
+      }
+      if (this.spare.length < 4 + size) return;
+      this.latest = Buffer.from(this.spare.subarray(4, 4 + size));
+      this.spare = this.spare.subarray(4 + size);
+      this.frames += 1;
+      this.lastFrameAt = Date.now();
+      for (const watcher of this.watchers) this.push(watcher, this.latest);
+    }
+  }
+
+  how() {
+    const still = this.lastFrameAt ? Date.now() - this.lastFrameAt : 0;
+    return { running: this.running, facing: this.facing, frames: this.frames,
+      watchers: this.watchers.size, sinceFrameMs: still,
+      live: this.frames > 0 && still < 2500, why: this.lastE

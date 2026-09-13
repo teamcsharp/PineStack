@@ -1226,11 +1226,113 @@ ipcMain.handle("mirror:sound", async (_event, want) => {
   }
 });
 
-/* LOOKING THROUGH THE TABLET'S CAMERA.
+/* THE CAMERA, IN A WINDOW OF ITS OWN, WITH THE TABLET LEFT ALONE.
  *
- * The tablet puts its camera on its own SCREEN and the mirror carries it
- * here - see camera/PineCameraActivity.kt for why that beats a second video
- * pipeline. This only asks. */
+ * The tablet streams JPEGs off an ImageReader with no preview and no
+ * activity, so the terminal goes on drawing the station while this runs -
+ * which is the whole point: looking through the camera must not take a radio
+ * station off the air.
+ *
+ * The older road - putting the preview on the tablet's own screen - is kept
+ * on the bridge, because it is the one that needs no adb and is the right
+ * one for somebody standing AT the tablet. It is simply not what the icon
+ * does any more. */
+let camera = null;
+let cameraWindow = null;
+
+async function openCameraWindow(facing) {
+  const { CameraGlass } = require("./tablet-mirror.cjs");
+  const tools = terminalHost.tools();
+  const serial = await terminalHost.glassSerial();
+  if (!serial) return { ok: false, why: "no tablet is reachable over adb" };
+
+  /* Ask the tablet to put its camera on the socket BEFORE connecting: the
+   * service opens the lens when a reader arrives, so the order matters. */
+  const glass = await terminalHost.glass();
+  const told = await glass.say(
+    "(async function () { var b = window.pineDesktop;"
+    + " if (!b || !b.cameraOpen) return JSON.stringify({ok:false,"
+    + " why:'this terminal has no camera stream'});"
+    + " return JSON.stringify(await b.cameraOpen({facing: "
+    + JSON.stringify(facing === "front" ? "front" : "rear") + "})); })()");
+  if (!told || !told.ok) {
+    return { ok: false, why: (told && told.why) || "the tablet would not start its camera" };
+  }
+
+  if (!camera) camera = new CameraGlass({ adb: tools.adb, serial });
+  const where = await camera.open(facing);
+
+  if (cameraWindow && !cameraWindow.isDestroyed()) {
+    cameraWindow.focus();
+    return Object.assign({ ok: true, already: true }, where);
+  }
+
+  cameraWindow = new BrowserWindow({
+    width: 960,
+    height: 620,
+    minWidth: 320,
+    minHeight: 240,
+    title: "The tablet's camera",
+    icon: path.join(__dirname, "assets", "pinebox.ico"),
+    backgroundColor: "#05080b",
+    alwaysOnTop: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+  cameraWindow.setMenuBarVisibility(false);
+  cameraWindow.on("closed", async () => {
+    cameraWindow = null;
+    /* The lens is released when the last reader goes, but the service is
+     * told as well - an open camera nobody is watching is a camera nothing
+     * else on the tablet can use. */
+    if (camera) { await camera.close(); camera = null; }
+    try {
+      const speak = await terminalHost.glass();
+      await speak.say("(async function () { var b = window.pineDesktop;"
+        + " if (b && b.cameraClose) await b.cameraClose();"
+        + " return JSON.stringify({ok:true}); })()");
+    } catch (error) { /* the tablet lets go on its own too */ }
+  });
+  cameraWindow.loadFile(path.join(__dirname, "renderer", "tablet-camera.html"));
+  return Object.assign({ ok: true }, where);
+}
+
+ipcMain.handle("camera:open", async (_event, want) => {
+  try {
+    return await openCameraWindow((want && want.facing) || "rear");
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("camera:where", () => {
+  if (!camera) return { ok: false, why: "the camera is not open" };
+  return Object.assign({ ok: true }, camera.where(), camera.how());
+});
+
+ipcMain.handle("camera:face", async (_event, facing) => {
+  if (!camera) return { ok: false, why: "the camera is not open" };
+  try {
+    const glass = await terminalHost.glass();
+    const told = await glass.say(
+      "(async function () { var b = window.pineDesktop;"
+      + " return JSON.stringify(await b.cameraOpen({facing: "
+      + JSON.stringify(facing === "front" ? "front" : "rear") + "})); })()");
+    if (told && told.ok) camera.facing = facing === "front" ? "front" : "rear";
+    return told || { ok: false, why: "the tablet did not answer" };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* LOOKING THROUGH THE TABLET'S CAMERA, ON ITS OWN SCREEN.
+ *
+ * The older road, kept because it needs no adb and suits somebody standing
+ * at the tablet. The icon uses camera:open instead. */
 ipcMain.handle("tablet:camera", async (_event, want) => {
   try {
     const glass = await terminalHost.glass();

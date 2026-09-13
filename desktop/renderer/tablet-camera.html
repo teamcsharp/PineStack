@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<!--
+  THE TABLET'S CAMERA, AND THE TABLET IS STILL ON THE AIR.
+
+  "I want to stay inside of the Pine Box application and not change it over to
+   being displaying a camera... I just happen to want to be able to enable the
+   camera on the computer and use it for accessing the camera if I need to
+   through the tablet."
+
+  The frames come straight off an ImageReader on the tablet - no preview, no
+  activity, nothing taken over - and arrive here as the same multipart the
+  screen mirror uses, which a bare <img> renders with nothing running per
+  frame.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>The tablet's camera</title>
+  <link rel="stylesheet" href="pineicons.css" />
+  <link rel="stylesheet" href="tablet-camera.css" />
+</head>
+<body>
+  <div id="shell">
+    <div id="glass">
+      <img id="live" alt="The Pine Box tablet's camera" />
+      <div id="veil">Opening the camera&hellip;</div>
+    </div>
+
+    <div id="bar">
+      <div class="group">
+        <span class="tag">Lens</span>
+        <button id="rear" type="button" class="on" title="The rear camera">Rear</button>
+        <button id="front" type="button" title="The front camera">Front</button>
+      </div>
+
+      <div class="group">
+        <button id="grab" type="button"
+                data-pine-icon="c:image" aria-label="Copy this frame"
+                title="Copy the current frame to the clipboard"></button>
+      </div>
+
+      <div class="group right">
+        <button id="ontop" type="button" class="toggle on"
+                data-pine-icon="c:pin--filled"
+                title="Keep this window above the others" aria-label="Keep on top"></button>
+        <span id="how" class="dim"></span>
+      </div>
+    </div>
+
+    <p id="said" class="said"></p>
+  </div>
+
+  <script src="pine-icons.js"></script>
+  <script src="tablet-camera.js"></script>
+</body>
+</html>

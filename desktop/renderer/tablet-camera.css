@@ -1,0 +1,89 @@
+/* Mostly picture, like the live view - and for the same reason: this is a
+   thing you glance at while doing something else. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: #05080b;
+  color: #d7e3ec;
+  font: 12px/1.4 "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+#shell {
+  height: 100%;
+  display: grid;
+  /* minmax(0,1fr): an auto track will not shrink below the picture, and the
+     strip then falls off the bottom of the window. */
+  grid-template-rows: minmax(0, 1fr) auto auto;
+}
+
+#glass {
+  position: relative;
+  min-height: 0;
+  background: #05080b;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#live { max-width: 100%; max-height: 100%; display: block; }
+
+#veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7e94a6;
+  background: #05080b;
+  text-align: center;
+  padding: 20px;
+}
+#veil.gone { display: none; }
+#veil.bad { color: #ff8f80; }
+
+#bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 10px;
+  background: #0d1217;
+  border-top: 1px solid #1b2831;
+}
+
+.group { display: flex; align-items: center; gap: 4px; }
+.group.right { margin-left: auto; }
+
+.tag {
+  color: #64798a;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-size: 10px;
+  margin-right: 3px;
+}
+
+button {
+  font: inherit;
+  color: #cfe0ea;
+  background: #16212b;
+  border: 1px solid #2a3946;
+  border-radius: 4px;
+  padding: 4px 9px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+button:hover { background: #1d2b36; border-color: #3a4c5c; }
+button.on { background: #1c5f4d; border-color: #2a7d66; color: #eafff8; }
+
+.dim { color: #64798a; font-variant-numeric: tabular-nums; }
+.pi-icon { width: 14px; height: 14px; }
+
+.said { margin: 0; padding: 0 10px 8px; min-height: 16px; color: #7e94a6; }
+.said.bad { color: #ff8f80; }

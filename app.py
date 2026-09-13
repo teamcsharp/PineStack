@@ -64306,6 +64306,11 @@ _SFX_ID_MEMO: dict[str, str] = {}
 SFX_ID_MEMO_MOST = 40000
 
 
+# #1307: the way back from an id to its path, written as the id is
+# minted. See sfx_by_id for why this exists.
+_SFX_ID_REVERSE: dict[str, str] = {}
+
+
 def sfx_id(path: Path) -> str:
     """The same opaque, unguessable shape a track id has, so the same guard
     and the same signature work. Memoised - see the note above (#1265)."""
@@ -64315,7 +64320,12 @@ def sfx_id(path: Path) -> str:
         got = hashlib.sha1(key.encode()).hexdigest()[:16]
         if len(_SFX_ID_MEMO) >= SFX_ID_MEMO_MOST:
             _SFX_ID_MEMO.clear()    # a pack repointed at a bigger library
+            _SFX_ID_REVERSE.clear()
         _SFX_ID_MEMO[key] = got
+    # #1307: and the way back, free, at the moment the id exists. An id
+    # cannot be asked for before something has hashed its path, so this
+    # is always written before it can be read.
+    _SFX_ID_REVERSE[got] = key
     return got
 
 
@@ -64369,6 +64379,30 @@ def sfx_by_id(wanted: str) -> Path | None:
     # that was sitting right there. Cheap, and it also spares the CIFS
     # walk on the common case.
     #
+    # #1307: THE REVERSE MAP FIRST, because the road under this one is
+    # a SHARE WALK and it is on the media route.
+    #
+    # /sfx/{key} begins with sfx_by_id, and for anything not in the
+    # capped pool cache this used to fall through to sfx_id_map(),
+    # whose memo key is computed from sfx_all() - the very 28-second
+    # walk of 9,404 files it is meant to avoid. So fetching a video
+    # clip stalled: measured on the tablet, net=2 ready=0 for seven
+    # seconds with no error, and a plain ranged curl returning no
+    # headers in thirty. The set popped up with nothing in it.
+    #
+    # sfx_id() already keeps path -> id for everything it has hashed;
+    # this is that map read backwards, and it cannot be stale in the
+    # direction that matters - an id only exists once its path has
+    # been hashed. is_file() so a deleted clip falls through to the
+    # real search instead of being served out of a dead memo.
+    try:
+        back = _SFX_ID_REVERSE.get(wanted)
+        if back:
+            known = Path(back)
+            if known.is_file():
+                return known
+    except Exception:  # noqa: BLE001
+        pass
     # #1297: and it is a LOOKUP now, not a walk of the whole pool.
     try:
         got = sfx_pool_ids().get(wanted)
