@@ -144,6 +144,18 @@ def ffmpeg_cmd() -> list[str]:
         "-f", "segment", "-segment_time", str(SEGMENT_SECONDS),
         "-reset_timestamps", "1", "-strftime", "1",
         str(CLIPS / "%Y-%m-%d_%H-%M-%S.mp4"),
+        # ...and a still, four times a second, for the picture in
+        # picture. HLS would be the better picture and Chromium cannot
+        # play it without a library nothing here vendors - and the
+        # tablet WebView is the same engine. A JPEG in an <img> plays
+        # on every surface in this house with no library at all, which
+        # for a corner-of-the-screen preview is the right trade.
+        #
+        # It is rewritten in place, so a reader can catch it half
+        # written. The door that serves it checks for the end-of-image
+        # marker and hands back the last whole frame instead.
+        "-map", "0:v", "-vf", "fps=4", "-q:v", "6",
+        "-f", "image2", "-update", "1", "-y", str(OUT / "frame.jpg"),
     ]
 
 

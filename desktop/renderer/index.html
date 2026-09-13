@@ -40,6 +40,7 @@
   <!-- #1263: the SFX guy's television. Mounted at BODY level so it floats
        over whatever view is showing rather than living inside one. -->
   <link rel="stylesheet" href="./sfx-tv.css">
+  <link rel="stylesheet" href="./pine-cam.css">
   <!-- The SVG sprite, for icon-only buttons that need a real <svg> with an
        aria-label rather than a bare character. -->
   <script src="./pine-icons.js"></script>
@@ -110,6 +111,13 @@
         <button id="glassCam" class="glass-btn" type="button"
                 data-pine-icon="m:video_camera_back" aria-label="Look through the tablet's camera"
                 title="Look through the Pine Box tablet's camera, in a window of its own.&#10;Front and rear are chosen there.&#10;The tablet keeps showing the station the whole time."></button>
+        <!-- THE PINE CAM. Hidden until the station says the link is
+             live, and gone again when the camera goes - see pine-cam.js.
+             A control for something that is not connected is a control
+             you learn to ignore. -->
+        <button id="glassPineCam" class="glass-btn" type="button" hidden
+                data-pine-icon="c:view" aria-label="Watch the Pine Cam"
+                title="The Pine Cam is linked. Click for a picture-in-picture of what it is seeing."></button>
         <input id="glassSeconds" class="glass-secs" type="number"
                min="3" max="30" step="1" value="10"
                title="How long the clip records, in seconds. Up to 30.">
@@ -728,6 +736,7 @@
        whatever is showing. -->
   <script src="./sfx-tv.js"></script>
   <script src="./rail.js"></script>
+  <script src="./pine-cam.js"></script>
   <!-- THE STARTUP ASSEMBLY. The tablet gets this from rail.js when the
        rail goes up; the desktop has no rail boot step of its own, so it is
        kicked here. Guarded by the same flag, so a build that ends up with

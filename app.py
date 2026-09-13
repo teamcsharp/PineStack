@@ -104269,6 +104269,11 @@ PINELINK_DIR = data_path("pinelink")
 PINELINK_LIVE = PINELINK_DIR / "live"
 PINELINK_CLIPS = PINELINK_DIR / "clips"
 PINELINK_STATE = PINELINK_DIR / "state.json"
+PINELINK_FRAME = PINELINK_DIR / "frame.jpg"
+# The last frame we know was WHOLE. ffmpeg rewrites frame.jpg in place
+# four times a second, so a read can land mid-write; rather than hand a
+# torn picture to the panel, the door below keeps the last good one.
+_PINELINK_LAST: dict[str, Any] = {"bytes": b"", "at": 0.0}
 # A segment name and nothing else. The filename arrives from a URL, and
 # `..` in it would hand out any file this process can read.
 PINELINK_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -104335,6 +104340,40 @@ async def pinelink_live_api(
     # A playlist that is cached is a playlist that stops updating, and the
     # segments roll every two seconds.
     return FileResponse(path, media_type=kind, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Access-Control-Allow-Origin": "*"})
+
+
+@app.get("/api/pinelink/frame.jpg")
+async def pinelink_frame_api(
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The camera, right now, as one picture.
+
+    This is what the picture-in-picture shows. HLS would be the better
+    picture, and Chromium plays no HLS without a library this project
+    does not vendor - the tablet WebView being the same engine. A JPEG
+    in an <img> needs nothing at all, and works on every surface here.
+
+    A JPEG ends 0xFFD9. ffmpeg rewrites this file in place while we read
+    it, so a read can catch it half written, and half a JPEG in an <img>
+    is a visible tear. Anything not ending where a JPEG ends is refused;
+    the last whole frame goes out instead, which at four frames a second
+    nobody can see.
+    """
+    require_read_auth(authorization)
+    try:
+        raw = PINELINK_FRAME.read_bytes()
+    except Exception:  # noqa: BLE001
+        raw = b""
+    if len(raw) > 1024 and raw[-2:] == b"\xff\xd9":
+        _PINELINK_LAST.update({"bytes": raw, "at": time.time()})
+    else:
+        raw = bytes(_PINELINK_LAST.get("bytes") or b"")
+    if not raw:
+        raise HTTPException(status_code=404,
+                            detail="the camera is not linked")
+    return Response(content=raw, media_type="image/jpeg", headers={
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "Access-Control-Allow-Origin": "*"})
 
@@ -115303,7 +115342,8 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                "/api/radio/clock",
                # #1253: the broadcast stream. This is the road a car
                # actually uses - one socket, held open, mixed here.
-               "/stream.mp3", "/stream.m3u", "/api/stream/state"}
+               "/stream.mp3", "/stream.m3u", "/stream.m3u8",
+               "/api/stream/state"}
 # #1253: ...and the things the listener page itself asks for. The
 # gallery pictures and the icon font were never on this list, so on a
 # phone the artwork was a broken-image box and the icons fell back to
@@ -115312,7 +115352,9 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
 # auth at all; the picture road is read-only and now takes the same
 # tune-in token as everything else on this page.
 _PUBLIC_GET_PREFIX = ("/tune/", "/media/", "/music/", "/data/vendor/",
-                      "/icons/", "/api/generations/image/")
+                      "/icons/", "/api/generations/image/",
+                      # #1253: the HLS segments an iPhone asks for.
+                      "/hls/")
 _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
                 "/api/music/vote",
                 # #1149: wake-only - the route refuses to pause anything,
@@ -115592,6 +115634,84 @@ async def station_stream_mp3(
     if wants_meta:
         headers["icy-metaint"] = str(STREAM_ICY_INTERVAL)
     return StreamingResponse(body(), media_type="audio/mpeg", headers=headers)
+
+
+@app.get("/stream.m3u8")
+async def station_stream_hls(
+    request: Request,
+    t: str = "",
+    br: str = "",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The broadcast as HLS. This is the road an iPhone should take.
+
+    One endless mp3 response asks the BROWSER to hold a TCP connection
+    alive across tower handoffs, choose its own read-ahead, and recover
+    when the socket dies. Safari on iOS is not generous about any of
+    those, and a cellular IPv6 address can change under a moving car,
+    which kills the connection mid-word.
+
+    HLS puts all of that in the protocol: short segments, listed in a
+    playlist the player re-reads, each its own small request. A dropped
+    connection costs one segment instead of the show, and the player
+    buffers several ahead by design. It is Apple's own format, so the
+    lock screen and CarPlay behave.
+    """
+    require_listen_auth(t, authorization)
+    enc = await asyncio.to_thread(STATION_STREAM.hls, br)
+    # The first playlist takes a moment to exist; the backlog prime means
+    # it arrives with several segments already in it.
+    for _ in range(40):
+        if await asyncio.to_thread(enc.ready):
+            break
+        await asyncio.sleep(0.25)
+    try:
+        raw = await asyncio.to_thread(enc.playlist.read_text)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=503,
+                            detail="The stream is still warming up.")
+    # ffmpeg writes bare segment names. They have to come back as URLs on
+    # this door, carrying the same token the playlist itself needed.
+    suffix = f"?t={quote(t)}" if t else ""
+    out = []
+    for line in raw.splitlines():
+        if line and not line.startswith("#"):
+            out.append(f"/hls/{enc.bitrate}/{line}{suffix}")
+        else:
+            out.append(line)
+    return Response(
+        content="\n".join(out) + "\n",
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                 "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/hls/{rate}/{name}")
+async def station_stream_hls_segment(
+    rate: int,
+    name: str,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """One HLS segment. Name-checked: this reads from a directory the
+    mixer owns, and nothing but a segment may ever come out of it."""
+    require_listen_auth(t, authorization)
+    if not re.fullmatch(r"seg\d{1,8}\.(ts|aac|m4s)", name):
+        return Response(status_code=404)
+    enc = STATION_STREAM.hls_existing(int(rate))
+    if enc is None:
+        return Response(status_code=404)
+    path = enc.dir / name
+    try:
+        data = await asyncio.to_thread(path.read_bytes)
+    except Exception:  # noqa: BLE001
+        # A segment that has already rolled out of the window. Saying 404
+        # is correct: the player asks for a newer one.
+        return Response(status_code=404)
+    return Response(
+        content=data, media_type="video/mp2t",
+        headers={"Cache-Control": "public, max-age=30",
+                 "X-Content-Type-Options": "nosniff"})
 
 
 @app.get("/stream.m3u")
@@ -124870,6 +124990,7 @@ async def comfy_outputs(
 async def generation_image(
     filename: str,
     t: str = "",
+    w: int = 0,
     authorization: str | None = Header(default=None),
 ) -> Response:
     """Proxy a finished render out of ComfyUI's output folder so the gallery
@@ -124892,6 +125013,20 @@ async def generation_image(
     # Going out over HTTP for it is why every image on the panel, the face on
     # a caller's licence included, broke the moment 8188 stopped answering.
     # ComfyUI stays as the fallback for anything not on the mount.
+    # #1253: a WIDTH CAP for the small screens. Without it the listener
+    # page pulls the full render - measured 1,292,338 bytes - every few
+    # seconds, over the same cellular link that is carrying the
+    # broadcast. Cached on disk, so the resize happens once per picture
+    # per width. No ?w= is the original, untouched: the panel and the
+    # slideshow are unaffected.
+    if w:
+        small = await asyncio.to_thread(_generation_thumb, filename, w)
+        if small is not None:
+            return Response(
+                content=small,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=86400"},
+            )
     off_disk = await asyncio.to_thread(comfy_output_bytes, filename)
     if off_disk is not None:
         return Response(
@@ -124920,6 +125055,50 @@ async def generation_image(
 
 _COMFY_OUTPUT_DIR = Path("/comfy-output")   # ComfyUI output, mounted read-write
 _SAFE_FILE_RE = re.compile(r"[\w.\- ()\[\]]{1,200}")
+
+# #1253: the widths a caller may ask for. A free-form number would let one
+# URL per pixel fill the cache directory, so it snaps to a short ladder.
+_THUMB_WIDTHS = (320, 480, 640, 800, 1080)
+
+
+def _generation_thumb(filename: str, want: int) -> bytes | None:
+    """A width-capped jpeg of one render, made once and kept.
+
+    Returns None for anything it cannot do - a missing Pillow, an
+    unreadable file, a picture already smaller than the cap - and the
+    caller then serves the original, which is the old behaviour exactly.
+    """
+    try:
+        width = min(_THUMB_WIDTHS, key=lambda n: abs(n - int(want)))
+        out = RADIO_CACHE / "_thumb" / f"{width}_{filename}.jpg"
+        if out.is_file() and out.stat().st_size > 0:
+            return out.read_bytes()
+        got = comfy_output_bytes(filename)
+        if got is None:
+            return None
+        import io as _io
+
+        from PIL import Image
+
+        with Image.open(_io.BytesIO(got[0])) as im:
+            if im.width <= width:
+                return None             # already small - serve the original
+            im = im.convert("RGB")
+            height = max(1, round(im.height * width / im.width))
+            im = im.resize((width, height), Image.LANCZOS)
+            buf = _io.BytesIO()
+            im.save(buf, format="JPEG", quality=82, optimize=True)
+        data = buf.getvalue()
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".part")
+            tmp.write_bytes(data)
+            tmp.replace(out)
+        except OSError:
+            pass                        # serving it matters more than keeping it
+        return data
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @app.delete("/api/generations/image/{filename}")
@@ -126375,7 +126554,13 @@ def script_ledger_order() -> dict[str, tuple[int, int]]:
     for r in script_ledger_rows():
         lid = str(r.get("line_id") or "")
         if lid:
-            out[lid] = (int(r.get("block") or 0), int(r.get("ord") or 0))
+            # #1343: and whether anybody wrote it down in advance.
+            # A row committed with its round is the SPINE of the
+            # script; one caught up afterwards (a gold bar, a rescue
+            # quip) got its block number minutes later and must not
+            # be ordered by it - see the composer.
+            out[lid] = (int(r.get("block") or 0), int(r.get("ord") or 0),
+                        bool(r.get("scripted", True)))
     return out
 
 
@@ -127264,6 +127449,31 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
               + [{"at": e["at"], "sort": 0, "row": e, "what": "action"}
                  for e in actions])
 
+    # #1343: ...AND NONE OF THIS APPLIES TO A ROW THE LEDGER PLACES.
+    #
+    # The re-anchor below is the largest single cause of the page
+    # moving under the reader, and it fires on the conversation being
+    # said RIGHT NOW. A burst is written to the ring as "prepared" and
+    # every one of its rows flips to heard only after the whole burst
+    # has finished playing - so throughout the minute it is on air it
+    # is "not heard", gets parked at `_floor + 1.0`, and prints below
+    # every banked round in the hour. The moment it ends, it jumps to
+    # its real place. The size of that jump is however much banked
+    # material the hour is holding, which is exactly the complaint:
+    # jumping up and down the page in different places depending on
+    # the listing.
+    #
+    # A row with a (block, ord) does not need a guessed time at all -
+    # its position was decided before it was audible and does not
+    # depend on whether it has been heard yet. So the re-anchor is
+    # skipped for those, and only ever touches rows nothing wrote
+    # down. `_ord_early` is read here rather than passed because this
+    # pass runs before the ordering block below.
+    try:
+        _ord_early = script_ledger_order()
+    except Exception:  # noqa: BLE001
+        _ord_early = {}
+
     # #1308: A LINE THAT HAS NOT BEEN SAID IS NOT PART OF WHAT WAS SAID.
     #
     # The `at` above is air_at OR ts. For a row that aired that is an
@@ -127315,6 +127525,8 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 _r = _e.get("row") or {}
                 if str(_r.get("aired") or "") in AIR_AT_HEARD:
                     continue
+                if str(_r.get("id") or "") in _ord_early:
+                    continue          # #1343: the ledger places it
                 _sid = str(_r.get("sid") or "")
                 _anchor = _heard.get(_sid)
                 if _anchor is None:
@@ -127601,7 +127813,72 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     #
     # An hour the ledger does not cover is left exactly as the repair
     # passes built it, which is how it read before #1330.
-    if _runs:
+    # #1343: THE SPINE, AND WHAT HANGS OFF IT.
+    #
+    # A script is a sequence. Blocks are numbered at commit, in the
+    # order rounds go to air, and `ord` is the order inside a round -
+    # neither is ever rewritten. So the reading order of everything
+    # anybody wrote down IS (block, ord), with no timestamp involved,
+    # and none of the four things that mutate `at` can disturb it.
+    #
+    # Everything else - a record dropping, an advert, a phone call, a
+    # sting off the board, and every line caught up after the fact -
+    # is pinned to the spine row it followed ON AIR, by the raw stamp
+    # the air log kept. That is what #1336 got wrong: it gave each
+    # caught-up line its own block, and laying blocks out end to end
+    # then expelled every interjection past the conversation it had
+    # interrupted. Heard "t1 t2 QUIP t3 t4", the page read "t1 t2 t3
+    # t4 QUIP" - the exact inverse of what #1299 was written to do.
+    #
+    # Pinning also fixes it across polls: an interjection sits after a
+    # named row rather than at a computed time, so nothing about it
+    # moves when the hour grows.
+    _spine: list[tuple[int, int, int]] = []     # (block, ord, index)
+    _raw_of: dict[int, float] = {}
+    for _ix, _e in enumerate(events):
+        _row = _e.get("row") or {}
+        # The stamp the air log kept, never the one this function has
+        # been rewriting.
+        _raw_of[_ix] = float(_row.get("air_at") or _row.get("ts")
+                             or _e.get("at") or 0)
+        _got = _ord.get(str(_row.get("id") or "")) if _ord else None
+        if _got and len(_got) > 2 and _got[2]:
+            _spine.append((int(_got[0]), int(_got[1]), _ix))
+    _spine.sort()
+
+    if _spine:
+        _pos: dict[int, tuple] = {}
+        for _rank, (_b, _o, _ix) in enumerate(_spine):
+            _pos[_ix] = (_rank, 0, 0.0, _ix)
+        # Each hanger goes after the last spine row that had already
+        # been said when it happened. Binary search over the spine in
+        # air order - which is the same as (block, ord) order, because
+        # blocks are numbered as rounds go out.
+        _times = [_raw_of[_ix] for _b, _o, _ix in _spine]
+        import bisect
+        for _ix, _e in enumerate(events):
+            if _ix in _pos:
+                continue
+            _t = _raw_of[_ix]
+            _rank = bisect.bisect_right(_times, _t) - 1
+            # Before the first spoken line: keep it at the very top.
+            _pos[_ix] = (_rank, 1, _t, _ix)
+        try:
+            _keyed2 = sorted(enumerate(events),
+                             key=lambda p: _pos.get(
+                                 p[0], (10 ** 9, 1, 0.0, p[0])))
+            events[:] = [_e for _ix, _e in _keyed2]
+            # The clock each row prints is still its own; only the
+            # ORDER came from the ledger. Where a stamp now runs
+            # backwards against the row above it the reader is told,
+            # rather than having the number quietly rewritten - that
+            # rewrite is what made every order metric unfalsifiable.
+            for _e in events:
+                _e.pop("air_at", None)
+        except Exception:  # noqa: BLE001
+            pass          # a script that will not re-order still reads
+
+    elif _runs:
         # #1336: AND ONE CONVERSATION AT A TIME.
         #
         # Making each row monotone fixed the reader being thrown
@@ -127690,6 +127967,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     elements: list[dict[str, Any]] = []
     scenes: list[tuple[int, float]] = []    # (subheader index, scene start)
     scene_round = None
+    scene_block = -1                 # #1342: whose conversation it is
     speaker = ""
     spoke_at = 0.0
     scene_mark: tuple[str, str] | None = None   # #1266: the heading standing
@@ -127710,7 +127988,44 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             more["seg"] = seg_now[0]
         elements.append({"id": eid, "type": etype, "text": text, **more})
 
-    for ev in events:
+    # #1342: WHICH EVENTS SIT INSIDE A CONVERSATION.
+    #
+    # A scene heading opens whenever `round` changes. That was right
+    # when the only things between two turns were the turns of
+    # another round - and wrong the moment #1339 started placing gold
+    # bars, the SFX guy's quips and advert reads between them, each
+    # carrying its own round. Every one of those flipped the round,
+    # opened a scene, and the conversation's next turn flipped it
+    # back and opened another.
+    #
+    # Measured on one live hour: block 132 - ONE conversation - was
+    # cut at ord 3 and again at ord 13 by headings reading THE
+    # SPONSOR'S COPY, THE PHONE LINE and THE TALKBACK. On the page
+    # that is a single exchange presented as four separate segments,
+    # which is exactly the complaint: "inconsistent with grouping all
+    # of the conversation that's happening for a segment in the same
+    # section".
+    #
+    # The ledger already knows the answer. An event with a conversation
+    # on both sides of it is an INTERJECTION, whatever its own round
+    # says, and the script has always written somebody cutting in
+    # without starting a new scene for them. `events` is fully ordered
+    # by this point, so it can simply be read.
+    _blk_at: list[int] = []
+    for _e in events:
+        _g = _ord.get(str((_e.get("row") or {}).get("id") or "")) \
+            if isinstance(_ord, dict) else None
+        _blk_at.append(int(_g[0]) if _g else -1)
+    _inside: set[int] = set()
+    for _i, _b in enumerate(_blk_at):
+        _before = next((_blk_at[_j] for _j in range(_i - 1, -1, -1)
+                        if _blk_at[_j] >= 0), -1)
+        _after = next((_blk_at[_j] for _j in range(_i + 1, len(_blk_at))
+                       if _blk_at[_j] >= 0), -2)
+        if _before >= 0 and _before == _after and _b != _before:
+            _inside.add(_i)
+
+    for _ev_ix, ev in enumerate(events):
         at = float(ev["at"])
         # #1336b: the stamp this row arrived with, when the sort
         # above had to correct it. Present only where the two differ,
@@ -127770,6 +128085,16 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         if (cuts_in and scene_round is not None
                 and not (gap and gap > SCREENPLAY_GAP_SCENE)):
             _want = False               # it happens INSIDE this scene
+        # #1342: and so does anything with the same conversation on
+        # both sides of it, and so does the conversation itself once
+        # its scene is standing - otherwise the turn AFTER an advert
+        # opens a second heading for the exchange it is continuing.
+        _blk_here = _blk_at[_ev_ix] if _ev_ix < len(_blk_at) else -1
+        if scene_round is not None and (
+                _ev_ix in _inside
+                or (_blk_here >= 0 and _blk_here == scene_block)):
+            if not (gap and gap > SCREENPLAY_GAP_SCENE):
+                _want = False
         if _want:
             slug = screenplay_scene_slug(round_kind, at)
             label = (" ".join(str(rnd.get("label") or "").split())
@@ -127779,6 +128104,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 _want = False           # the heading already standing
         if _want:
             scene_round = round_kind
+            scene_block = _blk_here          # #1342
             scene_mark = (slug, label)
             # #1281: A SCENE IS NAMED AFTER THE LINE THAT OPENS IT.
             # These were `sc-{int(at)}-{round}` / `sh-{int(at)}-{round}`
@@ -200370,14 +200696,27 @@ function renderGallery(state) {
     const name = galleryNames[galleryIndex % galleryNames.length];
     /* #1253: carry the tune-in token - an <img> has no headers, so
      * without this every picture on a shared link is a broken box. */
+    /* #1253: ...and a WIDTH CAP. The full render measured 1.29 MB and
+     * this stage is at most a phone-width box, so the original was a
+     * megabyte of cellular data every few seconds, competing with the
+     * broadcast on the same link. Narrower again while the stream is the
+     * point: at w=640 a picture is ~60 kB turning over every seven
+     * seconds, about 68 kbit/s - the SAME ORDER as the 64k broadcast it
+     * would be racing. */
+    const wide = (typeof streamMode !== "undefined" && streamMode)
+      ? "?w=480" : "?w=640";
     image.src = "/api/generations/image/" + encodeURIComponent(name)
-      + (GUEST ? "?t=" + encodeURIComponent(KEY) : "");
+      + wide + (GUEST ? "&t=" + encodeURIComponent(KEY) : "");
     caption.textContent = name;
     galleryIndex += 1;
   };
   if (galleryTimer) clearInterval(galleryTimer);
   show();
-  if (galleryNames.length > 1) galleryTimer = setInterval(show, 7000);
+  if (galleryNames.length > 1) {
+    galleryTimer = setInterval(
+      show, (typeof streamMode !== "undefined" && streamMode)
+              ? 20000 : 7000);
+  }
 }
 
 function patter(state) {
@@ -200498,6 +200837,22 @@ async function pollOnce() {
     document.getElementById("note").textContent = error.message;
   }
   if (!playing) return;
+  /* #1253: THE STREAM ROAD DOES NOT FETCH THE SHOW A SECOND TIME.
+   *
+   * Everything below announces clips, queues them, and - the expensive
+   * part - voicePrefetch()es each one into a blob. On the stream road
+   * not one of those blobs is ever sounded: the mix already contains
+   * that audio, made on the box. voiceNext() was guarded, so the
+   * PLAYBACK stopped; the DOWNLOADING did not, and a welded round is
+   * megabytes. On wifi it is invisible, which is why it worked on
+   * everybody else device. On a cellular link in a moving car those
+   * downloads compete with the broadcast and drain the very buffer that
+   * is meant to be riding out the bumps.
+   *
+   * Returning here also retires the ack posts and the queue bookkeeping
+   * for this road. Nothing downstream needs them: the mixer decides what
+   * airs, and it does not ask this page. */
+  if (streamMode) return;
   try {
     // #999: tell the server the rate too, so it can start the encode
     // during the broadcast lead rather than when the clip is asked for.
@@ -200852,11 +201207,31 @@ let radio = null;
 let streamTries = 0;
 let streamTimer = null;
 
+/* #1253: HLS WHERE IT IS NATIVE, mp3 everywhere else.
+ *
+ * Safari on iOS plays HLS in a plain <audio> element and handles the
+ * hard parts itself - read-ahead, segment retries, and surviving the
+ * address change a moving car causes on cellular. Nothing else here
+ * does: Chrome and Firefox have no native HLS, so they keep the single
+ * endless mp3 response, which they are good at.
+ *
+ * Feature test, not a user-agent sniff: the question really is "can this
+ * player do HLS on its own", and that is exactly what canPlayType
+ * answers. */
+function wantsHls() {
+  try {
+    const probe = document.createElement("audio");
+    return !!(probe.canPlayType
+      && probe.canPlayType("application/vnd.apple.mpegurl"));
+  } catch (e) { return false; }
+}
+
 function streamUrl() {
-  /* #1253: the quality selector governs the stream too. 0 ("Original")
-   * has no meaning for a live mix, so it takes the station default. */
+  /* The quality selector governs the stream too. 0 ("Original") has no
+   * meaning for a live mix, so it takes the station default. */
   const rate = Number(voiceRate || 0);
-  let url = "/stream.mp3?_=" + Date.now();
+  const road = wantsHls() ? "/stream.m3u8" : "/stream.mp3";
+  let url = road + "?_=" + Date.now();
   if (GUEST) url += "&t=" + encodeURIComponent(KEY);
   if (rate > 0) url += "&br=" + rate;
   return url;
@@ -200956,6 +201331,18 @@ function armStreamWatch() {
   streamWatch = setInterval(() => {
     if (!playing || !streamMode || !radio) return;
     const at = Number(radio.currentTime || 0);
+    /* #1253: SAY WHAT THE BUFFER IS. "it stutters" and "it is fine" are
+     * the same sentence without this number, and it is the one number
+     * that says whether the burst is arriving and surviving. */
+    try {
+      const b = radio.buffered;
+      const ahead = b && b.length ? (b.end(b.length - 1) - at) : 0;
+      const note = document.getElementById("note");
+      if (note && ahead >= 0) {
+        note.textContent = "streaming · " + Math.round(ahead)
+          + "s buffered ahead";
+      }
+    } catch (e) { /* the show goes on */ }
     if (at > streamAt + 0.05) { streamAt = at; streamAtSince = Date.now(); return; }
     if (Date.now() - streamAtSince > 40000) {
       streamAtSince = Date.now();
@@ -201164,8 +201551,25 @@ async function request() {
 initLevels();
 initMode();                     // #1253: which road this page takes
 poll();
-setInterval(poll, 3000);
-setInterval(clockPoll, 1500);   // the cheap one, often — stays on cue (#631)
+/* #1253: on the stream road these two are DISPLAY ONLY - the title, the
+ * sleeve, the patter, the paused state. Nothing they return touches the
+ * audio, because the audio is a socket the box is filling. The 1.5s clock
+ * beat exists to hold the shared on-air instant (#631), and there is no
+ * instant to hold here; on a car connection where a request can itself
+ * take a second or two, that beat is close to a continuous stream of
+ * requests running beside the broadcast. So they slow right down when the
+ * stream is carrying the show, and stay exactly as they were for the
+ * synchronised road in the house. */
+function pollLoop() {
+  try { poll(); } catch (e) {}
+  setTimeout(pollLoop, streamMode ? 8000 : 3000);
+}
+function clockLoop() {
+  try { clockPoll(); } catch (e) {}
+  setTimeout(clockLoop, streamMode ? 15000 : 1500);
+}
+setTimeout(pollLoop, 3000);
+setTimeout(clockLoop, 1500);
 </script>
 </body>
 </html>
