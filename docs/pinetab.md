@@ -1694,14 +1694,15 @@ station pays for almost none of this.
 | 4 | FLOOR | Takes the floor back from a hold that has gone silent |
 | 5 | FLUSH | Advances the feed epoch — every page abandons the clip it cannot start |
 | 6 | RELEASE | Releases the audio exclusive so every player may sound |
-| 7 | PAGES | Asks **every** page in the house to reload, not just this one |
+| 7 | DEVICES | Reads every device's out-loud switch; turns them on only if **every** one is off |
+| 8 | PAGES | Asks **every** page in the house to reload, not just this one |
 |   | *listens for eight seconds* | |
-| 8 | DEEP | The whole repair tree: engines, the box, routing, the writer's lifeboat, the deaf-device reboot |
-| 9 | SERVICES | Steward census — restarts xtts, ollama, comfy, a sick container; warms the music library |
-| 10 | RELOAD | Reloads this page, and resumes the ladder afterwards |
-| 11 | RESTART | Restarts the station process. About twenty seconds of silence |
+| 9 | DEEP | The whole repair tree: engines, the box, routing, the writer's lifeboat, the deaf-device reboot |
+| 10 | SERVICES | Steward census — restarts xtts, ollama, comfy, a sick container; warms the music library |
+| 11 | RELOAD | Reloads this page, and resumes the ladder afterwards |
+| 12 | RESTART | Restarts the station process. About twenty seconds of silence |
 
-### Four of those rungs were unreachable before #1331
+### Five of those rungs were unreachable before #1331
 
 Worth knowing, because each one was a night:
 
@@ -1713,6 +1714,15 @@ Worth knowing, because each one was a night:
   listener is frequently a *different* tablet, and it was never touched.
 - **DEEP** and **SERVICES** were never called at all, so a dead voice engine
   got "cured" by restarting the station around it, indefinitely.
+- **DEVICES** was nobody's job at all. `play` is the per-device out-loud
+  switch, and a terminal with `play=false` that nevertheless claims the air
+  gags every other page for a device that then plays nothing — measured at
+  #1187: *"the desktop panel re-claimed the air every few seconds while its
+  own row read play=false, so the tablet was gagged and the house heard
+  nothing."* Releasing the exclusive does not help, because the same page
+  re-claims it. The rung acts only when **every** switch is off, which is
+  silence by construction and nothing anybody configures on purpose; a
+  device deliberately set quiet is left alone.
 - **FLOOR** (`_floor_break`) had exactly one caller — the silence branch of
   `dead_air_watch`, which needs 20 s of quiet *and* nothing speaking *and* the
   station unpaused before it will even look. There was no operator path to it.
@@ -1742,6 +1752,7 @@ K=$(curl -s $B/ | grep -o 'SERVER_KEY = "[^"]*"' | cut -d'"' -f2)
 curl -s $B/api/broadcast/health          | jq .   # is anyone hearing it
 curl -s $B/api/broadcast/console         | jq .   # the whole step table + log
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/look
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/terminals
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/floor
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/steward
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/deep

@@ -120203,6 +120203,11 @@ BROADCAST_STEPS: list[dict[str, str]] = [
     {"key": "replay_hour", "label": "Go back the last hour",
      "say": "Re-airs up to three rounds from the last hour, oldest "
             "first, to refill a starved broadcast.", "tone": "air"},
+    {"key": "terminals", "label": "Check the out-loud switches",
+     "say": "A device set not to play out loud still gags every other one "
+            "when it holds the air (#1187). Turns them back on only if "
+            "EVERY device is off, which is silence by construction.",
+     "tone": "do"},
     {"key": "floor", "label": "Take the floor back",
      "say": "A round that took the floor and never gave it back deadlocks "
             "every other one behind it (#1316). Nothing else the operator "
@@ -120524,6 +120529,60 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                         % (str(row.get("name") or "")[:22],
                            str(row.get("finding") or "")[:90]))
         said.append("  verdict    " + str(got.get("verdict") or ""))
+
+    elif step == "terminals":
+        # #1331: THE OUT-LOUD SWITCH, WHICH NOTHING ELSE INSPECTS.
+        #
+        # `play` is the per-device out-loud switch and the exclusive only
+        # decides WHICH out-loud device wins. A terminal with play=false
+        # that nevertheless claims the air gags every other page for a
+        # device that then plays nothing - measured live at #1187: "the
+        # desktop panel re-claimed the air every few seconds while its
+        # own row read play=false, so the tablet was gagged and the house
+        # heard nothing."
+        #
+        # No rung in any ladder looked at this table. Releasing the
+        # exclusive does not help, because the same page re-claims it.
+        #
+        # The cure is narrow ON PURPOSE. A device set quiet is usually set
+        # quiet deliberately, so this only acts when EVERY device is off -
+        # the one arrangement that guarantees silence no matter what the
+        # station does, and which nobody configures on purpose.
+        said.append("$ the out-loud switches")
+        try:
+            _rows = terminal_rows()
+        except Exception as err:  # noqa: BLE001
+            _rows = {}
+            said.append("  could not read the terminals: %s" % err)
+        _on = [k for k, v in _rows.items() if (v or {}).get("play")]
+        _off = [k for k, v in _rows.items() if not (v or {}).get("play")]
+        for _k in _rows:
+            said.append("  %-14s play=%s"
+                        % (str(_k)[:14],
+                           "on" if (_rows[_k] or {}).get("play") else "OFF"))
+        if not _rows:
+            said.append("  no devices are registered - nothing to check")
+        elif _on:
+            said.append("  %d device(s) will play out loud - left alone"
+                        % len(_on))
+        else:
+            # Every switch is off. That is silence by construction.
+            try:
+                _s = load_settings()
+                _t = dict(_s.get("terminals") or {})
+                for _k in list(_t):
+                    _r = dict(_t[_k] or {})
+                    _r["play"] = True
+                    _t[_k] = _r
+                _s["terminals"] = _t
+                save_settings(_s)
+                _TERMINALS_CACHE.update({"at": 0.0, "rows": {}})
+                changed = True
+                said.append("  EVERY device was set not to play out loud - "
+                            "that is silence whatever the station does")
+                said.append("  turned %d switch(es) back on" % len(_off))
+            except Exception as err:  # noqa: BLE001
+                said.append("  could not turn them on: %s" % err)
 
     elif step == "floor":
         # #1331: TAKE THE FLOOR BACK.
@@ -184846,14 +184905,25 @@ async function fixRun(from) {
       step = 7;
     }
     if (step <= 7) {
+      /* #1331: nothing else in any ladder reads the out-loud switches,
+       * and a house where every one is off is silent no matter what the
+       * station does or how often the exclusive is released. */
+      try {
+        const got = await api("/api/broadcast/fix/terminals", {method: "POST"});
+        const lines = (got.lines || []);
+        fixSay("7 DEVICES   " + (lines[lines.length - 1] || "switches read"));
+      } catch (e) { fixSay("7 DEVICES   the station would not answer"); }
+      step = 8;
+    }
+    if (step <= 8) {
       /* Every page, not just this one. A stale pause, a stuck player and
        * yesterday's code all live in the tab, and the tab that is wedged
        * is frequently not the tab the operator is standing at. */
       try {
         await api("/api/broadcast/fix/reload_pages", {method: "POST"});
-        fixSay("7 PAGES     asked every page in the house to reload itself");
-      } catch (e) { fixSay("7 PAGES     the station would not answer"); }
-      step = 8;
+        fixSay("8 PAGES     asked every page in the house to reload itself");
+      } catch (e) { fixSay("8 PAGES     the station would not answer"); }
+      step = 9;
     }
 
     fixSay("            listening for eight seconds…");
@@ -184866,12 +184936,12 @@ async function fixRun(from) {
       return;
     }
 
-    if (step <= 8) {
+    if (step <= 9) {
       /* The whole triage tree: remembered cures, the box, routing, the
        * writer's lifeboat, the DJ rung, the deaf-device reboot. Slow on
        * purpose - and it keeps running server-side even if this request
        * gives up waiting, which is why a timeout here is not a failure. */
-      fixSay("8 DEEP      running the repair ladder - engines, the box,");
+      fixSay("9 DEEP      running the repair ladder - engines, the box,");
       fixSay("            routing, the writer. This takes a minute.");
       try {
         const got = await api("/api/broadcast/fix/deep", {method: "POST"});
@@ -184880,17 +184950,17 @@ async function fixRun(from) {
         fixSay("            still running at the station - it reports");
         fixSay("            into the repair log. Carrying on.");
       }
-      step = 9;
+      step = 10;
     }
-    if (step <= 9) {
+    if (step <= 10) {
       /* The only rung in the building that bounces xtts, ollama, comfy
        * or a sick container, and warms the music library. */
       try {
         await api("/api/broadcast/fix/steward", {method: "POST"});
-        fixSay("9 SERVICES  census running - every sick service restarted,");
+        fixSay("10 SERVICES census running - every sick service restarted,");
         fixSay("            then counted again. Watch /api/steward.");
-      } catch (e) { fixSay("9 SERVICES  the station would not answer"); }
-      step = 10;
+      } catch (e) { fixSay("10 SERVICES the station would not answer"); }
+      step = 11;
     }
 
     health = await fixHealth();
@@ -184901,24 +184971,24 @@ async function fixRun(from) {
       return;
     }
 
-    if (step <= 10) {
+    if (step <= 11) {
       const mark = fixMarkRead();
       if (mark && mark.reloaded) {
-        fixSay("10 RELOAD   already reloaded once this run - moving on");
+        fixSay("11 RELOAD   already reloaded once this run - moving on");
       } else {
-        fixSay("10 RELOAD   reloading this page - the one cure the station");
+        fixSay("11 RELOAD   reloading this page - the one cure the station");
         fixSay("            cannot perform from its end. Back in a moment.");
-        fixMarkWrite({at: Date.now(), step: 11, reloaded: true,
+        fixMarkWrite({at: Date.now(), step: 12, reloaded: true,
                       lines: fixLines.slice(-40)});
         setTimeout(() => { try { location.reload(); } catch (e) {} }, 1200);
         return;
       }
-      step = 11;
+      step = 12;
     }
-    if (step <= 11) {
-      fixSay("11 RESTART  restarting the station process - about twenty");
+    if (step <= 12) {
+      fixSay("12 RESTART  restarting the station process - about twenty");
       fixSay("            seconds of silence, then every page reconnects.");
-      fixMarkWrite({at: Date.now(), step: 12, reloaded: true,
+      fixMarkWrite({at: Date.now(), step: 13, reloaded: true,
                     restarted: true, lines: fixLines.slice(-40)});
       try { await api("/api/broadcast/fix/restart", {method: "POST"}); }
       catch (e) { /* the process is going down; a dropped reply is normal */ }
