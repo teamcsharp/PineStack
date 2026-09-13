@@ -1,6 +1,6 @@
 # The history of the Pine Box station
 
-Ten eras, 2026-08-08 to 2026-09-12. Every commit is listed with its date in
+Eleven eras, 2026-08-08 to 2026-09-13. Every commit is listed with its date in
 [docs/commit-log.md](docs/commit-log.md); the knowledge each era left behind is kept in
 [docs/notes/](docs/notes/).
 
@@ -21,6 +21,7 @@ discovering that most of the instruments it had built to watch itself were lying
 | 8. Pulse and the Gazette | Aug 30–Sep 5 | 7 | A newspaper on the hour, and an outage with a cause |
 | 9. The universe rhymes | Sep 6–9 | 56 | Every line a bar, System2, and the rejection queue |
 | 10. Rooms and measurement | Sep 10–12 | 61 | Why is this line playing, and the loop that kept freezing |
+| 11. Written down, and reachable | Sep 12–13 | 119 | The script becomes a document, and every cure gets a button |
 
 ---
 
@@ -356,14 +357,83 @@ orchestrator that works the silence instead of watching it`, `The one rung that 
 actually help a congested loop` — the operator's standing rule, finally applied across
 the board.
 
-The last commits before this repository was published, still the same kind of finding the
-project had been making since Era 4:
+The commits immediately before this repository was published, still the same kind of
+finding the project had been making since Era 4:
 
 > `The line that was read 385 lines before it was written`
 >
 > `A 625 MB JSON parse on the event loop, once per restart`
 >
 > `The debt paid to the road that earned it, and the binding shown`
+
+## Era 11 — Written down, and reachable (Sep 12–13, 119 commits)
+
+Publication changed nothing about the work. `The chronicle: ten eras, 489 commits, and
+the notes underneath them` went up, and the next hundred and nineteen commits went at the
+two things the audit of Era 10 had left standing: a script nobody had ever written down,
+and cures nobody could reach.
+
+**The script became a document.** There had never been a script. `screenplay_compose`
+rebuilt the hour out of `air_log.jsonl` on every poll, ordered it by `air_at` — a field
+eight separate paths rewrite — and then ran four corrective passes to undo what the clock
+had got wrong. `The script's own sequence decides, not a timestamp`, and then `The script
+is kept, not rebuilt`: `data/script_ledger.jsonl` records the running order as `(block,
+ord)`, assigned once before a round is audible and never rewritten after. The SFX guy is
+committed in position with everybody else, because his cadence and his random roll already
+happen at assembly time — that was never the problem, it had simply never been written
+down
+([script-ledger-and-the-reading-order](docs/notes/script-ledger-and-the-reading-order.md)).
+
+Then the reading order itself. Anchoring a whole block at its earliest time meant that
+anything which happened *during* a round sorted to the far side of it — 15 backward pairs
+in 365 elements, worst 93.3s, every single one of them `dialogue → action`. Giving each
+row its own stamp and making them monotone across the block — `A conversation is anchored
+on the one stamp that is never rewritten` — left 0 backward pairs in 558 elements, 0 order
+inversions, 23 of 23 SFX rows still inside their own conversation, and 47 previously
+unledgered events now sitting inside the block where they happened.
+
+**The chrome could not hear the panel.** The SCRIPT view placed its highlight from the DJ
+voice element's `currentTime`, and went looking for that element with `querySelectorAll`
+in the Electron chrome — whose document holds exactly one `<audio>`. The voice elements
+belong to the panel, and the panel runs inside a `<webview>`. So the scan returned null
+ALWAYS, not sometimes, and the view silently ran on the clock estimate that three earlier
+tickets existed to replace
+([the-chrome-cannot-see-the-panel](docs/notes/the-chrome-cannot-see-the-panel.md)).
+
+**One tap grew from five rungs to twelve.** `One tap now reaches every cure the station
+owns, and RELEASE finally runs`, then `The out-loud switch is a cure too, and the ladder
+now counts to twelve`. The audit behind those two found four cures that existed as working
+code with no button anywhere that reached them — RELIEVE, PAGES station-wide, DEEP and
+SERVICES — plus `_floor_break`, the cure for a deadlock that had put the station six
+minutes off the air with 134 finished rounds sitting on the shelf, which had one caller
+and no operator path at all
+([every-fix-becomes-a-tool](docs/notes/every-fix-becomes-a-tool.md)).
+
+> A cure the operator cannot reach during the fault it cures is not a cure the station
+> has.
+
+**And the button could not reach its own rung nine.** `reload_pages` reloads every page,
+the operator's own included, and no resume mark was written — so DEEP, SERVICES, RELOAD
+and RESTART never ran, while the transcript's last line read like success. `The ladder
+could not reach its own rung nine, and ON AIR never touched the switch.`
+
+**Polling is not consuming.** A freshly launched desktop claimed the audio exclusive with
+its play switch on, polled steadily enough that the stopped-polling test passed, and
+acknowledged nothing at all — while two tablets that had played 52 and 50 clips sat muted
+75 and 74 times waiting for it
+([audio-owner-and-the-play-switch](docs/notes/audio-owner-and-the-play-switch.md)).
+
+**Most of the era is instruments**, built on top of all that: a sampler that `keeps the
+last two minutes of air, and a pad can be cleared, tuned or carried away in a kit`, a kit
+`an MPC can open`, `DGX Terminal: a shell on the Spark, and the three bugs between here
+and typing`, a camera `window of its own, streamed from the tablet`, `Right-click any line
+anywhere, and inspect it in conversational context`, and `Carbon icons, not emoji`.
+
+And it closes on three diagnostics that lied, each caught only by measuring it: a
+`health.gagged` that had never existed; then `Two different gags wore the same word`, a
+`gagged` that meant a different fault from the one the rung was asking about; then a
+`solo_gagged` that read True with the station audible — `Sixty seconds, because at thirty
+the gagged light came on with the station audible`.
 
 ---
 

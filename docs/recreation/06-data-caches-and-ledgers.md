@@ -12,6 +12,7 @@ archive. Sizes are from 2026-09-08.
 | `conversations.jsonl` (1 MB), `feedback.jsonl` | every chat turn (`log_turn`), thumbs | chat → memory/context | keep |
 | `model_calls.jsonl` | one row per Ollama call: model, kind, ms, working/waiting, `prompt_eval_count/ms`, `eval_count/ms`, tinted | `airlog_model_call` → the airlog, the request book costs, the #1081 measurement | trimmed by `airlog_jsonl_trim` |
 | `airlog/*.jsonl` | what aired, when, who, the heat ring (GPU temp/load) | `airlog_append_bg` → the Gazette, `/api/airlog` | trimmed |
+| `script_ledger.jsonl`, `script_ledger_seq.json` | **the pillar**: the running order as WRITTEN, one row per scripted line, keyed `(block, ord)` — assigned once before the round is audible and never rewritten. The SFX guy is in it, at the position he was rolled into. Everything else in this table records what happened; this records what was going to | `script_ledger_commit` (from `_speak_turns_floorless`, before the weld goes to air) → `screenplay_compose`, the SCRIPT view | two days (`SCRIPT_LEDGER_KEEP_S`, 8 MB cap) — regenerable-but-lossy: wipe it and the hour reverts to being ordered by `air_at`, which is the thing it exists to replace |
 | `crystals.json`, `crystal_notes.json`, `crystals/` | the crystals and their notes/builds | the 🔮 cabinet | keep |
 | `minds/<id>/docs/` | each mind's documents (album lyrics from crystal extraction, topical minds) | extraction → `speakbox_reindex` | keep |
 | `speakbox/` (bind mount `../speakbox`) | the operator's own documents | operator → `speakbox_reindex` | keep |

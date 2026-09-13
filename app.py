@@ -27318,6 +27318,9 @@ def dj_state() -> dict[str, Any]:
     # predates this stamp reloads itself - the one cure the station could
     # never perform from its end.
     base["reload_at"] = int(_RADIO.get("reload_at") or 0)
+    # #1335: the terminal-restart stamp rides the same state the
+    # desktop already polls, exactly as reload_at does.
+    base["kiosk_kick"] = float(_RADIO.get("kiosk_kick") or 0)
     track = _RADIO.get("now") or {}
     elapsed = base.get("elapsed") or 0.0
     now = None
@@ -120367,6 +120370,11 @@ BROADCAST_STEPS: list[dict[str, str]] = [
             "when it holds the air (#1187). Turns them back on only if "
             "EVERY device is off, which is silence by construction.",
      "tone": "do"},
+    {"key": "kiosk", "label": "Restart the terminal app",
+     "say": "Force-stops and relaunches the tablet's kiosk. The one cure a "
+            "page reload cannot be - the WebView's network stack dies with "
+            "the app process, so reloading hands the new page the same "
+            "dead stack.", "tone": "do"},
     {"key": "floor", "label": "Take the floor back",
      "say": "A round that took the floor and never gave it back deadlocks "
             "every other one behind it (#1316). Nothing else the operator "
@@ -120758,6 +120766,28 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                 said.append("  turned %d switch(es) back on" % len(_off))
             except Exception as err:  # noqa: BLE001
                 said.append("  could not turn them on: %s" % err)
+
+    elif step == "kiosk":
+        # #1335: RESTART THE CLIENT, NOT ITS PAGE.
+        #
+        # A WebView reload will not cure the tablet's deaf net stack: the
+        # network service lives in the app process, so the new page is
+        # handed the same dead stack. That is measured and documented -
+        # which means rung 8 PAGES and rung 12 RELOAD are both no-ops
+        # against the fault this terminal is best known for, and both of
+        # them print as successes while being one.
+        #
+        # The station has no adb and no reach into the tablet; the desktop
+        # has both. So this stamps and the desktop acts - the same shape
+        # as pages_reload (#1207), which is how a flag on the far side of
+        # a process boundary gets reached at all.
+        said.append("$ restart the terminal app")
+        _RADIO["kiosk_kick"] = time.time()
+        changed = True
+        said.append("  stamped - a desktop with the tablet on adb will "
+                    "force-stop and relaunch the kiosk")
+        said.append("  the one cure a page reload cannot be: the net "
+                    "stack dies with the process")
 
     elif step == "floor":
         # #1331: TAKE THE FLOOR BACK.
@@ -185165,6 +185195,18 @@ async function fixRun(from) {
       step = 9;
     }
 
+    if (step <= 9) {
+      /* #1335: after PAGES, because a page reload is cheaper and is
+       * sometimes enough - and before DEEP, because a terminal whose net
+       * stack is dead will not answer anything the deep ladder asks it. */
+      try {
+        await api("/api/broadcast/fix/kiosk", {method: "POST"});
+        fixSay("9 TERMINAL  asked the desktop to force-stop and relaunch");
+        fixSay("            the tablet kiosk - the one cure a reload is not");
+      } catch (e) { fixSay("9 TERMINAL  the station would not answer"); }
+      step = 10;
+    }
+
     fixSay("            listening for eight seconds…");
     await new Promise((r) => setTimeout(r, 8000));
     health = await fixHealth();
@@ -185175,12 +185217,12 @@ async function fixRun(from) {
       return;
     }
 
-    if (step <= 9) {
+    if (step <= 10) {
       /* The whole triage tree: remembered cures, the box, routing, the
        * writer's lifeboat, the DJ rung, the deaf-device reboot. Slow on
        * purpose - and it keeps running server-side even if this request
        * gives up waiting, which is why a timeout here is not a failure. */
-      fixSay("9 DEEP      running the repair ladder - engines, the box,");
+      fixSay("10 DEEP     running the repair ladder - engines, the box,");
       fixSay("            routing, the writer. This takes a minute.");
       try {
         const got = await api("/api/broadcast/fix/deep", {method: "POST"});
@@ -185189,17 +185231,17 @@ async function fixRun(from) {
         fixSay("            still running at the station - it reports");
         fixSay("            into the repair log. Carrying on.");
       }
-      step = 10;
+      step = 11;
     }
-    if (step <= 10) {
+    if (step <= 11) {
       /* The only rung in the building that bounces xtts, ollama, comfy
        * or a sick container, and warms the music library. */
       try {
         await api("/api/broadcast/fix/steward", {method: "POST"});
-        fixSay("10 SERVICES census running - every sick service restarted,");
+        fixSay("11 SERVICES census running - every sick service restarted,");
         fixSay("            then counted again. Watch /api/steward.");
-      } catch (e) { fixSay("10 SERVICES the station would not answer"); }
-      step = 11;
+      } catch (e) { fixSay("11 SERVICES the station would not answer"); }
+      step = 12;
     }
 
     health = await fixHealth();
@@ -185210,24 +185252,24 @@ async function fixRun(from) {
       return;
     }
 
-    if (step <= 11) {
+    if (step <= 12) {
       const mark = fixMarkRead();
       if (mark && mark.reloaded) {
-        fixSay("11 RELOAD   already reloaded once this run - moving on");
+        fixSay("12 RELOAD   already reloaded once this run - moving on");
       } else {
-        fixSay("11 RELOAD   reloading this page - the one cure the station");
+        fixSay("12 RELOAD   reloading this page - the one cure the station");
         fixSay("            cannot perform from its end. Back in a moment.");
-        fixMarkWrite({at: Date.now(), step: 12, reloaded: true,
+        fixMarkWrite({at: Date.now(), step: 13, reloaded: true,
                       lines: fixLines.slice(-40)});
         setTimeout(() => { try { location.reload(); } catch (e) {} }, 1200);
         return;
       }
-      step = 12;
+      step = 13;
     }
-    if (step <= 12) {
-      fixSay("12 RESTART  restarting the station process - about twenty");
+    if (step <= 13) {
+      fixSay("13 RESTART  restarting the station process - about twenty");
       fixSay("            seconds of silence, then every page reconnects.");
-      fixMarkWrite({at: Date.now(), step: 13, reloaded: true,
+      fixMarkWrite({at: Date.now(), step: 14, reloaded: true,
                     restarted: true, lines: fixLines.slice(-40)});
       try { await api("/api/broadcast/fix/restart", {method: "POST"}); }
       catch (e) { /* the process is going down; a dropped reply is normal */ }

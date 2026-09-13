@@ -205,3 +205,13 @@ silencing the show.
 Every aired line is written into `_RADIO["chat"]` — the booth log — with its
 id, who said it, the voice, when it will actually be audible (`air_at`, not
 when the batch was written), and its dossier.
+
+That is the **transcript**, and it is not the script. `air_at` is written by
+eight different paths and rewritten after a line has aired, so it records
+*when* well enough and cannot be trusted for *order*. The order is written
+down separately and earlier: `script_ledger_commit` records the running order
+as `(block, ord)` from `_speak_turns_floorless`, at the moment the round is
+welded and can no longer change but before a sample of it is audible. Two
+ledgers, two questions — the booth log answers "what was said", the script
+ledger answers "in what order it was going to be", and only the second can be
+read forwards. See `docs/notes/script-ledger-and-the-reading-order.md`.

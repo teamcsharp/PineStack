@@ -71,8 +71,12 @@ a flag, check it still exists before acting on it.
 - [Why the feed shows fragments](why-the-feed-shows-fragments.md) — dj_start() wipes _RADIO["chat"]; stalling box -> dead air -> 3 strikes -> self-restart -> feed emptied (measured: 1 hour of history down to 3 min); and 64% of feed 'prepared' rows are banked shelf material
 - [Airings are the meter](airings-are-the-meter.md) — operator's rule: work expires by AIRINGS not time; 0 airings = no time expiry (#1180), news excepted; the shelf stays bounded by caps, not clocks
 - [Answerable orchestrator asks](answerable-orchestrator-asks.md) — #1181: answers DO land; prefer≠drive, short-horizon news is not a shortage, and a pin with no door
-- [Audio owner and the play switch](audio-owner-and-the-play-switch.md) — #1008 solo gate + #1161 terminals: check `play` FIRST; the stale-delivery sampling trap
+- [The cupboard must be heard](the-cupboard-must-be-heard.md) — #1260: the pile had no consumer (55 finished rounds unheard to 103h); and a rung that waits for a free floor never runs here (floor held 248s)
+- [The memo gets through](the-memo-gets-through.md) — #1261/#1262: entry_own_aired credited calls and stings to the manager; a banked round has NO turn boundary left to cut, so claim the next round instead of fighting for the floor
+- [Dead air has a named frame](dead-air-has-a-named-frame.md) — gap_log.jsonl carries cause + stall_top (who blocked the loop); baseline 858 s/h; never quote a rate from a window containing a restart
+- [Audio owner and the play switch](audio-owner-and-the-play-switch.md) — #1008 solo gate + #1161 terminals: check `play` FIRST; the stale-delivery sampling trap; #1332 the owner that polls but never acks (OWNER_DEAF_SECONDS), and `gagged` vs `solo_gagged`
 - [Every fix becomes a tool](every-fix-becomes-a-tool.md) — operator's standing rule: every hand-applied cure must become a rung the orchestrator can press itself
 - [The pause that gags the page](pause-gags-the-page.md) — flags living in the tab that no restart can reach; `published` != heard; a paused station is not a wedge
 - [Silent fallbacks hide exceptions](silent-fallbacks-hide-exceptions.md) — #1219: an UnboundLocalError invisible for two days; force the road with air-now, and date regressions by clip_media share
-
+- [The script ledger and the reading order](script-ledger-and-the-reading-order.md) — #1330/#1333: data/script_ledger.jsonl, (block, ord) written once at commit; air_at could never order a script (104 of 129 ids moved, median 88s); no block/ord = unscripted, and that absence is a signal
+- [The chrome cannot see the panel](the-chrome-cannot-see-the-panel.md) — the script highlight's audio scan ran in the Electron chrome and the players live inside the `<webview>`, so it returned null 100% of the time; stale must read as absent

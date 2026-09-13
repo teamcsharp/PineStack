@@ -461,7 +461,21 @@ show played three times, a few hundred milliseconds apart**.
 
 `#1008` (app.py:25001) gives ONE listener the air; every other page gags itself
 in `pineSoloGate` (app.py:154557), and an owner that stops polling releases it
-after `AUDIO_OWNER_LIFE` (90 s), so this can never leave the house silent.
+after `AUDIO_OWNER_LIFE` (90 s).
+
+That "stops polling" is doing more work than it looks, and it has been wrong
+twice. `#1187` added the second release condition: a device whose row says
+`play=false` may not keep, recover, or be given the air, because holding the
+exclusive while refusing to sound silences everything. `#1332` added the
+third, and it is the one that shows why "can never leave the house silent"
+was too strong — a device can have `play=true`, poll perfectly, and still
+acknowledge **nothing**. Measured: a freshly launched desktop held the air
+that way while two tablets that had played 52 and 50 clips sat muted 75 and
+74 times each, waiting for it. Polling is not consuming. An owner that holds
+the air for `OWNER_DEAF_SECONDS` (75 s) having taken no clip at all now loses
+it, and is refused re-entry for `OWNER_DEAF_REST` (300 s) — because without
+that it simply claimed it back on the next poll and the house went quiet for
+another seventy-five seconds, over and over.
 
 ```
 GET  /api/radio/listeners   the roster, plus audio_owner
@@ -1598,6 +1612,43 @@ scripted; one that does not (a rescue sting, an emergency filler, a record,
 an advert, a call) was not, and keeps its clock slot. That absence is a
 useful signal, not a gap.
 
+**And it reads downwards.** The first cut of that merge gave every row of a
+block ONE sort time — the block's earliest — and put unledgered events after
+it by their own clock. That keeps a conversation together and it is wrong,
+because a block is not an instant: anything that happened *during* a round
+sorted to the far side of it. Measured on the live hour: **15 backward pairs
+in 365, worst 93.3 s**, and every single one the same shape — `dialogue (in a
+block) → action (unledgered)`. A sting thirty seconds into a round was drawn
+after the round ended, so the stamps read 08:14:53, 08:14:56, … 08:16:26,
+then 08:14:53 again.
+
+So a block carries no single time. Each row keeps its own, and the written
+order is held by making those times **monotone** across the block: walking in
+`ord`, each row sits at `max(its own stamp, the previous one + a hair)`.
+Where the clock agrees with the script nothing moves at all; where `air_at`
+was rewritten backwards the row is nudged just far enough to stay behind the
+line it followed. Everything then sorts on one axis, so an interjection lands
+where it actually interrupted.
+
+After: **0 backward pairs in 558 elements**, 0 order inversions inside a
+block, 23 of 23 SFX guy rows still inside their conversation, and 47
+unledgered events now sitting *inside* a block — which is the point, because
+that is where they happened.
+
+> A script is read downwards. Holding a conversation together is worth
+> nothing if it throws the reader up and down the page to do it.
+
+**What the action lines say.** A record entry reads *"A record is spinning:"*
+while that record is on the deck and *"A record drops:"* once it has
+finished, and carries a `playing` flag the panel tints from. Before that the
+two read identically, so a record that began forty seconds ago looked exactly
+like one that finished an hour ago — which is what made a script that had
+simply not caught up with a track change look like one that had skipped it.
+The entry is never queued ahead: `_music_log_append` writes the row when the
+record *starts*, so an entry here always describes a record already turning.
+The lag it was hiding is the composition cache (20 s) plus the client's own
+rest (20 s).
+
 ---
 
 ## 20. Building something new for this tablet
@@ -1693,14 +1744,15 @@ station pays for almost none of this.
 | 3 | UNGAG | Local: drops this page's own hold, bumps the voice epoch, restarts the player |
 | 4 | FLOOR | Takes the floor back from a hold that has gone silent |
 | 5 | FLUSH | Advances the feed epoch — every page abandons the clip it cannot start |
-| 6 | RELEASE | Releases the audio exclusive so every player may sound |
-| 7 | DEVICES | Reads every device's out-loud switch; turns them on only if **every** one is off |
+| 6 | DEVICES | Reads every device's out-loud switch; turns them on only if **every** one is off |
+| 7 | RELEASE | Releases the audio exclusive so every player may sound |
 | 8 | PAGES | Asks **every** page in the house to reload, not just this one |
+| 9 | TERMINAL | Force-stops and relaunches **the tablet's kiosk** — the one cure a page reload cannot be |
 |   | *listens for eight seconds* | |
-| 9 | DEEP | The whole repair tree: engines, the box, routing, the writer's lifeboat, the deaf-device reboot |
-| 10 | SERVICES | Steward census — restarts xtts, ollama, comfy, a sick container; warms the music library |
-| 11 | RELOAD | Reloads this page, and resumes the ladder afterwards |
-| 12 | RESTART | Restarts the station process. About twenty seconds of silence |
+| 10 | DEEP | The whole repair tree: engines, the box, routing, the writer's lifeboat, the deaf-device reboot |
+| 11 | SERVICES | Steward census — restarts xtts, ollama, comfy, a sick container; warms the music library |
+| 12 | RELOAD | Reloads this page, and resumes the ladder afterwards |
+| 13 | RESTART | Restarts the station process. About twenty seconds of silence |
 
 ### Five of those rungs were unreachable before #1331
 
@@ -1729,13 +1781,73 @@ Worth knowing, because each one was a night:
   It is the cure for the deadlock that put the station off the air for six
   minutes with 134 finished rounds sitting on the shelf.
 
-RELEASE had a fifth, quieter problem: it read `health.gagged`, and
-`/api/broadcast/health` never returned that key. In JavaScript a missing key
-is `undefined`, so the condition collapsed to `!health.holding_the_air` — it
-fired only when *nobody* held the air, which is the one case where releasing
-does nothing, and was skipped whenever a page really was holding the exclusive
-and gagging the others. That is the tablet fault in §19.1's neighbourhood, and
-the rung written for it had never once run.
+RELEASE had a fifth, quieter problem, and it took three goes to kill.
+
+It read `health.gagged`, and `/api/broadcast/health` never returned that key.
+In JavaScript a missing key is `undefined`, so the condition collapsed to
+`!health.holding_the_air` — it fired only when *nobody* held the air, which is
+the one case where releasing does nothing, and was skipped whenever a page
+really was holding the exclusive and gagging the others. The rung written for
+that fault had never once run.
+
+Adding the key was not enough. `page_wedge_state`'s `gagged` means the page
+holding the air **stopped polling**; the live fault was the opposite — an
+owner polling happily while muting the whole house. So the rung was still
+skipped, through 317 seconds of silence, with `gagged=False` and triangulate
+saying `gagged` on every poll. Two genuinely different faults wearing one
+word. They are reported separately now: `gagged` keeps its meaning and
+`solo_gagged` carries triangulate's.
+
+Then the gate went altogether. There is nothing left to gate on — every
+branch above returns the moment sound is heard, so the ladder only *arrives*
+at RELEASE when nothing is being heard, and releasing is right at that point
+whatever the reason. The old else-branch said "the air is held by a page that
+is answering — left alone", and a page that is ANSWERING is not a page that
+is being HEARD. That distinction is the entire reason this endpoint exists.
+
+> Three diagnostics in a row, each one fixed and each one still lying. The
+> fix is never done until it has been watched against the real fault.
+
+### The rung that exists because of §19.1
+
+For a long time the ladder's entire client-side vocabulary was `fixUngag()`
+— this tab only — and a page reload. Against the fault documented in §19.1
+that is nothing: the WebView's network service lives in the app process, so
+a reload hands the new page **the same dead stack**. Two of the rungs were
+therefore no-ops on this tablet, and both printed as successes.
+
+`9 TERMINAL` is the cure §19.1 already names. The station has no adb and no
+reach into the tablet; the desktop app has both. So the station *stamps*
+`kiosk_kick` onto the state the desktop is already polling, and the desktop
+runs `am force-stop` then `am start` — the same shape as `reload_pages`,
+which is how a flag on the far side of a process boundary gets reached at
+all.
+
+It acts only on a **new** stamp, so a station restart — which re-sends the
+last value — cannot put the tablet into a restart loop.
+
+> Everything before this could reload a client. Nothing could restart one.
+
+### And it could not reach its own rung nine
+
+`reload_pages` stamps `_RADIO["reload_at"]`; every open page sees it on the
+next poll and reloads 0.8–4.8 s later — **including the operator's own**. The
+run was sitting in the eight-second wait with no resume mark written, so
+`fixResume` found nothing and it simply ended. DEEP, SERVICES, RELOAD and
+RESTART never ran, and the transcript's last line read *"8 PAGES asked every
+page in the house to reload itself"*, which looks exactly like success.
+
+That is why the deep repair had to be run by hand against a live wedge: the
+button could not reach its own rung 9. The mark is now written **before** the
+reload is asked for.
+
+Two more from the same audit. **ON AIR never touched the switch** —
+triangulate returns `off_air → onair` when `_RADIO["on"]` is false, and the
+step only ever looked at `radio_paused()`, so the one cure named for a
+switched-off station changed nothing. And **DEVICES now runs before
+RELEASE**, because for the `#1187` fault they are cause and symptom:
+releasing first hands the exclusive to a second device whose switch is also
+off, so the "sound is back" check could never pass.
 
 > **A cure the operator cannot reach during the fault it cures is not a cure
 > the station has.** Four of these existed as working code for months.

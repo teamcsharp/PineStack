@@ -1,6 +1,6 @@
 # Commit log
 
-All 489 commits in order, oldest first, grouped by day. This is the project history as
+All 608 commits in order, oldest first, grouped by day. This is the project history as
 it was developed, before it was published here; the initial commit and the merge that
 attached it are not listed. The narrative that runs through it is in
 [HISTORY.md](../HISTORY.md).
@@ -580,3 +580,125 @@ attached it are not listed. The narrative that runs through it is in
 - `ce53512` The line that was read 385 lines before it was written
 - `c4c9e53` A 625 MB JSON parse on the event loop, once per restart
 - `b2d353f` The debt paid to the road that earned it, and the binding shown
+- `65c1ebe` The chronicle: ten eras, 489 commits, and the notes underneath them
+- `3f383d6` The clock was deep-copying a whole slot, many times a second
+- `aa73ba9` The topic bank was exhausted, so the station cooks its own
+- `91b42e7` An hour's unheard work was locked out of the next hour
+- `7db4b27` A purity test that was a coin flip, and the census that found it
+- `721ef50` The SFX Guy gets a dial, a voice in the silence, and the topics board
+- `8afd565` A record playing is not the SFX Guy's problem
+- `cbc58bd` Taking a reservation copied the whole ledger to change one row
+- `79340d1` Who actually took the entry's window, and a grace period that ends
+- `623b6ae` And the stock count must still be what would go out
+- `8157013` The three modules app.py imports and the repository did not have
+- `9a5368d` The desktop app: 49 files the tracked index.html already asked for
+- `ae4ed79` Tests, tools, stylesheets and notes that were never tracked
+- `459d365` The Library's PDF reader, the craft prompts, and the eight phrases
+- `4af5e69` The transcriber, and HEAD finally matches the file that is running
+- `80165ad` The station's working repository and its published one, made one
+- `b222931` The repair button triangulates: the tablet was gagged, not broken
+- `c4e30e2` The tablet's timers were frozen, and the air stayed with its ghost
+- `5740d16` The draw walked 7,180 clips twice every three seconds
+- `1060d8a` The topic said out loud, and the manager bringing one downstairs
+- `db44a9a` The SFX Guy gets his own watch, the joins, and a gate that let him work
+- `b38014c` A watchdog that awaits the thing it watches is not a watchdog
+- `c4d3c7d` The popups answer in a quarter second, and the slideshow reaches the tablet
+- `b7cf20d` The speakbox walked the share on the event loop, once per document
+- `b0730cf` The sampler keeps the last two minutes of air, and a pad can be cleared, tuned or carried away in a kit
+- `f1812dc` Every clip is allowed, and the draw goes round all of them
+- `4c52926` The clip-length dial had no door, so lifting the ceiling changed nothing
+- `7518fae` A playhead across the sampler, a kit an MPC can open, and a take you can widen after the fact
+- `e141a0c` The slideshow stops sending 3.7 MB pictures, the desk answers under the thumb, and Listen grows a grab pad
+- `51564f2` The music ducks for anything that talks, a pad silences the radio outright, and three taps keep the last two lines
+- `7356dcd` A skipped book was never settled, so the shelf read it for ever
+- `ce8bafc` The sampler opens the way you left it, the records join the feed, and a carried row is a tile
+- `6374888` The MPC's card opens on the tablet, and a kit on it loads back onto the pads
+- `4353b84` Two voices were doing 65% of the callers
+- `753925f` A pad grab takes the voices, not the room - and nothing was ever recorded twice
+- `28fa594` One record in the feed, and the line on air goes back above it
+- `7465e36` The stream was in order; the document describing it was not
+- `392d73f` The script's own sequence decides, not a timestamp
+- `ec52a41` Double-tap the script and read it properly
+- `dd4c895` A pause is when to build hardest, and a script you can actually read
+- `898f15e` The sampler gets a face: a gallery backdrop, waveforms on the pads, three knobs and an edit sheet
+- `5acac67` The recap entry had never once been filled
+- `d4e1e35` The sampler tab opens again, and the pad grid cannot be squeezed out by the next child
+- `de41a05` Only one line is being said, so only one may be marked
+- `f90a55d` The reel airs a conversation that has no name, so the script cannot place it
+- `e2e09a3` An interjection is not a change of scene
+- `a689a69` Hold a line on any script screen, and it offers to play it as well
+- `072a422` The desktop follows the share while it runs, and the staleness mark stops lying
+- `8b2e528` The highlight kept its own clock, and its own clock was always behind
+- `3b587dc` The reading does not end because the hour did
+- `fdaedd7` The sampler feed keeps its rows, so you can scroll back and grab what just played
+- `7e0d280` A mark that did not happen is not remembered
+- `91eb43c` And the page goes and gets the line it cannot find
+- `0b7c33b` +5 steps the feed back five entries at a time, because scrolling to them was not realistic
+- `06083c6` A single tap does nothing, and that is the point
+- `cee4d92` Three buttons that reach the tablet's glass, and a window to draw on what they bring back
+- `13acca9` The script is kept, not rebuilt
+- `2237803` The clip gets sound, an export dialog to cut and mix it, and Asked-for folds away
+- `6ae5561` A conversation is anchored on the one stamp that is never rewritten
+- `c618367` The feed stops being cut off, and the picture follows the trim handles
+- `cb83d02` One line, one clip, one measured window
+- `69b9bbb` Notices can be switched off per screen, and Later means the orchestrator takes it
+- `6f16e24` The three chunkers are one chunker, or the bank misses
+- `f49db75` The capture buttons follow whichever device is mapped, and x264 stops refusing odd windows
+- `6ec5986` The line menu closes when you press it, and each choice wears a mark
+- `0abc1fe` Carbon icons, not emoji
+- `78a732a` The terminal finds the station from outside the house
+- `5586bd7` The hour that is over is fetched once, not on every poll
+- `16b4bcd` The player knows where it is. Ask it, not a clock.
+- `38b5dbd` The feed marks the line that is sounding, and its rows stop lying
+- `4448e48` DGX Terminal: a shell on the Spark, and the three bugs between here and typing
+- `48327f3` One timeline, computed once, served to every surface
+- `2a3f9c5` Restore app.py: the previous commit captured a half-written file
+- `d358101` One timeline computed once, and a line named before it is spoken
+- `1f4ca5c` The cupboard is heard, the memo gets through, and the sheet is measured
+- `625f1f5` Segments that fold, names that do not move, and a feed with a memory
+- `48a3486` The blank moment was the sample library being walked on the air path
+- `a5faa2d` Restore the parallel session's #1277 and re-apply the sample index on top
+- `7310512` Stop asking expensive questions at a rate nothing needs
+- `80f3f65` Match the file that is sounding, and stop the feed's treadmill
+- `0935c00` A line that has been heard sounded when it sounded
+- `168caf4` Commit the working tree so HEAD matches the container
+- `ee6e8f8` The command is performed where you chose it, and two bugs it uncovered
+- `2ad822e` The feed's memory must not cost the loop anything
+- `ac17970` Recap can air, recap knows what was discussed, and the mark stops dragging the page
+- `3029e45` Reading the settings must not wait behind writing them
+- `ea9ec84` The script reads one to one, and the readers stop blocking the air
+- `a058b61` The clip lands where it happened, and the hand-off is shown
+- `432b8eb` #1300b the heading answered the question before its members asked it
+- `83c2d08` Silence outranks the interval, and the clips library answers dead air
+- `c7a5b3c` The door says why, the meters share the graph, and a video on the thumb
+- `0ac6a23` The screenshot knows what is in it, and the marks are sized for the picture
+- `01e78b5` A webcam icon on the desk, and the annotation defaults stop lying about size
+- `6eea0d9` The lineage gets a chart, and the whole round is one parameter away
+- `2b1b6d8` The video actually plays: a cue road, a set that is seen, a clip that loads
+- `5a80b2c` The camera gets a window of its own, streamed from the tablet
+- `66ff56a` A line nobody heard stops standing in front of the ones they did
+- `f01137d` A pad that holds a video pops the video
+- `e3039a2` Clean then fill then enlarge, a door ComfyUI can find, and a countdown
+- `e5cbda2` Stopping gives a shorter clip, and the export says what colour it is
+- `d7265a6` The picture waits for the seek, and "not running" stops being a guess
+- `98dd232` The video button was working, refusing, and saying so where nobody could see
+
+## 2026-09-13
+
+- `f322f7d` Every chunk opens up, says whether it reached the prompt, and can be cut
+- `c986558` A swath is cut by its lines, and the X now reaches every draw road
+- `43058ea` The picture could not be fetched because the pictures before it never let go
+- `5d36e39` Right-click any line anywhere, and inspect it in conversational context
+- `97c2918` Change the line from the window you inspected it in
+- `78547d0` Silence loses: the rescue stops asking the floor for permission
+- `06a6bc6` Long-press any line on the tablet, and inspect it there
+- `ee2984f` There was already an inspect:play, and two of them stop the app booting
+- `51f62b8` The terminal's deaf-watch, mirrored into the renderer
+- `0f63631` A leading slash meant the disk, and a timeout now says what to do about it
+- `2aecf6e` The script is written down before it is heard, and the chrome can finally hear the panel
+- `7f09076` One tap now reaches every cure the station owns, and RELEASE finally runs
+- `737dc59` The out-loud switch is a cure too, and the ladder now counts to twelve
+- `8b065ab` Two different gags wore the same word, and RELEASE stopped asking permission
+- `4158184` A script is read downwards, and an owner that takes nothing loses the air
+- `f91a38d` Sixty seconds, because at thirty the gagged light came on with the station audible
+- `c1c0129` The ladder could not reach its own rung nine, and ON AIR never touched the switch

@@ -64,7 +64,7 @@ The station is developed in a working repository on the house share, on a branch
 single merge — nothing was rewritten, so every one of the 489 commits keeps its original
 author, date and hash.
 
-The history here is current as of `b2d353f` (2026-09-12). To push later work up from the
+The history here is current as of `c1c0129` (2026-09-13). To push later work up from the
 working repository, teach it about this one *once*, so the two branches share a tip:
 
 ```sh
