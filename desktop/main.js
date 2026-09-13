@@ -1497,13 +1497,31 @@ function regionAudio(region) {
       what: "the recording" };
   }
   /* NOTHING STORED YET, so ask the booth to cut it. This is the road the
-   * sampler already uses, and `whole=1` is what "the entire playthrough of
-   * that script" means - the welded round rather than the one turn. */
+   * sampler already uses. */
   if (region.id) {
     return { url: base + "/api/booth/clip?line=" + encodeURIComponent(region.id),
       what: "this line, cut by the booth", cuttable: true };
   }
   return null;
+}
+
+/**
+ * THE WHOLE ROUND THIS LINE CAME FROM.
+ *
+ * "Right click the script line and choose to download the entire playthrough
+ *  of that script that took place."
+ *
+ * `whole=1` is the station's own word for it: the booth answers with the
+ * surrounding WELDED round rather than the single turn, which is the thing
+ * that was actually said around this line in one file. No new route - only
+ * a parameter, and a label that does not pretend it is the same as the line.
+ */
+function roundAudio(region) {
+  const cfg = readConfig();
+  const base = String(cfg.baseUrl || "").replace(/\/+$/, "");
+  if (!region || !region.id) return null;
+  return { url: base + "/api/booth/clip?line=" + encodeURIComponent(region.id)
+    + "&whole=1", what: "the whole round it came from" };
 }
 
 ipcMain.handle("inspect:play", (_event, region) => {
@@ -1523,9 +1541,12 @@ ipcMain.handle("inspect:play", (_event, region) => {
   }
 });
 
-ipcMain.handle("inspect:download", async (event, region) => {
+ipcMain.handle("inspect:download", async (event, region, options) => {
   const { dialog } = require("electron");
-  const heard = regionAudio(region);
+  /* One line, or the whole round it sat in - different lengths of the same
+   * recording, so they are asked for separately and named apart. */
+  const heard = (options && options.whole)
+    ? roundAudio(region) : regionAudio(region);
   if (!heard) return { ok: false, why: "there is nothing to download for this one" };
   try {
     const response = await fetch(heard.url, { headers: authHeaders() });
@@ -1538,7 +1559,8 @@ ipcMain.handle("inspect:download", async (event, region) => {
     const type = String(response.headers.get("content-type") || "");
     const ext = type.includes("wav") ? "wav" : type.includes("mpeg") ? "mp3"
       : (heard.url.match(/\.(mp3|wav|m4a|ogg)\b/i) || [, "mp3"])[1];
-    const name = (region.who || region.kind || "line") + "-"
+    const name = (region.who || region.kind || "line")
+      + ((options && options.whole) ? "-round-" : "-")
       + String(region.id || "").slice(0, 8);
     let folder = app.getPath("music");
     try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
@@ -1585,6 +1607,61 @@ ipcMain.handle("inspect:deep", async (_event, region) => {
     out.why = error.message;
   }
   return out;
+});
+
+/* HOW A LINE CAME TO BE, in a window of its own.
+ *
+ * The provenance is fetched HERE rather than in the editor, so the window
+ * opens with its facts already in hand - a chart that draws itself empty and
+ * then fills in is a chart somebody screenshots halfway. */
+const flowWaiting = new Map();
+
+ipcMain.handle("inspect:flow", async (_event, region) => {
+  const cfg = readConfig();
+  const base = String(cfg.baseUrl || "").replace(/\/+$/, "");
+  let provenance = null;
+  let why = "";
+  if (region && region.id) {
+    try {
+      const response = await fetch(base + "/api/dj/provenance/"
+        + encodeURIComponent(region.id), { headers: authHeaders(cfg) });
+      if (response.ok) provenance = await response.json();
+      else if (response.status === 404) {
+        why = "The booth keeps a line's paperwork only while it is in the live "
+          + "ring, and this one has passed out of it - the chart below is what "
+          + "the feed still knows.";
+      } else why = "The station said " + response.status + ".";
+    } catch (error) { why = error.message; }
+  }
+
+  const window_ = new BrowserWindow({
+    width: 1180,
+    height: 720,
+    minWidth: 720,
+    minHeight: 480,
+    title: "How it came to be",
+    icon: path.join(__dirname, "assets", "pinebox.ico"),
+    backgroundColor: "#0d1217",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+  window_.setMenuBarVisibility(false);
+  const flowId = window_.webContents.id;
+  flowWaiting.set(flowId, { region, provenance, why });
+  window_.on("closed", () => flowWaiting.delete(flowId));
+  window_.loadFile(path.join(__dirname, "renderer", "script-flow.html"));
+  return { ok: true, had: !!provenance, why };
+});
+
+ipcMain.handle("flow:pending", (event) => {
+  const held = flowWaiting.get(event.sender.id);
+  if (!held) return { ok: false, why: "there is nothing waiting for this window" };
+  return { ok: true, region: held.region, provenance: held.provenance,
+    why: held.why };
 });
 
 ipcMain.handle("shot:save", async (event, dataUrl) => {

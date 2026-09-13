@@ -65138,6 +65138,8 @@ async def _sfx_pool_refresh() -> None:
         _SFX_SEEN.update(seen)
         publish(tuple(pool))
         _SFX_POOL_AT[0] = time.time()
+        # #1306c: and kicked from here as well as at startup, so the
+        # cold window is as short as the share allows.
         # #1303c: WARM THE VIDEO LIST HERE, in this same worker thread.
         # The operator's button must be instant - "the SFX guy should
         # be on the ball with it" - and a memo that is cold on the
@@ -65531,7 +65533,60 @@ def _sfx_any() -> Path | None:
 
 
 # #1303c: the airable video clips, built once per pool version.
-_SFX_VIDEO_MEMO: dict[str, Any] = {"key": None, "pool": []}
+_SFX_VIDEO_MEMO: dict[str, Any] = {"key": None, "pool": [], "at": 0.0}
+# #1306c: one build at a time. Four taps after a restart ran four
+# twenty-eight-second share walks on top of each other.
+_SFX_VIDEO_BUILDING = [False]
+# #1306d: a build costs half a minute of share I/O, so it is rested
+# rather than tied to the pool keeper's minute.
+SFX_VIDEO_REST_S = 600.0
+
+
+def _sfx_video_key() -> tuple:
+    """What the video list actually depends on.
+
+    #1306d: this used to include _SFX_POOL_AT[0] and
+    len(_SFX_POOL_CACHE). The first is rewritten at the end of every
+    pool refresh and a refresh fires whenever the pool is sixty
+    seconds old, so the key went stale once a minute; the second
+    changes dozens of times DURING a walk, because the refresh
+    publishes progressively. Between them they turned a memo into a
+    twenty-eight-second share walk every minute, for ever.
+
+    The list depends on which files exist and which are banned. Bans
+    are cheap and are a real dependency - a banned clip must stop
+    being offered at once. Everything else is handled by the rest."""
+    return (len(sfx_bans()),)
+
+
+def sfx_video_warm() -> bool:
+    """True if the video list can be read without a share walk."""
+    if _SFX_VIDEO_MEMO["key"] != _sfx_video_key():
+        return False
+    if not _SFX_VIDEO_MEMO["pool"]:
+        return False
+    return (time.time() - float(_SFX_VIDEO_MEMO.get("at") or 0)
+            < SFX_VIDEO_REST_S)
+
+
+def sfx_video_kick() -> None:
+    """Build it in the background, once, and never wait for it here."""
+    if _SFX_VIDEO_BUILDING[0] or sfx_video_warm():
+        return
+
+    def _go() -> None:
+        _SFX_VIDEO_BUILDING[0] = True
+        try:
+            _sfx_video_pool()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _SFX_VIDEO_BUILDING[0] = False
+
+    try:
+        fire_and_forget(asyncio.to_thread(_go))
+    except Exception:  # noqa: BLE001
+        _SFX_VIDEO_BUILDING[0] = False
 
 
 def _sfx_video_pool() -> list[Path]:
@@ -65547,15 +65602,15 @@ def _sfx_video_pool() -> list[Path]:
     pool's own refresh stamp, so a repointed pack rebuilds it and
     nothing else does. Never walk the share inside something somebody
     is waiting on - #826, #1199 and #1265 all say so already."""
-    banned = sfx_bans()
-    key = (_SFX_POOL_AT[0], len(_SFX_POOL_CACHE), len(banned))
-    if _SFX_VIDEO_MEMO["key"] == key and _SFX_VIDEO_MEMO["pool"]:
+    if sfx_video_warm():
         return list(_SFX_VIDEO_MEMO["pool"])
+    banned = sfx_bans()
     pool = [p for p in sfx_all()
             if sfx_is_video(p) and sfx_short(p)
             and sfx_id(p) not in banned
             and not sfx_is_silent(p)]
-    _SFX_VIDEO_MEMO.update({"key": key, "pool": list(pool)})
+    _SFX_VIDEO_MEMO.update({"key": _sfx_video_key(), "pool": list(pool),
+                            "at": time.time()})
     return pool
 
 
@@ -120477,6 +120532,95 @@ async def sfx_fill_now_api(
                 _PAGE_AIR_UNTIL[0] or 0) - time.time() > 1.5 else
             str(_SFX_GAP.get("talk_why") or "")
             or "no clip or prepared line was free"))}
+
+
+@app.post("/api/sfx/video/cue")
+async def sfx_video_cue_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1306: put a random video on the set NOW, and say which.
+
+    The operator's thumb, and nothing between it and the picture.
+    dj_sting's road worked (#1303) and cost 4.6-5.7s warm, none of it
+    the pick: it writes the chat row, writes the history to disk,
+    probes the length, signs the media and then walks the whole
+    satellite/own-tail/announce decision - which a video never uses,
+    because #1263 sets to_box=False for anything with a picture and
+    the page's CRT set is the only thing that plays it.
+
+    So this does the one thing that has to happen before the picture
+    can start - put the clip in the ring the set polls - and hands the
+    clip back so the set can start it without waiting for its own next
+    poll. The bookkeeping goes behind the answer.
+
+    No broadcast lead. The lead exists so a picture does not jump the
+    line it punctuates; this picture IS the event.
+
+    `id` rides along because the operator's window wants to inspect,
+    weight or delete the clip, and all three of those doors are
+    addressed by the sfx id."""
+    require_auth(authorization)
+    body = payload or {}
+    # #1306c: NEVER WAIT FOR THE LIBRARY TO WARM.
+    #
+    # The first build is a 28-second walk of the share (measured), and
+    # the keeper has to read the pool before it can happen at all - so
+    # for a minute or two after a restart the list is cold. A tap in
+    # that window used to run the walk inside the request; four taps
+    # ran four of them, and all four returned nothing at 30s. A button
+    # under the operator's thumb must answer.
+    if not sfx_video_warm():
+        sfx_video_kick()
+        return {"ok": False, "clip": None, "warming": True,
+                "say": "the clip library is still warming - tap again in "
+                       "a moment"}
+    pick = await asyncio.to_thread(_sfx_any_video)
+    if pick is None:
+        return {"ok": False, "clip": None,
+                "say": "no video clip is free - the library has none short "
+                       "enough, unbanned and carrying sound"}
+    key = sfx_id(pick)
+    signature = media_sign(key)
+    seconds = round(sfx_seconds(pick), 2)
+    stamp = int(time.time() * 1000)
+    clip = {
+        "url": f"/sfx/{key}?t={signature}",
+        "text": "", "sting": pick.stem,
+        "video": True, "seconds": seconds,
+        "id": key,
+        # #1306: NOW, not a lead ahead of now.
+        "broadcast_ms": stamp,
+    }
+    try:
+        page_feed_append(dict(clip))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "clip": None,
+                "say": "the set's own ring refused it: " + type(exc).__name__}
+
+    # Everything below is the record, not the broadcast, so it happens
+    # behind the answer the thumb is waiting on.
+    def _after() -> None:
+        try:
+            _RADIO["chat"].append({
+                "ts": int(time.time()), "air_at": time.time(),
+                "who": "board", "kind": "sfx",
+                "text": pick.stem, "sfx": key,
+                "sfx_dir": pick.parent.name or "sfx",
+                "video": True, "seconds": seconds,
+                "url": clip["url"], "aired": "airing",
+            })
+            del _RADIO["chat"][:-240]
+            note_activity("sting", pick.stem)
+            sfx_history_add(pick, str(body.get("who") or "operator"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        fire_and_forget(asyncio.to_thread(_after))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "clip": clip, "say": pick.stem + " is on the set"}
 
 
 @app.get("/api/sfx/anxiety")

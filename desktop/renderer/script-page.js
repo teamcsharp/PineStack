@@ -395,12 +395,24 @@
       say(text);
       setTimeout(function () { btn.classList.remove('sp-fired-bad'); }, 2600);
     }
-    api().post('/api/sfx/fill',
-      {road: 'video', why: 'the operator asked for a video'}
-    ).then(function (got) {
-      var went = String((got && got.went) || '');
-      if (went) done((got.clip ? got.clip + ' - ' : '') + 'on the set');
-      else done(String((got && got.say) || 'the air refused it'), true);
+    /* #1306: the CUE road, not the fill road. dj_sting's path cost
+       4.6-5.7s warm, none of it the pick - the chat row, the history
+       write, the length probe and the whole satellite/announce
+       decision a video never uses. This rings the clip and hands it
+       straight back, and the set cuts to it here rather than waiting
+       out its own 2.5s poll. Rapid taps therefore cycle. */
+    api().post('/api/sfx/video/cue', {who: 'operator'}).then(function (got) {
+      var clip = got && got.clip;
+      if (!clip) { done(String((got && got.say) || 'no clip'), true); return; }
+      var cut = false;
+      try {
+        if (root.PineSfxTv && root.PineSfxTv.cut) {
+          cut = root.PineSfxTv.cut(clip);
+        }
+      } catch (err) { cut = false; }
+      /* Not an error if the set is not on this surface - the clip is in
+         the ring either way and whatever is watching will show it. */
+      done(String(clip.sting || 'on the set'));
     }, function (err) {
       done(String((err && err.message) || err).slice(0, 60), true);
     });

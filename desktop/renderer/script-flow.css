@@ -1,0 +1,121 @@
+/* The assembly line for one line.
+   The visual language is the station's own: a dark body, a per-stage
+   emissive edge, connectors between, and a travelling packet - drawn in SVG
+   rather than three.js because a lineage is read, not orbited, and a
+   flat chart copies into a conversation. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: #0d1217;
+  color: #d7e3ec;
+  font: 13px/1.5 "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
+#head {
+  padding: 12px 16px 8px;
+  border-bottom: 1px solid #1b2831;
+}
+
+#who {
+  font-size: 15px;
+  font-weight: 600;
+  color: #e8f3fa;
+}
+
+#said {
+  margin-top: 4px;
+  color: #9fb3c2;
+  max-height: 3.2em;
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------- the chart */
+
+#chart {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 14px 16px 6px;
+}
+
+#spine { display: block; }
+
+.box { cursor: pointer; }
+.box rect {
+  fill: #141d26;
+  stroke: #24323f;
+  stroke-width: 1;
+  rx: 6;
+}
+
+/* LIT MEANS THE STATION RECORDED SOMETHING HERE. Empty means it did not,
+   which is a fact about the line rather than a gap in the drawing. */
+.box.has rect { fill: #16242c; stroke: #2a7d66; }
+.box.has .edge { fill: #46c2a0; }
+.box .edge { fill: #24323f; }
+
+.box.on rect { stroke: #65c7da; stroke-width: 2; }
+
+.box .name {
+  fill: #cfe0ea;
+  font: 600 11px "Segoe UI", system-ui, sans-serif;
+}
+.box.empty .name { fill: #64798a; }
+
+.box .said {
+  fill: #7e94a6;
+  font: 10px "Segoe UI", system-ui, sans-serif;
+}
+
+.link { stroke: #24323f; stroke-width: 2; fill: none; }
+.link.live { stroke: #2a7d66; }
+
+/* ------------------------------------------------------------ the detail */
+
+#detail {
+  overflow: auto;
+  padding: 10px 16px;
+  border-top: 1px solid #1b2831;
+  background: #0b1015;
+}
+
+#detail h3 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: #64798a;
+}
+
+.pair { display: flex; gap: 10px; padding: 1px 0; }
+.pair b { flex: none; width: 130px; color: #7e94a6; font-weight: 400; }
+.pair span { color: #cfe0ea; word-break: break-word; white-space: pre-wrap; }
+
+.block {
+  color: #e8f3fa;
+  background: #111922;
+  border-left: 2px solid #2a7d66;
+  padding: 7px 9px;
+  margin: 5px 0;
+  border-radius: 0 3px 3px 0;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.none { color: #ffc95c; }
+
+.note {
+  margin: 0;
+  padding: 6px 16px 10px;
+  color: #64798a;
+  min-height: 16px;
+}

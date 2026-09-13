@@ -1263,18 +1263,16 @@ function openMenu(atX, atY, region) {
   const room = document.body.getBoundingClientRect();
   menu.appendChild(item('c:volume--up--filled', 'Play it here',
     canPlay(region), () => playRegion(region)));
-  menu.appendChild(item('c:download', 'Download it',
-    canPlay(region), async () => {
-      say('Fetching \u2026');
-      try {
-        const got = await api.inspectDownload(region);
-        if (got && got.canceled) return say('Not saved.');
-        say(got && got.ok
-          ? 'Saved ' + Math.round(got.bytes / 1024) + ' kB. Opening the folder.'
-          : ((got && got.why) || 'it would not download'), !(got && got.ok));
-      } catch (error) { say(error.message, true); }
-    }));
+  menu.appendChild(item('c:download', 'Download this line',
+    canPlay(region), () => fetchDown(region, false)));
+  /* THE WHOLE ROUND, named apart from the line. They are different lengths
+   * of the same recording, and an operator who asked for one and got the
+   * other would only find out by playing it. */
+  menu.appendChild(item('c:script', 'Download the whole round',
+    !!region.id, () => fetchDown(region, true)));
   menu.appendChild(document.createElement('hr'));
+  menu.appendChild(item('c:chart--network', 'How it came to be',
+    true, () => flowOf(region)));
   menu.appendChild(item('c:microscope', 'What the station knows',
     true, () => deeper(region)));
   menu.appendChild(item('c:copy--to-clipboard', 'Copy its id',
@@ -1375,6 +1373,30 @@ function showDeep(region) {
 /* WHAT THE BOOTH KEPT, which is a different question from what the feed
  * knew. It is only answerable while the line is still in the live ring, and
  * says so when it is not rather than showing an empty panel. */
+async function fetchDown(region, whole) {
+  say(whole ? 'Fetching the whole round \u2014 the booth may have to cut it\u2026'
+            : 'Fetching \u2026');
+  try {
+    const got = await api.inspectDownload(region, { whole: !!whole });
+    if (got && got.canceled) return say('Not saved.');
+    say(got && got.ok
+      ? 'Saved ' + Math.round(got.bytes / 1024) + ' kB. Opening the folder.'
+      : ((got && got.why) || 'it would not download'), !(got && got.ok));
+  } catch (error) { say(error.message, true); }
+}
+
+/* THE FLOW CHART, in a window of its own. */
+async function flowOf(region) {
+  say('Asking how it came to be\u2026');
+  try {
+    const went = await api.inspectFlow(region);
+    say(went && went.ok
+      ? (went.had ? 'Opened its lineage.'
+        : 'Opened what is left of its lineage \u2014 ' + (went.why || ''))
+      : ((went && went.why) || 'it would not open'), !(went && went.ok));
+  } catch (error) { say(error.message, true); }
+}
+
 async function deeper(region) {
   showDeep(region);
   const body = document.getElementById('deepBody');

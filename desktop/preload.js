@@ -99,7 +99,11 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   /* Inspection mode: a region of a screenshot, turned back into the thing it
    * was a picture of. See the note in main.js. */
   inspectPlay: (region) => ipcRenderer.invoke("inspect:play", region),
-  inspectDownload: (region) => ipcRenderer.invoke("inspect:download", region),
+  inspectDownload: (region, options) =>
+    ipcRenderer.invoke("inspect:download", region, options),
+  /* The flow chart window, and what it opens with. */
+  inspectFlow: (region) => ipcRenderer.invoke("inspect:flow", region),
+  flowPending: () => ipcRenderer.invoke("flow:pending"),
   inspectDeep: (region) => ipcRenderer.invoke("inspect:deep", region),
   glassClip: (seconds, options) => ipcRenderer.invoke("glass:clip", seconds, options),
   /* The export window: what is waiting, and what to make of it. */
