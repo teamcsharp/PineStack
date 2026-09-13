@@ -58,7 +58,9 @@ object SamplerAssets {
         // #1310: the SFX guy's little CRT set. A pad that holds a video
         // pops the picture when it is pressed, and this surface is its
         // own page - the set in the views bundle is not loaded here.
-        "sfx-tv.js"
+        "sfx-tv.js",
+        // #1317: this surface is its own page and can go deaf too.
+        "deaf-watch.js"
     )
 
     private fun read(context: Context, name: String): String =

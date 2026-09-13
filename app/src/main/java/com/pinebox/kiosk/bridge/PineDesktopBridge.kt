@@ -108,6 +108,9 @@ class PineDesktopBridge(
             "cameraOpen", "cameraClose", "cameraTune", "cameraRange",
             /* Keeping a line: to the tablet, or to the working folder. */
             "keepClip", "jack", "wallpaper", "saveText", "saveBytes",
+            /* #1317: the terminal bringing itself round when the
+             * WebView's own network has died under it. */
+            "revive",
             "usbState", "usbPick", "usbSend", "usbList", "usbRead",
         ) + LCD_METHODS + TERMINAL_METHODS + BACKEND_METHODS
 
@@ -287,6 +290,37 @@ class PineDesktopBridge(
                     .put("where", kept.where)
                     .put("bytes", kept.bytes)
                     .put("detail", kept.detail).toString())
+            }
+        }
+
+        /* #1317: THE TERMINAL, BROUGHT ROUND.
+         *
+         * Chromium's network stack inside this WebView can die while
+         * everything else stays up - the bridge still answers, the feed
+         * still updates, the views still paint, and not one `fetch`,
+         * `<audio>` or `<video>` works. See net/Revive.kt for what was
+         * measured and what was ruled out.
+         *
+         * With no argument this REPORTS - whether a revival is allowed
+         * and how long since the last - so the page can decide without
+         * causing one. `{now:true}` actually does it, and the answer
+         * never arrives, because the process is gone. */
+        "revive" -> {
+            val opts = args.optJSONObject(0)
+            val why = opts?.optString("why", "") ?: ""
+            if (opts != null && opts.optBoolean("now", false)) {
+                val went = com.pinebox.kiosk.net.Revive.now(context, why)
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", went)
+                    .put("say", if (went) "reviving" else
+                        "too soon since the last one").toString())
+            } else {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", true)
+                    .put("rested", com.pinebox.kiosk.net.Revive.rested(context))
+                    .put("sinceMs", com.pinebox.kiosk.net.Revive.sinceMs(context))
+                    .put("inARow", com.pinebox.kiosk.net.Revive.inARow(context))
+                    .toString())
             }
         }
 

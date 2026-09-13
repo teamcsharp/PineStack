@@ -300,6 +300,23 @@
      * only the page's window onto it. */
     wallpaper: promised("wallpaper"),
 
+    /* #1317: THE TERMINAL, BROUGHT ROUND.
+     *
+     * Chromium's network stack inside this WebView can die while
+     * everything else stays up - this bridge still answers, the feed
+     * still updates, every view still paints, and not one fetch,
+     * <audio> or <video> works. The panel looks alive and the station
+     * is inaudible.
+     *
+     * `revive()` reports whether a revival is allowed and how long
+     * since the last; `revive({now:true, why})` ends this process and
+     * has the app start again, which is the only thing measured to
+     * cure it - a reload keeps the same dead network service. The app
+     * holds the rest period and may refuse, so a page that has gone
+     * wrong cannot make a restart loop. See deaf-watch.js, which is
+     * the only thing that should normally call it. */
+    revive: promised("revive"),
+
     /* WRITING A FILE OUT. saveText takes a string (a sampler preset, which
      * is JSON); saveBytes takes base64 (the WAVs of an MPC kit - audio put
      * through a JSON string comes back corrupted, silently).

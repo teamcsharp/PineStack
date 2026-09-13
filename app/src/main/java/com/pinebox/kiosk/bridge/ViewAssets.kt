@@ -69,6 +69,9 @@ object ViewAssets {
         "spark-overlays.js",      // the backend readouts, in any host
         "slideshow-source.js",    // the slideshow's whole traffic budget
         "slideshow.js",           // ~/bin/media-slideshow, on this glass
+        // #1317: the terminal noticing its own deafness. Before rail so
+        // it is watching whatever else fails to start.
+        "deaf-watch.js",
         "rail.js"                 // last: it looks for the globals above
     )
 

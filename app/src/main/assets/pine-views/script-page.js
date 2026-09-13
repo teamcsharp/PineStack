@@ -172,9 +172,16 @@
       }
     } catch (err) { /* the title still names it */ }
     if (!reel.innerHTML) reel.textContent = 'video';
+    /* #1311b: RAPID FIRE MEANS EVERY TAP COUNTS.
+     *
+     * This disabled the button for the length of the request, so at
+     * anything faster than one tap a second the second, third and
+     * fourth taps were simply swallowed - measured, five taps and the
+     * picture never changed after the first. The operator asked to
+     * "tap on the button, rapid fire, and have it cycle between
+     * videos", so nothing is refused; a sequence number keeps a slow
+     * answer from landing on top of a faster one that came after it. */
     reel.addEventListener('click', function () {
-      if (reel.disabled) return;
-      reel.disabled = true;
       reel.classList.add('sp-firing');
       fireVideo(reel);
     });
@@ -293,6 +300,9 @@
     var who = el('spSayingWho');
     var text = el('spSayingText');
     if (!who || !text) return;
+    /* #1311: an answer the operator asked for outranks the line for a
+       few seconds - see say(). */
+    if (sayUntil && Date.now() < sayUntil) return;
     var node = (row && row.id)
       ? document.querySelector('.sp-el[data-line="' + row.id + '"]')
       : null;
@@ -387,9 +397,12 @@
    * have to re-derive the base URL and the key for itself. The answer
    * lands on the strip, because a button that cues the air should
    * never be silent about whether the air took it. */
+  var reelTurn = 0;
+
   function fireVideo(btn) {
+    var mine = (reelTurn += 1);
     function done(text, bad) {
-      btn.disabled = false;
+      if (mine !== reelTurn) return;  /* a newer tap owns the screen */
       btn.classList.remove('sp-firing');
       btn.classList.toggle('sp-fired-bad', !!bad);
       say(text);
@@ -404,12 +417,12 @@
     api().post('/api/sfx/video/cue', {who: 'operator'}).then(function (got) {
       var clip = got && got.clip;
       if (!clip) { done(String((got && got.say) || 'no clip'), true); return; }
-      var cut = false;
+      /* #1311b: an answer that has been overtaken is dropped rather
+         than cutting the picture backwards. */
+      if (mine !== reelTurn) return;
       try {
-        if (root.PineSfxTv && root.PineSfxTv.cut) {
-          cut = root.PineSfxTv.cut(clip);
-        }
-      } catch (err) { cut = false; }
+        if (root.PineSfxTv && root.PineSfxTv.cut) root.PineSfxTv.cut(clip);
+      } catch (err) { /* the clip is in the ring either way */ }
       /* Not an error if the set is not on this surface - the clip is in
          the ring either way and whatever is watching will show it. */
       done(String(clip.sting || 'on the set'));
@@ -418,11 +431,24 @@
     });
   }
 
-  /* A short word on the strip, so an action has an answer. */
+  /* #1311: A SHORT WORD ON THE STRIP, AND IT STAYS LONG ENOUGH TO READ.
+   *
+   * This set the text and then cleared sayingSaid so the next tick
+   * would repaint - which it did, 250ms later, over the top of the
+   * message. So a tap that answered "the clip library is still
+   * warming" showed nothing at all, and a button that was working
+   * and refusing looked like a button that was dead. That is how the
+   * operator came to report the video icon as unresponsive.
+   *
+   * The message now holds the strip for a few seconds; paintSaying
+   * stands off until it expires. */
+  var sayUntil = 0;
+
   function say(text) {
     var line = el('spSayingText');
     if (!line) return;
-    sayingSaid = '';                  /* let the next tick repaint it */
+    sayUntil = Date.now() + 4000;
+    sayingSaid = ' said';        /* never equal to a real print */
     line.textContent = String(text || '');
   }
 

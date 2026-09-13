@@ -162,6 +162,17 @@
   }
 
   function build(name) {
+    /* #1312: one set at a time, always. A stray from an earlier cut
+       would otherwise sit here holding a connection for ever. */
+    try {
+      var old = document.querySelectorAll('.sfx-tv');
+      for (var i = 0; i < old.length; i += 1) {
+        var v = old[i].querySelector('video');
+        try { if (v) { v.pause(); v.removeAttribute('src'); v.load(); } }
+        catch (e2) { /* already gone */ }
+        if (old[i].parentNode) old[i].parentNode.removeChild(old[i]);
+      }
+    } catch (err) { /* nothing to sweep */ }
     var box = readBox();
     host = document.createElement('div');
     /* #1308b: `waiting` until the first frame - see play(). */
@@ -317,6 +328,16 @@
     catch (err) {}
     try { if (host && host.parentNode) host.parentNode.removeChild(host); }
     catch (err) {}
+    /* #1312: and anything an earlier tangle left attached. */
+    try {
+      var stray = document.querySelectorAll('.sfx-tv');
+      for (var i = 0; i < stray.length; i += 1) {
+        var v = stray[i].querySelector('video');
+        try { if (v) { v.pause(); v.removeAttribute('src'); v.load(); } }
+        catch (e2) { /* already gone */ }
+        if (stray[i].parentNode) stray[i].parentNode.removeChild(stray[i]);
+      }
+    } catch (err) { /* nothing stray */ }
     host = video = tube = null;
     showing = false;
     setTimeout(next, 120);
@@ -325,12 +346,36 @@
   /* #1306b: down NOW, for a cut. teardown() is the polite version and
    * schedules next(); this one leaves the queue alone because its
    * caller is about to put something in the tube itself. */
+  /* #1312: EVERY SET IN THE DOCUMENT, NOT THE ONE WE THINK IS OURS.
+   *
+   * This released `video` and `host` - the module's own references -
+   * which is precisely the mistake teardown(mine) was written to
+   * avoid, and under rapid cutting it orphans sets: cut() tears down,
+   * play() installs new references, and a host from a moment ago is
+   * left ATTACHED with a <video> still in NETWORK_LOADING.
+   *
+   * Each orphan holds an HTTP connection open. A WebView allows about
+   * six per host, and this page already spends several on the music
+   * player and the voice elements - so after a few taps there were
+   * none left and EVERY request hung. Measured on the tablet: two
+   * orphaned videos at net=2 ready=0, and from inside the page a
+   * fetch of /api/pulse never returning, while the same URL answered
+   * the desk in 0.02s. That is the whole of "I tap the icon and no
+   * video pops up": the picture could not be fetched because the
+   * pictures before it had never let go.
+   *
+   * Sweeping the document by class cannot orphan anything, however
+   * the references got tangled. Removing a <video> does not stop it,
+   * so the src goes first and the node second - #1147's rule. */
   function teardownNow() {
-    var going = video;
-    try { if (going) { going.pause(); going.removeAttribute('src'); going.load(); } }
-    catch (err) {}
-    try { if (host && host.parentNode) host.parentNode.removeChild(host); }
-    catch (err) {}
+    var all = document.querySelectorAll('.sfx-tv');
+    for (var i = 0; i < all.length; i += 1) {
+      var v = all[i].querySelector('video');
+      try { if (v) { v.pause(); v.removeAttribute('src'); v.load(); } }
+      catch (err) { /* already gone */ }
+      try { if (all[i].parentNode) all[i].parentNode.removeChild(all[i]); }
+      catch (err) { /* already gone */ }
+    }
     host = video = tube = null;
     showing = false;
   }
@@ -339,6 +384,7 @@
 
   function play(clip) {
     playing = clip;                                        /* #1306b */
+    var tries = Number(clip.__tries) || 0;                 /* #1311d */
     var parts = build(clip.sting || clip.text || 'SFX');
     /* Held locally, because every handler and timer below can fire after
      * the module's own references have moved on. */
@@ -402,8 +448,41 @@
     screen.addEventListener('loadeddata', reveal);
     screen.addEventListener('playing', reveal);
 
+    /* #1311d: A CLIP THIS BUILD CANNOT DECODE IS NOT THE END OF THE TAP.
+     *
+     * The library is 400 grabbed mp4s and they are not all the same
+     * inside - measured on the tablet, a clip that the station served
+     * perfectly (200 OK, video/mp4, 415 kB in 0.11s) came back
+     * MEDIA_ERR_SRC_NOT_SUPPORTED, because this WebView has no
+     * decoder for what is in that particular container.
+     *
+     * The operator tapped a button and is owed a picture, so a clip
+     * that will not open is SKIPPED rather than mourned: the set asks
+     * the cue road for another and tries that instead. Only a cut the
+     * operator asked for retries - the station's own stings keep the
+     * old behaviour, because there the clip is punctuating a line and
+     * a substitute would land after the moment it was for. */
+    var failed = function () {
+      if (done) return;
+      if (!shown && clip.__cut && tries < 3 && api() && api().post) {
+        done = true;                 /* this attempt is over */
+        try { teardownNow(); } catch (err) { /* nothing up */ }
+        api().post('/api/sfx/video/cue', {who: 'retry'}).then(
+          function (got) {
+            var next = got && got.clip;
+            if (!next) { showing = false; return; }
+            next.__cut = true;
+            next.__tries = tries + 1;
+            showing = true;
+            try { play(next); } catch (err) { showing = false; }
+          },
+          function () { showing = false; });
+        return;
+      }
+      finish();
+    };
     screen.addEventListener('ended', finish);
-    screen.addEventListener('error', finish);
+    screen.addEventListener('error', failed);
     screen.src = base.replace(/\/+$/, '') + String(clip.url || '');
     screen.volume = level;
     /* #1310: THE PAD'S IN AND OUT, ON THE PICTURE TOO.
@@ -432,7 +511,10 @@
      * with a black tube holds every clip behind it. */
     setTimeout(function () {
       if (done || video !== screen) return;
-      if (screen.paused || !Number(screen.currentTime)) finish();
+      /* #1311d: a clip that never started is skipped the same way one
+         that errored is - a stalled range request and a missing
+         decoder look identical from here and deserve the same answer. */
+      if (screen.paused || !Number(screen.currentTime)) failed();
     }, 12000);
     var started = screen.play();
     if (started && started.catch) {
@@ -699,6 +781,7 @@
       } catch (err) { /* the play below still stands */ }
       queue.length = 0;
       if (hold) { clearTimeout(hold); hold = null; }
+      try { clip.__cut = true; } catch (err) { /* frozen: no retry */ }
       /* Down without waiting out the CRT collapse - the next picture
          is the answer to the tap, not the animation. */
       try { teardownNow(); } catch (err) { /* nothing was up */ }
