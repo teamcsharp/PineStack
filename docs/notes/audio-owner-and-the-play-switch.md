@@ -1,6 +1,6 @@
 ---
 name: audio-owner-and-the-play-switch
-description: "Why no page makes a sound: the #1008 solo gate, the #1161 terminals table, the play switch - and #1332, the owner that polls but never listens"
+description: "Why no page makes a sound: the #1008 solo gate, the #1161 terminals table, the play switch - and #1332, the owner that polls, acks and still hears nothing"
 metadata:
   type: project
 ---
@@ -42,6 +42,14 @@ forced:
 - Dropping was not enough on its own: the page re-claimed on its next
   poll, so the claim door now refuses it for `OWNER_DEAF_REST = 300s`.
   **A cure undone faster than it can be noticed is a cure nobody has.**
+- #1332e: **an acknowledgment is not a sound.** The rule counted *any*
+  ack, which asks "is the page answering" - the #1208 question, already
+  covered by the stopped-polling test. The question here is whether the
+  room can HEAR it. Every ack carries `muted` and `audible_volume`, and a
+  device that acks a clip while muted or at zero audible volume is exactly
+  the thing holding the exclusive and playing nothing: measured live, the
+  desktop went on acknowledging through 140s of silence and the rule could
+  not tell it from a working device. Only an **audible** ack counts now.
 
 Also caught before shipping: the helper read `ev["who"]` from ack rows
 that key it `listener_id`. It would have matched nothing and returned True

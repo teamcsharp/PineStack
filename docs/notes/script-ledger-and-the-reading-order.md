@@ -1,6 +1,6 @@
 ---
 name: script-ledger-and-the-reading-order
-description: "#1330/#1333: the script is now a DOCUMENT - data/script_ledger.jsonl, (block, ord) written once at commit - not an hour reconstructed from air_log by a timestamp eight paths rewrite"
+description: "#1330-#1339: the script is now a DOCUMENT - data/script_ledger.jsonl, (block, ord) written once - not an hour reconstructed from air_log by a timestamp eight paths rewrite; and half the spoken lines were never in it"
 metadata:
   type: project
 ---
@@ -41,11 +41,12 @@ monotone across the block by `max(own stamp, previous + 0.001)`. After:
 **0 backward pairs in 558 elements, 0 ord inversions, 23 of 23 SFX rows
 inside their conversation, 47 unledgered events now inside a block.**
 
-**How to read it.** An element carrying `block`/`ord` was **scripted**.
-One without - a rescue sting, an emergency filler, a record, an advert, a
-call - **was not**, and keeps its clock slot. That absence is a signal,
-not a gap: it tells you which roads are authored and which are still being
-inserted by the air.
+**How to read it.** Everything that has been heard carries `block`/`ord`
+(#1339, below), so the position is no longer the signal - the **`scripted`**
+flag is. `true` means the booth wrote the line down before it was audible;
+`false` means the station reached for it and the ledger caught it once it
+had aired. That is what tells you which roads are authored and which are
+still being inserted by the air.
 
 **The measurement that matters**, over 12 minutes of live air: **28 of 28
 distinct aired lines were already in the script at the moment they started
@@ -70,3 +71,59 @@ the signal that the row is not where its own clock said it was.
 
 Final state, live: **0 backward pairs, 0 blocks re-entered, 0 order
 inversions, 38 of 38 SFX rows inside their conversation.**
+
+**#1339: half the spoken lines had no place in the document.** The ledger
+is written from the booth, and the booth is not where half the air comes
+from. Measured on one live hour: **194 of 399 dialogue rows carried no
+`(block, ord)`** - 151 gold bars, 33 of the SFX guy's quips, 9 adverts -
+and every one of them had aired. They are minted by the fill and rescue
+roads and appended straight to the ring, so `script_ledger_commit` never
+saw them and the screenplay could only order them by raw `air_at`.
+
+That is what "the script jumps around" actually was. Dropped into a
+ledgered conversation they push its own turns apart: conversation b90
+opened at element 14 with turn 0, and its turn 2 did not appear until
+element 39 - **24 elements of other material between two consecutive
+turns.**
+
+They cannot be written down before they are audible, because nothing knows
+they are coming. So they are committed as soon as they have been **HEARD**
+- one block each, in air order, by `script_ledger_catch_up` from
+`airlog_keeper`, the hook whose own docstring calls it *"the one hook that
+catches all twenty-five ring append sites"*. Patching the roads one at a
+time would have missed the next one somebody adds. A one-row block is
+contiguous by construction, so it can never split anything. They are
+marked **`scripted: false`**, because a reader is entitled to know which
+lines were planned and which the station reached for.
+
+After: **100% of dialogue rows placed** over the last three minutes, block
+runs reading `b126/0..5` and `b166/0,2,3,4,6,7,9,10,11,13`, with the
+stings landing exactly in the `ord` gaps they punctuate.
+
+**The lesson matters more than the fix: the metric said it was fine.**
+Three counters watched that document and all three read clean for fifteen
+minutes while it was wrong.
+
+- **"0 backward pairs" was true BY CONSTRUCTION.** #1336b rewrites every
+  element's stamp ascending *after* the sort, so nothing downstream of it
+  can ever measure backwards. The check was reading its own output.
+- **The other two ranged only over rows the ledger knew** - and every row
+  it knew was in perfect order. The fault lived entirely in the rows they
+  could not see, which is exactly the set that made it a fault.
+
+What found it was dumping the actual sequence and reading it. **A meter
+built out of the thing it is measuring cannot fail, and a meter that
+cannot fail is not evidence.** Before trusting a clean number, ask what
+input would make it dirty.
+
+**#1337: and do not re-sort an hour the ledger knows nothing about.** The
+merge was gated on `if _ord:`, and `_ord` is the whole 48-hour ledger, not
+the hour being composed. So it was true for every compose, including hours
+predating the ledger entirely, and it keyed every row on raw `air_at` with
+the list position only a third tiebreak. But #1259, #1265 and #1299
+express their results **as positions in that list**: re-sorting on
+`air_at` discards all three. Those hours reverted to the combed order
+those passes exist to repair - and then the monotone sweep painted clean
+ascending stamps over the top, so they measured perfectly. The gate is now
+the hour actually having ledger rows; an hour the ledger does not cover is
+left exactly as the repair passes built it.

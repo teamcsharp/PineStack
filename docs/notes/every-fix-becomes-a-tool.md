@@ -37,8 +37,9 @@ Hard-won constraints on that ladder:
 - The process restart rung is rate-limited to once an hour, and when the
   ladder is spent it must NAME what needs hands rather than loop.
 
-**The canonical example is now the Reinitialise ladder (#1331/#1335)** —
-one button, thirteen rungs, each one named in `docs/pinetab.md` §23. Auditing
+**The canonical example is now the Reinitialise ladder
+(#1331/#1335/#1338)** — one button, eighteen rungs, each one named in
+`docs/pinetab.md` §23. Auditing
 it against the code found **five cures that already existed as working code
 with no button anywhere to reach them**: RELIEVE (which the station's own
 `AIR_LADDER` puts *first*), a station-wide PAGES (the rung was a
@@ -58,6 +59,26 @@ is the one cure a reload cannot be).
 
 The rule that came out of it: **"A cure the operator cannot reach during the
 fault it cures is not a cure the station has."**
+
+**#1338 added five more**, from the opposite question — not "which cure has
+no button" but "which room does the ladder never walk into": DRAIN (renders
+already on disk), STOCK (unheard finished radio, falling back to a replay),
+STREAM (the :8097 public door and the mp3 mixer), ENGINES (F5 and the
+voice-director, which the SERVICES table does not cover) and DISK (the
+retention sweep, which names what is over its cap rather than guessing a
+cutoff). Eighteen rungs, and every one still exits the moment sound comes
+back.
+
+Which bought one more constraint: **a rung that can block past the client's
+timeout silently kills every rung after it.** STOCK waits for a line to
+actually reach the air and ran past 120 s; the caller gave up, and on a
+ladder that means the run simply ended — DEVICES, RELEASE, PAGES, TERMINAL
+and everything below them never ran, with nothing in the transcript saying
+so. Anything that waits on real work needs a bound (#1340, 25 s; the round
+is queued either way). And order the excepts narrowest first: a broad
+`except Exception` above `except asyncio.TimeoutError` makes the narrow one
+dead code, and a TimeoutError carries no message, so the transcript read
+"the cupboard raised: " with nothing after the colon (#1340b).
 
 Surfaces: `GET /api/broadcast/watch`, `GET /api/broadcast/console`,
 `POST /api/broadcast/fix/{step}`, `data/air_fixes.jsonl`.

@@ -1607,10 +1607,11 @@ written *before* a round is audible, keyed `(block, ord)`, assigned once and
 never rewritten. The screenplay applies it last, after the older corrective
 passes, so what you read is the order the round was written in — including
 the SFX guy, who sits where he was rolled in rather than being placed
-afterwards by a timestamp. An element that carries `block`/`ord` was
-scripted; one that does not (a rescue sting, an emergency filler, a record,
-an advert, a call) was not, and keeps its clock slot. That absence is a
-useful signal, not a gap.
+afterwards by a timestamp. **Everything that has been heard now carries a
+`block`/`ord`** (#1339, below), so the absence of one is no longer the
+signal it used to be — the element's `scripted` flag is. `true` means the
+booth wrote that line down before it was audible; `false` means the station
+reached for it and the ledger caught it once it had aired.
 
 **And it reads downwards.** The first cut of that merge gave every row of a
 block ONE sort time — the block's earliest — and put unledgered events after
@@ -1659,6 +1660,55 @@ stamp it arrived with. Its presence is the signal: this row is not where
 its own clock said it was. Final state on the live hour — **0 backward
 pairs, 0 blocks re-entered, 0 order inversions, 38 of 38 SFX rows inside
 their conversation**.
+
+**And half the spoken lines had no place in it at all.** The ledger is
+written from the booth, and the booth is not where half the air comes from.
+Measured on one live hour: **194 of 399 dialogue rows carried no
+`(block, ord)`** — 151 gold bars, 33 of the SFX guy's quips, 9 adverts — and
+every one of them had aired. They are minted by the fill and rescue roads
+and appended straight to the ring, so `script_ledger_commit` never saw them,
+and the screenplay had nothing to order them by but raw `air_at`.
+
+That is what "the script jumps around" actually was. Dropped into a ledgered
+conversation they push its own turns apart: conversation b90 opened at
+element 14 with turn 0, and its turn 2 did not appear until element 39 —
+**24 elements of other material between two consecutive turns.**
+
+They cannot be written down before they are audible, because nothing knows
+they are coming. So they are written the moment they have been **heard** —
+one block each, in air order, by `script_ledger_catch_up`, called from
+`airlog_keeper`, whose own docstring calls it *"the one hook that catches all
+twenty-five ring append sites"*. Patching the roads one at a time would have
+missed the next one somebody adds. A one-row block is contiguous by
+construction, so it can never split anything. They carry **`scripted:
+false`**, because a reader is entitled to know which lines were planned and
+which the station reached for. After: **100% of dialogue rows placed** over
+the last three minutes, block runs reading `b126/0..5` and
+`b166/0,2,3,4,6,7,9,10,11,13`, with the stings landing exactly in the `ord`
+gaps they punctuate (#1339).
+
+> **The metric said it was fine.** Three counters watched that document and
+> all three read clean for fifteen minutes while it was wrong. "0 backward
+> pairs" was true *by construction* — #1336b rewrites every element's stamp
+> ascending **after** the sort, so nothing downstream can measure backwards;
+> the check was reading its own output. The other two ranged only over rows
+> **the ledger knew**, and every row it knew was in perfect order — the
+> fault lived entirely in the rows they could not see. Dumping the actual
+> sequence and reading it is what found it. A meter built out of the thing
+> it measures cannot fail, and a meter that cannot fail is not evidence.
+
+**And it must not re-sort an hour it knows nothing about.** The whole merge
+was gated on `if _ord:` — and `_ord` is the entire 48-hour ledger, not the
+hour being composed. So it was true on every compose, including hours that
+predate the ledger, and it re-keyed every row on raw `air_at` with the list
+position only a third tiebreak. But #1259, #1265 and #1299 express their
+results **as positions in that list**: re-sorting on `air_at` throws all
+three away. Those hours quietly reverted to the combed `air_at` order that
+those passes exist to repair — and then the monotone sweep painted clean
+ascending stamps over the top, so they measured perfect. The gate is now the
+hour actually having ledger rows; an hour the ledger does not cover is left
+exactly as the repair passes built it, which is how it read before #1330
+(#1337).
 
 **What the action lines say.** A record entry reads *"A record is spinning:"*
 while that record is on the deck and *"A record drops:"* once it has
@@ -1766,15 +1816,20 @@ station pays for almost none of this.
 | 3 | UNGAG | Local: drops this page's own hold, bumps the voice epoch, restarts the player |
 | 4 | FLOOR | Takes the floor back from a hold that has gone silent |
 | 5 | FLUSH | Advances the feed epoch — every page abandons the clip it cannot start |
-| 6 | DEVICES | Reads every device's out-loud switch; turns them on only if **every** one is off |
-| 7 | RELEASE | Releases the audio exclusive so every player may sound |
-| 8 | PAGES | Asks **every** page in the house to reload, not just this one |
-| 9 | TERMINAL | Force-stops and relaunches **the tablet's kiosk** — the one cure a page reload cannot be |
+| 6 | DRAIN | Sends out audio that already exists: the clips held on the box's shelf, and the lines that could not be rendered when they were written |
+| 7 | STOCK | Takes the longest-unheard finished round off the cupboard shelf and airs it out of turn; replays the last segment if the cupboard refuses |
+| 8 | DEVICES | Reads every device's out-loud switch; turns them on only if **every** one is off |
+| 9 | RELEASE | Releases the audio exclusive so every player may sound |
+| 10 | PAGES | Asks **every** page in the house to reload, not just this one |
+| 11 | TERMINAL | Force-stops and relaunches **the tablet's kiosk** — the one cure a page reload cannot be |
 |   | *listens for eight seconds* | |
-| 10 | DEEP | The whole repair tree: engines, the box, routing, the writer's lifeboat, the deaf-device reboot |
-| 11 | SERVICES | Steward census — restarts xtts, ollama, comfy, a sick container; warms the music library |
-| 12 | RELOAD | Reloads this page, and resumes the ladder afterwards |
-| 13 | RESTART | Restarts the station process. About twenty seconds of silence |
+| 12 | STREAM | The public door on :8097 and the mp3 mixer behind `/stream.mp3` — probed for real, and the mixer revived |
+| 13 | ENGINES | F5, the voice-director and XTTS's reload — the engines the services table does not cover |
+| 14 | DEEP | The whole repair tree: engines, the box, routing, the writer's lifeboat, the deaf-device reboot |
+| 15 | SERVICES | Steward census — restarts xtts, ollama, comfy, a sick container; warms the music library |
+| 16 | RELOAD | Reloads this page, and resumes the ladder afterwards |
+| 17 | DISK | Runs the bounded retention sweep and names what is over its cap. Deletes nothing the rules would not have |
+| 18 | RESTART | Restarts the station process. About twenty seconds of silence |
 
 ### Five of those rungs were unreachable before #1331
 
@@ -1830,6 +1885,63 @@ is being HEARD. That distinction is the entire reason this endpoint exists.
 > Three diagnostics in a row, each one fixed and each one still lying. The
 > fix is never done until it has been watched against the real fault.
 
+### And five more after it (#1338)
+
+That audit asked which cures the operator had no button for. The next one
+asked a different question — which *rooms* the ladder never walks into at
+all. Five:
+
+- **DRAIN** (6). Two shelves hold finished renders that only their own
+  timers drain: the box's hold queue and the render backlog. A starved air
+  can be silent standing next to speech that is already on disk. It belongs
+  beside FLUSH — FLUSH throws away what the page cannot start, DRAIN puts
+  back what the station already made — and it is cheap, because that audio
+  exists.
+- **STOCK** (7). `unheard_stock_air(force=True)` drops the seven-minute
+  interval and the floor test (#1313) and puts the longest-unheard finished
+  round on the air out of turn (#1260). Its only callers were watchdog
+  timers. If the cupboard refuses it says why, and falls back to replaying
+  the last segment.
+- **STREAM** (12). Everything above that line is about the speakers in this
+  house. The public door on :8097 and the mp3 mixer behind `/stream.mp3`
+  are how the broadcast *leaves* it, and neither had a rung: the door is an
+  unsupervised startup task, and the mixer's own `running` flag is set true
+  before its thread has made a single frame and stays true after that thread
+  is dead. The rung deliberately ignores that flag and samples the frame
+  counter instead, then revives the mixer.
+- **ENGINES** (13). The steward's table is xtts, ollama and comfyui. F5
+  carries the clones whenever XTTS is offloaded, and the voice-director is
+  the middleman every engine handle goes through — when *it* is the
+  casualty, restarting the station around it changes nothing. The director
+  is bounced **only when it does not answer**, because a healthy one holds
+  every engine loaded behind it. Before DEEP, because a deep ladder asking
+  a dead director is asking nobody.
+- **DISK** (17). A box with no room left writes nothing — no render, no
+  larder, no log — and that fault survives a restart. It presses the
+  bounded retention sweep and **names** what is big and what is over its
+  cap. It deliberately **refuses** the three purge routes that require
+  areas to be named by hand: those take named areas on purpose, and a
+  ladder guessing a cutoff is exactly the slip that guard exists to stop.
+
+All five were exercised against the live station.
+
+**A rung that can block past the client's timeout silently kills every rung
+after it.** STOCK waits for the line to actually reach the air — a render
+*and* a playout — and from the console it ran past **120 s**, at which point
+the caller gave up. On a ladder that is not one slow step: the run ends
+there, and DEVICES, RELEASE, PAGES, TERMINAL and everything below them
+never happen, with nothing in the transcript saying so. It is bounded to
+**25 s** now, and the wait was never the work — the round is queued either
+way and the page starts it at its next poll — so the honest thing is to
+stop waiting and say so (#1340).
+
+And say it in words. The handler's broad `except Exception` sat **above**
+the narrow `except asyncio.TimeoutError`, and a `TimeoutError` *is* an
+`Exception`, so the narrow clause could never run — and a `TimeoutError`
+carries no message, so the transcript read *"the cupboard raised: "* with
+nothing after the colon (#1340b). An empty reason is worse than no line at
+all: it tells the operator something went wrong and refuses to say what.
+
 ### The rung that exists because of §19.1
 
 For a long time the ladder's entire client-side vocabulary was `fixUngag()`
@@ -1850,18 +1962,19 @@ last value — cannot put the tablet into a restart loop.
 
 > Everything before this could reload a client. Nothing could restart one.
 
-### And it could not reach its own rung nine
+### And it could not reach its own rung eleven
 
 `reload_pages` stamps `_RADIO["reload_at"]`; every open page sees it on the
 next poll and reloads 0.8–4.8 s later — **including the operator's own**. The
 run was sitting in the eight-second wait with no resume mark written, so
-`fixResume` found nothing and it simply ended. DEEP, SERVICES, RELOAD and
-RESTART never ran, and the transcript's last line read *"8 PAGES asked every
-page in the house to reload itself"*, which looks exactly like success.
+`fixResume` found nothing and it simply ended. Everything below it — STREAM,
+ENGINES, DEEP, SERVICES, RELOAD, DISK and RESTART — never ran, and the
+transcript's last line read *"10 PAGES asked every page in the house to
+reload itself"*, which looks exactly like success.
 
 That is why the deep repair had to be run by hand against a live wedge: the
-button could not reach its own rung 9. The mark is now written **before** the
-reload is asked for.
+button could not reach its own rung 11. The mark is now written **before**
+the reload is asked for.
 
 Two more from the same audit. **ON AIR never touched the switch** —
 triangulate returns `off_air → onair` when `_RADIO["on"]` is false, and the
@@ -1888,8 +2001,13 @@ curl -s $B/api/broadcast/console         | jq .   # the whole step table + log
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/look
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/terminals
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/floor
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/drain
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/stock
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/stream
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/engines
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/steward
 curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/deep
+curl -s -XPOST -H "Authorization: Bearer $K" $B/api/broadcast/fix/disk
 ```
 
 `look`, `speed` and `triangulate` change nothing and are always safe.
