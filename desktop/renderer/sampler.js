@@ -651,7 +651,16 @@
    * halves of it from the one editor that already exists.
    *
    * Silent about failure on purpose: the set not being on this
-   * surface must never stop the pad making its noise. */
+   * surface must never stop the pad making its noise.
+   *
+   * #1322: AND THE OTHER SURFACE SEES IT TOO. This was the one road to
+   * a picture that never touched the station - the clip is already
+   * decoded on the pad, so nothing was asked of it - which meant a pad
+   * pressed on the tablet popped nothing on the app, and a pad pressed
+   * on the app popped nothing on the tablet. `{ring: true}` publishes
+   * the clip into the ring every set polls, with no claim on the air
+   * (page_picture_append), and marks it here so this surface does not
+   * show the same picture twice. */
   function padPicture(meta) {
     if (!meta || !meta.video || !meta.url) return;
     const tv = root.PineSfxTv;
@@ -669,7 +678,8 @@
       const to = Number(meta.trim.end) || 0;
       if (to > clip.from) clip.to = to;
     }
-    try { tv.cut(clip); } catch (err) { /* the pad still sounds */ }
+    try { tv.cut(clip, {ring: true}); }
+    catch (err) { /* the pad still sounds */ }
   }
 
   /* THE BROADCAST COMES BACK WHEN THE LAST VOICE DIES, not when the finger

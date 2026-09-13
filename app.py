@@ -5491,10 +5491,29 @@ def _summarize_system_stats(js: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_GPU_TEMP_MEMO: list[Any] = [0.0, {}]
+GPU_TEMP_REST_S = 15.0
+
+
 def _read_gpu_temp() -> dict[str, Any]:
     """Best-effort DGX Spark thermals. /sys/class/thermal isn't namespaced,
     so the container can usually read the host's zones. Returns the hottest
-    zone in °C; empty if unreadable."""
+    zone in °C; empty if unreadable.
+
+    #1326: fifteen seconds' rest. This globs /sys/class/thermal and opens
+    two files per zone, on the event loop, for three separate status
+    surfaces that the panel polls continuously. Those reads are normally
+    quick, but they are host sysfs seen through a container and they are
+    not guaranteed to be: it stood beside word_cloud in the stall stack
+    of the largest gap of the 2026-09-13 window (207.7s of dead air off
+    a 39.6s stall).
+
+    A temperature that is fifteen seconds old is still a true
+    temperature - nothing here throttles or decides on it, it is printed
+    on a panel - and thermals do not move meaningfully faster than that.
+    """
+    if time.time() - float(_GPU_TEMP_MEMO[0] or 0) < GPU_TEMP_REST_S:
+        return dict(_GPU_TEMP_MEMO[1])
     try:
         import glob
         hottest = 0.0
@@ -5513,9 +5532,16 @@ def _read_gpu_temp() -> dict[str, Any]:
             except Exception:
                 continue
         if hottest > 0:
-            return {"temp_c": round(hottest, 1), "temp_zone": label}
+            _got = {"temp_c": round(hottest, 1), "temp_zone": label}
+            _GPU_TEMP_MEMO[0] = time.time()     # #1326
+            _GPU_TEMP_MEMO[1] = _got
+            return dict(_got)
     except Exception:
         pass
+    # #1326: an unreadable zone rests too, so a broken sysfs is not
+    # re-globbed on every poll for ever.
+    _GPU_TEMP_MEMO[0] = time.time()
+    _GPU_TEMP_MEMO[1] = {}
     return {}
 
 
@@ -9785,6 +9811,64 @@ def _pulse_frames() -> list[str]:
     return out
 
 
+def _pulse_blind() -> tuple[list[str], list[str]]:
+    """#1318: WHO IS IT, WHEN NONE OF IT IS OURS.
+
+    "outside app.py" was the largest single frame on the pulse - 85s of a
+    600s window, more than every named function of ours put together -
+    and it was unnameable BY CONSTRUCTION: _pulse_frames() keeps only
+    frames whose file ends in app.py, so a stall with nothing of ours in
+    the stack recorded an empty list, and every such stall aggregated
+    under one anonymous bucket.
+
+    Every one of those rows carried samples=0. Across an eight-second
+    stall, sampled twice a second, not one of sixteen samples found an
+    app.py frame. That is not a sampling accident, it is the answer: the
+    loop thread really is not in our code.
+
+    Two different faults look identical from there, and they need
+    different cures, so this names both:
+
+      - the FULL stack of the loop thread, filenames kept, so a library
+        frame (a response being serialised, an import, a socket write)
+        is named instead of discarded;
+
+      - the innermost frame of every OTHER thread, because a background
+        thread holding the GIL inside one long C call parks the loop in
+        epoll with no Python frame of ours anywhere. The loop then looks
+        innocent while the thief stands in a different stack entirely.
+        json over a large store is the known offender in this process
+        (#1156), and no amount of reading the loop's own frames would
+        ever have found it.
+
+    Read-only, allocation-light, and it runs only while a stall is
+    already open AND only when the app.py list came back empty - so on a
+    healthy loop it costs nothing at all.
+    """
+    import sys as _sys
+    import threading as _th
+    frames = _sys._current_frames()                  # noqa: SLF001
+    tid = int(_PULSE.get("main_tid") or 0)
+    here: list[str] = []
+    frame = frames.get(tid)
+    while frame is not None and len(here) < 6:
+        code = frame.f_code
+        here.append(f"{code.co_name} "
+                    f"({code.co_filename.rsplit('/', 1)[-1]}:"
+                    f"{frame.f_lineno})")
+        frame = frame.f_back
+    names = {t.ident: t.name for t in _th.enumerate()}
+    others: list[str] = []
+    for otid, frame in frames.items():
+        if otid == tid or frame is None:
+            continue
+        code = frame.f_code
+        others.append(f"{names.get(otid) or otid}: {code.co_name} "
+                      f"({code.co_filename.rsplit('/', 1)[-1]}:"
+                      f"{frame.f_lineno})")
+    return here, others
+
+
 def _pulse_watch() -> None:
     """The daemon thread. It only ever READS the loop's world."""
     while True:
@@ -9803,6 +9887,19 @@ def _pulse_watch() -> None:
                 if frames and frames not in open_stall["seen"][-3:]:
                     open_stall["seen"].append(frames)
                     del open_stall["seen"][:-6]
+                if not frames:
+                    # #1318: nothing of ours in the stack. Ask the wider
+                    # question rather than record another anonymous row.
+                    _here, _others = _pulse_blind()
+                    blind = open_stall.setdefault("blind", [])
+                    if _here and _here not in blind[-3:]:
+                        blind.append(_here)
+                        del blind[:-4]
+                    busy = open_stall.setdefault("threads", [])
+                    for _row in _others:
+                        if _row not in busy:
+                            busy.append(_row)
+                    del busy[:-24]
                 open_stall["seconds"] = round(late, 2)
                 continue
             if open_stall is None:
@@ -9810,17 +9907,31 @@ def _pulse_watch() -> None:
             _PULSE["open"] = None
             secs = float(open_stall.get("seconds") or 0)
             seen = [fr for fr in (open_stall.get("seen") or []) if fr]
+            blind = [fr for fr in (open_stall.get("blind") or []) if fr]
             top = seen[0][0] if seen else ""
             row = {"at": float(open_stall.get("at") or 0),
                    "seconds": secs, "top": top,
                    "frames": (seen[0] if seen else [])[:8],
                    "samples": len(seen)}
+            if not top and blind:
+                # #1318: the library stack, and who else was running.
+                row["blind"] = blind[0][:6]
+                row["threads"] = list(open_stall.get("threads") or [])[:24]
             with _PULSE_LOCK:
                 stalls = _PULSE.setdefault("stalls", [])
                 stalls.append(row)
                 del stalls[:-PULSE_KEEP]
                 by = _PULSE.setdefault("by_frame", {})
-                key = (top.split(" (")[0] if top else "outside app.py")
+                # #1318: name the anonymous bucket by the library frame
+                # the loop was actually in, so the top table stops
+                # saying "outside app.py" and starts saying which
+                # library and which call.
+                if top:
+                    key = top.split(" (")[0]
+                elif blind:
+                    key = "outside: " + blind[0][0].split(" (")[0]
+                else:
+                    key = "outside app.py"
                 agg = by.setdefault(key, {"n": 0, "seconds": 0.0,
                                           "worst": 0.0, "at": 0.0})
                 agg["n"] += 1
@@ -21969,11 +22080,41 @@ yeah yes yet you your youre yours
 CLOUD_WORD = re.compile(r"[a-z][a-z'\-]{2,}")
 
 
+_CLOUD_MEMO: dict[str, Any] = {}
+CLOUD_REST_S = 60.0
+
+
 def word_cloud(limit: int = 140, sides: str = "user") -> list[dict[str, Any]]:
     """Word frequencies across the conversation log, each with when it was
     last said — so the cloud can colour by recency as well as by size.
-    ponytail: a full recount per request. The log is a few hundred turns;
-    cache on mtime if it ever reaches tens of thousands."""
+
+    #1326: A MINUTE'S REST, BECAUSE THE LOG GOT BIG.
+
+    The note below this line has been asking for exactly this and names
+    the condition that has now arrived - "a full recount per request...
+    cache on mtime if it ever reaches tens of thousands". It reads
+    read_history(limit=100000) and runs CLOUD_WORD over every turn, on
+    the event loop, once per request.
+
+    Measured 2026-09-13: the loop profile put word_cloud and its inner
+    lambda at 9.1% of everything MainThread did, with re.sub the single
+    hottest innermost frame in the process; and the largest gap of the
+    whole post-fix window - 207.7s of dead air off a 39.6s stall - named
+    `<lambda> (app.py:22080)`, which is this function, as its blocker.
+    That is the picture on a panel costing the station three minutes of
+    air.
+
+    The house rule here is to cache the RAW with a rest window and never
+    the computed answer, because a stale verdict changes a decision.
+    This is the exception that proves it: the only caller is
+    api_word_cloud, nothing reads a word cloud to decide what airs, and
+    the answer is a drawing. A minute-old drawing of a log that spans
+    days is the same drawing.
+    """
+    _key = f"{int(limit)}|{sides}"
+    _hit = _CLOUD_MEMO.get(_key)
+    if _hit is not None and time.time() - _hit[0] < CLOUD_REST_S:
+        return _hit[1]
     counts: dict[str, int] = {}
     last_seen: dict[str, int] = {}
 
@@ -22003,7 +22144,7 @@ def word_cloud(limit: int = 140, sides: str = "user") -> list[dict[str, Any]]:
     newest, oldest = max(stamps), min(stamps)
     span = max(1, newest - oldest)
 
-    return [
+    _out = [
         {
             "word": word,
             "count": n,
@@ -22012,6 +22153,13 @@ def word_cloud(limit: int = 140, sides: str = "user") -> list[dict[str, Any]]:
         }
         for word, n in chosen
     ]
+    # #1326: the drawing, kept for a minute. Bounded by the caller: only
+    # api_word_cloud asks, and only for the handful of (limit, sides)
+    # shapes the panel uses.
+    if len(_CLOUD_MEMO) > 24:
+        _CLOUD_MEMO.clear()
+    _CLOUD_MEMO[_key] = (time.time(), _out)
+    return _out
 
 
 
@@ -22888,6 +23036,65 @@ def page_feed_append(clip: dict[str, Any]) -> str:
         return delivery_id
     except Exception:  # noqa: BLE001
         return ""
+
+
+def page_picture_append(clip: dict[str, Any]) -> dict[str, Any]:
+    """#1322: a PICTURE, rung for every surface, with no claim on the air.
+
+    page_feed_append is THE door onto the page voice feed and it is the
+    right door for anything the station is broadcasting. It does two
+    things a clip already sounding under the operator's hand must not
+    have done to it:
+
+      - it CHAINS the air moment behind whatever audio the page has
+        already been promised, so "now" can come out as forty seconds
+        from now;
+      - it RESERVES the clip's own length on top of that.
+
+    A sampler pad holding an mp4 is out of the engine the instant the
+    pad is pressed (#1310). Its picture is NOW or it is wrong, and a
+    performance of twenty pad presses must not mortgage a minute of the
+    show's air for pictures that have already been and gone.
+
+    So this rings the picture and nothing else - same ring, same
+    staleness rule, same /api/dj/video door the sets already poll - with
+    no lead, no reservation and no delivery to acknowledge. It is
+    bounded by its own length rather than by chaining: page_reservation_
+    repair takes each clip's own broadcast_ms, so a burst overlaps at
+    now..now+seconds instead of stacking.
+
+    The surface that fired it has already got the picture up and is
+    handed the stamped clip back, so it can mark it and not play it a
+    second time when the ring comes round.
+    """
+    stamp = int(time.time() * 1000)
+    seconds = 0.0
+    try:
+        seconds = max(0.0, min(600.0, float(clip.get("seconds") or 0)))
+    except (TypeError, ValueError):
+        seconds = 0.0
+    rung = {
+        "url": str(clip.get("url") or ""),
+        "text": "",
+        "sting": str(clip.get("sting") or "clip")[:120],
+        "id": str(clip.get("id") or ""),
+        "video": True,
+        "picture_only": True,
+        "seconds": round(seconds, 2),
+        "ts": stamp,
+        # NOW, not a lead ahead of now: the sound is already in the room.
+        "broadcast_ms": stamp,
+    }
+    for edge in ("from", "to"):
+        try:
+            value = float(clip.get(edge))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            rung[edge] = round(value, 3)
+    _RADIO.setdefault("voice_clips", []).append(rung)
+    del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
+    return rung
 
 
 def page_delivery_apply(entry: dict[str, Any], delivery_id: str) -> None:
@@ -63443,7 +63650,20 @@ _SFX_LEN_CACHE: dict[str, float] = {}
 # The current grab library alone holds over 15,000 clips. Keep their duration
 # readings across rotating pool scans; overflow evicts oldest readings rather
 # than discarding every cached SMB measurement at once.
-SFX_LEN_CACHE_MAX = 32000
+# #1321: ...AND THE LIBRARY IS BIGGER THAN THE LEDGER WAS.
+#
+# Measured today: this file holds exactly 32,000 rows, which is the cap,
+# which means it has been full and evicting for a long time - and the
+# drop root alone is 58,890 files, of which 14,354 are video. So every
+# walk was throwing away measurements the next walk would need, and the
+# expensive half of the video pool could never finish banking.
+#
+# The cap was low because of #1251c, when rewriting this ledger hammered
+# a CIFS share. That is no longer where it lives: measured today
+# /app/data is /dev/nvme0n1p2 - local NVMe - and only /samples is CIFS.
+# A larger file written to local disk at most once a minute is nothing,
+# and the alternative is probing ten thousand clips over SMB for ever.
+SFX_LEN_CACHE_MAX = 160000
 # #863: the measurements survive a restart. Keyed path+mtime, so a
 # replaced file is re-measured and a renamed one simply misses.
 SFX_LEN_PATH = data_path("sfx_lengths.json")
@@ -63470,6 +63690,20 @@ def _sfx_len_save() -> None:
         _SFX_LEN_DIRTY[0] = 0
     except Exception:  # noqa: BLE001
         pass
+
+
+def sfx_seconds_held(path: Path) -> float | None:
+    """#1321: the measurement we ALREADY HOLD, or None. Never probes.
+
+    The video pool needs to know which clips are free to judge and which
+    cost an ffprobe over CIFS, so that it can publish the free ones
+    before it starts paying for the rest. sfx_seconds() cannot answer
+    that question because answering it is what costs the money."""
+    try:
+        key = f"{path}:{path.stat().st_mtime_ns}"
+    except OSError:
+        return None
+    return _SFX_LEN_CACHE.get(key)
 
 
 def sfx_seconds(path: Path) -> float:
@@ -65585,10 +65819,52 @@ def _system2_repeat_rows(rows, entry=None) -> bool:
     return _system2().repeat_allowed(texts, entry)
 
 
-def _system2_acknowledge_row(clip, row, receipt_id) -> None:
-    """Remember both an audible chunk and its whole-turn identity, once."""
-    if not globals().get("_system2"):
-        return
+# #1325: A RECEIPT IS NOT WORTH THE EVENT LOOP.
+#
+# After #1320 took the events poll off the loop, this became the single
+# largest blocker on the pulse: 51.3s of an 84.5s stalled window - 61% -
+# in _system2_acknowledge_row, ahead of everything else put together.
+#
+# It is the same fault #1320 cured one road over, from the other side.
+# Every store call opens a connection while holding System2Store._lock,
+# and this one is a WRITE: _tx() runs BEGIN IMMEDIATE and commits under
+# `PRAGMA synchronous=FULL`, so it fsyncs, holding the lock, while the
+# loop waits. And it is on the AIR PATH - it runs for every audible line
+# the station speaks - so the show froze in proportion to how much of it
+# was working.
+#
+# The cure is a lane of its own, for the same reason #1311c gives: NOT
+# asyncio's default executor, which this process already runs twenty
+# threads deep. One daemon thread, one FIFO queue, so the receipts are
+# still written in the order they happened, by the same code, to the
+# same ledger.
+#
+# What this does NOT change is when the ledger learns. The write takes
+# as long as it takes either way; queueing it does not delay it, it only
+# stops the station standing still during it. The repeat guard is
+# therefore fed at the same wall-clock moment as before - the difference
+# is that the loop is free while the disk does its work.
+#
+# A full queue is the one case that must not lose a receipt (#1070's
+# whole point is that the ledger is the record), so an overflow is
+# written inline, on the caller, exactly as it used to be.
+_S2_ACK_LANE: list[Any] = [None]
+_S2_ACK_LANE_LOCK = RLock()
+S2_ACK_QUEUE_MAX = 2000
+
+
+def _s2_ack_worker() -> None:
+    """The lane. It only ever writes receipts, one at a time, in order."""
+    while True:
+        job = _S2_ACK_LANE[0].get()
+        try:
+            _system2_acknowledge_now(*job)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _system2_acknowledge_now(clip, row, receipt_id) -> None:
+    """The write itself - unchanged, and now never on the loop."""
     # #1070: a receipt the ledger will not take (the same receipt id seen
     # before with different words) is logged, never raised into the page
     # or box acknowledgement that delivered the line.
@@ -65604,6 +65880,30 @@ def _system2_acknowledge_row(clip, row, receipt_id) -> None:
                          extra=f"{receipt_id}: {type(exc).__name__}: {exc}"[:300])
         except Exception:  # noqa: BLE001
             pass
+
+
+def _system2_acknowledge_row(clip, row, receipt_id) -> None:
+    """Remember both an audible chunk and its whole-turn identity, once.
+
+    #1325: hands the write to the lane and returns at once. Nothing here
+    reads a result - all three callers are telling the ledger what has
+    already been heard - so there is nothing to wait for.
+    """
+    if not globals().get("_system2"):
+        return
+    try:
+        if _S2_ACK_LANE[0] is None:
+            with _S2_ACK_LANE_LOCK:
+                if _S2_ACK_LANE[0] is None:
+                    import queue as _queue
+                    _S2_ACK_LANE[0] = _queue.Queue(maxsize=S2_ACK_QUEUE_MAX)
+                    Thread(target=_s2_ack_worker, name="system2-ack",
+                           daemon=True).start()
+        _S2_ACK_LANE[0].put_nowait((clip, row, receipt_id))
+    except Exception:  # noqa: BLE001
+        # The lane is full or could not start. A receipt is never worth
+        # losing, so pay for it here - which is what this cost before.
+        _system2_acknowledge_now(clip, row, receipt_id)
 
 
 def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
@@ -65785,13 +66085,22 @@ def _sfx_any() -> Path | None:
 
 
 # #1303c: the airable video clips, built once per pool version.
-_SFX_VIDEO_MEMO: dict[str, Any] = {"key": None, "pool": [], "at": 0.0}
+# #1321: "built" separates "this library has no video clip that
+# qualifies" from "nobody has looked yet". Without it an empty pool
+# means the second, always, and the operator is told to tap again in a
+# moment for ever.
+_SFX_VIDEO_MEMO: dict[str, Any] = {"key": None, "pool": [], "at": 0.0,
+                                   "built": False}
 # #1306c: one build at a time. Four taps after a restart ran four
 # twenty-eight-second share walks on top of each other.
 _SFX_VIDEO_BUILDING = [False]
 # #1306d: a build costs half a minute of share I/O, so it is rested
 # rather than tied to the pool keeper's minute.
 SFX_VIDEO_REST_S = 600.0
+# #1321: how often a build in progress publishes what it has so far.
+# Small enough that the first clips are reachable at once, large enough
+# that the list is not being copied per clip.
+SFX_VIDEO_PUBLISH_EVERY = 20
 
 
 def _sfx_video_key() -> tuple:
@@ -65880,12 +66189,58 @@ def _sfx_video_pool() -> list[Path]:
     if _SFX_VIDEO_BUILDING[0] and _SFX_VIDEO_MEMO.get("pool"):
         return list(_SFX_VIDEO_MEMO["pool"])
     banned = sfx_bans()
-    pool = [p for p in sfx_all()
-            if sfx_is_video(p) and sfx_short(p)
-            and sfx_id(p) not in banned
-            and not sfx_is_silent(p)]
+    # #1321: THE ONES WE HAVE ALREADY MEASURED GO FIRST, AND GET
+    # PUBLISHED BEFORE THE REST IS EVEN LOOKED AT.
+    #
+    # This was one comprehension that published once, at the end. The
+    # end is HOURS away - 10,641 of the 14,354 video clips need an
+    # ffprobe across CIFS before it is reached - and until then the pool
+    # is empty and the operator's button says "still warming". Which is
+    # what it has been saying.
+    #
+    # Deciding an already-measured clip costs a stat and no probe, so
+    # the cheap half is separated out, judged, and published whole.
+    # Within seconds of a restart there is a pool. The expensive half
+    # then streams in behind it, publishing as it goes, so the library
+    # still fills out - it has just stopped being a precondition for a
+    # thumb on a button.
+    held: list[Path] = []
+    cost: list[Path] = []
+    for path in sfx_all():
+        if not sfx_is_video(path):
+            continue
+        if sfx_id(path) in banned:
+            continue
+        (held if sfx_seconds_held(path) is not None else cost).append(path)
+
+    pool: list[Path] = []
+    # #1321b: publish-as-you-go is worth something only when the
+    # alternative is an empty pool. On a REBUILD there is already a
+    # good list, and replacing it with the first twenty clips of a new
+    # walk would narrow the draw for the length of that walk. So the
+    # first build streams and a rebuild swaps at the end, as before.
+    streaming = not _SFX_VIDEO_MEMO.get("pool")
+
+    def _judge(paths: list[Path]) -> None:
+        for path in paths:
+            # Same two gates as before, in the same order. sfx_short
+            # exempts a video from the silence test (#1263); the pool
+            # does not, and that is deliberate - the set is for
+            # watching, but a clip with no sound is not a clip the SFX
+            # guy may drop into the air.
+            if sfx_short(path) and not sfx_is_silent(path):
+                pool.append(path)
+                if streaming and len(pool) % SFX_VIDEO_PUBLISH_EVERY == 0:
+                    _SFX_VIDEO_MEMO["pool"] = list(pool)
+
+    _judge(held)
+    # The cheap half, published whole, before a single probe is paid for.
+    if streaming and pool:
+        _SFX_VIDEO_MEMO["pool"] = list(pool)
+    _judge(cost)
+
     _SFX_VIDEO_MEMO.update({"key": _sfx_video_key(), "pool": list(pool),
-                            "at": time.time()})
+                            "at": time.time(), "built": True})
     return pool
 
 
@@ -66295,6 +66650,33 @@ async def sfxguy_gap_talk(why: str = "", floorless: bool = False) -> str:
 
 
 _SFX_PUNCTUATING = [False]      # #1246: one join's clip at a time
+# #1323: ...AND WHEN IT WAS TAKEN, BECAUSE A LATCH THAT STICKS IS SILENCE.
+#
+# Measured live 2026-09-13 with the room quiet: the SFX watch reported
+# asked=139, fired=0, gate=None. gate=None means sfx_fill_gap was never
+# ENTERED - so all 139 asks died inside sfx_punctuate, above its own
+# accounting, and the one road whose entire purpose is filling dead air
+# had been shut for 139 consecutive ticks without recording a reason.
+#
+# The latch is the way that happens. It is set True before the work is
+# handed to the loop and cleared in the task's `finally` - but a
+# coroutine that NEVER STARTS does not run its finally. fire_and_forget
+# closes the coroutine when create_task raises (#852), and a task
+# cancelled before its first step is closed the same way, so either one
+# leaves the latch held with nothing behind it and every later join
+# returns at the `if _SFX_PUNCTUATING[0]` line forever.
+#
+# A stamp beside the latch turns a permanent wedge into a 30-second one.
+_SFX_PUNCTUATING_AT = [0.0]
+SFX_PUNCTUATE_LATCH_MAX = 30.0
+# And the reason, so the watch stops having to infer it from a gate that
+# was never set.
+_SFX_PUNCTUATE_WHY: dict[str, Any] = {"at": 0.0, "why": "not asked yet"}
+
+
+def _sfx_punctuate_no(why: str) -> None:
+    """Record why a join was not even attempted."""
+    _SFX_PUNCTUATE_WHY.update({"at": time.time(), "why": str(why)})
 
 
 def sfx_punctuate(why: str) -> None:
@@ -66308,7 +66690,7 @@ def sfx_punctuate(why: str) -> None:
     louder."""
     try:
         if not _RADIO.get("on") or radio_paused():
-            return
+            return _sfx_punctuate_no("the station is off air")
         # #1246: NOT FROM INSIDE ITS OWN WORK. sfx_fill_gap can reach
         # dj_speak, dj_speak takes the floor, and _floor_take is one of
         # the two doors that calls this - so without a latch a join
@@ -66316,12 +66698,28 @@ def sfx_punctuate(why: str) -> None:
         # rest between clips would bound it in practice; a latch bounds
         # it on purpose.
         if _SFX_PUNCTUATING[0]:
-            return
+            # #1323: a held latch is normal for the couple of seconds a
+            # join takes, and a WEDGE after that - see the note on
+            # _SFX_PUNCTUATING_AT. Past the ceiling, break it open and
+            # say so, rather than refusing dead-air cover forever
+            # because one task was closed before it ever ran.
+            _held = time.time() - float(_SFX_PUNCTUATING_AT[0] or 0)
+            if _held < SFX_PUNCTUATE_LATCH_MAX:
+                return _sfx_punctuate_no("a join is already in flight")
+            _SFX_PUNCTUATING[0] = False
+            try:
+                pipeline_log("sfx", "(#1323) the join latch had been held "
+                                    "%.0fs with nothing behind it - broken "
+                                    "open so the SFX guy can cover the "
+                                    "silence again" % _held)
+            except Exception:  # noqa: BLE001
+                pass
         # #1263: a join inside a guarded entry is noise in front of the
         # thing the sheet is waiting to put on.
         if entry_guard_blocks("sfxguy"):
-            return
+            return _sfx_punctuate_no("a guarded entry is waiting to go on")
         _SFX_PUNCTUATING[0] = True
+        _SFX_PUNCTUATING_AT[0] = time.time()      # #1323
 
         async def _one() -> None:
             try:
@@ -66330,6 +66728,7 @@ def sfx_punctuate(why: str) -> None:
                 _SFX_PUNCTUATING[0] = False
 
         fire_and_forget(_one())
+        _sfx_punctuate_no("handed to the loop")   # #1323: the good case
     except Exception:  # noqa: BLE001
         _SFX_PUNCTUATING[0] = False
         pass                    # a join is never worth an exception
@@ -66394,9 +66793,15 @@ async def sfx_guy_watch() -> None:
                 _SFX_WATCH["fired"] = int(_SFX_WATCH.get("fired") or 0) + 1
                 _SFX_WATCH["why"] = "fired"
             else:
-                _SFX_WATCH["why"] = ("quiet %ds, asked - last gate: %s"
-                                     % (int(quiet),
-                                        str(_SFX_GAP.get("gate") or "?")))
+                # #1323: a gate of "?" meant sfx_fill_gap was never
+                # entered, which is a different fault from a gate that
+                # refused - and it was the live one. Say which.
+                _gate = str(_SFX_GAP.get("gate") or "")
+                _SFX_WATCH["why"] = (
+                    "quiet %ds, asked - last gate: %s" % (int(quiet), _gate)
+                    if _gate else
+                    "quiet %ds, asked - the join never reached the gate: %s"
+                    % (int(quiet), str(_SFX_PUNCTUATE_WHY.get("why") or "?")))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -70001,15 +70406,31 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
         entry = dict(dialogue_entry(row) or {})
         entry["prep_kind"] = kind
         entry["_ready_slot"] = window
+        # #1322: `force` IS the silence rescue (#1313) - it is set only
+        # under talk_quiet_for() >= SILENCE_LOSES_AFTER - so it, and
+        # nothing broader, is what lets the booth air a repeat. `rescue`
+        # deliberately does NOT: the standing cupboard consumer passes
+        # rescue=True on its ordinary timer, and that road must keep the
+        # repeat check.
         said = await _banter_air(entry, track, ready_takes=takes,
-                                 on_handoff=commit, can_handoff=can_handoff)
+                                 on_handoff=commit, can_handoff=can_handoff,
+                                 despite_repeats=bool(force))
         if said:
             commit()
             if kind == "gallery":
                 pics = [p for p in entry.get("prep_gallery") or [] if isinstance(p, dict)]
                 _RADIO["gallery_now"] = {"at": time.time(), "images": pics[:3]}
         else:
-            _shelf_no(kind, "the booth did not put it out")        # #1304
+            # #1322: ...and WHICH refusal the booth made. This sentence
+            # was the last anonymous one on the road.
+            _booth = ""
+            try:
+                if time.time() - float(_BANTER_WHY.get("at") or 0) < 30:
+                    _booth = str(_BANTER_WHY.get("why") or "")
+            except Exception:  # noqa: BLE001
+                _booth = ""
+            _shelf_no(kind, "the booth did not put it out"          # #1304
+                            + (": " + _booth if _booth else ""))
         return said
     finally:
         _READY_SHELF_BUSY.discard(id(row))
@@ -81124,6 +81545,19 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     transcript = [transcript[index] for index in original_rows]
                     seg_ix = [mapping[seg_ix[index]] for index in original_rows]
                     turn_ix = [turn_ix[index] for index in original_rows]
+                    # #1330: AND THE NAMES, which this rebuild forgot.
+                    # `line_ids` is parallel to `transcript` and is what
+                    # `rid` is read from below - so dropping an SFX row
+                    # out of the middle of the round without dropping its
+                    # name shifted every id after it by one. The ring then
+                    # carried each line under its neighbour's id, which is
+                    # the identity `speaking_now` reports and the identity
+                    # the script matches on: the panel highlighted the
+                    # wrong line and the clip behind it belonged to
+                    # someone else. Silent, because both lists stayed the
+                    # same shape and only the PAIRING was wrong.
+                    line_ids = [line_ids[index] for index in original_rows
+                                if index < len(line_ids)]
                     _sfx_meta = {}
                     beats = concat_beats(len(seg))
                     mixed = (await asyncio.to_thread(_call_concat_blocking, seg,
@@ -81216,6 +81650,46 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                                   _tail_at(0))
                 offset = _ring_real
                 lead = 1 if ring_secs else 0
+                # #1330: THE SCRIPT, WRITTEN DOWN, BEFORE IT IS HEARD.
+                #
+                # `transcript` is final here. The SFX guy has been rolled
+                # into it above - at his own cadence and his own dial, so
+                # "occasionally" and "at random" are already true of it -
+                # and the omission path that can take his rows back out
+                # again has already run. Nothing past this point changes
+                # the running order; only its timing. So this is the
+                # moment the hour becomes a script, and it is written
+                # down before the burst is handed to the air.
+                #
+                # The ids committed here are the ones the ring is about to
+                # carry, which is what lets a panel match `speaking_now`
+                # to a script row by identity. That is the join
+                # director_find_script had to fake with a substring search
+                # over every shelf row, and could not make at all once the
+                # round had been retired.
+                #
+                # Before `_est0`, because the estimate below is anchored
+                # on it and a file append is not free.
+                try:
+                    script_ledger_commit(
+                        _round_sid,
+                        [{"line_id": (line_ids[_r] if _r < len(line_ids)
+                                      else ""),
+                          "who": _w, "text": _c, "seconds": _s,
+                          "turn": (turn_ix[_r] if _r < len(turn_ix) else -1),
+                          "kind": ("sfx" if _w == "board"
+                                   else "sfxguy" if (_w == "drop"
+                                                     and _r in _sfx_meta)
+                                   else "dialogue"),
+                          "cue": str((_sfx_meta.get(_r) or {}).get(
+                              "sfx_sample_id") or ""),
+                          "scripted": True}
+                         for _r, (_w, _c, _s) in enumerate(transcript)],
+                        str(ready_meta.get("prep_kind") or source or ""))
+                except Exception:  # noqa: BLE001
+                    # A round must never fail to air because the document
+                    # could not be written.
+                    pass
                 _est0 = time.time()
                 _entries: list[dict[str, Any]] = []
                 for _row, (who, chunk, secs) in enumerate(transcript):
@@ -84155,16 +84629,64 @@ async def _freshen_script(script: str, caller_name: str = "",
     return _restore("\n".join(out))             # #838
 
 
+# #1322: THE BOOTH HAS TWO WAYS OF SAYING NOTHING AND THEY ARE NOT THE
+# SAME FAULT. _ready_shelf_air learned to name its five refusals in
+# #1304 and the number of never-heard rounds fell; the door it hands the
+# round to then reported all of its own refusals as the single sentence
+# "the booth did not put it out", which is #1304's fault exactly one
+# floor further down. Same cure: record which one, and let the caller
+# repeat it.
+_BANTER_WHY: dict[str, Any] = {"at": 0.0, "why": ""}
+
+
+def _banter_no(why: str) -> list[str]:
+    """Record which booth refusal this was, and refuse."""
+    _BANTER_WHY.update({"at": time.time(), "why": str(why)})
+    return []
+
+
 async def _banter_air(entry: dict[str, Any],
                       track: dict[str, Any] | None, *,
                       ready_takes: list[dict[str, Any]] | None = None,
-                      on_handoff: Any = None, can_handoff: Any = None) -> list[str]:
+                      on_handoff: Any = None, can_handoff: Any = None,
+                      despite_repeats: bool = False) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
     if not _system2_repeat_rows(ready_takes if ready_takes is not None else
             [{"text": text} for _, text in banter_turns(str(entry.get("script") or ""),
                 str(entry.get("caller_name") or ""), str(entry.get("caller2_name") or ""))], entry):
-        return []
+        # #1322: A REPEAT OUTRANKS DEAD AIR - AND ONLY WHEN IT IS DEAD AIR.
+        #
+        # Measured live, 2026-09-13, with the station silent: 78 finished
+        # recorded rounds ready and 69 of them overdue, the cupboard 7.3h
+        # deep, the room quiet 347s - and the sweep reporting
+        # walks=1 aired=0, "the booth did not put it out". This check was
+        # vetoing every banked round the cupboard offered, so the fuller
+        # the shelf got the more certain the silence became: a round that
+        # has been banked for hours has had every line of it said at some
+        # point, which is precisely what this test refuses.
+        #
+        # The operator has ruled on this trade in his own words - "check
+        # banked lines, swap only if a replacement exists" - under the
+        # standing rule that the station is never silent.
+        #
+        # So the veto stands everywhere except the one road that is
+        # already gated on MEASURED silence. `despite_repeats` is
+        # threaded from _ready_shelf_air's `force`, which comes from
+        # unheard_stock_air(force=True), which is reached only under
+        # `talk_quiet_for() >= SILENCE_LOSES_AFTER` (#1313/#1316). The
+        # ordinary road - including the standing cupboard consumer on its
+        # timer - keeps the check exactly as it was, because a station
+        # that repeats itself while it holds fresh material is the fault
+        # #1175 measured at 43.6% of aired lines, and this must not
+        # become that.
+        if not despite_repeats:
+            return _banter_no("the repeat check refused the round - every "
+                              "line in it has been on air before")
+        pipeline_log("air", "(#1322) a banked round aired DESPITE the "
+                            "repeat check: the room had gone measurably "
+                            "silent and the cupboard was full, and a "
+                            "repeat outranks dead air")
     airlog_round_hint(str(entry.get("prep_kind") or ""),
                       caller=str(entry.get("caller_name") or ""))  # #1023 (G1)
     # #1050 (P1): which lines were already in the ring, so the stamp at the
@@ -84241,7 +84763,11 @@ async def _banter_air(entry: dict[str, Any],
     if ready_takes is not None:
         ready_takes = copy.deepcopy(ready_takes)
         if not ready_takes:
-            return []
+            # #1322: the OTHER way this function says nothing. Until now
+            # it was indistinguishable from the repeat veto above, so the
+            # desk could not tell a vetoed round from an empty one.
+            return _banter_no("the round arrived at the booth with no "
+                              "takes on it")
         ready_takes[0]["round"] = copy.deepcopy(entry)
     elif entry.get("frozen") and not _stale:
         # #886: already freshened while a record played, and the audio was
@@ -118873,14 +119399,42 @@ async def music_file(
     if rate:
         small = _music_low_path(track_id, rate)
         _mk = f"music:{track_id}|{rate}"
-        _held = time.time() - float(_LOW_MISSED.get(_mk) or 0) < 900.0
+        # #1319: THE STICKY MISS WAS NOT STICKY, IT WAS PERMANENT.
+        #
+        # #1147's hold is right and is kept: a Range CONTINUATION must
+        # never get mp3 frames where it already expected library-file
+        # bytes. But the stamp was rewritten on every HELD serve, so the
+        # hold renewed itself - and a record being streamed is asked for
+        # far more often than once per 900s, so `_held` stayed true
+        # forever and the small copy was never once reached.
+        #
+        # Measured: one track served 15,742,466 bytes on every request
+        # while /app/data/music_lo/30566ce8029fb158-96k.mp3 sat beside
+        # it at 5,587,761 bytes, written and never read. That is 2.8x
+        # the bytes, and the tablet - which is the station's speaker -
+        # took 20.8s to fetch what the desk got in 0.62s. A record that
+        # buffers is dead air wearing a nicer name.
+        #
+        # Two changes, either of which alone fixes it:
+        #  1. stamp only a GENUINE miss (inside the not-a-file branch),
+        #     so a hold can no longer renew itself;
+        #  2. let a FRESH START ignore the hold. The hold exists for
+        #     continuations; a request with no Range, or a Range from
+        #     byte 0, is a new stream and has nothing to be inconsistent
+        #     with. That also drops the up-to-900s wait for a listener
+        #     starting a track whose small copy was encoded long ago.
+        _start = re.match(r"\s*bytes\s*=\s*(\d+)",
+                          str(request.headers.get("range") or ""))
+        _continuation = bool(_start and int(_start.group(1)) > 0)
+        _held = (_continuation
+                 and time.time() - float(_LOW_MISSED.get(_mk) or 0) < 900.0)
         if small.is_file() and not _held:
             path, media_type = small, "audio/mpeg"
         else:
             missed = True
             if not small.is_file():
                 _music_low_encode_soon(path, small, rate)
-            _LOW_MISSED[_mk] = time.time()
+                _LOW_MISSED[_mk] = time.time()
         for nxt in ([_RADIO.get("coming") or {}]
                     + (_RADIO.get("requests") or [])[:1]
                     + (_RADIO.get("queue") or [])[:1]):
@@ -121073,6 +121627,15 @@ async def sfx_video_cue_api(
     if not sfx_video_warm():
         sfx_video_kick()
         if not _SFX_VIDEO_MEMO.get("pool"):
+            # #1321: and say WHICH of the two silences this is. A walk
+            # that finished and found nothing is not a walk still
+            # running, and telling the operator to "tap again in a
+            # moment" about the first one is a lie they will act on.
+            if _SFX_VIDEO_MEMO.get("built"):
+                return {"ok": False, "clip": None, "warming": False,
+                        "say": "the library has been read and not one "
+                               "video clip qualifies - check the clip "
+                               "folders, the length dials and the bans"}
             return {"ok": False, "clip": None, "warming": True,
                     "say": "the clip library is still warming - tap again "
                            "in a moment"}
@@ -121128,6 +121691,57 @@ async def sfx_video_cue_api(
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, "clip": clip, "say": pick.stem + " is on the set"}
+
+
+@app.post("/api/sfx/video/cut")
+async def sfx_video_cut_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1322: EVERY VIDEO CLIP, WHEREVER IT WAS FIRED, ON EVERY SURFACE.
+
+    "When a video clip is played, show a PiP overlay on the application
+     as well."
+
+    Two of the three roads to a picture were already shared, because
+    both go through the station: an SFX sting with a picture (#1263) and
+    the operator's video button (#1306) both land in the ring that
+    /api/dj/video serves, so the tablet's set and the app's set each see
+    them. The third does not. A sampler pad holding an mp4 pops its
+    picture with a LOCAL PineSfxTv.cut (#1310) - the clip is already
+    decoded on the pad, nothing is asked of the station, and so the
+    other surface never learns the clip was played at all.
+
+    This is that road's door. It does not pick a clip and it does not
+    play one: it rings a clip the caller is ALREADY playing, so every
+    other set comes on with it. The caller gets the stamped clip back
+    and marks it, which is what stops the surface that fired it from
+    playing the same picture twice when its own poll comes round.
+
+    Station-relative urls only. The sets resolve a clip's url against
+    their own base, so an absolute one would send the tablet to fetch a
+    picture from somewhere nobody vetted."""
+    require_auth(authorization)
+    body = payload or {}
+    url = str(body.get("url") or "").strip()
+    if not url.startswith("/") or url.startswith("//") or ".." in url:
+        return {"ok": False, "clip": None,
+                "say": "a clip is rung by its station path - "
+                       "'/sfx/<id>?t=<sig>', not a url of its own"}
+    clip = page_picture_append({
+        "url": url,
+        "sting": body.get("sting") or body.get("label") or "clip",
+        "id": body.get("id") or "",
+        "seconds": body.get("seconds") or 0,
+        "from": body.get("from"),
+        "to": body.get("to"),
+    })
+    try:
+        note_activity("sting", str(clip.get("sting") or "clip"))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "clip": clip,
+            "say": str(clip.get("sting") or "clip") + " is on every set"}
 
 
 @app.get("/api/sfx/anxiety")
@@ -124613,6 +125227,193 @@ async def api_dj_gaps_ledger(
 # --- G1 end ---------------------------------------------------------------
 
 
+# --- P0: THE SCRIPT LEDGER (#1330) -----------------------------------------
+#
+# THE PILLAR. Everything above this line reconstructs the hour afterwards,
+# from whatever it can find. This writes the hour DOWN, in order, before a
+# sample of it is audible - and the air then executes what it says.
+#
+#   data/script_ledger.jsonl     one row per scripted line, APPEND ONLY,
+#                                ordered by (block, ord), both assigned
+#                                once at commit and never rewritten
+#   data/script_ledger_seq.json  the block counter, on disk
+#
+# Why: the screenplay's base sort was `air_at`, a field eight paths
+# rewrite. #1288 froze it once heard and #1274 moved the anchor to `ts` -
+# but both are repairs to a document that had no order of its own. Order
+# is not a property of when a line sounded. It is a property of the
+# script, and the script is settled before the mixer runs.
+#
+# The measurement those two tickets left behind is the case for this file:
+# "104 of 129 re-appended ids had their air_at move, median 88s" (#1274),
+# and "reading one hour twice, 45 seconds apart, six changed stamps put 83
+# of 468 elements back in a different order". A reader cannot follow a
+# document that reorders under them, and no amount of correcting a clock
+# turns a transcript into a script.
+#
+# What a round commits, from _speak_turns_floorless at the point the
+# running order can no longer change:
+#   block    monotonic per commit, from the counter on disk
+#   ord      the row's index in that round's transcript, SFX INCLUDED
+#   line_id  the id the ring will carry and `speaking_now` will report,
+#            which is what lets a panel match the needle to a script row
+#            by identity instead of by searching the words
+#
+# THE SFX GUY IS IN HERE, at the position he was rolled into. His cues are
+# chosen while the round is assembled (_sfx_cadence_additions, sting_due),
+# which is before the weld and therefore before air - so the script ahead
+# of the needle already knows where he lands. That is the whole difference
+# between a script and a transcript: this file can be read forwards.
+#
+# The ledger is never mutated. Airing state stays where it already lives -
+# on the air-log row - because a document that rewrites itself is the
+# thing this file exists to replace. A row that never aired keeps its slot
+# and simply never gets stamped, which is how a skipped line stays visible.
+
+SCRIPT_LEDGER_PATH = data_path("script_ledger.jsonl")
+SCRIPT_LEDGER_SEQ_PATH = data_path("script_ledger_seq.json")
+_SCRIPT_LEDGER_LOCK = RLock()
+_SCRIPT_LEDGER_MEMO: dict[str, Any] = {"at": 0.0, "rows": []}
+SCRIPT_LEDGER_MEMO_S = 5.0              # the screenplay asks on every compose
+SCRIPT_LEDGER_KEEP_S = AIRLOG_KEEP_S    # two days, like every ledger here
+SCRIPT_LEDGER_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _script_ledger_prune() -> None:
+    """Two days. Called under the lock, from the writer."""
+    try:
+        floor = time.time() - SCRIPT_LEDGER_KEEP_S
+        keep: list[str] = []
+        for line in SCRIPT_LEDGER_PATH.read_text().splitlines():
+            try:
+                if float(json.loads(line).get("at") or 0) >= floor:
+                    keep.append(line)
+            except Exception:  # noqa: BLE001
+                continue
+        SCRIPT_LEDGER_PATH.write_text("\n".join(keep) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _script_block_next() -> int:
+    """The next block number: allocated once, never reused.
+
+    Kept on disk because a restart that restarted the count would file a
+    new round in front of an old one, and the one promise this file makes
+    is that the order does not move. If the counter is ever lost, the
+    ledger itself is read for the high-water mark rather than handing out
+    a number that is already spoken for."""
+    with _SCRIPT_LEDGER_LOCK:
+        got = 0
+        try:
+            got = int(json.loads(
+                SCRIPT_LEDGER_SEQ_PATH.read_text()).get("block") or 0)
+        except Exception:  # noqa: BLE001
+            got = 0
+        if got <= 0:
+            try:
+                for line in SCRIPT_LEDGER_PATH.read_text().splitlines():
+                    try:
+                        got = max(got, int(json.loads(line).get("block") or 0))
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+        nxt = got + 1
+        try:
+            SCRIPT_LEDGER_SEQ_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SCRIPT_LEDGER_SEQ_PATH.write_text(json.dumps({"block": nxt}))
+        except Exception:  # noqa: BLE001
+            pass
+        return nxt
+
+
+def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
+                         round_kind: str = "") -> int:
+    """Write one round down, in the order it will be heard.
+
+    Returns the block, or 0 if nothing was written - and a failure here
+    must never stop the round airing, so callers ignore the result. The
+    rows arrive FINAL: after the SFX guy's cues have been rolled into the
+    running order, and after the omission path that can take them back out
+    again (#1330)."""
+    if not rows:
+        return 0
+    block = _script_block_next()
+    at = time.time()
+    out: list[str] = []
+    for ord_, row in enumerate(rows):
+        out.append(json.dumps({
+            "block": block, "ord": ord_, "at": at,
+            "sid": str(sid or ""), "round": str(round_kind or ""),
+            "line_id": str(row.get("line_id") or ""),
+            "who": str(row.get("who") or ""),
+            "kind": str(row.get("kind") or ""),
+            "text": str(row.get("text") or "")[:2000],
+            "seconds": round(float(row.get("seconds") or 0), 2),
+            "turn": row.get("turn"),
+            # The SFX guy's own row: which cue, and whether he was rolled
+            # into the script (scripted) or punched in later to cover a
+            # hole (not). Both belong in the document; only one of them
+            # could have been read in advance.
+            "cue": str(row.get("cue") or ""),
+            "scripted": bool(row.get("scripted", True)),
+        }))
+    try:
+        with _SCRIPT_LEDGER_LOCK:
+            SCRIPT_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with SCRIPT_LEDGER_PATH.open("a") as handle:
+                handle.write("\n".join(out) + "\n")
+            _SCRIPT_LEDGER_MEMO["at"] = 0.0
+            if SCRIPT_LEDGER_PATH.stat().st_size > SCRIPT_LEDGER_MAX_BYTES:
+                _script_ledger_prune()
+    except Exception:  # noqa: BLE001
+        return 0
+    return block
+
+
+def script_ledger_rows() -> list[dict[str, Any]]:
+    """The script as written, in its own order.
+
+    Memoised for five seconds: the screenplay asks on every compose and
+    json holds the GIL (#1156)."""
+    with _SCRIPT_LEDGER_LOCK:
+        if (time.time() - float(_SCRIPT_LEDGER_MEMO.get("at") or 0)
+                < SCRIPT_LEDGER_MEMO_S):
+            return list(_SCRIPT_LEDGER_MEMO.get("rows") or [])
+        rows: list[dict[str, Any]] = []
+        try:
+            for line in SCRIPT_LEDGER_PATH.read_text().splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            rows = []
+        rows.sort(key=lambda r: (int(r.get("block") or 0),
+                                 int(r.get("ord") or 0)))
+        _SCRIPT_LEDGER_MEMO["rows"] = rows
+        _SCRIPT_LEDGER_MEMO["at"] = time.time()
+        return list(rows)
+
+
+def script_ledger_order() -> dict[str, tuple[int, int]]:
+    """line_id -> (block, ord): the screenplay's sort key.
+
+    This one mapping is the whole integration. A line the ledger knows is
+    placed where the script put it; a line it does not know - a rescue
+    sting, an emergency filler, anything minted outside a round - keeps
+    the clock-ordered slot it has always had."""
+    out: dict[str, tuple[int, int]] = {}
+    for r in script_ledger_rows():
+        lid = str(r.get("line_id") or "")
+        if lid:
+            out[lid] = (int(r.get("block") or 0), int(r.get("ord") or 0))
+    return out
+
+
+# --- P0 end ----------------------------------------------------------------
+
 # --- P1: THE SCREENPLAY (#1050) --------------------------------------------
 #
 # "in the newspaper screen, I also want a screenplay generated for the
@@ -125375,18 +126176,33 @@ def _screenplay_actions(d: dict[str, Any], since: float,
         out.append({"at": float(at), "id": eid, "text": text, "tag": tag,
                     **more})
 
+    # #1330: WHICH RECORD IS ACTUALLY ON THE DECK.
+    #
+    # "the script jumped over changing the track to this track... if it is
+    #  queued up for the next track, then it needs to say that."
+    #
+    # It is never queued ahead - _music_log_append writes the row when the
+    # record STARTS - so an entry here always describes a record already
+    # turning. What it could not say was WHICH tense it was in, so a
+    # record that began forty seconds ago read exactly like one that
+    # finished an hour ago, and the reader had no way to tell the script
+    # had caught up. Now it says so, and carries the flag for the panel.
+    _deck = str((_RADIO.get("now") or {}).get("id") or "")
     for r in d.get("records") or []:
         title = r.get("title") or "an untitled record"
         by = f" by {r['artist']}" if r.get("artist") else ""
+        _spinning = bool(_deck and str(r.get("id") or "") == _deck)
         # #1281: named after the record, not the moment. `at` is
         # air_at and air_at moves; the id does not.
         add(r["at"], f"ac-rec-{r.get('id') or int(r['at'])}",
-            f"A record drops: \"{title}\"{by} "
-            f"({screenplay_mmss(r.get('length') or r.get('seconds'))}"
+            ("A record is spinning: " if _spinning else "A record drops: ")
+            + f"\"{title}\"{by} "
+            + f"({screenplay_mmss(r.get('length') or r.get('seconds'))}"
             + (f", cut to {screenplay_mmss(r['seconds'])}"
                if float(r.get("seconds") or 0) + 6
                < float(r.get("length") or 0) else "")
-            + ").", "record", seconds=r.get("seconds"))
+            + ").", "record", seconds=r.get("seconds"),
+            playing=_spinning)
     for a in d.get("ads") or []:
         add(a["at"], f"ac-ad-{a.get('id') or int(a['at'])}",   # #1281
             "The advert airs" + (f" - {a['product']}" if a.get("product")
@@ -125736,6 +126552,62 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     except Exception:  # noqa: BLE001
         pass                # a script that will not re-block still reads
 
+    # #1330: AND THEN THE LEDGER, WHICH DOES NOT HAVE TO GUESS.
+    #
+    # Everything above this line repairs an order the clock got wrong:
+    # #1308 trails the unheard, #1259 restores turn order inside a round,
+    # #1265 gathers a conversation into one block, #1299 pins the
+    # interjections back onto the line they interrupted. Every one of them
+    # is an inference from timestamps, and the comment at the head of
+    # #1259 says plainly what they are worth: "air_at cannot order a
+    # script."
+    #
+    # It does not have to. The round was written down in order before it
+    # was welded (script_ledger_commit), and (block, ord) IS that order -
+    # assigned once, never rewritten, and carrying the very line ids the
+    # ring went out with. Where the ledger knows a line, it is the answer
+    # and the passes above are simply overruled.
+    #
+    # This is a MERGE, not a replacement. The ledger cannot know a rescue
+    # sting, an emergency filler, a record, an advert or a call - none of
+    # them come from a round - so a block is anchored at the earliest
+    # moment any of its rows reached the air, its rows hold their written
+    # order inside that anchor, and everything unledgered keeps the clock
+    # slot it has always had and lands between blocks where it sounded.
+    # A scripted sting is inside its block by construction, so the #1299
+    # drift ("52 of 1,055 elements run backwards, median 37.1s") cannot
+    # reach it any more.
+    try:
+        _ord = script_ledger_order()
+    except Exception:  # noqa: BLE001
+        _ord = {}
+    if _ord:
+        _anchor_of: dict[int, float] = {}
+        for _e in events:
+            _got = _ord.get(str((_e.get("row") or {}).get("id") or ""))
+            if not _got:
+                continue
+            _when = float(_e.get("at") or 0)
+            _anchor_of[_got[0]] = (min(_anchor_of[_got[0]], _when)
+                                   if _got[0] in _anchor_of else _when)
+
+        def _script_key(e: dict[str, Any]) -> tuple:
+            got = _ord.get(str((e.get("row") or {}).get("id") or ""))
+            if got and got[0] in _anchor_of:
+                # Inside a block: where the script put it.
+                return (_anchor_of[got[0]], 0, got[0], got[1], e["sort"])
+            # Outside one: where the clock says it happened.
+            return (float(e.get("at") or 0), 1, 0, 0, e["sort"])
+
+        try:
+            events.sort(key=_script_key)
+        except Exception:  # noqa: BLE001
+            pass          # a script that will not re-order still reads
+
+    # #1330: the same mapping the sort above used, kept for the element
+    # builder so a row can carry its written position out to the panel.
+    _script_pos = _ord if isinstance(_ord, dict) else {}
+
     elements: list[dict[str, Any]] = []
     scenes: list[tuple[int, float]] = []    # (subheader index, scene start)
     scene_round = None
@@ -125767,6 +126639,13 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                                                      "parenthetical"):
                 speaker = ""
             push("action", row["text"], row["id"], at=at, tag=row.get("tag"),
+                 # #1330: the record that is TURNING. `add` accepts **more
+                 # and this forwarded only `tag`, so the flag was set on
+                 # the event and dropped on the way to the element - the
+                 # text said "is spinning" while the field the panel tints
+                 # from was never there. Only when true: an action that is
+                 # not a record has no business carrying it.
+                 **({"playing": True} if row.get("playing") else {}),
                  **({"line": row["line"], "clip": row.get("url") or ""}
                     if row.get("line") else {}))
             counts["actions"] += 1
@@ -125864,7 +126743,15 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
              engine=str((one.get("voice") or {}).get("engine")
                         or row.get("engine") or ""),
              model=str((one.get("wrote") or {}).get("model") or ""),
-             recorded=bool(one), replay=bool(row.get("replay")))
+             recorded=bool(one), replay=bool(row.get("replay")),
+             # #1330: where the SCRIPT put this line, not where the clock
+             # found it. A panel that wants the next line - to read ahead,
+             # or to know the highlight is about to move - can follow
+             # these without re-deriving anything. Absent on a line no
+             # round wrote, which is itself the useful signal: it says
+             # this one was not scripted.
+             **({"block": _pos[0], "ord": _pos[1]}
+                if (_pos := _script_pos.get(line_id)) else {}))
         counts["lines"] += 1
         counts["seconds"] += float(row.get("seconds") or 0)
         if tinted:
@@ -147417,6 +148304,81 @@ function key() {
   return document.getElementById("apiKey").value.trim() || SERVER_KEY;
 }
 
+/* #1324: EVERY REQUEST IS BOUNDED, AND IDENTICAL ONES SHARE A FLIGHT.
+ *
+ * THE FAULT: the tablet's WebView "went deaf" and only a fresh process
+ * cured it. It was never the network stack, the door or the station.
+ * It was Chromium's per-origin request queue for 127.0.0.1:8096,
+ * saturated by this panel's own pollers.
+ *
+ * The proof is one line: during a confirmed fault the SAME door reached
+ * through the `localhost:8096` alias - a different Chromium socket-pool
+ * group, same door, same station - answered in 185ms, while
+ * 127.0.0.1:8096 could not complete a request at all. Direct to the
+ * station: 111ms. Everything was healthy except that one pool group.
+ *
+ * A 75-second capture during the fault:
+ *     still pending on 127.0.0.1:8096 = 274  (oldest 74s, never dispatched)
+ *     completed                       =  21
+ *       15 at 0s   - PineNet's OkHttp, which never touches the pool
+ *        6 at 16-18s - actual network requests
+ * Six requests served in seventy-five seconds.
+ *
+ * The arithmetic: Chromium allows 6 connections per origin (measured -
+ * 16 concurrent finished 6 at 13.2s and the rest at 15.9s). This panel
+ * runs 59 setInterval timers, ~35 of them network pollers at 1.5-6s,
+ * measured arriving at 4-6.5 requests/s. Every one came through this
+ * function, which had NO TIMEOUT AND NO IN-FLIGHT GUARD - ten
+ * simultaneous copies of the identical /api/dj/pipeline?since=... were
+ * observed outstanding at once. 4/s arriving against 6 sockets serving
+ * ~0.35/s is a queue that grows without bound and never drains, which
+ * is exactly why nothing short of a new process ever fixed it.
+ *
+ * TWO CHANGES, and the first is the one that matters:
+ *
+ * 1. A deadline on every request. This is what turns an unbounded queue
+ *    into one bounded by (pollers x timeout / interval): a request can
+ *    no longer occupy a socket, or wait for one, for ever.
+ * 2. Identical in-flight GETs share one flight, so a slow endpoint
+ *    cannot have ten copies of itself outstanding.
+ *
+ * THE TRADE, stated plainly: this station currently takes 10-15s to
+ * answer some endpoints (/api/dj/sections measured at 13s), so those
+ * requests will now FAIL where before they would eventually arrive. A
+ * failed poll is self-healing - the next tick asks again - and a
+ * saturated queue is not, so this is the right way round. It is also
+ * why the event-loop stall work is the other half of this same fault:
+ * every stall second removed from the station widens the drain, and the
+ * timeout stops being reached at all.
+ */
+const API_TIMEOUT_MS = 8000;
+const _apiInFlight = new Map();
+
+function _apiSignal(options) {
+  if (options && options.signal) return options.signal;   // caller owns it
+  try {
+    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) {
+      return AbortSignal.timeout(API_TIMEOUT_MS);
+    }
+    if (typeof AbortController !== "undefined") {
+      const ac = new AbortController();
+      setTimeout(() => { try { ac.abort(); } catch (e) {} }, API_TIMEOUT_MS);
+      return ac.signal;
+    }
+  } catch (e) { /* an engine without either keeps the old behaviour */ }
+  return undefined;
+}
+
+/* Sharers must not be handed the same object: the first caller may keep
+ * and mutate what it got (the panel does exactly that with settings),
+ * and before this change ten parallel callers got ten separate objects.
+ */
+function _apiCopy(value) {
+  try { return structuredClone(value); } catch (e) {}
+  try { return JSON.parse(JSON.stringify(value)); } catch (e) {}
+  return value;
+}
+
 async function api(path, options = {}) {
   options.headers = {
     ...(options.headers || {}),
@@ -147427,14 +148389,33 @@ async function api(path, options = {}) {
     options.headers["Content-Type"] = "application/json";
   }
 
-  const response = await fetch(path, options);
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    throw new Error(data.detail || "Request failed");
+  // #1324: a deadline, and one flight per identical GET.
+  const _method = (options.method || "GET").toUpperCase();
+  const _share = _method === "GET" && !options.body;
+  const _flight = _method + " " + path;
+  if (_share) {
+    const _held = _apiInFlight.get(_flight);
+    if (_held) return _held.then(_apiCopy);
   }
+  const _signal = _apiSignal(options);
+  const _sent = _signal ? {...options, signal: _signal} : options;
+  const _run = (async () => {
+    const response = await fetch(path, _sent);
+    const data = await response.json().catch(() => ({}));
 
-  return data;
+    if (!response.ok) {
+      throw new Error(data.detail || "Request failed");
+    }
+
+    return data;
+  })();
+  if (_share) {
+    _apiInFlight.set(_flight, _run);
+    _run.catch(() => {}).then(() => {
+      if (_apiInFlight.get(_flight) === _run) _apiInFlight.delete(_flight);
+    });
+  }
+  return _run;
 }
 
 function setStatus(message, error = false) {
@@ -197632,6 +198613,81 @@ function initLevels() {
 // routes accept it and nothing else will.
 const GUEST = /^\d+\.[a-f0-9]+\.[a-f0-9]+$/.test(String(KEY || ""));
 
+/* #1324: EVERY REQUEST IS BOUNDED, AND IDENTICAL ONES SHARE A FLIGHT.
+ *
+ * THE FAULT: the tablet's WebView "went deaf" and only a fresh process
+ * cured it. It was never the network stack, the door or the station.
+ * It was Chromium's per-origin request queue for 127.0.0.1:8096,
+ * saturated by this panel's own pollers.
+ *
+ * The proof is one line: during a confirmed fault the SAME door reached
+ * through the `localhost:8096` alias - a different Chromium socket-pool
+ * group, same door, same station - answered in 185ms, while
+ * 127.0.0.1:8096 could not complete a request at all. Direct to the
+ * station: 111ms. Everything was healthy except that one pool group.
+ *
+ * A 75-second capture during the fault:
+ *     still pending on 127.0.0.1:8096 = 274  (oldest 74s, never dispatched)
+ *     completed                       =  21
+ *       15 at 0s   - PineNet's OkHttp, which never touches the pool
+ *        6 at 16-18s - actual network requests
+ * Six requests served in seventy-five seconds.
+ *
+ * The arithmetic: Chromium allows 6 connections per origin (measured -
+ * 16 concurrent finished 6 at 13.2s and the rest at 15.9s). This panel
+ * runs 59 setInterval timers, ~35 of them network pollers at 1.5-6s,
+ * measured arriving at 4-6.5 requests/s. Every one came through this
+ * function, which had NO TIMEOUT AND NO IN-FLIGHT GUARD - ten
+ * simultaneous copies of the identical /api/dj/pipeline?since=... were
+ * observed outstanding at once. 4/s arriving against 6 sockets serving
+ * ~0.35/s is a queue that grows without bound and never drains, which
+ * is exactly why nothing short of a new process ever fixed it.
+ *
+ * TWO CHANGES, and the first is the one that matters:
+ *
+ * 1. A deadline on every request. This is what turns an unbounded queue
+ *    into one bounded by (pollers x timeout / interval): a request can
+ *    no longer occupy a socket, or wait for one, for ever.
+ * 2. Identical in-flight GETs share one flight, so a slow endpoint
+ *    cannot have ten copies of itself outstanding.
+ *
+ * THE TRADE, stated plainly: this station currently takes 10-15s to
+ * answer some endpoints (/api/dj/sections measured at 13s), so those
+ * requests will now FAIL where before they would eventually arrive. A
+ * failed poll is self-healing - the next tick asks again - and a
+ * saturated queue is not, so this is the right way round. It is also
+ * why the event-loop stall work is the other half of this same fault:
+ * every stall second removed from the station widens the drain, and the
+ * timeout stops being reached at all.
+ */
+const API_TIMEOUT_MS = 8000;
+const _apiInFlight = new Map();
+
+function _apiSignal(options) {
+  if (options && options.signal) return options.signal;   // caller owns it
+  try {
+    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) {
+      return AbortSignal.timeout(API_TIMEOUT_MS);
+    }
+    if (typeof AbortController !== "undefined") {
+      const ac = new AbortController();
+      setTimeout(() => { try { ac.abort(); } catch (e) {} }, API_TIMEOUT_MS);
+      return ac.signal;
+    }
+  } catch (e) { /* an engine without either keeps the old behaviour */ }
+  return undefined;
+}
+
+/* Sharers must not be handed the same object: the first caller may keep
+ * and mutate what it got (the panel does exactly that with settings),
+ * and before this change ten parallel callers got ten separate objects.
+ */
+function _apiCopy(value) {
+  try { return structuredClone(value); } catch (e) {}
+  try { return JSON.parse(JSON.stringify(value)); } catch (e) {}
+  return value;
+}
+
 async function api(path, options = {}) {
   let url = path;
   if (GUEST) {
@@ -197645,10 +198701,30 @@ async function api(path, options = {}) {
     options.headers = Object.assign({}, options.headers,
       {"Content-Type": "application/json"});
   }
-  const response = await fetch(url, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || "Request failed");
-  return data;
+  // #1324: the car page and the guest page share this pool group too.
+  const _method = (options.method || "GET").toUpperCase();
+  const _share = _method === "GET" && !options.body;
+  const _flight = _method + " " + url;
+  if (_share) {
+    const _held = _apiInFlight.get(_flight);
+    if (_held) return _held.then(_apiCopy);
+  }
+  const _signal = _apiSignal(options);
+  const _sent = _signal ? Object.assign({}, options, {signal: _signal})
+                        : options;
+  const _run = (async () => {
+    const response = await fetch(url, _sent);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || "Request failed");
+    return data;
+  })();
+  if (_share) {
+    _apiInFlight.set(_flight, _run);
+    _run.catch(() => {}).then(() => {
+      if (_apiInFlight.get(_flight) === _run) _apiInFlight.delete(_flight);
+    });
+  }
+  return _run;
 }
 
 /* #632: the room can shout back. A reaction is a mood the show can feel; a

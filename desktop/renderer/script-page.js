@@ -1467,6 +1467,20 @@
      * 'published' and 'stream' have both already been heard. */
     if (item.aired === 'prepared') node.classList.add('pending');
     if (item.tinted) node.classList.add('tinted');
+    /* #1330: the record that is on the deck RIGHT NOW, not one that
+     * finished an hour ago. The two read identically before this, so a
+     * script that had just caught up with a track change looked exactly
+     * like one that had skipped it - which is how "the script jumped
+     * over changing the track" is what a forty second lag looks like
+     * from the outside. The server says which; this shows it. */
+    if (item.playing) node.classList.add('sp-spinning');
+    /* #1330: where the SCRIPT put this line. Carried so a reader can
+     * follow the running order without re-deriving it, and so the mark
+     * can tell a scripted line from one nothing wrote. */
+    if (item.block) node.dataset.block = String(item.block);
+    if (item.ord !== undefined && item.ord !== null) {
+      node.dataset.ord = String(item.ord);
+    }
     if (type === 'dialogue' || type === 'action') {
       node.addEventListener('click', function () { openLine(item, node); });
     }
@@ -1483,6 +1497,33 @@
    * The DJ voice rides one of a small set of <audio> elements. The one
    * that matters is the one that is actually playing - unpaused, not
    * ended, and past its first frame. */
+  /* #1330: THE PANEL'S PLAYHEAD, ACROSS THE WEBVIEW BOUNDARY.
+   *
+   * soundingPlayer() below scans THIS document. On the desktop chrome
+   * that document holds one <audio> (desktopRadioPlayer); djVoiceAudio0/1
+   * are created by the panel, which runs inside <webview id="radioFrame">
+   * and is a DOM this one cannot reach. So on the chrome the scan
+   * returned null every single time - not intermittently - and #1278's
+   * read position, #1287's file guard and #1294's named-row preference
+   * were all silently dead there, leaving the view on the clock estimate
+   * the whole lot was written to replace.
+   *
+   * webview-preload.js posts the position out; renderer.js stamps it on
+   * arrival and hands back null once it is stale. Stale has to mean
+   * absent: a frozen mark reads as a working one, which is worse than
+   * falling back to the clock and is how this fault survived so long. */
+  function bridgeHead() {
+    try { return (root.pinePlayhead && root.pinePlayhead()) || null; }
+    catch (e) { return null; }
+  }
+
+  /* True when the position is READ off the sound, false when it is
+   * estimated. The searches below are only trustworthy in the first
+   * case, and they had no way to ask. */
+  function headIsRead() {
+    return !!(bridgeHead() || soundingPlayer());
+  }
+
   function soundingPlayer() {
     var all = document.querySelectorAll('audio');
     for (var i = 0; i < all.length; i += 1) {
@@ -1517,6 +1558,8 @@
    * The clock remains for the one case with nothing to read: no player
    * sounding. */
   function streamAt() {
+    var head = bridgeHead();                              /* #1330 */
+    if (head) return Number(head.t) || 0;
     var player = soundingPlayer();
     if (player) return Number(player.currentTime) || 0;
     if (!liveStream || !liveStream.at) return -1;
@@ -1533,6 +1576,8 @@
      the file is how a row 99 seconds away wins - 23 of the 24
      wrong-line samples were exactly that. */
   function soundingFile() {
+    var head = bridgeHead();                              /* #1330 */
+    if (head) return String(head.file || '');
     var a = soundingPlayer();
     if (!a) return '';
     var src = String(a.currentSrc || a.src || '').split('?')[0];
@@ -1564,6 +1609,28 @@
     var t = streamAt();
     var rows = (liveStream && liveStream.rows) || [];
     var file = soundingFile();
+    /* #1330: A BURST THAT HAS RUN OUT IS NOT A TABLE TO SEARCH.
+     *
+     * With an estimated position there is no filename to hold a row to,
+     * so #1287's guard cannot fire and a finished burst's windows still
+     * bracket the estimate - lighting a row that stopped sounding some
+     * time ago and holding it lit. #1294 measured that shape: 12 of 19
+     * wrong samples were more than two seconds in.
+     *
+     * The station's own reader already refuses this - it accepts an
+     * offset only inside [0, length + 4] before falling back to
+     * speaking_now - and the view should refuse it on the same terms.
+     * Where the position is READ this cannot arise, because the file
+     * guard settles it; this is only for where we are guessing. */
+    if (!headIsRead() && liveStream && liveStream.at) {
+      var span = Number(liveStream.length || 0) + 4;
+      if (!(t >= 0 && t <= span)) {
+        return (speakingNow && speakingNow.id)
+          ? {id: String(speakingNow.id), from: 0, until: 0, at: t,
+             index: -1, of: rows.length}
+          : null;
+      }
+    }
     function within(list, of) {
       var lone = null, loneAt = -1;
       for (var i = 0; i < list.length; i += 1) {
@@ -1800,10 +1867,22 @@
        * scroll cancelled itself, which is the very fault the guard
        * exists to prevent. `scrollend` says when it is really over. */
       selfScrollUntil = Date.now() + 2400;        /* backstop only */
+      /* #1330: ON THE BOX THAT ACTUALLY SCROLLS.
+       *
+       * This said `script`, which is declared in build() and in
+       * planLayout() and in neither case is in scope here. Under 'use
+       * strict' it resolved through named access on the global object to
+       * <section id="script"> - the view HOST, which is overflow:hidden
+       * and never scrolls. So 'scrollend' never fired, selfScrollUntil
+       * never cleared early, and the 2400ms backstop governed every
+       * move: for 2.4s after each highlight the handler below returned
+       * at its first line and the operator's own scroll was discarded,
+       * which is the precise opposite of what the guard is for. */
+      var box = el('spScript');
       try {
-        if ('onscrollend' in script) {
-          script.addEventListener('scrollend', function done() {
-            script.removeEventListener('scrollend', done);
+        if (box && 'onscrollend' in box) {
+          box.addEventListener('scrollend', function done() {
+            box.removeEventListener('scrollend', done);
             selfScrollUntil = 0;
           }, {once: true});
         }

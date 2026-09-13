@@ -8,6 +8,12 @@ The aim is a tablet that boots straight into Pine Box and is a limb of the
 station — listen, work the deck, open every console, and play the air back
 through a sampler — with no Google account, no Lenovo shell, and no home screen.
 
+
+**Part I (§1-14)** is how a stock Lenovo Tab M9 was made ours. **Part II
+(§15-22)** is the software that runs on it, how to build for it, and every
+way it has been seen to fail. If you are picking this up cold and something
+is broken, read §19 first.
+
 ---
 
 ## 1. The device
@@ -1101,3 +1107,511 @@ will ask to be signed in again when the key runs out.
   directory was temporary. They belong beside the project that needs them.
 - **`[hidden]` is a UA type-level rule**, so any class-level `display` out-ranks
   it. That is the whole of the "I still cannot close this overlay" bug.
+
+---
+
+# Part II — the software on it, and how to work with it
+
+Sections 1–14 are how a stock Lenovo Tab M9 was made ours. What follows is how
+the thing that runs on it is built, how to build for it, and every way it has
+been seen to fail. Written 2026-09-13, after a night that found most of §19 the
+expensive way.
+
+If you are an LLM handed this document with no other context: **§15 tells you
+how to reach the tablet, §16 how the app is put together, §17 the hardware
+surfaces, §19 the faults, §20 how to add something new.** Read §19 before you
+conclude anything is broken.
+
+---
+
+## 15. Reaching it, day to day
+
+```sh
+export PATH="$PATH:/c/_tools/android-sdk/platform-tools"
+adb connect 10.89.1.154:5555
+D="-s 10.89.1.154:5555"        # ALWAYS use -s: USB and Wi-Fi are often both attached
+```
+
+`adb shell id` returns **uid 0** — this is a userdebug GSI and root is there when
+you need it.
+
+### The pid, and why your script will fail without this
+
+`adb shell ps -A | grep pinebox` **returns nothing at random on this device**,
+while the process is plainly running. It has cost hours across several nights.
+
+```sh
+P=$(adb $D shell "pidof com.pinebox.kiosk" | tr -d '\r\n ' | awk '{print $1}')
+```
+
+`pidof` can hand back **two** pids mid-restart — hence `awk '{print $1}'`. Loop
+and retry rather than trusting a single attempt. The app's own log is a third
+road: `adb $D logcat -d | grep "panel up in"` — field 3 is the pid.
+
+### Looking inside the page
+
+The panel is a WebView, so Chrome DevTools Protocol works over adb:
+
+```sh
+adb $D forward tcp:9600 localabstract:webview_devtools_remote_$P
+curl -s http://127.0.0.1:9600/json          # -> webSocketDebuggerUrl
+node cdp-ask.js "<ws url>" "<a JS expression>"
+```
+
+Three helpers exist and the difference matters:
+
+| tool | when |
+|---|---|
+| `cdp-ask.js` | evaluate, print the result |
+| `cdp-ask-long.js` | 45 s budget, awaits promises |
+| `cdp-tap.js` | sets `userGesture: true` — **required to start audio or video** |
+
+**The trap:** the kiosk injects its view code with `evaluateJavascript`, so
+**injected JS never enters the DOM**. Searching
+`document.documentElement.innerHTML` for a function you just shipped finds
+nothing, and you will wrongly conclude the deploy failed — this has happened
+twice. **CSS does** land in the DOM, so a stylesheet rule is a reliable "did my
+build arrive" probe. Better: call the function and see if it answers.
+
+### Screen frozen, nothing responds
+
+Check the **notification shade first**. It takes focus and covers everything and
+is indistinguishable from a hung kiosk:
+
+```sh
+adb $D shell "cmd statusbar collapse"
+adb $D shell "dumpsys window | grep mCurrentFocus"      # names what actually has it
+```
+
+Lock-task pinning is a separate thing (`dumpsys activity activities | grep
+mLockTaskModeState`) and is usually **NONE** — see §16.6.
+
+---
+
+## 16. How the app is built
+
+### 16.1 One Activity, one WebView, injected views
+
+`MainActivity` owns a WebView that loads the station's panel. Everything that
+makes it *the Pine Box* is **injected at document start** from the APK's own
+assets — the station serves the panel, the tablet supplies the views:
+
+| bundle | file | carries |
+|---|---|---|
+| Boot | `bridge/BootAssets.kt` | the logo and splash, before anything else |
+| Views | `bridge/ViewAssets.kt` | `assets/pine-views/*` — Script, Listen, Music, Presentation, the rail, the meters, the CRT set, the deaf-watch |
+| Sampler | `bridge/SamplerAssets.kt` | `assets/pine-sampler/*` — its own page, its own copies |
+
+**Order is not cosmetic.** `SCRIPTS` is evaluated in list order: models first,
+then the views that read them, `rail.js` last because it looks for the globals
+the others define. Wrong position, silent `undefined`.
+
+**A file on one surface is not on the other.** The sampler page is a separate
+bundle with its own copy of shared files. `sfx-tv.js` lived only in the desktop
+shell for weeks, which is why the video window never appeared on the tablet —
+the operator was tapping a button whose window did not exist there. A shared
+view goes in **both** lists and **both** asset directories.
+
+### 16.2 The bridge — `window.pineDesktop`
+
+`bridge/PineDesktopBridge.kt` plus the shim `assets/pine-bridge.js`. The shim
+hangs **one function per method** off `window.pineDesktop`:
+
+```js
+await pineDesktop.get('/api/dj')                 // the station, via the APP's HTTP client
+await pineDesktop.post('/api/sfx/fill', {road:'video'})
+await pineDesktop.jack({on:true})                // hand audio to the cable
+await pineDesktop.wallpaper({now:true})
+await pineDesktop.revive({now:true, why:'…'})    // restart the terminal
+```
+
+**A new bridge method needs THREE edits. Missing the third is the usual bug:**
+
+1. the name in the method set in `PineDesktopBridge.kt` — dispatch
+2. a `"name" -> { … }` branch in the `when` — behaviour
+3. **`name: promised("name")` in `assets/pine-bridge.js`** — exposure
+
+Skip (3) and `pineDesktop.yourMethod` is `undefined`, with no error anywhere.
+(Measured: added `revive` to the dispatch set, rebuilt, and it was still
+undefined on the page until the shim line went in.)
+
+**The bridge does not use the WebView's network.** It goes through the app's own
+HTTP client. This is the single most important fact for debugging this tablet —
+see §19.1 — and the reason anything that must not fail belongs on the bridge.
+
+### 16.3 `PineNet` — the request interceptor
+
+`net/PineNet.kt`, hooked from `PanelClient.shouldInterceptRequest`. It owns two
+prefixes and returns `null` for everything else:
+
+- `/vendor/*` — served straight from APK assets (three.js and friends)
+- `/api/generations/image/*` — fetched by the **app's** HTTP client, cached on disk
+
+Why: the panel draws ~180 full-size 1024×1024 PNGs as thumbnails, which
+saturates an HTTP/1.1 connection pool and starves everything behind it —
+measured with `/vendor/three.min.js` still unanswered after three minutes.
+
+Consequence to remember: **images keep loading when the WebView's network is
+dead**, because they never touch it. That asymmetry is the diagnostic in §19.1.
+
+### 16.4 `LoopDoor` — the loopback proxy, and why the origin is 127.0.0.1
+
+`net/LoopDoor.kt` runs a proxy on `127.0.0.1:8096`, and the panel is loaded from
+**there**, not from `10.89.1.246:8096`. It forwards raw bytes upstream.
+
+This is not an optimisation, it is the only road that worked. `sampler-air.js`
+wants an **AudioWorklet** for the broadcast tap, because the fallback
+`ScriptProcessorNode` runs on the main thread and *loses* 17–23 % of buffers,
+85 ms at a time, whenever the panel is laying out (§8 has the rest).
+`BaseAudioContext.audioWorklet` is gated on `isSecureContext`, and the panel is
+plain http.
+
+Three roads were tried:
+
+- **a certificate** — none obtainable for a LAN address that is also reached on
+  a tailnet
+- **a command-line flag** — the flag file *is* read on this device (proved with
+  `--force-device-scale-factor`), but
+  `--unsafely-treat-insecure-origin-as-secure` never reached the renderer, and
+  it would need every road's origin listed
+- **loopback** — potentially trustworthy *by spec*, no certificate, no flag,
+  and it stays http so the panel's own cleartext media is not blocked as mixed
+  content
+
+Measured: a page on `127.0.0.1` reports `isSecureContext: true` with a live
+`audioWorklet`; the same page on `10.89.1.246` reports `false` and `undefined`.
+
+**So `location.origin` is `http://127.0.0.1:8096` and that is correct.** Do not
+"fix" it. If you see a fetch to 127.0.0.1 failing, the door is not the first
+suspect — read §19.1.
+
+### 16.5 Provisioning itself — `KeyDiscovery`
+
+The station embeds its key in every page it serves (`const SERVER_KEY = "…"`),
+so a terminal on the LAN provisions itself with one unauthenticated `GET /`
+rather than being told a secret by hand. The regex must stay identical to
+Electron's `discoverAgentKey`.
+
+### 16.6 What makes it a kiosk
+
+Three separate mechanisms, and confusing them is how a "kiosk" ends up with a
+Recents button:
+
+1. **HOME** — declared in the manifest, made sticky with
+   `addPersistentPreferredActivity`. Decides where every boot and every
+   back-out-of-everything lands.
+2. **LOCK TASK** — `startLockTask()`. Without device owner this is only screen
+   pinning: a toast, and Back+Recents together lets you out. Usually reports
+   `mLockTaskModeState=NONE`.
+3. **IMMERSIVE** — whether the bars are drawn. Cosmetic, and the one that keeps
+   needing re-applying, because the system restores the bars on every focus
+   change.
+
+---
+
+## 17. The hardware surfaces
+
+Permissions held (manifest): `CAMERA`, `RECORD_AUDIO`, `MODIFY_AUDIO_ROUTING`,
+`MODIFY_AUDIO_SETTINGS`, `CAPTURE_AUDIO_OUTPUT`, `CAPTURE_VIDEO_OUTPUT`,
+`CAPTURE_SECURE_VIDEO_OUTPUT`, `DUMP`, `SET_WALLPAPER`, `WAKE_LOCK`,
+`RECEIVE_BOOT_COMPLETED`, `FOREGROUND_SERVICE*`, `POST_NOTIFICATIONS`,
+`INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`.
+
+Several of those are **signature-level** and only exist because the app is
+platform-signed (§637 and §18).
+
+| surface | file | the shape of it |
+|---|---|---|
+| The jack | `audio/JackWatch.kt` | announces the cable to the framework, because this GSI never notices it (§8 and §19.4) |
+| Output routing | `audio/OutputRoute.kt` | where the sound goes |
+| The mix | `audio/AirTap.kt` | the broadcast captured natively, off the page — the ScriptProcessor version lost 85 ms at a time |
+| The ear | `audio/MicCapture.kt` | native capture; a level comparison in a silent room compares noise floors (§14) |
+| The sampler engine | `audio/NativeAudio.kt` + `app/src/main/cpp/` | oboe. **Not written by this project.** A build with no engine still installs and the panel's own HTML5 audio carries the show |
+| Focus | `audio/MediaFocus.kt` | give the speaker back when something else is in front |
+| Camera | `camera/PineCameraService.kt` | **no preview and no Activity** — Camera2 renders into an `ImageReader`, so looking through the camera never takes the terminal off the air |
+| Screen | `replay/ScreenReplay.kt` | a `VirtualDisplay` mirrors the real screen into an encoder, held in a rolling ring, extractable through the app |
+| Power | `power/PowerWatch.kt` | how long the radio has left, computed rather than guessed — Android only answers `computeChargeTimeRemaining` while charging |
+| USB | `gallery/UsbBrowse.kt`, `UsbTarget.kt` | browse and write a stick |
+| Wallpaper | `gallery/WallpaperWatch.kt` | the gallery on the home screen and keyguard (§19.2) |
+| DGX terminal | `terminal/Dgx*.kt` | ssh to the workstation, no keys stored (§12) |
+| Rail | `rail/*` | the side rail, quick jumps, who owns the air |
+
+### The one rule that governs the audio graph
+
+`window.audioScope(el)` memoises **one analyser per element** and adopts
+`window.pineAudioCtx`. An element may have exactly **one**
+`createMediaElementSource`; a second **throws** and takes the audio with it.
+
+So anything wanting levels **borrows**, never builds. `sampler-air.js` states
+this; `pine-meters.js` had to learn it — it called `createMediaElementSource`
+itself, threw every time, caught, returned `null` for ever, and the player's
+spectrum was blank while the code drawing it ran perfectly. Measured cure:
+ink 0 → 4033 on the music meter, 0 → 2569 on the voice meter.
+
+Pads **duck the broadcast** (`PineAir.duck('pad')`, released when nothing is
+sounding and no pad is held). If everything reports "playing" and you hear
+nothing, check `PineAir.duckState()` before anything else.
+
+---
+
+## 18. Deploying
+
+```sh
+cd /c/_tools/pinebox-android/PineBoxKiosk
+export JAVA_HOME=C:/_tools/jdk17 ANDROID_HOME=C:/_tools/android-sdk \
+       GRADLE_USER_HOME=C:/_tools/_gradlehome
+./deploy.sh
+```
+
+**Always `deploy.sh`. Never `gradle assembleDebug` + `adb install`.** Gradle
+signs with the debug key every time, so a plain install silently reverts the
+platform signature and takes `MODIFY_AUDIO_ROUTING` and `DUMP` with it — and the
+headphone jack stops working with no error. `deploy.sh` re-signs with
+`keys/platform.pk8` / `platform.x509.pem`, refuses to install anything that is
+not platform-signed, and prints the proof:
+
+```
+android.permission.MODIFY_AUDIO_ROUTING: granted=true
+android.permission.DUMP: granted=true
+```
+
+If either says `false`, stop. Also: an uninstall takes **runtime** grants with
+it, and `RECORD_AUDIO` does not come back on its own — the mic then records
+silence rather than failing, which reads as "it did not hear me".
+
+**`deploy.sh` leaves the app stopped.** Start it yourself:
+
+```sh
+adb $D shell "am start -n com.pinebox.kiosk/.MainActivity"
+```
+
+**A view change still needs a rebuild.** The views live inside the APK, so
+copying a `.js` onto the station changes the desktop shell only. Copy to all the
+places that need it:
+
+```
+…/spark-agent/desktop/renderer/<file>                     # the shell
+…/PineBoxKiosk/app/src/main/assets/pine-views/<file>      # the tablet's panel
+…/PineBoxKiosk/app/src/main/assets/pine-sampler/<file>    # the tablet's sampler
+```
+
+---
+
+## 19. Failure modes, with their cures
+
+### 19.1 The WebView goes deaf — the one that will fool you
+
+**Symptom:** the panel looks completely alive — feed updating, views painting —
+and there is **no audio at all**.
+
+**Why it looks alive:** the feed and every API call go through the bridge
+(§16.2), which is the app's HTTP client. Images load for the same reason
+(§16.3). What has died is **Chromium's own network stack**, and with it every
+`fetch`, every `<audio>` and every `<video>` — the only three things the
+broadcast needs.
+
+**Signature:**
+
+```
+musicPlayer        net=2 ready=0        stuck loading, never plays
+djVoiceAudio0/1    src="" or ready=0
+djVoiceSeen        stuck  (seen 51 minutes behind)
+fetch('/api/…')     TypeError: Failed to fetch in 40–100 ms
+                   — a PRISTINE fetch from a fresh <iframe> fails too,
+                     so it is not a page-level override
+images             still 200 in ~500 ms       <-- the tell
+```
+
+**Ruled out, each measured. Do not spend a night on these again:** no proxy
+(`settings get global http_proxy` null, Wi-Fi `Proxy settings: NONE`);
+Tailscale up but `ip route get 10.89.1.246 uid 10212` goes straight out
+`wlan0`; `mediaPlaybackRequiresUserGesture` already false; nothing ducked, all
+elements volume 1 and unmuted; `LoopDoor` healthy (two requests on one
+connection, 200 each in 0.02 s, keep-alive reused).
+
+**The cure is a fresh process:**
+
+```sh
+adb $D shell "am force-stop com.pinebox.kiosk"; sleep 4
+adb $D shell "am start -n com.pinebox.kiosk/.MainActivity"
+```
+
+Measured: `fetch` went from `TypeError` to `200 in 442 ms` on the instant, and
+audio returned. **A WebView reload will not do it** — the network service lives
+in the app process, so the same dead stack is handed to the new page.
+
+**The self-heal** is `deaf-watch.js` (a view) + `net/Revive.kt` (the app). It
+does **not** watch the audio: "no sound for a while" cannot tell deafness from a
+quiet show, and this station has real quiet stretches. It compares the two
+roads — *the bridge answers and a plain fetch does not* — which is a pattern no
+amount of genuine dead air can produce. Three consecutive strikes, a 25 s probe
+budget, and any round where the bridge itself was slow is thrown away.
+
+Two things it had to learn, both measured on this device:
+
+- `setExactAndAllowWhileIdle` is **refused**: *"Package com.pinebox.kiosk, uid
+  10212 lost permission to set exact alarms"*. Use `setAndAllowWhileIdle`.
+- **The relaunch delay must be ~2.5 s, not 900 ms.** At 900 ms the app came back
+  and the panel **never loaded** — no `panel up in` line at all, `listeners=0` —
+  because the launch landed inside a process that was still dying, while
+  Android was also restarting the foreground activity itself. Two launches
+  fighting.
+- The rest period lives **on disk**, not in a field: a field is reborn with the
+  process, so a terminal that came back still deaf would revive for ever. It
+  gives up after three in thirty minutes, because a restart loop is worse than a
+  silent screen — you can at least read a silent screen.
+
+**Watch for:** if the probe budget is shorter than the station's worst
+event-loop stall, this watch will restart a perfectly healthy tablet. It did
+exactly that at an 8 s budget against a station that stalls 10–15 s.
+
+### 19.2 The wallpaper relaunches the Activity
+
+Hanging gallery art makes systemui regenerate the Material You overlays, which
+raises `CONFIG_ASSETS_PATHS` (`0x80000000`) — a config change with **no name in
+the `android:configChanges` flag set**, so it cannot be declared away and the
+Activity is **relaunched**. Measured: seven times in thirty-three minutes, on
+exactly `WallpaperWatch.EVERY_MS` (5 min), each taking the operator's scroll
+position and folds with it.
+
+Cure: still choose a piece every round, but **hang it only when no view is on
+the glass** — `reading` set in `onResume`, `released()` from `onPause`. That is
+faithful to `PineApp`'s own note: *"the wallpaper's whole point is to be right
+when the app is NOT the thing on screen."* Verified: zero relaunches after.
+
+### 19.3 JS timers freeze; rAF does not
+
+The WebView **suspends JS timers** while `requestAnimationFrame` keeps firing.
+Anything that must keep moving — a mark, a meter, a countdown — rides rAF, not
+`setInterval`. No web-side cure can reach the timer that would fix it, because
+that cure would itself be a timer.
+
+### 19.4 Audio going to a jack with nothing in it
+
+The announcement **outlives the app** (§8), so a stale one routes the broadcast
+into an empty socket. `dumpsys audio | grep Devices:` shows `headset(4)` —
+which on this tablet is usually **correct**, because a cable runs to a larger
+system. Confirm with the operator before "restoring" the speaker.
+
+```js
+await pineDesktop.jack()                // report
+await pineDesktop.jack({on:false})      // hand it back
+```
+
+### 19.5 The connection pool, and leaked media elements
+
+A WebView allows roughly **six connections per origin**, and the panel holds
+several long-lived polls. Anything that leaks a loading `<video>` eats a slot
+permanently — measured: two orphaned videos at `net=2`, after which **87 fetches
+were outstanding and not one completed in 25 s**, including `/api/pulse`.
+
+If you build a floating player, tear it down **by class over the document**, not
+through the module's own references. Under rapid cutting the references have
+moved on and the old node is left attached, still loading. Removing a `<video>`
+does **not** stop it: clear `src` and call `load()` first, then remove the node.
+
+### 19.6 Floating above the views
+
+Every view is `display:none` the moment another tab is chosen and three of them
+are separate documents, so anything that must float mounts at **body level**.
+Then it has to out-rank the view layer:
+
+```
+the kiosk floats every injected view at   z-index 2147483000
+the sampler's own overlays                2147483030+
+the hold sheets                           2147483046
+the lock screen                           2147483050
+```
+
+A picture-in-picture belongs around **2147483020** — above the views, below the
+things meant to cover it.
+
+Measured before this was understood: the video window was built, playing and
+**completely buried**, with `elementFromPoint` at its own centre returning a
+script line.
+
+**#1322 — and the same number applies in the shell.** This used to lift the
+kiosk only, told apart by `location.protocol`, on the reasoning that 900 was
+right in the Electron renderer because that shell's own chrome is at 1000. That
+reasoning has not held: the shell now carries the same high bands the kiosk
+does — `view-chrome` at 2147483200, the hold sheets at 2147483046, the trace
+console at 2147483004, the SC pop-up at 2147483010, the panel's own 3JS windows
+at 2147483020 — and its Agent tab is a `<webview>` with a compositing layer of
+its own. A set at 900 behind any of those is this same fault on the other
+surface, with nothing on screen to say so. **Both surfaces lift.** The 900 in
+`sfx-tv.css` is now only the fallback for a surface where an inline style is
+refused; `tests/test_sfx_tv_2026_09_12.cjs` asserts the lifted number in a
+world with no `location` at all, which is the shell's case.
+
+### 19.7 Stale ANRs
+
+`/data/anr` keeps old traces. **Check the date** before blaming one for
+something happening now.
+
+---
+
+## 20. Building something new for this tablet
+
+1. Write the view as a plain IIFE hanging one global off `window`
+   (`window.PineYourThing = {…}`). No modules, no bundler — files are
+   concatenated and evaluated in order.
+2. Put it in `assets/pine-views/` **and** name it in `ViewAssets.SCRIPTS` at the
+   right point in the order; a `.css` goes in `STYLES` the same way.
+3. If it must also live on the sampler page, repeat for `pine-sampler/` and
+   `SamplerAssets`.
+4. Talk to the station through **`pineDesktop`**, not `fetch` — the bridge
+   survives §19.1 and `fetch` does not.
+5. New native capability? **Three edits** (§16.2), and remember the shim.
+6. Anything that must not stop when the screen is idle rides **rAF** (§19.3).
+7. Floating? Body level, and mind the z-index bands (§19.6).
+8. Media? One owner of the audio graph — **borrow** the analyser (§17).
+9. Deploy with `./deploy.sh`, then `am start`, then verify by **calling** your
+   code over CDP — never by grepping the DOM for it (§15).
+
+---
+
+## 21. Quick reference
+
+```sh
+D="-s 10.89.1.154:5555"
+
+# alive?
+adb $D shell "pidof com.pinebox.kiosk"
+adb $D shell "dumpsys window | grep mCurrentFocus"
+
+# the cure for §19.1
+adb $D shell "am force-stop com.pinebox.kiosk"; sleep 4
+adb $D shell "am start -n com.pinebox.kiosk/.MainActivity"
+
+# the app's own voice
+adb $D logcat -d | grep -E "PineKioskActivity|PineRevive|PineWallpaper"
+
+# audio routing
+adb $D shell "dumpsys audio | grep -iE 'Devices:|Current:'"
+
+# is the tablet actually hearing the station?  listeners>0 means it is polling
+curl -s http://10.89.1.246:8096/api/dj | python -c "import sys,json;d=json.load(sys.stdin);print('listeners',d['listeners'],'|',d['dialogue_flow']['why_quiet']['why'])"
+
+# screen covered by nothing you can see
+adb $D shell "cmd statusbar collapse"
+```
+
+---
+
+## 22. The standing rules
+
+- **`deploy.sh`, always.** Platform signing is what makes the jack and the
+  routing work, and a plain install silently takes them away.
+- **The bridge outlives the WebView's network.** Anything that must not fail
+  goes on the bridge.
+- **One owner of the audio graph.** Borrow the analyser; never build a second
+  source on an element.
+- **Measure on the device.** Every number in Part II came off this tablet, and
+  several contradicted a reasonable guess.
+- **A meter that can only ever print one answer is not a meter.** Two separate
+  nights were lost to checks that could not fail — a highlight measured against
+  the arithmetic it was testing, and a "0 nodes rebuilt" reading taken during
+  the one condition that cannot produce the fault.
+- **Ruling something out is worth writing down.** Half of §19.1 is a list of
+  things that were *not* the cause, and that list is what makes the next
+  occurrence a ten-minute job instead of a night.

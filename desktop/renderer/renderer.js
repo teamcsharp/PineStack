@@ -842,12 +842,63 @@ function selectView(name) {
  * to be an absolute file:// URL and has to be set before `src`, or the
  * document that needs it is already loading. */
 function frameBridge(frame) {
-  if (!frame || frame.getAttribute("preload")) return;
+  if (!frame) return;
+  /* #1330: before the early return below, not after it. That return
+   * fires whenever a preload is already attached - which is every
+   * call after the first, and any frame something else set up - and
+   * the playhead listener has nothing to do with the preload
+   * attribute. Behind it, the bridge would attach only on the one
+   * path that also happens to install the preload. */
+  playheadBridge(frame);
+  if (frame.getAttribute("preload")) return;
   try {
     frame.setAttribute("preload",
                        new URL("webview-preload.js", location.href).href);
   } catch (e) { /* without it Copy falls back exactly as it did before */ }
 }
+
+/* #1330: the panel's DJ playhead, carried into the chrome.
+ *
+ * The SCRIPT view needs the voice element's currentTime to place its
+ * highlight, and that element lives in this webview's document, not
+ * ours. The preload posts it; this puts it somewhere the view can read.
+ *
+ * PINE_PLAYHEAD_STALE_MS is the whole safety story. A reading is only
+ * usable while it is fresh, so a webview that navigates, crashes or
+ * simply stops sending leaves the view falling back to stream_now and
+ * then the clock - which is exactly where it was before this existed.
+ * A bridge that freezes the mark would be worse than no bridge. */
+const PINE_PLAYHEAD_STALE_MS = 1200;
+
+function playheadBridge(frame) {
+  if (!frame || frame.__pinePlayhead) return;
+  frame.__pinePlayhead = true;
+  try {
+    frame.addEventListener("ipc-message", (event) => {
+      if (!event || event.channel !== "pine-playhead") return;
+      const got = (event.args && event.args[0]) || null;
+      window.__pinePlayhead = got ? {
+        id: String(got.id || ""),
+        t: Number(got.t) || 0,
+        file: String(got.file || ""),
+        duration: Number(got.duration) || 0,
+        /* Stamped on arrival, not at the sender: the two documents share
+         * a machine but not necessarily a clock reading, and all this
+         * value is ever asked is "how old are you". */
+        at: Date.now()
+      } : null;
+    });
+  } catch (e) { /* the view keeps the clock road it has always had */ }
+}
+
+/* Read by script-page.js. Null once the reading goes stale, so a caller
+ * never has to think about freshness itself. */
+window.pinePlayhead = function () {
+  const got = window.__pinePlayhead;
+  if (!got || !got.at) return null;
+  if (Date.now() - got.at > PINE_PLAYHEAD_STALE_MS) return null;
+  return got;
+};
 
 function loadFrames() {
   if (!config) return;
@@ -2400,6 +2451,13 @@ async function checkBuild() {
       "",
       "running from: " + (got.running_from || "?"),
       "source: " + (got.source || "?"),
+      /* WHAT THE VERDICT IS ABOUT. Twice now this line has been read as
+       * the truth about the app while being the truth about a subset of
+       * it - six files, then everything except the main process. The
+       * count is here so the next narrowing shows up on the tooltip
+       * rather than in an afternoon. */
+      "compared: " + (got.counted || "?") + " files here, "
+        + (got.source_counted || "?") + " on the share",
     ];
     if ((got.missing || []).length) {
       bits.push("missing from this build: " + got.missing.join(", "));

@@ -182,29 +182,34 @@
     host.style.top = Math.round(box.top) + 'px';
     host.style.width = Math.round(box.width) + 'px';
     host.style.height = Math.round(box.height) + 'px';
-    /* #1306e: HIGH ENOUGH TO BE SEEN, ON WHICHEVER SURFACE THIS IS.
+    /* #1306e/#1322: HIGH ENOUGH TO BE SEEN, ON EVERY SURFACE.
      *
-     * The stylesheet puts the set at 900, which is right in the
-     * desktop shell: its own top chrome sits at 1000 and should cover
-     * a picture-in-picture. The kiosk is a different world - it floats
-     * every injected view at z-index 2147483000, so at 900 the set was
-     * built, playing and completely buried. Measured on the tablet:
-     * the set on screen at 702,350 with elementFromPoint at its own
-     * centre returning `sp-el sp-character`.
+     * The stylesheet puts the set at 900. On the kiosk that buried it
+     * outright - every injected view floats at z-index 2147483000 - so
+     * the set was built, playing and completely invisible. Measured on
+     * the tablet: the set on screen at 702,350 with elementFromPoint at
+     * its own centre returning `sp-el sp-character`.
      *
-     * So on the kiosk it climbs just above the view layer, and stays
-     * UNDER the things that are meant to cover it - the sampler's
-     * overlays (2147483030+), the hold sheets (2147483046) and the
-     * lock screen (2147483050). A locked tablet must never be showing
-     * a video through the lock.
+     * #1306e lifted the KIOSK only, reasoning that 900 was right in the
+     * desktop shell because that shell's top chrome sits at 1000. That
+     * reasoning has not held. The shell now carries the same high bands
+     * the kiosk does - view-chrome at 2147483200, the hold sheets at
+     * 2147483046, the trace console at 2147483004, the SC pop-up at
+     * 2147483010, the panel's own 3JS windows at 2147483020 - and the
+     * Agent tab is a <webview> with a compositing layer of its own. A
+     * set at 900 behind any of those is #1306e's fault again, on the
+     * other surface, with nothing on screen to say so.
      *
-     * Told apart the same way the self-mount tells them apart: the
-     * kiosk is served over http from the station, the shell's renderer
-     * is not. */
+     * So it climbs on BOTH, and stays UNDER the things that are meant
+     * to cover it: the sampler's overlays (2147483030+), the hold
+     * sheets (2147483046), the lock screen (2147483050) and the boot
+     * splash (2147483100). A locked tablet must never be showing a
+     * video through the lock.
+     *
+     * The stylesheet's 900 is now only the fallback for a surface where
+     * an inline style is refused. */
     try {
-      if (/^https?:$/.test(String(root.location.protocol))) {
-        host.style.zIndex = '2147483020';
-      }
+      host.style.zIndex = '2147483020';
     } catch (err) { /* the stylesheet's own 900 stands */ }
 
     /* #1309b: NO CHROME. "The video pop-up needs to be just a video.
@@ -696,11 +701,53 @@
     catch (err) { showing = false; }
   }
 
+  /* The one shape of "this clip has been dealt with here". Written in
+   * one place because two spellings of it is a picture that plays
+   * twice. */
+  function markOf(clip) {
+    if (!clip || !clip.url) return '';
+    var mark = String(clip.ts || '') + '|' + String(clip.url);
+    marks[mark] = 1;
+    return mark;
+  }
+
+  /* #1322: TELL THE OTHER SETS.
+   *
+   * A clip fired locally - a sampler pad holding an mp4 (#1310) - never
+   * touches the station, so the app's set and the tablet's set each
+   * only ever show the clips that happen to have been fired on them.
+   * "When a video clip is played, show a PiP overlay on the application
+   * as well."
+   *
+   * So a local cut also RINGS the clip: /api/sfx/video/cut puts it in
+   * the same ring /api/dj/video serves, with no claim on the air (see
+   * page_picture_append). The stamped clip comes back and is marked
+   * here, which is what stops this surface playing its own picture a
+   * second time when the poll comes round to it.
+   *
+   * Silent about failure throughout: the picture is already on THIS
+   * screen, and a station that refused the ring is not a reason to take
+   * it down. */
+  function ring(clip) {
+    if (!clip || !clip.url) return;
+    if (!api() || !api().post) return;
+    var body = {
+      url: String(clip.url), sting: String(clip.sting || ''),
+      id: String(clip.id || ''), seconds: Number(clip.seconds) || 0
+    };
+    if (Number(clip.from) > 0) body.from = Number(clip.from);
+    if (Number(clip.to) > 0) body.to = Number(clip.to);
+    try {
+      api().post('/api/sfx/video/cut', body).then(function (got) {
+        if (got && got.clip) markOf(got.clip);
+      }, function () { /* the picture is up here either way */ });
+    } catch (err) { /* likewise */ }
+  }
+
   function offer(clip) {
     if (!clip || !clip.url) return;
-    var mark = String(clip.ts || '') + '|' + String(clip.url);
-    if (marks[mark]) return;
-    marks[mark] = 1;
+    if (marks[String(clip.ts || '') + '|' + String(clip.url)]) return;
+    markOf(clip);
     queue.push(clip);
     if (queue.length > 4) queue.splice(0, queue.length - 4);
     next();
@@ -762,6 +809,10 @@
     waiting: function () { return queue.length; },
     on: function () { return showing; },
     offer: offer,
+    /* #1322: "this clip has been dealt with here", for a caller that
+       rang the station by some other road and does not want its own
+       picture back. */
+    mark: markOf,
     /* #1306b: CUT TO THIS ONE, NOW.
      *
      * offer() queues and next() refuses while `showing`, which is
@@ -773,12 +824,21 @@
      *
      * The mark is set the way offer() sets it, so the poll that later
      * sees this same clip in the ring does not play it a second
-     * time. */
-    cut: function (clip) {
-      if (!clip || !clip.url || !mounted) return false;
-      try {
-        marks[String(clip.ts || '') + '|' + String(clip.url)] = 1;
-      } catch (err) { /* the play below still stands */ }
+     * time.
+     *
+     * #1322: `{ring: true}` says the caller fired this clip LOCALLY and
+     * the station has never heard of it - a sampler pad, not the cue
+     * road - so it is also published for the other surfaces' sets. A
+     * clip that came back FROM the station is already in the ring and
+     * must not be rung again. */
+    cut: function (clip, opts) {
+      if (!clip || !clip.url) return false;
+      /* Before the mount check, deliberately: a surface with no set of
+         its own still owes the other surfaces the picture. */
+      if (opts && opts.ring) ring(clip);
+      if (!mounted) return false;
+      try { markOf(clip); }
+      catch (err) { /* the play below still stands */ }
       queue.length = 0;
       if (hold) { clearTimeout(hold); hold = null; }
       try { clip.__cut = true; } catch (err) { /* frozen: no retry */ }

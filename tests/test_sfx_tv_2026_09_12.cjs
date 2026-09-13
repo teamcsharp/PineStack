@@ -100,9 +100,15 @@ function makeNode(tag) {
   return self;
 }
 
+/* A class LIST, not a string equal. #1308b added a second class to the
+ * frame (`sfx-tv waiting`) and this finder stopped seeing the set at all
+ * - so six tests began asserting against `undefined` and reported the
+ * module broken when nothing about the module had changed. A stub that
+ * models the browser loosely is a meter that fails for its own reasons. */
 function findByClass(from, name, out = []) {
   for (const child of from.children) {
-    if (child.classes.has(name) || child.className === name) out.push(child);
+    const named = String(child.className || '').split(/\s+/);
+    if (child.classes.has(name) || named.indexOf(name) >= 0) out.push(child);
     findByClass(child, name, out);
   }
   return out;
@@ -151,6 +157,18 @@ function aClip(over) {
 
 function set(body) { return findByClass(body, 'sfx-tv')[0] || null; }
 
+/* #1308b: NOTHING IS SHOWN UNTIL THERE IS A PICTURE. The set is built
+ * and positioned but stays `waiting` until the <video> has a frame, so
+ * a test that wants the tube on has to give it one. The browser fires
+ * this; the stub cannot know when to. */
+function firstFrame(body) {
+  const tube = findByClass(body, 'sfx-tv-tube')[0];
+  if (!tube) return null;
+  const video = tube.children[0];
+  video.fire('loadeddata', {});
+  return video;
+}
+
 /* --------------------------------------------------------- the tests */
 
 test('the set is a child of the body, never of a view', async () => {
@@ -187,13 +205,15 @@ test('a drag writes the preference, and the next set opens there', async () => {
   tv.mount({baseUrl: 'http://box:8096'});
   await wait(60);
   const win = set(body);
-  const head = findByClass(body, 'sfx-tv-head')[0];
-
-  head.fire('pointerdown', {button: 0, clientX: 500, clientY: 400,
-                            pointerId: 1, target: {closest: () => null},
-                            preventDefault() {}});
-  head.fire('pointermove', {clientX: 560, clientY: 445});
-  head.fire('pointerup', {});
+  /* #1309b: THE WINDOW IS THE HANDLE. There is no title bar to grab any
+   * more - "just a video box, just a video itself" - so the drag is on
+   * the frame, and drag() tells a real drag from the press that opens
+   * the hold sheet by movement. */
+  win.fire('pointerdown', {button: 0, clientX: 500, clientY: 400,
+                           pointerId: 1, target: {closest: () => null},
+                           preventDefault() {}});
+  win.fire('pointermove', {clientX: 560, clientY: 445});
+  win.fire('pointerup', {});
 
   assert.equal(win.style.left, '160px');
   assert.equal(win.style.top, '145px');
@@ -221,9 +241,11 @@ test('the tube comes on, then collapses before the window is removed',
   tv.mount({baseUrl: 'http://box:8096'});
   await wait(60);
   const tube = findByClass(body, 'sfx-tv-tube')[0];
+  assert.ok(!tube.classes.has('on'),
+            'the set came on before there was a picture in it');
+  const video = firstFrame(body);
   assert.ok(tube.classes.has('on'), 'the set did not come on');
 
-  const video = tube.children[0];
   assert.equal(video.tag, 'video');
   assert.equal(video.src, 'http://box:8096/sfx/abc?t=sig');
   /* #789/#981: the booth monitor switch governs anything tagged. */
@@ -278,16 +300,23 @@ test('the same clip twice is one set', async () => {
   tv.stop();
 });
 
-test('the shut button takes it away at once and keeps the position',
+test('the picture carries no chrome, and its place is kept when it ends',
      async () => {
   const {body, store} = world({left: 60, top: 70, width: 300, height: 190});
   station([aClip()]);
   const tv = load();
   tv.mount({baseUrl: 'http://box:8096'});
   await wait(60);
-  const shut = findByClass(body, 'sfx-tv-head')[0].children[1];
-  shut.fire('click', {});
-  assert.equal(set(body), null, 'the operator asked for it gone now');
+  /* #1309b: "No wasted space, no elements around it... just a video
+   * box." The ✕ and the title bar this test used to press are gone on
+   * purpose, so their absence is what is asserted - otherwise the next
+   * person to add chrome finds nothing in the way. */
+  assert.equal(findByClass(body, 'sfx-tv-head').length, 0,
+               'the set grew a title bar again');
+  const video = firstFrame(body);
+  video.fire('ended', {});
+  await wait(OFF_MS + 120);
+  assert.equal(set(body), null, 'the window never went');
   assert.deepEqual(JSON.parse(store.get('pineSfxTvBox')),
                    {left: 60, top: 70, width: 300, height: 190});
   tv.stop();
@@ -315,5 +344,92 @@ test('the route it asks is the station video door, with a marker',
   tv.mount({baseUrl: 'http://box:8096'});
   await wait(60);
   assert.equal(asked[0], '/api/dj/video?since=0');
+  tv.stop();
+});
+
+/* ------------------------------------------------------- #1322 */
+
+test('the set is lifted above the view layer, on EVERY surface', async () => {
+  const {body} = world();
+  station([aClip()]);
+  const tv = load();
+  tv.mount({baseUrl: 'http://box:8096'});
+  await wait(60);
+  /* #1306e lifted the kiosk only, told apart by location.protocol - and
+   * this world has no location at all, which is the shell's case. The
+   * stylesheet's 900 is under the shell's own high bands (view-chrome
+   * 2147483200, the hold sheets 2147483046, the SC pop-up 2147483010)
+   * and under a <webview>'s layer, so a set at 900 there is the tablet's
+   * "built, playing and completely buried" all over again. Nothing on
+   * screen reports that, which is exactly why it is asserted. */
+  assert.equal(set(body).style.zIndex, '2147483020');
+  tv.stop();
+});
+
+test('a clip fired here is rung for the other sets, and shown once here',
+     async () => {
+  const {body} = world();
+  const posts = [];
+  /* What the station makes of it: its own stamp, which is NOT the one
+   * the pad used - the two machines have no reason to agree - so the
+   * mark the caller already set cannot cover it. */
+  const rung = {ts: 990099, url: '/sfx/pad.mp4?t=sig', sting: 'pad',
+                seconds: 2, video: true, picture_only: true,
+                broadcast_ms: Date.now()};
+  let serving = false;
+  globalThis.pineDesktop = {
+    get: async () => ({server_ms: Date.now(), cut_ms: 0,
+                       clips: serving ? [rung] : []}),
+    post: async (route, payload) => {
+      posts.push({route, payload});
+      return {ok: true, clip: rung};
+    }
+  };
+  const tv = load();
+  tv.mount({baseUrl: 'http://box:8096'});
+  await wait(40);
+
+  tv.cut({url: '/sfx/pad.mp4?t=sig', sting: 'pad', id: 'pad.mp4',
+          video: true, seconds: 2, ts: Date.now(), from: 0.5, to: 1.8},
+         {ring: true});
+  await wait(40);
+
+  /* THE OTHER SURFACES ARE TOLD. Without this a pad pressed on the
+   * tablet pops nothing on the app and vice versa - the clip is already
+   * decoded on the pad, so the station never hears of it. */
+  assert.equal(posts.length, 1, 'the clip was never rung');
+  assert.equal(posts[0].route, '/api/sfx/video/cut');
+  assert.equal(posts[0].payload.url, '/sfx/pad.mp4?t=sig');
+  assert.equal(posts[0].payload.from, 0.5);
+  assert.equal(posts[0].payload.to, 1.8);
+
+  /* AND NOT TWICE HERE. The picture is already on this screen; the ring
+   * coming back round must not play it again. */
+  serving = true;
+  const before = findByClass(body, 'sfx-tv').length;
+  tv.offer({...rung, at: Date.now()});
+  await wait(40);
+  assert.equal(findByClass(body, 'sfx-tv').length, before,
+               'the surface that fired it played it a second time');
+  assert.equal(tv.waiting(), 0);
+  tv.stop();
+});
+
+test('a clip that came FROM the station is not rung back at it', async () => {
+  world();
+  const posts = [];
+  globalThis.pineDesktop = {
+    get: async () => ({server_ms: Date.now(), cut_ms: 0, clips: []}),
+    post: async (route, payload) => { posts.push({route, payload}); return {}; }
+  };
+  const tv = load();
+  tv.mount({baseUrl: 'http://box:8096'});
+  await wait(40);
+  /* The cue road (#1306) hands back a clip that is ALREADY in the ring.
+   * Ringing it again would put a second copy in front of every other
+   * set - so the ring is asked for, never assumed. */
+  tv.cut(aClip());
+  await wait(40);
+  assert.equal(posts.length, 0, 'a clip already in the ring was rung again');
   tv.stop();
 });

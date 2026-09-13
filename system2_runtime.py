@@ -6,6 +6,7 @@ transport services remain the station's resource providers, never its clock.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import contextvars
 import copy
 import hashlib
@@ -18,6 +19,25 @@ import uuid
 
 from system2 import System2Store, System2Conflict, text_hash, _candidate as validate_candidate
 from system2_media import System2Media
+
+# #1320: A LANE OF ITS OWN, DELIBERATELY NOT THE DEFAULT EXECUTOR.
+#
+# events_tick() runs once a second forever, and its first act is to take
+# the store lock. s2_events is empty almost always - measured 0 rows, and
+# the query itself times at 0.000s - so the poll does no work whatsoever;
+# it only queues behind whichever writer currently holds the lock. The
+# pulse caught the event loop waiting on exactly that line for 31.0s of
+# an 85.4s stalled window (36%), the largest single blocker on the meter.
+#
+# Awaiting it is the cure, but NOT on asyncio's default pool: #1311c is
+# the standing lesson here - a long job on the shared ThreadPoolExecutor
+# starves every other to_thread in the process, and this box already runs
+# that pool up to twenty threads deep (the loop was measured starved of
+# the GIL underneath them). One dedicated worker instead. It can block on
+# the store lock for as long as the store likes; nothing else waits
+# behind it, and the loop never waits at all.
+_STORE_POOL = ThreadPoolExecutor(max_workers=1,
+                                 thread_name_prefix="system2-store")
 
 
 WORK = contextvars.ContextVar("system2_work", default=None)
@@ -1077,7 +1097,18 @@ class System2Runtime:
     async def events_tick(self):
         if not self.enabled:
             return
-        for event in self.store.events(states=["pending"], limit=100):
+        # #1320: the poll itself waits in its own thread (see _STORE_POOL).
+        # Identical query, identical rows, identical order - the only
+        # change is that the event loop is free while it happens.
+        #
+        # The claim/finish writes below stay on the loop on purpose: they
+        # run only when a pending music_request actually exists, which is
+        # rare (s2_events measured empty), so they are not what the meter
+        # was catching and moving them would widen the patch for nothing.
+        pending = await asyncio.get_running_loop().run_in_executor(
+            _STORE_POOL,
+            lambda: self.store.events(states=["pending"], limit=100))
+        for event in pending:
             if event["kind"] != "music_request":
                 continue
             claimed = self.store.claim_event("system2-events", event_id=event["id"])

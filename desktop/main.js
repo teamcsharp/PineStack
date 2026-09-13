@@ -792,6 +792,20 @@ function hotScan(dir) {
   return out;
 }
 
+/* The main-process files beside renderer/ - everything this process loads
+ * or runs that a reload cannot replace. Read from the SHARE each pass, so
+ * a module added tomorrow is watched without anyone remembering to add it
+ * here. `source` is .../desktop/renderer; its parent is the tree. */
+function hotSelfFiles(source) {
+  try {
+    return fs.readdirSync(path.join(source, ".."), { withFileTypes: true })
+      .filter((entry) => entry.isFile() && /\.(js|cjs|ps1)$/i.test(entry.name))
+      .map((entry) => entry.name);
+  } catch {
+    return ["main.js", "preload.js"];
+  }
+}
+
 function watchTheShare() {
   if (hotTimer) return;
   let source;
@@ -818,23 +832,34 @@ function watchTheShare() {
       for (const [name, stamp] of now) {
         if (hotSeen.get(name) !== stamp) changed.push(name);
       }
-      /* A scan that takes a noticeable slice of the interval means the share
-       * is busy; asking again immediately makes it worse. */
-      if (Date.now() - began > 500) wait = HOT_SLOW_MS;
       hotSeen = now;
       if (changed.length) applyHot(source, changed);
-      /* This process's own two files. Not hot - see the header - but the
-       * operator should hear about it rather than wonder why a main.js
-       * change did nothing. */
-      for (const name of ["main.js", "preload.js"]) {
+      /* THIS PROCESS'S OWN FILES. Not hot - see the header - but the
+       * operator should hear about it rather than wonder why the change
+       * did nothing.
+       *
+       * Not two of them. `main.js` requires twenty-one .cjs siblings -
+       * lcd-agent, terminal-host, tablet-mirror, clip-mux, shot-enhance,
+       * terminal-glass - and shells out to two .ps1 workers, and a
+       * change to any of those was exactly as invisible as a main.js
+       * change, with not even a line in the log to say a relaunch was
+       * owed. Same rule as the tree stamp below: no hand-picked list. */
+      for (const name of hotSelfFiles(source)) {
         try {
           const at = path.join(source, "..", name);
-          const stamp = Math.round(fs.statSync(at).mtimeMs) + ":" + fs.statSync(at).size;
+          const info = fs.statSync(at);
+          const stamp = Math.round(info.mtimeMs) + ":" + info.size;
           const key = "^" + name;
           if (hotSelf.has(key) && hotSelf.get(key) !== stamp) hotSayRelaunch(name);
           hotSelf.set(key, stamp);
         } catch {}
       }
+      /* A pass that takes a noticeable slice of the interval means the
+       * share is busy; asking again immediately makes it worse. Measured
+       * after ALL of it, not after the renderer scan alone - this pass now
+       * also reads the tree's own directory, and a back-off that ignores
+       * half its own cost is not a back-off. */
+      if (Date.now() - began > 500) wait = HOT_SLOW_MS;
     } catch (error) {
       /* The share going away must never stop the app - it just stops being
        * watched until it comes back. */
@@ -921,27 +946,46 @@ ipcMain.handle("backend:setup", () => createVenvAndInstall());
  * quietly serving an old bridge until somebody happened to relaunch.
  */
 function treeStamp(root) {
-  /* EVERY RENDERER FILE, not a hand-picked six.
+  /* THE WHOLE TREE, because a list is a blind spot waiting to happen.
    *
-   * This list was written when the renderer was renderer.js and a
-   * stylesheet. It has since grown views of its own - the sampler, listen,
-   * script, presentation, the slideshow - and none of them were stamped, so
-   * a build could differ from the share in a dozen files and still report
-   * "running the newest source". The mark was telling the truth about six
-   * files and being read as the truth about the app. */
-  const wanted = ["main.js", "preload.js"];
-  try {
-    for (const entry of fs.readdirSync(path.join(root, "renderer"),
-                                       { withFileTypes: true })) {
-      if (entry.isFile() && /\.(js|css|html)$/i.test(entry.name)) {
-        wanted.push("renderer/" + entry.name);
-      }
+   * The first version of this stamped a hand-picked six, back when the
+   * renderer WAS renderer.js and a stylesheet; it grew views of its own
+   * and the mark went on reporting "newest source" about six files while
+   * a dozen others differed. That was fixed by walking renderer/ - and
+   * the fix repeated the mistake one level up. `main.js` and
+   * `preload.js` were still named by hand, so their twenty-one SIBLINGS
+   * were not stamped at all: lcd-agent, terminal-host, tablet-mirror,
+   * clip-mux, shot-enhance, terminal-glass, the two .ps1 workers - every
+   * one of them `require`d by this process at startup, and every one of
+   * them able to differ from the share behind a green line.
+   *
+   * What the mark is really asked is "is my mirror the share's tree",
+   * and the rebuild answers it with `robocopy /MIR` over the WHOLE of
+   * desktop/. So that is the question stamped here: all of it, walked,
+   * with no list to fall out of date. 131 files against the 97 this
+   * stated before - one extra SMB stat per four, once a minute. */
+  const wanted = [];
+  const walk = (relative) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(path.join(root, relative) || root,
+                               { withFileTypes: true });
+    } catch {
+      return false;
     }
-  } catch {
-    /* Unreadable renderer folder: fall back to the originals so the mark
-     * still answers something rather than throwing. */
-    wanted.push("renderer/renderer.js", "renderer/index.html",
-                "renderer/webview-preload.js", "renderer/styles.css");
+    for (const entry of entries) {
+      const name = relative ? relative + "/" + entry.name : entry.name;
+      if (entry.isDirectory()) walk(name);
+      else if (entry.isFile()) wanted.push(name);
+    }
+    return true;
+  };
+  if (!walk("")) {
+    /* Unreadable tree: answer something rather than throwing, and let the
+     * missing list say which of the originals could not be reached. */
+    wanted.push("main.js", "preload.js", "renderer/renderer.js",
+                "renderer/index.html", "renderer/webview-preload.js",
+                "renderer/styles.css");
   }
   let newest = 0;
   let bytes = 0;
@@ -955,14 +999,14 @@ function treeStamp(root) {
       missing.push(name);
     }
   }
-  return { newest, bytes, missing };
+  return { newest, bytes, missing, counted: wanted.length };
 }
 
 ipcMain.handle("desktop:build", () => {
   const source = path.join(process.env.PINE_AGENT_ROOT || agentRoot(),
                            "desktop");
   const mine = treeStamp(path.resolve(__dirname));
-  let theirs = { newest: 0, bytes: 0, missing: [] };
+  let theirs = { newest: 0, bytes: 0, missing: [], counted: 0 };
   let reachable = true;
   try {
     theirs = treeStamp(source);
@@ -979,6 +1023,10 @@ ipcMain.handle("desktop:build", () => {
     running_stamp: mine.newest, running_bytes: mine.bytes,
     source_stamp: theirs.newest, source_bytes: theirs.bytes,
     missing: mine.missing,
+    /* How many files that verdict is about. A green line over six files
+     * read as a green line over the app once already; the number makes
+     * the next narrowing visible instead of silent. */
+    counted: mine.counted, source_counted: theirs.counted,
     say: !reachable
       ? "the share could not be read, so the app cannot check itself"
       : stale

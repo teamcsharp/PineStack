@@ -120,6 +120,7 @@ class System2Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.now = now
         self._lock = threading.RLock()
+        self._journal = False           # #1320: set WAL once, not per connect
         with closing(self._connect()) as db:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS s2_hours(id TEXT PRIMARY KEY,start REAL,revision INTEGER,config TEXT,body TEXT);
@@ -139,7 +140,25 @@ class System2Store:
         db = sqlite3.connect(str(self.path), timeout=15, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA busy_timeout=15000')
-        db.execute('PRAGMA journal_mode=WAL')
+        # #1320: JOURNAL MODE IS A PROPERTY OF THE DATABASE, NOT OF THE
+        # CONNECTION. It is written into the file header once and
+        # survives every later connection and every restart, so asserting
+        # it here bought nothing - and it was not free. Unlike a read,
+        # `PRAGMA journal_mode=WAL` wants the database lock, so when a
+        # writer was mid-commit this waited on it, inside the store lock,
+        # with busy_timeout=15000 as the ceiling.
+        #
+        # That mattered because every store call opens a NEW connection
+        # while holding self._lock, so the pragma's wait was added to the
+        # lock hold time of every caller behind it. The pulse measured
+        # the queue from the other end: 31.0s of an 85.4s stalled window
+        # (36%) was the event loop parked on system2.py's `with
+        # self._lock` line, while a pool thread sat in _connect.
+        #
+        # busy_timeout and synchronous ARE per-connection and stay.
+        if not self._journal:
+            db.execute('PRAGMA journal_mode=WAL')
+            self._journal = True
         db.execute('PRAGMA synchronous=FULL')
         return db
 

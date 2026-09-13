@@ -427,6 +427,24 @@
 .sp-el.pending { opacity: .58; }
 .sp-el.pending.sp-dialogue { font-style: italic; }
 
+/* #1330: THE RECORD THAT IS TURNING.
+   An action line, so it must stay quieter than the live speech mark -
+   the deck is context, not the thing being read. No left border and no
+   gutter: that column belongs to sp-now alone (#1286), and the whole
+   point of this is to be legible WHILE a line is lit somewhere else. */
+.sp-el.sp-spinning {
+  color: var(--sp-text, #edf3f5);
+  opacity: 1;
+}
+.sp-el.sp-spinning::after {
+  content: ' · on the deck';
+  color: var(--sp-on, #65c7da);
+  font-size: 11px;
+  letter-spacing: .04em;
+}
+.sp-page.sp-look-paper .sp-el.sp-spinning { color: #1d1913; }
+.sp-page.sp-look-paper .sp-el.sp-spinning::after { color: #6b4f2a; }
+
 /* THE LINE BEING SAID, RIGHT NOW.
    One at a time, and unmistakable: the eye should find it without reading.
    The bar on the left pulses at roughly the pace of speech so a still
