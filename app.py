@@ -15290,6 +15290,10 @@ CUPBOARD_UNHEARD_HOURS = float(os.getenv("PINE_UNHEARD_HOURS", "2"))
 CUPBOARD_UNHEARD_EVERY = float(os.getenv("PINE_UNHEARD_EVERY", "420"))
 _UNHEARD_AT = [0.0]
 _UNHEARD_LOG: list[dict[str, Any]] = []
+# #1265: this walks every shelf and the larder, and it rides in
+# dj_state(), which every panel polls. It measures stock that has been
+# waiting for DAYS - three-second resolution was never meaningful.
+UNHEARD_STATE_TTL = float(os.getenv("PINE_UNHEARD_TTL", "20"))
 _UNHEARD_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
 _UNHEARD_SWEEP: dict[str, Any] = {"at": 0.0, "why": "not run yet", "walks": 0,
                                   "aired": 0, "passes": 0, "blocked": {}}
@@ -15641,7 +15645,7 @@ def unheard_state() -> dict[str, Any]:
     polls."""
     now = time.time()
     if (_UNHEARD_MEMO["value"] is not None
-            and now - float(_UNHEARD_MEMO["at"]) < 3.0):
+            and now - float(_UNHEARD_MEMO["at"]) < UNHEARD_STATE_TTL):
         return dict(_UNHEARD_MEMO["value"])
     after = cupboard_unheard_after()
     roads: list[dict[str, Any]] = []
@@ -45106,6 +45110,10 @@ def schedule_lessons(most: int = 400) -> dict[str, Any]:
 # dead air and that road stays open; what stands down is the
 # discretionary half - the punctuation over a record and the first
 # refusal on a join, which is where his 82 seconds came from.
+# #1265: an entry lasts minutes and this walks the shelf, so asking it
+# thirty times a minute (a 2-second memo, read from the round chooser and
+# both SFX roads) bought nothing and cost a stall.
+ENTRY_GUARD_TTL = float(os.getenv("PINE_ENTRY_GUARD_TTL", "12"))
 _ENTRY_GUARD_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
 _ENTRY_GUARD_LOG: dict[str, Any] = {"held": 0, "road": "", "at": 0.0}
 
@@ -45144,7 +45152,7 @@ def entry_guard_road() -> str:
     """
     now = time.time()
     if (_ENTRY_GUARD_MEMO["value"] is not None
-            and now - float(_ENTRY_GUARD_MEMO["at"]) < 2.0):
+            and now - float(_ENTRY_GUARD_MEMO["at"]) < ENTRY_GUARD_TTL):
         return str(_ENTRY_GUARD_MEMO["value"])
     road = ""
     try:
@@ -63032,9 +63040,31 @@ SFX_ALL_TTL = float(os.getenv("SFX_ALL_TTL", "45"))
 _SFX_ALL_MEMO: dict[str, Any] = {"at": 0.0, "key": None, "value": None}
 
 
+_SFX_BY_ID: dict[str, Any] = {"key": None, "map": {}}
+
+
 def sfx_all_index_reset() -> None:
     """Drop the index - a new pack, or a scratch just made."""
     _SFX_ALL_MEMO.update({"at": 0.0, "key": None, "value": None})
+    _SFX_BY_ID.update({"key": None, "map": {}})
+
+
+def sfx_id_map() -> dict[str, Path]:
+    """id -> path for the whole pool, built once per index.
+
+    sfx_by_id walked the pool hashing every path, which is why `sfx_id`
+    sat at the top of the stall stacks: 38 stacks and 900 seconds. The id
+    is a pure function of the path, so this is the same answer without
+    the walk."""
+    try:
+        got = sfx_all()
+        key = (len(got), str(got[0]) if got else "", str(got[-1]) if got else "")
+        if _SFX_BY_ID.get("key") != key:
+            _SFX_BY_ID.update({"key": key,
+                               "map": {sfx_id(p): p for p in got}})
+        return dict(_SFX_BY_ID.get("map") or {})
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _sfx_all_walk() -> list[Path]:
@@ -63916,9 +63946,13 @@ def sfx_by_id(wanted: str) -> Path | None:
                 return path
     except Exception:  # noqa: BLE001
         pass
+    # #1265: the indexed map, not a walk-and-hash of the whole pool.
+    got = sfx_id_map().get(wanted)
+    if got is not None:
+        return got
     made = (list(SFX_MADE_DIR.glob("*.wav"))
             if SFX_MADE_DIR.is_dir() else [])
-    for path in sfx_all() + made:
+    for path in made:
         if sfx_id(path) == wanted:
             return path
     return None
