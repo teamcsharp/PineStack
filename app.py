@@ -119767,6 +119767,18 @@ NOTIFICATIONS_KEEP = 400
 PHRASE_SETS_PATH = data_path("phrase_sets.json")
 
 
+def _triage_cause_is_gagged() -> bool:
+    """#1331c: is the solo gate silencing the house right now?
+
+    Its own cheap wrapper so /health can ask without the caller having to
+    know that triangulate returns a whole verdict, and so a failure here
+    can never take the health endpoint down with it."""
+    try:
+        return str((broadcast_triangulate() or {}).get("cause") or "") == "gagged"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @app.get("/api/broadcast/health")
 async def api_broadcast_health(
     authorization: str | None = Header(default=None),
@@ -119879,6 +119891,22 @@ async def api_broadcast_health(
         "clips_waiting": int(state.get("waiting") or 0),
         "stall_reports": int(state.get("stalls") or 0),
         "holding_the_air": str(state.get("owner") or ""),
+        # #1331c: TWO DIFFERENT GAGS, AND THE RUNG WANTED THE OTHER ONE.
+        #
+        # `gagged` below is page_wedge_state's: the page holding the air
+        # STOPPED POLLING (#1208). Proven live to be the wrong signal for
+        # the RELEASE rung - the desktop held the air, re-claimed it every
+        # few seconds, gagged both tablets, and was polling perfectly, so
+        # this read False through 317 seconds of silence while
+        # broadcast_triangulate said "gagged" the whole time.
+        #
+        # They are genuinely different faults with the same word on them,
+        # so this reports both rather than folding them together. Only
+        # computed when nothing has been heard, because that is the only
+        # time it can matter and triangulate is not free.
+        "solo_gagged": (
+            bool(_triage_cause_is_gagged())
+            if (mute is None or mute >= 30 or not heard_at) else False),
         # #1331: WHETHER THE SOLO GATE IS GAGGING ANYBODY.
         #
         # The Reinitialise ladder's RELEASE rung reads `health.gagged`,
@@ -184889,18 +184917,31 @@ async function fixRun(from) {
     }
     if (step <= 6) {
       health = await fixHealth();
-      /* #1331: `gagged` is now actually on /health. It never was, so
-       * this read undefined and the condition collapsed to
-       * `!holding_the_air` - firing only when NOBODY held the air, which
-       * is the one case where releasing does nothing, and skipping the
-       * case it exists for. */
-      if (health && (health.gagged || !health.holding_the_air)) {
+      /* #1331c: AND THEN IT STOPPED ASKING PERMISSION.
+       *
+       * This gated on `health.gagged`, which /health never returned, so
+       * it collapsed to `!holding_the_air` - firing only when NOBODY
+       * held the air, the one case where releasing does nothing. Adding
+       * the key was not enough: page_wedge_state's `gagged` means the
+       * owner STOPPED POLLING, and the live fault was an owner polling
+       * happily while muting the whole house. So the rung was still
+       * skipped, through 317 seconds of silence.
+       *
+       * There is nothing left to gate on. The ladder only reaches this
+       * rung when nothing is being heard - every branch above returns
+       * the moment it is - and at that point releasing is right whatever
+       * the reason. "Heard in the wrong room beats not heard at all"
+       * (#738) is the whole argument, and a page that is ANSWERING is
+       * not the same thing as a page that is being HEARD, which is the
+       * lesson this endpoint exists to teach. */
+      if (health && (health.holding_the_air || health.gagged
+                     || health.solo_gagged)) {
         try {
           await api("/api/broadcast/fix/release", {method: "POST"});
           fixSay("6 RELEASE   the exclusive is released - every player may sound");
         } catch (e) { fixSay("6 RELEASE   the station would not answer"); }
       } else {
-        fixSay("6 RELEASE   the air is held by a page that is answering - left alone");
+        fixSay("6 RELEASE   nobody holds the air - nothing to release");
       }
       step = 7;
     }
