@@ -158665,7 +158665,792 @@ function djProvenanceWatch(row, line) {
     try { djDossierClose(); } catch (e) {}
     djProvenanceShow(line, event);
   });
+  /* AND THE SAME REACH FOR A FINGER. There is no right-click on the tablet,
+   * so this row has been uninspectable there since #888. Hung here, on the
+   * one function every booth row already passes through, rather than on a
+   * second list of places that would drift out of step with this one. */
+  try { pineHold(row, line); } catch (e) {}
 }
+/* ======================= THE INSPECTOR, ON A TOUCHSCREEN ==================
+ *
+ * "I still need it on the tablet."
+ *
+ * The desktop got this first; the tablet runs THIS page, so it needs its own.
+ * Two things make it a different build rather than a port:
+ *
+ *   THERE IS NO RIGHT-CLICK. The booth has had right-click provenance since
+ *   #888, and on a kiosk with no mouse that is simply unreachable. A LONG
+ *   PRESS is the touch equivalent, and it hangs off djProvenanceWatch - the
+ *   one function every booth row already passes through - so it inherits
+ *   exactly the reach right-click has rather than needing a second list of
+ *   places to remember.
+ *
+ *   A 9-INCH SCREEN WILL NOT TAKE THE DESKTOP'S LAYOUT. That window puts the
+ *   chart and the script side by side. Here it is a full-screen sheet with
+ *   three tabs - what it came from, what was said around it, and how to
+ *   change it - so each gets the whole width.
+ *
+ * IT IS THE SAME STATION UNDERNEATH. Every route this calls is one the
+ * desktop inspector already uses, so the two cannot drift about what a line
+ * is or what cutting one means.
+ */
+
+/* HOW LONG A PRESS IS, and how far a finger may stray while making one.
+ * Too short and scrolling the booth opens sheets; too long and it feels
+ * broken. 500ms with a 12px slop is what the platform itself uses. */
+const PINE_HOLD_MS = 500;
+const PINE_HOLD_SLIP = 12;
+
+function pineHold(row, line) {
+  let timer = null;
+  let from = null;
+  let fired = false;
+
+  const stop = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    from = null;
+  };
+
+  row.addEventListener("touchstart", (event) => {
+    if (!line || !line.id) return;
+    const t = event.touches && event.touches[0];
+    if (!t) return;
+    fired = false;
+    from = {x: t.clientX, y: t.clientY};
+    timer = setTimeout(() => {
+      timer = null;
+      fired = true;
+      /* A held finger is a decision, so say so - on a tablet there is no
+       * cursor to change and no other way to know it landed. */
+      try { if (navigator.vibrate) navigator.vibrate(12); } catch (e) {}
+      pineSheet(line);
+    }, PINE_HOLD_MS);
+  }, {passive: true});
+
+  /* SCROLLING MUST STILL WORK. The booth is a long list and the whole point
+   * of it is being scrolled; a press that survives a drag would make the
+   * feed feel stuck. */
+  row.addEventListener("touchmove", (event) => {
+    const t = event.touches && event.touches[0];
+    if (!t || !from) return;
+    if (Math.abs(t.clientX - from.x) > PINE_HOLD_SLIP
+        || Math.abs(t.clientY - from.y) > PINE_HOLD_SLIP) stop();
+  }, {passive: true});
+
+  row.addEventListener("touchend", (event) => {
+    stop();
+    /* The tap that ENDS a long press must not also replay the line - the
+     * sheet is already open and the operator did not ask for both. */
+    if (fired) {
+      fired = false;
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  });
+  row.addEventListener("touchcancel", stop, {passive: true});
+}
+
+/* ------------------------------------------------------------- the sheet */
+
+function pineSheetClose() {
+  const had = document.getElementById("pineSheet");
+  if (had) had.remove();
+}
+
+/* The same fingerprint the desktop and prompt_cuts.py use. It has to agree
+ * with both or a cut made here would be stored and never match anything -
+ * see the note in prompt_cuts.py on why only the first 160 characters. */
+const PINE_MARK_CHARS = 160;
+function pineMark(text) {
+  const flat = String(text || "").replace(/\s+/g, " ").trim().toLowerCase()
+    .slice(0, PINE_MARK_CHARS);
+  let a = 0x811c9dc5;
+  for (let i = 0; i < flat.length; i += 1) {
+    a ^= flat.charCodeAt(i);
+    a = (a + ((a << 1) + (a << 4) + (a << 7) + (a << 8) + (a << 24))) >>> 0;
+  }
+  return ("00000000" + a.toString(16)).slice(-8) + "-" + flat.length;
+}
+
+async function pineSheet(line) {
+  pineSheetClose();
+  try { djProvenanceClose(); } catch (e) {}
+
+  const sheet = el("div", "", "");
+  sheet.id = "pineSheet";
+  sheet.style.cssText = "position:fixed;inset:0;z-index:520;background:#0d1217;"
+    + "display:flex;flex-direction:column;font-size:13px";
+
+  /* ---- the head: what it is, and the way out ---- */
+  const head = el("div", "", "");
+  head.style.cssText = "flex:none;padding:10px 12px;border-bottom:1px solid "
+    + "#1b2831;display:flex;gap:10px;align-items:flex-start";
+  const whoBox = el("div", "", "");
+  whoBox.style.cssText = "flex:1;min-width:0";
+  const who = el("div", "", (line.name || line.who || "a line")
+    + (line.kind ? "  ·  " + line.kind : ""));
+  who.style.cssText = "font-weight:600;color:#cfe0ea";
+  const said = el("div", "", String(line.text || line.said || ""));
+  said.style.cssText = "color:#9fb3c2;font-size:12px;line-height:1.45;"
+    + "margin-top:2px";
+  whoBox.appendChild(who);
+  whoBox.appendChild(said);
+  const shut = el("button", "", "✕");
+  shut.style.cssText = "flex:none;background:none;border:1px solid #2a3b47;"
+    + "border-radius:4px;color:#cfe0ea;font-size:16px;padding:4px 11px;"
+    + "cursor:pointer";
+  shut.onclick = pineSheetClose;
+  head.appendChild(whoBox);
+  head.appendChild(shut);
+  sheet.appendChild(head);
+
+  /* ---- the tabs ---- */
+  const tabs = el("div", "", "");
+  tabs.style.cssText = "flex:none;display:flex;gap:16px;padding:7px 12px 0;"
+    + "border-bottom:1px solid #1b2831";
+  const body = el("div", "", "");
+  body.style.cssText = "flex:1;overflow:auto;padding:10px 12px 24px";
+  const named = [["flow", "Where it came from"], ["script", "What was said"],
+                 ["change", "Change it"]];
+  let pane = "flow";
+  const marks = {};
+  for (const [id, label] of named) {
+    const tab = el("span", "", label);
+    /* Styled here rather than by firing the first tab's click - that would
+     * paint an empty chart before anything has been fetched, so the sheet
+     * would open showing "nothing recorded" at every stage and then correct
+     * itself a moment later. */
+    tab.style.cssText = "cursor:pointer;padding-bottom:6px;font-size:12px;"
+      + "border-bottom:2px solid " + (id === pane ? "#46c2a0" : "transparent")
+      + ";color:" + (id === pane ? "#cfe0ea" : "#7e94a6");
+    tab.onclick = () => {
+      pane = id;
+      for (const [other, t] of Object.entries(marks)) {
+        t.style.color = other === id ? "#cfe0ea" : "#7e94a6";
+        t.style.borderBottomColor = other === id ? "#46c2a0" : "transparent";
+      }
+      paint();
+    };
+    marks[id] = tab;
+    tabs.appendChild(tab);
+  }
+  sheet.appendChild(tabs);
+  sheet.appendChild(body);
+  document.body.appendChild(sheet);
+
+  /* ---- what the station knows, fetched once ---- */
+  let prov = null;
+  let provWhy = "";
+  let chain = [];
+  let around = [];
+  let cuts = [];
+
+  /* ASKED ALL AT ONCE, AND PAINTED AS THEY LAND.
+   *
+   * Measured on the live station: the provenance call takes 9.9 SECONDS for
+   * a line still in the ring, while the feed takes 0.7 and the cut list 0.9.
+   * Awaited in sequence that is eleven seconds of nothing on a device
+   * somebody is holding. The feed is what "What was said" needs, so that
+   * pane is readable in under a second while the paperwork catches up. */
+  let waitingOn = 3;
+  const landed = () => { waitingOn -= 1; paint(); };
+
+  api("/api/dj/provenance/" + encodeURIComponent(line.id)).then((got) => {
+    prov = got;
+  }).catch((err) => {
+    /* PAST THE RING IS NOT AN ERROR. The booth keeps a line's paperwork only
+     * while it is in the live ring; saying so is more use than a status. */
+    provWhy = /404/.test(err.message)
+      ? "The booth keeps a line's paperwork only while it is in the live "
+        + "ring, and this one has passed out of it."
+      : err.message;
+  }).finally(landed);
+
+  api("/api/dj").then((feed) => {
+    const rows = (feed.chat || []).filter((r) => r && r.id);
+    const at = rows.findIndex((r) => r.id === line.id);
+    const sid = String(line.sid || (at >= 0 ? rows[at].sid : "") || "");
+    if (sid) {
+      chain = rows.filter((r) => String(r.sid || "") === sid)
+        .sort((a, b) => (Number(a.turn) || 0) - (Number(b.turn) || 0));
+    }
+    if (at >= 0) around = rows.slice(Math.max(0, at - 10), at + 11);
+    if (at >= 0 && !line.sid) line.sid = rows[at].sid;
+    if (at >= 0 && line.turn === undefined) line.turn = rows[at].turn;
+  }).catch(() => { /* the panes say so themselves */ }).finally(landed);
+
+  api("/api/prompt/cuts").then((got) => {
+    cuts = (got && got.cuts) || [];
+  }).catch(() => { cuts = []; }).finally(landed);
+
+  paint();
+
+  /* --------------------------------------------------------- the panes */
+
+  function note(into, words, bad) {
+    const p = el("div", "", words);
+    p.style.cssText = "font-size:11px;margin:6px 0;color:"
+      + (bad ? "#ff8f86" : "#46c2a0");
+    into.appendChild(p);
+    return p;
+  }
+
+  function paint() {
+    body.textContent = "";
+    if (pane === "flow") return paintFlow();
+    if (pane === "script") return paintScript();
+    return paintChange();
+  }
+
+  /* ---- where it came from ---- */
+
+  const STAGES = [
+    ["schedule", "Schedule", "what asked for it"],
+    ["system", "Character", "who was armed"],
+    ["seed", "Material", "what seeded it"],
+    ["written", "Written", "the prompt and the answer"],
+    ["crystal", "Crystal", "shards offered"],
+    ["vectors", "Vectors", "what was searched"],
+    ["render", "Recorded", "engine and voice"],
+    ["air", "Air", "when it went out"]
+  ];
+  let stage = "written";
+
+  function chunksOf(id) {
+    const p = prov || {};
+    if (id === "seed") {
+      const out = [];
+      for (const d of (p.documents || [])) {
+        out.push({kind: "document", name: d.file || "document",
+          note: d.how || "", flagged: d.quoted,
+          text: d.text || "", lines: d.lines || null});
+      }
+      for (const m of (p.material || [])) {
+        out.push({kind: "material", name: "material",
+          text: typeof m === "string" ? m : (m.text || JSON.stringify(m))});
+      }
+      for (const r of (p.requests || [])) {
+        out.push({kind: "request",
+          name: (r.title || "request") + (r.artist ? " — " + r.artist : ""),
+          note: (r.count || 0) + "× asked",
+          text: (r.asked || []).join("\n") || r.title || ""});
+      }
+      return out;
+    }
+    if (id === "crystal") {
+      return (p.crystal || []).map((s) => ({kind: "crystal",
+        name: s.kind || "shard", flagged: s.in_prompt,
+        text: s.text || ""}));
+    }
+    if (id === "vectors") {
+      return (p.vectors || []).map((v) => ({kind: "vector",
+        name: v.file || v.query || "search",
+        note: (v.query ? "for " + v.query : "")
+          + (v.score !== undefined ? "  score " + v.score : ""),
+        text: v.text || ""}));
+    }
+    if (id === "system") {
+      const out = [];
+      const s = p.system || {};
+      if (s.text) {
+        out.push({kind: "character", name: s.name || "character prompt",
+          note: "armed when this was written", text: s.text});
+      }
+      if (s.station) {
+        out.push({kind: "station", name: "station prompt",
+          note: "carried on every round", text: s.station});
+      }
+      return out;
+    }
+    return [];
+  }
+
+  /* Did this chunk really reach the prompt? Checked against the prompt as
+   * SENT rather than relayed from a flag - and when the two disagree the
+   * row says so, which is invisible to anyone reading either alone. */
+  function reached(text) {
+    const sent = ((prov || {}).written || {}).prompt || "";
+    const flat = String(text || "").replace(/\s+/g, " ").trim();
+    if (!sent || flat.length < 12) return null;
+    const hay = String(sent).replace(/\s+/g, " ").toLowerCase();
+    const run = flat.length <= 40 ? flat
+      : flat.slice(Math.floor((flat.length - 40) / 2),
+        Math.floor((flat.length - 40) / 2) + 40);
+    return hay.indexOf(run.toLowerCase()) >= 0;
+  }
+
+  function isCut(kind, text) {
+    const mark = pineMark(text);
+    return cuts.some((c) => c && c.kind === kind && c.mark === mark);
+  }
+
+  function paintFlow() {
+    if (!prov && !provWhy && waitingOn > 0) {
+      note(body, "Reading the paperwork\u2026 the station takes about ten "
+        + "seconds over this one.");
+      return;
+    }
+    if (provWhy) note(body, provWhy, true);
+
+    const strip = el("div", "", "");
+    strip.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px";
+    for (const [id, label] of STAGES) {
+      const has = chunksOf(id).length > 0
+        || (id === "written" && ((prov || {}).written || {}).prompt)
+        || (id === "render" && (prov || {}).render)
+        || (id === "air" && (prov || {}).line)
+        || (id === "schedule" && (prov || {}).schedule);
+      const chip = el("button", "", label);
+      chip.style.cssText = "border:1px solid " + (id === stage ? "#65c7da"
+        : has ? "#2a7d66" : "#24323f") + ";border-radius:5px;background:"
+        + (has ? "#16242c" : "#111a20") + ";color:" + (has ? "#cfe0ea"
+        : "#64798a") + ";font-size:12px;padding:7px 11px;cursor:pointer";
+      chip.onclick = () => { stage = id; paint(); };
+      strip.appendChild(chip);
+    }
+    body.appendChild(strip);
+
+    const which = STAGES.find((s) => s[0] === stage) || STAGES[0];
+    const title = el("div", "", which[1] + " — " + which[2]);
+    title.style.cssText = "color:#7e94a6;font-size:11px;letter-spacing:.06em;"
+      + "text-transform:uppercase;margin:6px 0";
+    body.appendChild(title);
+
+    if (stage === "written") {
+      const w = (prov || {}).written || {};
+      if (!w.prompt) {
+        note(body, "The prompt and the answer are not kept for this one.", true);
+      }
+      for (const [name, value] of [["the prompt as sent", w.prompt],
+                                   ["what came back", w.script]]) {
+        if (!value) continue;
+        const h = el("div", "", name);
+        h.style.cssText = "color:#7e94a6;font-size:11px;margin:8px 0 3px";
+        const pre = el("pre", "", String(value));
+        pre.style.cssText = "white-space:pre-wrap;word-break:break-word;"
+          + "background:#0b1319;border:1px solid #1e2c36;border-radius:4px;"
+          + "padding:8px;font-size:11px;line-height:1.45;max-height:44vh;"
+          + "overflow:auto;margin:0";
+        body.appendChild(h);
+        body.appendChild(pre);
+      }
+      return;
+    }
+
+    if (stage === "render" || stage === "air" || stage === "schedule") {
+      const p = prov || {};
+      const src = stage === "render" ? (p.render || {})
+        : stage === "air" ? (p.line || {}) : (p.schedule || {});
+      const keys = Object.keys(src);
+      if (!keys.length) { note(body, "Nothing is recorded here.", true); return; }
+      for (const k of keys) {
+        const v = src[k];
+        if (v === "" || v === null || v === undefined) continue;
+        const r = el("div", "", "");
+        r.style.cssText = "display:flex;gap:10px;padding:2px 0;font-size:12px";
+        const b = el("b", "", k);
+        b.style.cssText = "flex:none;width:132px;color:#7e94a6;font-weight:400";
+        const s = el("span", "", typeof v === "object" ? JSON.stringify(v)
+          : String(v));
+        s.style.cssText = "color:#cfe0ea;word-break:break-word";
+        r.appendChild(b); r.appendChild(s);
+        body.appendChild(r);
+      }
+      return;
+    }
+
+    const rows = chunksOf(stage);
+    if (!rows.length) {
+      note(body, "Nothing is recorded at this stage for this line.", true);
+      return;
+    }
+    for (const chunk of rows) body.appendChild(chunkRow(chunk));
+  }
+
+  /* One contribution: what it is, whether it got there, and a way to stop it
+   * getting there again. Same three parts as the desktop's. */
+  function chunkRow(chunk) {
+    const text = String(chunk.text || "");
+    const wrap = el("div", "", "");
+    const gone = () => isCut(chunk.kind, chunk.lines ? chunk.lines[0] : text);
+    const paintBox = () => {
+      wrap.style.cssText = "border:1px solid #1e2c36;border-radius:4px;"
+        + "margin:5px 0;background:#101a21;opacity:" + (gone() ? ".55" : "1");
+    };
+    paintBox();
+
+    const bar = el("div", "", "");
+    bar.style.cssText = "display:flex;align-items:baseline;gap:8px;"
+      + "padding:7px 9px;cursor:pointer";
+    const tw = el("span", "", "▸");
+    tw.style.cssText = "color:#8fa6b6;font-size:13px";
+    const nm = el("span", "", chunk.name || chunk.kind);
+    nm.style.cssText = "color:#cfe0ea;font-weight:500;word-break:break-word";
+    bar.appendChild(tw); bar.appendChild(nm);
+    if (chunk.note) {
+      const nt = el("span", "", chunk.note);
+      nt.style.cssText = "color:#7e94a6;font-size:11px";
+      bar.appendChild(nt);
+    }
+    const got = reached(text);
+    const mk = el("span", "", got === null
+      ? (chunk.flagged === undefined ? ""
+        : (chunk.flagged ? "marked used" : "marked unused"))
+      : (got ? "in the prompt" : "not in the prompt"));
+    mk.style.cssText = "margin-left:auto;flex:none;font-size:11px;color:"
+      + (got ? "#46c2a0" : got === null ? "#55697a" : "#64798a");
+    bar.appendChild(mk);
+    wrap.appendChild(bar);
+
+    if (got !== null && chunk.flagged !== undefined && !!chunk.flagged !== got) {
+      const odd = el("div", "", chunk.flagged
+        ? "recorded as used, but its text is not in the prompt as sent"
+        : "recorded as unused, yet its text IS in the prompt as sent");
+      odd.style.cssText = "color:#ffc95c;font-size:11px;padding:0 9px 6px 26px";
+      wrap.appendChild(odd);
+    }
+
+    const pre = el("pre", "", text || "(nothing was recorded here)");
+    pre.style.cssText = "display:none;white-space:pre-wrap;word-break:break-word;"
+      + "margin:0;padding:6px 9px 9px 26px;color:#a9c0ce;font-size:11px;"
+      + "line-height:1.45;max-height:40vh;overflow:auto;"
+      + "border-top:1px solid #1a262e";
+    wrap.appendChild(pre);
+    bar.onclick = () => {
+      const open = pre.style.display !== "none";
+      pre.style.display = open ? "none" : "block";
+      tw.textContent = open ? "▸" : "▾";
+    };
+
+    /* NO PASSAGE, NO CUT - and say so. A vector hit is logged with a file
+     * and a score and no text, so a cut here could never match anything. */
+    const can = text.trim().length >= 12;
+    const cut = el("button", "", gone() ? "put it back" : "cut it");
+    cut.disabled = !can;
+    cut.style.cssText = "margin:0 9px 9px 26px;background:none;border:1px "
+      + "solid " + (can ? "#2a3b47" : "#1e2c36") + ";border-radius:3px;"
+      + "color:" + (can ? "#9fb3c2" : "#4a5b68") + ";font-size:11px;"
+      + "padding:4px 9px;cursor:" + (can ? "pointer" : "not-allowed");
+    if (!can) {
+      cut.textContent = "the station kept only its name";
+    } else {
+      cut.onclick = async () => {
+        const was = gone();
+        if (!was && !confirm("Stop this being added to future prompts?\n\n"
+          + text.slice(0, 180))) return;
+        cut.disabled = true;
+        try {
+          const body_ = {kind: chunk.kind, name: chunk.name || "",
+            mark: pineMark(chunk.lines ? chunk.lines[0] : text),
+            text: text.slice(0, 4000), lines: chunk.lines || undefined};
+          const done = await api(was ? "/api/prompt/cuts/remove"
+            : "/api/prompt/cuts",
+            {method: "POST", body: JSON.stringify(body_)});
+          cuts = (done && done.cuts) || cuts;
+          cut.textContent = gone() ? "put it back" : "cut it";
+          paintBox();
+        } catch (err) { cut.textContent = err.message.slice(0, 60); }
+        cut.disabled = false;
+      };
+    }
+    wrap.appendChild(cut);
+    return wrap;
+  }
+
+  /* ---- what was said around it ---- */
+
+  let where = "round";
+
+  function paintScript() {
+    const pick = el("div", "", "");
+    pick.style.cssText = "display:flex;gap:14px;margin-bottom:8px";
+    for (const [id, label] of [["round", "The round"], ["air", "On air"]]) {
+      const t = el("span", "", label);
+      t.style.cssText = "cursor:pointer;font-size:12px;padding-bottom:4px;"
+        + "border-bottom:2px solid " + (where === id ? "#46c2a0" : "transparent")
+        + ";color:" + (where === id ? "#cfe0ea" : "#7e94a6");
+      t.onclick = () => { where = id; paint(); };
+      pick.appendChild(t);
+    }
+    body.appendChild(pick);
+
+    const rows = where === "round" ? chain : around;
+    if (!rows.length && waitingOn > 0) {
+      note(body, "Still reading the feed\u2026");
+      return;
+    }
+    if (!rows.length) {
+      note(body, where === "round"
+        ? "The station kept no written round for this line, so there is no "
+          + "conversation to show. Lines that arrive as interjects are "
+          + "written one at a time and carry no round."
+        : "Nothing of the surrounding air came through.", true);
+      return;
+    }
+    for (const row of rows) body.appendChild(scriptRow(row));
+  }
+
+  function scriptRow(row) {
+    const here = row.id === line.id;
+    const wrap = el("div", "", "");
+    wrap.style.cssText = "padding:7px 9px;margin:3px 0;border-radius:4px;"
+      + "border-left:3px solid " + (here ? "#46c2a0" : "transparent")
+      + ";background:" + (here ? "#10201d" : "#0f171d");
+    const top = el("div", "", "");
+    top.style.cssText = "display:flex;gap:8px;align-items:baseline";
+    const who = el("b", "", row.name || row.who || "?");
+    who.style.cssText = "color:#9fb3c2;font-size:11px;font-weight:500";
+    top.appendChild(who);
+    if (where === "round" && row.turn !== null && row.turn !== undefined) {
+      const tn = el("span", "", (Number(row.turn) + 1) + "/" + (row.turns || "?"));
+      tn.style.cssText = "color:#55697a;font-size:10px";
+      top.appendChild(tn);
+    } else if (row.kind) {
+      const kn = el("span", "", row.kind);
+      kn.style.cssText = "color:#55697a;font-size:10px";
+      top.appendChild(kn);
+    }
+    wrap.appendChild(top);
+    const what = el("div", "", String(row.text || ""));
+    what.style.cssText = "color:" + (here ? "#eaf4f8" : "#cfe0ea")
+      + ";font-size:12px;line-height:1.45;margin-top:2px;word-break:break-word";
+    wrap.appendChild(what);
+
+    /* The actions are opened by tapping the line rather than always shown:
+     * five buttons on every row of a long feed is a wall, not a tool. */
+    const tray = el("div", "", "");
+    tray.style.cssText = "display:none;gap:6px;flex-wrap:wrap;margin-top:6px";
+    const button = (label, go) => {
+      const b = el("button", "", label);
+      b.style.cssText = "background:#16242c;border:1px solid #2a3b47;"
+        + "border-radius:4px;color:#cfe0ea;font-size:11px;padding:5px 9px;"
+        + "cursor:pointer";
+      b.onclick = (e) => { e.stopPropagation(); go(b); };
+      tray.appendChild(b);
+      return b;
+    };
+    button("Play", (b) => pineHear(row, tray, b));
+    button("Save the line", () => pineKeep(row, false, tray));
+    if (row.sid) button("Save the conversation", () => pineKeep(row, true, tray));
+    if (!here) button("Inspect this one", () => pineSheet(row));
+    wrap.appendChild(tray);
+    wrap.onclick = () => {
+      tray.style.display = tray.style.display === "none" ? "flex" : "none";
+    };
+    return wrap;
+  }
+
+  /* Played in the page rather than handed off: on a kiosk there is nothing
+   * to hand it to, and a control the operator can stop is better than a
+   * sound that starts on its own. */
+  async function pineHear(row, into, button) {
+    button.disabled = true;
+    button.textContent = "cutting…";
+    try {
+      const r = await fetch("/api/booth/clip?line=" + encodeURIComponent(row.id),
+        {headers: {Authorization: "Bearer " + key()}});
+      if (!r.ok) throw new Error("the booth would not cut it (" + r.status + ")");
+      const blob = await r.blob();
+      const player = el("audio", "", "");
+      player.controls = true;
+      player.src = URL.createObjectURL(blob);
+      player.style.cssText = "width:100%;margin-top:6px;height:32px";
+      into.parentElement.appendChild(player);
+      player.play().catch(() => {});
+      button.remove();
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = err.message.slice(0, 40);
+    }
+  }
+
+  /* Fetched with the bearer and saved from a blob rather than linked
+   * straight at the route: reads are open today, and a download that stops
+   * working the day they are locked is a trap left for later. */
+  async function pineKeep(row, whole, into) {
+    const said = note(into.parentElement, "fetching…");
+    try {
+      const r = await fetch("/api/booth/clip?line=" + encodeURIComponent(row.id)
+        + (whole ? "&whole=1" : ""),
+        {headers: {Authorization: "Bearer " + key()}});
+      if (!r.ok) throw new Error("the booth would not cut it (" + r.status + ")");
+      const kind = String(r.headers.get("content-type") || "");
+      const blob = await r.blob();
+      /* The extension follows the BYTES - the booth answers mp3 or wav and
+       * says which; a .mp3 holding a wav fails later in whatever opens it. */
+      const ext = kind.indexOf("wav") >= 0 ? "wav" : "mp3";
+      const a = el("a", "", "");
+      a.href = URL.createObjectURL(blob);
+      a.download = "pine-" + (whole ? "conversation" : "line") + "-"
+        + String(row.id).slice(0, 8) + "." + ext;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      said.textContent = "Saved " + a.download;
+    } catch (err) {
+      said.textContent = err.message;
+      said.style.color = "#ff8f86";
+    }
+  }
+
+  /* ---- changing it ---- */
+
+  function paintChange() {
+    const sid = String(line.sid || "");
+    const turn = line.turn;
+    if (!sid) {
+      note(body, "The station kept no written round for this line, so there "
+        + "is nothing to edit. Lines that arrive as interjects are written "
+        + "one at a time and carry no round. The votes below still work.",
+        true);
+    } else {
+      const w = el("div", "muted", "This line sits in round " + sid
+        + (turn === null || turn === undefined ? "" : ", turn " + (turn + 1)));
+      w.style.cssText = "font-size:11px;margin-bottom:8px";
+      body.appendChild(w);
+    }
+
+    const head_ = (words) => {
+      const h = el("div", "", words);
+      h.style.cssText = "color:#7e94a6;font-size:11px;letter-spacing:.06em;"
+        + "text-transform:uppercase;margin:14px 0 4px";
+      body.appendChild(h);
+    };
+    const hint = (words) => {
+      const h = el("div", "", words);
+      h.style.cssText = "color:#55697a;font-size:11px;line-height:1.45;"
+        + "margin-bottom:6px";
+      body.appendChild(h);
+    };
+    const area = (rows, value, hold) => {
+      const t = el("textarea", "", "");
+      t.rows = rows;
+      t.value = value || "";
+      if (hold) t.placeholder = hold;
+      t.style.cssText = "width:100%;box-sizing:border-box;background:#0b1319;"
+        + "border:1px solid #24323f;border-radius:4px;color:#cfe0ea;"
+        + "font:inherit;font-size:12px;padding:7px 9px;resize:vertical";
+      body.appendChild(t);
+      return t;
+    };
+    const act = (label, can, go) => {
+      const b = el("button", "", label);
+      b.disabled = !can;
+      b.style.cssText = "margin-top:6px;background:#16242c;border:1px solid "
+        + (can ? "#2a3b47" : "#1e2c36") + ";border-radius:4px;color:"
+        + (can ? "#cfe0ea" : "#4a5b68") + ";font-size:12px;padding:7px 13px;"
+        + "cursor:" + (can ? "pointer" : "not-allowed");
+      if (can) b.onclick = () => go(b);
+      body.appendChild(b);
+      return b;
+    };
+    const doing = async (b, was, go, done_) => {
+      b.disabled = true;
+      b.textContent = was;
+      try {
+        const said = await go();
+        b.textContent = done_;
+        note(body, "Done.");
+      } catch (err) { note(body, err.message, true); b.textContent = was; }
+      b.disabled = false;
+    };
+
+    head_("Rewrite it yourself");
+    hint("Sent with the words it replaces, so if the round moved underneath "
+      + "you the station refuses rather than overwriting somebody else's edit.");
+    const text = area(4, String(line.text || line.said || ""));
+    act("Rewrite this turn", !!sid, (b) => {
+      const words = String(text.value || "").trim();
+      if (!words) return note(body, "Write the line first.", true);
+      doing(b, "rewriting…", () => api(
+        "/api/director/script/" + encodeURIComponent(sid) + "/turn",
+        {method: "POST", body: JSON.stringify({index: Number(turn) || 0,
+          text: words, was: String(line.text || "")})}), "Rewritten");
+    });
+
+    head_("Send it back to the writer room");
+    hint("The note fixes this line now. Kept as standing it rides every "
+      + "future round of this road.");
+    const why = area(3, "", "what should change, and why");
+    const standingRow = el("label", "", "");
+    standingRow.style.cssText = "display:flex;gap:7px;align-items:center;"
+      + "color:#7e94a6;font-size:11px;margin-top:6px";
+    const standing = el("input", "", "");
+    standing.type = "checkbox";
+    standing.checked = true;
+    standingRow.appendChild(standing);
+    standingRow.appendChild(el("span", "", "keep it as a standing note"));
+    body.appendChild(standingRow);
+    act("Send it back", !!sid, (b) => {
+      const words = String(why.value || "").trim();
+      if (!words) return note(body, "A revision needs a note.", true);
+      if (!confirm("Send this back to the writer room?\n\n" + words)) return;
+      doing(b, "sending…", () => api(
+        "/api/director/script/" + encodeURIComponent(sid) + "/revise",
+        {method: "POST", body: JSON.stringify({note: words,
+          standing: standing.checked})}), "Sent");
+    });
+
+    head_("Try a tint");
+    hint("Asks for a tinted version and applies nothing, so both can be read "
+      + "against each other first.");
+    act("Tint just this line", !!sid, async (b) => {
+      b.disabled = true;
+      try {
+        const got = await api("/api/director/script/" + encodeURIComponent(sid)
+          + "/tint", {method: "POST",
+          body: JSON.stringify({index: Number(turn) || 0})});
+        const box = el("div", "", "");
+        box.style.cssText = "margin-top:8px;font-size:12px;line-height:1.5";
+        const a = el("div", "", "as written: "
+          + String(got.plain || got.was || line.text || ""));
+        a.style.cssText = "color:#7e94a6;padding:4px 0";
+        const c = el("div", "", "tinted: "
+          + String(got.tinted || got.text || "(it came back empty)"));
+        c.style.cssText = "color:#cfe0ea;padding:4px 0;border-top:1px solid #1a262e";
+        box.appendChild(a); box.appendChild(c);
+        body.appendChild(box);
+        note(body, "Nothing has been applied — this is the tint offered.");
+      } catch (err) { note(body, err.message, true); }
+      b.disabled = false;
+    });
+
+    head_("Record it again");
+    const bypassRow = el("label", "", "");
+    bypassRow.style.cssText = "display:flex;gap:7px;align-items:center;"
+      + "color:#7e94a6;font-size:11px";
+    const bypass = el("input", "", "");
+    bypass.type = "checkbox";
+    bypassRow.appendChild(bypass);
+    bypassRow.appendChild(el("span", "", "skip the tint pass for this round"));
+    body.appendChild(bypassRow);
+    act("Send to the recording room", !!sid, (b) => {
+      if (!confirm("Send this round back to the recording room?")) return;
+      doing(b, "sending…", () => api(
+        "/api/director/script/" + encodeURIComponent(sid) + "/record",
+        {method: "POST", body: JSON.stringify({bypass: bypass.checked,
+          who: "operator"})}), "Sent");
+    });
+
+    head_("Say what you thought of it");
+    hint("Bounds what gets written next. The only one of these that still "
+      + "works on a line with no round.");
+    const votes = el("div", "", "");
+    votes.style.cssText = "display:flex;gap:8px";
+    body.appendChild(votes);
+    for (const [label, up] of [["Good", true], ["Poor", false]]) {
+      const b = el("button", "", label);
+      b.style.cssText = "background:#16242c;border:1px solid #2a3b47;"
+        + "border-radius:4px;color:#cfe0ea;font-size:12px;padding:7px 13px;"
+        + "cursor:pointer";
+      b.onclick = () => doing(b, "…", () => api("/api/dj/line/vote",
+        {method: "POST", body: JSON.stringify({id: line.id,
+          vote: up ? "up" : "down"})}), label);
+      votes.appendChild(b);
+    }
+  }
+}
+
 
 function djDossierWatch(row, line) {
   row.addEventListener("mouseenter", () => {
