@@ -26582,6 +26582,8 @@ _BUILD_MS = int(time.time() * 1000)
 # twelve, so it is thin far more often than it is full.
 FEED_WARM_ROWS = 160
 FEED_WARM_SECONDS = 3600.0
+# #1283b: several clients poll this door at 4 Hz; they share one pass.
+_FEED_WARM_MEMO: dict[str, Any] = {"at": 0.0, "rows": None}
 
 
 def feed_warm_rows(held: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -26605,11 +26607,33 @@ def feed_warm_rows(held: list[dict[str, Any]]) -> list[dict[str, Any]]:
     of what a feed shows."""
     if len(held) >= FEED_WARM_ROWS:
         return held
-    try:
-        now = time.time()
-        older = airlog_rows(now - FEED_WARM_SECONDS, now + 60.0, quiet=True)
-    except Exception:  # noqa: BLE001
-        return held                      # a feed without history still reads
+    # #1283b: THE KEEPER'S INDEX OR NOTHING.
+    #
+    # This called airlog_rows, which falls back to folding the WHOLE
+    # 48-hour file when the index is cold - memoised on (mtime, size),
+    # which the keeper changes every ten seconds, so the memo misses
+    # almost every time. The feed door is hit by every client every
+    # four seconds, and the station restarts about every nine minutes,
+    # so the index is cold often. Measured in /api/pulse's own blocking
+    # frames after #1283 shipped: airlog_read_all 5.81s, airlog_rows
+    # 1.76s - on a station where 90% of dead-air seconds are loop
+    # stalls. A convenience may not block the loop.
+    #
+    # Cold index means the feed comes back thin, which is exactly what
+    # it did before #1283: a cosmetic loss, not dead air.
+    if not _AIRLOG_STATE.get("loaded"):
+        return held
+    now = time.time()
+    memo = _FEED_WARM_MEMO
+    if memo.get("rows") is not None and now - float(memo.get("at") or 0) < 4.0:
+        older = memo["rows"]
+    else:
+        try:
+            older = airlog_rows(now - FEED_WARM_SECONDS, now + 60.0, quiet=True)
+        except Exception:  # noqa: BLE001
+            return held                  # a feed without history still reads
+        memo["rows"] = older
+        memo["at"] = now
     if not older:
         return held
     have = {str(r.get("id") or "") for r in held}
@@ -64051,10 +64075,48 @@ def scratch_stock(want: int = 12) -> list[Path]:
     return made
 
 
+# #1265, third pass, and the first two were wrong about where the cost was.
+#
+# Measured over a clean restart-free 40 minutes AFTER indexing sfx_all():
+# 1,182 s/h of stall-attributed dead air against an 858 s/h baseline. Not
+# an improvement - worse. And `sfx_id` was STILL in the stall stacks (3 of
+# 13 stall gaps, 84s), which is exactly what the index was meant to remove.
+#
+# The index was the wrong cure because the WALK was never the expensive
+# part. sfx_id is called PER PATH ACROSS THE WHOLE POOL inside at least
+# six comprehensions on the draw road:
+#
+#     [p for p in _SFX_POOL_CACHE if sfx_id(p) not in banned]
+#     {... if int((_played.get(sfx_id(p)) or {}).get("plays") or 0) <= 0}
+#     [p for p in sfx_all() if ... sfx_id(p) not in banned]
+#     [... if sfx_id(Path(p)) not in banned and weights.get(sfx_id(Path(p)))]
+#     random.choices(pool, weights=[weights.get(sfx_id(p), 1.0) for p in pool])
+#
+# With 3,588 samples that is tens of thousands of sha1s per pick, cached
+# pool or not. Caching the LIST does nothing about hashing every member of
+# it several times over - which is the whole lesson: the innermost frame in
+# a stall stack is usually cheap, and the question is who is calling it in
+# a loop, not why it is slow.
+#
+# Memoising the function fixes all thirty-six call sites at once, including
+# the ones no stack named. Bounded, because a pack can be repointed at a
+# bigger library and an unbounded map of every path this station has ever
+# seen is a slow leak.
+_SFX_ID_MEMO: dict[str, str] = {}
+SFX_ID_MEMO_MOST = 40000
+
+
 def sfx_id(path: Path) -> str:
     """The same opaque, unguessable shape a track id has, so the same guard
-    and the same signature work."""
-    return hashlib.sha1(str(path).encode()).hexdigest()[:16]
+    and the same signature work. Memoised - see the note above (#1265)."""
+    key = str(path)
+    got = _SFX_ID_MEMO.get(key)
+    if got is None:
+        got = hashlib.sha1(key.encode()).hexdigest()[:16]
+        if len(_SFX_ID_MEMO) >= SFX_ID_MEMO_MOST:
+            _SFX_ID_MEMO.clear()    # a pack repointed at a bigger library
+        _SFX_ID_MEMO[key] = got
+    return got
 
 
 def sfx_by_id(wanted: str) -> Path | None:
