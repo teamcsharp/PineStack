@@ -552,6 +552,18 @@ function pick(id) {
   region = held.region || null;
   prov = held.provenance || null;
 
+  /* THE SCRIPT BESIDE IT. Handed the same payload rather than fetching its
+   * own - one read of the feed, for a window that is opened on a whim. */
+  if (window.pineScript) {
+    window.pineScript.fill(held, (row) => {
+      /* Inspecting a neighbour opens ITS inspector rather than redrawing
+       * this one: the two lines have different paperwork, and quietly
+       * swapping the subject under a window somebody is reading is how you
+       * end up reasoning about the wrong line. */
+      if (api.inspectFlow) api.inspectFlow(row);
+    });
+  }
+
   /* WHAT IS ALREADY CUT, before anything is drawn - so a row that has been
    * dropped already says so rather than offering to drop it again. A station
    * that cannot answer is not an error here: the chart is still worth

@@ -120,6 +120,11 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   inspectFlow: (region) => ipcRenderer.invoke("inspect:flow", region),
   flowPending: () => ipcRenderer.invoke("flow:pending"),
 
+  /* The inspector's script sidebar: hear one, or save one, a round, or the
+   * run of air around it. */
+  inspectPlay: (what) => ipcRenderer.invoke("inspect:play", what),
+  inspectExport: (what) => ipcRenderer.invoke("inspect:export", what),
+
   /* WHAT THE PROMPTS ARE NO LONGER ALLOWED TO CARRY. The X in the flow
    * chart - a standing decision about every future round, so it is kept on
    * the station rather than here. */

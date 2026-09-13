@@ -29,18 +29,41 @@
     <div id="said"></div>
   </header>
 
-  <div id="chart">
-    <svg id="spine" xmlns="http://www.w3.org/2000/svg"></svg>
-  </div>
+  <!-- THE CHART AND ITS DETAIL ON THE LEFT, THE SCRIPT ON THE RIGHT.
+       The chart answers "how did this come to be"; the sidebar answers "and
+       what was being said around it", which is the question you actually
+       have when you are trying to correct the flow of a conversation. -->
+  <main id="shell">
+    <div id="left">
+      <div id="chart">
+        <svg id="spine" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
 
-  <section id="detail">
-    <h3 id="detailWhat">Pick a stage</h3>
-    <div id="detailBody"></div>
-  </section>
+      <section id="detail">
+        <h3 id="detailWhat">Pick a stage</h3>
+        <div id="detailBody"></div>
+      </section>
 
-  <p id="note" class="note"></p>
+      <p id="note" class="note"></p>
+    </div>
+
+    <aside id="script">
+      <header id="scriptHead">
+        <span class="scriptTab on" data-where="round">The round</span>
+        <span class="scriptTab" data-where="air">On air</span>
+        <span id="scriptCount" class="dim"></span>
+      </header>
+      <div id="scriptBody"></div>
+      <p id="scriptSaid" class="scriptSaid"></p>
+      <p class="hint">Right-click any line to play or export it.
+        Double-click to inspect it instead.</p>
+    </aside>
+  </main>
+
+  <div id="scriptMenu" class="popmenu" hidden></div>
 
   <script src="pine-icons.js"></script>
+  <script src="line-script.js"></script>
   <script src="script-flow.js"></script>
 </body>
 </html>

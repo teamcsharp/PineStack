@@ -1880,12 +1880,47 @@ ipcMain.handle("inspect:flow", async (_event, region) => {
     } catch (error) { why = error.message; }
   }
 
+  /* THE CONVERSATION AROUND IT, off the same feed the booth draws.
+   *
+   * Not /api/director/script/{sid}: that answers 404 once a round has aired
+   * and been retired, which is exactly the case somebody inspects. The feed
+   * carries sid/turn/turns on every row, so the round is the rows sharing
+   * that sid in turn order - the same data the station said it from. */
+  let chain = [];
+  let around = [];
+  let feedWhy = "";
+  try {
+    const feed = await fetchJson(base + "/api/dj");
+    const rows = (feed.chat || []).filter((r) => r && r.id);
+    const at = rows.findIndex((r) => r.id === (region && region.id));
+    const thin = (r) => ({
+      id: r.id, who: r.who, name: r.name, kind: r.kind, text: r.text,
+      sid: r.sid, turn: r.turn, turns: r.turns, ts: r.ts, air_at: r.air_at,
+      aired: r.aired, voice: r.voice, engine: r.engine, seconds: r.seconds,
+      media: r.media, clip_media: r.clip_media, round: r.round
+    });
+    const sid = String((region && region.sid)
+      || (at >= 0 ? rows[at].sid : "") || "");
+    if (sid) {
+      chain = rows.filter((r) => String(r.sid || "") === sid)
+        .sort((a, b) => (Number(a.turn) || 0) - (Number(b.turn) || 0))
+        .map(thin);
+    }
+    /* Broadcast order, because "what was next" is what was HEARD next and
+     * not what the script had planned. */
+    if (at >= 0) {
+      around = rows.slice(Math.max(0, at - 12), at + 13).map(thin);
+    }
+  } catch (error) {
+    feedWhy = "the feed would not answer: " + error.message;
+  }
+
   const window_ = new BrowserWindow({
-    width: 1180,
-    height: 720,
-    minWidth: 720,
-    minHeight: 480,
-    title: "How it came to be",
+    width: 1420,
+    height: 860,
+    minWidth: 900,
+    minHeight: 560,
+    title: "Inspect the line",
     icon: path.join(__dirname, "assets", "pinebox.ico"),
     backgroundColor: "#0d1217",
     webPreferences: {
@@ -1897,7 +1932,8 @@ ipcMain.handle("inspect:flow", async (_event, region) => {
   });
   window_.setMenuBarVisibility(false);
   const flowId = window_.webContents.id;
-  flowWaiting.set(flowId, { region, provenance, why });
+  flowWaiting.set(flowId, { region, provenance, why, chain, around,
+    feedWhy });
   window_.on("closed", () => flowWaiting.delete(flowId));
   window_.loadFile(path.join(__dirname, "renderer", "script-flow.html"));
   return { ok: true, had: !!provenance, why };
@@ -1943,6 +1979,114 @@ ipcMain.handle("prompt:keep", async (_event, what) => {
     return await fetchJson(`${cfg.baseUrl}/api/prompt/cuts/remove`, {
       method: "POST", body: JSON.stringify(what || {})
     });
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Hearing and keeping what the inspector is showing                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One line's audio, as the booth cuts it.
+ *
+ * Answers mp3 OR wav depending on what the cut needed, and says which in
+ * Content-Type - so this reads that rather than assuming. `whole` asks for
+ * the welded burst the line sat in instead of the row alone.
+ */
+async function boothCut(id, whole) {
+  const cfg = readConfig();
+  const base = String(cfg.baseUrl || "").replace(/\/+$/, "");
+  const url = base + "/api/booth/clip?line=" + encodeURIComponent(id)
+    + (whole ? "&whole=1" : "");
+  const response = await fetch(url, { headers: authHeaders(cfg) });
+  if (!response.ok) {
+    throw new Error("the booth would not cut that line ("
+      + response.status + ")");
+  }
+  const kind = String(response.headers.get("content-type") || "");
+  const body = Buffer.from(await response.arrayBuffer());
+  if (!body.length) throw new Error("the cut came back empty");
+  return {
+    bytes: body,
+    /* THE EXTENSION FOLLOWS THE BYTES. A .mp3 that is really a wav is a
+     * file that fails an hour later in whatever opens it. */
+    ext: kind.includes("wav") ? "wav" : "mp3",
+    exact: response.headers.get("x-pine-exact") === "1",
+    cut: String(response.headers.get("x-pine-cut") || "")
+  };
+}
+
+ipcMain.handle("inspect:play", async (_event, what) => {
+  try {
+    const id = String((what && what.id) || "");
+    if (!id) return { ok: false, why: "no line was named" };
+    const got = await boothCut(id, false);
+    const dir = clipMux.stash();
+    const file = path.join(dir, "line." + got.ext);
+    fs.writeFileSync(file, got.bytes);
+    /* Handed to whatever the operator plays audio with, rather than this
+     * window growing a second player beside the one the station has. */
+    await shell.openPath(file);
+    return { ok: true, path: file, exact: got.exact, cut: got.cut };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("inspect:export", async (event, what) => {
+  const { dialog } = require("electron");
+  try {
+    const id = String((what && what.id) || "");
+    if (!id) return { ok: false, why: "no line was named" };
+    const how = String((what && what.how) || "line");
+
+    let got = null;
+    let many = 0;
+    if (how === "segment") {
+      /* WHAT THE SIDEBAR IS SHOWING, in the order it is showing it - not a
+       * fresh read of the feed, which could hand back a different set of
+       * rows than the ones being looked at. */
+      const ids = ((what && what.ids) || []).filter(Boolean);
+      if (!ids.length) return { ok: false, why: "there is no segment to save" };
+      const parts = [];
+      let ext = "mp3";
+      for (const one of ids) {
+        /* One at a time - twenty-five rows is twenty-five cuts, and this
+         * station has been starved by clients asking all at once. */
+        try {
+          const piece = await boothCut(one, false);
+          parts.push(piece.bytes);
+          ext = piece.ext;
+          many += 1;
+        } catch (error) { /* a row with no audio is not a failed export */ }
+      }
+      if (!parts.length) return { ok: false, why: "none of those lines had audio" };
+      got = { bytes: Buffer.concat(parts), ext };
+    } else {
+      got = await boothCut(id, how === "round");
+      many = 1;
+    }
+
+    const when = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    let folder = app.getPath("music");
+    try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
+    catch { folder = app.getPath("downloads"); }
+    const named = { line: "line", round: "conversation", segment: "segment" };
+    const picked = await dialog.showSaveDialog(
+      BrowserWindow.fromWebContents(event.sender), {
+        title: "Save " + (named[how] || how),
+        defaultPath: path.join(folder,
+          "pine-" + (named[how] || how) + "-" + when + "." + got.ext),
+        filters: [{ name: got.ext.toUpperCase() + " audio",
+          extensions: [got.ext] }]
+      });
+    if (picked.canceled || !picked.filePath) return { ok: true, canceled: true };
+    fs.writeFileSync(picked.filePath, got.bytes);
+    shell.showItemInFolder(picked.filePath);
+    return { ok: true, path: picked.filePath, bytes: got.bytes.length,
+      lines: many, exact: got.exact, cut: got.cut };
   } catch (error) {
     return { ok: false, why: error.message };
   }

@@ -1979,3 +1979,44 @@ body.slides-dragging webview { pointer-events: none; }
 
 .vitals-box > .pv { padding: 0 9px 9px; }
 .vitals-box.shut > .pv { display: none; }
+
+/* ===== the shared right-click menu =====
+   One shape for every line menu in the app - see line-reach.js. Two
+   right-click menus that do not look like each other is two applications. */
+.popmenu {
+  position: fixed;
+  z-index: 4000;
+  min-width: 220px;
+  padding: 4px;
+  border: 1px solid #2a3b47;
+  border-radius: 5px;
+  background: #101a21;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+}
+
+.popmenu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: #cfe0ea;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 5px 9px;
+  border-radius: 3px;
+}
+
+.popmenu button:hover:not(:disabled) { background: #1b2b35; }
+.popmenu button:disabled { color: #4a5b68; cursor: not-allowed; }
+.popmenu hr { border: 0; border-top: 1px solid #1e2c36; margin: 4px 2px; }
+
+/* Which line the menu is about, so it is never a guess. */
+.reachWho {
+  padding: 5px 9px 6px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid #1e2c36;
+  color: #7e94a6;
+  font-size: 11px;
+  word-break: break-word;
+}

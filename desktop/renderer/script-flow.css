@@ -15,9 +15,17 @@ html, body {
   overflow: hidden;
 }
 
+/* Two children now - the header, then the shell that holds the chart and the
+ * script side by side. The old four-row grid was shaped for #head/#chart/
+ * #detail/#note sitting directly on the body. */
+/* minmax(0, ...) on BOTH axes. Without the column track a grid item is free
+ * to be as wide as its content, and the chart's SVG is wider than the window
+ * - which pushed the script sidebar off the right edge entirely while every
+ * flex rule below looked correct. */
 body {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 #head {
@@ -40,10 +48,130 @@ body {
 
 /* ------------------------------------------------------------- the chart */
 
+/* The chart and its detail scroll on their own; the script keeps its own
+ * column so a long conversation never pushes the chart off screen. */
+#shell {
+  display: flex;
+  align-items: stretch;
+  min-height: 0;
+  flex: 1;
+}
+
+#left {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+}
+
+#script {
+  flex: none;
+  width: 380px;
+  border-left: 1px solid #1b2730;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #0b1319;
+}
+
+#scriptHead {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #1b2730;
+}
+
+.scriptTab {
+  cursor: pointer;
+  color: #7e94a6;
+  font-size: 12px;
+  padding-bottom: 2px;
+  border-bottom: 2px solid transparent;
+}
+
+.scriptTab.on { color: #cfe0ea; border-bottom-color: #46c2a0; }
+.scriptTab:hover { color: #cfe0ea; }
+
+#scriptCount { margin-left: auto; font-size: 11px; }
+
+#scriptBody { flex: 1; overflow: auto; padding: 6px 0; min-height: 0; }
+
+/* One spoken line. The one being inspected is marked, because a sidebar you
+ * have to search for your own line in is not context, it is a list. */
+.sline {
+  padding: 5px 12px;
+  border-left: 2px solid transparent;
+  cursor: default;
+}
+
+.sline:hover { background: #101a21; }
+
+.sline.here {
+  border-left-color: #46c2a0;
+  background: #10201d;
+}
+
+.sline b { color: #9fb3c2; font-weight: 500; font-size: 11px; }
+.sline em { color: #55697a; font-style: normal; font-size: 10px;
+  margin-left: 6px; }
+.sline i {
+  display: block;
+  color: #cfe0ea;
+  font-style: normal;
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 2px;
+  word-break: break-word;
+}
+
+.sline.here i { color: #eaf4f8; }
+
+.scriptSaid { flex: none; margin: 0; padding: 6px 12px; color: #46c2a0;
+  font-size: 11px; }
+.scriptSaid.bad { color: #ff8f86; }
+
+.hint { flex: none; margin: 0; padding: 0 12px 10px; color: #55697a;
+  font-size: 10px; }
+
+/* The right-click menu, shared shape with the editors. */
+.popmenu {
+  position: fixed;
+  z-index: 40;
+  min-width: 210px;
+  padding: 4px;
+  border: 1px solid #2a3b47;
+  border-radius: 5px;
+  background: #101a21;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.popmenu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: #cfe0ea;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 5px 9px;
+  border-radius: 3px;
+}
+
+.popmenu button:hover:not(:disabled) { background: #1b2b35; }
+.popmenu button:disabled { color: #4a5b68; cursor: not-allowed; }
+.popmenu hr { border: 0; border-top: 1px solid #1e2c36; margin: 4px 2px; }
+
 #chart {
   overflow-x: auto;
   overflow-y: hidden;
   padding: 14px 16px 6px;
+  /* Scrolls its own SVG rather than widening the column it sits in. */
+  min-width: 0;
 }
 
 #spine { display: block; }

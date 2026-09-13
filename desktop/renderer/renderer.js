@@ -12982,6 +12982,10 @@ function initAirMarquee() {
     el.dataset.who = item.who || "";
     el.dataset.kind = item.kind || "";
     el.dataset.at = String(item.at || 0);
+    if (item.sid) el.dataset.sid = item.sid;
+    /* The whole row, carried on the element, so the shared right-click does
+     * not have to reconstruct it out of dataset strings. */
+    if (window.pineReach) window.pineReach.mark(el, item);
     const glyph = DX_KIND[String(item.kind || "").toLowerCase()];
     if (glyph) {
       const tag = document.createElement("em");
@@ -13173,6 +13177,14 @@ function initAirMarquee() {
                     text,
                     who: String(row.who || ""),
                     kind: String(row.kind || ""),
+                    /* THE ROUND THIS CAME FROM, for the same reason `at`
+                     * and `who` are here: it cannot be recovered from the
+                     * belt afterwards, and without it a line can be played
+                     * but its CONVERSATION cannot be exported - the round
+                     * is the rows sharing this sid. */
+                    sid: String(row.sid || ""),
+                    turn: row.turn,
+                    turns: row.turns,
                     at: Number(row.air_at || row.ts || 0) });
       });
       if (pool.length > KEEP) {
