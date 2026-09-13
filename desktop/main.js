@@ -1790,6 +1790,9 @@ ipcMain.handle("glass:clip", async (_event, seconds, options) => {
      * along, so "the last thirty seconds" is a read rather than a wait. Only
      * the tablet has a rolling recorder; this window does not, so a local
      * capture still films forwards. */
+    /* A REPLAY PULL MAY ASK FOR EVERYTHING. `seconds` null or 0 means the
+     * whole buffer; the forward recording still needs a real number because
+     * it is a thing the operator waits for. */
     const wantsReplay = !!(options && options.replay) && aim.where !== "app";
     const made = wantsReplay
       ? await (await terminalHost.glass()).clip_fromReplay(seconds)

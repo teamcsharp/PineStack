@@ -1017,7 +1017,7 @@ $("glassStill")?.addEventListener("click", (event) => {
 $("glassClip")?.addEventListener("click", (event) => {
   const seconds = glassSeconds();
   const back = !!(event.ctrlKey || event.metaKey);
-  glassDo(back ? `Pulling the last ${seconds}s off the tablet\u2026`
+  glassDo(back ? "Pulling everything the tablet still holds\u2026"
                 : `Recording ${seconds}s\u2026`, async () => {
     /* The tablet is filming and will not answer until it has finished, so
      * the countdown is run here. Without it the app looks hung for exactly
@@ -1032,7 +1032,12 @@ $("glassClip")?.addEventListener("click", (event) => {
         : "Fetching the clip from the tablet\u2026");
     }, 1000);
     try {
-      const made = await api.glassClip(seconds,
+      /* CTRL+CLICK TAKES EVERYTHING THE TABLET STILL HOLDS, not the number
+       * in the seconds box - that box is the ceiling for recording FORWARD,
+       * which is a thing you wait for. There is nothing to wait for here and
+       * the in/out points are a better place to choose from than a number
+       * guessed before looking. */
+      const made = await api.glassClip(back ? 0 : seconds,
         { target: glassTarget(), replay: back });
       if (!made || !made.ok) {
         return glassSay(made && made.why ? made.why : "the clip did not come back", true);

@@ -702,7 +702,19 @@ class Glass {
      * broadcast ring alongside would add megabytes and seconds to a window
      * that cannot play a sound. */
     const silent = !!(options && options.silent);
-    const want = clampSeconds(seconds);
+    /* EVERYTHING, UNLESS A NUMBER WAS NAMED.
+     *
+     * clampSeconds caps at CLIP_MAX, which is the ceiling for RECORDING
+     * forward - a thing the operator stands and waits for. Reaching
+     * backwards costs no waiting, the material already exists, and that cap
+     * was hiding history: measured at 200 seconds held against a 60-second
+     * design figure, of which only 30 could be asked for.
+     *
+     * The ring is a fixed blob, so "everything" is bounded by bytes no
+     * matter how long the history reads, and no ceiling is invented here to
+     * replace the one being removed. */
+    const asked = Number(seconds);
+    const want = isFinite(asked) && asked > 0 ? asked : Infinity;
     const pid = await this.pid();
     if (!pid) return { ok: false, why: 'the kiosk app is not running' };
     let page = null;
@@ -731,12 +743,15 @@ class Glass {
        * less than the ceiling for the first minute, and after the screen has
        * been dark. Asking for 30 and silently getting 11 is a lie the
        * operator only finds out on playback. */
+      /* Never more than is there - the ring holds what it holds, and
+       * asking for everything when there are eleven seconds must still
+       * produce eleven. */
       const take = Math.min(want, held);
 
       const got = await page.askJson(`(async function () {
         try {
           var b = window.pineDesktop;
-          var saved = await b.replaySave({seconds: ${take.toFixed(2)}});
+          var saved = await b.replaySave({seconds: ${(isFinite(take) ? take : 86400).toFixed(2)}});
           if (!saved || !saved.ok) return JSON.stringify({ok:false, why:(saved && saved.detail) || 'it would not write'});
           var out = '';
           for (var at = 0; at < saved.bytes;) {
@@ -761,7 +776,7 @@ class Glass {
       const audio = { broadcast: null, mic: null };
       const notes = ['from the tablet\u2019s rolling recording'];
       if (silent) {
-        if (ran + 0.5 < want) {
+        if (isFinite(want) && ran + 0.5 < want) {
           notes.push('only ' + ran.toFixed(1) + 's had been recorded');
         }
         return { ok: true, mp4, bytes: mp4.length, seconds: ran,
@@ -781,7 +796,7 @@ class Glass {
       /* The microphone is not recorded continuously, so there is no past of
        * it to fetch. Said once rather than left as a puzzle. */
       notes.push('no microphone - it is not recorded continuously');
-      if (ran + 0.5 < want) {
+      if (isFinite(want) && ran + 0.5 < want) {
         notes.push('only ' + ran.toFixed(1) + 's had been recorded');
       }
       return { ok: true, mp4, bytes: mp4.length, seconds: ran, at: this.now(),

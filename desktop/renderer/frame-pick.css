@@ -43,7 +43,15 @@ html, body {
   max-height: 100%;
   display: block;
   background: #05080b;
+  /* Origin at the centre, which is what the pan arithmetic in place()
+     assumes. */
+  transform-origin: center center;
 }
+
+/* Zoomed in, the middle button is a hand. Said with the cursor because there
+   is nowhere sensible to put a hint. */
+#glass.zoomed { cursor: grab; }
+#glass.panning { cursor: grabbing; }
 
 #waiting {
   position: absolute;

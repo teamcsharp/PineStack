@@ -213,11 +213,106 @@ document.addEventListener('keydown', function (event) {
     event.preventDefault(); pause(); goTo(span);
   } else if (event.key === 'Enter') {
     event.preventDefault(); take(true);
+  } else if (event.key === '0') {
+    event.preventDefault(); resetZoom();
+  } else if (event.key === 'Escape' && zoom > 1) {
+    /* Escape gets out of the magnifier before it gets out of the window -
+     * one press should not throw away the moment that was just found. */
+    event.preventDefault(); resetZoom();
   } else if (event.key === 'Escape') {
     event.preventDefault();
     if (api.frameDone) api.frameDone();
   }
 });
+
+/* -------------------------------------------------------- zoom and pan */
+
+/* THE SAME GESTURE AS THE LIVE MIRROR, because it is the same gesture: the
+ * picture is letterboxed into whatever room the window has, and finding the
+ * exact moment often means reading something small.
+ *
+ * A VIEWING AID ONLY. frameNow() still draws the whole video at its natural
+ * size, so zooming in to read a label cannot quietly hand over a cropped
+ * screenshot of whatever happened to be on screen. */
+const MOST = 8;
+let zoom = 1;
+let ox = 0;
+let oy = 0;
+let panning = null;
+
+function place() {
+  /* Clamped so the picture cannot be thrown off the edge and lost - an
+   * unclamped viewer has a state with no obvious way out of it. */
+  const wide = film.clientWidth;
+  const tall = film.clientHeight;
+  const room = glass.getBoundingClientRect();
+  const slackX = Math.max(0, (wide * zoom - room.width) / 2);
+  const slackY = Math.max(0, (tall * zoom - room.height) / 2);
+  ox = Math.max(-slackX, Math.min(slackX, ox));
+  oy = Math.max(-slackY, Math.min(slackY, oy));
+  film.style.transform = zoom === 1 && !ox && !oy
+    ? '' : 'translate(' + ox.toFixed(1) + 'px,' + oy.toFixed(1) + 'px) scale('
+      + zoom.toFixed(4) + ')';
+  glass.classList.toggle('zoomed', zoom > 1);
+}
+
+function resetZoom() { zoom = 1; ox = 0; oy = 0; place(); }
+
+glass.addEventListener('wheel', function (event) {
+  event.preventDefault();
+  const was = zoom;
+  /* A fixed ratio per notch, so in-and-straight-back-out lands exactly
+   * where it started rather than drifting. */
+  zoom = Math.max(1, Math.min(MOST, zoom * (event.deltaY < 0 ? 1.25 : 1 / 1.25)));
+  if (zoom === was) return;
+  /* ABOUT THE POINTER: with the origin at the centre a screen point maps
+   * from a picture point as p = o + q*s, so holding p still across a scale
+   * change gives o1 = p - (p - o0) * s1/s0. Zooming about the centre would
+   * mean every zoom is followed by a pan to get back to what you were
+   * looking at. */
+  const room = glass.getBoundingClientRect();
+  const px = event.clientX - room.left - room.width / 2;
+  const py = event.clientY - room.top - room.height / 2;
+  ox = px - (px - ox) * (zoom / was);
+  oy = py - (py - oy) * (zoom / was);
+  if (zoom === 1) { ox = 0; oy = 0; }
+  place();
+}, { passive: false });
+
+glass.addEventListener('pointerdown', function (event) {
+  if (event.button !== 1) return;
+  event.preventDefault();
+  panning = { x: event.clientX, y: event.clientY };
+  glass.classList.add('panning');
+  try { glass.setPointerCapture(event.pointerId); } catch (error) { /* fine */ }
+});
+
+glass.addEventListener('pointermove', function (event) {
+  if (!panning) return;
+  ox += event.clientX - panning.x;
+  oy += event.clientY - panning.y;
+  panning = { x: event.clientX, y: event.clientY };
+  place();
+});
+
+function stopPan(event) {
+  if (!panning) return;
+  panning = null;
+  glass.classList.remove('panning');
+  try { glass.releasePointerCapture(event.pointerId); } catch (error) { /* fine */ }
+}
+
+glass.addEventListener('pointerup', stopPan);
+glass.addEventListener('pointercancel', stopPan);
+/* Windows starts its own autoscroll on the middle button and the picture
+ * fights it. */
+glass.addEventListener('auxclick', function (event) {
+  if (event.button === 1) event.preventDefault();
+});
+
+/* The fit changes with the window, so the clamp has to be reapplied or a
+ * zoomed picture ends up pinned off-centre. */
+window.addEventListener('resize', place);
 
 /* ------------------------------------------------------------- the taking */
 

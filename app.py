@@ -15423,6 +15423,15 @@ def cupboard_unheard_after() -> float:
         return CUPBOARD_UNHEARD_HOURS * 3600.0
 
 
+# #1301: what "the air is actually dead" means for the standing
+# consumer, and how fast it may try while it is. Deliberately not
+# dials: the interval itself is the dial, and these only say that a
+# silent station stops honouring it.
+UNHEARD_QUIET_AFTER = 20.0     # seconds of cast silence
+UNHEARD_QUIET_EVERY = 15.0     # the rest that replaces the interval
+UNHEARD_RETRY_EVERY = 20.0     # what a refused pick costs instead
+
+
 def cupboard_unheard_every() -> float:
     """The shortest gap between two out-of-turn airings from the shelf."""
     try:
@@ -15874,7 +15883,30 @@ async def unheard_stock_air() -> str:
     if not cupboard_unheard_on():
         return _unheard_no("switched off")
     now = time.time()
-    if now - _UNHEARD_AT[0] < cupboard_unheard_every():
+    # #1301: SILENCE OUTRANKS THE INTERVAL.
+    #
+    # The docstring above says this rung "does not wait for silence",
+    # and it does not - it waits for a SEVEN-MINUTE TIMER, which is
+    # worse, because a timer cannot tell that the air is dead.
+    # Measured on the live station mid-silence: 39 rounds ready against
+    # a target of 12, 7.18 hours banked, 60 finished rounds never
+    # heard with the oldest at 4d 11h - and 860s of dead air in the
+    # hour, while this returned "inside the interval" and had aired
+    # NOTHING since the process started.
+    #
+    # talk_quiet_for() is the station's own measure of cast silence,
+    # the same clock the SFX guy's watch and the cover watchdog read.
+    # Past a real stretch of it the rest collapses, because silence is
+    # the one condition this rung was built for and the last moment to
+    # make it wait.
+    rest = cupboard_unheard_every()
+    try:
+        hush = talk_quiet_for()
+    except Exception:  # noqa: BLE001
+        hush = 0.0
+    if hush >= UNHEARD_QUIET_AFTER:
+        rest = min(rest, UNHEARD_QUIET_EVERY)
+    if now - _UNHEARD_AT[0] < rest:
         return _unheard_no("inside the interval")
     if not _RADIO.get("on") or radio_paused():
         return _unheard_no("off air or paused")
@@ -15899,6 +15931,16 @@ async def unheard_stock_air() -> str:
     said = await _ready_shelf_air(kind, _RADIO.get("now"), rescue=True,
                                   pick=row)
     if not said:
+        # #1301: A REFUSAL IS NOT WORTH SEVEN MINUTES.
+        #
+        # The stamp above is taken before the pick on purpose - the
+        # interval paces the WALK, which reads four shelves through
+        # dialogue_row_ready, and that reasoning stands. But the one
+        # refusal measured on the live station bought seven minutes of
+        # doing nothing while the air was dead and sixty unheard rounds
+        # sat in the cupboard. Pacing a walk is worth an interval;
+        # failing once is not.
+        _UNHEARD_AT[0] = min(now, now - rest + UNHEARD_RETRY_EVERY)
         return _unheard_no("the air's own door refused the row it picked")
     _RESCUE_AT[0] = time.time()
     _UNHEARD_SWEEP.update({"at": time.time(), "why": "aired",
@@ -43470,6 +43512,9 @@ def _dialogue_flow_state_fresh() -> dict[str, Any]:
         # radio that nobody was taking. The orchestrator reads this panel.
         "unheard": {k: v for k, v in unheard_state().items()
                     if k not in ("roads", "recent")},
+        # #1301: and the same facts as an ANSWER, because the operator
+        # asks a button "why is it quiet", not "what is unheard_state".
+        "why_quiet": why_quiet(),
         "blockers": blockers,
         # #886/#887: depth in ROUNDS says nothing about whether the
         # station can keep talking. These say it in seconds of finished
@@ -65435,10 +65480,30 @@ def _sfx_any() -> Path | None:
     # actually hears the hole. Video reaches the air through the ordinary
     # draw (sting_due), where a picture instead of a sting is a choice
     # rather than a dropped rescue.
+    #
+    # #1302: ...AND SOUND IS THE QUESTION, NOT FORMAT.
+    #
+    # Everything above stays true: a SILENT clip fills the screen and
+    # not the hole. But it banned video by its extension when what it
+    # cares about is whether the thing makes a noise, and on this
+    # station those are not the same question. Measured on the live
+    # pool: 400 video clips, 386 of them short enough to go out, 386 of
+    # those carrying sound, and NOT ONE measured silent. The ban was
+    # holding a clip library the operator built specifically for dead
+    # air out of the one job it was built for, to prevent a case that
+    # does not occur in it.
+    #
+    # So the test is the one audio already passes. sfx_short carries
+    # the house rule - only a MEASURED silence refuses - and #1263
+    # waived it for video because a silent clip is still worth
+    # watching; on the rescue road that waiver is precisely wrong, so
+    # it is taken back here and only here. A clip with a soundtrack
+    # answers the box, the stream and the car, and lights the set as
+    # well. A measured-silent one still airs through the ordinary draw.
     banned = sfx_bans()
     pool = [p for p in sfx_all()
-            if sfx_short(p) and not sfx_is_video(p)
-            and sfx_id(p) not in banned]
+            if sfx_short(p) and sfx_id(p) not in banned
+            and not (sfx_is_video(p) and sfx_is_silent(p))]
     if not pool:
         return None
     names = unrepeated([str(p) for p in pool], "sting",
@@ -68656,6 +68721,108 @@ def gap_brief(now: float | None = None) -> dict[str, Any]:
         "stock_first_left": int(_GAP_STOCK_FIRST[0]),
         "runway_left_s": round(runway, 1),
     }
+
+
+def why_quiet(now: float | None = None) -> dict[str, Any]:
+    """#1301: THE ANSWER THE OPERATOR ASKS A DIAGNOSTIC BUTTON FOR.
+
+    Three questions, in the order they are actually asked: why is the
+    broadcast quiet, what is being done about it, and what stops it
+    happening again. Every number here is already measured somewhere
+    else on this panel; what was missing was anybody putting them in
+    one sentence.
+
+    Pure and cheap - it reads state, takes no lock and airs nothing -
+    so a button may call it as often as it likes."""
+    now = now or time.time()
+    out: dict[str, Any] = {"at": now}
+    try:
+        hush = talk_quiet_for()
+    except Exception:  # noqa: BLE001
+        hush = 0.0
+    out["quiet_for_s"] = round(hush, 1)
+    try:
+        gaps = gap_brief(now)
+    except Exception:  # noqa: BLE001
+        gaps = {}
+    out["gaps"] = gaps
+    try:
+        stock = unheard_state()
+    except Exception:  # noqa: BLE001
+        stock = {}
+    sweep = stock.get("sweep") or {}
+    out["banked"] = {
+        "rounds_ready": int(stock.get("ready") or 0),
+        "never_heard": int(stock.get("unheard") or 0),
+        "overdue": int(stock.get("overdue") or 0),
+        "oldest_s": float(stock.get("oldest") or 0),
+        "shut_roads": list(stock.get("shut_roads") or []),
+    }
+    out["consumer"] = {
+        "on": bool(stock.get("on")),
+        "walks": int(sweep.get("walks") or 0),
+        "aired": int(sweep.get("aired") or 0),
+        "last_why": str(sweep.get("why") or ""),
+        "blocked": dict(sweep.get("blocked") or {}),
+        "next_in_s": sweep.get("next_in"),
+    }
+
+    # --- why -----------------------------------------------------------
+    live = hush >= UNHEARD_QUIET_AFTER
+    if not _RADIO.get("on"):
+        why = "the station is off air"
+    elif radio_paused():
+        why = "the operator has the station paused"
+    elif live:
+        why = ("nobody has said a word for %ds" % int(hush))
+        if gaps.get("last_gap_cause"):
+            why += (" - the last gap ran %ds and was blamed on %s"
+                    % (int(float(gaps.get("last_gap_s") or 0)),
+                       gaps.get("last_gap_cause")))
+    else:
+        why = "the pair are talking - nothing is quiet right now"
+        if float(gaps.get("total_hour_s") or 0) > 0:
+            why += (", but %d gap(s) this hour have cost %ds"
+                    % (int(gaps.get("count_hour") or 0),
+                       int(float(gaps.get("total_hour_s") or 0))))
+    out["why"] = why
+
+    # --- what is being done about it -------------------------------------
+    doing: list[str] = []
+    if out["banked"]["never_heard"]:
+        doing.append(
+            "the cupboard holds %d finished round(s) that have never been "
+            "heard, %d of them overdue" % (out["banked"]["never_heard"],
+                                           out["banked"]["overdue"]))
+    if not out["consumer"]["on"]:
+        doing.append("the standing consumer is SWITCHED OFF, so none of "
+                     "that stock can go out of turn at all")
+    elif out["consumer"]["aired"]:
+        doing.append("the standing consumer has put %d of them on the air "
+                     "out of turn since the process started"
+                     % out["consumer"]["aired"])
+    else:
+        doing.append("the standing consumer has aired NOTHING since the "
+                     "process started (%d walk(s)) - last answer: %s"
+                     % (out["consumer"]["walks"],
+                        out["consumer"]["last_why"] or "none recorded"))
+    for road in out["banked"]["shut_roads"]:
+        doing.append("the %s road cannot air out of turn at all, so its "
+                     "ready work is held" % road)
+    out["doing"] = doing
+
+    # --- and what stops it happening again --------------------------------
+    out["guard"] = (
+        "#1301: while nobody has spoken for %ds the standing consumer "
+        "stops honouring its %ds interval and retries every %ds, and a "
+        "pick the air refuses costs %ds instead of a whole interval. A "
+        "full cupboard is no longer allowed to sit behind a timer while "
+        "the station is silent."
+        % (int(UNHEARD_QUIET_AFTER), int(cupboard_unheard_every()),
+           int(UNHEARD_QUIET_EVERY), int(UNHEARD_RETRY_EVERY)))
+
+    out["say"] = why + ". " + "; ".join(doing) + "."
+    return out
 
 
 def gap_report(hours: float = 3.0,

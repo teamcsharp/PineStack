@@ -520,12 +520,17 @@ document.getElementById('film').addEventListener('click', function () {
   });
 });
 
-/* THE LAST THIRTY SECONDS, already recorded. The export window it opens is
- * the one that carries the in and out points and the channel choices - it
- * was built for exactly this and there is no reason for a second one. */
+/* EVERYTHING THE TABLET STILL HOLDS, already recorded.
+ *
+ * Not "the last thirty": the ring keeps whatever fits in its blob, which on
+ * a mostly-static terminal is minutes rather than the design's sixty
+ * seconds. Asking for a fixed thirty threw the rest away before the operator
+ * could see it. The export window it opens carries the in and out points and
+ * the crop, so the choosing happens there - against everything that exists,
+ * rather than against a number guessed beforehand. */
 document.getElementById('back30').addEventListener('click', function () {
-  capture('Cutting the last 30s off the tablet\u2026', function () {
-    return api.glassClip(30, { target: 'tablet', replay: true });
+  capture('Pulling everything the tablet still holds\u2026', function () {
+    return api.glassClip(0, { target: 'tablet', replay: true });
   });
 });
 
