@@ -235,6 +235,11 @@
      * cameraShow({facing: "rear"|"front"}) puts the camera on the tablet's
      * SCREEN; the desktop sees it through the mirror it already has.
      * cameraHide() puts the terminal back. */
+    /* THE ONE THAT LEAVES THE SCREEN ALONE. cameraOpen({facing}) starts the
+     * stream to the desktop - no preview, the terminal stays on the air. */
+    cameraOpen: promised("cameraOpen"),
+    cameraClose: promised("cameraClose"),
+
     cameraShow: promised("cameraShow"),
     cameraHide: promised("cameraHide"),
 

@@ -100,6 +100,10 @@ class PineDesktopBridge(
             "readyReport",
             /* Looking through the tablet's own camera - see camera/. */
             "cameraShow", "cameraHide",
+            /* ...and without taking the screen, which is the one that
+             * matters: cameraOpen streams frames to the desktop while
+             * the terminal stays on the air. */
+            "cameraOpen", "cameraClose",
             /* Keeping a line: to the tablet, or to the working folder. */
             "keepClip", "jack", "wallpaper", "saveText", "saveBytes",
             "usbState", "usbPick", "usbSend", "usbList", "usbRead",
@@ -485,6 +489,37 @@ class PineDesktopBridge(
          * lay under a video - see terminal-glass.cjs. Nothing is transcribed
          * and nothing leaves the tablet here; the take is parked and read
          * out by micChunk. */
+        /* THE CAMERA AS A STREAM, WITH THE SCREEN LEFT ALONE.
+         *
+         * This is the road that matters: no preview, no activity, the
+         * terminal keeps drawing the station, and the frames go to the
+         * desktop over a local socket. See camera/PineCameraService.kt.
+         * `facing` switches the lens without stopping the service. */
+        "cameraOpen" -> {
+            val want = args.optJSONObject(0)?.optString("facing") ?: "rear"
+            try {
+                com.pinebox.kiosk.camera.PineCameraService.begin(context, want)
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", true).put("facing", want)
+                    .put("socket", com.pinebox.kiosk.camera.PineCameraService.SOCKET)
+                    .toString())
+            } catch (err: Exception) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false)
+                    .put("detail", err.message ?: "the camera would not open").toString())
+            }
+        }
+
+        "cameraClose" -> {
+            try {
+                com.pinebox.kiosk.camera.PineCameraService.end(context)
+                BridgeEnvelope.ok(id, JSONObject().put("ok", true).toString())
+            } catch (err: Exception) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false).put("detail", err.message ?: "no").toString())
+            }
+        }
+
         /* LOOKING THROUGH THE TABLET'S CAMERA.
          *
          * The picture reaches the desktop through the screen mirror that

@@ -170,6 +170,30 @@
     host.style.top = Math.round(box.top) + 'px';
     host.style.width = Math.round(box.width) + 'px';
     host.style.height = Math.round(box.height) + 'px';
+    /* #1306e: HIGH ENOUGH TO BE SEEN, ON WHICHEVER SURFACE THIS IS.
+     *
+     * The stylesheet puts the set at 900, which is right in the
+     * desktop shell: its own top chrome sits at 1000 and should cover
+     * a picture-in-picture. The kiosk is a different world - it floats
+     * every injected view at z-index 2147483000, so at 900 the set was
+     * built, playing and completely buried. Measured on the tablet:
+     * the set on screen at 702,350 with elementFromPoint at its own
+     * centre returning `sp-el sp-character`.
+     *
+     * So on the kiosk it climbs just above the view layer, and stays
+     * UNDER the things that are meant to cover it - the sampler's
+     * overlays (2147483030+), the hold sheets (2147483046) and the
+     * lock screen (2147483050). A locked tablet must never be showing
+     * a video through the lock.
+     *
+     * Told apart the same way the self-mount tells them apart: the
+     * kiosk is served over http from the station, the shell's renderer
+     * is not. */
+    try {
+      if (/^https?:$/.test(String(root.location.protocol))) {
+        host.style.zIndex = '2147483020';
+      }
+    } catch (err) { /* the stylesheet's own 900 stands */ }
 
     var head = document.createElement('div');
     head.className = 'sfx-tv-head';
