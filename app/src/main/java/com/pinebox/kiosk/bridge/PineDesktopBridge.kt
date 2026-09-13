@@ -96,6 +96,8 @@ class PineDesktopBridge(
             "micTake", "micChunk",
             /* The rolling record of the screen - see replay/ScreenReplay. */
             "replayState", "replaySave", "replayChunk",
+            /* What the terminal confirmed on its way up - see net/Readiness. */
+            "readyReport",
             /* Keeping a line: to the tablet, or to the working folder. */
             "keepClip", "jack", "wallpaper", "saveText", "saveBytes",
             "usbState", "usbPick", "usbSend", "usbList", "usbRead",
@@ -481,6 +483,15 @@ class PineDesktopBridge(
          * lay under a video - see terminal-glass.cjs. Nothing is transcribed
          * and nothing leaves the tablet here; the take is parked and read
          * out by micChunk. */
+        /* WHAT THE TERMINAL CONFIRMED WHEN IT CAME UP.
+         *
+         * Written at startup by MainActivity and simply handed over here -
+         * asking again would be a fresh probe pretending to be a record of
+         * the old one. See net/Readiness.kt. */
+        "readyReport" -> {
+            BridgeEnvelope.ok(id, com.pinebox.kiosk.net.Readiness.report().toString())
+        }
+
         /* WHAT THE ROLLING RECORD HOLDS RIGHT NOW.
          *
          * `seconds` is what is actually in the ring, which is less than the

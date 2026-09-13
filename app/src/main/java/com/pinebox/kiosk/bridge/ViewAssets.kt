@@ -64,6 +64,7 @@ object ViewAssets {
         "three-full.js",          // every 3JS scene, full screen on glass
         "line-deep.js",           // why a line was said, and how often
         "line-actions.js",        // hold a line: pad, keep, or examine
+        "sfx-tv.js",              // #1306b: the SFX guy's little CRT set
         "lock.js",                // the station on a locked tablet
         "spark-overlays.js",      // the backend readouts, in any host
         "slideshow-source.js",    // the slideshow's whole traffic budget
@@ -83,6 +84,7 @@ object ViewAssets {
         "lock.css",               // the locked screen
         "vote-arrows.css",        // the up and down arrows
         "line-actions.css",       // the hold sheet and the examination
+        "sfx-tv.css",             // #1306b: the set, its glass and its sheet
         "three-full.css",         // the 3JS lift and the full-screen mode
         "busy.css",               // the working bar
         "slideshow.css",          // the slideshow and its twenty transitions

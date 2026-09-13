@@ -1,0 +1,227 @@
+/* #1263 The SFX guy's television.
+ *
+ * A little set that pops up over whatever view is showing when a sting
+ * with a picture goes out, and comes on the way a CRT does: a dot, opened
+ * out into a line, the line pulled open into a picture. When the clip ends
+ * it goes back the other way - the picture collapses into a line, the line
+ * into a dot, and the dot fades.
+ *
+ * The animation is on the TUBE, an inner element, and never on the frame.
+ * The frame's left/top/width/height are the operator's saved preference;
+ * animating them would write an animation frame into that preference
+ * fifty times a second and fight a drag that was happening at the time.
+ */
+.sfx-tv {
+  position: fixed;
+  z-index: 900;                 /* over every view, under a modal shade */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #05070c;
+  border: 1px solid rgba(159, 216, 255, .34);
+  border-radius: 10px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, .72);
+  max-width: calc(100vw - 8px);
+  max-height: calc(100vh - 8px);
+}
+
+.sfx-tv-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 5px 6px 5px 10px;
+  background: rgba(18, 26, 38, .96);
+  border-bottom: 1px solid rgba(159, 216, 255, .2);
+  font-size: 12px;
+  font-weight: 600;
+  color: #cfe6f6;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;           /* or the pointer drag becomes a scroll */
+}
+.sfx-tv-head:active { cursor: grabbing; }
+.sfx-tv-head > b {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.sfx-tv-head button {
+  flex: none;
+  padding: 1px 7px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #cfe6f6;
+  background: transparent;
+  border: 1px solid rgba(159, 216, 255, .28);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.sfx-tv-head button:hover { background: rgba(159, 216, 255, .14); }
+
+.sfx-tv-screen {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+.sfx-tv-tube {
+  position: absolute;
+  inset: 0;
+  background: #000;
+  transform-origin: 50% 50%;
+  will-change: transform, filter, opacity;
+}
+.sfx-tv-tube video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+/* The scan lines, the glow and the white pop are what make it read as a
+   tube rather than a <video> in a box. All three are inert to the
+   pointer, so the frame underneath still takes every drag. */
+.sfx-tv-glass {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: .5;
+  background: repeating-linear-gradient(to bottom,
+    rgba(0, 0, 0, 0) 0px, rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, .34) 2px, rgba(0, 0, 0, .34) 3px);
+}
+.sfx-tv-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 46%,
+    rgba(255, 255, 255, .07) 0%, rgba(0, 0, 0, 0) 52%, rgba(0, 0, 0, .6) 100%);
+}
+.sfx-tv-flash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: #fff;
+  opacity: 0;
+}
+
+/* #1306b: the pad icon, over the top right of the picture. */
+.sfx-tv-pad {
+  position: absolute;
+  top: 8px; right: 8px;
+  z-index: 4;
+  width: 26px; height: 26px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid rgba(159, 216, 255, .35);
+  border-radius: 6px;
+  background: rgba(8, 14, 20, .62);
+  color: #cfe8f5;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+}
+.sfx-tv-pad .pi-icon { width: 15px; height: 15px; }
+.sfx-tv-pad:hover { background: rgba(159, 216, 255, .2); }
+.sfx-tv-pad.said::after {
+  content: attr(data-say);
+  position: absolute;
+  top: 30px; right: 0;
+  white-space: nowrap;
+  font-size: 10px;
+  letter-spacing: .04em;
+  color: #cfe8f5;
+  background: rgba(8, 14, 20, .88);
+  border: 1px solid rgba(159, 216, 255, .3);
+  border-radius: 5px;
+  padding: 3px 6px;
+}
+
+/* #1306b: the hold sheet - inspect, weigh, pad, delete. */
+.sfx-tv-sheet {
+  position: absolute;
+  left: 8px; right: 8px; bottom: 8px;
+  z-index: 6;
+  padding: 9px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(159, 216, 255, .34);
+  background: rgba(8, 14, 20, .93);
+  color: #dcecf6;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .55);
+}
+.sfx-tv-sheet > b {
+  display: block;
+  font-size: 11px;
+  letter-spacing: .06em;
+  margin-bottom: 7px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sfx-tv-sheetrow { display: flex; gap: 6px; margin-bottom: 6px; }
+.sfx-tv-sheet button {
+  flex: 1 1 auto;
+  font: inherit;
+  font-size: 11px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(159, 216, 255, .3);
+  background: rgba(159, 216, 255, .08);
+  color: #dcecf6;
+  cursor: pointer;
+}
+.sfx-tv-sheet button:hover { background: rgba(159, 216, 255, .18); }
+.sfx-tv-sheet button.bad { border-color: rgba(216, 107, 87, .55); color: #e9b5aa; }
+.sfx-tv-sheet button.quiet { flex: 0 0 auto; opacity: .75; }
+.sfx-tv-note {
+  display: block;
+  font-size: 10.5px;
+  font-style: normal;
+  opacity: .8;
+  min-height: 13px;
+}
+
+.sfx-tv-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  z-index: 6;
+  cursor: nwse-resize;
+  touch-action: none;
+  background: linear-gradient(135deg, transparent 50%,
+    rgba(159, 216, 255, .5) 50%, rgba(159, 216, 255, .5) 60%, transparent 60%,
+    transparent 74%, rgba(159, 216, 255, .5) 74%, rgba(159, 216, 255, .5) 84%,
+    transparent 84%);
+}
+
+/* on: dot -> line -> picture.  off: picture -> line -> dot. */
+@keyframes sfxTvOn {
+  0%   { transform: scale(.004, .004); filter: brightness(4); opacity: 1; }
+  34%  { transform: scale(1, .006);    filter: brightness(3.4); opacity: 1; }
+  58%  { transform: scale(1, .06);     filter: brightness(2); opacity: 1; }
+  100% { transform: scale(1, 1);       filter: brightness(1); opacity: 1; }
+}
+@keyframes sfxTvOff {
+  0%   { transform: scale(1, 1);       filter: brightness(1); opacity: 1; }
+  40%  { transform: scale(1, .014);    filter: brightness(3.2); opacity: 1; }
+  62%  { transform: scale(1, .006);    filter: brightness(5); opacity: 1; }
+  100% { transform: scale(.004, .004); filter: brightness(7); opacity: 0; }
+}
+@keyframes sfxTvFlash { 0% { opacity: .8; } 100% { opacity: 0; } }
+
+.sfx-tv-tube.on  { animation: sfxTvOn .42s cubic-bezier(.18, .9, .3, 1) both; }
+.sfx-tv-tube.off { animation: sfxTvOff .46s cubic-bezier(.7, 0, .9, .35) both; }
+.sfx-tv-flash.pop { animation: sfxTvFlash .3s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .sfx-tv-tube.on, .sfx-tv-tube.off, .sfx-tv-flash.pop { animation: none; }
+  .sfx-tv-tube.off { opacity: 0; }
+}

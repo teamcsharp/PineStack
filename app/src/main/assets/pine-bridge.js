@@ -223,6 +223,13 @@
      *   Writes the last N and parks it. `seconds` is what was actually
      *   written, which can be less than asked for.
      * replayChunk({at, much}) -> {ok, at, bytes, sent, done, b64} */
+    /* WHAT THE TERMINAL CONFIRMED ON ITS WAY UP.
+     *
+     * readyReport() -> {ok, at, network, tailnet, road, roadMs, steps[]}
+     *   Each step is {what, ok, said}. Written once at startup - see
+     *   net/Readiness.kt - so this is a record, not a fresh probe. */
+    readyReport: promised("readyReport"),
+
     replayState: promised("replayState"),
     replaySave: promised("replaySave"),
     replayChunk: promised("replayChunk"),

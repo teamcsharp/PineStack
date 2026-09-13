@@ -960,10 +960,21 @@ class MainActivity : AppCompatActivity() {
              * banner already calls the same thing on its own retry, so a
              * tablet that walks out of the house re-chooses its road with no
              * new machinery and no "the network changed" listener. */
+            val began = System.currentTimeMillis()
             val found = app.client.reachable()
+            val roadMs = System.currentTimeMillis() - began
             val base = Reach.base(cfg)
             Log.i(TAG, if (found) "station " + Reach.said
                        else "no station on any road: " + Reach.said)
+            /* WHAT IT CONFIRMED ON ITS WAY UP, written down where the Pine
+             * Box application can read it back - see net/Readiness.kt. This
+             * is on the background thread the probe already used, because
+             * two of its checks read /proc and the interface list. */
+            try {
+                com.pinebox.kiosk.net.Readiness.take(this@MainActivity, cfg, roadMs)
+            } catch (err: Exception) {
+                Log.w(TAG, "readiness could not be taken: " + err.message)
+            }
             stationHost = Uri.parse(base).host.orEmpty()
             webView.loadUrl("$base/")
         }

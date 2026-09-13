@@ -71,6 +71,16 @@ object Reach {
      */
     fun base(cfg: Config): String = chosen ?: cfg.base
 
+    /**
+     * DID ANY ROAD ACTUALLY ANSWER?
+     *
+     * settle() returns cfg.base when nothing did - deliberately, so the
+     * terminal fails against the address the operator expects - which means
+     * its RETURN VALUE cannot be used to tell success from failure. Anything
+     * reporting on readiness has to ask this instead.
+     */
+    val answered: Boolean get() = chosen != null
+
     /** Whether the tailnet is carrying us, which the report wants to say. */
     fun onTailnet(cfg: Config): Boolean {
         val now = chosen ?: return false
