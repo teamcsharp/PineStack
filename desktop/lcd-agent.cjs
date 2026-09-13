@@ -67,6 +67,44 @@ function parseStatus(body) {
     raw: text.slice(0, 1500)};
 }
 
+/**
+ * WHY THE DISPLAY DID NOT ANSWER, in terms somebody can act on.
+ *
+ * Asked only after a request has already failed, and bounded to a second, so
+ * the ordinary path pays nothing and a diagnosis never becomes a second hang.
+ *
+ * The distinction that matters: a board that ANSWERS PING but refuses every
+ * port is not unreachable and not slow - its network stack is up and its
+ * servers have died, and only a power cycle brings those back. Measured on
+ * this display: 5 of 6 pings at 4-53ms with 80, 3232 and 3233 all shut.
+ */
+async function whyUnreachable(address) {
+  try {
+    const { execFile } = require('node:child_process');
+    const alive = await new Promise((resolve) => {
+      const done = (v) => resolve(v);
+      const child = execFile(
+        process.platform === 'win32' ? 'ping' : 'ping',
+        process.platform === 'win32'
+          ? ['-n', '1', '-w', '900', address]
+          : ['-c', '1', '-W', '1', address],
+        { timeout: 1500, windowsHide: true },
+        (error) => done(!error));
+      child.on('error', () => done(null));
+    });
+    if (alive === true) {
+      return ' It answers the network but is refusing connections, which '
+        + 'means its servers have stopped rather than the display being '
+        + 'unreachable - power-cycle it.';
+    }
+    if (alive === false) {
+      return ' It is not answering the network either, so it is powered off '
+        + 'or not on this network.';
+    }
+  } catch (err) { /* a diagnosis that fails is not a second failure */ }
+  return '';
+}
+
 async function deviceRequest(host, route, body = null, timeout = 4000) {
   if (/^COM/i.test(String(host))) throw new Error('USB displays require the USB transport.');
   const target = new URL('http://' + endpoint(host));
@@ -98,7 +136,14 @@ async function deviceRequest(host, route, body = null, timeout = 4000) {
     const deadline = setTimeout(() => req.destroy(new Error('Display timed out.')), timeout);
     req.once('close', () => clearTimeout(deadline));
     req.setTimeout(timeout, () => req.destroy(new Error('Display timed out.')));
-    req.on('error', reject);
+    /* SAY WHAT IT MEANS. "Display timed out" is true and cannot be acted on;
+     * whether the board still answers ping decides between "power-cycle it"
+     * and "it is off", and those are different evenings. */
+    req.on('error', (err) => {
+      whyUnreachable(address).then((why) => {
+        reject(why ? new Error(String(err.message || err) + why) : err);
+      }).catch(() => reject(err));
+    });
     req.end(raw);
   });
 }

@@ -1580,6 +1580,27 @@ function desktopPlayerEnabled() {
   return boothMonitor;
 }
 
+/**
+ * WHERE three.js IS, from wherever this page happens to be loaded.
+ *
+ * A leading slash means two different things across the two products. On the
+ * tablet the page is served BY the station, so "/vendor/three.min.js" is the
+ * station's copy and is also what lets the kiosk hand the page its own copy
+ * out of the APK with no network at all. On the desktop the page is file://,
+ * where a leading slash is the root of the disk - so the same string asks for
+ * C:\vendor\three.min.js and fails with ERR_FILE_NOT_FOUND, which is how
+ * every 3js view in the desktop app came to be quietly dead.
+ *
+ * Same trap desktopMusicUrl below was written for. Shared, so the next file
+ * that needs three.js does not have to know any of this.
+ */
+function pineThreeUrl() {
+  if (/^https?:$/.test(location.protocol)) return "/vendor/three.min.js";
+  const base = (config && config.baseUrl) || "http://127.0.0.1:8096";
+  return base.replace(/\/+$/, "") + "/vendor/three.min.js";
+}
+window.pineThreeUrl = pineThreeUrl;
+
 function desktopMusicUrl(url) {
   if (!url) return "";
   if (/^https?:\/\//i.test(url)) return url;
