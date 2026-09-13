@@ -683,6 +683,29 @@ function createWindow() {
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(["media", "microphone", "camera", "fullscreen", "display-capture"].includes(permission));
   });
+  // #1355: A REQUEST HANDLER IS NOT THE ONLY THING ASKED.
+  //
+  // Chromium asks two different questions. getUserMedia raises a
+  // permission REQUEST, which the handler above answers. But
+  // enumerateDevices, and getUserMedia's own re-checks on a later
+  // call, go through the permission CHECK - a separate, synchronous
+  // handler that Electron answers on its own if you do not set one.
+  // With no check handler the device list comes back with empty
+  // labels, which is why a microphone picker had nothing to pick
+  // from: the devices were all there and none of them had a name.
+  try {
+    session.defaultSession.setPermissionCheckHandler(
+      (_wc, permission) => [
+        "media", "microphone", "audioCapture", "camera", "videoCapture",
+        "fullscreen"
+      ].includes(permission));
+  } catch (err) { /* older Electron: the request handler is enough */ }
+  // ...and this one gates which specific device may be opened once the
+  // page names it. Default-deny in Electron, so pinning a microphone
+  // other than the system default fails silently without it.
+  try {
+    session.defaultSession.setDevicePermissionHandler(() => true);
+  } catch (err) { /* likewise */ }
 
   // #786: the window comes back EXACTLY as it was left — size and place —
   // and the minimums match the responsive chrome (it genuinely works small).

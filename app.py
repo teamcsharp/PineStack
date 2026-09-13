@@ -12819,6 +12819,33 @@ def full_ok(token: str) -> bool:
     return token_scope(token) == "full"
 
 
+def token_tag(token: str) -> str:
+    """#1354: WHICH link this is, verified - or "" if it is not a link.
+
+    token_scope answers what a token may do. This answers who it was
+    minted for, which is a different question and the one a per-person
+    permission needs. It re-derives the signature exactly as
+    token_scope does rather than trusting the tag it just read out of
+    the string: the tag is the middle field of a token anyone can
+    type, and a permission keyed on an unverified name is no
+    permission at all.
+    """
+    raw = str(token or "")
+    scope = "listen"
+    if raw.endswith(".full"):
+        scope, raw = "full", raw[:-5]
+    try:
+        expires, tag, _sig = raw.split(".", 2)
+        if int(expires) < time.time():
+            return ""
+        if hmac.compare_digest(listen_token(int(expires), tag, scope),
+                               token):
+            return tag
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def require_listen_auth(token: str, authorization: str | None) -> None:
     """A guest with a live link, or the operator with the key."""
     if listen_ok(token):
@@ -104400,6 +104427,13 @@ async def pinelink_look_api(
         # stands whether or not there is a camera to apply it to.
         "on_air_pref": pinelink_on_air(),
         "on_air_now": bool(linked and pinelink_on_air()),
+        # #1352: out of the house is its own answer, and its own switch.
+        # #1354: ...which now has three positions rather than two.
+        "mode": pinelink_public_mode(),
+        "picked": len(pinelink_picked()),
+        "public_pref": pinelink_public_on_air(),
+        "public_now": bool(linked and pinelink_on_air()
+                           and pinelink_public_on_air()),
         # One sentence a surface can print without knowing any of this.
         "say": ("the camera is linked and recording" if linked
                 else "the camera is on the network - connecting"
@@ -104479,8 +104513,20 @@ async def pinelink_on_air_api(
         body = {}
     want = bool((body or {}).get("on_air", True))
     try:
+        # #1354: MERGE. This wrote the whole file, so turning the
+        # in-house switch also silently reset who may watch from
+        # outside it - two unrelated answers, one of them thrown away
+        # by a press on the other.
+        got = {}
+        try:
+            got = json.loads(PINELINK_PREF.read_text())
+        except Exception:  # noqa: BLE001
+            got = {}
+        if not isinstance(got, dict):
+            got = {}
+        got["on_air"] = want
         PINELINK_PREF.parent.mkdir(parents=True, exist_ok=True)
-        PINELINK_PREF.write_text(json.dumps({"on_air": want}))
+        PINELINK_PREF.write_text(json.dumps(got))
     except Exception as err:  # noqa: BLE001
         return {"ok": False, "say": "could not remember that: "
                 + str(err)[:160]}
@@ -104489,6 +104535,355 @@ async def pinelink_on_air_api(
                     if want else
                     "the gallery keeps the air; the camera is watchable "
                     "here but does not go out")}
+
+
+# #1354: THREE ANSWERS, NOT TWO.
+#
+# "instead of it just being public for anyone ... I want to be able to
+#  select which users are able to see the stream."
+#
+# #1352 made this a switch, and a switch can only ever say everybody or
+# nobody. A body camera is pointed at whatever its wearer is doing, so the
+# useful answer is almost always neither of those: some named people, the
+# ones who were handed a link on purpose.
+#
+# The roster this picks from already exists and needed no inventing. Every
+# tune-in link is minted with a label - "a listener", a name, whatever the
+# operator typed - against a tag that is signed into the token and cannot
+# be edited. So "which users" is a tick beside a share link, the permission
+# travels with the link, and REVOKING the link revokes the camera with it
+# rather than leaving an orphan permission behind pointing at nobody.
+PINELINK_MODES = ("off", "picked", "all")
+
+
+def pinelink_public_mode() -> str:
+    """off / picked / all - who outside the house may see the camera.
+
+    Migrates the #1352 boolean on read rather than rewriting the file: a
+    preference file that is upgraded by being READ cannot be half
+    upgraded by a crash between the two.
+    """
+    try:
+        got = json.loads(PINELINK_PREF.read_text())
+        if not isinstance(got, dict):
+            return "off"
+        mode = str(got.get("mode") or "")
+        if mode in PINELINK_MODES:
+            return mode
+        return "all" if got.get("public") else "off"
+    except Exception:  # noqa: BLE001
+        return "off"
+
+
+def pinelink_public_on_air() -> bool:
+    """#1352, kept honest: is it out there for ANYONE with a link?
+
+    Deliberately still narrow. Callers that ask this are asking whether
+    the camera is on the open stream, and "picked" is not that - naming
+    six people is closer to off than to on, and a surface that printed
+    "public" over a picked list would be lying to the operator about
+    what they had just done.
+    """
+    return pinelink_public_mode() == "all"
+
+
+def pinelink_picked() -> dict[str, Any]:
+    """The live links that carry the camera tick, by tag."""
+    out: dict[str, Any] = {}
+    try:
+        now = time.time()
+        for tag, row in ((read_shares().get("links") or {})).items():
+            if not isinstance(row, dict) or not row.get("camera"):
+                continue
+            if float(row.get("expires") or 0) <= now:
+                continue
+            out[str(tag)] = row
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def pinelink_viewer_ok(token: str) -> bool:
+    """May the holder of THIS token see the camera?
+
+    Deliberately independent of the in-house on-air preference. That one
+    settles whether the camera takes the gallery's place on the operator's
+    own screens; this settles whether a particular guest is allowed to
+    look. Tying them would mean that turning the picture off in the studio
+    silently cut off the people who were invited to watch it, which is not
+    what either control says it does.
+
+    What it IS tied to is the camera being linked - there is no point
+    telling a viewer they may watch a thing that is not running.
+    """
+    mode = pinelink_public_mode()
+    if mode == "off":
+        return False
+    got = pinelink_state()
+    if not (got.get("state") == "live" and got.get("fresh")):
+        return False
+    if mode == "all":
+        return listen_ok(token)
+    tag = token_tag(token)
+    return bool(tag and tag in pinelink_picked())
+
+
+@app.post("/api/pinelink/public")
+async def pinelink_public_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Set who outside the house may watch.
+
+    Takes {"mode": "off"|"picked"|"all"}. Still takes the #1352
+    {"public": true|false} so anything already calling it keeps working -
+    that spelling maps onto the two ends it could always say.
+    """
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body or {}
+    if "mode" in body:
+        want = str(body.get("mode") or "off").lower()
+        if want not in PINELINK_MODES:
+            return {"ok": False,
+                    "say": "mode must be one of: " + ", ".join(PINELINK_MODES)}
+    else:
+        want = "all" if body.get("public") else "off"
+    try:
+        got = {}
+        try:
+            got = json.loads(PINELINK_PREF.read_text())
+        except Exception:  # noqa: BLE001
+            got = {}
+        if not isinstance(got, dict):
+            got = {}
+        got["mode"] = want
+        got["public"] = (want == "all")     # the old key, kept in step
+        PINELINK_PREF.parent.mkdir(parents=True, exist_ok=True)
+        PINELINK_PREF.write_text(json.dumps(got))
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "say": "could not remember that: " + str(err)[:160]}
+    picked = len(pinelink_picked())
+    return {"ok": True, "mode": want, "public": (want == "all"),
+            "picked": picked,
+            "say": {
+                "all": "the camera goes out to anyone holding a tune-in link",
+                "off": ("the camera stays in the house - the broadcast keeps "
+                        "the gallery"),
+                "picked": ("the camera goes out to the %d listener%s you have "
+                           "ticked%s" % (picked, "" if picked == 1 else "s",
+                                         "" if picked else
+                                         " - which is nobody yet, so tick "
+                                         "somebody or it is the same as off")),
+            }[want]}
+
+
+@app.get("/api/pinelink/viewers")
+async def pinelink_viewers_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1354: one answer a viewer picker can be drawn from.
+
+    The mode, every live tune-in link with its tick, and whether there is
+    a camera to argue about in the first place. One call rather than two,
+    because a picker that reads the roster and the mode separately will
+    eventually draw one of them from a stale read and show ticks against
+    the wrong switch.
+    """
+    require_auth(authorization)
+    got = pinelink_state()
+    now = time.time()
+    rows = []
+    for tag, row in ((read_shares().get("links") or {})).items():
+        if not isinstance(row, dict):
+            continue
+        left = float(row.get("expires") or 0) - now
+        if left <= 0:
+            continue
+        rows.append({
+            "tag": str(tag),
+            "label": str(row.get("label") or "a listener"),
+            "scope": str(row.get("scope") or "listen"),
+            "camera": bool(row.get("camera")),
+            "hours_left": round(left / 3600, 1),
+            "expires": int(row.get("expires") or 0),
+        })
+    rows.sort(key=lambda r: (-int(bool(r["camera"])), r["label"].lower()))
+    mode = pinelink_public_mode()
+    return {
+        "mode": mode, "modes": list(PINELINK_MODES),
+        "linked": bool(got.get("state") == "live" and got.get("fresh")),
+        "viewers": rows, "picked": sum(1 for r in rows if r["camera"]),
+        "say": ("no tune-in links exist yet, so there is nobody to pick - "
+                "mint one on the Share panel first" if not rows else
+                "%d of %d listeners may see the camera"
+                % (sum(1 for r in rows if r["camera"]), len(rows))),
+    }
+
+
+@app.get("/api/pinelink/mine")
+async def pinelink_mine_api(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1354: what THIS viewer is allowed to see. Cheap, and public.
+
+    The tune-in page polls this. It answers for the caller's own token
+    and never lists anyone else's, so it is safe on the listener door -
+    a guest learns whether THEY may watch and nothing whatever about who
+    else may.
+    """
+    if t:
+        show = pinelink_viewer_ok(t)
+    elif request.headers.get("x-pinebox-public") == "1":
+        # #1354d: no token on the listener door is not the house, it is
+        # a stranger. Answered rather than refused - a page asking what
+        # it may see is entitled to be told "nothing" - but the answer
+        # is no.
+        show = False
+    else:
+        # No token means the house: the operator's own panel, where the
+        # in-house switch is the one that decides.
+        require_read_auth(authorization)
+        got = pinelink_state()
+        show = bool(got.get("state") == "live" and got.get("fresh")
+                    and pinelink_on_air())
+    return {"show": bool(show),
+            "frame": "/api/pinelink/frame.jpg" + ("?t=" + t if t else ""),
+            "why": ("" if show else
+                    "the camera is not being shared with you right now")}
+
+
+
+
+PINELINK_CUTS = PINELINK_DIR / "cuts"
+# A cut is named by the span it covers, so asking twice for the same span
+# costs nothing and cannot pile up duplicates.
+PINELINK_CUT_MOST = 1800.0          # half an hour is not a clip
+
+
+@app.post("/api/pinelink/cut")
+async def pinelink_cut_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1352: cut a clip out of the footage already kept.
+
+    The link records continuously in five-minute segments, so "record this"
+    does not need to ask the camera for anything. Pressing record marks a
+    moment and pressing it again marks another; this cuts exactly that span
+    out of what is already on disk.
+
+    That is better than starting a fresh pull on the press, for three
+    reasons worth writing down: nothing is lost at the head while a stream
+    opens, stopping is instant rather than waiting for a flush, and the
+    camera is never asked for a second client - these APs commonly allow
+    only one.
+
+    `from` and `to` are epoch seconds. Both must land inside the footage
+    that is still kept, which is two days.
+    """
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    try:
+        lo = float((body or {}).get("from") or 0)
+        hi = float((body or {}).get("to") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "say": "from and to must be epoch seconds"}
+    if not (lo and hi) or hi <= lo:
+        return {"ok": False, "say": "that is not a span"}
+    if hi - lo > PINELINK_CUT_MOST:
+        return {"ok": False,
+                "say": "that is %d minutes - longer than a clip; the whole "
+                       "recording is already kept" % int((hi - lo) / 60)}
+
+    def _cut() -> dict[str, Any]:
+        import subprocess
+        # Imported here, not at module scope: this module does not carry
+        # datetime and adding a top-level import for one function in a
+        # 200k-line file is how import order gets surprising.
+        from datetime import datetime as _dt
+        PINELINK_CUTS.mkdir(parents=True, exist_ok=True)
+        # Which kept segments overlap the span. Their names ARE their start
+        # times - written with strftime by the supervisor - so this needs no
+        # index and cannot drift out of step with one.
+        want: list[tuple[float, Path]] = []
+        for f in sorted(PINELINK_CLIPS.glob("*.mp4")):
+            try:
+                at = _dt.strptime(
+                    f.stem, "%Y-%m-%d_%H-%M-%S").timestamp()
+            except Exception:  # noqa: BLE001
+                continue
+            want.append((at, f))
+        cover = []
+        for ix, (at, f) in enumerate(want):
+            end = want[ix + 1][0] if ix + 1 < len(want) else at + 3600
+            if end > lo and at < hi:
+                cover.append((at, f))
+        if not cover:
+            return {"ok": False,
+                    "say": "nothing kept covers that span - the footage only "
+                           "goes back two days"}
+        first_at = cover[0][0]
+        out = PINELINK_CUTS / ("cut_%d_%d.mp4" % (int(lo), int(hi)))
+        if out.is_file():
+            return {"ok": True, "name": out.name, "reused": True,
+                    "url": "/api/pinelink/cut/" + out.name}
+        listing = PINELINK_CUTS / ("list_%d.txt" % int(lo))
+        listing.write_text("".join(
+            "file '%s'\n" % f.as_posix() for _at, f in cover))
+        try:
+            # Concat the covering segments, then trim to the span. -c copy
+            # throughout: the footage is already h264 and re-encoding a
+            # recording to cut it is a quality loss for nothing.
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-f", "concat", "-safe", "0", "-i", str(listing),
+                 "-ss", str(max(0.0, lo - first_at)),
+                 "-t", str(hi - lo), "-c", "copy",
+                 "-avoid_negative_ts", "make_zero", str(out)],
+                capture_output=True, timeout=180)
+        finally:
+            try:
+                listing.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        if not out.is_file() or out.stat().st_size < 1024:
+            return {"ok": False,
+                    "say": "the cut came out empty - the span may fall in a "
+                           "gap between recordings"}
+        return {"ok": True, "name": out.name, "bytes": out.stat().st_size,
+                "seconds": round(hi - lo, 1),
+                "url": "/api/pinelink/cut/" + out.name}
+
+    got = await asyncio.to_thread(_cut)
+    if got.get("ok"):
+        got.setdefault("say", "cut %.0fs and kept it" % (hi - lo))
+    return got
+
+
+@app.get("/api/pinelink/cut/{filename}")
+async def pinelink_cut_file_api(
+    filename: str,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """One cut clip, to be saved wherever the operator wants it."""
+    require_read_auth(authorization)
+    if not PINELINK_NAME.match(filename or ""):
+        raise HTTPException(status_code=400, detail="bad name")
+    path = PINELINK_CUTS / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no such cut")
+    return FileResponse(path, media_type="video/mp4",
+                        filename=filename,
+                        headers={"Accept-Ranges": "bytes"})
 
 
 @app.get("/api/pinelink/doctor")
@@ -104564,6 +104959,8 @@ async def pinelink_live_api(
 
 @app.get("/api/pinelink/frame.jpg")
 async def pinelink_frame_api(
+    request: Request,
+    t: str = "",
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The camera, right now, as one picture.
@@ -104578,8 +104975,31 @@ async def pinelink_frame_api(
     is a visible tear. Anything not ending where a JPEG ends is refused;
     the last whole frame goes out instead, which at four frames a second
     nobody can see.
+
+    #1354: and a guest gets here with ?t=<their link>, which must
+    carry the camera tick. A token that is merely VALID is not
+    enough - every listener holds one of those, and that was exactly
+    the all-or-nothing this replaced. The listener door strips the
+    Authorization header, so on the public port the token is the only
+    thing that can answer and there is no fall-through to the house.
     """
-    require_read_auth(authorization)
+    #1354d: MEASURED, NOT ASSUMED. With no token this fell through to
+    # require_read_auth, and LOCK_READS is false by default - so the
+    # listener door, which strips Authorization and therefore has
+    # nothing to check, answered 200 to anyone who asked. The camera
+    # was open to the public internet the moment the door was up,
+    # whatever the mode said. A probe against :8097 returned 200 with
+    # no token at all; that is what this line is for.
+    if request.headers.get("x-pinebox-public") == "1" and not t:
+        raise HTTPException(status_code=403,
+                            detail="a tune-in link is required here")
+    if t:
+        if not pinelink_viewer_ok(t):
+            raise HTTPException(
+                status_code=403,
+                detail="the camera is not being shared with you")
+    else:
+        require_read_auth(authorization)
     try:
         raw = PINELINK_FRAME.read_bytes()
     except Exception:  # noqa: BLE001
@@ -105618,6 +106038,12 @@ _SPARK_ASSETS = {
     "slideshow.js": "application/javascript; charset=utf-8",
     "slideshow-source.js": "application/javascript; charset=utf-8",
     "slideshow.css": "text/css; charset=utf-8",
+    # #1353: the SFX guy's little CRT set, for pages that are not the
+    # Electron shell. The tune-in page is served by this station and
+    # can reach this route, so it can have the same picture the app
+    # and the tablet have had all along.
+    "sfx-tv.js": "application/javascript; charset=utf-8",
+    "sfx-tv.css": "text/css; charset=utf-8",
 }
 
 
@@ -115434,6 +115860,8 @@ async def share_list(
         token = url.rsplit("/tune/", 1)[-1] if "/tune/" in url else ""
         out.append({"tag": tag, "label": row.get("label") or "",
                     "expires": int(row.get("expires") or 0),
+                    # #1354: may this person see the Pine Cam?
+                    "camera": bool(row.get("camera")),
                     "hours_left": round(left / 3600, 1),
                     # Links minted before scopes existed are listener links.
                     "scope": row.get("scope") or "listen",
@@ -115510,10 +115938,48 @@ async def share_make(
     rows.setdefault("epoch", 1)
     rows.setdefault("links", {})[tag] = {
         "label": label, "expires": expires, "url": url, "scope": scope,
+        # #1354: a link can be minted already allowed to see the
+        # camera, so inviting somebody to watch is one action rather
+        # than two. Off unless asked for, like every other reach.
+        "camera": bool(payload.get("camera")),
         "made": int(time.time())}
     write_shares(rows)
     return {"token": token, "url": url, "expires": expires, "label": label,
             "scope": scope, "remote": bool(net["tailscale"]["up"])}
+
+
+@app.post("/api/share/camera")
+async def share_camera(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1354: tick or untick one listener's camera permission.
+
+    Lives with the shares rather than with the camera because that is
+    where it is STORED, and storing it here is the point: revoking the
+    link takes the permission with it. A separate list of allowed people
+    would outlive the links it named and quietly re-admit whoever was
+    handed a recycled tag.
+    """
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    tag = str((payload or {}).get("tag") or "")
+    want = bool((payload or {}).get("camera"))
+    rows = read_shares()
+    row = (rows.get("links") or {}).get(tag)
+    if not isinstance(row, dict):
+        return {"ok": False, "say": "no such link - it may have expired"}
+    row["camera"] = want
+    write_shares(rows)
+    label = str(row.get("label") or "that listener")
+    return {"ok": True, "tag": tag, "camera": want,
+            "mode": pinelink_public_mode(),
+            "picked": len(pinelink_picked()),
+            "say": ("%s may now see the camera" % label if want
+                    else "%s can no longer see the camera" % label)}
 
 
 @app.post("/api/share/revoke")
@@ -115561,7 +116027,21 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                # #1253: the broadcast stream. This is the road a car
                # actually uses - one socket, held open, mixed here.
                "/stream.mp3", "/stream.m3u", "/stream.m3u8",
-               "/api/stream/state"}
+               "/api/stream/state",
+               # #1353b: the two files that draw the SFX guy's
+               # picture. Named exactly, not by prefix: the asset
+               # route is itself an exact-name allowlist of static
+               # client code, and this list should not inherit its
+               # contents as it grows.
+               "/spark/asset/sfx-tv.js",
+               "/spark/asset/sfx-tv.css",
+               # #1354: the camera, for a listener who has been
+               # ticked. Both routes decide for themselves from the
+               # ?t= token; being on this list only means they are
+               # allowed to be ASKED, and the answer for an unticked
+               # listener is 403 either way.
+               "/api/pinelink/mine",
+               "/api/pinelink/frame.jpg"}
 # #1253: ...and the things the listener page itself asks for. The
 # gallery pictures and the icon font were never on this list, so on a
 # phone the artwork was a broken-image box and the icons fell back to
@@ -115572,7 +116052,17 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
 _PUBLIC_GET_PREFIX = ("/tune/", "/media/", "/music/", "/data/vendor/",
                       "/icons/", "/api/generations/image/",
                       # #1253: the HLS segments an iPhone asks for.
-                      "/hls/")
+                      "/hls/",
+                      # #1353b: and the samples themselves, because a
+                      # picture with no bytes behind it is a black
+                      # box on a listener's phone. This is the same
+                      # contract /music/ has had on this list all
+                      # along and no weaker: sfx_file demands a
+                      # sixteen-hex key AND an HMAC in ?t= that only
+                      # this process can compute, or it falls through
+                      # to require_auth. The gate strips Authorization
+                      # first, so the fall-through is a refusal.
+                      "/sfx/")
 _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
                 "/api/music/vote",
                 # #1149: wake-only - the route refuses to pause anything,
@@ -200137,6 +200627,16 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
 <link rel="stylesheet" href="/icons/pineicons.css">
+<!-- #1353b: the SFX guy's little CRT set. Exactly the files the app
+     and the tablet load, off the same route, so a picture that airs
+     is the same picture everywhere. It mounts itself three seconds
+     after load on any http page and needs no call from here; the
+     hand-over in the voice reader below is the belt to this brace,
+     and the one that still works on the public door where the
+     video ring is not offered. offer() de-duplicates on ts|url, so
+     a clip arriving down both roads shows once. -->
+<link rel="stylesheet" href="/spark/asset/sfx-tv.css">
+<script src="/spark/asset/sfx-tv.js"></script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -200206,6 +200706,41 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   .gallery-caption { position:absolute; left:0; right:0; bottom:0; padding:9px 12px;
     background:rgba(4,6,11,.78); color:#dce8f5; font-size:12px; white-space:nowrap;
     overflow:hidden; text-overflow:ellipsis; }
+  /* #1354b: the Pine Cam, for a listener who has been ticked. It is a
+     window over the show rather than a replacement for it - the record
+     keeps playing, the sleeve keeps turning, and this sits in the
+     corner the way a picture-in-picture does on a television. */
+  .pinecam {
+    position: fixed; right: 14px; bottom: 14px; width: min(320px, 46vw);
+    background: #070b12; border: 1px solid #1b2735; border-radius: 12px;
+    overflow: hidden; z-index: 40; display: none;
+    box-shadow: 0 10px 30px rgba(0,0,0,.55);
+  }
+  .pinecam.show { display: block; }
+  .pinecam-bar {
+    display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+    background: #0b111b; border-bottom: 1px solid #1b2735;
+    font-size: 12px; color: #9fb0c4;
+  }
+  .pinecam-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: #ff4d5e;
+    flex: 0 0 auto;
+  }
+  .pinecam-bar b { color: #dce8f5; font-weight: 600; }
+  .pinecam-bar .sp { margin-left: auto; }
+  .pinecam-bar button {
+    background: none; border: 0; color: #7f8ea3; cursor: pointer;
+    font: inherit; padding: 0 2px;
+  }
+  .pinecam-bar button:hover { color: #dce8f5; }
+  .pinecam img {
+    display: block; width: 100%; aspect-ratio: 16/9;
+    object-fit: cover; background: #04060b;
+  }
+  .pinecam.folded img { display: none; }
+  @media (max-width: 520px) {
+    .pinecam { right: 8px; bottom: 8px; width: min(240px, 62vw); }
+  }
 </style>
 </head>
 <body>
@@ -201176,7 +201711,26 @@ async function pollOnce() {
         /* #1263: a clip with a PICTURE belongs to the panel's little CRT
          * set. Handed to a listener's <audio> element it is a transport
          * error, a retry, and then a hole where a sting should have been. */
-        if (clip.video) return;
+        if (clip.video) {
+          /* #1353: ...which is a reason not to give it to the AUDIO
+           * element, and was never a reason to drop it. This page has
+           * been receiving the SFX guy's pictures all along and
+           * discarding them, so a listener tuned in here was the only
+           * one in the house who could not see them - the app, the
+           * tablet, the slideshow and the presentation stage all get
+           * the same body-level set for free.
+           *
+           * PineSfxTv reads `at`, and this page has already worked out
+           * the local moment as `broadcastAt`. It mounts itself on any
+           * http page, so there is nothing to start. */
+          try {
+            if (window.PineSfxTv) {
+              clip.at = clip.broadcastAt;
+              window.PineSfxTv.offer(clip);
+            }
+          } catch (err) { /* a missed picture never costs the sound */ }
+          return;
+        }
         // #1146: ts+url, so two clips stamped the same millisecond both
         // still play while a re-delivered twin does not.
         const mark = String(clip.ts || "") + "|" + String(clip.url);
@@ -201865,6 +202419,111 @@ function clockLoop() {
 }
 setTimeout(pollLoop, 3000);
 setTimeout(clockLoop, 1500);
+/* #1354b: THE PINE CAM, FOR THE PEOPLE WHO WERE INVITED TO SEE IT.
+ *
+ * The permission is not this page's to decide and it deliberately does not
+ * try: it asks /api/pinelink/mine, which answers for the caller's own
+ * token and nobody else's. An unticked listener is told "no" and is told
+ * nothing about who was told "yes".
+ *
+ * The picture is a JPEG in an <img>, four a second, exactly as the panel
+ * and the tablet draw it. That is not a compromise made for this page -
+ * Chromium plays no HLS without a library this project does not vendor,
+ * and an <img> works on every surface here including a phone that has
+ * just been handed a link.
+ *
+ * The frame road refuses the token itself, so a page that guessed wrong
+ * about its own permission gets 403s and an empty box rather than a
+ * picture it should not have.
+ */
+(function () {
+  var box = null;
+  var shot = null;
+  var mayShow = false;
+  var frameUrl = "";
+  var folded = false;
+  var timer = 0;
+
+  function stamp(url) {
+    return url + (url.indexOf("?") >= 0 ? "&" : "?") + "_=" + Date.now();
+  }
+
+  function build() {
+    if (box) return;
+    box = document.createElement("div");
+    box.className = "pinecam";
+    var bar = document.createElement("div");
+    bar.className = "pinecam-bar";
+    var dot = document.createElement("span");
+    dot.className = "pinecam-dot";
+    var name = document.createElement("b");
+    name.textContent = "Pine Cam";
+    var live = document.createElement("span");
+    live.textContent = "live";
+    var sp = document.createElement("span");
+    sp.className = "sp";
+    var fold = document.createElement("button");
+    fold.type = "button";
+    fold.textContent = "–";
+    fold.title = "Fold the picture away";
+    fold.addEventListener("click", function () {
+      folded = !folded;
+      box.classList.toggle("folded", folded);
+      fold.textContent = folded ? "+" : "–";
+      fold.title = folded ? "Show the picture" : "Fold the picture away";
+    });
+    bar.appendChild(dot);
+    bar.appendChild(name);
+    bar.appendChild(live);
+    bar.appendChild(sp);
+    bar.appendChild(fold);
+    shot = document.createElement("img");
+    shot.alt = "the Pine Cam";
+    /* A frame that fails to load must not leave the browser's broken-image
+     * glyph sitting over the show; the next tick replaces it anyway. */
+    shot.addEventListener("error", function () { shot.removeAttribute("src"); });
+    box.appendChild(bar);
+    box.appendChild(shot);
+    document.body.appendChild(box);
+  }
+
+  function draw() {
+    if (!mayShow || !frameUrl || folded) return;
+    /* A hidden tab is a tab nobody is watching, and a phone throttles
+     * these timers anyway - so stop asking rather than queue up a burst
+     * of stale frames to be fetched the moment it wakes. */
+    if (document.hidden) return;
+    if (!shot) return;
+    shot.src = stamp(frameUrl);
+  }
+
+  async function ask() {
+    try {
+      var got = await api("/api/pinelink/mine");
+      var want = !!(got && got.show);
+      frameUrl = String((got && got.frame) || "");
+      if (want !== mayShow) {
+        mayShow = want;
+        if (want) { build(); box.classList.add("show"); draw(); }
+        else if (box) {
+          box.classList.remove("show");
+          shot.removeAttribute("src");   /* stop the fetches too */
+        }
+      }
+    } catch (e) {
+      /* A station that cannot answer is a station with no camera as far
+       * as this page is concerned. It never blocks the broadcast. */
+      if (mayShow && box) { mayShow = false; box.classList.remove("show"); }
+    }
+  }
+
+  function loop() {
+    try { ask(); } catch (e) {}
+    setTimeout(loop, 15000);
+  }
+  timer = setInterval(draw, 250);
+  setTimeout(loop, 1200);
+})();
 </script>
 </body>
 </html>

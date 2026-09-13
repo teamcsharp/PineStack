@@ -225,6 +225,109 @@
     }).join('');
   }
 
+  /* --------------------------------------------------- the viewers */
+
+  /* #1354: WHICH LISTENERS MAY SEE THE CAMERA.
+   *
+   * The roster needed no inventing: every tune-in link was already
+   * minted with a label against a tag that is signed into the token.
+   * So "which users" is a tick beside a link, and the permission
+   * travels with the link rather than beside it - revoke the link and
+   * the camera goes with it.
+   *
+   * The station decides; this only draws what it said and posts back
+   * what was clicked. Nothing here is trusted by the frame road.
+   */
+  var viewMode = '';
+
+  function post(path, body) {
+    try {
+      if (root.pineDesktop && root.pineDesktop.post) {
+        return root.pineDesktop.post(path, body);
+      }
+    } catch (e) { /* fall through to fetch */ }
+    return fetch(base() + path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {})
+    }).then(function (r) { return r.ok ? r.json() : null; });
+  }
+
+  function say(text) {
+    var el = document.getElementById('pineCamShareSay');
+    if (el) el.textContent = String(text || '');
+  }
+
+  function paintViewers(got) {
+    var modes = document.getElementById('pineCamModes');
+    var list = document.getElementById('pineCamViewers');
+    if (!modes || !list || !got) return;
+    viewMode = String(got.mode || 'off');
+    Array.prototype.forEach.call(modes.children, function (b) {
+      b.classList.toggle('on', b.getAttribute('data-mode') === viewMode);
+    });
+    /* The list is only a question when the mode is asking it. Shown
+     * under 'anyone' it would read as a restriction that is not being
+     * applied, which is the kind of half-true control that gets a
+     * camera pointed at the wrong room. */
+    list.classList.toggle('show', viewMode === 'picked');
+    if (viewMode !== 'picked') { say(got.say || ''); return; }
+    var rows = got.viewers || [];
+    list.innerHTML = '';
+    if (!rows.length) {
+      say('no tune-in links exist yet, so there is nobody to pick - '
+        + 'mint one on the Share panel first');
+      return;
+    }
+    rows.forEach(function (v) {
+      var line = document.createElement('label');
+      line.className = 'pine-cam-viewer';
+      var tick = document.createElement('input');
+      tick.type = 'checkbox';
+      tick.checked = !!v.camera;
+      var name = document.createElement('span');
+      name.textContent = v.label || 'a listener';
+      var left = document.createElement('em');
+      left.textContent = v.hours_left >= 48
+        ? Math.round(v.hours_left / 24) + 'd left'
+        : Math.round(v.hours_left) + 'h left';
+      tick.addEventListener('change', function () {
+        tick.disabled = true;
+        Promise.resolve(post('/api/share/camera',
+          {tag: v.tag, camera: tick.checked})).then(function (r) {
+          tick.disabled = false;
+          if (r && r.say) say(r.say);
+          if (!r || !r.ok) { tick.checked = !tick.checked; }
+          viewers();
+        }).catch(function () {
+          tick.disabled = false;
+          tick.checked = !tick.checked;
+          say('the station did not answer');
+        });
+      });
+      line.appendChild(tick);
+      line.appendChild(name);
+      line.appendChild(left);
+      list.appendChild(line);
+    });
+    say(got.say || '');
+  }
+
+  function viewers() {
+    Promise.resolve(ask('/api/pinelink/viewers'))
+      .then(paintViewers)
+      .catch(function () { /* asked again on the next sweep */ });
+  }
+
+  function setMode(mode) {
+    say('…');
+    Promise.resolve(post('/api/pinelink/public', {mode: mode}))
+      .then(function (r) {
+        if (r && r.say) say(r.say);
+        viewers();
+      }).catch(function () { say('the station did not answer'); });
+  }
+
   /* ------------------------------------------------ the troubleshooter */
 
   /* 'Not on the network' covers three faults with different cures - a
@@ -272,6 +375,21 @@
         if (live) { toggle(); } else { troubleshoot(); }
       });
     }
+    var modes = document.getElementById('pineCamModes');
+    if (modes && !modes.__wired) {
+      modes.__wired = true;
+      modes.addEventListener('click', function (ev) {
+        var b = ev.target && ev.target.closest
+          ? ev.target.closest('[data-mode]') : null;
+        if (!b) return;
+        ev.stopPropagation();
+        setMode(b.getAttribute('data-mode'));
+      });
+    }
+    /* No fold wiring of its own: the picker lives INSIDE
+     * #pineCamTools, which the header already hides and shows. A
+     * second hidden flag, set once at startup, would strand the list
+     * shut the first time the panel was opened. */
     var fixBtn = document.getElementById('pineCamFix');
     if (fixBtn && !fixBtn.__wired) {
       fixBtn.__wired = true;
@@ -303,6 +421,7 @@
       b.addEventListener('click', toggle);
     }
     look();
+    viewers();
     if (!timer) timer = setInterval(look, POLL_MS);
   }
 

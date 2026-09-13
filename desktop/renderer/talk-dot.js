@@ -48,6 +48,150 @@
   var quietSince = 0;
   var scene = null;
 
+  /* #1355: WHICH MICROPHONE.
+   *
+   * getUserMedia({audio: true}) asks for 'an' audio input, and what it
+   * hands back is whatever Chromium picked - which on a machine with a
+   * webcam, a headset and a line-in is frequently not the one the
+   * operator has set as their Windows default. It is also silent about
+   * its choice, so a dot that hears nothing and a dot that is listening
+   * to an unplugged jack look identical.
+   *
+   * Three changes, each earning its place:
+   *   - ask for deviceId 'default' explicitly. That is a real device id
+   *     in Chromium, not a synonym for 'any': it FOLLOWS the system
+   *     default, so changing it in Windows changes this without a
+   *     relaunch.
+   *   - say the track's label out loud when listening starts, so the
+   *     answer to 'is it hearing me' includes 'with what'.
+   *   - let it be pinned, because a default is a guess and the operator
+   *     is not. Right-click the dot.
+   *
+   * `ideal`, never `exact`, for the default - an exact constraint on a
+   * device that has gone is an OverconstrainedError and no microphone
+   * at all, which is strictly worse than the wrong one.
+   */
+  var MIC_KEY = 'pineTalkMic';
+  var micLabel = '';
+
+  function micPin() {
+    try { return localStorage.getItem(MIC_KEY) || ''; }
+    catch (err) { return ''; }
+  }
+
+  function micConstraints(pin) {
+    var audio = {
+      /* The room is a room: the operator is talking over a broadcast
+       * coming out of the same machine's speakers. */
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true
+    };
+    if (pin) audio.deviceId = {exact: pin};
+    else audio.deviceId = {ideal: 'default'};
+    return {audio: audio};
+  }
+
+  async function openMic() {
+    var pin = micPin();
+    try {
+      return await navigator.mediaDevices.getUserMedia(micConstraints(pin));
+    } catch (err) {
+      if (!pin) throw err;
+      /* The pinned device has gone - unplugged, or a Bluetooth headset
+       * that wandered off. Forget it and take the default rather than
+       * refusing to listen at all; a pin is a preference, not a
+       * requirement. */
+      try { localStorage.removeItem(MIC_KEY); } catch (e) { /* fine */ }
+      return await navigator.mediaDevices.getUserMedia(micConstraints(''));
+    }
+  }
+
+  function micName(got) {
+    try {
+      var track = got && got.getAudioTracks && got.getAudioTracks()[0];
+      var name = String((track && track.label) || '').trim();
+      /* Chromium prefixes the follow-the-system entry; the prefix is
+       * the useful part of the answer, so keep it and trim the rest. */
+      return name.length > 42 ? name.slice(0, 41) + '\u2026' : name;
+    } catch (err) { return ''; }
+  }
+
+  /* The list, for the picker. Labels are empty until the microphone has
+   * been opened once in this session - that is a browser rule, not a
+   * fault - so an unnamed device is numbered rather than hidden. */
+  async function mics() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      return [];
+    }
+    var all = await navigator.mediaDevices.enumerateDevices();
+    var n = 0;
+    return all.filter(function (d) { return d.kind === 'audioinput'; })
+      .map(function (d) {
+        n += 1;
+        return {id: d.deviceId,
+          label: String(d.label || '').trim() || ('Microphone ' + n)};
+      });
+  }
+
+  function useMic(id) {
+    try {
+      if (id) localStorage.setItem(MIC_KEY, id);
+      else localStorage.removeItem(MIC_KEY);
+    } catch (err) { /* an unremembered choice still works this session */ }
+  }
+
+  /* ---- the picker ----------------------------------------------- */
+
+  function closeMicMenu() {
+    var old = el('pineTalkMics');
+    if (old) old.remove();
+  }
+
+  async function micMenu() {
+    closeMicMenu();
+    var list;
+    try { list = await mics(); } catch (err) { list = []; }
+    var box = document.createElement('div');
+    box.id = 'pineTalkMics';
+    box.className = 'pine-talk-mics';
+    var head = document.createElement('div');
+    head.className = 'pine-talk-mics-head';
+    head.textContent = 'Which microphone';
+    box.appendChild(head);
+    var pin = micPin();
+    var rows = [{id: '', label: 'System default'}].concat(list);
+    rows.forEach(function (m) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'pine-talk-mic' + (m.id === pin ? ' on' : '');
+      b.textContent = m.label;
+      b.addEventListener('click', function () {
+        useMic(m.id);
+        closeMicMenu();
+        announce(m.id ? ('Listening with ' + m.label + ' from now on')
+          : 'Back to whichever microphone the system says is default');
+      });
+      box.appendChild(b);
+    });
+    if (!list.length) {
+      var none = document.createElement('div');
+      none.className = 'pine-talk-mics-none';
+      none.textContent = 'This machine reports no audio input.';
+      box.appendChild(none);
+    }
+    document.body.appendChild(box);
+    /* One dismissal road, attached after this click has finished
+     * bubbling or it would close the menu it just opened. */
+    setTimeout(function () {
+      document.addEventListener('click', function away(ev) {
+        if (box.contains(ev.target)) return;
+        document.removeEventListener('click', away);
+        closeMicMenu();
+      });
+    }, 0);
+  }
+
   function api() {
     return root.pineDesktop || {
       post: function () { return Promise.reject(new Error('no bridge')); }
@@ -69,6 +213,15 @@
     dot.innerHTML = '<canvas id="pineTalkFx" class="pine-talk-fx"></canvas>'
       + '<i class="pine-talk-core"></i>';
     dot.addEventListener('click', toggle);
+    /* #1355: and the other button picks the ear. A right-click rather
+     * than a second piece of chrome - the dot is deliberately one
+     * object, and this is a setting that is changed once. */
+    dot.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      micMenu();
+    });
+    dot.title = 'Click and speak - the station will hear you. '
+      + 'Right-click to choose which microphone.';
     document.body.appendChild(dot);
 
     var say = document.createElement('div');
@@ -285,7 +438,7 @@
       return;
     }
     try {
-      stream = await navigator.mediaDevices.getUserMedia({audio: true});
+      stream = await openMic();
     } catch (err) {
       /* The usual cause is the WebView not having been granted RECORD_AUDIO,
        * which is a native permission the page cannot ask for itself. */
@@ -295,7 +448,11 @@
 
     duck(true);
     setState(LISTENING);
-    announce('Listening...');
+    /* #1355: WITH WHAT. A dot that is listening to the wrong jack and a
+     * dot that is listening to a quiet room look the same, and the
+     * operator can only tell them apart if the name is on screen. */
+    micLabel = micName(stream);
+    announce('Listening...' + (micLabel ? ' (' + micLabel + ')' : ''));
     startScene();
 
     ctx = ctx || new (root.AudioContext || root.webkitAudioContext)();
@@ -780,7 +937,28 @@
     });
   }
 
+  /* #1355: a device list that changed under a pinned choice is worth
+   * knowing about before the next press, not during it. */
+  try {
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', function () {
+        var pin = micPin();
+        if (!pin) return;
+        mics().then(function (list) {
+          var still = list.some(function (m) { return m.id === pin; });
+          if (still) return;
+          useMic('');
+          announce('That microphone has gone - back to the system '
+            + 'default');
+        }).catch(function () { /* asked again on the next press */ });
+      });
+    }
+  } catch (err) { /* not every engine has this */ }
+
   root.PineTalkDot = {
+    mics: mics,
+    useMic: useMic,
+    micPin: micPin,
     mount: mount, listen: listen, finish: finish, duck: duck,
     /* `act` is the door for a sentence that arrived some other way - a
      * wake word, a typed command, or a test - and it deliberately does

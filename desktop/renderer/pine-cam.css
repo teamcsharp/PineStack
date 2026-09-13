@@ -92,6 +92,46 @@
   cursor: pointer;
 }
 .pine-cam-pref input { margin-top: 2px; }
+/* #1354: the viewer picker. Deliberately plain - it is a list of
+   people and a tick each, and anything more decorative would make a
+   permission look like a preference. */
+.pine-cam-share {
+  margin-top: 8px; padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, .07);
+}
+.pine-cam-share-head {
+  font-size: 11px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted, #7f8ea3); margin-bottom: 6px;
+}
+.pine-cam-modes { display: flex; gap: 4px; margin-bottom: 6px; }
+.pine-cam-modes button {
+  flex: 1 1 auto; font-size: 11px; padding: 5px 6px; border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, .12); background: transparent;
+  color: var(--muted, #7f8ea3); cursor: pointer; white-space: nowrap;
+}
+.pine-cam-modes button:hover { color: var(--ink, #e6edf5); }
+.pine-cam-modes button.on {
+  background: rgba(75, 179, 255, .16); border-color: rgba(75, 179, 255, .5);
+  color: var(--ink, #e6edf5);
+}
+.pine-cam-viewers { display: none; flex-direction: column; gap: 2px; }
+.pine-cam-viewers.show { display: flex; }
+.pine-cam-viewer {
+  display: flex; align-items: center; gap: 7px; font-size: 12px;
+  padding: 3px 2px; cursor: pointer; color: var(--ink, #e6edf5);
+}
+.pine-cam-viewer input { margin: 0; flex: 0 0 auto; }
+.pine-cam-viewer span { flex: 1 1 auto; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.pine-cam-viewer em {
+  flex: 0 0 auto; font-style: normal; font-size: 11px;
+  color: var(--muted, #7f8ea3);
+}
+.pine-cam-say {
+  font-size: 11px; color: var(--muted, #7f8ea3); margin-top: 5px;
+  line-height: 1.4;
+}
+
 /* The verdict, as the supervisor wrote it. Pre, because the steps are a
    numbered list and re-flowing them loses the order. */
 .pine-cam-doc {

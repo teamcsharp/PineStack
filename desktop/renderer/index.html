@@ -164,6 +164,29 @@
             <input id="pineCamLive" type="checkbox" checked>
             <span>Put it on the broadcast, in place of the gallery</span>
           </label>
+          <!-- #1354: WHO OUTSIDE THE HOUSE MAY WATCH.
+
+               Three positions, not a switch. A body camera is pointed
+               at whatever its wearer is doing, so "everybody" and
+               "nobody" are both usually the wrong answer; the useful
+               one is a handful of named people.
+
+               The names are the tune-in links that already exist -
+               ticking one here writes the permission ONTO that link,
+               so revoking the link takes the camera with it and no
+               orphan permission is left pointing at nobody. -->
+          <div class="pine-cam-share" id="pineCamShare">
+            <div class="pine-cam-share-head">Who outside the house
+              may watch</div>
+            <div class="pine-cam-modes" id="pineCamModes">
+              <button type="button" data-mode="off">Nobody</button>
+              <button type="button" data-mode="picked">Picked</button>
+              <button type="button" data-mode="all">Anyone with a
+                link</button>
+            </div>
+            <div id="pineCamViewers" class="pine-cam-viewers"></div>
+            <div id="pineCamShareSay" class="pine-cam-say"></div>
+          </div>
           <pre id="pineCamDoc" class="pine-cam-doc" hidden></pre>
         </div>
       </div>
