@@ -115581,16 +115581,28 @@ async def station_stream_mp3(
     async def body() -> Any:
         since = 0
         last_title: str | None = None
+        ticks = 0
         try:
             while True:
-                if await request.is_disconnected():
-                    break
-                # take() parks on a condition variable, so it waits on a
-                # THREAD - the event loop is never blocked by a quiet
-                # moment, and a stalled loop costs the listener latency
-                # out of their buffer rather than audio.
-                chunk = await asyncio.to_thread(sink.take, 1.0)
+                # #1253: NO THREAD POOL ON THIS PATH.
+                #
+                # This used to be `await asyncio.to_thread(sink.take, 1)`,
+                # which parked one pool thread per listener, in a loop,
+                # on the SAME default executor app.py uses from 407 other
+                # places - including the synchronous reads that cause the
+                # stalls. So the station could starve delivery outright
+                # while the event loop itself was perfectly healthy, and
+                # the car heard it as stuttering. Now the encoder thread
+                # hands chunks over with call_soon_threadsafe and this
+                # awaits an ordinary queue: no pool, no contention.
+                chunk = await sink.aget(1.0)
                 if not sink.open:
+                    break
+                # Checking the socket costs a receive() round trip, and
+                # a dead client also surfaces as a send failure on the
+                # yield below. Once every ten ticks is plenty.
+                ticks += 1
+                if ticks % 10 == 0 and await request.is_disconnected():
                     break
                 if not chunk:
                     continue                  # keep-alive tick, no bytes
@@ -115658,15 +115670,20 @@ async def station_stream_hls(
     lock screen and CarPlay behave.
     """
     require_listen_auth(t, authorization)
-    enc = await asyncio.to_thread(STATION_STREAM.hls, br)
+    # #1253: inline, not through the shared executor. A player asks for
+    # this every few seconds; `hls()` is a dict lookup once the encoder
+    # exists, `ready()` is one stat and the playlist is a few hundred
+    # bytes. All three cost the loop far less than a round trip through
+    # a pool that 407 other call sites are hammering.
+    enc = STATION_STREAM.hls(br)
     # The first playlist takes a moment to exist; the backlog prime means
     # it arrives with several segments already in it.
     for _ in range(40):
-        if await asyncio.to_thread(enc.ready):
+        if enc.ready():
             break
         await asyncio.sleep(0.25)
     try:
-        raw = await asyncio.to_thread(enc.playlist.read_text)
+        raw = enc.playlist.read_text()
     except Exception:  # noqa: BLE001
         raise HTTPException(status_code=503,
                             detail="The stream is still warming up.")
@@ -127854,14 +127871,34 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         # been said when it happened. Binary search over the spine in
         # air order - which is the same as (block, ord) order, because
         # blocks are numbered as rounds go out.
-        _times = [_raw_of[_ix] for _b, _o, _ix in _spine]
+        # #1343b: ONLY A ROW THAT HAS ACTUALLY AIRED MAY ANCHOR ONE.
+        #
+        # A spine row that has not been heard yet has no air_at, so
+        # `_raw_of` falls back to `ts` - when the round was WRITTEN,
+        # which can be minutes before anything around it. Let one of
+        # those anchor a hanger and the hanger moves the instant the
+        # row airs and its real stamp appears. Measured across twelve
+        # polls: 27 elements changing places with nothing else about
+        # them changing.
+        #
+        # An unheard row still keeps its place in the spine - that is
+        # what (block, ord) is for. It simply does not get to say where
+        # anything else goes until it has been said.
+        _anchorable = [(_raw_of[_ix], _rank)
+                       for _rank, (_b, _o, _ix) in enumerate(_spine)
+                       if float((events[_ix].get("row") or {}).get(
+                           "air_at") or 0) > 0]
+        _anchorable.sort()
+        _times = [_t for _t, _r in _anchorable]
+        _ranks = [_r for _t, _r in _anchorable]
         import bisect
         for _ix, _e in enumerate(events):
             if _ix in _pos:
                 continue
             _t = _raw_of[_ix]
-            _rank = bisect.bisect_right(_times, _t) - 1
+            _at_ix = bisect.bisect_right(_times, _t) - 1
             # Before the first spoken line: keep it at the very top.
+            _rank = _ranks[_at_ix] if _at_ix >= 0 else -1
             _pos[_ix] = (_rank, 1, _t, _ix)
         try:
             _keyed2 = sorted(enumerate(events),

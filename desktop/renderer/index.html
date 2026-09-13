@@ -737,6 +737,26 @@
   <script src="./sfx-tv.js"></script>
   <script src="./rail.js"></script>
   <script src="./pine-cam.js"></script>
+  <!-- #1344: PUT THE RAIL UP HERE TOO.
+
+       rail.js has always been device-agnostic and byte-identical to the
+       tablet's copy; the only reason the desktop never had the rail is
+       that nothing called it. The tablet calls it from ViewAssets.kt
+       after injecting the bundle. This is that call.
+
+       It also starts the four things rail.js starts and nothing else
+       does - the console line, the line actions, the talk dot and the
+       full-screen 3JS - which have been loaded but dormant on the
+       desktop all along. -->
+  <script>
+    try {
+      if (window.__pineViewRail) window.__pineViewRail();
+    } catch (e) {
+      /* The panel below is the whole application; a rail that will not
+         go up must never take it down with it. */
+      console.error("[rail] did not go up", e);
+    }
+  </script>
   <!-- THE STARTUP ASSEMBLY. The tablet gets this from rail.js when the
        rail goes up; the desktop has no rail boot step of its own, so it is
        kicked here. Guarded by the same flag, so a build that ends up with

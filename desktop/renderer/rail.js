@@ -221,8 +221,28 @@
         /* The sampler already built its own host and handle before this
          * ran. Adopt it rather than building a second one. */
         if (!view.external) {
-          var host = make('section', view.id, 'pine-view-host ' + view.cls);
-          document.body.appendChild(host);
+          /* #1344: ADOPT A HOST THAT IS ALREADY THERE.
+           *
+           * The desktop shell owns #script, #listen, #music,
+           * #presentation and #sampler as its own <section class="view">
+           * elements. Building a second element with the same id gives
+           * getElementById the DESKTOP one - first in document order -
+           * which has no `pine-view-host` class, so `.open` matches
+           * nothing and the tab looks broken rather than missing.
+           *
+           * On the tablet nothing owns these ids, so this still builds
+           * exactly what it always did. */
+          var host = document.getElementById(view.id);
+          if (host) {
+            host.classList.add('pine-view-host');
+            var bits = String(view.cls || '').split(/\s+/);
+            for (var c = 0; c < bits.length; c += 1) {
+              if (bits[c]) host.classList.add(bits[c]);
+            }
+          } else {
+            host = make('section', view.id, 'pine-view-host ' + view.cls);
+            document.body.appendChild(host);
+          }
         }
         var tab = make('button', 'pineViewTab-' + view.id, 'pine-view-tab');
         tab.textContent = view.label;
@@ -230,7 +250,10 @@
           if (view.external) {
             /* Hand the sampler's own handle the press, so its repaint and
              * its `on` state keep working exactly as they did. */
-            var handle = document.getElementById('pineSamplerTab');
+            /* #1344: the tablet builds #pineSamplerTab; the desktop has
+             * its own nav button instead. Either is a handle. */
+            var handle = document.getElementById('pineSamplerTab')
+              || document.getElementById('samplerTabBtn');
             var wasOpen = handle && handle.classList.contains('on');
             closeAll();
             if (handle && !wasOpen) handle.click();
