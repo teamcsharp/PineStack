@@ -346,6 +346,15 @@ class PineCameraService : Service() {
             }
         }
 
+        /**
+         * Stop the service outright.
+         *
+         * NOT what closing a viewer should do. The service is meant to stand
+         * so the desktop can attach whenever it likes, and the LENS is
+         * already released the moment the last reader disconnects - so a
+         * window closing needs to do nothing at all. This exists for a
+         * deliberate shutdown, and for a test that wants the socket gone.
+         */
         fun end(context: Context) {
             try {
                 context.stopService(Intent(context, PineCameraService::class.java))

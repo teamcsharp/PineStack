@@ -305,6 +305,9 @@ class MainActivity : AppCompatActivity() {
          * boot receiver because a background start can be refused and a
          * visible activity is the one context that never is. */
         com.pinebox.kiosk.replay.PineAppRecorder.begin(this)
+        /* The camera's door, open and waiting. The lens stays shut until
+         * somebody connects - see PineCameraService. */
+        com.pinebox.kiosk.camera.PineCameraService.begin(this, null)
         super.onResume()
         /* #1296: a view is on the glass, so the wallpaper holds. Hanging
            one regenerates the Material You overlays, and the

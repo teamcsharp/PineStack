@@ -42,6 +42,18 @@ class BootReceiver : BroadcastReceiver() {
          * capturing from the moment it boots, which is the whole ask. */
         com.pinebox.kiosk.replay.PineAppRecorder.begin(context)
 
+        /* AND THE CAMERA, STANDING AND READY.
+         *
+         * "I'm able to grab and connect to the webcam through the Pinebox app
+         *  no matter what whenever I want just through the service."
+         *
+         * It costs nothing to leave running: the socket listens, and the LENS
+         * is only opened when something actually connects to it - see
+         * PineCameraService. So "always available" and "not holding the
+         * camera" are both true at once, which is the only way a shared
+         * device can be left on duty. */
+        com.pinebox.kiosk.camera.PineCameraService.begin(context, null)
+
         try {
             val launch = Intent(context, MainActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

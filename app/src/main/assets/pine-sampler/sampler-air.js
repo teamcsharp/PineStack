@@ -78,11 +78,28 @@
    * heard, short enough not to cost a second 23 MB. */
   var VOICE_HISTORY_S = 60;
 
-  /* ScriptProcessor, not AudioWorklet, on purpose: a worklet needs a module
-   * fetched from a URL, and these views are injected into a page whose origin
-   * and CSP this file does not control. The work here is a memcpy of 4096
-   * frames - the main-thread cost that matters on this tablet is the eleven
-   * WebGL canvases, not this. */
+  /* AN AUDIOWORKLET WHERE THE PAGE ALLOWS ONE, AND THE OLD ROAD WHERE IT
+   * DOES NOT.
+   *
+   * This used to be a ScriptProcessor on purpose, with a real reason: "a
+   * worklet needs a module fetched from a URL, and these views are injected
+   * into a page whose origin and CSP this file does not control". The answer
+   * to that is a blob: URL, which needs no origin and no server - and where
+   * a CSP refuses even that, the ScriptProcessor is still here and still
+   * runs.
+   *
+   * The reason it had to move is measured rather than argued. The drop
+   * counter below, read over twenty seconds on a live tablet:
+   *
+   *     29 gaps, 3.429 seconds of audio lost - seventeen per cent
+   *
+   * A ScriptProcessor runs on the MAIN thread, and a blocked main thread
+   * does not delay a buffer, it loses it. The ring then writes the next
+   * buffer hard against the last, so the waveform steps - and THAT is the
+   * "static and noise" in a captured broadcast. Nothing was ever added to
+   * the signal; silence was cut out of it, hundreds of times a minute, on a
+   * tablet running the station, eleven canvases, a screen encoder and a
+   * camera at a load average of 22. */
   var BLOCK = 4096;
 
   /* WHAT THE CAPTURE MISSES.
@@ -185,6 +202,87 @@
     if (c && c.state === 'suspended') c.resume().catch(function () {});
   }
 
+  /* ------------------------------------------------------------ the worklet */
+
+  /* THE PROCESSOR, AS SOURCE. It is compiled from a blob: URL because these
+   * views are injected into a page whose origin this file does not own.
+   *
+   * It does exactly what the ScriptProcessor did - fold stereo to mono - and
+   * then gathers into a block before posting, so the main thread is woken
+   * about a dozen times a second rather than four hundred. Crucially it
+   * gathers in ITS OWN memory on the audio thread: a main thread that is busy
+   * now makes the ring LATE, which is inaudible, instead of making the audio
+   * MISSING, which is not. */
+  var WORKLET_SOURCE = [
+    'class PineTap extends AudioWorkletProcessor {',
+    '  constructor(options) {',
+    '    super();',
+    '    this.size = (options && options.processorOptions',
+    '      && options.processorOptions.size) || 4096;',
+    '    this.held = new Float32Array(this.size);',
+    '    this.at = 0;',
+    '  }',
+    '  process(inputs) {',
+    '    const input = inputs[0];',
+    '    if (!input || !input.length) return true;',
+    '    const left = input[0];',
+    '    const right = input.length > 1 ? input[1] : null;',
+    '    if (!left) return true;',
+    '    for (let i = 0; i < left.length; i += 1) {',
+    '      this.held[this.at] = right ? (left[i] + right[i]) * 0.5 : left[i];',
+    '      this.at += 1;',
+    '      if (this.at === this.size) {',
+    '        /* Transferred, not copied: the buffer leaves this thread and a',
+    '           fresh one takes its place. */',
+    '        const out = this.held;',
+    '        this.held = new Float32Array(this.size);',
+    '        this.at = 0;',
+    '        this.port.postMessage(out, [out.buffer]);',
+    '      }',
+    '    }',
+    '    return true;',
+    '  }',
+    '}',
+    'registerProcessor("pine-tap", PineTap);'
+  ].join('\n');
+
+  var workletReady = null;      /* a promise, once, or null if refused */
+  var workletWhy = '';
+
+  function haveWorklet(c) {
+    if (workletReady) return workletReady;
+    if (typeof AudioWorkletNode !== 'function' || !c.audioWorklet) {
+      workletWhy = 'this WebView has no AudioWorklet';
+      workletReady = Promise.reject(new Error(workletWhy));
+      workletReady.catch(function () {});
+      return workletReady;
+    }
+    var url;
+    try {
+      url = URL.createObjectURL(new Blob([WORKLET_SOURCE],
+        { type: 'text/javascript' }));
+    } catch (err) {
+      workletWhy = 'a blob URL could not be made: ' + err.message;
+      workletReady = Promise.reject(new Error(workletWhy));
+      workletReady.catch(function () {});
+      return workletReady;
+    }
+    workletReady = c.audioWorklet.addModule(url).then(function () {
+      try { URL.revokeObjectURL(url); } catch (err) { /* fine */ }
+      return true;
+    }).catch(function (err) {
+      /* A page whose CSP refuses blob: scripts lands here, which is exactly
+       * the case the old comment worried about. The ScriptProcessor below
+       * still works; this is a fall back, not a failure. */
+      workletWhy = 'the page refused the worklet module: ' + err.message;
+      throw err;
+    });
+    return workletReady;
+  }
+
+  /** How the capture is actually running, for the diagnostics road. */
+  var captureHow = 'starting';
+
   /* --------------------------------------------------------------- the ring */
 
   function ensureRing() {
@@ -194,6 +292,47 @@
     sink = c.createGain();
     sink.gain.value = 0;          /* it must hear, not speak */
     sink.connect(c.destination);
+    /* THE WORKLET FIRST. It is asked for asynchronously, so the
+     * ScriptProcessor below is wired up immediately and REPLACED when the
+     * worklet is ready - a capture that is silent for the two hundred
+     * milliseconds a module takes to compile is a capture that has lost the
+     * two hundred milliseconds. */
+    haveWorklet(c).then(function () {
+      try {
+        var tap = new AudioWorkletNode(c, 'pine-tap', {
+          numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+          processorOptions: { size: BLOCK }
+        });
+        tap.port.onmessage = function (event) {
+          var block = event.data;
+          if (!block || !block.length) return;
+          for (var i = 0; i < block.length; i += 1) {
+            var v = block[i];
+            ring[write] = v;
+            write = write + 1 === ring.length ? 0 : write + 1;
+            var a = v < 0 ? -v : v;
+            if (a > loudest) loudest = a;
+          }
+          if (filled < ring.length) {
+            filled = Math.min(ring.length, filled + block.length);
+          }
+        };
+        /* The old node is taken out of the graph only once the new one is
+         * in it, so nothing is deaf in between. */
+        if (sink) tap.connect(sink);
+        if (capture) {
+          try { capture.disconnect(); } catch (err) { /* gone */ }
+          capture.onaudioprocess = null;
+        }
+        capture = tap;
+        captureHow = 'worklet';
+      } catch (err) {
+        captureHow = 'script processor (' + err.message + ')';
+      }
+    }).catch(function () {
+      captureHow = 'script processor (' + workletWhy + ')';
+    });
+
     capture = c.createScriptProcessor(BLOCK, 2, 1);
     capture.onaudioprocess = function (event) {
       var due = event.playbackTime;
@@ -224,6 +363,32 @@
 
     /* The voices-only ring. Same shape, its own clock, fed in tap(). */
     voiceRing = new Float32Array(Math.round(VOICE_HISTORY_S * c.sampleRate));
+    haveWorklet(c).then(function () {
+      try {
+        var tap = new AudioWorkletNode(c, 'pine-tap', {
+          numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+          processorOptions: { size: BLOCK }
+        });
+        tap.port.onmessage = function (event) {
+          var block = event.data;
+          if (!block || !block.length) return;
+          for (var i = 0; i < block.length; i += 1) {
+            voiceRing[voiceWrite] = block[i];
+            voiceWrite = voiceWrite + 1 === voiceRing.length ? 0 : voiceWrite + 1;
+          }
+          if (voiceFilled < voiceRing.length) {
+            voiceFilled = Math.min(voiceRing.length, voiceFilled + block.length);
+          }
+        };
+        if (sink) tap.connect(sink);
+        if (voiceCapture) {
+          try { voiceCapture.disconnect(); } catch (err) { /* gone */ }
+          voiceCapture.onaudioprocess = null;
+        }
+        voiceCapture = tap;
+      } catch (err) { /* the ScriptProcessor below carries on */ }
+    }).catch(function () { /* likewise */ });
+
     voiceCapture = c.createScriptProcessor(BLOCK, 2, 1);
     voiceCapture.onaudioprocess = function (event) {
       var input = event.inputBuffer;
@@ -824,7 +989,13 @@
      * how many buffers the ring has lost since it started. */
     drops: function () {
       return { gaps: gaps, seconds: gapSeconds,
-               how: (typeof AudioWorkletNode === 'function' ? 'worklet-capable' : 'no worklet'),
+               /* WHAT IS ACTUALLY CARRYING THE CAPTURE, not what the browser
+                * is capable of. The old answer said "worklet-capable" while
+                * a ScriptProcessor was dropping seventeen per cent of the
+                * audio, which is a meter describing the wrong thing. */
+               how: captureHow,
+               able: (typeof AudioWorkletNode === 'function'),
+               why: workletWhy,
                block: BLOCK };
     },
     sliceWav: sliceWav, measure: measure, quiet: quiet, spectrum: spectrum,

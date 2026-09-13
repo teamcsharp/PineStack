@@ -164,7 +164,8 @@
   function build(name) {
     var box = readBox();
     host = document.createElement('div');
-    host.className = 'sfx-tv';
+    /* #1308b: `waiting` until the first frame - see play(). */
+    host.className = 'sfx-tv waiting';
     host.id = 'sfxTv';
     host.style.left = Math.round(box.left) + 'px';
     host.style.top = Math.round(box.top) + 'px';
@@ -195,17 +196,18 @@
       }
     } catch (err) { /* the stylesheet's own 900 stands */ }
 
-    var head = document.createElement('div');
-    head.className = 'sfx-tv-head';
-    var title = document.createElement('b');
-    title.textContent = String(name || 'SFX');
+    /* #1309b: NO CHROME. "The video pop-up needs to be just a video.
+     * No wasted space, no elements around it... I just want it to pop
+     * up as just a video box. Just a video itself."
+     *
+     * So there is no title bar and no close button. The set closes
+     * itself when the clip ends, and the hold sheet carries a Close
+     * for a clip somebody wants gone early. `shut` is still handed
+     * back so play()'s own wiring is unchanged - it is simply a
+     * button nothing ever shows. */
     var shut = document.createElement('button');
     shut.type = 'button';
-    shut.textContent = '✕';
-    shut.title = 'Close';
-    shut.setAttribute('aria-label', 'Close');
-    head.appendChild(title);
-    head.appendChild(shut);
+    shut.hidden = true;
 
     var screen = document.createElement('div');
     screen.className = 'sfx-tv-screen';
@@ -285,13 +287,17 @@
       });
     });
 
-    host.appendChild(head);
     host.appendChild(screen);
     grip(host);
     /* A sibling of <main>, never inside a view: that is the whole reason
      * it survives a tab change. */
     document.body.appendChild(host);
-    drag(host, head);
+    /* #1309b: the head WAS the drag handle, so the window itself is
+       now the handle. drag() already ignores a pointerdown on a
+       button, and the hold that opens the sheet cancels itself the
+       moment the pointer wanders - so a small press opens the sheet
+       and a real drag moves the set. */
+    drag(host, host);
     return {shut: shut, flash: flash};
   }
 
@@ -360,8 +366,41 @@
     };
 
     parts.shut.addEventListener('click', close);
-    glass.classList.add('on');       // dot -> line -> picture
-    parts.flash.classList.add('pop');
+
+    /* #1308b: NOTHING IS SHOWN UNTIL THERE IS A PICTURE.
+     *
+     * "I don't want to see the video icon. I just want to see the crt
+     *  effect then expand out becoming the video window. Do not show
+     *  the preview video box first. That image isn't even scaled
+     *  properly to be a box, so it's like skewed."
+     *
+     * That icon is not ours and it is not the clip: it is the Android
+     * WebView's own placeholder for a <video> with no frames yet, and
+     * being a fixed bitmap it ignores the object-fit: contain this
+     * stylesheet sets, which is why it came out stretched. The set
+     * used to open the moment play() was called, and the clip takes a
+     * couple of seconds to arrive over the LAN - so the CRT expanded
+     * onto the placeholder and the picture appeared inside it later.
+     *
+     * So the whole window waits. It is built and positioned, but
+     * hidden, until the first real frame exists; then the CRT runs and
+     * expands into the picture itself. A clip that never arrives is
+     * torn down by the watchdog below and was never seen at all,
+     * which is better than an empty box that sat there. */
+    var shown = false;
+    var reveal = function () {
+      if (shown || done) return;
+      shown = true;
+      try {
+        host.classList.remove('waiting');
+        glass.classList.add('on');   // dot -> line -> picture
+        parts.flash.classList.add('pop');
+      } catch (err) { /* the picture is there either way */ }
+    };
+    /* loadeddata is the first frame; playing covers a clip that was
+       already buffered. Both are harmless twice - reveal guards. */
+    screen.addEventListener('loadeddata', reveal);
+    screen.addEventListener('playing', reveal);
 
     screen.addEventListener('ended', finish);
     screen.addEventListener('error', finish);
@@ -516,6 +555,14 @@
     var shut = button(rowB, 'Close', 'Put this away',
                       function () { wrap.remove(); });
     shut.className = 'quiet';
+    /* #1309b: and the only way left to dismiss the picture itself,
+       now that the title bar with its ✕ is gone. */
+    var away = button(rowB, 'Stop', 'Take the picture off the screen',
+      function () {
+        wrap.remove();
+        try { teardownNow(); } catch (err) { /* already gone */ }
+      });
+    away.className = 'quiet';
 
     wrap.appendChild(name);
     wrap.appendChild(rowA);
