@@ -406,6 +406,26 @@
     screen.addEventListener('error', finish);
     screen.src = base.replace(/\/+$/, '') + String(clip.url || '');
     screen.volume = level;
+    /* #1310: THE PAD'S IN AND OUT, ON THE PICTURE TOO.
+     *
+     * The same {start, end} the engine clips the audio to, so a video
+     * pad's trim edits both halves of it from the one editor. Seeking
+     * waits for metadata - currentTime cannot be set before the
+     * duration is known - and the out is watched on timeupdate rather
+     * than with a timer, because a clip that stalls should stop where
+     * the operator said, not where a clock guessed. */
+    var from = Number(clip.from);
+    var to = Number(clip.to);
+    if (isFinite(from) && from > 0) {
+      screen.addEventListener('loadedmetadata', function () {
+        try { screen.currentTime = from; } catch (err) { /* whole clip */ }
+      });
+    }
+    if (isFinite(to) && to > 0) {
+      screen.addEventListener('timeupdate', function () {
+        if (Number(screen.currentTime) >= to) finish();
+      });
+    }
     /* THE WATCHDOG. `error` does not fire for every way a clip can fail
      * to begin - a stalled range request, a container this build cannot
      * decode, a zero-byte download off the drop share - and a set left on

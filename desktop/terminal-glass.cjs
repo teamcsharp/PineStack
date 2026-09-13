@@ -647,6 +647,12 @@ class Glass {
   /* ------------------------------------------------------------- the still */
 
   async still() {
+    /* A SCREENSHOT OF A SLEEPING TABLET IS A BLACK RECTANGLE, and that has
+     * been reported as a fault more than once before anyone thought to check
+     * whether the screen was even on. Waking is cheap when it is already
+     * awake - one dumpsys - so it is simply what happens first. */
+    await this.wake().catch(() => ({ ok: false }));
+
     /* `exec-out` keeps bytes as bytes. `adb shell` runs them through a pty
      * that turns every 0x0A into 0x0D 0x0A, which corrupts a PNG in a way
      * that still looks like a file - so this road is taken first and checked
@@ -678,6 +684,56 @@ class Glass {
       return { ok: false, why: 'the tablet answered, but not with a PNG' };
     }
     return { ok: true, png, bytes: png.length, size: pngSize(png), how, at: this.now() };
+  }
+
+  /**
+   * IS THE SCREEN ON, AND IF NOT, TURN IT ON.
+   *
+   * Through adb rather than the bridge: the bridge lives in a WebView, and a
+   * WebView on a sleeping tablet is not running. Asking it to wake itself is
+   * asking the thing that is asleep. The framework never sleeps.
+   *
+   * Returns what it had to do, so the caller can say "it was asleep" rather
+   * than silently taking four seconds longer.
+   */
+  async wake() {
+    let was = '';
+    try {
+      const said = await this.maybe('dumpsys power | grep -E "mWakefulness="', 12000);
+      was = /mWakefulness=(\w+)/.exec(String(said || ''))?.[1] || '';
+    } catch (error) { was = ''; }
+
+    if (was === 'Awake') return { ok: true, was, woke: false };
+
+    try {
+      await this.maybe('input keyevent KEYCODE_WAKEUP', 12000);
+      /* AND DISMISS THE KEYGUARD. A tablet that wakes to a lock screen has
+       * not given anybody access to anything. MENU is a no-op where there is
+       * no lock and a dismissal where there is a swipe - this terminal is
+       * device owner with no credential set. */
+      await this.maybe('input keyevent KEYCODE_MENU', 12000);
+      /* The compositor needs a moment before a screenshot is worth taking. */
+      await new Promise((go) => setTimeout(go, 700));
+      return { ok: true, was, woke: true };
+    } catch (error) {
+      return { ok: false, was, woke: false, why: error.message };
+    }
+  }
+
+  /**
+   * Put it back to sleep.
+   *
+   * Offered because a terminal woken from another room should be able to be
+   * left as it was found - and because the screen is three percent of a
+   * battery this tablet does not have much of.
+   */
+  async sleep() {
+    try {
+      await this.maybe('input keyevent KEYCODE_SLEEP', 12000);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, why: error.message };
+    }
   }
 
   /**

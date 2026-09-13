@@ -1300,8 +1300,22 @@ async function openCameraWindow(facing) {
   return Object.assign({ ok: true }, where);
 }
 
+ipcMain.handle("tablet:wake", async (_event, want) => {
+  try {
+    const glass = await terminalHost.glass();
+    return (want && want.off) ? await glass.sleep() : await glass.wake();
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
 ipcMain.handle("camera:open", async (_event, want) => {
   try {
+    /* THE CAMERA NEEDS THE TABLET AWAKE. The capture itself would work on a
+     * sleeping device, but the service is started from an activity and a
+     * sleeping tablet's activity is not there to start it. */
+    const glass = await terminalHost.glass();
+    await glass.wake().catch(() => ({ ok: false }));
     return await openCameraWindow((want && want.facing) || "rear");
   } catch (error) {
     return { ok: false, why: error.message };

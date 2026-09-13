@@ -82,6 +82,9 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   /* The camera in a window of its own, streamed - the tablet keeps the
    * station on its screen. */
   cameraOpen: (want) => ipcRenderer.invoke("camera:open", want),
+  /* Waking the tablet from here, because a WebView on a sleeping tablet is
+   * not running and cannot wake itself. */
+  tabletWake: (want) => ipcRenderer.invoke("tablet:wake", want),
   cameraWhere: () => ipcRenderer.invoke("camera:where"),
   cameraFace: (facing) => ipcRenderer.invoke("camera:face", facing),
   /* The speaker on the mirror. null asks, true/false sets - and what comes
