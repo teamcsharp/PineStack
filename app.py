@@ -26830,7 +26830,20 @@ def _owner_takes_nothing(who: str) -> bool:
         held = now - float(_OWNER_RUN.get("since") or now)
         if not who or held < OWNER_DEAF_SECONDS:
             return False
-        floor = now - held
+        # #1332d: THE LAST SEVENTY-FIVE SECONDS, NOT THE WHOLE RUN.
+        #
+        # This was `now - held`, which asks "has it taken anything
+        # since it took the air" - so a page that acknowledged one
+        # clip at the start of a long run was immune for as long as
+        # it held on, however deaf it went afterwards. Caught live:
+        # the desktop played normally for minutes, went silent, and
+        # sat on the exclusive through 140s of quiet with the rule
+        # watching and unable to fire, because its own old
+        # acknowledgments were still inside the window.
+        #
+        # The question is not "has it ever worked". It is "is it
+        # working now".
+        floor = now - OWNER_DEAF_SECONDS
         for ev in list(_PAGE_ACK_EVENTS[-400:]):
             # These rows key the page `listener_id`, not `who`.
             # Reading the wrong field would make this return True
@@ -26839,8 +26852,27 @@ def _owner_takes_nothing(who: str) -> bool:
             # paying for.
             if str((ev or {}).get("listener_id") or "") != who:
                 continue
-            if float((ev or {}).get("at") or 0) >= floor:
-                return False          # it is taking clips; leave it alone
+            if float((ev or {}).get("at") or 0) < floor:
+                continue
+            # #1332e: AN ACKNOWLEDGMENT IS NOT A SOUND.
+            #
+            # Counting any ack at all made this ask "is the page still
+            # answering", which is the #1208 question and already has a
+            # test. The question here is whether the room can HEAR it.
+            # A page reports `muted` and `audible_volume` on every ack,
+            # and a device that acknowledges a clip while muted or at
+            # zero is exactly the thing holding the exclusive and
+            # playing nothing - measured live, the desktop went on
+            # acknowledging through 140s of silence and the rule could
+            # not tell it from a working device.
+            if (ev or {}).get("muted"):
+                continue
+            try:
+                if float((ev or {}).get("audible_volume") or 0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            return False          # it is sounding; leave it alone
         others = [w for w in (_listeners_live() or []) if w != who]
         if others:
             _OWNER_RUN.update({"who": "", "since": 0.0})   # the run ends here
@@ -120365,6 +120397,15 @@ BROADCAST_STEPS: list[dict[str, str]] = [
     {"key": "replay_hour", "label": "Go back the last hour",
      "say": "Re-airs up to three rounds from the last hour, oldest "
             "first, to refill a starved broadcast.", "tone": "air"},
+    {"key": "drain", "label": "Send out what is already made",
+     "say": "Plays the clips held on the box's shelf and publishes the "
+            "lines that could not be rendered when they were written. "
+            "Cheap: this audio exists already.", "tone": "air"},
+    {"key": "stock", "label": "Air something unheard",
+     "say": "Takes the longest-unheard finished round off the cupboard "
+            "shelf and puts it on the air out of turn (#1260), and "
+            "replays the last segment if the cupboard refuses.",
+     "tone": "air"},
     {"key": "terminals", "label": "Check the out-loud switches",
      "say": "A device set not to play out loud still gags every other one "
             "when it holds the air (#1187). Turns them back on only if "
@@ -120386,6 +120427,21 @@ BROADCAST_STEPS: list[dict[str, str]] = [
     {"key": "deep", "label": "Run the repair ladder",
      "say": "The whole triage tree (#836) - engines, services, the box, "
             "the wire. Slow.", "tone": "deep"},
+    {"key": "stream", "label": "Check the public stream",
+     "say": "The listener door on the public port and the mp3 mixer "
+            "behind /stream.mp3. Probes both for real - the mixer's own "
+            "`running` flag is not evidence - and revives the mixer.",
+     "tone": "do"},
+    {"key": "engines", "label": "Revive the voice engines",
+     "say": "F5 and the voice-director - what the services steward's "
+            "table does not cover - plus XTTS's reload. Reports which "
+            "answered, and bounces the director only when it did not: "
+            "a healthy one holds every engine behind it.", "tone": "deep"},
+    {"key": "disk", "label": "Free what is safe to free",
+     "say": "Runs the bounded store retention sweep and names what is "
+            "big and what is over its cap. Deletes nothing that the "
+            "retention rules would not have deleted anyway.",
+     "tone": "deep"},
     {"key": "restart", "label": "Restart the station",
      "say": "Last resort. The show stops for about twenty seconds and "
             "every page reconnects to a clean feed.", "tone": "danger"},
@@ -120840,6 +120896,356 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                         "music library")
         except Exception as err:  # noqa: BLE001
             said.append("  the steward would not start: %s" % err)
+
+    elif step == "drain":
+        # #1338: THE AUDIO THAT IS ALREADY MADE.
+        #
+        # Two shelves hold finished audio that nothing on the wedge
+        # console could reach. _BOX_HOLD is the ordered queue of clips
+        # bound for the speaker that have not had a verified playout;
+        # _RENDER_BACKLOG is every written line the ladder could not
+        # render at the time, kept because "a station fault is a delay
+        # rather than a deletion" (#784). Both are drained only by their
+        # own timers, so a starved air can sit beside rendered speech.
+        #
+        # This rung reports COUNTS, never success: render_backlog_drain's
+        # whole body is inside a bare `except Exception: pass`, so the
+        # only honest evidence it produced is how the shelves changed.
+        said.append("$ drain the held clips and the render backlog")
+        _held_was = len(_BOX_HOLD)
+        _back_was = len(_RENDER_BACKLOG)
+        said.append("  held    %d clip(s) waiting on the box's shelf"
+                    % _held_was)
+        said.append("  backlog %d written line(s) never rendered"
+                    % _back_was)
+        if not (_held_was or _back_was):
+            said.append("  nothing is held and nothing is backed up - "
+                        "this rung has no work to do")
+        else:
+            _went = 0
+            _budget = time.time() + 30.0
+            for _ in range(6):
+                if not _BOX_HOLD or time.time() > _budget:
+                    break
+                try:
+                    # A verified playout waits for the clip's own length,
+                    # so a console button must cap it. The drain drops
+                    # the floor in a `finally`, which makes the timeout
+                    # safe: the head simply keeps its place on the shelf.
+                    _got = await asyncio.wait_for(box_hold_drain_one(),
+                                                  timeout=20)
+                except asyncio.TimeoutError:
+                    said.append("  hold    the head is still playing out "
+                                "after 20s - left it on the shelf")
+                    break
+                except Exception as err:  # noqa: BLE001
+                    said.append("  hold    the shelf refused: %s" % err)
+                    break
+                if not _got:
+                    break
+                _went += 1
+            if _held_was:
+                said.append("  hold    %d of %d went out, %d still held"
+                            % (_went, _held_was, len(_BOX_HOLD)))
+                if not _went:
+                    said.append("          the head would not play - "
+                                "paused, the box is not the out, or the "
+                                "wire is down")
+            if _back_was:
+                if _BACKLOG_BUSY[0]:
+                    said.append("  backlog a drain is already running - "
+                                "left it to finish")
+                else:
+                    try:
+                        await render_backlog_drain()
+                    except Exception as err:  # noqa: BLE001
+                        said.append("  backlog the drain raised: %s" % err)
+                    said.append("  backlog %d of %d published, %d still "
+                                "waiting (the drain swallows its own "
+                                "errors - this count is the evidence)"
+                                % (max(0, _back_was - len(_RENDER_BACKLOG)),
+                                   _back_was, len(_RENDER_BACKLOG)))
+            changed = bool(_went or len(_RENDER_BACKLOG) != _back_was)
+
+    elif step == "stock":
+        # #1338: A STARVED AIR WITH A FULL SHELF.
+        #
+        # unheard_stock_air is the cupboard's standing consumer and its
+        # only callers are watchdog timers. force=True is the #1313 road
+        # - it drops the interval and the floor test - and it was
+        # reachable from nothing the operator could press.
+        said.append("$ put unheard finished radio on the air")
+        if not cupboard_unheard_on():
+            said.append("  the out-of-turn road is switched OFF in the "
+                        "settings - nothing will come off the shelf")
+        _aired = ""
+        try:
+            # #1340: BOUNDED. unheard_stock_air waits for the line to
+            # actually reach the air, which includes a render and a
+            # playout - measured from the console it ran past 120s and
+            # the caller gave up, which on the ladder means the rung
+            # after it never runs. The work is not wasted when the wait
+            # ends: the round is already queued and the page starts it
+            # at its next poll, so the honest thing is to stop waiting
+            # and say so, not to hold the whole ladder open.
+            _aired = await asyncio.wait_for(
+                unheard_stock_air(force=True), timeout=25.0)
+        # #1340b: THE TIMEOUT FIRST. asyncio.TimeoutError IS an
+        # Exception, so with the broad clause above it the narrow one
+        # below could never run - and TimeoutError carries no message,
+        # so the transcript read "the cupboard raised: " with nothing
+        # after the colon. An empty reason is worse than no line at all:
+        # it tells the operator something went wrong and refuses to say
+        # what.
+        except asyncio.TimeoutError:
+            _aired = ""
+            said.append("  asked for, and still working after 25s -")
+            said.append("  the round is queued either way; the page "
+                        "starts it at its next poll")
+        except Exception as err:  # noqa: BLE001
+            said.append("  the cupboard raised: %s"
+                        % (err or err.__class__.__name__))
+        if _aired:
+            changed = True
+            said.append("  aired   %s off the shelf, out of turn"
+                        % SHELF_LABEL.get(_aired, _aired))
+            said.append("  the page will start it at its next poll")
+        else:
+            # It returns "" for every refusal and writes the reason down
+            # rather than raising, so the reason is where to look.
+            _why = ""
+            try:
+                _why = str(_UNHEARD_SWEEP.get("why") or "")
+            except Exception:  # noqa: BLE001
+                _why = ""
+            said.append("  cupboard put nothing out: %s"
+                        % (_why or "it did not say"))
+            said.append("  falling back to a replay of the last segment")
+            _recent, _pool = await rows_back(7200.0)
+            if not _recent:
+                said.append("  nothing in the log carries audio we can "
+                            "replay either - the air has nothing at all")
+            else:
+                changed = bool(await _broadcast_replay(_recent[:1],
+                                                       _pool, said))
+
+    elif step == "stream":
+        # #1338: THE PUBLIC DOOR, WHICH NOTHING WATCHES.
+        #
+        # Two roads carry the broadcast off this box and neither has a
+        # repair rung. The listener door is an unsupervised
+        # asyncio.create_task hung off startup: if its server task dies,
+        # nothing notices and nothing restarts it, and only a process
+        # restart brings it back. The mp3 mixer is a daemon thread whose
+        # state() reports `"running": bool(self._run)` - a FLAG set true
+        # by ensure_running before the thread has produced a single
+        # frame. So this rung probes the door with a real request and the
+        # mixer with its frame counter, and only then calls
+        # ensure_running, which is a no-op on a live thread.
+        said.append("$ the public door and the broadcast mixer")
+        if not PUBLIC_ENABLED or PUBLIC_PORT == STATION_PORT:
+            said.append("  door    not configured - SPARK_PUBLIC_LISTEN "
+                        "is off, or it shares the station's port")
+        else:
+            try:
+                async with httpx.AsyncClient(timeout=6) as _c:
+                    _r = await _c.get("http://127.0.0.1:%d/api/stream/state"
+                                      % PUBLIC_PORT)
+                # ANY status proves the socket answered - the state
+                # route wants a listen token, so a 401 from here is the
+                # door being alive, not the door being broken.
+                said.append("  door    :%d answered %d - it is up%s"
+                            % (PUBLIC_PORT, _r.status_code,
+                               " (401 just means it wants a token)"
+                               if _r.status_code in (401, 403) else ""))
+            except Exception as err:  # noqa: BLE001
+                said.append("  door    :%d DOES NOT ANSWER (%s)"
+                            % (PUBLIC_PORT, type(err).__name__))
+                said.append("          it is an unsupervised task in this "
+                            "process - only RESTART brings it back")
+        _alive_was = False
+        _frames_was = 0
+        try:
+            _th = getattr(STATION_STREAM, "_thread", None)
+            _alive_was = bool(_th is not None and _th.is_alive())
+            _frames_was = int((STATION_STREAM.stats or {}).get("frames") or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        _st: dict[str, Any] = {}
+        try:
+            _st = dict(STATION_STREAM.state() or {})
+        except Exception as err:  # noqa: BLE001
+            said.append("  mixer   would not report: %s" % err)
+        said.append("  mixer   thread %s; its own flag says %s"
+                    % ("alive" if _alive_was else "DEAD",
+                       "running" if _st.get("running") else "stopped"))
+        said.append("  mixer   %s listener(s), %ss produced, %d underrun(s), "
+                    "%d encoder restart(s)"
+                    % (_st.get("listeners"), _st.get("produced_seconds"),
+                       int(_st.get("underruns") or 0),
+                       int(_st.get("encoder_restarts") or 0)))
+        if _st.get("last_error"):
+            said.append("  mixer   last error: "
+                        + str(_st.get("last_error"))[:110])
+        try:
+            STATION_STREAM.ensure_running()
+        except Exception as err:  # noqa: BLE001
+            said.append("  mixer   would not start: %s" % err)
+        await asyncio.sleep(1.0)
+        _alive_now = False
+        _frames_now = _frames_was
+        try:
+            _th = getattr(STATION_STREAM, "_thread", None)
+            _alive_now = bool(_th is not None and _th.is_alive())
+            _frames_now = int((STATION_STREAM.stats or {}).get("frames") or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        if _alive_now and not _alive_was:
+            changed = True
+            said.append("  mixer   was dead and has been started again")
+        if _frames_now > _frames_was:
+            said.append("  mixer   TURNING - %d frame(s) in the last second"
+                        % (_frames_now - _frames_was))
+        elif _alive_now:
+            said.append("  mixer   the thread is up but NO FRAME advanced "
+                        "in a second - ffmpeg or the encoder is the suspect")
+        else:
+            said.append("  mixer   still not running - nothing is being "
+                        "mixed for /stream.mp3")
+        said.append("  a mixer that stops with nobody listening is normal: "
+                    "it lingers, then shuts down until somebody tunes in")
+
+    elif step == "engines":
+        # #1338: THE TWO ENGINES THE STEWARD DOES NOT COVER.
+        #
+        # service_steward's table is xtts, ollama and comfyui. F5 - the
+        # engine that carries the clones whenever XTTS is offloaded - and
+        # the voice-director itself are not in it, and the director is
+        # the middleman every engine handle goes through: when it is the
+        # casualty, restarting the station around it changes nothing.
+        # _lifeboat_restart is the hand outside the water (#825) and it
+        # had no operator path.
+        said.append("$ revive the voice engines")
+        _answered: dict[str, bool] = {}
+        for _name, _url in (("director", VOICE_DIRECTOR_URL + "/host/pressure"),
+                            ("f5", F5_URL + "/health")):
+            try:
+                async with httpx.AsyncClient(timeout=8) as _c:
+                    _r = await _c.get(_url)
+                _answered[_name] = _r.status_code < 300
+                said.append("  %-8s answered %d" % (_name, _r.status_code))
+            except Exception as err:  # noqa: BLE001
+                _answered[_name] = False
+                said.append("  %-8s NO ANSWER (%s)"
+                            % (_name, type(err).__name__))
+        # XTTS: the same road the panel's own button takes - the cooldown
+        # is a pacing rule for a watchdog, not for an operator (#1060).
+        # This one is always pressed, because a deploy of a loaded engine
+        # is a no-op and an offloaded XTTS answers the director perfectly
+        # well - "the director is up" is no evidence about the voice.
+        try:
+            _XTTS_REVIVE_AT[0] = 0.0
+            _xtts_revive_maybe()
+            changed = True
+            said.append("  xtts     reload asked for - it makes room first "
+                        "and then deploys, in the background")
+            said.append("           nothing here can promise it came back; "
+                        "watch the gpu line in the pipeline log")
+        except Exception as err:  # noqa: BLE001
+            said.append("  xtts     would not be asked: %s" % err)
+        # F5 carries the clones whenever XTTS is offloaded, and nothing in
+        # the steward's table ever redeploys it.
+        if _answered.get("f5"):
+            said.append("  f5       answering - left alone")
+        else:
+            try:
+                _F5_REVIVE_AT[0] = 0.0
+                _f5 = await _director_post("/director/engine/f5/deploy")
+            except Exception as err:  # noqa: BLE001
+                _f5 = False
+                said.append("  f5       the deploy raised: %s" % err)
+            changed = changed or bool(_f5)
+            said.append("  f5       deploy %s"
+                        % ("asked for - it loads in the background"
+                           if _f5 else "was refused by the director"))
+        # The director itself LAST, and only when it is not answering -
+        # the same rule the deep ladder uses (#836), because bouncing a
+        # healthy director throws away every engine loaded behind it.
+        if _answered.get("director"):
+            said.append("  director answering - NOT bounced; a healthy "
+                        "director holds every loaded engine behind it")
+        else:
+            try:
+                _ok = await _lifeboat_restart("voice-director")
+            except Exception as err:  # noqa: BLE001
+                _ok = False
+                said.append("  lifeboat raised: %s" % err)
+            if _ok:
+                changed = True
+                said.append("  director the lifeboat restarted it - every "
+                            "engine handle comes back with it")
+            else:
+                said.append("  director the lifeboat did not take it - it "
+                            "lives outside docker at %s" % LIFEBOAT_URL)
+
+    elif step == "disk":
+        # #1338: WHAT IS SAFE TO FREE, AND NOTHING ELSE.
+        #
+        # The only deletion road in this file with fixed, age-based rules
+        # and no "everything" shape is retention_sweep: four named tables
+        # trimmed by age, bounded by a wall-clock budget, already running
+        # on a sixty-second clock. That is what this rung presses.
+        #
+        # It deliberately does NOT press the store room. Every purge
+        # there requires the areas to be NAMED - "there is no
+        # 'everything' shape and an empty list is a 400... the last thing
+        # standing between a slip of the hand and the station's entire
+        # archive" - and a troubleshooting ladder pressing its own button
+        # with a guessed cutoff is exactly the slip that guard is for. So
+        # the shape of the problem is REPORTED and the operator chooses.
+        said.append("$ free what is safe to free")
+        try:
+            _got = await asyncio.to_thread(retention_sweep, str(DATA_DIR))
+            _RETENTION_LAST.clear()
+            _RETENTION_LAST.update(_got)
+            changed = bool(int(_got.get("total") or 0))
+            said.append("  stores  " + str(_got.get("say") or "swept"))
+        except Exception as err:  # noqa: BLE001
+            said.append("  stores  the retention sweep failed: %s" % err)
+        try:
+            _sizes = await asyncio.to_thread(store_sizes, str(DATA_DIR))
+            _big = sorted(_sizes.items(), key=lambda kv: -float(kv[1] or 0))
+            said.append("  stores  %.0f MB across %d store(s); biggest %s"
+                        % (sum(_sizes.values()), len(_sizes),
+                           ", ".join("%s %.0f MB" % (k, v)
+                                     for k, v in _big[:3])))
+        except Exception as err:  # noqa: BLE001
+            said.append("  stores  could not be measured: %s" % err)
+        # The register, from the cache only. Walking the archive is a
+        # CIFS walk and this rung must not become the stall it is here to
+        # relieve, so a cold cache is reported as cold.
+        _reg = _STORAGE_CACHE.get("value") or {}
+        if not _reg:
+            said.append("  archive not measured recently - open the store "
+                        "room to walk it")
+        else:
+            said.append("  archive %.1f GB in %d area(s), measured %ds ago"
+                        % (float(_reg.get("bytes") or 0) / (1 << 30),
+                           len(_reg.get("areas") or []),
+                           int(now - float(_STORAGE_CACHE.get("at") or now))))
+            _over = [r for r in (_reg.get("areas") or [])
+                     if int(r.get("over_bytes") or 0) > 0]
+            for _r in _over[:4]:
+                said.append("  over    %-18s %.1f GB over its own cap"
+                            % (str(_r.get("label") or "")[:18],
+                               int(_r.get("over_bytes") or 0) / (1 << 30)))
+            if _over:
+                said.append("  this rung will not delete those - the store "
+                            "room's purge takes NAMED areas on purpose")
+                said.append("  press it there: Store room > purge, or POST "
+                            "/api/storage/<area>/purge with keep_bytes")
+            else:
+                said.append("  no area is over the cap the operator set")
 
     elif step == "restart":
         said.append("$ restart the station")
@@ -124929,6 +125335,15 @@ async def airlog_keeper() -> None:
         await asyncio.sleep(AIRLOG_TICK)
         try:
             _ensure_chat_ids()
+            # #1339: anything that reached the air without a written
+            # position gets one here, before the screenplay is asked
+            # to order it. Off the loop - it appends to a file.
+            try:
+                await asyncio.to_thread(
+                    script_ledger_catch_up,
+                    list(_RADIO.get("chat") or []))
+            except Exception:  # noqa: BLE001
+                pass          # an unplaced line still airs
             changed = airlog_pick_changed(list(_RADIO.get("chat") or []))
             if changed:
                 await asyncio.to_thread(airlog_write_rows, changed)
@@ -125740,6 +126155,80 @@ def script_ledger_rows() -> list[dict[str, Any]]:
         _SCRIPT_LEDGER_MEMO["rows"] = rows
         _SCRIPT_LEDGER_MEMO["at"] = time.time()
         return list(rows)
+
+
+def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
+    """#1339: a position for every line that reached the air.
+
+    HALF THE SPOKEN LINES NEVER PASSED THROUGH THE BOOTH. Measured on
+    one live hour: 194 of 399 dialogue rows carried no (block, ord) -
+    151 gold bars, 33 of the SFX guy's quips, 9 adverts. They are
+    minted by the fill and rescue roads and appended straight to the
+    ring, so script_ledger_commit never saw them, and the screenplay
+    had nothing to order them by but raw air_at.
+
+    That is what the script jumping around actually was. A ledgered
+    conversation with twenty unledgered lines landing inside it has
+    its own turns pushed apart by them, so the reader gets four lines
+    of one exchange, a stretch of something else, then the rest - and
+    no counter over the ledgered rows alone can see it, because every
+    row it CAN see is in perfect order.
+
+    These cannot be written down before they are audible: nothing
+    knows they are coming. So they are written as soon as they have
+    been HEARD - one block each, in the order they aired. Late enough
+    to be honest about what it is, early enough that a reader
+    watching the hour sees them in place. A one-row block is
+    contiguous by construction, so it can never split anything.
+
+    Returns how many were caught. Called from the keeper, which is
+    already "the one hook that catches all twenty-five ring append
+    sites" - patching the roads one at a time would have missed the
+    next one somebody adds.
+    """
+    try:
+        known = script_ledger_order()
+    except Exception:  # noqa: BLE001
+        return 0
+    want: list[dict[str, Any]] = []
+    for row in rows or []:
+        rid = str((row or {}).get("id") or "")
+        if not rid or rid in known:
+            continue
+        if str(row.get("aired") or "") not in AIR_AT_HEARD:
+            continue          # not heard yet; it may still be written
+        kind = str(row.get("kind") or "")
+        if kind in SCREENPLAY_SKIP_KINDS:
+            continue          # the screenplay will not show it anyway
+        if not str(row.get("text") or "").strip():
+            continue
+        want.append(row)
+    if not want:
+        return 0
+    # In the order they were HEARD, so the blocks ascend the way the
+    # hour did. air_at is frozen once heard (#1288), so this is stable
+    # and a later pass cannot file the same line somewhere else.
+    want.sort(key=lambda r: (float(r.get("air_at") or r.get("ts") or 0),
+                             str(r.get("id") or "")))
+    caught = 0
+    for row in want[:200]:            # a bounded bite per tick
+        got = script_ledger_commit(
+            str(row.get("sid") or ""),
+            [{"line_id": str(row.get("id") or ""),
+              "who": str(row.get("who") or ""),
+              "text": str(row.get("text") or ""),
+              "seconds": float(row.get("seconds") or 0),
+              "turn": row.get("turn"),
+              "kind": str(row.get("kind") or ""),
+              "cue": "",
+              # NOT scripted: nothing wrote this down in advance, and
+              # a reader is entitled to know which lines were planned
+              # and which the station reached for.
+              "scripted": False}],
+            str(row.get("round") or ""))
+        if got:
+            caught += 1
+    return caught
 
 
 def script_ledger_order() -> dict[str, tuple[int, int]]:
@@ -126955,12 +127444,31 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     # Everything then sorts on one axis - ledgered and unledgered
     # together - so the document reads downwards in time with no special
     # cases, and an interjection lands where it actually interrupted.
+    _runs: dict[int, list[tuple[int, int]]] = {}
     if _ord:
-        _runs: dict[int, list[tuple[int, int]]] = {}
         for _ix, _e in enumerate(events):
             _got = _ord.get(str((_e.get("row") or {}).get("id") or ""))
             if _got:
                 _runs.setdefault(_got[0], []).append((_got[1], _ix))
+    # #1337: AND NOT AT ALL FOR AN HOUR IT KNOWS NOTHING ABOUT.
+    #
+    # The guard was `if _ord:`, and `_ord` is the WHOLE ledger - 48
+    # hours of it - not this hour. So it was true for every compose,
+    # including hours that predate the ledger entirely, and the sort
+    # below ran on them with `_when_at` empty.
+    #
+    # That sort keys an unledgered row on its RAW `at`, with the list
+    # position only a third tiebreak. But #1259, #1265 and #1299
+    # express their results AS positions in this list: re-sorting on
+    # air_at throws all three away. For an hour with no ledger rows
+    # that is every row in it - the document silently reverted to the
+    # combed air_at order those passes exist to repair, and then the
+    # monotone sweep painted ascending stamps over the top so it
+    # measured perfectly clean.
+    #
+    # An hour the ledger does not cover is left exactly as the repair
+    # passes built it, which is how it read before #1330.
+    if _runs:
         # #1336: AND ONE CONVERSATION AT A TIME.
         #
         # Making each row monotone fixed the reader being thrown
@@ -127018,10 +127526,20 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             # backwards while the lines themselves run forwards, which is
             # the same confusion one level down.
             #
-            # So the corrected time is written onto the element. The raw
-            # air time is kept beside it as `air_at`, because the ledger's
-            # whole argument is that a document may correct an order
-            # without pretending the original never existed.
+            # So the corrected time is written onto the element, and the
+            # stamp it had on the way in is kept beside it as `air_at`,
+            # because the ledger's whole argument is that a document may
+            # correct an order without pretending the original never
+            # existed.
+            #
+            # #1337b: BE PRECISE ABOUT WHAT THAT VALUE IS. It is the
+            # stamp as it stood entering THIS sweep - not necessarily the
+            # air log's. A line that never aired has already been
+            # re-anchored by #1308 to trail the heard ones, so what is
+            # preserved there is that synthetic position, not a time
+            # anything happened. The air log keeps the only original.
+            # Read `air_at` as "where this row sat before the sort moved
+            # it", which is the question the panel actually asks.
             _run: float | None = None
             for _t, _s, _ix, _e in _keyed:
                 _run = _t if _run is None else max(_t, _run + 0.001)
@@ -185183,6 +185701,36 @@ async function fixRun(from) {
       step = 6;
     }
     if (step <= 6) {
+      /* #1338: THE AUDIO THAT IS ALREADY MADE, BEFORE ANYTHING THAT
+       * MAKES MORE.
+       *
+       * Two shelves hold finished renders that only their own timers
+       * drain - the box's hold queue and the render backlog - so a
+       * starved air can be silent standing next to speech that is
+       * already on disk. Cheap, and it belongs beside FLUSH: FLUSH
+       * throws away what the page cannot start, this puts back what the
+       * station already made. */
+      try {
+        const got = await api("/api/broadcast/fix/drain", {method: "POST"});
+        (got.lines || []).slice(1, 7).forEach((l, i) =>
+          fixSay((i ? "            " : "6 DRAIN     ") + String(l).trim()));
+      } catch (e) { fixSay("6 DRAIN     the station would not answer"); }
+      step = 7;
+    }
+    if (step <= 7) {
+      /* #1338: and then the cupboard. unheard_stock_air(force) drops the
+       * seven-minute interval and the floor test (#1313) - the road no
+       * timer takes - and puts the longest-unheard finished round on the
+       * air out of turn. If the cupboard refuses it says why and falls
+       * back to replaying the last segment. */
+      try {
+        const got = await api("/api/broadcast/fix/stock", {method: "POST"});
+        (got.lines || []).slice(1, 6).forEach((l, i) =>
+          fixSay((i ? "            " : "7 STOCK     ") + String(l).trim()));
+      } catch (e) { fixSay("7 STOCK     the station would not answer"); }
+      step = 8;
+    }
+    if (step <= 8) {
       /* #1334: THE CAUSE BEFORE THE SYMPTOM.
        *
        * This ran after RELEASE. For the #1187 fault that is backwards:
@@ -185194,11 +185742,11 @@ async function fixRun(from) {
       try {
         const got = await api("/api/broadcast/fix/terminals", {method: "POST"});
         const lines = (got.lines || []);
-        fixSay("6 DEVICES   " + (lines[lines.length - 1] || "switches read"));
-      } catch (e) { fixSay("6 DEVICES   the station would not answer"); }
-      step = 7;
+        fixSay("8 DEVICES   " + (lines[lines.length - 1] || "switches read"));
+      } catch (e) { fixSay("8 DEVICES   the station would not answer"); }
+      step = 9;
     }
-    if (step <= 7) {
+    if (step <= 9) {
       health = await fixHealth();
       /* #1331c: AND THEN IT STOPPED ASKING PERMISSION.
        *
@@ -185221,14 +185769,14 @@ async function fixRun(from) {
                      || health.solo_gagged)) {
         try {
           await api("/api/broadcast/fix/release", {method: "POST"});
-          fixSay("7 RELEASE   the exclusive is released - every player may sound");
-        } catch (e) { fixSay("7 RELEASE   the station would not answer"); }
+          fixSay("9 RELEASE   the exclusive is released - every player may sound");
+        } catch (e) { fixSay("9 RELEASE   the station would not answer"); }
       } else {
-        fixSay("7 RELEASE   nobody holds the air - nothing to release");
+        fixSay("9 RELEASE   nobody holds the air - nothing to release");
       }
-      step = 8;
+      step = 10;
     }
-    if (step <= 8) {
+    if (step <= 10) {
       /* Every page, not just this one. A stale pause, a stuck player and
        * yesterday's code all live in the tab, and the tab that is wedged
        * is frequently not the tab the operator is standing at. */
@@ -185239,32 +185787,32 @@ async function fixRun(from) {
        * page is one of them. fixRun was sitting in the eight second wait
        * below when that happened, with no mark written, so fixResume
        * found nothing and the run simply ended. DEEP, SERVICES, RELOAD
-       * and RESTART never ran, and the transcript's last line was "8
+       * and RESTART never ran, and the transcript's last line was "10
        * PAGES asked every page in the house to reload itself" - which
        * reads like success.
        *
        * That is why the deep repair had to be run by hand against a real
-       * wedge today: the button could not reach its own rung 9. */
-      fixMarkWrite({at: Date.now(), step: 9, reloaded: true,
+       * wedge today: the button could not reach its own rung 11. */
+      fixMarkWrite({at: Date.now(), step: 11, reloaded: true,
                     lines: fixLines.slice(-40)});
       try {
         await api("/api/broadcast/fix/reload_pages", {method: "POST"});
-        fixSay("8 PAGES     asked every page in the house to reload itself");
-        fixSay("            (including this one - the run picks up at 9)");
-      } catch (e) { fixSay("8 PAGES     the station would not answer"); }
-      step = 9;
+        fixSay("10 PAGES    asked every page in the house to reload itself");
+        fixSay("            (including this one - the run picks up at 11)");
+      } catch (e) { fixSay("10 PAGES    the station would not answer"); }
+      step = 11;
     }
 
-    if (step <= 9) {
+    if (step <= 11) {
       /* #1335: after PAGES, because a page reload is cheaper and is
        * sometimes enough - and before DEEP, because a terminal whose net
        * stack is dead will not answer anything the deep ladder asks it. */
       try {
         await api("/api/broadcast/fix/kiosk", {method: "POST"});
-        fixSay("9 TERMINAL  asked the desktop to force-stop and relaunch");
+        fixSay("11 TERMINAL asked the desktop to force-stop and relaunch");
         fixSay("            the tablet kiosk - the one cure a reload is not");
-      } catch (e) { fixSay("9 TERMINAL  the station would not answer"); }
-      step = 10;
+      } catch (e) { fixSay("11 TERMINAL the station would not answer"); }
+      step = 12;
     }
 
     fixSay("            listening for eight seconds…");
@@ -185277,12 +185825,44 @@ async function fixRun(from) {
       return;
     }
 
-    if (step <= 10) {
+    if (step <= 12) {
+      /* #1338: THE ROAD OUT OF THE BUILDING.
+       *
+       * Everything above this line is about the speakers in the house.
+       * The public door on :8097 and the mp3 mixer behind /stream.mp3
+       * are how the broadcast leaves it, and neither had a rung: the
+       * door is an unsupervised startup task, and the mixer's own
+       * `running` flag is set true before its thread has made a frame,
+       * so nothing that reads it can tell a live mixer from a dead one.
+       * This probes both for real and revives the mixer. */
+      try {
+        const got = await api("/api/broadcast/fix/stream", {method: "POST"});
+        (got.lines || []).slice(1, 8).forEach((l, i) =>
+          fixSay((i ? "            " : "12 STREAM   ") + String(l).trim()));
+      } catch (e) { fixSay("12 STREAM   the station would not answer"); }
+      step = 13;
+    }
+    if (step <= 13) {
+      /* #1338: the two engines SERVICES does not cover. Its table is
+       * xtts, ollama and comfyui; F5 carries the clones whenever XTTS is
+       * offloaded, and the voice-director is the middleman every engine
+       * handle goes through - when IT is the casualty, restarting the
+       * station around it changes nothing. Before DEEP, because a deep
+       * ladder asking a dead director is asking nobody. */
+      try {
+        const got = await api("/api/broadcast/fix/engines", {method: "POST"});
+        (got.lines || []).slice(1, 8).forEach((l, i) =>
+          fixSay((i ? "            " : "13 ENGINES  ") + String(l).trim()));
+      } catch (e) { fixSay("13 ENGINES  the station would not answer"); }
+      step = 14;
+    }
+
+    if (step <= 14) {
       /* The whole triage tree: remembered cures, the box, routing, the
        * writer's lifeboat, the DJ rung, the deaf-device reboot. Slow on
        * purpose - and it keeps running server-side even if this request
        * gives up waiting, which is why a timeout here is not a failure. */
-      fixSay("10 DEEP     running the repair ladder - engines, the box,");
+      fixSay("14 DEEP     running the repair ladder - engines, the box,");
       fixSay("            routing, the writer. This takes a minute.");
       try {
         const got = await api("/api/broadcast/fix/deep", {method: "POST"});
@@ -185291,17 +185871,17 @@ async function fixRun(from) {
         fixSay("            still running at the station - it reports");
         fixSay("            into the repair log. Carrying on.");
       }
-      step = 11;
+      step = 15;
     }
-    if (step <= 11) {
+    if (step <= 15) {
       /* The only rung in the building that bounces xtts, ollama, comfy
        * or a sick container, and warms the music library. */
       try {
         await api("/api/broadcast/fix/steward", {method: "POST"});
-        fixSay("11 SERVICES census running - every sick service restarted,");
+        fixSay("15 SERVICES census running - every sick service restarted,");
         fixSay("            then counted again. Watch /api/steward.");
-      } catch (e) { fixSay("11 SERVICES the station would not answer"); }
-      step = 12;
+      } catch (e) { fixSay("15 SERVICES the station would not answer"); }
+      step = 16;
     }
 
     health = await fixHealth();
@@ -185312,24 +185892,39 @@ async function fixRun(from) {
       return;
     }
 
-    if (step <= 12) {
+    if (step <= 16) {
       const mark = fixMarkRead();
       if (mark && mark.reloaded) {
-        fixSay("12 RELOAD   already reloaded once this run - moving on");
+        fixSay("16 RELOAD   already reloaded once this run - moving on");
       } else {
-        fixSay("12 RELOAD   reloading this page - the one cure the station");
+        fixSay("16 RELOAD   reloading this page - the one cure the station");
         fixSay("            cannot perform from its end. Back in a moment.");
-        fixMarkWrite({at: Date.now(), step: 13, reloaded: true,
+        fixMarkWrite({at: Date.now(), step: 17, reloaded: true,
                       lines: fixLines.slice(-40)});
         setTimeout(() => { try { location.reload(); } catch (e) {} }, 1200);
         return;
       }
-      step = 13;
+      step = 17;
     }
-    if (step <= 13) {
-      fixSay("13 RESTART  restarting the station process - about twenty");
+    if (step <= 17) {
+      /* #1338: the last thing before the restart, because a box with no
+       * room left writes nothing - no render, no larder, no log - and
+       * that fault survives a restart. This presses the bounded
+       * retention sweep only, and REPORTS the archive rather than
+       * purging it: the store room's purge takes named areas on purpose,
+       * and a ladder guessing a cutoff is exactly the slip that guard
+       * exists to stop. */
+      try {
+        const got = await api("/api/broadcast/fix/disk", {method: "POST"});
+        (got.lines || []).slice(1, 8).forEach((l, i) =>
+          fixSay((i ? "            " : "17 DISK     ") + String(l).trim()));
+      } catch (e) { fixSay("17 DISK     the station would not answer"); }
+      step = 18;
+    }
+    if (step <= 18) {
+      fixSay("18 RESTART  restarting the station process - about twenty");
       fixSay("            seconds of silence, then every page reconnects.");
-      fixMarkWrite({at: Date.now(), step: 14, reloaded: true,
+      fixMarkWrite({at: Date.now(), step: 19, reloaded: true,
                     restarted: true, lines: fixLines.slice(-40)});
       try { await api("/api/broadcast/fix/restart", {method: "POST"}); }
       catch (e) { /* the process is going down; a dropped reply is normal */ }
@@ -185559,7 +186154,7 @@ async function fixResume() {
              + " rungs below are all that is left, then it needs hands.");
     return;
   }
-  fixRun(Number(mark.step) || 6);
+  fixRun(Number(mark.step) || 8);   /* #1338: DEVICES is 8 now */
 }
 
 async function orchToast() {
