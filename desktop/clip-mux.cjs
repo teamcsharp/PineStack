@@ -48,6 +48,28 @@ const FFMPEG_LIKELY = [
  * adds a one-pixel band of black that shows on a screen recording. */
 const EVEN = 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
 
+/* SAYING WHAT COLOUR THE FILE IS.
+ *
+ * An untagged h264 stream is read as BT.601 by ffmpeg and BT.709 by VLC, the
+ * browsers, and most hardware decoders. Measured on a nine-patch chart, that
+ * disagreement is 23 levels on green and 15 on red - plainly visible on skin.
+ * Every check run from this side looked clean precisely because ffmpeg was
+ * agreeing with itself.
+ *
+ * BT.709 limited is the right answer for HD and, better, it is what the
+ * players that IGNORE tags already assume - so the file comes out correct
+ * whether or not anything reads these. */
+const SAY_COLOUR = ['-colorspace', 'bt709', '-color_primaries', 'bt709',
+  '-color_trc', 'bt709', '-color_range', 'tv'];
+
+/* AND CONVERTING TO IT, where the source is not already there.
+ *
+ * A canvas JPEG is FULL-RANGE BT.601. Handing that to libx264 as plain
+ * yuv420p converts nothing, so the levels were being stretched by a player
+ * that thought they were limited-range 709. This names both ends. */
+const TO_709 = 'scale=in_color_matrix=bt601:out_color_matrix=bt709'
+  + ':in_range=pc:out_range=tv';
+
 function findFfmpeg(configured) {
   const tried = [];
   for (const guess of [configured, ...FFMPEG_LIKELY].filter(Boolean)) {
@@ -247,6 +269,10 @@ function planArgs(plan) {
   } else {
     args.push('-an');
   }
+  /* The tablet's own recording arrives tagged BT.709 limited, so here this
+   * is the tag and not a conversion - but without it the tag was being
+   * dropped on the way out and the file became a guess again. */
+  args.push(...SAY_COLOUR);
   args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
     /* yuv420p or the file will not play in half the things it is sent to,
      * including Windows' own preview. */
@@ -303,7 +329,10 @@ async function fromFrames({ dir, pattern, fps, out }, options) {
      * when every one of them is sitting right there. */
     '-start_number', '1',
     '-i', path.join(dir, pattern || 'f%06d.jpg'),
-    '-r', '30', '-vf', EVEN,
+    /* The frames are canvas JPEGs - full-range BT.601 - and the file is read
+     * as limited-range BT.709. Both ends named, then declared. */
+    '-r', '30', '-vf', EVEN + ',' + TO_709,
+    ...SAY_COLOUR,
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
     '-pix_fmt', 'yuv420p', '-movflags', '+faststart', out];
   await run(tool.path, args, 600000);

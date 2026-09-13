@@ -335,6 +335,14 @@ document.addEventListener('keydown', function (event) {
   /* WHILE TOUCH IS ON, LETTERS BELONG TO THE TABLET. Otherwise there would
    * be no way to type an "f" into it. Escape still gets out. */
   if (touching && event.key !== 'Escape') return;
+  /* STOP THE FETCH FIRST. Escape already unzooms and leaves fullscreen, but
+   * both of those can be done again in a second and a pull cannot - so while
+   * one is running it owns the key. */
+  if (event.key === 'Escape' && busy) {
+    event.preventDefault();
+    stopFetch();
+    return;
+  }
   if (event.key === 'f' || event.key === 'F') { event.preventDefault(); goFull(!full); }
   else if (event.key === '0') { event.preventDefault(); reset(); }
   else if (event.key === 'Escape' && zoom > 1) { event.preventDefault(); reset(); }
@@ -519,6 +527,20 @@ statsBtn.addEventListener('click', function () { vitalsOn(!showStats); });
  * quality of one that was asked for on purpose. */
 let busy = false;
 
+/* STOPPING A FETCH IN FLIGHT.
+ *
+ * A pull off the tablet's rolling recording is the one thing in this window
+ * measured in tens of seconds, so it is the one thing worth being able to
+ * abandon. It does not hand back a truncated file: the tablet is asked for a
+ * complete, shorter clip covering what had already come across - see the
+ * note in terminal-glass.cjs on why a cut-off MP4 will not open at all. */
+function stopFetch() {
+  if (!busy) return false;
+  api.glassStop();
+  cover('Stopping \u2014 taking what has come across so far\u2026');
+  return true;
+}
+
 async function capture(saying, work) {
   if (busy) return;
   busy = true;
@@ -546,6 +568,9 @@ document.getElementById('grab').addEventListener('click', function () {
 });
 
 document.getElementById('film').addEventListener('click', function () {
+  /* Pressed again while one is running: stop it. Otherwise the button is
+   * dead for exactly as long as the operator might want out. */
+  if (stopFetch()) return;
   capture('Recording 10s of the tablet\u2026', function () {
     return api.glassClip(10, { target: 'tablet' });
   });
@@ -560,6 +585,7 @@ document.getElementById('film').addEventListener('click', function () {
  * the crop, so the choosing happens there - against everything that exists,
  * rather than against a number guessed beforehand. */
 document.getElementById('back30').addEventListener('click', function () {
+  if (stopFetch()) return;
   capture('Pulling everything the tablet still holds\u2026', function () {
     return api.glassClip(0, { target: 'tablet', replay: true });
   });

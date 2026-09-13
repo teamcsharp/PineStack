@@ -263,6 +263,13 @@ document.getElementById('grab3').addEventListener('click', function () { grab(3)
  * a status line. */
 const LENGTHS = [5, 10, 15, 20, 30];
 let filming = false;
+
+/* THE WAY OUT OF A TAKE.
+ *
+ * Set by the record button pressed a second time, or by Escape. Both the
+ * countdown and the frame loop read it on their next tick, so a cancel lands
+ * within a tenth of a second rather than at the end of the take. */
+let dropFilm = false;
 let filmFor = 10;
 try {
   const kept = Number(localStorage.getItem('pine-camera-seconds'));
@@ -313,6 +320,14 @@ function countdown(from) {
     countEl.classList.remove('rolling');
     countEl.textContent = String(left);
     const tick = setInterval(function () {
+      /* Checked before the count, because the five seconds before a take are
+       * exactly when somebody realises they do not want it. */
+      if (dropFilm) {
+        clearInterval(tick);
+        countEl.textContent = '';
+        done();
+        return;
+      }
       left -= 1;
       if (left <= 0) {
         clearInterval(tick);
@@ -326,9 +341,17 @@ function countdown(from) {
 }
 
 document.getElementById('film').addEventListener('click', async function () {
-  if (filming) return;
+  /* THE SECOND PRESS IS STOP. This used to return, which made the only
+   * control on screen dead for the whole take - and the whole take is
+   * precisely when somebody wants out of it. */
+  if (filming) {
+    dropFilm = true;
+    say('Stopping \u2014 this take is being thrown away.');
+    return;
+  }
   if (!gradedCanvas()) return say('there is no picture to record', true);
   filming = true;
+  dropFilm = false;
   const seconds = filmFor;
   try {
     say('Get ready\u2026');
@@ -341,6 +364,9 @@ document.getElementById('film').addEventListener('click', async function () {
     const began = Date.now();
     await new Promise(function (done) {
       const tick = setInterval(function () {
+        /* Before grabbing another frame, not after - there is no reason to
+         * collect one more picture for something about to be discarded. */
+        if (dropFilm) { clearInterval(tick); return done(); }
         const one = gradedCanvas();
         if (one) frames.push(one.toDataURL('image/jpeg', 0.92));
         const gone = (Date.now() - began) / 1000;
@@ -351,6 +377,13 @@ document.getElementById('film').addEventListener('click', async function () {
     });
     countEl.hidden = true;
     countEl.classList.remove('rolling');
+
+    /* CANCELLED MEANS NOTHING IS WRITTEN. Not a shorter clip - that is a
+     * different gesture, and treating an accidental press as "save what you
+     * have" makes it expensive to take back. */
+    if (dropFilm) {
+      return say('Cancelled \u2014 nothing was saved.');
+    }
 
     say('Writing ' + frames.length + ' frames\u2026');
     const made = await api.cameraRecord({ frames: frames,
@@ -366,6 +399,25 @@ document.getElementById('film').addEventListener('click', async function () {
     countEl.hidden = true;
     countEl.classList.remove('rolling');
     filming = false;
+    dropFilm = false;
+  }
+});
+
+/* ESCAPE IS THE SAME DECISION FROM THE KEYBOARD, and it comes first: an
+ * operator standing in front of the lens with a countdown running is not
+ * aiming a mouse at a small button. It closes the length menu otherwise, so
+ * the key always does the nearest undoable thing. */
+document.addEventListener('keydown', function (event) {
+  if (event.key !== 'Escape') return;
+  if (filming) {
+    event.preventDefault();
+    dropFilm = true;
+    say('Stopping \u2014 this take is being thrown away.');
+    return;
+  }
+  if (filmMenu && !filmMenu.hidden) {
+    event.preventDefault();
+    filmMenu.hidden = true;
   }
 });
 

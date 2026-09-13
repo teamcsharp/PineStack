@@ -2031,6 +2031,11 @@ async function localReport() {
  * takes long enough to write that the timer starts slipping, which shows up
  * as a clip that runs short. The frames are an intermediate that is thrown
  * away after encoding, so the quality that matters is the x264 pass. */
+/* THE WINDOW'S OWN RECORDER, AND THE WAY OUT OF IT. Set by glass:stop; the
+ * frame loop reads it each tenth of a second and the frames already taken are
+ * still muxed, so stopping gives a shorter clip rather than nothing. */
+let stopLocalClip = false;
+
 async function localClipFrames(seconds, dir) {
   const fps = 10;
   const every = Math.round(1000 / fps);
@@ -2038,6 +2043,7 @@ async function localClipFrames(seconds, dir) {
   let taken = 0;
   const startedAt = Date.now();
   while (taken < want) {
+    if (stopLocalClip) break;
     const due = startedAt + taken * every;
     const wait = due - Date.now();
     if (wait > 0) await new Promise((done) => setTimeout(done, wait));
@@ -2367,8 +2373,29 @@ async function localClip(seconds) {
   }
 }
 
+/* CLICKING IT AGAIN STOPS THE PULL. What comes back is a complete, shorter
+ * clip rather than the bytes that happened to arrive - see the note in
+ * terminal-glass.cjs on why a truncated MP4 is not a short one. */
+ipcMain.handle("glass:stop", async () => {
+  /* THREE ROADS BEHIND ONE ICON, and the stop has to reach all of them or it
+   * is a button that lies on two thirds of its presses. Each yields a
+   * complete shorter clip - see the notes on stopRecording and
+   * clip_fromReplay for why that is the whole point. */
+  const glass = require("./terminal-glass.cjs");
+  glass.stopPull(true);
+  stopLocalClip = true;
+  try {
+    /* The tablet's screenrecord, if one is running. Harmless if not. */
+    await (await terminalHost.glass()).stopRecording();
+  } catch (error) { /* nothing recording is the ordinary case */ }
+  return { ok: true };
+});
+
 ipcMain.handle("glass:clip", async (_event, seconds, options) => {
   try {
+    /* Cleared at the start, not at the end: a stop that arrived after the
+     * last one finished must not silently cancel the next one. */
+    stopLocalClip = false;
     const aim = await captureTarget(options && options.target);
     /* CTRL+CLICK REACHES BACKWARDS. The tablet has been recording itself all
      * along, so "the last thirty seconds" is a read rather than a wait. Only

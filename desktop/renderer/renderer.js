@@ -961,6 +961,24 @@ function glassSeconds() {
 }
 
 let glassBusy = false;
+
+/* THE WAY OUT OF A FETCH. Clicking the icon again says it, and so does
+ * Escape - see the note on the click handler on why the icon cannot simply
+ * stay inert while it is working. */
+function stopGlass() {
+  if (!glassBusy) return false;
+  api.glassStop();
+  glassSay("Stopping \u2014 taking what has come across so far\u2026");
+  return true;
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !glassBusy) return;
+  /* Not preventDefault'd past the stop: Escape means other things in this
+   * window too, and this one only claims it while a pull is actually in
+   * flight. */
+  if (stopGlass()) event.preventDefault();
+});
 async function glassDo(saying, work) {
   if (glassBusy) return;
   glassBusy = true;
@@ -1029,6 +1047,14 @@ $("glassStill")?.addEventListener("click", (event) => {
  * recording, which is usually the ones you actually wanted - by the time
  * anyone decides to record something, the thing worth recording is over. */
 $("glassClip")?.addEventListener("click", (event) => {
+  /* A SECOND CLICK WHILE ONE IS IN FLIGHT MEANS STOP. glassDo refuses to
+   * start another anyway, so without this the button is simply dead for as
+   * long as the fetch takes - and a long fetch is exactly when somebody
+   * wants out of it. */
+  if (glassBusy) {
+    stopGlass();
+    return;
+  }
   const seconds = glassSeconds();
   const back = !!(event.ctrlKey || event.metaKey);
   glassDo(back ? "Pulling everything the tablet still holds\u2026"

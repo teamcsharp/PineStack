@@ -121,6 +121,8 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   flowPending: () => ipcRenderer.invoke("flow:pending"),
   inspectDeep: (region) => ipcRenderer.invoke("inspect:deep", region),
   glassClip: (seconds, options) => ipcRenderer.invoke("glass:clip", seconds, options),
+  /* Stop a pull in flight and take a complete, shorter clip instead. */
+  glassStop: () => ipcRenderer.invoke("glass:stop"),
   /* The export window: what is waiting, and what to make of it. */
   clipPending: () => ipcRenderer.invoke("clip:pending"),
   clipExport: (choices) => ipcRenderer.invoke("clip:export", choices),

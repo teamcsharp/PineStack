@@ -72,6 +72,17 @@ function pngSize(buffer) {
   }
 }
 
+/* STOPPING A PULL IN FLIGHT.
+ *
+ * Module-level rather than on the instance, because terminalHost.glass()
+ * hands back a NEW Glass every time it is called - a flag set on one would
+ * never be seen by the pull running on another. There is at most one pull at
+ * a time, and this says so plainly. */
+let pullStopping = false;
+
+function stopPull(want) { pullStopping = want !== false; }
+function pullStopped() { return pullStopping; }
+
 function clampSeconds(seconds) {
   const want = Math.round(Number(seconds));
   if (!isFinite(want)) return CLIP_DEFAULT;
@@ -644,6 +655,25 @@ class Glass {
     catch (error) { return ''; }
   }
 
+  /**
+   * END A RECORDING EARLY AND STILL GET A FILE THAT OPENS.
+   *
+   * screenrecord holds the shell for the whole take, so there is nothing on
+   * this side to interrupt - the stop has to happen on the device. SIGINT is
+   * the signal it handles: it stops capturing and FINALISES the container,
+   * where a kill would leave an mp4 with no index and no player.
+   *
+   * Measured on this tablet: a 30-second take interrupted at four seconds
+   * produced 4.05 seconds of h264 that decodes end to end.
+   *
+   * `maybe`, because nothing recording is not a failure - it is the ordinary
+   * case for a stop pressed a moment too late.
+   */
+  async stopRecording() {
+    await this.maybe('killall -s INT screenrecord', 10000);
+    return { ok: true };
+  }
+
   /* ------------------------------------------------------------- the still */
 
   async still() {
@@ -924,6 +954,7 @@ class Glass {
    * on a long clip.
    */
   async clip_fromReplay(seconds, options) {
+    stopPull(false);
     /* SILENT WHEN ONLY THE PICTURES ARE WANTED. The frame picker shows one
      * moment of the recording and takes a still off it; fetching the
      * broadcast ring alongside would add megabytes and seconds to a window
@@ -975,33 +1006,94 @@ class Glass {
        * produce eleven. */
       const take = Math.min(want, held);
 
-      const got = await page.askJson(`(async function () {
-        try {
-          var b = window.pineDesktop;
-          var saved = await b.replaySave({seconds: ${(isFinite(take) ? take : 86400).toFixed(2)}});
-          if (!saved || !saved.ok) return JSON.stringify({ok:false, why:(saved && saved.detail) || 'it would not write'});
-          var out = '';
-          for (var at = 0; at < saved.bytes;) {
-            var part = await b.replayChunk({at: at, much: 1048576});
-            if (!part || !part.ok) return JSON.stringify({ok:false, why:(part && part.detail) || 'it could not be read out'});
-            out += part.b64;
-            at = part.at + part.sent;
-            if (part.done) break;
-          }
-          return JSON.stringify({ok:true, bytes:saved.bytes, seconds:saved.seconds, b64:out});
-        } catch (err) { return JSON.stringify({ok:false, why:String(err && err.message || err)}); }
-      })()`, 120000);
+      /* Declared before the pull, because a cancel writes its own line into
+       * it and the export window shows these to explain what it holds. */
+      const notes = ['from the tablet\u2019s rolling recording'];
 
-      if (!got || !got.ok) {
-        return { ok: false, why: (got && got.why) || 'the replay did not come back' };
+      /* ONE CHUNK PER ROUND TRIP, so there is a gap to notice a cancel in.
+       * This used to be a loop inside the page, which cannot be interrupted
+       * from here at all. */
+      const write = async (many) => page.askJson(`(async function () {
+        try {
+          var saved = await window.pineDesktop.replaySave({seconds: ${many.toFixed(2)}});
+          if (!saved || !saved.ok) return JSON.stringify({ok:false, why:(saved && saved.detail) || 'it would not write'});
+          return JSON.stringify({ok:true, bytes:saved.bytes, seconds:saved.seconds});
+        } catch (err) { return JSON.stringify({ok:false, why:String(err && err.message || err)}); }
+      })()`, 60000);
+
+      const pull = async (from, much) => page.askJson(`(async function () {
+        try {
+          var part = await window.pineDesktop.replayChunk({at: ${from}, much: ${much}});
+          if (!part || !part.ok) return JSON.stringify({ok:false, why:(part && part.detail) || 'it could not be read out'});
+          return JSON.stringify(part);
+        } catch (err) { return JSON.stringify({ok:false, why:String(err && err.message || err)}); }
+      })()`, 45000);
+
+      const gather = async (saved) => {
+        const parts = [];
+        let at = 0;
+        let quit = false;
+        while (at < saved.bytes) {
+          if (pullStopped()) { quit = true; break; }
+          const part = await pull(at, 1048576);
+          if (!part || !part.ok) return { bad: (part && part.why) || 'it did not come back' };
+          parts.push(part.b64);
+          at = part.at + part.sent;
+          if (part.done) break;
+        }
+        return { b64: parts.join(''), at, quit };
+      };
+
+      let saved = await write(isFinite(take) ? take : 86400);
+      if (!saved || !saved.ok) {
+        return { ok: false, why: (saved && saved.why) || 'the replay would not be written' };
       }
+
+      let heap = await gather(saved);
+      if (heap.bad) return { ok: false, why: heap.bad };
+
+      /* CANCELLED: ASK FOR A SHORTER ONE, DO NOT HAND OVER A PREFIX.
+       *
+       * MediaMuxer writes its index at the END, so the bytes that did arrive
+       * are not a shorter clip, they are an unopenable one. "A portion" has
+       * to mean a complete clip of roughly the length that was waited for. */
+      let stoppedEarly = false;
+      if (heap.quit) {
+        stoppedEarly = true;
+        const share = saved.bytes > 0 ? heap.at / saved.bytes : 0;
+        const shorter = Math.max(2, Number(saved.seconds || take) * share);
+
+        /* THE FLAG HAS TO COME DOWN BEFORE THE SECOND FETCH, or the pull
+         * meant to RESCUE the cancel is cancelled by it on its own first
+         * chunk - which hands back a file with no index, the exact thing all
+         * of this exists to avoid. Measured: without this, the cancelled
+         * clip came back "moov atom not found".
+         *
+         * And it is right, not merely convenient. The operator asked to stop
+         * waiting for a hundred seconds of history; this two-second clip is
+         * the ANSWER to that, not a fresh request to cancel again. */
+        stopPull(false);
+
+        saved = await write(shorter);
+        if (!saved || !saved.ok) {
+          return { ok: false, why: 'stopped, and the shorter clip would not be written' };
+        }
+        heap = await gather(saved);
+        if (heap.bad) return { ok: false, why: 'stopped, and ' + heap.bad };
+      }
+
+      const got = { ok: true, bytes: saved.bytes, seconds: saved.seconds,
+        b64: heap.b64 };
       const mp4 = fromB64(got.b64);
       const ran = Number(got.seconds) || take;
+      if (stoppedEarly) {
+        notes.unshift('stopped early \u2014 ' + ran.toFixed(1)
+          + 's of what had come across');
+      }
 
       /* The same window of the broadcast, out of PineAir's ring. The video
        * ends NOW, so the audio wanted is the same span ending now. */
       const audio = { broadcast: null, mic: null };
-      const notes = ['from the tablet\u2019s rolling recording'];
       if (silent) {
         if (isFinite(want) && ran + 0.5 < want) {
           notes.push('only ' + ran.toFixed(1) + 's had been recorded');
@@ -1223,6 +1315,8 @@ class Glass {
 }
 
 module.exports = {
+  /* So the desktop can stop a pull between chunks - see clip_fromReplay. */
+  stopPull, pullStopped,
   /* broadcastQuestion is exported for main.js's LOCAL recorder: the desktop
    * renderer runs PineAir too, so the very same ring slice works here. */
   Glass, GLASS_QUESTION, GLASS_PORT, broadcastQuestion,
