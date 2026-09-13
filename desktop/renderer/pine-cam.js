@@ -36,9 +36,7 @@
 
   function base() {
     try {
-      var cfg = root.pineDesktopConfig || {};
-      return String(cfg.baseUrl || '').replace(/\/$/, '')
-        || 'http://10.89.1.246:8096';
+      if (root.pineStationBase) return root.pineStationBase();
     } catch (e) { return 'http://10.89.1.246:8096'; }
   }
 
@@ -184,6 +182,7 @@
       if (why && got) {
         why.textContent = live ? 'live' : String(got.state || '');
       }
+      paintRow(got, live);
       /* If it goes while the view is open, say so rather than freezing on
        * the last frame - a still picture of a camera that has gone is the
        * worst of both. */
@@ -191,7 +190,48 @@
     }).catch(function () { /* the station will be asked again in 5s */ });
   }
 
+  /* ------------------------------------------------- the sidebar row */
+
+  /* The Pine Cam reads the way the tablet does: what it is, whether it
+   * is reachable, and what it is costing. It is ALWAYS listed, unlike
+   * the button - a device that only appears when it is working cannot
+   * tell you that it is not working, and 'no camera on the network' is
+   * the answer to the question most often being asked. */
+  function paintRow(got, isLive) {
+    var brief = document.getElementById('pineCamBrief');
+    var stats = document.getElementById('pineCamStats');
+    if (!brief) return;
+    if (!got) { brief.textContent = 'the station did not answer'; return; }
+    var state = String(got.state || '');
+    var seen = !!got.seen;
+    brief.textContent = isLive ? 'live'
+      : seen ? 'on the network - joining'
+        : state === 'no-link' ? 'not on the network' : (state || 'looking…');
+    if (!stats) return;
+    var mb = Math.round(Number(got.kept_bytes || 0) / 1048576);
+    var rows = [
+      ['where', String(got.ssid || '') + ' · ' + String(got.camera || '')],
+      ['signal', got.signal ? got.signal + '%' : (seen ? 'seen' : '—')],
+      ['link', isLive ? 'joined, recording' : state || 'not joined'],
+      ['kept', (got.clips || 0) + ' clip(s) · ' + mb + ' MB'],
+      ['newest', String(got.newest || '—')]
+    ];
+    stats.innerHTML = rows.map(function (r) {
+      return '<div class="pv-row"><span>' + r[0] + '</span><b>'
+        + String(r[1]).replace(/[&<>]/g, '') + '</b></div>';
+    }).join('');
+  }
+
   function start() {
+    var row = document.getElementById('pineCamRow');
+    if (row && !row.__pineCamWired) {
+      row.__pineCamWired = true;
+      row.addEventListener('click', function () {
+        /* Only when there is something to see. Opening an empty frame
+         * teaches the row that it lies. */
+        if (live) { toggle(); } else { look(); }
+      });
+    }
     var b = button();
     if (b && !b.__pineCamWired) {
       b.__pineCamWired = true;

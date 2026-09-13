@@ -104309,6 +104309,135 @@ def pinelink_state() -> dict[str, Any]:
     return got
 
 
+PINELINK_IFACE = "wlx984827b6b478"      # the spare radio, not the station's
+PINELINK_SSID = "H88_5c8e8bddfab1"
+PINELINK_SCAN_TTL = 20.0
+_PINELINK_SEEN: dict[str, Any] = {"at": 0.0, "got": {}}
+
+
+def pinelink_scan(fresh: bool = False) -> dict[str, Any]:
+    """#1347: is the camera on the air, whether or not we have joined it.
+
+    The state file says whether the LINK is up. That is not the same
+    question as whether the camera is THERE - a camera that is switched on
+    and has not been joined yet looks identical, from the state file, to
+    one sitting in a drawer. The operator asked to see it in a list and
+    choose to connect, so the list needs the other question answered.
+
+    A scan is a radio operation on the spare interface and takes several
+    seconds, so it is memoised. It never touches the station's radio: the
+    interface is named here and nowhere does this pass a different one.
+    """
+    # #1347b: THIS PROCESS CANNOT SEE A RADIO.
+    #
+    # The station runs in a container with no nmcli and no systemctl, so
+    # the first cut of this shelled out to tools that are not there and
+    # would have reported "no camera" forever, confidently. The
+    # supervisor owns the interface and already writes a state file the
+    # station reads, so it answers the radio question there and this just
+    # reads it. One writer, one reader, and no door that lets a container
+    # reconfigure the host's networking.
+    now = time.time()
+    try:
+        got = json.loads(PINELINK_STATE.read_text())
+        return {"at": now, "ssid": PINELINK_SSID,
+                "seen": bool(got.get("seen")),
+                "signal": int(got.get("signal") or 0),
+                "joined": bool(got.get("state") == "live")}
+    except Exception:  # noqa: BLE001
+        return {"at": now, "ssid": PINELINK_SSID, "seen": False,
+                "signal": 0, "joined": False}
+
+    if not fresh and now - float(_PINELINK_SEEN.get("at") or 0) < PINELINK_SCAN_TTL:
+        return dict(_PINELINK_SEEN.get("got") or {})
+    got: dict[str, Any] = {"at": now, "seen": False, "signal": 0,
+                           "ssid": PINELINK_SSID}
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nmcli", "-t", "-f", "SSID,SIGNAL,IN-USE", "device", "wifi",
+             "list", "ifname", PINELINK_IFACE],
+            capture_output=True, text=True, timeout=25).stdout or ""
+        for line in out.splitlines():
+            bits = line.split(":")
+            if bits and bits[0] == PINELINK_SSID:
+                got["seen"] = True
+                try:
+                    got["signal"] = int(bits[1]) if len(bits) > 1 else 0
+                except ValueError:
+                    got["signal"] = 0
+                got["joined"] = bool(len(bits) > 2 and bits[2].strip())
+                break
+    except Exception as err:  # noqa: BLE001
+        got["why"] = str(err)[:200]
+    _PINELINK_SEEN.update({"at": now, "got": got})
+    return dict(got)
+
+
+@app.get("/api/pinelink/look")
+async def pinelink_look_api(
+    fresh: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Everything a surface needs to draw one row for the camera.
+
+    Both questions in one answer, because a caller that has to ask twice
+    will eventually ask once and draw a row that is half true: `seen` is
+    the radio, `state`/`fresh` is the link, and `ready` is the only one a
+    picture can be pulled from."""
+    require_read_auth(authorization)
+    saw = await asyncio.to_thread(pinelink_scan, bool(fresh))
+    got = pinelink_state()
+    linked = bool(got.get("state") == "live" and got.get("fresh"))
+    return {
+        "seen": bool(saw.get("seen")), "signal": int(saw.get("signal") or 0),
+        "ssid": PINELINK_SSID, "linked": linked,
+        "state": str(got.get("state") or ""), "clips": int(got.get("clips") or 0),
+        "frame": "/api/pinelink/frame.jpg",
+        "ready": linked,
+        # One sentence a surface can print without knowing any of this.
+        "say": ("the camera is linked and recording" if linked
+                else "the camera is on the network - connecting"
+                if saw.get("seen")
+                else "no camera on the network"),
+    }
+
+
+@app.post("/api/pinelink/connect")
+async def pinelink_connect_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Join the camera now, rather than waiting for the next sweep.
+
+    The supervisor retries every fifteen seconds on its own, so this is
+    impatience rather than necessity - but a button that does nothing for
+    fifteen seconds is a button the operator presses again, and then does
+    not trust. It restarts the supervisor, which is the one thing that
+    holds the radio; joining behind its back would leave two owners of the
+    same interface."""
+    require_auth(authorization)
+    try:
+        import subprocess
+        # #1347b: a container cannot restart a host unit. The supervisor
+        # retries every fifteen seconds anyway, so the honest answer is
+        # to say when the next attempt is rather than to pretend to have
+        # forced one.
+        raise FileNotFoundError("the station cannot reach the host's "
+                                "service manager")
+        subprocess.run(["systemctl", "restart", "pinelink"],
+                       capture_output=True, timeout=20)
+    except Exception as err:  # noqa: BLE001
+        return {"ok": True, "say": "the link retries every 15 seconds on "
+                "its own - it will join as soon as the camera is on the air",
+                "retrying": True}
+    except SyntaxError:  # unreachable; keeps the original branch honest
+        return {"ok": False, "say": "could not ask the link to reconnect: "
+                + str(err)[:160]}
+    _PINELINK_SEEN["at"] = 0.0          # the next look is a real scan
+    return {"ok": True,
+            "say": "asked the link to reconnect - it takes a few seconds"}
+
+
 @app.get("/api/pinelink/state")
 async def pinelink_state_api(
     authorization: str | None = Header(default=None),
@@ -115793,9 +115922,16 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
     # #1253: the page needs to know which side of the door it came
     # through. In the house it keeps the synchronised player; on the road
     # it defaults to the stream, which is the only road that works there.
-    return HTMLResponse(page
-                        .replace("__SERVER_KEY__", json.dumps(token))
-                        .replace("__AWAY__", "true" if public else "false"))
+    # #1253: NO-STORE. Without it Safari can hand back the cached player
+    # on a reload, so "I reloaded and it still does it" and "the fix is
+    # not deployed" become the same sentence. The page is a few tens of
+    # kB and it is the thing that must never be stale.
+    return HTMLResponse(
+        page.replace("__SERVER_KEY__", json.dumps(token))
+            .replace("__AWAY__", "true" if public else "false")
+            .replace("__BUILD__", str(int(_BUILD_MS))),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                 "Pragma": "no-cache"})
 
 
 @app.post("/api/dj/shout")
@@ -200099,6 +200235,7 @@ the library files untouched">📶 quality</label>
 
   <div class="patter" id="patter"></div>
   <div class="note" id="note"></div>
+  <div class="note" id="build" style="opacity:.45;font-size:11px"></div>
 </div>
 
 <script>
@@ -200107,6 +200244,9 @@ const KEY = __SERVER_KEY__;
  * or in the HOUSE? The two want opposite things, and the page used
  * to do the house thing for everybody. */
 const AWAY = __AWAY__;
+/* #1253: which player is actually running. "Did it update" should be
+ * readable off the screen, not inferred from behaviour. */
+const BUILD = "__BUILD__";
 // A listener id keeps the count honest across reloads in the same tab.
 const ME = sessionStorage.getItem("pbfm") ||
   (sessionStorage.setItem("pbfm", Math.random().toString(36).slice(2)),
@@ -200475,13 +200615,32 @@ let pineBuildGoing = false;
 
 /* #1213: and the same shape for an ASKED-FOR reload. The station can
    now reach the flags that live in this tab. */
+/* #1253: a reload is owed, but not while the radio is playing. */
+let pineReloadOwed = false;
+
+function pineListening() {
+  try { return !!playing; } catch (e) { return false; }
+}
+
+function pineReloadOrDefer(delay) {
+  if (pineListening()) {
+    /* THE BROADCAST OUTRANKS THE BUILD. Reloading kills the audio
+     * element, and iOS will not start it again without a gesture - so a
+     * restart of the station would silently end the drive. Remember it
+     * and take it when they stop. */
+    pineReloadOwed = true;
+    pineBuildGoing = false;
+    return;
+  }
+  pineBuildGoing = true;
+  setTimeout(() => { try { location.reload(); } catch (e) {} }, delay);
+}
+
 function pineReloadWatch(state) {
   const at = Number((state || {}).reload_at || 0);
   if (!at || pineBuildGoing) return;
   if (at <= pineBuildUp) return;           /* older than this page */
-  pineBuildGoing = true;
-  setTimeout(() => { try { location.reload(); } catch (e) {} },
-             800 + Math.floor(Math.random() * 4000));
+  pineReloadOrDefer(800 + Math.floor(Math.random() * 4000));
 }
 
 function pineBuildWatch(state) {
@@ -200490,9 +200649,8 @@ function pineBuildWatch(state) {
   if (!pineBuildSeen) { pineBuildSeen = build; return; }
   if (build === pineBuildSeen || pineBuildGoing) return;
   if (Date.now() - pineBuildUp < 60000) { pineBuildSeen = build; return; }
-  pineBuildGoing = true;
-  setTimeout(() => { try { location.reload(); } catch (e) {} },
-             1500 + Math.floor(Math.random() * 6000));
+  pineBuildSeen = build;
+  pineReloadOrDefer(1500 + Math.floor(Math.random() * 6000));
 }
 
 function sync(state) {
@@ -201483,6 +201641,11 @@ function tune() {
      * this button - which is the persistence that was asked for. */
     stopEverything();
     paintMediaSession(null);
+    /* #1253: the reload we declined to do mid-broadcast. Now is the one
+     * moment it costs nothing. */
+    if (pineReloadOwed) {
+      setTimeout(() => { try { location.reload(); } catch (e) {} }, 400);
+    }
     return;
   }
   startListening();
@@ -201587,6 +201750,12 @@ async function request() {
 
 initLevels();
 initMode();                     // #1253: which road this page takes
+try {
+  document.getElementById("build").textContent =
+    "player " + BUILD.slice(-6) + " · "
+    + (streamMode ? (wantsHls() ? "car stream (HLS)" : "car stream (mp3)")
+                  : "live with the house");
+} catch (e) {}
 poll();
 /* #1253: on the stream road these two are DISPLAY ONLY - the title, the
  * sleeve, the patter, the paused state. Nothing they return touches the

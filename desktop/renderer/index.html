@@ -135,6 +135,19 @@
         </button>
         <div id="vitals" class="pv"></div>
       </div>
+      <!-- #1348: the Pine Cam reads like the tablet does - what it is,
+           whether it is reachable, and what it is costing. It is always
+           listed, because a device that only appears when it is working
+           cannot tell you it is not. Click it for the picture. -->
+      <div id="pineCamBox2" class="vitals-box">
+        <button id="pineCamRow" class="vitals-fold" type="button"
+                title="The Pine Cam. Click to watch it, when it is linked.">
+          <span data-pine-icon="c:view" aria-hidden="true"></span>
+          <span>Pine Cam</span>
+          <span id="pineCamBrief" class="vitals-brief">looking…</span>
+        </button>
+        <div id="pineCamStats" class="pv"></div>
+      </div>
       <div class="stream-routes">
         <button id="nabuMuteBtn" type="button" title="Mute every sound on Nabu without changing its physical volume or routes">Mute Nabu</button>
         <button id="nabuUnmuteBtn" type="button" title="Restore Nabu at its existing physical volume and channel settings">Unmute Nabu</button>

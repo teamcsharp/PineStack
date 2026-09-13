@@ -118,6 +118,26 @@
      */
     '.pine-view-tab{background:#1c242c;color:#edf3f5;border:1px solid #35414c;',
     'border-right:none;border-radius:12px 0 0 12px;padding:16px 12px;',
+    /* #1345b: AND IT MUST SAY ITS OWN HEIGHT.
+     *
+     * This is the whole fault, and it is not flex at all. The desktop
+     * shell's styles.css carries a bare element rule -
+     *
+     *     button { height: 36px; padding: 0 12px; }
+     *
+     * - and this rule never declared a height, so there was nothing to
+     * override: specificity does not enter into it when only one rule
+     * declares the property. Every tab was pinned to a 36px square, and
+     * vertical text in a 36px box loses its word. Measured on the real
+     * document: all nine tabs exactly 40x36, seven of them clipped -
+     * SAMPLER needed 69px and was given 36.
+     *
+     * The tablet has no such element rule, which is precisely why the
+     * rail looks right there and cramped here off the same stylesheet.
+     * A rail that can be dropped into any document has to state the
+     * dimensions it depends on rather than inherit them.
+     */
+    'height:auto;width:auto;min-height:0;min-width:0;',
     'flex:0 0 auto;white-space:nowrap;',
     'font-size:11px;letter-spacing:.09em;writing-mode:vertical-rl;',
     'cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',

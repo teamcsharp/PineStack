@@ -55,6 +55,7 @@ RTSP = "rtsp://%s:554/live" % CAMERA
 SEGMENT_SECONDS = 300           # one file per five minutes
 KEEP_HOURS = 48.0               # same as every other ledger here
 RESTART_REST = 5.0
+_LAST_SEEN: dict = {"seen": False, "signal": 0}
 
 
 def run(cmd: list[str], timeout: float = 30.0) -> tuple[int, str]:
@@ -74,7 +75,10 @@ def say(state: str, **more) -> None:
         OUT.mkdir(parents=True, exist_ok=True)
         STATE.write_text(json.dumps({
             "at": time.time(), "state": state, "camera": CAMERA,
-            "rtsp": RTSP, "ssid": SSID, "iface": SPARE_IF, **more}, indent=2))
+            "rtsp": RTSP, "ssid": SSID, "iface": SPARE_IF,
+            # #1347: so a surface can draw "the camera is there but not
+            # joined yet" without being able to see a radio.
+            **_LAST_SEEN, **more}, indent=2))
     except Exception:  # noqa: BLE001
         pass
 
@@ -100,6 +104,32 @@ def join() -> bool:
     code, out = run(["nmcli", "device", "wifi", "connect", SSID,
                      "password", PSK, "ifname", SPARE_IF], 60)
     return code == 0 and linked()
+
+
+def seen_on_air() -> dict:
+    """#1347: is the camera BROADCASTING, whether or not we have joined.
+
+    The station runs in a container with no nmcli and no systemctl, so it
+    cannot ask the radio anything. This can - it is the process that owns
+    the interface - so it answers here and leaves the answer in the state
+    file the station already reads. One writer, one reader, no new door.
+    """
+    got = {'seen': False, 'signal': 0}
+    try:
+        code, out = run(['nmcli', '-t', '-f', 'SSID,SIGNAL', 'device',
+                         'wifi', 'list', 'ifname', SPARE_IF], 25)
+        for line in (out or '').splitlines():
+            bits = line.split(':')
+            if bits and bits[0] == SSID:
+                got['seen'] = True
+                try:
+                    got['signal'] = int(bits[1]) if len(bits) > 1 else 0
+                except ValueError:
+                    got['signal'] = 0
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    return got
 
 
 def camera_awake() -> bool:
@@ -169,6 +199,7 @@ def supervise(once: bool = False) -> None:
     CLIPS.mkdir(parents=True, exist_ok=True)
 
     while True:
+        _LAST_SEEN.update(seen_on_air())
         if not join():
             say("no-link", why="the camera's network is not being "
                 "broadcast, or the join failed")

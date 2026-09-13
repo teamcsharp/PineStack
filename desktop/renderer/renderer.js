@@ -1,6 +1,25 @@
 const api = window.pineDesktop;
 
 let config = null;
+
+/* #1348: WHERE THE STATION IS, FOR ANYTHING THAT BUILDS A URL.
+ *
+ * The chrome is a file:// document. A root-relative URL - the kind
+ * every view was written with, because on the tablet the panel is
+ * SERVED by the station - resolves to file:///api/... here and loads
+ * nothing at all. Views that fetch through the pineDesktop bridge
+ * escaped this; views that put a path in an <img src> did not, which
+ * is why the SC monitor drew and the slideshow stayed black.
+ *
+ * config is module-local and arrives asynchronously, so this is a
+ * function rather than a constant, and it answers with the same
+ * fallback the rest of this file uses. */
+window.pineStationBase = function () {
+  try {
+    return String((config && config.baseUrl)
+      || "http://127.0.0.1:8096").replace(/\/$/, "");
+  } catch (err) { return "http://127.0.0.1:8096"; }
+};
 let currentView = "control";
 let railResize = null;
 let defaultBroadcastApplied = false;
