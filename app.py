@@ -104455,26 +104455,71 @@ async def pinelink_connect_api(
     holds the radio; joining behind its back would leave two owners of the
     same interface."""
     require_auth(authorization)
+    return pinelink_kick("connect",
+                         "asked the link to reconnect - it takes a few "
+                         "seconds")
+
+
+PINELINK_KICK_PATH = data_path("pinelink_kick")
+PINELINK_KICK_ACTIONS = ("connect", "reset-radio")
+
+
+def pinelink_kick(action: str, said: str) -> dict[str, Any]:
+    """#1359: THE ONE DOOR FROM THE CONTAINER TO THE RADIO.
+
+    This route used to call `systemctl restart pinelink` directly, and it
+    could never have worked: there is no systemctl in this image - measured,
+    `docker exec spark-agent which systemctl` returns nothing. #1347b then
+    made it HONEST, which was the right first move - it stopped claiming to
+    have forced a reconnection and said the supervisor retries every
+    fifteen seconds - but an honest button that does nothing is still a
+    button that does nothing, and the operator presses it anyway.
+
+    The station already had the right pattern twice over: ComfyUI and the
+    host services are restarted by writing a flag file that a systemd
+    .path unit on the host is watching. pinelink-kick.path does the same
+    for the camera link, and its service accepts exactly the two actions
+    named below - so neither this process nor anything that reaches it can
+    widen what the host will do on its behalf.
+
+    The supervisor also holds a radio, which is the other reason this must
+    not be done behind its back: joining an interface it owns would leave
+    two owners of the same device.
+    """
+    if action not in PINELINK_KICK_ACTIONS:
+        return {"ok": False, "say": "the link does not know how to " + action}
     try:
-        import subprocess
-        # #1347b: a container cannot restart a host unit. The supervisor
-        # retries every fifteen seconds anyway, so the honest answer is
-        # to say when the next attempt is rather than to pretend to have
-        # forced one.
-        raise FileNotFoundError("the station cannot reach the host's "
-                                "service manager")
-        subprocess.run(["systemctl", "restart", "pinelink"],
-                       capture_output=True, timeout=20)
+        PINELINK_KICK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PINELINK_KICK_PATH.write_text(action)
     except Exception as err:  # noqa: BLE001
-        return {"ok": True, "say": "the link retries every 15 seconds on "
-                "its own - it will join as soon as the camera is on the air",
-                "retrying": True}
-    except SyntaxError:  # unreachable; keeps the original branch honest
-        return {"ok": False, "say": "could not ask the link to reconnect: "
-                + str(err)[:160]}
+        return {"ok": False,
+                "say": "could not reach the host bridge: " + str(err)[:160]}
     _PINELINK_SEEN["at"] = 0.0          # the next look is a real scan
-    return {"ok": True,
-            "say": "asked the link to reconnect - it takes a few seconds"}
+    return {"ok": True, "action": action, "say": said}
+
+
+@app.post("/api/pinelink/reset-radio")
+async def pinelink_reset_radio_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1359: unbind and re-bind the USB adapter.
+
+    Measured on 2026-09-13: after three refused authentications this
+    RTL8821AU stopped scanning altogether - `iw dev ... scan` returned
+    zero networks with no error at all, and the interface reported
+    admin-UP with NO-CARRIER. `ip link` down and up did not clear it.
+    A USB re-bind did: the radio came back seeing twelve networks.
+
+    That is why this exists as its own button rather than as advice. The
+    doctor's step for that state used to read "reseat it", which is the
+    physical version of the same idea and cannot be followed from a panel
+    - or from another room, which is where the operator usually is.
+    """
+    require_auth(authorization)
+    return pinelink_kick("reset-radio",
+                         "re-binding the spare radio on the USB bus, then "
+                         "restarting the link - give it about fifteen "
+                         "seconds")
 
 
 PINELINK_PREF = data_path("pinelink_pref.json")

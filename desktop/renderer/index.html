@@ -162,6 +162,14 @@
                   title="Save what the camera can see right now">Snapshot</button>
           <button id="pineCamRec" type="button" hidden
                   title="Mark the start of a clip; press again to end it and save it">Record</button>
+          <!-- #1359: the cure for the state the troubleshooter used to
+               answer with "reseat it". This chipset stops scanning
+               altogether after a refused association - admin-UP, no
+               carrier, and a scan that returns nothing with no error -
+               and only a USB re-bind clears it. Advice you cannot
+               follow from another room is not advice. -->
+          <button id="pineCamReset" type="button"
+                  title="Unbind and re-bind the spare radio on the USB bus. Use this when the troubleshooter says it can see no networks at all.">Reset radio</button>
           <!-- #1351: the camera on the air, when there is air to be on.
                Defaults to on: turning the camera on is a deliberate act,
                and the overwhelmingly likely reason for it is to show

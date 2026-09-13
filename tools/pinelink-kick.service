@@ -1,0 +1,9 @@
+[Unit]
+Description=Do what the Pine Box agent asked of the camera link (flag file bridge)
+
+[Service]
+Type=oneshot
+# The flag carries the ACTION. The container cannot run systemctl and has
+# no business holding a radio; this is the one door, and it does exactly
+# two things, named here so neither the panel nor the agent can widen it.
+ExecStart=/bin/sh -c 'F=/home/ehm_eckx/pinevoice-stack/spark-agent/data/pinelink_kick; A=$(head -c 32 "$F" 2>/dev/null | tr -cd "a-z-"); rm -f "$F"; case "$A" in reset-radio) /usr/bin/python3 /home/ehm_eckx/pinevoice-stack/spark-agent/tools/pinelink.py --reset-radio; systemctl restart pinelink.service ;; connect) systemctl restart pinelink.service ;; *) echo "unknown action: $A" ;; esac'

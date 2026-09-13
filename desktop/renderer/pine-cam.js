@@ -37,10 +37,27 @@
   var shown = false;
   var live = false;
 
+  /* #1358: AND IT HAD NO ANSWER AT ALL OFF THE DESKTOP.
+   *
+   * pineStationBase is defined by the Electron renderer. Anywhere else -
+   * the tablet's panel, a browser pointed at the station - it is
+   * undefined, this function fell off its own end, and every URL built
+   * from it began with the four letters `undefined`. The frame road, the
+   * look road and the doctor all failed the same way and all failed
+   * silently, because each caller catches.
+   *
+   * Where the document IS served by the station a bare path is not just
+   * acceptable, it is correct: it follows the host the panel was opened
+   * on, which on the tablet is the loopback door.
+   */
   function base() {
     try {
+      if (root.location && /^https?:$/.test(root.location.protocol)) {
+        return '';
+      }
       if (root.pineStationBase) return root.pineStationBase();
-    } catch (e) { return 'http://10.89.1.246:8096'; }
+    } catch (e) { /* fall through to the last resort */ }
+    return 'http://10.89.1.246:8096';
   }
 
   function ask(path) {
@@ -58,8 +75,37 @@
 
   /* ------------------------------------------------------- the button */
 
+  /* #1358: THE BUTTON, WHERE THERE IS A BAR TO PUT IT IN - AND WHERE
+   * THERE IS NOT.
+   *
+   * glassPineCam lives in the Electron chrome's glass bar. The tablet
+   * has no such bar: its shell is a WebView showing the station's panel
+   * with the views welded on, and nothing in that page has ever heard
+   * of this one. So showButton found nothing, did nothing, and the
+   * camera could not be opened on the surface the operator actually
+   * carries around.
+   *
+   * It builds its own rather than asking the panel to carry a button
+   * for a device that is usually not there. Same rule as the chrome's:
+   * absent until the link is live, gone when the camera goes.
+   */
   function button() {
-    return document.getElementById('glassPineCam');
+    var own = document.getElementById('glassPineCam');
+    if (own) return own;
+    own = document.getElementById('pineCamFlag');
+    if (own) return own;
+    if (!document.body) return null;
+    own = document.createElement('button');
+    own.id = 'pineCamFlag';
+    own.type = 'button';
+    own.className = 'pine-cam-flag';
+    own.hidden = true;
+    own.title = 'The Pine Cam is live - tap to watch it';
+    own.innerHTML = '<i class="pine-cam-flag-dot"></i><span>CAM</span>';
+    own.addEventListener('click', toggle);
+    own.__pineCamWired = true;
+    document.body.appendChild(own);
+    return own;
   }
 
   function showButton(on) {
@@ -435,6 +481,25 @@
       }).catch(function () { say('the station did not answer'); });
   }
 
+  /* #1359: the cure the troubleshooter can only describe. */
+  function resetRadio() {
+    var out = document.getElementById('pineCamDoc');
+    if (out) { out.hidden = false; out.textContent = 'resetting the radio…'; }
+    Promise.resolve(post('/api/pinelink/reset-radio', {}))
+      .then(function (r) {
+        if (out) {
+          out.textContent = (r && r.say)
+            || 'the station did not answer';
+        }
+        /* The re-bind and the service restart together take about
+         * fifteen seconds, so asking sooner would only show the
+         * outage it is curing. */
+        setTimeout(troubleshoot, 16000);
+      }).catch(function () {
+        if (out) out.textContent = 'the station did not answer';
+      });
+  }
+
   /* ------------------------------------------------ the troubleshooter */
 
   /* 'Not on the network' covers three faults with different cures - a
@@ -519,6 +584,14 @@
       recBtn.addEventListener('click', function (ev) {
         ev.stopPropagation();
         record();
+      });
+    }
+    var resetBtn = document.getElementById('pineCamReset');
+    if (resetBtn && !resetBtn.__wired) {
+      resetBtn.__wired = true;
+      resetBtn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        resetRadio();
       });
     }
     var row = document.getElementById('pineCamRow');

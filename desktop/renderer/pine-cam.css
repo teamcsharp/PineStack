@@ -99,6 +99,46 @@
   cursor: pointer;
 }
 .pine-cam-pref input { margin-top: 2px; }
+/* #1358: the indicator, on a surface with no glass bar to hang one in.
+
+   It sits on the right edge above the view rail rather than in it: the
+   rail is already nine tabs and measured at 758px against an 800px
+   tablet, so a tenth would have put something where no thumb can reach
+   it. This is small, it is only there when the camera is, and it is the
+   same red the broadcast tag uses so the two read as one state. */
+.pine-cam-flag {
+  position: fixed;
+  right: 0;
+  top: 12px;
+  z-index: 2147483002;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px 7px 11px;
+  border: 1px solid #35414c;
+  border-right: none;
+  border-radius: 12px 0 0 12px;
+  background: #1c242c;
+  color: #edf3f5;
+  font: 600 11px/1 Inter, Segoe UI, system-ui, sans-serif;
+  letter-spacing: .08em;
+  cursor: pointer;
+}
+.pine-cam-flag[hidden] { display: none !important; }
+.pine-cam-flag-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #e46b6b;
+  /* It pulses, because the useful reading of this control is not 'there
+     is a camera' but 'it is running right now'. */
+  animation: pine-cam-flag-beat 1.8s ease-in-out infinite;
+}
+@keyframes pine-cam-flag-beat {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
 /* #1354: the viewer picker. Deliberately plain - it is a list of
    people and a tick each, and anything more decorative would make a
    permission look like a preference. */

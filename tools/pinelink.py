@@ -30,6 +30,7 @@ up later, when you try to play it back or cut it.
 from __future__ import annotations
 
 import argparse
+import glob                  # #1359: finding the adapter on the bus
 import json
 import os
 import shutil
@@ -47,6 +48,10 @@ STATE = OUT / "state.json"
 
 STATION_IF = "wlP9s9"           # holds 10.89.1.246 - never touched
 SPARE_IF = "wlx984827b6b478"
+# #1359: the TP-Link Archer T2U PLUS (RTL8821AU) that IS the spare
+# radio. Used only to find it on the USB bus for a reset, and matched
+# exactly - never as a prefix.
+ADAPTER_VENDOR = "2357"
 SSID = "H88_5c8e8bddfab1"
 PSK = "12345678"
 CAMERA = "192.168.1.254"
@@ -168,6 +173,104 @@ def seen_on_air() -> dict:
     return got
 
 
+NEIGH_CEILING = "net.ipv4.neigh.default.gc_thresh3"
+
+
+def neigh_pressure() -> dict:
+    """#1359: IS THE KERNEL STILL ACCEPTING NEW NEIGHBOURS?
+
+    Measured on 2026-09-13, and it is the reason this whole diagnostic
+    needed another question. The adapter associated with the camera three
+    times and timed out authenticating each time; the radio looked fine,
+    the camera was on the air, and the doctor's verdict was "out of range".
+
+    It was neither. The ARP table held 1,019 entries against a
+    gc_thresh3 of 1,024 - the hard ceiling - because five Docker bridge
+    networks were holding about 250 each. dmesg was flooding with
+    "neighbour: arp_cache: neighbor table overflow!", and a kernel that
+    cannot record a new neighbour cannot finish an ARP exchange with a
+    camera it has only just met.
+
+    The defaults are sized for a machine with one or two networks on it.
+    This box has eight bridges before anything else is counted, so this is
+    not an edge case here - it is the normal state, and it will come back
+    the moment the ceiling is lowered or a new stack is brought up.
+    """
+    out = {'entries': 0, 'ceiling': 0, 'full': False}
+    try:
+        code, txt = run(['ip', '-4', 'neigh', 'show'], 15)
+        out['entries'] = len([x for x in (txt or '').splitlines() if x.strip()])
+    except Exception:  # noqa: BLE001
+        return out
+    try:
+        code, txt = run(['sysctl', '-n', NEIGH_CEILING], 10)
+        out['ceiling'] = int((txt or '0').strip() or 0)
+    except Exception:  # noqa: BLE001
+        out['ceiling'] = 0
+    if out['ceiling']:
+        # 90%, not 100%. The table is refused at the ceiling, and by the
+        # time it is exactly full the damage has already been done to
+        # whatever tried to associate.
+        out['full'] = out['entries'] >= out['ceiling'] * 0.9
+    return out
+
+
+def radio_reset() -> dict:
+    """#1359: re-bind the USB adapter, which is what actually cured it.
+
+    "reseat it" was the advice and it was wrong - or rather, it was the
+    physical version of the right idea, and it cannot be followed from a
+    panel. After a failed authentication this RTL8821AU stops scanning
+    entirely: `iw dev ... scan` returns zero networks with no error, the
+    interface reports admin-UP with NO-CARRIER, and `ip link` down/up does
+    not clear it. Unbinding and re-binding the USB device does: the radio
+    came back seeing twelve networks.
+
+    Deliberately narrow. It finds the adapter by its USB vendor id and
+    refuses to act if that lookup is ambiguous, because the one thing this
+    must never do is reset a different device - the station's own radio is
+    on this machine and the broadcast rides it.
+    """
+    out = {'ok': False, 'say': ''}
+    try:
+        found = []
+        for path in sorted(glob.glob('/sys/bus/usb/devices/*')):
+            vendor = os.path.join(path, 'idVendor')
+            if not os.path.isfile(vendor):
+                continue
+            try:
+                with open(vendor) as fh:
+                    if fh.read().strip() != ADAPTER_VENDOR:
+                        continue
+            except OSError:
+                continue
+            # A USB device directory is named bus-port; an INTERFACE is
+            # named bus-port:config.interface and must not be unbound here.
+            name = os.path.basename(path)
+            if ':' in name:
+                continue
+            found.append(name)
+        if len(found) != 1:
+            out['say'] = ('found %d adapters with vendor %s - refusing to '
+                          'guess which one to reset'
+                          % (len(found), ADAPTER_VENDOR))
+            return out
+        which = found[0]
+        for door in ('unbind', 'bind'):
+            with open('/sys/bus/usb/drivers/usb/' + door, 'w') as fh:
+                fh.write(which)
+            time.sleep(4 if door == 'unbind' else 7)
+        out['ok'] = True
+        out['device'] = which
+        out['say'] = ('re-bound the USB adapter at %s - it takes a few '
+                      'seconds to start scanning again' % which)
+    except PermissionError:
+        out['say'] = 'only root can re-bind a USB device'
+    except Exception as err:  # noqa: BLE001
+        out['say'] = str(err)[:200]
+    return out
+
+
 def doctor() -> dict:
     """#1349: why is the camera not here, in terms that separate the
     three things that look identical from the outside.
@@ -202,11 +305,30 @@ def doctor() -> dict:
     except Exception as err:  # noqa: BLE001
         out['why'] = str(err)[:200]
     seen.sort(reverse=True)
+    out['neigh'] = neigh_pressure()
     out['nearby'] = len(seen)
     out['strongest'] = [{'ssid': n, 'signal': s} for s, n in seen[:5]]
     out['camera'] = any(n == SSID for _s, n in seen)
 
-    if out['camera']:
+    # #1359: the answer that outranks all of them. A full neighbour
+    # table breaks the ARP exchange itself, so the radio looks healthy,
+    # the camera is visible, and the join still fails - with every
+    # other reading saying nothing is wrong.
+    if out.get('neigh', {}).get('full'):
+        n = out['neigh']
+        out['verdict'] = ('the kernel neighbour table is full (%d of %d)'
+                          % (n['entries'], n['ceiling']))
+        out['steps'] = [
+            'new ARP entries are being refused, so this machine cannot '
+            'finish an address exchange with a device it has just met - '
+            'the radio and the camera can both be perfectly healthy and '
+            'the join will still time out',
+            'Docker bridge networks are almost always what fills it: '
+            'each one holds an entry per address it has seen',
+            'raise the ceiling: net.ipv4.neigh.default.gc_thresh1/2/3 '
+            'to 1024/4096/8192 in /etc/sysctl.d, then sysctl -p']
+        out['cure'] = 'neigh'
+    elif out['camera']:
         out['verdict'] = 'the camera is on the air - joining it now'
         out['steps'] = ['found it; the link will join within 15 seconds']
     elif not out['iface_up']:
@@ -215,9 +337,18 @@ def doctor() -> dict:
                         'restart the pinelink service']
     elif out['nearby'] == 0:
         out['verdict'] = 'the spare radio sees nothing at all'
-        out['steps'] = ['the adapter is up but scanning nothing - reseat '
-                        'it, or check it is not being held by something '
-                        'else']
+        # #1359: and the cure is a re-bind, not a reseat. This is the
+        # exact state measured on 2026-09-13 after three failed
+        # authentications: admin-UP, NO-CARRIER, and a scan that
+        # returns zero networks with no error at all.
+        out['steps'] = [
+            'the adapter is up but scanning nothing, which is how this '
+            'chipset fails after a refused association',
+            'press Reset radio - it unbinds and re-binds the USB '
+            'device, which clears it; ip link down/up does not',
+            'if that does not bring it back, reseat the adapter in a '
+            'different USB port']
+        out['cure'] = 'reset'
     else:
         out['verdict'] = ('the radio is fine - it can see %d other '
                           'network(s) - so the camera is out of range or '
@@ -354,7 +485,18 @@ def main() -> None:
     ap.add_argument("--once", action="store_true",
                     help="one attempt, then exit (for testing)")
     ap.add_argument("--status", action="store_true")
+    # #1359b: the two answers the station asks for by name. Both are
+    # root operations on the spare radio and neither can be done from
+    # inside the container, so the station shells out to this.
+    ap.add_argument("--doctor", action="store_true")
+    ap.add_argument("--reset-radio", action="store_true")
     args = ap.parse_args()
+    if args.doctor:
+        print(json.dumps(doctor()))
+        return
+    if args.reset_radio:
+        print(json.dumps(radio_reset()))
+        return
     if args.status:
         try:
             print(STATE.read_text())
