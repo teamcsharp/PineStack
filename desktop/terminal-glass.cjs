@@ -775,7 +775,7 @@ class Glass {
    */
   async say(question) {
     const pid = await this.pid();
-    if (!pid) return { ok: false, why: 'the kiosk app is not running' };
+    if (!pid) return { ok: false, why: this.pidTrouble || 'the kiosk app is not running' };
     let page = null;
     try {
       page = await new PageSession(this.run, (a) => this.target(a), GLASS_PORT).open(pid);
@@ -805,7 +805,7 @@ class Glass {
    */
   async map() {
     const pid = await this.pid();
-    if (!pid) return { ok: false, why: 'the kiosk app is not running' };
+    if (!pid) return { ok: false, why: this.pidTrouble || 'the kiosk app is not running' };
     let page = null;
     try {
       page = await new PageSession(this.run, (a) => this.target(a), GLASS_PORT).open(pid);
@@ -846,7 +846,7 @@ class Glass {
         page = null;
       }
     } else if (wantBroadcast || wantMic) {
-      notes.push('no audio: the kiosk app is not running');
+      notes.push('no audio: ' + (this.pidTrouble || 'the kiosk app is not running'));
     }
 
     let micStartedAt = 0;
@@ -974,7 +974,7 @@ class Glass {
     const asked = Number(seconds);
     const want = isFinite(asked) && asked > 0 ? asked : Infinity;
     const pid = await this.pid();
-    if (!pid) return { ok: false, why: 'the kiosk app is not running' };
+    if (!pid) return { ok: false, why: this.pidTrouble || 'the kiosk app is not running' };
     let page = null;
     try {
       page = await new PageSession(this.run, (a) => this.target(a), GLASS_PORT).open(pid);
@@ -1127,10 +1127,39 @@ class Glass {
 
   /* ------------------------------------------------------------ the report */
 
+  /**
+    * THE APP'S PID, OR AN HONEST ACCOUNT OF WHY THERE ISN'T ONE.
+    *
+    * This asked through `maybe()`, which swallows every error and returns an
+    * empty string - and an empty string here meant "nothing is running". So a
+    * timeout, a busy adb server or a dropped connection all came back as a
+    * confident, false statement about the tablet, and the operator was sent
+    * to restart an app that was already up.
+    *
+    * It matters most exactly when it fires: adb serialises per device, so a
+    * `pidof` is slowest precisely when the mirror is streaming and the vitals
+    * poll is running - which is when somebody is most likely to press the
+    * camera.
+    *
+    * `|| true` makes the command exit 0 whatever it finds, so an empty answer
+    * is a REAL answer. A throw is then genuinely "could not ask": tried once
+    * more, because a contended adb usually answers on the second go, and
+    * otherwise recorded in `pidTrouble` for the caller to say out loud.
+    */
   async pid() {
-    const said = await this.maybe('pidof ' + PACKAGE, 15000);
-    const first = String(said || '').trim().split(/\s+/)[0];
-    return /^\d+$/.test(first) ? first : '';
+    for (let go = 0; go < 2; go += 1) {
+      try {
+        const said = await this.shell('pidof ' + PACKAGE + ' || true', 15000);
+        const first = String(said || '').trim().split(/\s+/)[0];
+        this.pidTrouble = '';
+        return /^\d+$/.test(first) ? first : '';
+      } catch (error) {
+        this.pidTrouble = 'could not ask the tablet whether the kiosk app is '
+          + 'running: ' + error.message;
+        if (go === 0) await new Promise((done) => setTimeout(done, 400));
+      }
+    }
+    return '';
   }
 
   /* The WebView's own account of itself, through the DevTools port. This is

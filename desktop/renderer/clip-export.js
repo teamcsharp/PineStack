@@ -398,6 +398,52 @@ function follow() {
   raf = requestAnimationFrame(follow);
 }
 
+/* ROLLING THE PICTURE ONCE THE SEEK HAS LANDED.
+ *
+ * See the note inside play(): calling play() across a seek leaves the element
+ * paused with no error at all, and then the only thing moving the picture is
+ * the drift nudge at five frames a second. That is the jerkiness.
+ *
+ * Everything here is about the ways `seeked` fails to arrive, and about not
+ * believing play() when it says it worked. */
+function rollPicture() {
+  let rolled = false;
+
+  const go = () => {
+    if (rolled) return;
+    rolled = true;
+    const said = film.play();
+    if (!said || !said.then) return;
+    said.then(() => {
+      /* A KEPT PROMISE IS NOT PROOF - measured here: resolved, and paused
+       * still true three seconds in. Read the state back. */
+      if (!playing || !film.paused) return;
+      const again = film.play();
+      if (again && again.catch) again.catch(() => { /* said just below */ });
+      setTimeout(() => {
+        if (playing && film.paused) {
+          say('The picture will not roll \u2014 the sound and the playhead '
+            + 'carry on without it.', true);
+        }
+      }, 300);
+    }).catch((error) => {
+      say('The picture would not play: ' + error.message
+        + ' \u2014 the sound and the playhead carry on.', true);
+    });
+  };
+
+  /* ALREADY THERE. Pressing Preview from the in point assigns a currentTime
+   * that is already correct and NO `seeked` ever fires - waiting for it would
+   * be a preview that never starts. */
+  if (!film.seeking && Math.abs(film.currentTime - inAt) < 0.02) return go();
+
+  film.addEventListener('seeked', go, { once: true });
+
+  /* AND IF IT NEVER COMES. A stalled buffer or a seek past the last keyframe
+   * leaves the event unsent. A late picture beats no picture. */
+  setTimeout(go, 500);
+}
+
 function play() {
   if (!duration) return;
   /* Any scrub still in flight is abandoned: its `seeked` handler would
@@ -418,7 +464,8 @@ function play() {
     audio.resume().catch(() => { /* the fallback clock covers it */ });
   }
 
-  /* PLAY AFTER THE SEEK, NOT ACROSS IT.
+  /* PLAY AFTER THE SEEK, NOT ACROSS IT - see rollPicture() above, which is
+   * where that finally happens.
    *
    * `film.currentTime = inAt` immediately above starts a seek, and calling
    * play() while one is in flight is how the element ends up paused with no
@@ -429,10 +476,7 @@ function play() {
    * playhead's fault.
    *
    * NOT SWALLOWED either way: a refused play() is a fact worth saying. */
-  film.play().catch((error) => {
-    say('The picture would not play: ' + error.message
-      + ' — the sound and the playhead carry on.', true);
-  });
+  rollPicture();
   start();
 
   ranOn = 'wall';
