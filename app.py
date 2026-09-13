@@ -120013,9 +120013,17 @@ async def api_broadcast_health(
         # ago" was the MUSIC while the pair had been silent three
         # minutes. The question here is whether ANYTHING is reaching the
         # room, so it is asked of `heard_at`.
+        # #1331e: sixty, not thirty. At thirty it read True with the
+        # station audible - measured mid-record, heard 33.9s ago,
+        # everything working - because triangulate's gagged test
+        # fires whenever the solo gate does its ordinary job. Sixty
+        # is the threshold the rest of this file already uses for
+        # "quiet long enough to mean something", and the ladder
+        # reaches the rung that reads this only after minutes of
+        # silence, so nothing that needs it is lost.
         "solo_gagged": (
             bool(_triage_cause_is_gagged())
-            if (not heard_at or now - heard_at >= 30) else False),
+            if (not heard_at or now - heard_at >= 60) else False),
         # #1331: WHETHER THE SOLO GATE IS GAGGING ANYBODY.
         #
         # The Reinitialise ladder's RELEASE rung reads `health.gagged`,
