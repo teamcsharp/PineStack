@@ -104247,6 +104247,139 @@ async def slideshow_playlist_api(
     }
 
 
+# --- PINELINK: the camera, served to the house (#1341) ----------------------
+#
+# The camera is an ACCESS POINT. Anything that wants its video must join
+# `H88_<mac>`, and a one-radio device that joins it drops off the house LAN
+# - for the tablet that means losing the station itself. The DGX has two
+# radios, so tools/pinelink.py holds the camera on the spare one while
+# wlP9s9 keeps 10.89.1.246, and these doors re-serve what it captures over
+# the ordinary network.
+#
+# So nothing else in the building ever has to know the camera exists as a
+# separate network. The tablet, the app and the broadcast all read it from
+# the station, at the station's address, like any other media here.
+#
+# The live view is HLS because it is the one thing every surface in this
+# house can already play: the panel, the Electron app, and the tablet's
+# WebView. MJPEG would be lower latency and four times the bytes for a
+# picture-in-picture nobody is studying frame by frame.
+
+PINELINK_DIR = data_path("pinelink")
+PINELINK_LIVE = PINELINK_DIR / "live"
+PINELINK_CLIPS = PINELINK_DIR / "clips"
+PINELINK_STATE = PINELINK_DIR / "state.json"
+# A segment name and nothing else. The filename arrives from a URL, and
+# `..` in it would hand out any file this process can read.
+PINELINK_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def pinelink_state() -> dict[str, Any]:
+    """What the link says about itself, plus what is actually on disk.
+
+    The state file is written by the supervisor and can be stale - it is a
+    file, not a process check - so `fresh` is reported beside it rather
+    than folded into `state`. A caller that wants "is the camera live
+    right now" has to look at both, and saying so here is cheaper than a
+    surface that silently believes a minute-old claim.
+    """
+    got: dict[str, Any] = {}
+    try:
+        got = json.loads(PINELINK_STATE.read_text())
+    except Exception:  # noqa: BLE001
+        got = {"state": "never-run"}
+    try:
+        got["fresh"] = bool(time.time() - float(got.get("at") or 0) < 30.0)
+    except Exception:  # noqa: BLE001
+        got["fresh"] = False
+    try:
+        clips = sorted(PINELINK_CLIPS.glob("*.mp4"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        got["clips"] = len(clips)
+        got["kept_bytes"] = sum(p.stat().st_size for p in clips)
+        got["newest"] = clips[0].name if clips else ""
+    except Exception:  # noqa: BLE001
+        got["clips"] = 0
+    got["playlist"] = "/api/pinelink/live/index.m3u8"
+    return got
+
+
+@app.get("/api/pinelink/state")
+async def pinelink_state_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Is the camera linked, and is anything coming down it."""
+    require_read_auth(authorization)
+    return pinelink_state()
+
+
+@app.get("/api/pinelink/live/{filename}")
+async def pinelink_live_api(
+    filename: str,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """One piece of the live playlist - the .m3u8 or one .ts segment.
+
+    Read auth, like the gallery: a picture of the room is already on every
+    panel in the house, and making the live view need a key would mean the
+    tablet cannot show it.
+    """
+    require_read_auth(authorization)
+    if not PINELINK_NAME.match(filename or ""):
+        raise HTTPException(status_code=400, detail="bad name")
+    path = PINELINK_LIVE / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no such piece")
+    kind = ("application/vnd.apple.mpegurl" if filename.endswith(".m3u8")
+            else "video/mp2t")
+    # A playlist that is cached is a playlist that stops updating, and the
+    # segments roll every two seconds.
+    return FileResponse(path, media_type=kind, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Access-Control-Allow-Origin": "*"})
+
+
+@app.get("/api/pinelink/clips")
+async def pinelink_clips_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What has been kept, newest first."""
+    require_read_auth(authorization)
+    out: list[dict[str, Any]] = []
+    try:
+        for p in sorted(PINELINK_CLIPS.glob("*.mp4"),
+                        key=lambda q: q.stat().st_mtime, reverse=True)[:400]:
+            st = p.stat()
+            out.append({"name": p.name, "bytes": st.st_size,
+                        "at": st.st_mtime,
+                        "url": "/api/pinelink/clip/" + p.name})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"clips": out, "count": len(out)}
+
+
+@app.get("/api/pinelink/clip/{filename}")
+async def pinelink_clip_api(
+    filename: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """One kept recording, seekable.
+
+    FileResponse and not a read-into-memory answer, for the reason the
+    slideshow route already gives: without Range a video cannot be sought
+    and the tablet buffers the whole file before the first frame.
+    """
+    require_read_auth(authorization)
+    if not PINELINK_NAME.match(filename or ""):
+        raise HTTPException(status_code=400, detail="bad name")
+    path = PINELINK_CLIPS / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no such clip")
+    return FileResponse(path, media_type="video/mp4",
+                        headers={"Accept-Ranges": "bytes"})
+
+
 @app.get("/api/slideshow/media/{filename}")
 async def slideshow_media_api(
     filename: str,

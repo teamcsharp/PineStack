@@ -1,0 +1,23 @@
+[Unit]
+Description=PineLink - the camera held on the spare radio, served to the house
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# root, because it joins a Wi-Fi network: nmcli and `ip link` are not
+# things the station's user can do. It touches one interface and refuses
+# to start at all if wlP9s9 is not holding 10.89.1.246.
+User=root
+WorkingDirectory=/home/ehm_eckx/pinevoice-stack/spark-agent
+ExecStart=/usr/bin/python3 tools/pinelink.py
+StandardOutput=append:/home/ehm_eckx/pinelink.log
+StandardError=append:/home/ehm_eckx/pinelink.log
+# The camera sleeps, wanders out of range and runs its battery down. All
+# three end the stream, none of them is a failure, and every one of them
+# should be picked up again without anybody noticing.
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
