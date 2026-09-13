@@ -26786,6 +26786,71 @@ def _listener_for_terminal(row: dict[str, Any]) -> str:
         return ""
 
 
+OWNER_DEAF_SECONDS = 75.0      # #1332: held this long having taken nothing
+# #1332b: how long the CURRENT owner has held it without interruption.
+# Separate from _AUDIO_OWNER["at"], which a re-claim resets.
+_OWNER_RUN: dict[str, Any] = {"who": "", "since": 0.0}
+# #1332c: listeners judged deaf, and until when. Dropping the exclusive
+# was not enough on its own - the page re-claimed it within seconds and
+# the house went quiet again for another OWNER_DEAF_SECONDS, over and
+# over. A cure that is undone faster than it can be noticed is a cure
+# nobody has. The rest is short on purpose: a page that starts taking
+# clips again is not deaf any more, and this must never become a way to
+# lock a working device out of the air.
+OWNER_DEAF_REST = 300.0
+_OWNER_DEAF: dict[str, float] = {}
+
+
+def _owner_takes_nothing(who: str) -> bool:
+    """#1332: does this owner hold the air and never take a clip?
+
+    #1187 asks whether a device is SET to play out loud. It never asks
+    whether it actually does. Measured on the live wedge: the desktop
+    held the exclusive with `play=on`, polled steadily so the
+    stopped-polling test (#1208) passed, and acknowledged NOTHING - it
+    did not appear in the ack ledger at all - while two tablets that had
+    played 52 and 50 clips between them sat muted 75 and 74 times each
+    waiting for it. Polling is not consuming, and the gate was reading
+    the wrong one.
+
+    Deliberately narrow: it must have held the air a good while, taken
+    nothing at all in that time, and there must be somebody else live to
+    hand it to. A house with one device stays as it is."""
+    try:
+        now = time.time()
+        # #1332b: MEASURED OVER THE UNBROKEN RUN, NOT SINCE THE LAST
+        # CLAIM. `_AUDIO_OWNER["at"]` is rewritten on every claim, and
+        # the page this rule exists for re-claims every few seconds -
+        # which is precisely what triangulate means by "it re-gags
+        # itself". Anchored there, `held` never reached the threshold
+        # and the rule could not fire against the only fault it was
+        # written for. This clock restarts when the owner CHANGES.
+        if str(_OWNER_RUN.get("who") or "") != who:
+            _OWNER_RUN.update({"who": who, "since": now})
+        held = now - float(_OWNER_RUN.get("since") or now)
+        if not who or held < OWNER_DEAF_SECONDS:
+            return False
+        floor = now - held
+        for ev in list(_PAGE_ACK_EVENTS[-400:]):
+            # These rows key the page `listener_id`, not `who`.
+            # Reading the wrong field would make this return True
+            # for EVERY owner - a check that can only ever print
+            # one answer, which is the trap this codebase keeps
+            # paying for.
+            if str((ev or {}).get("listener_id") or "") != who:
+                continue
+            if float((ev or {}).get("at") or 0) >= floor:
+                return False          # it is taking clips; leave it alone
+        others = [w for w in (_listeners_live() or []) if w != who]
+        if others:
+            _OWNER_RUN.update({"who": "", "since": 0.0})   # the run ends here
+            _OWNER_DEAF[who] = time.time() + OWNER_DEAF_REST     # #1332c
+            return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def audio_owner() -> str:
     """The listener that owns the air, or "" when everybody may play.
 
@@ -26835,6 +26900,22 @@ def audio_owner() -> str:
             # something the table has never heard of still works.
             _row = terminal_for_listener(who)
             if not (_row and not _row.get("play")):
+                # #1332: ...AND UNLESS IT TAKES NOTHING. The check above
+                # is about the SETTING; this one is about the behaviour,
+                # and they came apart on a freshly launched desktop that
+                # claimed the air and then never acknowledged a single
+                # clip. Same outcome as #1187 - the exclusive held by
+                # something that does not sound - reached by a route
+                # #1187 cannot see, which is why releasing it by hand
+                # never stuck: it re-claimed within seconds, every time.
+                if _owner_takes_nothing(who):
+                    _AUDIO_OWNER.clear()
+                    pipeline_log(
+                        "air", f"{who} held the air for "
+                        f"{OWNER_DEAF_SECONDS:.0f}s without taking a "
+                        "single clip - every player is unmuted again so "
+                        "the house can hear something (#1332)")
+                    return ""
                 return who
             pipeline_log("air", f"{who} holds the air but its row is set "
                          "not to play out loud - passing it to a device "
@@ -99958,6 +100039,24 @@ async def radio_solo_api(
     # play=false, so the tablet was gagged and the house heard nothing.
     # `play` is the out-loud switch; the exclusive only decides WHICH
     # out-loud device wins. To give the air to this one, turn its play on.
+    # #1332c: A PAGE THAT WAS JUST DROPPED FOR TAKING NOTHING MAY NOT
+    # WALK STRAIGHT BACK IN. #1332 takes the air off an owner that holds
+    # it and acknowledges no clip; without this the same page claimed it
+    # again on its very next poll and the house was silent for another
+    # seventy-five seconds, repeatedly. It clears itself: the entry
+    # expires, and any page that is actually taking clips never gets one.
+    _deaf_until = float(_OWNER_DEAF.get(who) or 0)
+    if _deaf_until and time.time() < _deaf_until:
+        pipeline_log("air", f"{who} asked for the air again after holding "
+                     "it without taking a single clip - refused for "
+                     f"{int(_deaf_until - time.time())}s more (#1332c)")
+        return {"audio_owner": audio_owner(), "listeners": listener_roster(),
+                "refused": who,
+                "why": f"{who} held the air without playing anything; it "
+                       "may ask again shortly"}
+    if _deaf_until:
+        _OWNER_DEAF.pop(who, None)
+
     _row = terminal_for_listener(who)
     if _row and not _row.get("play"):
         name = str(_row.get("name") or who)
@@ -119901,12 +120000,22 @@ async def api_broadcast_health(
         # broadcast_triangulate said "gagged" the whole time.
         #
         # They are genuinely different faults with the same word on them,
-        # so this reports both rather than folding them together. Only
-        # computed when nothing has been heard, because that is the only
-        # time it can matter and triangulate is not free.
+        # so this reports both rather than folding them together.
+        #
+        # #1331d: GATED ON HEARD, NOT ON DIALOGUE-QUIET. The first cut
+        # asked `mute >= 30`, and `mute` is how long the DJs have been
+        # silent - which is a normal thing to be during a four minute
+        # record. Triangulate's gagged test fires whenever the solo gate
+        # is doing its ordinary job (one owner, everyone else muted), so
+        # this read True with the station perfectly audible, heard 0.3s
+        # ago. That is a diagnostic that lies, which is the one thing
+        # worse than not having it - the #1240 lesson exactly: "heard 3s
+        # ago" was the MUSIC while the pair had been silent three
+        # minutes. The question here is whether ANYTHING is reaching the
+        # room, so it is asked of `heard_at`.
         "solo_gagged": (
             bool(_triage_cause_is_gagged())
-            if (mute is None or mute >= 30 or not heard_at) else False),
+            if (not heard_at or now - heard_at >= 30) else False),
         # #1331: WHETHER THE SOLO GATE IS GAGGING ANYBODY.
         #
         # The Reinitialise ladder's RELEASE rung reads `health.gagged`,
@@ -126749,26 +126858,56 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         _ord = script_ledger_order()
     except Exception:  # noqa: BLE001
         _ord = {}
+    # #1333: A SCRIPT IS READ DOWNWARDS. ANCHORING A BLOCK BROKE THAT.
+    #
+    # The first cut of #1330 gave every row of a block ONE sort time - the
+    # block's earliest - and put unledgered events after it by their own
+    # clock. That keeps a conversation together, and it is wrong, because
+    # a block is not an instant: it runs for as long as it runs, and
+    # anything that happened DURING it then sorted to the far side of it.
+    #
+    # Measured on the live hour before this change: 15 backward pairs in
+    # 365, worst 93.3s, and EVERY ONE of them was the same shape -
+    # `dialogue (in a block) -> action (unledgered)`. A sting that fired
+    # thirty seconds into a round was drawn after the round finished, so
+    # the timestamps ran 08:14:53, 08:14:56, ... 08:16:26, then 08:14:53
+    # again. That is the reader being thrown up and down the page, and
+    # the operator was explicit about it: "I want it to go from entry to
+    # entry like a script read."
+    #
+    # So the block no longer carries one time. Each row keeps its OWN
+    # time, and the written order is preserved by making those times
+    # MONOTONE across the block: walking the rows in `ord`, each one is
+    # placed at max(its own stamp, the previous row + a hair). Where the
+    # clock agrees with the script nothing moves at all; where air_at was
+    # rewritten backwards (#1274: 104 of 129 re-appended ids moved,
+    # median 88s) the row is nudged just far enough to stay behind the
+    # line it followed, instead of being hauled to the front.
+    #
+    # Everything then sorts on one axis - ledgered and unledgered
+    # together - so the document reads downwards in time with no special
+    # cases, and an interjection lands where it actually interrupted.
     if _ord:
-        _anchor_of: dict[int, float] = {}
-        for _e in events:
+        _runs: dict[int, list[tuple[int, int]]] = {}
+        for _ix, _e in enumerate(events):
             _got = _ord.get(str((_e.get("row") or {}).get("id") or ""))
-            if not _got:
-                continue
-            _when = float(_e.get("at") or 0)
-            _anchor_of[_got[0]] = (min(_anchor_of[_got[0]], _when)
-                                   if _got[0] in _anchor_of else _when)
-
-        def _script_key(e: dict[str, Any]) -> tuple:
-            got = _ord.get(str((e.get("row") or {}).get("id") or ""))
-            if got and got[0] in _anchor_of:
-                # Inside a block: where the script put it.
-                return (_anchor_of[got[0]], 0, got[0], got[1], e["sort"])
-            # Outside one: where the clock says it happened.
-            return (float(e.get("at") or 0), 1, 0, 0, e["sort"])
+            if _got:
+                _runs.setdefault(_got[0], []).append((_got[1], _ix))
+        _when_at: dict[int, float] = {}
+        for _blk, _rows in _runs.items():
+            _rows.sort()                       # by the written position
+            _prev: float | None = None
+            for _o, _ix in _rows:
+                _raw = float(events[_ix].get("at") or 0)
+                _prev = _raw if _prev is None else max(_raw, _prev + 0.001)
+                _when_at[_ix] = _prev
 
         try:
-            events.sort(key=_script_key)
+            _keyed = [(_when_at.get(_ix, float(_e.get("at") or 0)),
+                       _e.get("sort") or 0, _ix, _e)
+                      for _ix, _e in enumerate(events)]
+            _keyed.sort(key=lambda r: (r[0], r[1], r[2]))
+            events[:] = [r[3] for r in _keyed]
         except Exception:  # noqa: BLE001
             pass          # a script that will not re-order still reads
 
