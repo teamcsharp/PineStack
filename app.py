@@ -227,8 +227,22 @@ def _with_review_instances(work):
     return run
 
 
+# #1314: the last policy this process read, so a stalling station can
+# answer without going to the desk for it.
+_LINE_REVIEW_POLICY_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
 def line_review_policy() -> dict[str, Any]:
-    return _LINE_REVIEW.policy()
+    # #1314: measured at 10.73s of blocked loop in one call. While the
+    # air is at risk the last known policy is good enough - it changes
+    # when the operator changes it, not by the second.
+    memo = _LINE_REVIEW_POLICY_MEMO
+    if memo["value"] is not None and (air_first()
+                                      or time.time() - memo["at"] < 5.0):
+        return memo["value"]
+    got = _LINE_REVIEW.policy()
+    memo.update({"at": time.time(), "value": got})
+    return got
 
 
 def crystal_acceptance_mode() -> str:
@@ -250,6 +264,11 @@ def crystal_fluid_proof(report: Any) -> bool:
 
 def prompt_learning_observe(row: dict[str, Any], *, decision: bool = False) -> dict[str, Any] | None:
     """Learn only from durable refusals and explicit individual reviews."""
+    # #1314: and not while the air is at risk - 16.73s of blocked loop
+    # in a single measured call. The refusal it would have learned from
+    # is still on the record; only the learning is skipped.
+    if air_first():
+        return
     if _REJECTION_LAB_PREVIEW.get():
         return
     try:
@@ -15430,6 +15449,32 @@ def cupboard_unheard_after() -> float:
 # consumer, and how fast it may try while it is. Deliberately not
 # dials: the interval itself is the dial, and these only say that a
 # silent station stops honouring it.
+# #1313: past this much measured silence, the floor and the running
+# order stop being able to keep the station quiet.
+SILENCE_LOSES_AFTER = 20.0
+# #1314: and a little before that, the desks that are not the broadcast
+# stand down. Shorter than SILENCE_LOSES_AFTER on purpose, so the loop
+# is already clearing when the rescue above needs it.
+AIR_FIRST_AFTER = 12.0
+
+
+def air_first() -> bool:
+    """#1314: is the air at risk, so that nothing but the air may run?
+
+    True while the pair have gone measurably quiet on a station that is
+    on and not paused. The learning desks read this and stand down; a
+    grade not recorded is the whole cost, and it is only ever paid in
+    the window where nobody can hear the station anyway.
+
+    Deliberately NOT true for a paused or off-air station: that is not
+    an emergency, it is the operator's choice, and the desks may use
+    the quiet to catch up."""
+    try:
+        if not _RADIO.get("on") or radio_paused():
+            return False
+        return talk_quiet_for() >= AIR_FIRST_AFTER
+    except Exception:  # noqa: BLE001
+        return False
 UNHEARD_QUIET_AFTER = 20.0     # seconds of cast silence
 UNHEARD_QUIET_EVERY = 15.0     # the rest that replaces the interval
 UNHEARD_RETRY_EVERY = 20.0     # what a refused pick costs instead
@@ -15871,7 +15916,7 @@ def unheard_replace_sweep() -> list[str]:
     return asked
 
 
-async def unheard_stock_air() -> str:
+async def unheard_stock_air(force: bool = False) -> str:
     """#1260: THE STANDING CONSUMER. Put the longest-unheard finished round
     on the air, out of turn, because nothing else ever will.
 
@@ -15909,11 +15954,16 @@ async def unheard_stock_air() -> str:
         hush = 0.0
     if hush >= UNHEARD_QUIET_AFTER:
         rest = min(rest, UNHEARD_QUIET_EVERY)
+    if force:
+        rest = 0.0                                  # #1313: dead air waits for nothing
     if now - _UNHEARD_AT[0] < rest:
         return _unheard_no("inside the interval")
     if not _RADIO.get("on") or radio_paused():
         return _unheard_no("off air or paused")
-    if _SPEAKING[0] or _floor_busy():
+    # #1313: `force` is the silence rescue, and silence outranks the
+    # floor. Something actually SOUNDING still stops it - that is not
+    # ceremony, that is two voices at once.
+    if _SPEAKING[0] or (_floor_busy() and not force):
         return _unheard_no("somebody has the floor")
     # The clock is spent on the WALK, not on the airing. unheard_pick()
     # reads every row of four shelves through dialogue_row_ready, and this
@@ -15932,7 +15982,7 @@ async def unheard_stock_air() -> str:
     if row is None:
         return _unheard_no("nothing unheard is past the dial and airable")
     said = await _ready_shelf_air(kind, _RADIO.get("now"), rescue=True,
-                                  pick=row)
+                                  pick=row, force=force)
     if not said:
         # #1304: and it says WHICH refusal, because "the door refused"
         # was the sentence 120 unheard rounds hid behind.
@@ -20340,6 +20390,18 @@ def _floor_stage(label: str) -> None:
 def _floor_drop(owned: bool) -> None:
     if not owned:
         return
+    # #1316: ONLY A HOLD THIS TASK STILL OWNS.
+    #
+    # This released whatever was locked, which was harmless while
+    # nothing ever broke a floor - and becomes a stranger's-lock bug
+    # the moment something does. If _floor_break took this hold away
+    # and somebody else has since taken the floor, that hold is not
+    # ours to end.
+    try:
+        if _FLOOR_OWNER.get("task") is not asyncio.current_task():
+            return
+    except Exception:  # noqa: BLE001
+        pass
     _FLOOR_OWNER.update({"task": None, "at": 0.0, "label": ""})
     # The quiet clock starts from the moment the floor frees, not from
     # the last per-line announce - otherwise the cover watchdog reads a
@@ -20388,12 +20450,71 @@ async def _floor_lend(label: str, work: Any) -> Any:
                                  "label": str(label)[:120]})
 
 
+# #1316: a floor held this long over a SILENT room is not a slow
+# round, it is a wedge. Short, because the whole cost of being wrong is
+# one cover speaking over a round that was about to start anyway, and
+# the cost of being right is the station coming back on the air.
+FLOOR_MUTE_SECONDS = 45.0
+
+
+def _floor_wedged() -> bool:
+    """Held, and nobody has heard a word for long enough to say so."""
+    if not _FLOOR_LOCK.locked():
+        return False
+    held = time.time() - float(_FLOOR_OWNER.get("at") or 0)
+    if held < FLOOR_MUTE_SECONDS:
+        return False
+    try:
+        return talk_quiet_for() >= FLOOR_MUTE_SECONDS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _floor_break(why: str = "") -> bool:
+    """#1316: take the floor back from a hold that has gone silent.
+
+    Reporting it free was never enough. _floor_take awaits
+    _FLOOR_LOCK.acquire() with no bound, so a station that "knows" the
+    floor is free still hangs the instant anything tries to take it -
+    which is the deadlock that put this broadcast off the air for six
+    minutes with 134 finished rounds on the shelf.
+
+    The owner's own finally may still run later; _floor_drop refuses to
+    release a hold it no longer owns, so a late arrival cannot take the
+    floor out from under whoever has it by then."""
+    if not _floor_wedged():
+        return False
+    label = str(_FLOOR_OWNER.get("label") or "a round")
+    held = round(time.time() - float(_FLOOR_OWNER.get("at") or 0))
+    _FLOOR_OWNER.update({"task": None, "at": 0.0, "label": ""})
+    try:
+        if _FLOOR_LOCK.locked():
+            _FLOOR_LOCK.release()
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        pipeline_log(
+            "air", "the floor was taken back from %s - it had held it for "
+            "%ds with nobody hearing a word%s (#1316)"
+            % (label, held, (" - " + why) if why else ""))
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
 def _floor_busy() -> bool:
     """Somebody is mid-conversation on the air - and provably alive."""
     if not _FLOOR_LOCK.locked():
         return False
     held = time.time() - float(_FLOOR_OWNER.get("at") or 0)
-    return held < FLOOR_STALE_SECONDS
+    if held >= FLOOR_STALE_SECONDS:
+        return False
+    # #1316: ...and "alive" means AUDIBLE. A hold over a silent room
+    # past FLOOR_MUTE_SECONDS re-arms every cover, drain and rescue in
+    # forty-five seconds rather than twenty-five minutes.
+    if _floor_wedged():
+        return False
+    return True
 
 
 # #1146 review: how far ahead of its own air moment a paced burst may be
@@ -45654,6 +45775,38 @@ async def dead_air_watch() -> None:
                     await page_wedge_clear()
             except Exception:  # noqa: BLE001
                 pass
+            # #1313: SILENCE ALWAYS LOSES, AND IT IS ASKED FIRST.
+            #
+            # Everything below answers to _floor_busy(), which is TRUE
+            # for as long as a writer is making a round - so the whole
+            # rescue block is skipped in exactly the condition it was
+            # built for. Measured on a dead station: 326s of silence,
+            # 129 finished rounds never heard, the SFX watchdog asked
+            # 176 times and fired 0, and the unheard sweep never run.
+            #
+            # This runs before any of it and does not answer to the
+            # floor. The gap filler is AWAITED here rather than handed
+            # off: #1248 hands it off so the watchdog is never parked
+            # behind a floor wait, which is right on the ordinary road
+            # and is precisely what swallowed those 176 asks on a
+            # starved loop.
+            try:
+                if (not _SPEAKING[0] and _RADIO.get("on")
+                        and not radio_paused()
+                        and talk_quiet_for() >= SILENCE_LOSES_AFTER):
+                    # #1316: take the floor back FIRST. Everything below
+                    # can proceed without it, but the rest of the
+                    # station cannot - and a wedge left in place would
+                    # keep queueing every ordinary round behind it.
+                    _floor_break("the silence rescue needed the air")
+                    _went = await unheard_stock_air(force=True)
+                    if not _went:
+                        await sfx_fill_gap(
+                            "silence outranks the floor (#1313)",
+                            under_floor=True, ignore_rest=True)
+            except Exception:  # noqa: BLE001
+                pass
+
             if not (_SPEAKING[0] or _floor_busy()):
                 try:
                     # #1260: ...AND THE CUPBOARD'S OWN UNHEARD STOCK, last.
@@ -66328,7 +66481,27 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
                 return _no("the air is already sold %.0fs ahead (allowing "
                            "%.0fs)" % (_ahead, sfx_sold_tolerance()))
             _deep = sfx_queue_deep()
-            if _deep >= SFX_WAITING_CAP:
+            # #1315: AND A QUEUE IS NOT A SOUND EITHER.
+            #
+            # The check immediately above learned this for the sold
+            # cursor (#1249: "a page that stops playing makes it run
+            # AWAY from reality... when the room says otherwise, the
+            # cursor is describing audio that is not happening and it
+            # does not get a vote"). This one, one line down, never got
+            # the same carve-out - so a page that stops consuming
+            # leaves clips queued for ever and this gate then refuses
+            # every fill, for ever.
+            #
+            # Measured on a dead station: the pair silent for 273
+            # seconds while this returned "5 clip(s) already waiting on
+            # the page" thirty times, "4 clip(s)" eleven, "6" five, "7"
+            # three. The station was not out of things to play. It was
+            # waiting on a consumer that had stopped consuming.
+            #
+            # Same rule, same words: while the room has gone quiet past
+            # the notice threshold, a queue on the page is describing
+            # audio that is not happening, and it does not get a vote.
+            if _deep >= SFX_WAITING_CAP                     and talk_quiet_for() < sfx_gap_notice():
                 return _no("%d clip(s) already waiting on the page"
                            % _deep)
         except Exception:  # noqa: BLE001
@@ -69701,7 +69874,8 @@ def _shelf_no(kind: str, why: str) -> list[str]:
 
 async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
                            rescue: bool = False,
-                           pick: dict[str, Any] | None = None) -> list[str]:
+                           pick: dict[str, Any] | None = None,
+                           force: bool = False) -> list[str]:
     """Reserve one exact finished round; only its transport can commit it.
 
     2026-09-10: `rescue` is DEAD AIR, and it is the one caller allowed to
@@ -69796,7 +69970,24 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
         _pantry_save(True)
 
     try:
-        owned = await _floor_take("a ready " + kind + " round")
+        # #1313: WHEN THE AIR IS DEAD, THE FLOOR IS CEREMONY.
+        #
+        # _floor_take awaits _FLOOR_LOCK.acquire() with no bound, and a
+        # writer holds that for six to seventy-eight seconds a line
+        # (#1146). A rescue that queues behind it is not a rescue. It
+        # still asks - briefly, so the ordinary case is untouched - and
+        # if the answer does not come it goes on anyway, because
+        # nothing has sounded for twenty seconds and there is nothing
+        # to collide with. `owned` stays honest either way, so a lock
+        # this frame never took is never dropped.
+        if force:
+            try:
+                owned = await asyncio.wait_for(
+                    _floor_take("a ready " + kind + " round"), 1.5)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                owned = False
+        else:
+            owned = await _floor_take("a ready " + kind + " round")
         if not any(held is row for held in shelf_rows(kind)):
             return _shelf_no(kind, "the row left the shelf while we waited "
                                    "for the floor")               # #1304
@@ -94469,6 +94660,11 @@ async def crystal_learning_ask(prompt, *, learning_kind, learning_parent,
 
 def crystal_learning_note(ticket, original, candidate, evaluation, row=None):
     """Record fresh production grades once; cached regrades never create tickets."""
+    # #1314: not while the air is at risk. Measured in /api/pulse's
+    # blocking frames at 11.58s across four samples, on the same loop
+    # that has to put a sound out.
+    if air_first():
+        return
     if not isinstance(ticket, dict) or not ticket.get("attempt_id"):
         return
     if any(ticket.get(key) for key in ("preview", "technical", "deferred", "regrade", "imported")) or _REJECTION_LAB_PREVIEW.get():
