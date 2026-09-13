@@ -127,6 +127,9 @@ if ! "$ADB" -s "$DEV" install -r "$SIGNED" 2>&1 | tee /dev/stderr | grep -q Succ
   # transcribes nothing. There is no prompt to fall back on in a kiosk that
   # owns HOME, so it is granted here.
   "$ADB" -s "$DEV" shell pm grant "$PKG" android.permission.RECORD_AUDIO || true
+  # Looking through the tablet's camera from the desktop. Runtime, so an
+  # uninstall takes it with it, same as the microphone above.
+  "$ADB" -s "$DEV" shell pm grant "$PKG" android.permission.CAMERA || true
 fi
 
 say "what the tablet granted"

@@ -230,6 +230,14 @@
      *   net/Readiness.kt - so this is a record, not a fresh probe. */
     readyReport: promised("readyReport"),
 
+    /* LOOKING THROUGH THE TABLET'S CAMERA.
+     *
+     * cameraShow({facing: "rear"|"front"}) puts the camera on the tablet's
+     * SCREEN; the desktop sees it through the mirror it already has.
+     * cameraHide() puts the terminal back. */
+    cameraShow: promised("cameraShow"),
+    cameraHide: promised("cameraHide"),
+
     replayState: promised("replayState"),
     replaySave: promised("replaySave"),
     replayChunk: promised("replayChunk"),

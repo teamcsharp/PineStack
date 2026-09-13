@@ -98,6 +98,8 @@ class PineDesktopBridge(
             "replayState", "replaySave", "replayChunk",
             /* What the terminal confirmed on its way up - see net/Readiness. */
             "readyReport",
+            /* Looking through the tablet's own camera - see camera/. */
+            "cameraShow", "cameraHide",
             /* Keeping a line: to the tablet, or to the working folder. */
             "keepClip", "jack", "wallpaper", "saveText", "saveBytes",
             "usbState", "usbPick", "usbSend", "usbList", "usbRead",
@@ -483,6 +485,41 @@ class PineDesktopBridge(
          * lay under a video - see terminal-glass.cjs. Nothing is transcribed
          * and nothing leaves the tablet here; the take is parked and read
          * out by micChunk. */
+        /* LOOKING THROUGH THE TABLET'S CAMERA.
+         *
+         * The picture reaches the desktop through the screen mirror that
+         * already exists - this only puts the camera ON the screen. See
+         * camera/PineCameraActivity for why that beats a second video
+         * pipeline. */
+        "cameraShow" -> {
+            val want = args.optJSONObject(0)?.optString("facing") ?: "rear"
+            try {
+                com.pinebox.kiosk.camera.PineCameraActivity.show(context, want)
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", true).put("facing", want).toString())
+            } catch (err: Exception) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false)
+                    .put("detail", err.message ?: "the camera would not open").toString())
+            }
+        }
+
+        /* Back to the terminal. The camera activity closes itself; this is
+         * the road for a desktop that wants to put the station back without
+         * reaching through the mirror's touch. */
+        "cameraHide" -> {
+            try {
+                val go = android.content.Intent(context, com.pinebox.kiosk.MainActivity::class.java)
+                go.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                go.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                context.startActivity(go)
+                BridgeEnvelope.ok(id, JSONObject().put("ok", true).toString())
+            } catch (err: Exception) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false).put("detail", err.message ?: "no").toString())
+            }
+        }
+
         /* WHAT THE TERMINAL CONFIRMED WHEN IT CAME UP.
          *
          * Written at startup by MainActivity and simply handed over here -

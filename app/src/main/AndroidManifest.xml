@@ -21,6 +21,12 @@
          268,000 pixels.
          signature-level from `android`, so the platform key grants it. -->
     <uses-permission android:name="android.permission.CAPTURE_SECURE_VIDEO_OUTPUT" />
+    <!-- LOOKING THROUGH THE TABLET'S CAMERA, on request and never ambient:
+         the preview holds the device only while its window is in front.
+         Granted by deploy.sh, and asked for at runtime by the activity so a
+         fresh install says what is wrong instead of showing black. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -252,6 +258,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Looking through the tablet's own camera. `assetsPaths` is
+             deliberately absent from configChanges: AAPT rejects it as a
+             flag at this level, which is the same reason #1296's wallpaper
+             relaunches could not simply be opted out of. -->
+        <activity
+            android:name=".camera.PineCameraActivity"
+            android:exported="false"
+            android:label="Pine Box camera"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode|smallestScreenSize|screenLayout|density|fontScale|locale|layoutDirection"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
         <service
             android:name=".replay.PineAppRecorder"
