@@ -93,6 +93,10 @@
   function absolute(url) {
     const path = String(url || "");
     if (/^https?:/i.test(path)) return path;
+    /* The page's own origin first - see the long note in sampler.js's
+     * absolute(). The terminal may have reached the station by a different
+     * road than the configured one, and this station has no CORS. */
+    if (/^https?:$/i.test(location.protocol)) return location.origin + path;
     return String((config && config.baseUrl) || "").replace(/\/+$/, "") + path;
   }
 

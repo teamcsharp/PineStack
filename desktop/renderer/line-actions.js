@@ -121,6 +121,9 @@
   /* Closing the SHEET. The toast is deliberately not touched: it belongs to
    * work that is still running, and taking it down with the menu would hide
    * the answer to the very thing that was just asked for. */
+  /* Closing the SHEET. The toast and the orb are deliberately not touched:
+   * both belong to work that is still running, and taking them down with the
+   * menu would hide the answer to the very thing that was just asked for. */
   function close() {
     stopPlaying();
     if (sheet) { sheet.remove(); sheet = null; }
@@ -145,19 +148,25 @@
      * that differs between them; a download arrow on both would say nothing.
      * There is no c:play in the set, so hearing a line takes the speaker. */
     choice(list, 'c:volume--up--filled', 'Play it',
-      'hear this line, here', function (say) { playIt(line, say); });
+      'hear this line, here', 'sound', function (stage) {
+        return playIt(line, stage.say);
+      });
     choice(list, 'c:audio-console', 'Put it on a sampler pad',
-      'the next free pad, ready to fire', function (say, bar) { toPad(line, say, bar); });
+      'the next free pad, ready to fire', 'pad', function (stage) {
+        return toPad(line, stage);
+      });
     choice(list, 'c:screen', 'Download it to the tablet',
-      'into Downloads / Pine Box', function (say, bar) {
-        keep(line, 'downloads', say, bar);
+      'into Downloads / Pine Box', 'to:c:screen', function (stage) {
+        return keep(line, 'downloads', stage);
       });
     choice(list, 'c:folder', 'Download it to the recording folder',
-      'the working folder you extract into', function (say, bar) {
-        keep(line, 'recordings', say, bar);
+      'the working folder you extract into', 'to:c:folder', function (stage) {
+        return keep(line, 'recordings', stage);
       });
     choice(list, 'c:microscope', 'Examine it in depth',
-      'where it came from, how often it airs, and why', function () {
+      'where it came from, how often it airs, and why', 'glass', function () {
+        return Promise.resolve({ then: 'the record opens' });
+      }, function () {
         if (root.PineLineDeep) root.PineLineDeep.open(line);
       });
     sheet.appendChild(list);
@@ -217,7 +226,18 @@
     return node;
   }
 
-  function choice(into, mark, title, why, run) {
+  /* A CHOICE, AND WHAT IT LOOKS LIKE WHILE IT HAPPENS.
+   *
+   * `kind` says which performance the row puts on when it is pressed:
+   *   'pad'        a sampler slides in and the clip flies to a pad
+   *   'to:<icon>'  a parcel travels to that destination, with a bar
+   *   'glass'      the mark becomes a magnifier and the sheet withdraws
+   *   'sound'      the mark pulses while the line plays
+   *
+   * `after` runs once the performance has finished and the sheet has gone -
+   * for the one choice whose whole point is to open another window, which
+   * must not arrive while this one is still on top of it. */
+  function choice(into, mark, title, why, kind, run, after) {
     var row = make('button', 'la-choice');
     row.type = 'button';
     row.appendChild(icon(mark));
@@ -225,19 +245,255 @@
     row.appendChild(make('i', '', why));
     row.addEventListener('click', function (event) {
       event.stopPropagation();
-      /* THE MENU GOES AT ONCE. It is dismissed BY being chosen from; one
-       * that stays reads as not having heard you, and the old version then
-       * reported refusals into a sheet the operator had already finished
-       * with. The work carries on and speaks from the foot of the screen. */
-      var held = sheet;
-      sheet = null;
-      if (held) held.remove();
-      run(laToast, {
-        say: function (text) { laToast(text); },
-        finish: function (ok) { if (!ok) return; }
-      });
+      perform(row, mark, title, kind, run, after);
     });
     into.appendChild(row);
+  }
+
+  /* ------------------------------------------------------- the performance */
+
+  /* THE WORK HAPPENS WHERE IT WAS ASKED FOR.
+   *
+   * This walks back the previous behaviour on purpose. The sheet used to
+   * vanish the moment a row was pressed, because a menu that just sits there
+   * reads as not having heard you. True, and too blunt: it cured "did it hear
+   * me" by removing the only surface that could answer "what is it doing".
+   *
+   * Now the row is promoted - the others fold away, it fills the sheet, and
+   * the operation is drawn happening inside it. The sheet leaves when the
+   * work is done, so the two questions are answered by the same thing.
+   */
+  var acting = false;
+
+  function perform(row, mark, title, kind, run, after) {
+    if (acting || !sheet) return;
+    acting = true;
+
+    /* Every other row folds away. The one pressed stays where it is, which
+     * is what makes this read as THAT row acting rather than a new dialog. */
+    var list = row.parentNode;
+    [].slice.call(list.children).forEach(function (other) {
+      if (other !== row) other.classList.add('la-gone');
+    });
+    row.classList.add('la-acting');
+    var shut = sheet.querySelector('.la-close');
+    if (shut) shut.classList.add('la-gone');
+
+    var scene = make('div', 'la-scene');
+    row.appendChild(scene);
+    var note = make('div', 'la-progress-said');
+    row.appendChild(note);
+
+    var stage = buildStage(kind, mark, scene, note);
+    var closing = false;
+    var done = function (ok, text) {
+      if (closing) return;
+      closing = true;
+      stage.finish(ok, text);
+      /* Long enough to see the landing, short enough not to be a wait. A
+       * refusal is held longer because it is the only place it is said. */
+      setTimeout(function () {
+        acting = false;
+        close();
+        if (ok && typeof after === 'function') after();
+      }, ok ? 900 : 2200);
+    };
+
+    var settled = false;
+    var orb = null;
+
+    /* IF IT IS GOING TO TAKE A WHILE, GET OUT OF THE WAY.
+     *
+     * A cut is the station writing and recording audio with this request
+     * queued behind it - the sampler's own ceiling is ninety seconds. A modal
+     * sheet held over the script for that long is not progress, it is the
+     * screen taken hostage.
+     *
+     * Two and a half seconds rather than none: a cached cut comes back in a
+     * few hundred milliseconds and should finish where the eye already is.
+     * Collapsing and re-expanding for that is more movement than the work
+     * deserved. Only a job that will actually make you wait earns the corner. */
+    var toCorner = setTimeout(function () {
+      if (settled || closing) return;
+      orb = raiseOrb(mark, title);
+      closing = true;                 /* the sheet's part is over */
+      acting = false;
+      close();
+    }, 2500);
+
+    var land = function (ok, text) {
+      clearTimeout(toCorner);
+      if (orb) { orb.settle(ok, text); return; }
+      done(ok, text);
+    };
+
+    Promise.resolve()
+      .then(function () { return run(stage); })
+      .then(function (got) {
+        settled = true;
+        if (got && got.ok === false) return land(false, got.why || 'it would not');
+        land(true, (got && got.then) || stage.finished);
+      })
+      .catch(function (err) {
+        settled = true;
+        land(false, (err && err.message) || String(err));
+      });
+    /* Neither the sheet nor the orb may become a thing that never answers. */
+    setTimeout(function () {
+      if (settled) return;
+      if (orb) orb.say('still cutting…');
+      else if (!closing) stage.say('still working…');
+    }, 8000);
+  }
+
+  /* THE ORB: work that outlived its sheet.
+   *
+   * Bottom left because that is the one corner of this layout holding
+   * nothing - the rail is on the right, the note bar is bottom centre, and
+   * the feed's own head is top left.
+   *
+   * It carries the same Carbon mark the row did, so it is recognisably the
+   * thing that was just asked for rather than a new notification. Tapping it
+   * dismisses it; it does not re-open the sheet, because the sheet's question
+   * has already been answered and re-asking it is not what a tap there
+   * means. */
+  var orbNode = null;
+
+  function raiseOrb(mark, title) {
+    if (orbNode) { orbNode.remove(); orbNode = null; }
+    var node = make('div', 'la-orb');
+    node.title = title;
+    node.appendChild(make('span', 'la-orb-ring'));
+    var face = icon(mark);
+    face.classList.add('la-orb-face');
+    node.appendChild(face);
+    var said = make('span', 'la-orb-said');
+    node.appendChild(said);
+    node.addEventListener('click', function (e) { e.stopPropagation(); fade(); });
+    document.body.appendChild(node);
+    requestAnimationFrame(function () { node.classList.add('up'); });
+    orbNode = node;
+
+    var gone = 0;
+    function fade() {
+      clearTimeout(gone);
+      node.classList.remove('up');
+      setTimeout(function () {
+        if (node.parentNode) node.remove();
+        if (orbNode === node) orbNode = null;
+      }, 320);
+    }
+
+    return {
+      say: function (text) { said.textContent = String(text || ''); },
+      settle: function (ok, text) {
+        node.classList.add(ok ? 'done' : 'bad');
+        said.textContent = String(text || '');
+        /* A refusal is held longer: a success is visible on the pad it
+         * landed on, and a refusal is only ever said here. */
+        gone = setTimeout(fade, ok ? 4200 : 7000);
+      }
+    };
+  }
+
+  /* Each performance is a tiny scene plus a `say`. They share a shape so
+   * perform() does not have to know which one it is driving. */
+  function buildStage(kind, mark, scene, note) {
+    var api = {
+      finished: '',
+      say: function (text, bad) {
+        note.textContent = String(text || '');
+        note.classList.toggle('bad', !!bad);
+      },
+      /* The pad scene wants to know where it landed before it can finish. */
+      landed: function () {},
+      finish: function (ok, text) {
+        scene.classList.add(ok ? 'la-ok' : 'la-bad');
+        if (text) api.say(text, !ok);
+      }
+    };
+
+    if (kind === 'pad') {
+      /* THE SAMPLER, SLID IN FROM THE SIDE. Sixteen cells, because that is
+       * what a bank is; the chip flies from the row into the one that was
+       * actually used, which grab() reports. Without showing WHICH, the
+       * operator has to go and hunt for what they just made. */
+      var rig = make('div', 'la-rig');
+      var grid = make('div', 'la-grid');
+      var cells = [];
+      for (var i = 0; i < 16; i++) {
+        var cell = make('span', 'la-cell');
+        cells.push(cell);
+        grid.appendChild(cell);
+      }
+      var chip = make('span', 'la-chip');
+      rig.appendChild(chip);
+      rig.appendChild(grid);
+      scene.appendChild(rig);
+      requestAnimationFrame(function () { rig.classList.add('in'); });
+      api.say('cutting it…');
+      api.landed = function (bank, pad) {
+        var at = cells[pad % 16];
+        if (!at) return;
+        at.classList.add('target');
+        /* The chip flies to the cell it is going into, so the eye follows
+         * the clip rather than being told about it afterwards. */
+        var box = at.getBoundingClientRect();
+        var from = chip.getBoundingClientRect();
+        chip.style.transform = 'translate(' + Math.round(box.left - from.left)
+          + 'px,' + Math.round(box.top - from.top) + 'px) scale(.62)';
+        chip.classList.add('flying');
+        setTimeout(function () {
+          chip.classList.add('landed');
+          at.classList.add('filled');
+        }, 420);
+        api.finished = 'bank ' + (bank + 1) + ' · pad ' + (pad + 1);
+      };
+      return api;
+    }
+
+    if (kind.indexOf('to:') === 0) {
+      /* A PARCEL, TRAVELLING. The destination wears the same Carbon mark the
+       * row does, so the picture and the words agree about where it is
+       * going. */
+      var move = make('div', 'la-move');
+      var fromMark = icon('c:document');
+      fromMark.classList.add('la-end');
+      var track = make('span', 'la-track');
+      var parcel = make('i', 'la-parcel');
+      track.appendChild(parcel);
+      var toMark = icon(kind.slice(3));
+      toMark.classList.add('la-end');
+      move.appendChild(fromMark);
+      move.appendChild(track);
+      move.appendChild(toMark);
+      scene.appendChild(move);
+      var bar = make('div', 'la-bar');
+      bar.appendChild(make('i', '', ''));
+      scene.appendChild(bar);
+      requestAnimationFrame(function () { scene.classList.add('running'); });
+      api.say('fetching it…');
+      /* THE BAR SWEEPS, IT DOES NOT COUNT. keepClip answers once, with a
+       * byte count and no progress along the way; a percentage here would be
+       * invented. It fills only when the bytes are on disk. */
+      return api;
+    }
+
+    if (kind === 'glass') {
+      var glass = icon('c:search');
+      glass.classList.add('la-glass');
+      scene.appendChild(glass);
+      requestAnimationFrame(function () { scene.classList.add('running'); });
+      api.say('opening the record…');
+      return api;
+    }
+
+    /* 'sound' */
+    var wave = make('div', 'la-wave');
+    for (var b = 0; b < 7; b++) wave.appendChild(make('i', '', ''));
+    scene.appendChild(wave);
+    requestAnimationFrame(function () { scene.classList.add('running'); });
+    return api;
   }
 
   /* --------------------------------------------------------- the actions */
@@ -312,55 +568,87 @@
    * are published precisely so another view can ask the same question this
    * one does rather than guessing from `aired` - the mistake that once
    * offered 7 of about 220 takeable moments. */
-  function toPad(line, say, bar) {
+  /* THE REAL FEED ROW, not a stub of one.
+   *
+   * The sampler decides whether a line has audio from clip_media/clip_sig,
+   * ad_audio, media/sig or aired - all fields of the station's own row. A
+   * `{id, text}` stub carries none of them, so every line looked empty:
+   * measured on the tablet, 42 lines on screen and 0 takeable, which is why
+   * this always said "the station has no clip for this line yet".
+   *
+   * PineStationFeed holds the ring and keys it by the same id the script
+   * screens write into data-line. Searched newest-first, because a re-aired
+   * line can appear twice and the later copy is the one whose media is
+   * current. */
+  function feedRow(line) {
+    try {
+      var rows = (root.PineStationFeed && root.PineStationFeed.rows)
+        ? (root.PineStationFeed.rows() || []) : [];
+      for (var i = rows.length - 1; i >= 0; i--) {
+        if (rows[i] && String(rows[i].id) === String(line.id)) return rows[i];
+      }
+    } catch (err) { /* fall through to the stub */ }
+    /* Rolled off the 240-row ring. There is genuinely no row any more, and
+     * the sampler's own refusal is the honest answer. */
+    return { id: line.id, text: line.said };
+  }
+
+  function toPad(line, stage) {
     var sampler = root.PineSampler;
     if (!sampler || typeof sampler.grab !== 'function') {
-      say('the sampler is not loaded on this terminal', true);
-      return;
+      return Promise.resolve({ ok: false,
+        why: 'the sampler is not loaded on this terminal' });
     }
-    var row = {id: line.id, text: line.said};
+    var row = feedRow(line);
     try {
       if (typeof sampler.takeable === 'function' && !sampler.takeable(row)) {
-        say('the station has no clip for this line yet', true);
-        return;
+        return Promise.resolve({ ok: false,
+          why: 'the station has no clip for this line yet' });
       }
     } catch (err) { /* if it will not answer, try the grab anyway */ }
-    say('cutting it…');
-    Promise.resolve(sampler.grab(row)).then(function (got) {
-      if (got === false) say('the sampler would not take it', true);
-      else say('on a pad · bank ' + ((root.PineSampler && root.PineSampler.bankIndex)
-        ? (root.PineSampler.bankIndex() + 1) : '?'));
-    }, function (err) {
-      say(String((err && err.message) || err), true);
+
+    return Promise.resolve(sampler.grab(row)).then(function (got) {
+      /* THE OLD TEST WAS `got === false`, AND grab() NEVER ANSWERS THAT.
+       *
+       * It answers {ok, bank, pad, meta} - so every failure fell through to
+       * the success branch and reported "on a pad - bank ?". Failures have
+       * been announcing success. The animation is what turned it up: there
+       * was no bank and no pad to fly the clip to. */
+      if (!got || got.ok === false) {
+        return { ok: false, why: (got && got.why) || 'the sampler would not take it' };
+      }
+      stage.landed(Number(got.bank) || 0, Number(got.pad) || 0);
+      return { ok: true, then: 'on bank ' + ((Number(got.bank) || 0) + 1)
+        + ' · pad ' + ((Number(got.pad) || 0) + 1) };
     });
   }
 
+
   /* The bytes never enter the page - the bridge fetches and writes them,
    * and answers with the full path so the operator knows where it went. */
-  function keep(line, where, say, bar) {
+  function keep(line, where, stage) {
     var bridge = root.pineDesktop;
     if (!bridge || typeof bridge.keepClip !== 'function') {
-      say('this terminal cannot save files', true);
-      return;
+      return Promise.resolve({ ok: false, why: 'this terminal cannot save files' });
     }
-    say('fetching the clip…');
+    stage.say('fetching the clip…');
     /* The clip is fetched NATIVELY - the bytes never enter the page - so
-     * there is no Content-Length here to count against. The sweep is the
-     * honest indicator, and the bar says what stage it is at instead of
-     * inventing a percentage. */
-    bridge.keepClip({
+     * there is no Content-Length to count against, and the bar sweeps
+     * rather than claiming a percentage nobody measured. */
+    return Promise.resolve(bridge.keepClip({
       route: '/api/booth/clip?line=' + encodeURIComponent(line.id),
       said: line.said,
       id: line.id,
       where: where
-    }).then(function (got) {
-      if (got && got.ok) {
-        say('saved to ' + got.where);
-      } else {
-        say(String((got && got.detail) || 'it could not be saved'), true);
+    })).then(function (got) {
+      if (!got || !got.ok) {
+        return { ok: false, why: String((got && got.detail) || 'it could not be saved') };
       }
+      var size = Number(got.bytes) || 0;
+      return { ok: true, then: (size ? Math.round(size / 1024) + ' kB · ' : '')
+        + String(got.where || where) };
     }, function (err) {
-      say(String((err && err.message) || err), true);
+      return { ok: false, why: String((err && err.message) || err) };
     });
   }
 

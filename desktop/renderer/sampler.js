@@ -212,9 +212,28 @@
 
   /* ------------------------------------------------------------- fetching */
 
+  /* THE PAGE'S OWN ORIGIN WINS, when there is one.
+   *
+   * This used to prefix with `config.baseUrl` unconditionally, which was
+   * harmless while the page and the configured address were always the same
+   * host. They are not any more: the terminal chooses its road - the LAN at
+   * home, the tailnet away - and a URL built against the CONFIGURED address
+   * while the page is served from the other one is cross-origin. This station
+   * has no CORS middleware, so the browser refuses it before it is sent and
+   * the operator sees only "Failed to fetch".
+   *
+   * Measured on the tablet with the page on the tailnet: the relative path
+   * answered 200 with 73,676 bytes; the same route named against the LAN
+   * address threw TypeError in 700ms. Same station, same second.
+   *
+   * The page's origin is by definition the road that works - the page loaded
+   * over it. `config.baseUrl` remains for the one case with no origin to use:
+   * the desktop, where the renderer is a file:// page and a bare `/media/...`
+   * would resolve at the app itself and 404. */
   function absolute(url) {
     const path = String(url || "");
     if (/^https?:/i.test(path)) return path;
+    if (/^https?:$/i.test(location.protocol)) return location.origin + path;
     return String(config.baseUrl).replace(/\/+$/, "") + path;
   }
 

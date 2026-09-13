@@ -133,7 +133,12 @@
   function absolute(path) {
     const url = String(path || "");
     if (/^https?:/i.test(url)) return url;
-    const base = String((config && config.baseUrl) || "").replace(/\/+$/, "");
+    /* The page's own origin first - see sampler.js's absolute(). A URL built
+     * against the configured address while the page came in by another road
+     * is cross-origin, and this station has no CORS to allow it. */
+    const base = /^https?:$/i.test(location.protocol)
+      ? location.origin
+      : String((config && config.baseUrl) || "").replace(/\/+$/, "");
     return base + url;
   }
 
