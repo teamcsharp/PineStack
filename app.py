@@ -65181,6 +65181,9 @@ async def _sfx_pool_refresh() -> None:
         # so the tap is a list index and never a share walk.
         try:
             await asyncio.to_thread(_sfx_video_pool)
+            # #1309: and a few of them pulled through a read, so the
+            # first tap finds a warm clip rather than a cold share.
+            await asyncio.to_thread(_sfx_deck_fill)
         except Exception:  # noqa: BLE001
             pass
         if arrived:
@@ -65646,6 +65649,64 @@ def _sfx_video_pool() -> list[Path]:
     _SFX_VIDEO_MEMO.update({"key": _sfx_video_key(), "pool": list(pool),
                             "at": time.time()})
     return pool
+
+
+# #1309: clips already pulled through a read, so the page cache has
+# them before the operator asks. See sfx_deck_take.
+_SFX_VIDEO_DECK: list[Path] = []
+SFX_DECK_DEEP = 3
+SFX_DECK_WARM_BYTES = 1 << 20      # a video only needs its head to start
+
+
+def _sfx_deck_warm(path: Path) -> bool:
+    """Pull a clip through a read so the OS has it. Head only."""
+    try:
+        with open(path, "rb") as fh:
+            fh.read(SFX_DECK_WARM_BYTES)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _sfx_deck_fill() -> None:
+    """Bring the deck back up to depth, warming whatever is new.
+
+    Runs in a worker thread - it reads the share."""
+    try:
+        pool = _sfx_video_pool()
+        if not pool:
+            return
+        have = {str(p) for p in _SFX_VIDEO_DECK}
+        tries = 0
+        while len(_SFX_VIDEO_DECK) < SFX_DECK_DEEP and tries < 12:
+            tries += 1
+            pick = random.choice(pool)
+            if str(pick) in have:
+                continue
+            if not _sfx_deck_warm(pick):
+                continue
+            have.add(str(pick))
+            _SFX_VIDEO_DECK.append(pick)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def sfx_deck_take() -> Path | None:
+    """The front of the deck, already warm, and a refill behind it.
+
+    #1309: a clip picked at the moment of the tap is a COLD read off
+    the share - measured at 4.46s for the first two kilobytes, against
+    0.50s for the whole file once it is cached. Keeping a few read
+    ahead is the difference between the picture arriving with the tap
+    and arriving several seconds after it."""
+    got = _SFX_VIDEO_DECK.pop(0) if _SFX_VIDEO_DECK else None
+    try:
+        fire_and_forget(asyncio.to_thread(_sfx_deck_fill))
+    except Exception:  # noqa: BLE001
+        pass
+    if got is not None and got.is_file():
+        return got
+    return None
 
 
 def _sfx_any_video() -> Path | None:
@@ -120609,7 +120670,13 @@ async def sfx_video_cue_api(
         return {"ok": False, "clip": None, "warming": True,
                 "say": "the clip library is still warming - tap again in "
                        "a moment"}
-    pick = await asyncio.to_thread(_sfx_any_video)
+    # #1309: the deck first - those are already read, so the WebView's
+    # own fetch is the warm 0.5s one rather than the cold 4.5s one. An
+    # empty deck (the first tap of a process) falls back to the random
+    # pick rather than waiting for a refill.
+    pick = sfx_deck_take()
+    if pick is None:
+        pick = await asyncio.to_thread(_sfx_any_video)
     if pick is None:
         return {"ok": False, "clip": None,
                 "say": "no video clip is free - the library has none short "
@@ -125007,6 +125074,69 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 "sort": 1, "row": r, "what": "line"} for r in speech]
               + [{"at": e["at"], "sort": 0, "row": e, "what": "action"}
                  for e in actions])
+
+    # #1308: A LINE THAT HAS NOT BEEN SAID IS NOT PART OF WHAT WAS SAID.
+    #
+    # The `at` above is air_at OR ts. For a row that aired that is an
+    # AIR time; for a row that never aired there is no air_at and it
+    # falls back to ts, which is when the round was WRITTEN. Sorting a
+    # preparation time against air times is the same category error
+    # #1274 found between air_at and ts, and it puts banked material
+    # in the middle of a conversation that really happened.
+    #
+    # Measured on one live hour: 10 of 51 dialogue lines inside a
+    # segment had the air go past them, every one of them `prepared`,
+    # and an entire eight-line gallery round sat spliced in front of
+    # the round that aired - with the script running a hundred seconds
+    # backwards to pick that round up again.
+    #
+    # Banked work is worth seeing; it is what the segment is holding.
+    # So it is not hidden, it is made to TRAIL. A conversation nobody
+    # has heard sits after everything that has been heard, in its own
+    # order. A conversation that HAS aired keeps its own anchor, and
+    # an unaired turn inside it trails that conversation instead of
+    # jumping in front of what was already said.
+    try:
+        _floor = 0.0
+        for _e in events:
+            _r = _e.get("row") or {}
+            if _e.get("what") != "line":
+                continue
+            if str(_r.get("aired") or "") in AIR_AT_HEARD:
+                _floor = max(_floor, float(_e["at"] or 0))
+        if _floor:
+            # The latest air time each conversation actually reached.
+            _heard: dict[str, float] = {}
+            for _e in events:
+                if _e.get("what") != "line":
+                    continue
+                _r = _e.get("row") or {}
+                if str(_r.get("aired") or "") not in AIR_AT_HEARD:
+                    continue
+                _sid = str(_r.get("sid") or "")
+                if not _sid:
+                    continue
+                _heard[_sid] = max(_heard.get(_sid, 0.0), float(_e["at"] or 0))
+            # A hair past the floor, so ordering among the unheard is
+            # kept by their own written order rather than collapsed.
+            _step = 0.0
+            for _e in events:
+                if _e.get("what") != "line":
+                    continue
+                _r = _e.get("row") or {}
+                if str(_r.get("aired") or "") in AIR_AT_HEARD:
+                    continue
+                _sid = str(_r.get("sid") or "")
+                _anchor = _heard.get(_sid)
+                if _anchor is None:
+                    _step += 0.001
+                    _e["at"] = _floor + 1.0 + _step   # never heard at all
+                elif float(_e["at"] or 0) < _anchor:
+                    _step += 0.001
+                    _e["at"] = _anchor + _step        # its turn is still to come
+    except Exception:  # noqa: BLE001
+        pass              # a script that will not re-anchor still reads
+
     events.sort(key=lambda e: (e["at"], e["sort"]))
 
     # #1259: AND THEN THE SCRIPT DECIDES. The sort above orders rounds
@@ -125148,7 +125278,25 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             # quantity, which is what an anchor wants. `at` breaks the
             # tie because `ts` is whole seconds and two rounds can open
             # inside one; a row with no `ts` falls back to `at`.
-            def _anchor(w: list[int]) -> tuple[float, float]:
+            def _anchor(w: list[int]) -> tuple[int, float, float]:
+                # #1308b: HEARD FIRST, THEN WRITTEN.
+                #
+                # `ts` is the right anchor between two conversations
+                # that both went out - #1274 measured what happens
+                # when air_at is used instead. But `ts` is a WRITTEN
+                # time, and between a conversation that aired and one
+                # that was only ever banked it says nothing about
+                # which the listener heard first: the banked round was
+                # written earlier, so it sorted earlier, and the
+                # operator read eight lines nobody ever said in front
+                # of the round that actually went out.
+                #
+                # So a block that was never heard goes after every
+                # block that was, and keeps its own order among the
+                # other unheard ones.
+                _heard_here = any(
+                    str((events[_i].get("row") or {}).get("aired") or "")
+                    in AIR_AT_HEARD for _i in w)
                 _best: tuple[float, float] | None = None
                 for _i in w:
                     _r = events[_i].get("row") or {}
@@ -125157,7 +125305,8 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                     _key = (_t, _at)
                     if _best is None or _key < _best:
                         _best = _key
-                return _best or (0.0, 0.0)
+                _got = _best or (0.0, 0.0)
+                return (0 if _heard_here else 1, _got[0], _got[1])
 
             _blocks = sorted(_talk.values(), key=_anchor)
             # #1299: each line, then whatever interrupted it, so the

@@ -84,7 +84,10 @@ function paintTrim() {
 
 function paintHead(at) {
   if (!duration) return;
-  const when = at == null ? film.currentTime : at;
+  /* While playing, the clock is the truth and film.currentTime is a lagging
+   * approximation of it - so a paint with no argument must not fall back to
+   * the video or the playhead jumps backwards every time one arrives. */
+  const when = at != null ? at : (playing ? headAt() : film.currentTime);
   head.style.left = ((when / duration) * 100) + '%';
   const said = document.getElementById('headSaid');
   if (said) said.textContent = clock(when);
@@ -330,9 +333,68 @@ function stopVoices() {
   voices = [];
 }
 
+/* WHERE THE PLAYHEAD REALLY IS.
+ *
+ * Not film.currentTime. The tablet's recorder films a SCREEN, which is not
+ * motion - it emits a frame when something changes - so the file is variable
+ * rate with long gaps and its currentTime advances in lurches. A playhead
+ * painted from it lurches too, faithfully drawing a number that only moves
+ * when a picture happens to arrive.
+ *
+ * And it is not the clock being HEARD: the video is muted and the sound is a
+ * decoded WAV on Web Audio's own sample-accurate clock. Following the video
+ * meant the playhead and the ears were on two different clocks, which is
+ * exactly "doesn't match".
+ *
+ * So: the audio clock while there is audio, and a wall clock when there is
+ * not - either is a better clock than a screen recording. */
+let ranFrom = 0;        /* the media time playback began at */
+let ranAt = 0;          /* the clock reading when it began */
+let ranOn = '';         /* 'audio' or 'wall', for the console when this next
+                           needs explaining */
+
+/* THE WALL CLOCK, AND ONLY THE WALL CLOCK.
+ *
+ * This tried the audio clock first, on the reasonable theory that the sound
+ * is what the ears follow. It cost two rounds of measuring to learn that a
+ * browser hands out a SUSPENDED AudioContext until a gesture, and a
+ * suspended context does not merely play nothing - its currentTime stops.
+ * Reading it gave a playhead that sat still while the button said Stop
+ * (measured: 21 ms of travel in 1.2 seconds), and resume() is asynchronous,
+ * so the moment play() captures a start time is exactly the moment the
+ * clock is most likely to be frozen.
+ *
+ * performance.now() is never asleep, never needs a gesture and never needs
+ * a fallback. It runs at the same rate as the audio clock to within parts
+ * per million, which over a thirty-second preview is nothing - and the
+ * alternative is a clock with a state machine in front of it. */
+function nowClock() {
+  return performance.now() / 1000;
+}
+
+function headAt() {
+  if (!playing) return film.currentTime;
+  return ranFrom + (nowClock() - ranAt);
+}
+
 function follow() {
-  paintHead();
-  if (playing && film.currentTime >= outAt - 0.02) { stop('reached the out point'); return; }
+  const at = headAt();
+  paintHead(at);
+
+  /* THE PICTURE IS NUDGED, NOT DRIVEN. Seeking every frame is how a preview
+   * becomes a slideshow; this corrects only real drift, which on a
+   * variable-rate recording means after a gap rather than continuously. */
+  /* A FIFTH OF A SECOND, AND NOT TIGHTER. Measured at 0.12 the nudge fires
+   * often enough that this window's own scrub machinery takes it for a
+   * finger on the timeline and stops playback - the head fell from 1.00x to
+   * 0.35x and froze. The nudge is a correction for drift; it must stay rare
+   * enough not to be mistaken for an instruction. */
+  if (playing && !seeking && Math.abs(film.currentTime - at) > 0.2) {
+    try { film.currentTime = Math.min(at, duration - 0.01); }
+    catch (error) { /* a seek that is refused is not worth a stack */ }
+  }
+
+  if (playing && at >= outAt - 0.02) { stop('reached the out point'); return; }
   raf = requestAnimationFrame(follow);
 }
 
@@ -347,8 +409,36 @@ function play() {
   film.muted = true;
   playing = true;
   document.getElementById('playBtn').innerHTML = '&#9632; Stop';
-  film.play().catch(() => {});
+
+  /* WAKE THE CONTEXT FIRST. A browser suspends it until a gesture, and a
+   * suspended context plays nothing AND stops its own clock - so the mix was
+   * silent and the playhead frozen for the same reason. */
+  const audio = ensureContext();
+  if (audio && audio.state !== 'running') {
+    audio.resume().catch(() => { /* the fallback clock covers it */ });
+  }
+
+  /* PLAY AFTER THE SEEK, NOT ACROSS IT.
+   *
+   * `film.currentTime = inAt` immediately above starts a seek, and calling
+   * play() while one is in flight is how the element ends up paused with no
+   * error at all - measured: playing true, the playhead running at exactly
+   * 1.00x, and film.paused still true three seconds in, so the only thing
+   * moving the picture was the drift nudge in follow() at five frames a
+   * second. That is the "jerky" half of the complaint, and it is not the
+   * playhead's fault.
+   *
+   * NOT SWALLOWED either way: a refused play() is a fact worth saying. */
+  film.play().catch((error) => {
+    say('The picture would not play: ' + error.message
+      + ' — the sound and the playhead carry on.', true);
+  });
   start();
+
+  ranOn = 'wall';
+  ranFrom = inAt;
+  ranAt = nowClock();
+
   cancelAnimationFrame(raf);
   raf = requestAnimationFrame(follow);
 }

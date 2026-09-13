@@ -1289,13 +1289,12 @@ async function openCameraWindow(facing) {
     /* The lens is released when the last reader goes, but the service is
      * told as well - an open camera nobody is watching is a camera nothing
      * else on the tablet can use. */
+    /* THE SERVICE IS LEFT STANDING. Disconnecting is what releases the
+     * lens - see PineCameraService - so closing a window needs to do
+     * nothing more, and stopping the service would mean the next tap on the
+     * icon had to start one and wait for it. "Available whenever I want" is
+     * a service that is already there. */
     if (camera) { await camera.close(); camera = null; }
-    try {
-      const speak = await terminalHost.glass();
-      await speak.say("(async function () { var b = window.pineDesktop;"
-        + " if (b && b.cameraClose) await b.cameraClose();"
-        + " return JSON.stringify({ok:true}); })()");
-    } catch (error) { /* the tablet lets go on its own too */ }
   });
   cameraWindow.loadFile(path.join(__dirname, "renderer", "tablet-camera.html"));
   return Object.assign({ ok: true }, where);
