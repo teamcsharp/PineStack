@@ -147,6 +147,25 @@
           <span id="pineCamBrief" class="vitals-brief">looking…</span>
         </button>
         <div id="pineCamStats" class="pv"></div>
+        <!-- #1349: three faults look identical from here - a dead radio,
+             a camera out of range, a camera that slept its Wi-Fi. Look
+             asks again; Troubleshoot asks the supervisor WHICH. -->
+        <div id="pineCamTools" class="pine-cam-tools">
+          <button id="pineCamLook" type="button"
+                  title="Watch the camera when it is linked, or look for it again when it is not">Look</button>
+          <button id="pineCamFix" type="button"
+                  title="Work out why the camera is not here, and what to do about it">Troubleshoot</button>
+          <!-- #1351: the camera on the air, when there is air to be on.
+               Defaults to on: turning the camera on is a deliberate act,
+               and the overwhelmingly likely reason for it is to show
+               what it can see. The station says so on the panel either
+               way, so nothing goes out unannounced. -->
+          <label class="pine-cam-pref" for="pineCamLive">
+            <input id="pineCamLive" type="checkbox" checked>
+            <span>Put it on the broadcast, in place of the gallery</span>
+          </label>
+          <pre id="pineCamDoc" class="pine-cam-doc" hidden></pre>
+        </div>
       </div>
       <div class="stream-routes">
         <button id="nabuMuteBtn" type="button" title="Mute every sound on Nabu without changing its physical volume or routes">Mute Nabu</button>

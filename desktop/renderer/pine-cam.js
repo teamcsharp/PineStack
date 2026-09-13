@@ -31,6 +31,9 @@
   var timer = 0;
   var frameTimer = 0;
   var box = null;
+  var folded = false;
+  var FOLD_KEY = 'pineCamFolded';
+  var busy = false;
   var shown = false;
   var live = false;
 
@@ -222,14 +225,76 @@
     }).join('');
   }
 
+  /* ------------------------------------------------ the troubleshooter */
+
+  /* 'Not on the network' covers three faults with different cures - a
+   * dead radio, a camera out of range, a camera that has slept its Wi-Fi
+   * to save battery - and they look identical from here. The station
+   * cannot tell them apart either; the link supervisor can, because it
+   * owns the radio, so this just asks it and prints what it said. */
+  function troubleshoot() {
+    var out = document.getElementById('pineCamDoc');
+    if (!out || busy) return;
+    busy = true;
+    out.hidden = false;
+    out.textContent = 'looking…';
+    Promise.resolve(ask('/api/pinelink/doctor')).then(function (d) {
+      busy = false;
+      if (!d) { out.textContent = 'the station did not answer'; return; }
+      var lines = [d.verdict || 'no verdict'];
+      if (d.stale) lines.push('(this reading is ' + d.age + 's old)');
+      if (d.nearby) {
+        lines.push('the radio can see ' + d.nearby + ' network(s)');
+      }
+      (d.steps || []).forEach(function (t, i) {
+        lines.push((i + 1) + '. ' + t);
+      });
+      out.textContent = lines.join(String.fromCharCode(10));
+      look();
+    }).catch(function () {
+      busy = false;
+      out.textContent = 'the station did not answer';
+    });
+  }
+
   function start() {
+    try { folded = localStorage.getItem(FOLD_KEY) === '1'; }
+    catch (e) { folded = false; }
+    var stats0 = document.getElementById('pineCamStats');
+    var tools0 = document.getElementById('pineCamTools');
+    if (stats0) stats0.hidden = folded;
+    if (tools0) tools0.hidden = folded;
+    var lookBtn = document.getElementById('pineCamLook');
+    if (lookBtn && !lookBtn.__wired) {
+      lookBtn.__wired = true;
+      lookBtn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        if (live) { toggle(); } else { troubleshoot(); }
+      });
+    }
+    var fixBtn = document.getElementById('pineCamFix');
+    if (fixBtn && !fixBtn.__wired) {
+      fixBtn.__wired = true;
+      fixBtn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        troubleshoot();
+      });
+    }
     var row = document.getElementById('pineCamRow');
     if (row && !row.__pineCamWired) {
       row.__pineCamWired = true;
       row.addEventListener('click', function () {
-        /* Only when there is something to see. Opening an empty frame
-         * teaches the row that it lies. */
-        if (live) { toggle(); } else { look(); }
+        /* #1349: THE HEADER FOLDS, like every other panel in this
+         * sidebar. Watching it is the LOOK button's job; a header that
+         * opens a video is a header that behaves unlike its neighbours. */
+        folded = !folded;
+        var stats = document.getElementById('pineCamStats');
+        var tools = document.getElementById('pineCamTools');
+        if (stats) stats.hidden = folded;
+        if (tools) tools.hidden = folded;
+        row.setAttribute('aria-expanded', folded ? 'false' : 'true');
+        try { localStorage.setItem(FOLD_KEY, folded ? '1' : '0'); }
+        catch (e) { /* a forgotten fold is not worth an error */ }
       });
     }
     var b = button();

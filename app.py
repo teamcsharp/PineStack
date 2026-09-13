@@ -104395,6 +104395,11 @@ async def pinelink_look_api(
         "state": str(got.get("state") or ""), "clips": int(got.get("clips") or 0),
         "frame": "/api/pinelink/frame.jpg",
         "ready": linked,
+        # #1351: whether a live camera displaces the gallery, and whether
+        # it is doing so RIGHT NOW. Two different facts: the preference
+        # stands whether or not there is a camera to apply it to.
+        "on_air_pref": pinelink_on_air(),
+        "on_air_now": bool(linked and pinelink_on_air()),
         # One sentence a surface can print without knowing any of this.
         "say": ("the camera is linked and recording" if linked
                 else "the camera is on the network - connecting"
@@ -104436,6 +104441,90 @@ async def pinelink_connect_api(
     _PINELINK_SEEN["at"] = 0.0          # the next look is a real scan
     return {"ok": True,
             "say": "asked the link to reconnect - it takes a few seconds"}
+
+
+PINELINK_PREF = data_path("pinelink_pref.json")
+
+
+def pinelink_on_air() -> bool:
+    """#1351: should a live camera take the gallery's place on air?
+
+    Default YES. Turning the camera on is a deliberate act and the
+    overwhelmingly likely reason for it is to show what it can see, so
+    the default should be the thing that needs no second step. It is
+    always ANNOUNCED - the panel says the camera is on the air while it
+    is - because a broadcast that changed what it was showing without
+    saying so would be the one version of this nobody wants.
+
+    A file rather than a dial in settings.json: this is a property of the
+    camera link, it is read by surfaces that never load dj_settings, and
+    it should survive a settings rewrite that knows nothing about it.
+    """
+    try:
+        return bool(json.loads(PINELINK_PREF.read_text()).get("on_air", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+@app.post("/api/pinelink/on-air")
+async def pinelink_on_air_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Turn that off, or back on."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    want = bool((body or {}).get("on_air", True))
+    try:
+        PINELINK_PREF.parent.mkdir(parents=True, exist_ok=True)
+        PINELINK_PREF.write_text(json.dumps({"on_air": want}))
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "say": "could not remember that: "
+                + str(err)[:160]}
+    return {"ok": True, "on_air": want,
+            "say": ("a live camera takes the gallery's place on air"
+                    if want else
+                    "the gallery keeps the air; the camera is watchable "
+                    "here but does not go out")}
+
+
+@app.get("/api/pinelink/doctor")
+async def pinelink_doctor_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1349: WHY is the camera not here.
+
+    "not on the network" covers three faults with different cures - a
+    dead radio, a camera out of range, and a camera that has switched its
+    Wi-Fi off to save battery - and from the outside they are identical.
+    The supervisor can tell them apart, because it owns the radio: a
+    radio that can see OTHER networks is working, so a missing camera is
+    range or sleep, and this link is rated at ten metres.
+
+    Read out of the state file for the reason the scan is: this process
+    is in a container and cannot see a radio at all.
+    """
+    require_read_auth(authorization)
+    try:
+        got = json.loads(PINELINK_STATE.read_text())
+    except Exception:  # noqa: BLE001
+        got = {}
+    doc = dict(got.get("doctor") or {})
+    age = time.time() - float(got.get("at") or 0)
+    if not doc:
+        return {"verdict": "the link supervisor has not reported yet",
+                "steps": ["it sweeps every 15 seconds - give it a moment",
+                          "if this persists the pinelink service is not "
+                          "running on the DGX"],
+                "nearby": 0, "camera": False, "age": round(age, 1)}
+    doc["age"] = round(age, 1)
+    # A diagnosis older than a minute is a diagnosis of a moment that has
+    # passed, and saying so costs nothing.
+    doc["stale"] = bool(age > 60)
+    return doc
 
 
 @app.get("/api/pinelink/state")

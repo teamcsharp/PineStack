@@ -93,6 +93,39 @@ def linked() -> bool:
     return "192.168.1." in out
 
 
+def remember() -> None:
+    """#1350: so turning the camera on is the whole procedure.
+
+    NetworkManager keeps a profile after the first successful join, but
+    two of its defaults are wrong for this. Autoconnect has to be ON, or
+    the camera coming back is noticed by nobody. And the profile has to
+    be PINNED to the spare interface: an unbound profile is a profile
+    NetworkManager may bring up on wlP9s9, which is the station's radio
+    and the only way anything reaches the broadcast. That is not a
+    trade worth making for a camera.
+
+    Low priority on purpose, so it can never win against the house
+    network on a radio that can see both.
+    """
+    try:
+        code, out = run(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection',
+                         'show'], 20)
+        name = ''
+        for line in (out or '').splitlines():
+            bits = line.split(':')
+            if bits and bits[0] == SSID:
+                name = bits[0]
+                break
+        if not name:
+            return          # nothing joined yet; nothing to remember
+        run(['nmcli', 'connection', 'modify', name,
+             'connection.autoconnect', 'yes',
+             'connection.autoconnect-priority', '-10',
+             'connection.interface-name', SPARE_IF], 20)
+    except Exception:  # noqa: BLE001
+        pass          # the sweep rejoins anyway; this only makes it quicker
+
+
 def join() -> bool:
     """Join the camera's AP on the spare radio only."""
     if linked():
@@ -103,7 +136,10 @@ def join() -> bool:
     time.sleep(4)
     code, out = run(["nmcli", "device", "wifi", "connect", SSID,
                      "password", PSK, "ifname", SPARE_IF], 60)
-    return code == 0 and linked()
+    ok = code == 0 and linked()
+    if ok:
+        remember()          # #1350: next time, it just comes back
+    return ok
 
 
 def seen_on_air() -> dict:
@@ -130,6 +166,72 @@ def seen_on_air() -> dict:
     except Exception:  # noqa: BLE001
         pass
     return got
+
+
+def doctor() -> dict:
+    """#1349: why is the camera not here, in terms that separate the
+    three things that look identical from the outside.
+
+    'not on the network' covers a dead radio, a camera out of range and a
+    camera that is switched off, and the cure is different for each. The
+    radio can tell them apart: if it can see OTHER networks, the radio
+    works and the antenna is fine, so a missing camera is out of range or
+    asleep - and the manual rates this link at 10 m. If it can see
+    nothing at all, the radio is the problem.
+    """
+    out = {'iface': SPARE_IF, 'nearby': 0, 'strongest': [], 'steps': []}
+    try:
+        code, link = run(['ip', '-br', 'link', 'show', SPARE_IF], 10)
+        out['iface_up'] = ' UP ' in (link or '') or 'UP>' in (link or '')
+    except Exception:  # noqa: BLE001
+        out['iface_up'] = False
+    seen = []
+    try:
+        run(['nmcli', 'device', 'wifi', 'rescan', 'ifname', SPARE_IF], 40)
+        time.sleep(4)
+        code, txt = run(['nmcli', '-t', '-f', 'SSID,SIGNAL', 'device',
+                         'wifi', 'list', 'ifname', SPARE_IF], 25)
+        for line in (txt or '').splitlines():
+            bits = line.split(':')
+            if bits and bits[0]:
+                try:
+                    seen.append((int(bits[1]) if len(bits) > 1 else 0,
+                                 bits[0]))
+                except ValueError:
+                    seen.append((0, bits[0]))
+    except Exception as err:  # noqa: BLE001
+        out['why'] = str(err)[:200]
+    seen.sort(reverse=True)
+    out['nearby'] = len(seen)
+    out['strongest'] = [{'ssid': n, 'signal': s} for s, n in seen[:5]]
+    out['camera'] = any(n == SSID for _s, n in seen)
+
+    if out['camera']:
+        out['verdict'] = 'the camera is on the air - joining it now'
+        out['steps'] = ['found it; the link will join within 15 seconds']
+    elif not out['iface_up']:
+        out['verdict'] = 'the spare radio is down'
+        out['steps'] = ['the USB adapter is not up - reseat it, then '
+                        'restart the pinelink service']
+    elif out['nearby'] == 0:
+        out['verdict'] = 'the spare radio sees nothing at all'
+        out['steps'] = ['the adapter is up but scanning nothing - reseat '
+                        'it, or check it is not being held by something '
+                        'else']
+    else:
+        out['verdict'] = ('the radio is fine - it can see %d other '
+                          'network(s) - so the camera is out of range or '
+                          'asleep') % out['nearby']
+        out['steps'] = [
+            'the camera Wi-Fi only reaches about 10 m (32 ft) - bring it '
+            'closer to the DGX, or move the USB adapter towards it',
+            'these cameras drop their Wi-Fi to save battery: press the '
+            'Wi-Fi button again and watch for the solid green light',
+            'a phone or the Viidure app already joined takes the only '
+            'client slot - disconnect it first',
+            'then press Look again',
+        ]
+    return out
 
 
 def camera_awake() -> bool:
@@ -200,6 +302,14 @@ def supervise(once: bool = False) -> None:
 
     while True:
         _LAST_SEEN.update(seen_on_air())
+        # #1349: and why not, when it is not. Cheap - the scan above
+        # has already been paid for - and it is the difference between
+        # a surface that says 'not found' and one that says which of
+        # the three reasons it is.
+        try:
+            _LAST_SEEN['doctor'] = doctor()
+        except Exception:  # noqa: BLE001
+            pass
         if not join():
             say("no-link", why="the camera's network is not being "
                 "broadcast, or the join failed")

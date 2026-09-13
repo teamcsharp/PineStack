@@ -74,3 +74,37 @@
   min-height: 120px;
   background: #05080a;
 }
+
+/* The camera's own controls, under its stats, folding with them. */
+.pine-cam-tools { padding: 6px 8px 8px; display: grid; gap: 6px; }
+.pine-cam-tools[hidden] { display: none !important; }
+.pine-cam-tools button {
+  height: 28px;
+  font-size: 11px;
+}
+.pine-cam-pref {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #9fb4bd;
+  cursor: pointer;
+}
+.pine-cam-pref input { margin-top: 2px; }
+/* The verdict, as the supervisor wrote it. Pre, because the steps are a
+   numbered list and re-flowing them loses the order. */
+.pine-cam-doc {
+  margin: 0;
+  padding: 7px 8px;
+  background: #0b1114;
+  border: 1px solid #24323a;
+  border-radius: 7px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: #cfe0e6;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.pine-cam-doc[hidden] { display: none !important; }
