@@ -48058,10 +48058,13 @@ SCHEDULE_PROMPT_SEED: dict[str, str] = {
     "manager": "It is a memo, not an order. Read it out, react honestly "
                "— wince at it, argue with it, agree with it — and say "
                "what it means for the show tonight.",
-    "recap": "Take stock of the hour that just went out: what played, "
-             "who rang, what sold, what came down from upstairs. Two "
-             "moments worth remembering, a joke on each, then straight "
-             "back to the music.",
+    # #1291: the operator's own description of this segment.
+    "recap": "Close out the hour. Say back what was actually discussed "
+             "— \"the last hour we got into this, and this, and this\" "
+             "— three or four subjects in your own words, then a brief "
+             "bit of banter about them, then put a lid on the hour and "
+             "hand back to the music. Concise. An ending, not a "
+             "segment: do not preview what is coming.",
     "deep": "One subject, taken further than it should be. No "
             "topic-hopping — dig.",
     "bombshell": "Something has set one of you off. Let the rant run, "
@@ -49494,21 +49497,37 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
     beats: list[str] = []
     for row in list(_RADIO.get("chat") or [])[-60:]:
         text = str(row.get("text") or "").strip()
+        # #1291: THE CONVERSATIONS TOO. This listed news, calls, ads,
+        # gallery and manager - and left out `banter`, which is 49.8%
+        # of aired seconds. The dominant conversation of every hour was
+        # invisible to the one segment whose job is to summarise the
+        # hour's conversations, so the pair were asked to recap a show
+        # they had been handed no record of.
         if text and str(row.get("kind") or "") in (
-                "news", "call", "caller", "ad", "gallery", "manager"):
+                "news", "call", "caller", "ad", "gallery", "manager",
+                "banter", "interject", "sfxguy", "deep", "bombshell"):
             beats.append(f"{row.get('kind')}: {text[:110]}")
-    del beats[:-8]
+    del beats[:-14]
     stats = _RADIO.get("session_stats") or {}
     when = time.strftime("%I:%M %p", time.localtime()).lstrip("0")
     angle = (
-        f"IT IS {when} AND THIS IS THE RECAP ON THE HOUR. The two of you "
-        "take stock of the hour that just went out — briskly, in your own "
-        "voices, never read like a wire service. Say what actually "
-        "happened: the records, who rang in and what they wanted, anything "
-        "that got sold, and whatever came down from upstairs. Pick the two "
-        "moments worth remembering and land a joke on each. Finish by "
-        "telling the listeners what the next hour holds, then hand straight "
-        "back to the music."
+        f"IT IS {when} AND THIS IS THE RECAP ON THE HOUR. You are "
+        "CLOSING OUT THE HOUR, and it goes in three beats, in this "
+        "order.\n\n"
+        "FIRST, say back what was actually discussed. Out loud, plainly, "
+        "in the shape of \"the last hour we got into this, and this, and "
+        "this\" — name the SUBJECTS the two of you and the callers "
+        "actually talked about, three or four of them, in your own "
+        "words and briskly. Not a list of events, not a wire service: "
+        "the topics, as somebody who was in the room would say them.\n\n"
+        "SECOND, a brief bit of banter about them. A couple of lines "
+        "only — the thing one of you is still chewing on, and the "
+        "other one\'s answer.\n\n"
+        "THIRD, close the hour. Put a lid on it and hand straight back "
+        "to the music. Do NOT preview the next hour; this is an "
+        "ending.\n\n"
+        "Concise throughout. The whole thing is a closing, not a "
+        "segment of its own."
         + (f"\n\nRecords that actually played: {'; '.join(played[:8])}."
            if played else "")
         + (f"\n\nWhat went out on air: {'; '.join(beats)}." if beats else "")
@@ -69255,6 +69274,29 @@ def gap_kind_policy(kind: str, dj: dict[str, Any] | None = None,
             # finished round of its OWN is not improved by being
             # replaced with banked banter, whichever road it is.
             if kind in RESCUE_ROADS_OPEN and _ready_shelf_row(kind):
+                return kind, ""
+            # #1290: A ROAD THAT CANNOT BE BANKED IS NOT FAILING A TEST
+            # ABOUT BANKING.
+            #
+            # CANNOT_PREPARE says a recap "reads the hour that just
+            # happened, so it can only be written at the end of it" -
+            # so it can never have a banked row, can never answer this
+            # question with a yes, and was diverted every hour for
+            # ever. Measured: 0 reservations in 18 consecutive hours,
+            # the sheet naming it 17 times and 0 airing, 4 rows in 48
+            # hours of log. It was being failed on a test it is not
+            # eligible to sit, and the gate's own consolation - "their
+            # original road is still prepared in the background and can
+            # air below 100" - is false for a road nothing prepares.
+            #
+            # This gate runs AFTER the running order has chosen. Its
+            # job is to protect the air from an unbacked guess, not to
+            # overrule the schedule about a segment that is only ever
+            # live. GAP_LIVE_ONLY already names these roads; the
+            # station has always meant to pay live render time for
+            # them, and what it was doing instead was paying nothing
+            # and airing banter.
+            if kind in CANNOT_PREPARE:
                 return kind, ""
             # At the absolute top stop, "a script exists" is not enough.
             # A shelf road can invalidate its own takes while freshening or

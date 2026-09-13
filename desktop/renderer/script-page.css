@@ -356,7 +356,13 @@
   padding-left: 7px;
   color: #ffffff;
   font-weight: 600;
-  scroll-margin: 40vh 0;
+  /* #1282b: SMALL, because the scroll is now `nearest`.
+     40vh on a 612px pane is ~245px of required clearance EACH side,
+     leaving about 122px in which a line counts as "in view" - so
+     nearly every line change forced a scroll, and a long one. That is
+     the jumping that survived #1282: `nearest` with a huge margin is
+     worse than `center` was. A comfortable band, not a demand. */
+  scroll-margin: 96px 0;
 }
 .sp-el.sp-now::before {
   content: "ON AIR";
@@ -628,3 +634,67 @@
   border-left: 2px dotted #b08a2e; opacity: .9;
 }
 .sp-page.sp-look-paper .sp-empty { color: #6d6455; }
+
+/* --- #1289 THE HOUR AHEAD ------------------------------------------
+ *
+ * "I'm able to see in advance everything that's scripted for the hour...
+ *  and then deal with how am I scheduling things for these next hours."
+ *
+ * The screenplay above is what HAS been said. This is what is still to
+ * come, read from the director's own running order. Two layouts, and
+ * they differ only in where this node hangs: inside the script's
+ * scroll (below) or in a column next to it (beside).
+ */
+.sp-plan { margin: 26px 0 40px; }
+.sp-el.sp-planhour {
+  margin: 22px 0 10px;
+  font-size: 10px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--sp-on);
+  border-top: 1px solid var(--sp-line);
+  padding-top: 12px;
+}
+.sp-el.sp-planseg {
+  margin: 16px 0 6px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  color: var(--sp-text);
+  opacity: .92;
+}
+.sp-el.sp-planseg::before { content: "○ "; opacity: .6; }
+.sp-el.sp-planlive::before { content: "● "; color: var(--sp-on); opacity: 1; }
+/* A slot with nothing written for it is shown, not hidden. */
+.sp-el.sp-planbare { color: var(--sp-amber); }
+.sp-el.sp-planwhy {
+  margin: 0 0 8px 6%;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--sp-amber);
+  opacity: .85;
+}
+/* Not yet heard: present, and plainly not the air. */
+.sp-el.sp-plancue { opacity: .5; }
+.sp-el.sp-planline { opacity: .62; font-style: italic; }
+
+/* BESIDE: the plan takes its own column and scrolls on its own. */
+.sp-page.sp-beside .sp-right {
+  display: grid;
+  grid-template-columns: 1fr minmax(200px, 38%);
+  grid-template-rows: auto auto 1fr auto auto;
+  column-gap: 14px;
+}
+.sp-page.sp-beside #spScript { grid-column: 1; grid-row: 3; }
+.sp-page.sp-beside #spPlan {
+  grid-column: 2;
+  grid-row: 3;
+  overflow-y: auto;
+  margin: 0;
+  padding-right: 6px;
+  border-left: 1px solid var(--sp-line);
+  padding-left: 12px;
+}
+.sp-page.sp-beside .sp-scripthead,
+.sp-page.sp-beside .sp-now-line { grid-column: 1 / -1; }
+.sp-page.sp-beside .sp-crawl { grid-column: 1 / -1; }
+.sp-crawl-go.sp-planway.on { background: #2f5f6f; border-color: #4a9ab0; }
