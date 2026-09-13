@@ -696,7 +696,12 @@ class Glass {
    * @JavascriptInterface is the kind of thing that works in a test and fails
    * on a long clip.
    */
-  async clip_fromReplay(seconds) {
+  async clip_fromReplay(seconds, options) {
+    /* SILENT WHEN ONLY THE PICTURES ARE WANTED. The frame picker shows one
+     * moment of the recording and takes a still off it; fetching the
+     * broadcast ring alongside would add megabytes and seconds to a window
+     * that cannot play a sound. */
+    const silent = !!(options && options.silent);
     const want = clampSeconds(seconds);
     const pid = await this.pid();
     if (!pid) return { ok: false, why: 'the kiosk app is not running' };
@@ -755,6 +760,13 @@ class Glass {
        * ends NOW, so the audio wanted is the same span ending now. */
       const audio = { broadcast: null, mic: null };
       const notes = ['from the tablet\u2019s rolling recording'];
+      if (silent) {
+        if (ran + 0.5 < want) {
+          notes.push('only ' + ran.toFixed(1) + 's had been recorded');
+        }
+        return { ok: true, mp4, bytes: mp4.length, seconds: ran,
+          at: this.now(), audio, notes };
+      }
       try {
         const heard = await page.askJson(
           broadcastQuestion(ran.toFixed(3), '0'), 30000);

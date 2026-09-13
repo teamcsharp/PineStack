@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!--
+  SCRUB BACK TO THE MOMENT, THEN DRAW ON IT.
+
+  "When I control click the image icon, allow me to scrub the timeline to
+   scrub back and find the exact moment in time in which I want to draw on
+   the screenshot."
+
+  A screenshot is taken at the moment you press the button, which is never
+  quite the moment you wanted - the dialog has closed, the meter has fallen
+  back, the finger has lifted. The tablet has been recording itself all
+  along, so the moment is already on disk; this window is the way back to it.
+
+  It is deliberately NOT the export window. That one cuts a span with audio
+  and in and out points. This one picks ONE frame, and everything on it
+  serves that: step by a frame, read how long ago you are, take the picture.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Find the moment</title>
+  <link rel="stylesheet" href="pineicons.css" />
+  <link rel="stylesheet" href="frame-pick.css" />
+</head>
+<body>
+  <div id="shell">
+
+    <div id="glass">
+      <video id="film" muted playsinline preload="auto"></video>
+      <div id="waiting">Fetching the tablet&rsquo;s recording&hellip;</div>
+    </div>
+
+    <div id="scrub">
+      <div id="track" tabindex="0" role="slider" aria-label="Scrub the recording">
+        <div id="done"></div>
+        <div id="head"></div>
+      </div>
+      <div id="ticks"></div>
+    </div>
+
+    <div id="bar">
+      <div id="transport">
+        <button id="backFrame" class="step" title="Back one frame (Left arrow)"
+                data-pine-icon="c:skip--back--filled" aria-label="Back one frame"></button>
+        <button id="playPause" class="step wide" title="Play or pause (Space)"
+                aria-label="Play"></button>
+        <button id="onFrame" class="step" title="Forward one frame (Right arrow)"
+                data-pine-icon="c:skip--forward--filled" aria-label="Forward one frame"></button>
+      </div>
+
+      <div id="clock">
+        <span id="ago">&mdash;</span>
+        <span id="ofWhat" class="dim"></span>
+      </div>
+
+      <div id="doing">
+        <button id="copy" class="mild" title="Copy this frame to the clipboard">
+          <span data-pine-icon="c:copy--to-clipboard" aria-hidden="true"></span>
+          <span>Copy this frame</span>
+        </button>
+        <button id="take" class="go" title="Copy it and open the mark-up window">
+          <span data-pine-icon="c:edit" aria-hidden="true"></span>
+          <span>Mark up this frame</span>
+        </button>
+      </div>
+    </div>
+
+    <div id="said" role="status"></div>
+  </div>
+
+  <script src="pine-icons.js"></script>
+  <script src="frame-pick.js"></script>
+</body>
+</html>

@@ -124623,8 +124623,48 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 continue
             _sid = str((_e.get("row") or {}).get("sid") or "")
             if not _sid:
-                continue                 # an interjection: it does not move
+                continue                 # an interjection: see riders
             _talk.setdefault(_sid, []).append(_i)
+
+        # #1299: AN INTERJECTION RIDES THE LINE IT INTERRUPTED.
+        #
+        # #1265 says "everything WITHOUT a sid keeps its slot, so a
+        # sting, a quip or a hang-up still lands inside the
+        # conversation it interrupted" - and that is false exactly
+        # when this pass does its job. The permutation below is over
+        # the slots held by sid-carrying lines; a sting holds none of
+        # them, so the conversation moves and the sting is left at an
+        # absolute index beside whatever lands there.
+        #
+        # Measured on the live hour: of 1,055 elements, 52 run
+        # backwards in time, median 37.1s and worst 225.4s, and the
+        # two biggest pairs are `action -> character` (18) and
+        # `dialogue -> action` (16). Those actions are the SFX guy.
+        # The operator sees the mark leave the conversation they are
+        # reading and jump across the page.
+        #
+        # So an interjection is pinned to the line before it and
+        # carried with that line - but ONLY when it truly fell between
+        # two turns of ONE conversation, which is what "interrupted"
+        # means. One that sits on the boundary between two
+        # conversations, or after the last line of the hour,
+        # interrupted nobody and keeps its slot exactly as before.
+        _riders: dict[int, list[int]] = {}
+        _waiting: list[int] = []
+        _last_i: int | None = None
+        _last_sid = ""
+        for _i, _e in enumerate(events):
+            _sid = (str((_e.get("row") or {}).get("sid") or "")
+                    if _e.get("what") == "line" else "")
+            if _sid:
+                if _waiting and _last_i is not None and _last_sid == _sid:
+                    _riders.setdefault(_last_i, []).extend(_waiting)
+                _waiting = []
+                _last_i, _last_sid = _i, _sid
+            elif _last_i is not None:
+                _waiting.append(_i)
+        # _waiting at the end interrupted nothing that resumed.
+
         if len(_talk) > 1:
             # only the slots conversations hold between them
             _held = sorted(_i for _w in _talk.values() for _i in _w)
@@ -124656,9 +124696,24 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 return _best or (0.0, 0.0)
 
             _blocks = sorted(_talk.values(), key=_anchor)
-            _lined = [events[_i] for _w in _blocks for _i in _w]
-            for _i, _e in zip(_held, _lined):
-                events[_i] = _e
+            # #1299: each line, then whatever interrupted it, so the
+            # clip lands between the same two turns it landed between
+            # on air. The slots permuted are the conversations' own
+            # slots PLUS the riders', which is the same set of indices
+            # by construction - every rider is pinned to exactly one
+            # line, and only lines that carry a sid can hold riders.
+            _held = sorted(
+                {_i for _w in _talk.values() for _i in _w}
+                | {_r for _rs in _riders.values() for _r in _rs})
+            _lined = []
+            for _w in _blocks:
+                for _i in _w:
+                    _lined.append(events[_i])
+                    for _r in _riders.get(_i, []):
+                        _lined.append(events[_r])
+            if len(_lined) == len(_held):
+                for _i, _e in zip(_held, _lined):
+                    events[_i] = _e
     except Exception:  # noqa: BLE001
         pass                # a script that will not re-block still reads
 

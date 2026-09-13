@@ -161,6 +161,142 @@
     return bar;
   }
 
+  /* #1298: WHAT IS BEING SAID, BESIDE THE TREE.
+   *
+   * The words come from activeRow() - the same answer the highlight
+   * uses, so the strip and the script can never disagree. The speaker
+   * is the nearest preceding character heading, which is how the
+   * screenplay says it; a clip has no heading, because it is an action
+   * line, so it is named as a clip instead of being given a voice it
+   * does not have. */
+  function buildSaying() {
+    var box = make('div', 'sp-saying');
+    box.id = 'spSaying';
+    var body = make('div', 'sp-saying-body');
+    var who = make('div', 'sp-saying-who', '');
+    who.id = 'spSayingWho';
+    var text = make('div', 'sp-saying-text', '');
+    text.id = 'spSayingText';
+    body.appendChild(who);
+    body.appendChild(text);
+    var scope = document.createElement('canvas');
+    scope.className = 'sp-saying-scope';
+    scope.id = 'spSayingScope';
+    box.appendChild(body);
+    box.appendChild(scope);
+    /* Tapping the strip takes the reader to the line it is quoting. */
+    box.addEventListener('click', function () {
+      if (nowLineId) jumpToLine(nowLineId);
+    });
+    return box;
+  }
+
+  /* Who says this line, the way the screenplay says it: the nearest
+     character heading above it. */
+  function sayingWho(node) {
+    var walk = node;
+    while (walk) {
+      if (/sp-character/.test(walk.className || '')) {
+        return String(walk.textContent || '').trim();
+      }
+      walk = walk.previousElementSibling;
+    }
+    return '';
+  }
+
+  var sayingSaid = '';
+
+  function paintSaying(row) {
+    var who = el('spSayingWho');
+    var text = el('spSayingText');
+    if (!who || !text) return;
+    var node = (row && row.id)
+      ? document.querySelector('.sp-el[data-line="' + row.id + '"]')
+      : null;
+    var body = node ? String(node.textContent || '').trim() : '';
+    var name = '';
+    if (node && /sp-dialogue/.test(node.className)) {
+      name = sayingWho(node);
+    } else if (node) {
+      /* An action line IS the clip - "A sting off the board: 344 clip
+         (0:35)" - so it is labelled as one rather than attributed. */
+      name = 'CLIP';
+    }
+    if (!body) {
+      name = '';
+      body = soundingPlayer() ? 'sounding' : 'the room is quiet';
+    }
+    var print = name + '\u0001' + body;
+    if (print === sayingSaid) return;         /* no needless repaint */
+    sayingSaid = print;
+    who.textContent = name;
+    text.textContent = body;
+    host.classList.toggle('sp-saying-idle', !node);
+  }
+
+  /* THE SPECTRUM, OFF THE PANEL'S OWN ANALYSER.
+   *
+   * window.audioScope memoises one analyser per element and adopts
+   * window.pineAudioCtx; sampler-air.js wraps that same function
+   * because a second createMediaElementSource on one element throws.
+   * So this never builds a context or a source - it asks for the one
+   * that exists.
+   *
+   * On rAF rather than a timer: this tablet's WebView suspends JS
+   * timers and keeps firing rAF (#1241), so rAF is the only clock here
+   * that does not freeze. */
+  var scopeFrame = 0;
+  var scopeWide = 0;
+  var scopeHigh = 0;
+
+  function paintScope() {
+    scopeFrame = root.requestAnimationFrame(paintScope);
+    var canvas = el('spSayingScope');
+    /* #745's lesson, on our own canvas: it costs nothing while it
+       cannot be seen. */
+    if (!canvas || !canvas.offsetParent) return;
+    var player = soundingPlayer();
+    var ctx2d = null;
+    try { ctx2d = canvas.getContext('2d'); } catch (err) { return; }
+    if (!ctx2d) return;
+    var dpr = root.devicePixelRatio || 1;
+    var wide = Math.round(canvas.clientWidth * dpr);
+    var high = Math.round(canvas.clientHeight * dpr);
+    /* #745 again: writing canvas.width resets the whole 2D context, so
+       it is measured and compared, never assigned every frame. */
+    if (wide && high && (wide !== scopeWide || high !== scopeHigh)) {
+      canvas.width = wide; canvas.height = high;
+      scopeWide = wide; scopeHigh = high;
+    }
+    if (!scopeWide || !scopeHigh) return;
+    ctx2d.clearRect(0, 0, scopeWide, scopeHigh);
+    var scope = null;
+    if (player && typeof root.audioScope === 'function') {
+      try { scope = root.audioScope(player); } catch (err) { scope = null; }
+    }
+    var bins = scope && scope.bins;
+    if (!scope || !bins) {
+      /* A flat line is the honest picture of silence. */
+      ctx2d.fillStyle = 'rgba(101, 199, 218, .22)';
+      ctx2d.fillRect(0, Math.floor(scopeHigh / 2), scopeWide, Math.max(1, dpr));
+      return;
+    }
+    try { scope.analyser.getByteFrequencyData(bins); } catch (err) { return; }
+    var bars = 22;
+    var step = Math.max(1, Math.floor(bins.length / bars));
+    var gap = Math.max(1, Math.round(dpr));
+    var span = scopeWide / bars;
+    ctx2d.fillStyle = 'rgba(101, 199, 218, .85)';
+    for (var b = 0; b < bars; b += 1) {
+      var sum = 0;
+      for (var k = 0; k < step; k += 1) sum += bins[(b * step) + k] || 0;
+      var level = (sum / step) / 255;
+      var tall = Math.max(dpr, level * scopeHigh);
+      ctx2d.fillRect(Math.round(b * span), Math.round(scopeHigh - tall),
+        Math.max(1, Math.round(span) - gap), Math.round(tall));
+    }
+  }
+
   /* ---------------------------------------------------------------- 4 */
 
   /* The tree opens the Pine Box panel. On the tablet that panel already
@@ -761,10 +897,18 @@
    * (#1273) stitches a FLAT list, and that is the fix that stopped this
    * page destroying a few hundred nodes a poll and losing the highlight
    * with them. A tree would undo it. */
-  function segApply() {
+  /* #1300: what each segment was last left as, so a repaint that
+     re-asserts the same folds does not replay their motion. */
+  var segWas = Object.create(null);
+  var segFxTimer = 0;
+  var FOLD_FX_MOST = 140;        /* beyond this a segment snaps */
+  var FOLD_FX_MS = 260;
+
+  function segApply(motion) {
     var box = el('spScript');
     if (!box) return;
     var all = box.querySelectorAll('.sp-el');
+    var moving = [], shutting = [], opening = [];      /* #1300 */
     /* #1294: EVERYTHING BEHIND THE AIR IS SHUT, NOT ONLY THE SEGMENT
      * IT JUST LEFT.
      *
@@ -800,6 +944,27 @@
       var shut = !!(seg && folded[seg] && seg !== liveSeg);
       /* The heading is how a folded segment is reopened, so it is the
          one thing that must never be hidden by its own fold. */
+      /* #1300: and when this segment has just CHANGED state, it is
+         shown changing rather than simply being different. */
+      if (seg && motion && segWas[seg] !== undefined
+          && segWas[seg] !== shut && !head
+          && (moving.length < FOLD_FX_MOST)) {
+        moving.push(node);
+        if (shut) {
+          /* Stays in layout while it collapses; hidden at the end. */
+          node.hidden = false;
+          node.classList.add('sp-fx');
+          shutting.push(node);
+        } else {
+          node.hidden = false;
+          node.classList.add('sp-fx', 'sp-gone');
+          opening.push(node);
+        }
+        /* Recorded HERE too: this branch skips the tail of the loop,
+           and a state never recorded would animate again next pass. */
+        segWas[seg] = shut;
+        continue;
+      }
       node.hidden = shut && !head;
       if (head) {
         node.classList.toggle('sp-shut', shut);
@@ -818,7 +983,49 @@
           node.setAttribute('data-inside', '');
         }
       }
+      if (seg) segWas[seg] = shut;                           /* #1300 */
     }
+    segSettle(shutting, opening);                            /* #1300 */
+  }
+
+  /* #1300: THE BATCH, FINISHED TOGETHER.
+   *
+   * One timer for the whole pass rather than one per node - a few
+   * hundred timers is the kind of thing that makes a tablet stutter,
+   * and they would all land in the same frame anyway.
+   *
+   * The close is only committed to `hidden` at the end, so a folded
+   * segment still costs nothing in layout once it has gone; the open
+   * only has to drop the class it started from. */
+  function segSettle(shutting, opening) {
+    if (!shutting.length && !opening.length) return;
+    if (opening.length) {
+      /* A frame with the start value on the node, or there is nothing
+         for the transition to run FROM and it arrives instantly. */
+      root.requestAnimationFrame(function () {
+        for (var i = 0; i < opening.length; i += 1) {
+          opening[i].classList.remove('sp-gone');
+        }
+      });
+    }
+    if (shutting.length) {
+      root.requestAnimationFrame(function () {
+        for (var i = 0; i < shutting.length; i += 1) {
+          shutting[i].classList.add('sp-gone');
+        }
+      });
+    }
+    if (segFxTimer) root.clearTimeout(segFxTimer);
+    segFxTimer = root.setTimeout(function () {
+      segFxTimer = 0;
+      for (var i = 0; i < shutting.length; i += 1) {
+        shutting[i].hidden = true;
+        shutting[i].classList.remove('sp-fx', 'sp-gone');
+      }
+      for (var k = 0; k < opening.length; k += 1) {
+        opening[k].classList.remove('sp-fx', 'sp-gone');
+      }
+    }, FOLD_FX_MS + 40);
   }
 
   /* What is inside a fold, so it can be chosen without opening it. */
@@ -839,7 +1046,7 @@
     if (!seg) return;
     folded[seg] = !folded[seg];
     byHand[seg] = true;              /* the operator's choice outranks */
-    segApply();
+    segApply(true);                                          /* #1300 */
     foldSave();                                              /* #1294 */
   }
 
@@ -894,7 +1101,9 @@
     liveSeg = seg;
     if (was && !byHand[was]) folded[was] = true;
     folded[seg] = false;
-    segApply();
+    /* #1300: the hand-off the operator asked to SEE - the finished
+       script shutting and the next one opening out. */
+    segApply(true);
     foldSave();                                              /* #1294 */
   }
 
@@ -1546,6 +1755,7 @@
     var row = activeRow();
     markNow(row ? row.id : '');
     markRun(row);                                            /* #1295 */
+    paintSaying(row);                                        /* #1298 */
     markFeedLive(row ? row.id : '');            /* #1279 */
     /* #1286: say when the room is quiet, instead of leaving a page full
        of `pending` and `tinted` marks to be read as though one of them
@@ -1679,6 +1889,7 @@
     left.appendChild(buildBar());            /* 1 2 3 */
     var treeRow = make('div', 'sp-treerow');
     treeRow.appendChild(buildTree());        /* 4 */
+    treeRow.appendChild(buildSaying());      /* #1298 */
     left.appendChild(treeRow);
     left.appendChild(buildPanel());
     left.appendChild(buildPlayer());         /* 5 */
@@ -1929,6 +2140,7 @@
     wirePlayer();
     mounted = true;
     foldLoad();                                              /* #1294 */
+    if (!scopeFrame) paintScope();                           /* #1298 */
 
     var feed = root.PineStationFeed;
     if (feed && typeof feed.subscribe === 'function') {

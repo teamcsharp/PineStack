@@ -1,0 +1,160 @@
+/* A WINDOW THAT IS MOSTLY PICTURE.
+ *
+ * The control strip is deliberately thin and goes away entirely in
+ * fullscreen: this is a thing you glance at while doing something else, and
+ * chrome around a picture-in-picture is chrome in the way. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: #05080b;
+  color: #d7e3ec;
+  font: 12px/1.4 "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+#shell {
+  height: 100%;
+  display: grid;
+  /* minmax(0,1fr): an auto-sized track will not shrink below the picture's
+   * own width, and the strip then falls off the bottom of the window. */
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+#glass {
+  position: relative;
+  min-height: 0;
+  background: #05080b;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+/* The browser does the scaling. contain rather than cover, because a mirror
+ * that crops is a mirror that hides the thing you were looking for. */
+#live {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  display: block;
+  /* The magnifier. Origin at the centre because that is what the pan
+   * arithmetic in place() assumes. */
+  transform-origin: center center;
+  /* A screen is made of hard edges and text; smoothing them on the way up
+   * makes a 1/3 capture look like a photograph of a screen rather than a
+   * screen. This keeps it honest. */
+  image-rendering: -webkit-optimize-contrast;
+}
+
+/* Zoomed in, the middle button is a hand. Said with the cursor rather than
+ * with a hint, because there is nowhere to put a hint. */
+#glass.zoomed { cursor: grab; }
+#glass.panning { cursor: grabbing; }
+
+#veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7e94a6;
+  background: #05080b;
+  text-align: center;
+  padding: 20px;
+}
+
+#veil.gone { display: none; }
+#veil.bad { color: #ff8f80; }
+
+/* ------------------------------------------------------------- the strip */
+
+#bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 10px;
+  background: #0d1217;
+  border-top: 1px solid #1b2831;
+}
+
+.group { display: flex; align-items: center; gap: 4px; }
+.group.right { margin-left: auto; }
+
+.tag {
+  color: #64798a;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-size: 10px;
+  margin-right: 3px;
+}
+
+button {
+  font: inherit;
+  color: #cfe0ea;
+  background: #16212b;
+  border: 1px solid #2a3946;
+  border-radius: 4px;
+  padding: 4px 8px;
+  min-width: 30px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+button:hover { background: #1d2b36; border-color: #3a4c5c; }
+
+/* The setting that is in force, not merely the one under the pointer. */
+button.on {
+  background: #1c5f4d;
+  border-color: #2a7d66;
+  color: #eafff8;
+}
+
+.dim { color: #64798a; font-variant-numeric: tabular-nums; }
+
+.pi-icon { width: 14px; height: 14px; }
+
+/* TOUCH IS LIVE, AND IT SAYS SO. This window floats over everything and
+   shows a running radio station - a stray click can put a sound on the air,
+   so the state is visible from across the room rather than inferred from a
+   button. */
+#glass.touching {
+  outline: 2px solid #46c2a0;
+  outline-offset: -2px;
+  cursor: crosshair;
+}
+
+#glass.touching.zoomed { cursor: crosshair; }
+#glass.panning { cursor: grabbing; }
+
+/* Where the last touch landed, for a moment. Confirms the click went
+   somewhere without waiting for the tablet to redraw - at 42 ms it usually
+   beats the picture back. */
+#spot {
+  position: absolute;
+  width: 26px;
+  height: 26px;
+  margin: -13px 0 0 -13px;
+  border: 2px solid #46c2a0;
+  border-radius: 50%;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .35s ease-out, transform .35s ease-out;
+}
+
+#spot.hit {
+  opacity: .9;
+  transform: scale(.55);
+  transition: none;
+}
+
+/* FULLSCREEN IS THE PICTURE AND NOTHING ELSE. */
+body.full #bar { display: none; }
+body.full #shell { grid-template-rows: 1fr; }

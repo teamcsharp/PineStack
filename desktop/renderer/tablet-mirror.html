@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<!--
+  THE TABLET, LIVE, ON THIS DESK.
+
+  "An icon of a tablet that whenever I click it, it allows me to show a
+   picture in picture window in the Pine box app that allows me to see the
+   screen of the tablet itself in real time and be able to dynamically adjust
+   the scale of the window... And if I double click it, I want to go
+   fullscreen with the display."
+
+  The picture is a bare <img> pointed at a multipart stream, so the browser
+  does the decoding and the scaling, and the window can be dragged to any
+  size without a line of JavaScript running per frame.
+
+  Two different things are called "size" here and the window keeps them
+  apart, because confusing them is how a mirror ends up crisp and tiny or
+  huge and soft:
+
+    the WINDOW size   how big it is on this desk. Drag it, or use the
+                      quarter/half/full-size buttons.
+    the CAPTURE size  how many pixels the tablet actually sends - a third,
+                      a half, or all of them. This is what costs the tablet.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>The tablet, live</title>
+  <link rel="stylesheet" href="pineicons.css" />
+  <link rel="stylesheet" href="pine-vitals.css" />
+  <link rel="stylesheet" href="tablet-mirror.css" />
+</head>
+<body>
+  <div id="shell">
+    <div id="glass" title="Double-click for fullscreen">
+      <img id="live" alt="The Pine Box tablet's screen, live" />
+      <!-- Over the picture, not beside it: this window is mostly picture
+           on purpose. -->
+      <div id="vitalsOver" class="pv"></div>
+      <div id="spot" aria-hidden="true"></div>
+      <div id="veil">Opening the tablet&rsquo;s screen&hellip;</div>
+    </div>
+
+    <div id="bar">
+      <div class="group" role="group" aria-label="How much of the tablet is sent">
+        <span class="tag">Detail</span>
+        <button class="res" data-size="quarter" type="button"
+                title="A quarter of the tablet's pixels - the cheapest, and enough for a small window">&frac14;</button>
+        <button class="res" data-size="third" type="button"
+                title="A third of the tablet's pixels">&frac13;</button>
+        <button class="res" data-size="half" type="button"
+                title="Half of the tablet's pixels - the everyday setting">&frac12;</button>
+        <button class="res" data-size="full" type="button"
+                title="Every pixel the tablet has. Costs it the most work.">Full</button>
+        <button id="autoRes" class="toggle on" type="button"
+                title="Raise the detail on its own when you zoom in, and lower it again when you zoom out">Auto</button>
+      </div>
+
+      <div class="group" role="group" aria-label="How big this window is">
+        <span class="tag">Window</span>
+        <button class="zoom" data-zoom="0.5" type="button" title="Half size on this desk">50%</button>
+        <button class="zoom" data-zoom="0.75" type="button" title="Three quarters">75%</button>
+        <button class="zoom" data-zoom="1" type="button" title="One tablet pixel per screen pixel">100%</button>
+        <button id="big" type="button" title="Fullscreen (F, or double-click the picture)"
+                data-pine-icon="c:maximize" aria-label="Fullscreen"></button>
+      </div>
+
+      <div class="group" role="group" aria-label="Capture what is on the tablet">
+        <button id="grab" type="button"
+                data-pine-icon="c:image" aria-label="Copy the screen"
+                title="Copy the tablet's screen to this clipboard, at full resolution"></button>
+        <button id="film" type="button"
+                data-pine-icon="c:recording--filled" aria-label="Record a clip"
+                title="Record the next few seconds of the tablet and open it for export"></button>
+        <button id="back30" type="button"
+                data-pine-icon="c:time" aria-label="The last 30 seconds"
+                title="Cut the last 30 seconds out of the tablet's rolling recording.&#10;Set the in and out points and choose the broadcast or microphone audio."></button>
+      </div>
+
+      <!-- Silent unless asked. The tablet is usually right there and already
+           playing it; this exists for when it is not. -->
+      <div class="group">
+        <button id="sound" type="button" class="toggle"
+                data-pine-icon="c:volume--mute--filled" aria-label="Hear the broadcast"
+                title="Hear the broadcast in this app as well.&#10;Off by default - the tablet is usually already playing it."></button>
+      </div>
+
+      <div class="group right">
+        <button id="touch" type="button" class="toggle"
+                data-pine-icon="m:front_hand" aria-label="Touch the tablet"
+                title="Click and drag on the picture to touch the tablet.&#10;The wheel still zooms and the middle button still pans."></button>
+        <button id="stats" type="button" class="toggle on"
+                data-pine-icon="c:chart--line"
+                title="Show the tablet's battery, heartbeat and load over the picture"
+                aria-label="Vital signs"></button>
+        <button id="ontop" type="button" class="toggle on"
+                data-pine-icon="c:pin--filled"
+                title="Keep this window above the others" aria-label="Keep on top"></button>
+        <span id="zoomAt" class="dim" title="Wheel to zoom, middle button to pan, 0 to reset"></span>
+        <span id="how" class="dim"></span>
+      </div>
+    </div>
+  </div>
+
+  <script src="pine-icons.js"></script>
+  <script src="pine-vitals.js"></script>
+  <script src="tablet-mirror.js"></script>
+</body>
+</html>

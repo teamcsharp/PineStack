@@ -62,6 +62,31 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   /* The tablet's glass: a still on the clipboard, a clip on disk, and a
    * written account of what the terminal is doing. */
   glassStill: (options) => ipcRenderer.invoke("glass:still", options),
+  /* What the tablet is costing: battery, heartbeat, load and frame times.
+   * One sweep serves every caller - see tabletVitals in main.js. */
+  tabletVitals: () => ipcRenderer.invoke("tablet:vitals"),
+  /* THE TABLET, LIVE. `mirrorShow` is the sidebar icon opening the window;
+   * everything after it is that window talking about itself. */
+  mirrorShow: (options) => ipcRenderer.invoke("mirror:show", options),
+  mirrorOpen: (shape) => ipcRenderer.invoke("mirror:open", shape),
+  mirrorSize: (size) => ipcRenderer.invoke("mirror:size", size),
+  mirrorHow: () => ipcRenderer.invoke("mirror:how"),
+  mirrorWindow: (shape) => ipcRenderer.invoke("mirror:window", shape),
+  mirrorFull: (want) => ipcRenderer.invoke("mirror:full", want),
+  mirrorOnTop: () => ipcRenderer.invoke("mirror:ontop"),
+  /* Reaching through the picture: a tap, a swipe, a key, or typed text, in
+   * the DISPLAY's coordinates. See tablet-input.cjs. */
+  mirrorTouch: (act) => ipcRenderer.invoke("mirror:touch", act),
+  /* The speaker on the mirror. null asks, true/false sets - and what comes
+   * back is what is AUDIBLE, not what was asked for. */
+  mirrorSound: (want) => ipcRenderer.invoke("mirror:sound", want),
+  /* The frame picker: the recording to scrub through, and the one frame
+   * chosen out of it. Picking copies it and, if asked, opens the mark-up
+   * window on it - so a picked frame goes exactly where a fresh screenshot
+   * would have. */
+  framePending: () => ipcRenderer.invoke("frame:pending"),
+  framePick: (choice) => ipcRenderer.invoke("frame:pick", choice),
+  frameDone: () => ipcRenderer.invoke("frame:done"),
   /* The mark-up window asks for the picture it was opened with, and hands
    * back a marked-up one to be saved. Copying is copyImage, below. */
   shotImage: () => ipcRenderer.invoke("shot:image"),

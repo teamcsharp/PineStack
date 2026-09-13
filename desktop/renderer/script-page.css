@@ -115,6 +115,88 @@
 /* ------------------------------------------------------------------- 4 */
 
 .sp-treerow { display: flex; align-items: center; gap: 10px; }
+
+/* #1300: THE HAND-OFF, SHOWN.
+ *
+ * One segment shuts and the next opens out, so the moment the show
+ * moves from one script to the next is legible instead of happening
+ * between two frames.
+ *
+ * On the MEMBERS, because #1285 folds a flat list by hiding members
+ * rather than nesting them - a wrapper would undo the reconciler that
+ * stopped this page destroying a few hundred nodes a poll.
+ *
+ * max-height rather than height: the members are single lines of
+ * dialogue and a generous ceiling avoids measuring several hundred
+ * nodes, which is a layout pass this view cannot afford. The class is
+ * only on a node while it is actually moving. */
+.sp-el.sp-fx {
+  overflow: hidden;
+  max-height: 260px;
+  transition: max-height .26s ease, opacity .2s ease,
+              margin .26s ease, padding .26s ease;
+}
+.sp-el.sp-fx.sp-gone {
+  max-height: 0;
+  opacity: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+/* The heading of the segment now on air says so as it opens. */
+.sp-el.sp-scene:not(.sp-shut) { transition: color .26s ease; }
+
+@media (prefers-reduced-motion: reduce) {
+  .sp-el.sp-fx { transition: none; }
+  .sp-el.sp-scene:not(.sp-shut) { transition: none; }
+}
+
+/* #1298: WHAT IS BEING SAID, beside the tree. The strip takes the rest
+   of the row, and the scope sits at its right shoulder. */
+.sp-saying {
+  flex: 1 1 auto;
+  min-width: 0;                      /* so the text may ellipsize */
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 62px;
+  padding: 7px 10px;
+  border: 1px solid var(--sp-line, #35414c);
+  border-radius: 8px;
+  background: var(--sp-panel, #1c242c);
+  cursor: pointer;
+}
+.sp-saying-body { flex: 1 1 auto; min-width: 0; }
+.sp-saying-who {
+  font-size: 9px;
+  letter-spacing: .16em;
+  font-weight: 700;
+  color: var(--sp-on, #65c7da);
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-saying-who:empty { display: none; }
+/* Three lines and then an ellipsis: enough to read the thought without
+   the strip resizing the column under the reader. */
+.sp-saying-text {
+  font-size: 12px;
+  line-height: 1.32;
+  color: var(--sp-text, #edf3f5);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.sp-page.sp-saying-idle .sp-saying-text { color: var(--sp-muted, #8fa0ad); }
+.sp-saying-scope {
+  flex: 0 0 auto;
+  width: 92px;
+  height: 46px;
+  display: block;
+}
 .sp-tree {
   display: grid; place-items: center;
   width: 54px; height: 54px; padding: 0;

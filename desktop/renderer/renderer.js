@@ -977,21 +977,36 @@ async function glassDo(saying, work) {
   }
 }
 
-/* CTRL+CLICK MARKS IT UP. Plain click is the fast road - picture, clipboard,
- * done - and holding Ctrl adds the editor on top of it without taking the
- * clipboard copy away. */
+/* CTRL+CLICK FINDS THE MOMENT FIRST, THEN MARKS IT UP.
+ *
+ * A plain click is the fast road - picture, clipboard, done. Holding Ctrl
+ * opens the tablet's rolling recording to scrub through, because the moment
+ * worth drawing on has almost always just passed: the dialog has closed, the
+ * meter has fallen back, the finger has lifted. The frame chosen there goes
+ * to the clipboard and into the mark-up window, which is exactly where a
+ * Ctrl+click's picture went before - it is simply picked rather than
+ * whatever happened to be on the glass. */
 $("glassStill")?.addEventListener("click", (event) => {
   const edit = !!(event.ctrlKey || event.metaKey);
-  glassDo(edit ? "Taking the picture to mark up\u2026" : "Taking the tablet's picture\u2026",
+  glassDo(edit ? "Fetching the tablet's recording to scrub\u2026"
+               : "Taking the tablet's picture\u2026",
     async () => {
-      const shot = await api.glassStill({ edit, target: glassTarget() });
+      const shot = await api.glassStill({ edit, scrub: edit,
+        seconds: glassSeconds(), target: glassTarget() });
       if (!shot || !shot.ok) {
         return glassSay(shot && shot.why ? shot.why : "the picture did not come back", true);
+      }
+      if (shot.picking) {
+        return glassSay(`Scrub back through the last `
+          + `${Number(shot.seconds).toFixed(1)}s and pick the frame.`);
       }
       glassSay(`On the clipboard \u2014 ${shot.width}\u00d7${shot.height}`
         + glassWhere(shot) + "."
         + (edit ? (shot.edited ? " Marking-up window opened."
-          : " The mark-up window would not open.") : ""));
+          : " The mark-up window would not open.") : "")
+        /* The scrub was asked for and did not happen. Say why. */
+        + (shot.instead ? " No timeline to scrub: " + shot.instead + "." : ""),
+        !!shot.instead);
     });
 });
 
@@ -1037,6 +1052,104 @@ $("glassClip")?.addEventListener("click", (event) => {
       if (tick) clearInterval(tick);
     }
   });
+});
+
+/* THE MIRROR WINDOW'S SPEAKER, answered from here.
+ *
+ * The live view has no player of its own on purpose - see the note on
+ * mirror:sound in main.js. It asks this instead, and this reports what is
+ * genuinely audible rather than what the switch says: when music is routed
+ * here or to both, the page feed already carries the record and
+ * desktopPlayerEnabled() deliberately keeps the shell player silent. A
+ * speaker icon lit in that state would be a lie the operator only catches by
+ * listening for a sound that never comes. */
+window.pineMonitorSay = function (want) {
+  const box = $("boothMonitor");
+  if (!box) return { ok: false, why: "this app has no monitor switch" };
+  if (want === true || want === false) {
+    box.checked = want;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  const player = $("desktopRadioPlayer");
+  return {
+    ok: true,
+    monitor: !!box.checked,
+    /* Whether the switch can do anything at all right now. */
+    effective: typeof desktopPlayerEnabled === "function"
+      ? !!desktopPlayerEnabled() : !!box.checked,
+    musicRoute: typeof streamRoute === "function" ? streamRoute("music") : "",
+    playing: !!(player && !player.paused && !player.muted)
+  };
+};
+
+/* THE TABLET'S VITAL SIGNS, beside the buttons that talk to it.
+ *
+ * "Whenever I'm connected with the tablet show connection information here
+ *  and detailed information about the heartbeat and the graphics information
+ *  on how it's taxing the system and the tablet and how it's impacting the
+ *  battery life."
+ *
+ * The fold is remembered, like every other panel here. Folded, the header
+ * still carries the battery and the heartbeat, because those two are the
+ * reason to glance at it at all. */
+(function () {
+  const box = $("vitalsBox");
+  const into = $("vitals");
+  const fold = $("vitalsFold");
+  const brief = $("vitalsBrief");
+  if (!box || !into || !window.pineVitals) return;
+
+  const KEY = "pine-vitals-shut";
+  let shut = false;
+  try { shut = localStorage.getItem(KEY) === "1"; } catch (error) { shut = false; }
+  box.classList.toggle("shut", shut);
+  fold.setAttribute("aria-expanded", String(!shut));
+
+  fold.addEventListener("click", () => {
+    shut = !shut;
+    box.classList.toggle("shut", shut);
+    fold.setAttribute("aria-expanded", String(!shut));
+    try { localStorage.setItem(KEY, shut ? "1" : "0"); } catch (error) { /* fine */ }
+  });
+
+  /* A TABLET THAT IS NOT THERE IS NOT POLLED HARD. Four seconds is right for
+   * a live readout and wrong for an empty socket, so an absent tablet is
+   * asked every twenty instead. */
+  async function turn() {
+    let said = null;
+    try { said = await api.tabletVitals(); }
+    catch (error) { said = { ok: false, why: error.message }; }
+
+    window.pineVitals.paint(into, said);
+
+    if (brief) {
+      brief.textContent = said && said.ok && said.battery
+        ? (said.battery.percent == null ? "" : said.battery.percent + "%")
+          + (said.rttMs != null ? "  \u00b7  " + Math.round(said.rttMs) + " ms" : "")
+        : "not attached";
+    }
+    setTimeout(turn, said && said.ok ? 4000 : 20000);
+  }
+  turn();
+})();
+
+/* THE TABLET, LIVE. Click opens the window; double-click opens it
+ * fullscreen - and because a double-click fires `click` twice first, the
+ * first one has already opened it, so the second only has to make it big.
+ * No timer, and no delay on the ordinary single click. */
+$("glassMirror")?.addEventListener("click", () => {
+  glassDo("Opening the tablet's screen\u2026", async () => {
+    const said = await api.mirrorShow({});
+    if (!said || !said.ok) {
+      return glassSay(said && said.why ? said.why : "the tablet would not open", true);
+    }
+    glassSay(said.already ? "The tablet's window is already open."
+      : "Watching the tablet. Double-click the picture for fullscreen.");
+  });
+});
+
+$("glassMirror")?.addEventListener("dblclick", () => {
+  api.mirrorShow({ full: true });
 });
 
 $("glassReport")?.addEventListener("click", () => glassDo(

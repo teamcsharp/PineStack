@@ -1,0 +1,174 @@
+/* THE MOMENT, AND ALMOST NOTHING ELSE.
+ *
+ * The picture gets every pixel the window can spare, because the whole job
+ * is recognising the frame you meant. The controls are a strip underneath,
+ * sized for a mouse rather than a finger - this window only ever opens on
+ * the desktop. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: #0d1217;
+  color: #d7e3ec;
+  font: 13px/1.45 "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+#shell {
+  height: 100%;
+  display: grid;
+  /* minmax(0,1fr) and not 1fr: an `auto`-ish track refuses to shrink below
+   * its content, and a 1340x800 video inside one pushes the controls off
+   * the bottom of the window. */
+  grid-template-rows: minmax(0, 1fr) auto auto auto;
+}
+
+/* ------------------------------------------------------------- the glass */
+
+#glass {
+  position: relative;
+  min-height: 0;
+  background: #05080b;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#film {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+  background: #05080b;
+}
+
+#waiting {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7e94a6;
+  background: #05080b;
+  font-size: 14px;
+}
+
+#waiting.gone { display: none; }
+
+/* ---------------------------------------------------------- the timeline */
+
+#scrub { padding: 10px 16px 0; }
+
+#track {
+  position: relative;
+  height: 26px;
+  border-radius: 4px;
+  background: #16212b;
+  border: 1px solid #24323f;
+  cursor: pointer;
+  outline: none;
+}
+
+#track:focus-visible { border-color: #46c2a0; }
+
+#done {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 0;
+  background: #1d3a44;
+  border-radius: 3px 0 0 3px;
+  pointer-events: none;
+}
+
+/* A line, not a knob: the operator is looking for one frame, and a knob wide
+ * enough to grab is wide enough to hide what it is pointing at. */
+#head {
+  position: absolute;
+  top: -3px; bottom: -3px;
+  left: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: #46c2a0;
+  box-shadow: 0 0 6px rgba(70, 194, 160, .7);
+  pointer-events: none;
+}
+
+#ticks {
+  position: relative;
+  height: 14px;
+  margin-top: 2px;
+  color: #64798a;
+  font-size: 10px;
+}
+
+#ticks span {
+  position: absolute;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------- the controls */
+
+#bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px 12px;
+}
+
+#transport { display: flex; gap: 6px; }
+
+button {
+  font: inherit;
+  color: #cfe0ea;
+  background: #16212b;
+  border: 1px solid #2a3946;
+  border-radius: 5px;
+  padding: 7px 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+button:hover { background: #1d2b36; border-color: #3a4c5c; }
+button:active { background: #223240; }
+button[disabled] { opacity: .4; cursor: default; }
+
+.step { padding: 7px 11px; }
+.wide { min-width: 54px; justify-content: center; }
+
+button.go {
+  background: #1c5f4d;
+  border-color: #2a7d66;
+  color: #eafff8;
+}
+button.go:hover { background: #226f5a; }
+
+#clock {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+#ago { font-size: 17px; color: #e8f3fa; }
+.dim { color: #7e94a6; }
+
+#doing { display: flex; gap: 8px; }
+
+#said {
+  padding: 0 16px 10px;
+  min-height: 18px;
+  color: #7e94a6;
+}
+
+#said.bad { color: #ff8f80; }
+
+/* The icons are Carbon, monochrome, and take their colour from the text -
+ * never a coloured glyph and never an emoji. */
+.pi-icon { width: 16px; height: 16px; }

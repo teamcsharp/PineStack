@@ -1,0 +1,93 @@
+/* The vital signs block. Narrow enough for the sidebar, legible enough to
+   read across a room in the mirror window's overlay.
+
+   NOTHING IS COLOURED EXCEPT A CROSSED THRESHOLD. That is the whole point of
+   the colour: a glance should find the one row that needs attention, and it
+   cannot if six rows are already tinted for decoration. */
+
+.pv {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9fb3c2;
+}
+
+.pv-head {
+  margin: 8px 0 2px;
+  color: #64798a;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  font-size: 9px;
+}
+
+.pv-head:first-child { margin-top: 0; }
+
+.pv-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 1px 0;
+}
+
+.pv-name { color: #7e94a6; }
+
+.pv-value {
+  color: #cfe0ea;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.pv-poor .pv-value { color: #ffc95c; }
+.pv-bad .pv-value { color: #ff8f80; }
+
+/* THE NUMBER THAT WAS ASKED FOR FIRST. Big, because "how much battery life
+   is on the tablet and how much is left" is the question this block exists
+   to answer at a glance; everything under it is the detail behind it. */
+.pv-crown {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0 6px;
+  border-bottom: 1px solid #1b2831;
+  margin-bottom: 6px;
+}
+
+.pv-pc {
+  font-size: 22px;
+  font-weight: 600;
+  color: #d7e3ec;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.pv-crown.poor .pv-pc { color: #ffc95c; }
+.pv-crown.bad .pv-pc { color: #ff8f80; }
+
+.pv-left { color: #7e94a6; }
+.pv-left.poor { color: #ffc95c; }
+.pv-left.bad { color: #ff8f80; }
+
+/* ------------------------------------------------- in the mirror window */
+
+/* Over the picture rather than beside it: the mirror is mostly picture on
+   purpose, and a panel that pushed the picture aside would defeat it. */
+#vitalsOver {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 210px;
+  max-height: calc(100% - 16px);
+  overflow: auto;
+  padding: 9px 11px;
+  border-radius: 6px;
+  background: rgba(8, 13, 18, .86);
+  border: 1px solid #1b2831;
+  backdrop-filter: blur(3px);
+  pointer-events: none;
+}
+
+#vitalsOver.gone { display: none; }
+
+/* Fullscreen keeps the overlay - it is the one thing worth having over a
+   fullscreen picture - but the strip goes, so the toggle goes with it. */
+body.full #vitalsOver { top: 12px; right: 12px; }

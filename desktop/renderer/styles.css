@@ -1939,3 +1939,43 @@ body.slides-dragging webview { pointer-events: none; }
    from the list looks like a bug in the list. */
 .player.away { opacity: .45; cursor: default; }
 .player.away:hover { border-color: var(--line); }
+
+/* THE TABLET'S VITAL SIGNS in the sidebar.
+   The readout itself is styled by pine-vitals.css, which the live mirror
+   window shares - this is only its housing and its fold. */
+.vitals-box {
+  margin: 6px 0 10px;
+  border: 1px solid #1b2831;
+  border-radius: 5px;
+  background: #0b1015;
+  overflow: hidden;
+}
+
+.vitals-fold {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 8px;
+  background: none;
+  border: 0;
+  color: #9fb3c2;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.vitals-fold:hover { background: #111922; }
+.vitals-fold .pi-icon { width: 13px; height: 13px; flex: none; }
+
+/* Folded, the two numbers worth a glance stay on the header line. Hiding
+   them entirely would defeat the point of having asked for them. */
+.vitals-brief {
+  margin-left: auto;
+  color: #7e94a6;
+  font-variant-numeric: tabular-nums;
+}
+
+.vitals-box > .pv { padding: 0 9px 9px; }
+.vitals-box.shut > .pv { display: none; }

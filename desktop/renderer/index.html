@@ -15,6 +15,7 @@
        Both files are built by tools/icons_build.py - do not hand-edit. -->
   <link rel="stylesheet" href="./pineicons.css">
   <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./pine-vitals.css">
   <link rel="stylesheet" href="./sampler.css">
   <link rel="stylesheet" href="./script.css">
   <!-- Listen and Music share one stylesheet: two arrangements of the same
@@ -42,6 +43,7 @@
   <!-- The SVG sprite, for icon-only buttons that need a real <svg> with an
        aria-label rather than a bare character. -->
   <script src="./pine-icons.js"></script>
+  <script src="./pine-vitals.js"></script>
 </head>
 <!-- agent-down until the first health check proves otherwise: the compact
      rail's mark ring is the only state indicator, and it must not open green
@@ -91,18 +93,35 @@
              load. Never emoji. -->
         <button id="glassStill" class="glass-btn" type="button"
                 data-pine-icon="c:image" aria-label="Take a picture of the screen"
-                title="Take a picture of the Pine Box tablet's screen and put it on this clipboard.&#10;Ctrl+click to open it for mark-up as well."></button>
+                title="Take a picture of the Pine Box tablet's screen and put it on this clipboard.&#10;Ctrl+click to scrub back through the tablet's recording, pick the exact moment, and mark it up."></button>
         <button id="glassClip" class="glass-btn" type="button"
                 data-pine-icon="c:recording--filled" aria-label="Record the screen"
                 title="Record the Pine Box tablet's screen and save it as an MP4"></button>
         <button id="glassReport" class="glass-btn" type="button"
                 data-pine-icon="c:copy--to-clipboard" aria-label="Copy the diagnostics"
                 title="Copy a written account of what the tablet is doing right now to this clipboard"></button>
+        <!-- The tablet's screen, live and on top of this window. Click to
+             open it, double-click to open it fullscreen. -->
+        <button id="glassMirror" class="glass-btn" type="button"
+                data-pine-icon="c:screen" aria-label="Watch the tablet live"
+                title="Watch the Pine Box tablet's screen live in a window on top of this one.&#10;Double-click to open it fullscreen."></button>
         <input id="glassSeconds" class="glass-secs" type="number"
                min="3" max="30" step="1" value="10"
                title="How long the clip records, in seconds. Up to 30.">
       </div>
       <p id="glassNote" class="glass-note" role="status"></p>
+      <!-- What the tablet is costing, whenever one is attached. Folds away,
+           and the fold is remembered like every other panel here. -->
+      <div id="vitalsBox" class="vitals-box">
+        <button id="vitalsFold" class="vitals-fold" type="button"
+                aria-expanded="true"
+                title="Battery, heartbeat, load and frame times for the tablet">
+          <span data-pine-icon="c:screen" aria-hidden="true"></span>
+          <span>The tablet</span>
+          <span id="vitalsBrief" class="vitals-brief"></span>
+        </button>
+        <div id="vitals" class="pv"></div>
+      </div>
       <div class="stream-routes">
         <button id="nabuMuteBtn" type="button" title="Mute every sound on Nabu without changing its physical volume or routes">Mute Nabu</button>
         <button id="nabuUnmuteBtn" type="button" title="Restore Nabu at its existing physical volume and channel settings">Unmute Nabu</button>

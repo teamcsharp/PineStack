@@ -1048,6 +1048,334 @@ function openShotEditor(png) {
   return editor;
 }
 
+/* WHAT THE TABLET IS COSTING, asked once for everyone who wants to know.
+ *
+ * The sidebar polls this and so does the live window, and they must not each
+ * run their own sweep: every sweep is an adb round trip of 140-200 ms
+ * against a tablet whose load average is already 27, and two readouts that
+ * disagree about the same battery are worse than one.
+ *
+ * So the answer is held for a moment and handed to whoever asks inside that
+ * window. See tablet-vitals.cjs for why it is one shell rather than seven. */
+let vitals = null;
+let vitalsAt = 0;
+let vitalsHeld = null;
+let vitalsGoing = null;
+const VITALS_HOLD = 2500;
+
+async function tabletVitals() {
+  const serial = await terminalHost.glassSerial();
+  if (!serial) {
+    vitals = null;
+    return { ok: false, why: "no tablet is attached" };
+  }
+  if (!vitals || vitals.serial !== serial) {
+    const { Vitals } = require("./tablet-vitals.cjs");
+    const tools = terminalHost.tools();
+    vitals = new Vitals({ adb: tools.adb, serial,
+      run: (args) => new Promise((resolve, reject) => {
+        require("node:child_process").execFile(tools.adb, args,
+          { timeout: 20000, maxBuffer: 8 * 1024 * 1024, windowsHide: true },
+          (error, stdout, stderr) => {
+            const text = String(stdout || "") + String(stderr || "");
+            if (error && !text) return reject(error);
+            resolve(text);
+          });
+      }) });
+  }
+  if (vitalsHeld && Date.now() - vitalsAt < VITALS_HOLD) return vitalsHeld;
+  /* Two callers arriving together share one sweep rather than starting two. */
+  if (!vitalsGoing) {
+    vitalsGoing = vitals.read().then((said) => {
+      vitalsHeld = said;
+      vitalsAt = Date.now();
+      vitalsGoing = null;
+      return said;
+    }).catch((error) => {
+      vitalsGoing = null;
+      return { ok: false, why: error.message };
+    });
+  }
+  return vitalsGoing;
+}
+
+ipcMain.handle("tablet:vitals", () => tabletVitals());
+
+/* THE TABLET'S SCREEN, LIVE IN A WINDOW OF ITS OWN.
+ *
+ * One mirror, one window. Clicking the icon again raises what is already
+ * open rather than starting a second encoder on the tablet - the tablet is
+ * running the station, the rolling recorder and this, and a second copy of
+ * this would cost it twice for nothing.
+ *
+ * The stream itself lives in tablet-mirror.cjs; everything here is the
+ * window around it. */
+let mirror = null;
+let mirrorWindow = null;
+
+async function openTabletMirror(options) {
+  const { Mirror } = require("./tablet-mirror.cjs");
+
+  if (mirrorWindow && !mirrorWindow.isDestroyed()) {
+    if (mirrorWindow.isMinimized()) mirrorWindow.restore();
+    mirrorWindow.focus();
+    if (options && options.full) mirrorWindow.setFullScreen(true);
+    return { ok: true, already: true };
+  }
+
+  const tools = terminalHost.tools();
+  const serial = await terminalHost.glassSerial();
+  if (!serial) return { ok: false, why: "no tablet is reachable over adb" };
+
+  /* WHAT THE TABLET WAS DRAWING BEFORE THIS OPENED, so the panel can say
+   * what watching costs rather than only what the tablet costs. Taken
+   * before the encoder starts, which is the only moment it means anything. */
+  try {
+    const before = await tabletVitals();
+    if (vitals && before && before.ok) vitals.mark(before);
+  } catch (error) { /* a missing baseline just hides one row */ }
+
+  const found = clipMux.findFfmpeg((readConfig() || {}).ffmpeg);
+  mirror = new Mirror({ adb: tools.adb, serial, ffmpeg: found.path });
+  /* How big the tablet actually is, asked once, so a third and a half are
+   * fractions of the real screen rather than of a guess. */
+  await mirror.measure((args) => new Promise((resolve) => {
+    require("node:child_process").execFile(tools.adb, args,
+      { timeout: 15000, windowsHide: true },
+      (error, stdout, stderr) => resolve(String(stdout || "") + String(stderr || "")));
+  }));
+
+  const real = mirror.real;
+  /* Opens at half the tablet's size on this desk - big enough to read, small
+   * enough to sit beside the panel, and the window is resizable from there. */
+  mirrorWindow = new BrowserWindow({
+    width: Math.round(real.width / 2),
+    height: Math.round(real.height / 2) + 34,
+    minWidth: 240,
+    minHeight: 200,
+    title: "The tablet, live",
+    icon: path.join(__dirname, "assets", "pinebox.ico"),
+    backgroundColor: "#05080b",
+    /* PICTURE IN PICTURE: above the panel by default, because the whole
+     * point is watching the tablet while working in the app. */
+    alwaysOnTop: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+  mirrorWindow.setMenuBarVisibility(false);
+  mirrorWindow.on("closed", () => {
+    mirrorWindow = null;
+    /* The held input shell belongs to this window. Leaving it open would
+     * keep an adb shell alive on the tablet for no reader. */
+    if (poke) { poke.close(); poke = null; }
+    /* The encoder on the tablet stops when nobody is watching. A mirror
+     * left running behind a closed window is a battery being spent on a
+     * picture nobody can see. */
+    if (mirror) { mirror.close(); mirror = null; }
+  });
+  mirrorWindow.loadFile(path.join(__dirname, "renderer", "tablet-mirror.html"));
+  if (options && options.full) {
+    mirrorWindow.once("ready-to-show", () => mirrorWindow.setFullScreen(true));
+  }
+  return { ok: true };
+}
+
+/* TOUCHING THE TABLET THROUGH THE PICTURE.
+ *
+ * One held `adb shell` for the life of the mirror window - measured at 42 ms
+ * a tap against 127 ms for a fresh adb call and 161 ms for raw sendevent.
+ * See tablet-input.cjs for why `input` beats `sendevent` here. */
+let poke = null;
+
+function tabletPoke() {
+  return poke;
+}
+
+/* THE MIRROR'S SPEAKER, which is a remote control for the monitor this app
+ * already has rather than a second player. `want` null only asks. */
+ipcMain.handle("mirror:sound", async (_event, want) => {
+  if (!win || win.isDestroyed()) return { ok: false, why: "the panel is not open" };
+  try {
+    const said = await win.webContents.executeJavaScript(
+      "(function () { try { return pineMonitorSay("
+      + (want === null || want === undefined ? "null" : (want ? "true" : "false"))
+      + "); } catch (error) { return { ok: false, why: error.message }; } })()",
+      true);
+    return said || { ok: false, why: "the panel did not answer" };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("mirror:touch", async (_event, act) => {
+  try {
+    if (!poke) {
+      const { TabletInput } = require("./tablet-input.cjs");
+      const tools = terminalHost.tools();
+      const serial = await terminalHost.glassSerial();
+      if (!serial) return { ok: false, why: "no tablet is attached" };
+      poke = new TabletInput({ adb: tools.adb, serial });
+    }
+    const what = (act && act.do) || "";
+    if (what === "tap") return poke.tap(act.x, act.y);
+    if (what === "swipe") return poke.swipe(act.x, act.y, act.x2, act.y2, act.ms);
+    if (what === "key") return poke.key(act.key);
+    if (what === "text") return poke.text(act.text);
+    if (what === "how") return Object.assign({ ok: true }, poke.how());
+    return { ok: false, why: "nothing to do" };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("mirror:show", async (_event, options) => {
+  try {
+    return await openTabletMirror(options || {});
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("mirror:open", async (_event, shape) => {
+  if (!mirror) return { ok: false, why: "the mirror is not set up" };
+  try {
+    return await mirror.open(shape || {});
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("mirror:size", (_event, size) => {
+  if (!mirror) return { ok: false, why: "the mirror is not set up" };
+  try {
+    return mirror.retune(String(size || ""));
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("mirror:how", () => {
+  if (!mirror) return { ok: false, why: "the mirror is not set up" };
+  return Object.assign({ ok: true }, mirror.how());
+});
+
+ipcMain.handle("mirror:window", (event, shape) => {
+  const window_ = BrowserWindow.fromWebContents(event.sender);
+  if (!window_ || window_.isDestroyed()) return { ok: false };
+  if (window_.isFullScreen()) window_.setFullScreen(false);
+  /* The strip under the picture is part of the window but not part of the
+   * tablet, so it is added on top of the asked-for picture size. */
+  window_.setSize(Math.max(240, Math.round(shape.width)),
+    Math.max(200, Math.round(shape.height) + 34));
+  return { ok: true };
+});
+
+ipcMain.handle("mirror:full", (event, want) => {
+  const window_ = BrowserWindow.fromWebContents(event.sender);
+  if (!window_ || window_.isDestroyed()) return { ok: false, full: false };
+  window_.setFullScreen(!!want);
+  return { ok: true, full: window_.isFullScreen() };
+});
+
+ipcMain.handle("mirror:ontop", (event) => {
+  const window_ = BrowserWindow.fromWebContents(event.sender);
+  if (!window_ || window_.isDestroyed()) return { ok: false, onTop: false };
+  const want = !window_.isAlwaysOnTop();
+  window_.setAlwaysOnTop(want);
+  return { ok: true, onTop: want };
+});
+
+/* THE RECORDING TO SCRUB THROUGH, waiting for its window.
+ *
+ * The mp4 goes to a folder rather than through IPC for the same reason the
+ * export window's does: the picker PLAYS it, which means it needs a URL, and
+ * a thirty-second recording is megabytes that have no business being turned
+ * into a data URL. The folder goes when the window does. */
+const frameWaiting = new Map();
+
+function openFramePicker(reel) {
+  const dir = clipMux.stash();
+  const held = { dir, video: path.join(dir, "replay.mp4"),
+    seconds: reel.seconds, notes: reel.notes || [] };
+  fs.writeFileSync(held.video, reel.mp4);
+
+  const picker = new BrowserWindow({
+    width: 1100,
+    height: 780,
+    minWidth: 640,
+    minHeight: 480,
+    title: "Find the moment",
+    icon: path.join(__dirname, "assets", "pinebox.ico"),
+    backgroundColor: "#0d1217",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+  picker.setMenuBarVisibility(false);
+  /* The id while the window is still alive - see openShotEditor. */
+  const pickerId = picker.webContents.id;
+  frameWaiting.set(pickerId, held);
+  picker.on("closed", () => {
+    frameWaiting.delete(pickerId);
+    clipMux.forget(dir);
+  });
+  picker.loadFile(path.join(__dirname, "renderer", "frame-pick.html"));
+  return picker;
+}
+
+ipcMain.handle("frame:pending", (event) => {
+  const held = frameWaiting.get(event.sender.id);
+  if (!held) return { ok: false, why: "there is no recording waiting for this window" };
+  return { ok: true, seconds: held.seconds, notes: held.notes,
+    videoUrl: fileUrl(held.video) };
+});
+
+ipcMain.handle("frame:done", (event) => {
+  const window_ = BrowserWindow.fromWebContents(event.sender);
+  if (window_ && !window_.isDestroyed()) window_.close();
+  return { ok: true };
+});
+
+/* THE CHOSEN FRAME, treated exactly as a fresh screenshot is: onto the
+ * clipboard, and into the mark-up window if that is what was asked for. The
+ * picker closes behind it - it has done its job, and leaving it open would
+ * put a second window between the operator and the drawing. */
+ipcMain.handle("frame:pick", (event, choice) => {
+  const { clipboard, nativeImage } = require("electron");
+  try {
+    const body = String((choice && choice.dataUrl) || "").split(",")[1] || "";
+    if (!body) return { ok: false, why: "there was no picture in the frame" };
+    const png = Buffer.from(body, "base64");
+    const image = nativeImage.createFromBuffer(png);
+    if (!image || image.isEmpty()) {
+      return { ok: false, why: "the frame could not be decoded" };
+    }
+    clipboard.writeImage(image);
+    if (clipboard.readImage().isEmpty()) {
+      return { ok: false, why: "the clipboard would not take the frame" };
+    }
+    let edited = false;
+    if (choice && choice.edit) {
+      try { openShotEditor(png); edited = true; }
+      catch (error) { edited = false; }
+    }
+    const window_ = BrowserWindow.fromWebContents(event.sender);
+    if (window_ && !window_.isDestroyed()) window_.close();
+    const size = image.getSize();
+    return { ok: true, edited, width: size.width, height: size.height,
+      back: Number(choice && choice.back) || 0 };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
 ipcMain.handle("shot:image", (event) => {
   const png = shotWaiting.get(event.sender.id);
   if (!png) return { ok: false, why: "there is no picture waiting for this window" };
@@ -1198,41 +1526,73 @@ async function localClipFrames(seconds, dir) {
     endedAt: Date.now() };
 }
 
-ipcMain.handle("glass:still", async (_event, options) => {
+/* THE PICTURE, TAKEN NOW.
+ *
+ * Its own function because there are two roads to it: the button, and the
+ * fallback when the operator asked to scrub back but there is no rolling
+ * recording to scrub through. */
+async function plainStill(options, aim) {
   const { clipboard, nativeImage } = require("electron");
+  let image = null;
+  let shot = { bytes: 0, how: "", size: null };
+  if (aim.where === "app") {
+    image = await localStill();
+    const png = image.toPNG();
+    shot = { bytes: png.length, how: "this window", size: image.getSize() };
+  } else {
+    shot = await (await terminalHost.glass()).still();
+    if (!shot.ok) return shot;
+    image = nativeImage.createFromBuffer(shot.png);
+  }
+  if (!image || image.isEmpty()) {
+    return { ok: false, why: "the picture could not be decoded" };
+  }
+  clipboard.writeImage(image);
+  if (clipboard.readImage().isEmpty()) {
+    return { ok: false, why: "the clipboard would not take the picture" };
+  }
+  const size = shot.size || image.getSize();
+  /* The clipboard copy happens either way. The editor is an ADDITION to
+   * it, not an alternative - "also copy it to clipboard, but also pop it
+   * up in a window" - so a Ctrl+click that never gets marked up has still
+   * done what a plain click would have done. */
+  let edited = false;
+  if (options && options.edit) {
+    try { openShotEditor(aim.where === "app" ? image.toPNG() : shot.png); edited = true; }
+    catch (error) { edited = false; }
+  }
+  return { ok: true, width: size.width, height: size.height,
+    bytes: shot.bytes, how: shot.how, edited,
+    where: aim.where, why: aim.why };
+}
+
+ipcMain.handle("glass:still", async (_event, options) => {
   try {
     const aim = await captureTarget(options && options.target);
-    let image = null;
-    let shot = { bytes: 0, how: "", size: null };
-    if (aim.where === "app") {
-      image = await localStill();
-      const png = image.toPNG();
-      shot = { bytes: png.length, how: "this window", size: image.getSize() };
-    } else {
-      shot = await (await terminalHost.glass()).still();
-      if (!shot.ok) return shot;
-      image = nativeImage.createFromBuffer(shot.png);
+
+    /* SCRUB BACK TO THE MOMENT FIRST.
+     *
+     * Only the tablet has a rolling recording, and only a Ctrl+click asks to
+     * scrub through it - so this window's own capture, and a tablet whose
+     * ring is still empty, both fall through to taking the picture now,
+     * which is what the button did before. */
+    if (options && options.scrub && aim.where !== "app") {
+      const reel = await (await terminalHost.glass())
+        .clip_fromReplay(options.seconds, { silent: true });
+      if (reel && reel.ok && reel.mp4 && reel.mp4.length > 0) {
+        openFramePicker(reel);
+        return { ok: true, picking: true, seconds: reel.seconds,
+          where: aim.where, why: aim.why };
+      }
+      const now = await plainStill(options, aim);
+      if (!now.ok) return now;
+      /* Said, not swallowed: the operator asked to scrub and got a plain
+       * screenshot instead, and the reason for that matters. */
+      return Object.assign({}, now, { picking: false,
+        instead: (reel && reel.why) || "the rolling recording is not available" });
     }
-    if (!image || image.isEmpty()) {
-      return { ok: false, why: "the picture could not be decoded" };
-    }
-    clipboard.writeImage(image);
-    if (clipboard.readImage().isEmpty()) {
-      return { ok: false, why: "the clipboard would not take the picture" };
-    }
-    const size = shot.size || image.getSize();
-    /* The clipboard copy happens either way. The editor is an ADDITION to
-     * it, not an alternative - "also copy it to clipboard, but also pop it
-     * up in a window" - so a Ctrl+click that never gets marked up has still
-     * done what a plain click would have done. */
-    let edited = false;
-    if (options && options.edit) {
-      try { openShotEditor(aim.where === "app" ? image.toPNG() : shot.png); edited = true; }
-      catch (error) { edited = false; }
-    }
-    return { ok: true, width: size.width, height: size.height,
-      bytes: shot.bytes, how: shot.how, edited,
-      where: aim.where, why: aim.why };
+
+    return await plainStill(options, aim);
   } catch (error) {
     return { ok: false, why: error.message };
   }
