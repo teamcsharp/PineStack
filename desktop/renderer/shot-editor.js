@@ -51,6 +51,18 @@ let zoomedByHand = false;  /* has the operator taken the wheel to it */
 
 const style = { colour: '#ff3b30', weight: 4, fill: false, fontSize: 28 };
 
+/* THE SIZES THE DEFAULTS WERE CHOSEN AGAINST.
+ *
+ * 4px and 28px look right on the tablet's own 1340-wide screen. On a 3x
+ * capture - 4020 across - they are a hairline and a caption nobody can read,
+ * because they are absolute and the picture is not. sizeDefaults() puts them
+ * back in proportion, and markScale is how far the operator has moved them
+ * since. */
+const BASE_WIDE = 1340;
+const BASE_WEIGHT = 4;
+const BASE_FONT = 28;
+let markScale = 1;
+
 /* A scratch canvas for the pixelate tool. One, reused - allocating a canvas
  * per frame while dragging a blur box is how you make a 1340x800 editor
  * stutter. */
@@ -966,6 +978,12 @@ document.getElementById('fitBtn')?.addEventListener('click', () => {
 window.addEventListener('keydown', (event) => {
   if (typingMark) return;
   const meta = event.ctrlKey || event.metaKey;
+  if (event.key === 'Escape' && !menu.hidden) {
+    event.preventDefault(); shutMenu(); return;
+  }
+  if (event.key === 'Escape' && !deep.hidden) {
+    event.preventDefault(); deep.hidden = true; return;
+  }
   if (!meta && event.key === '0') {
     event.preventDefault();
     if (base) fit();
@@ -1041,10 +1059,32 @@ function rescaleMarks(by) {
     }
     if (mark.fit) mark.fit = { w: mark.fit.w * by, h: mark.fit.h * by };
   }
-  /* And the tool defaults, so the NEXT mark looks like the last one rather
-   * than a hairline on a picture eight times the size. */
-  setWeight(Math.max(1, Math.min(200, Math.round(style.weight * by))), true);
-  setFont(Math.max(10, Math.min(600, Math.round(style.fontSize * by))), true);
+  /* The tool defaults are NOT set here. sizeDefaults() reads canvas.width,
+   * and at this point fit() has not run yet - the canvas still measures the
+   * OLD picture, so the defaults would be worked out against a width that is
+   * about to change. Measured: dropping 3x to 1x with the size at 125% gave
+   * 15px and 105px, which is 125% of the THREE-times figures. resample()
+   * calls it after fit(), where the width is the new one. */
+}
+
+/* What a mark should measure on THIS picture, before the operator's own
+ * adjustment. A 4px line on the tablet's screen is a 12px line on a 3x
+ * capture of it - the same line, photographed larger. */
+function naturalWeight() {
+  const by = (canvas.width || BASE_WIDE) / BASE_WIDE;
+  return Math.max(1, Math.min(200, Math.round(BASE_WEIGHT * by * markScale)));
+}
+
+function naturalFont() {
+  const by = (canvas.width || BASE_WIDE) / BASE_WIDE;
+  return Math.max(8, Math.min(600, Math.round(BASE_FONT * by * markScale)));
+}
+
+function sizeDefaults() {
+  setWeight(naturalWeight(), true);
+  setFont(naturalFont(), true);
+  const said = document.getElementById('markScale');
+  if (said) said.textContent = Math.round(markScale * 100) + '%';
 }
 
 function sayTimes() {
@@ -1082,6 +1122,9 @@ async function resample(wantTimes, wantHow) {
     /* The marks are in the OLD picture's coordinates until this runs. */
     rescaleMarks(times / wasTimes);
     fit();
+    /* AFTER fit(), which is what gives the canvas its new width - see the
+     * note at the end of rescaleMarks. */
+    sizeDefaults();
     sayTimes();
     say(base.naturalWidth + '\u00d7' + base.naturalHeight + ' at ' + times
       + '\u00d7' + (got.why ? ' \u2014 ' + got.why : '')
@@ -1107,6 +1150,324 @@ document.getElementById('times')?.addEventListener('input', (event) => {
 document.getElementById('how')?.addEventListener('change', (event) => {
   resample(times, event.target.value);
 });
+
+/* ------------------------------------------------------ inspection mode */
+
+/* THE PICTURE BECOMES THE THING IT IS A PICTURE OF.
+ *
+ * Every region and its station row were collected at the moment of the
+ * shutter - see Glass.map - because a photograph carries no identity and
+ * anything claimed about it afterwards would be a guess about pixels.
+ *
+ * THE REGIONS ARE SCALED. The page lays out at 1154x690 CSS pixels while the
+ * screencap is 1340x800 - measured, not assumed - so a region has to be
+ * multiplied by (source width / viewport width) and then by the enlargement,
+ * or every hit box sits a sixth of a screen up and to the left of the thing
+ * it describes.
+ *
+ * DRAWING WAITS WHILE THIS IS ON. The same click cannot both start an arrow
+ * and play a line. The marks are untouched and come back exactly as they
+ * were. */
+let inspecting = false;
+let chart = null;              /* the map, as captured */
+let picked = null;             /* the region under discussion */
+const regionLayer = document.createElement('div');
+regionLayer.id = 'regions';
+const menu = document.getElementById('menu');
+const deep = document.getElementById('deep');
+
+function regionScale() {
+  /* From the page's CSS pixels to the picture's, at whatever enlargement it
+   * is currently showing. */
+  const view = chart && chart.viewport;
+  if (!view || !(view.w > 0) || !(source.width > 0)) return times || 1;
+  return (source.width / view.w) * (times || 1);
+}
+
+function paintRegions() {
+  regionLayer.textContent = '';
+  if (!inspecting || !chart || !Array.isArray(chart.regions)) return;
+  if (!regionLayer.parentNode) holder.appendChild(regionLayer);
+  const by = regionScale() * scale;      /* picture px -> screen px */
+  const off = regionScale();
+  regionLayer.style.left = '0px';
+  regionLayer.style.top = '0px';
+  regionLayer.style.width = canvas.style.width;
+  regionLayer.style.height = canvas.style.height;
+
+  for (const region of chart.regions) {
+    const hit = document.createElement('div');
+    hit.className = 'hit' + (region === picked ? ' on' : '')
+      + (canPlay(region) ? '' : ' mute');
+    hit.style.left = (region.x * off * scale) + 'px';
+    hit.style.top = (region.y * off * scale) + 'px';
+    hit.style.width = (region.w * off * scale) + 'px';
+    hit.style.height = (region.h * off * scale) + 'px';
+    hit.title = label(region);
+    hit.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      choose(region);
+      if (canPlay(region)) playRegion(region);
+    });
+    hit.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      choose(region);
+      openMenu(event.clientX, event.clientY, region);
+    });
+    regionLayer.appendChild(hit);
+  }
+}
+
+function canPlay(region) {
+  return !!(region.clip_media || region.media || region.id
+    || (region.kind === 'music' && region.track));
+}
+
+function label(region) {
+  const who = region.who || region.kind || 'element';
+  const said = (region.said || region.text || '').slice(0, 70);
+  return who + (said ? ' \u2014 ' + said : '');
+}
+
+function choose(region) {
+  picked = region;
+  paintRegions();
+  showDeep(region);
+}
+
+async function playRegion(region) {
+  say('Playing \u2026');
+  try {
+    const went = await api.inspectPlay(region);
+    say(went && went.ok ? 'Playing ' + went.what + ' in the Pine Box window.'
+      : ((went && went.why) || 'it would not play'), !(went && went.ok));
+  } catch (error) { say(error.message, true); }
+}
+
+/* ---- the right-click menu -------------------------------------------- */
+
+function item(icon, words, able, go) {
+  const button = document.createElement('button');
+  button.innerHTML = (window.pineIcon ? window.pineIcon(icon) : '')
+    + '<span></span>';
+  button.querySelector('span').textContent = words;
+  button.disabled = !able;
+  if (able) button.addEventListener('click', () => { shutMenu(); go(); });
+  return button;
+}
+
+function openMenu(atX, atY, region) {
+  menu.textContent = '';
+  const room = document.body.getBoundingClientRect();
+  menu.appendChild(item('c:volume--up--filled', 'Play it here',
+    canPlay(region), () => playRegion(region)));
+  menu.appendChild(item('c:download', 'Download it',
+    canPlay(region), async () => {
+      say('Fetching \u2026');
+      try {
+        const got = await api.inspectDownload(region);
+        if (got && got.canceled) return say('Not saved.');
+        say(got && got.ok
+          ? 'Saved ' + Math.round(got.bytes / 1024) + ' kB. Opening the folder.'
+          : ((got && got.why) || 'it would not download'), !(got && got.ok));
+      } catch (error) { say(error.message, true); }
+    }));
+  menu.appendChild(document.createElement('hr'));
+  menu.appendChild(item('c:microscope', 'What the station knows',
+    true, () => deeper(region)));
+  menu.appendChild(item('c:copy--to-clipboard', 'Copy its id',
+    !!region.id, () => {
+      if (api.copyText) api.copyText(region.id);
+      say('Copied ' + region.id);
+    }));
+
+  menu.hidden = false;
+  /* Kept on screen: a menu opened near the right edge would otherwise open
+   * off it. */
+  const box = menu.getBoundingClientRect();
+  menu.style.left = Math.min(atX, room.width - box.width - 6) + 'px';
+  menu.style.top = Math.min(atY, room.height - box.height - 6) + 'px';
+}
+
+function shutMenu() { menu.hidden = true; }
+
+document.addEventListener('click', (event) => {
+  if (!menu.hidden && !menu.contains(event.target)) shutMenu();
+});
+
+/* ---- the sidebar ------------------------------------------------------ */
+
+function pair(into, name, value) {
+  if (value === undefined || value === null || value === '') return;
+  const line = document.createElement('div');
+  line.className = 'pair';
+  const b = document.createElement('b');
+  b.textContent = name;
+  const s = document.createElement('span');
+  s.textContent = String(value);
+  line.appendChild(b);
+  line.appendChild(s);
+  into.appendChild(line);
+}
+
+function when(stamp) {
+  const at = Number(stamp);
+  if (!isFinite(at) || at <= 0) return '';
+  /* The feed's stamps are seconds since the epoch, not milliseconds. */
+  const ms = at > 1e12 ? at : at * 1000;
+  return new Date(ms).toLocaleString();
+}
+
+function showDeep(region) {
+  const body = document.getElementById('deepBody');
+  document.getElementById('deepWhat').textContent = label(region).slice(0, 60);
+  body.textContent = '';
+
+  if (region.said) {
+    const said = document.createElement('div');
+    said.className = 'said';
+    said.textContent = region.said;
+    body.appendChild(said);
+  }
+
+  const who = document.createElement('h4');
+  who.textContent = 'On air';
+  body.appendChild(who);
+  pair(body, 'who', region.who || region.kind);
+  pair(body, 'name', region.name);
+  pair(body, 'kind', region.kind);
+  pair(body, 'round', region.round);
+  pair(body, 'aired', region.aired ? 'yes' : 'not yet');
+  pair(body, 'written at', when(region.ts));
+  pair(body, 'aired at', when(region.air_at));
+  pair(body, 'seconds', region.seconds);
+
+  const made = document.createElement('h4');
+  made.textContent = 'How it was made';
+  body.appendChild(made);
+  pair(body, 'round (sid)', region.sid);
+  pair(body, 'turn', region.turn !== undefined && region.turns !== undefined
+    ? region.turn + ' of ' + region.turns : region.turn);
+  pair(body, 'voice', region.voice);
+  pair(body, 'engine', region.engine);
+  pair(body, 'caller', region.caller);
+  pair(body, 'source', region.source);
+
+  const bytes = document.createElement('h4');
+  bytes.textContent = 'Where the sound is';
+  body.appendChild(bytes);
+  pair(body, 'id', region.id);
+  pair(body, 'clip', region.clip_media);
+  pair(body, 'media', region.media);
+  pair(body, 'track', region.track);
+  if (!canPlay(region)) {
+    const note = document.createElement('div');
+    note.className = 'note';
+    note.textContent = 'Nothing playable is attached to this one.';
+    body.appendChild(note);
+  }
+
+  deep.hidden = false;
+}
+
+/* WHAT THE BOOTH KEPT, which is a different question from what the feed
+ * knew. It is only answerable while the line is still in the live ring, and
+ * says so when it is not rather than showing an empty panel. */
+async function deeper(region) {
+  showDeep(region);
+  const body = document.getElementById('deepBody');
+  const head = document.createElement('h4');
+  head.textContent = 'What the booth kept';
+  body.appendChild(head);
+  const waiting = document.createElement('div');
+  waiting.textContent = 'Asking the station\u2026';
+  body.appendChild(waiting);
+  try {
+    const got = await api.inspectDeep(region);
+    waiting.remove();
+    if (!got || !got.ok) {
+      const bad = document.createElement('div');
+      bad.className = 'note';
+      bad.textContent = (got && got.why) || 'the station did not answer';
+      body.appendChild(bad);
+      return;
+    }
+    if (got.why) {
+      const note = document.createElement('div');
+      note.className = 'note';
+      note.textContent = got.why;
+      body.appendChild(note);
+    }
+    const p = got.provenance;
+    if (p) {
+      for (const key of Object.keys(p)) {
+        const value = p[key];
+        if (value === null || value === undefined) continue;
+        if (typeof value === 'object') {
+          pair(body, key, JSON.stringify(value).slice(0, 300));
+        } else {
+          pair(body, key, String(value).slice(0, 300));
+        }
+      }
+    }
+  } catch (error) {
+    waiting.remove();
+    const bad = document.createElement('div');
+    bad.className = 'note';
+    bad.textContent = error.message;
+    body.appendChild(bad);
+  }
+}
+
+document.getElementById('deepShut')?.addEventListener('click', () => {
+  deep.hidden = true;
+});
+
+/* ---- the mode itself -------------------------------------------------- */
+
+function inspectMode(want) {
+  inspecting = want;
+  document.body.classList.toggle('inspecting', want);
+  document.getElementById('inspectBtn')?.classList.toggle('on', want);
+  shutMenu();
+  if (!want) {
+    deep.hidden = true;
+    if (regionLayer.parentNode) regionLayer.remove();
+    say('Back to marking up.');
+    return;
+  }
+  commitTyping();
+  select(null);
+  if (!chart || !Array.isArray(chart.regions) || !chart.regions.length) {
+    say('Nothing in this picture could be identified'
+      + (chart ? '.' : ' - it was taken without a map.'), true);
+  } else {
+    say(chart.regions.length + ' things in this picture. Click one to hear it, '
+      + 'right-click for more.');
+  }
+  paintRegions();
+}
+
+document.getElementById('inspectBtn')?.addEventListener('click', () => {
+  inspectMode(!inspecting);
+});
+
+/* THE SIZE CONTROL IN THE BAR. The same action as Ctrl+wheel: with something
+ * selected it resizes that, with nothing selected it sets what comes next -
+ * and there it moves the picture-proportional default rather than an
+ * absolute number, so it stays meaningful at every capture size. */
+function stepSize(by) {
+  if (selected) { growSelected(by); return; }
+  markScale = Math.max(0.2, Math.min(6, markScale * by));
+  sizeDefaults();
+  say('New marks: ' + style.weight + 'px line, ' + style.fontSize + 'px text ('
+    + Math.round(markScale * 100) + '%).');
+}
+
+document.getElementById('bigger')?.addEventListener('click', () => stepSize(1.25));
+document.getElementById('smaller')?.addEventListener('click', () => stepSize(1 / 1.25));
 
 /* --------------------------------------------------------------------- fit */
 
@@ -1140,6 +1501,8 @@ function apply(next) {
   canvas.style.width = Math.round(canvas.width * scale) + 'px';
   canvas.style.height = Math.round(canvas.height * scale) + 'px';
   redraw();
+  /* The hit boxes are laid over the picture, so they move with it. */
+  if (inspecting) paintRegions();
   const said = document.getElementById('zoomSaid');
   if (said) {
     said.textContent = Math.round(scale * 100) + '%';
@@ -1168,8 +1531,75 @@ function zoomTo(next, holdX, holdY) {
   stage.scrollTop += (after.top + py * scale) - holdY;
 }
 
+/* CTRL+WHEEL SIZES THE ANNOTATION, the wheel alone sizes the VIEW.
+ *
+ * "If I'm in annotation mode and I hold control and roll the wheel scale the
+ *  annotations up."
+ *
+ * With something selected it grows THAT, about its own centre so it stays
+ * where it was pointed. With nothing selected it grows the tool defaults, so
+ * the next arrow comes out the size you just dialled in - which is the same
+ * gesture meaning the same thing either side of drawing it. */
+let lastGrowAt = 0;
+
+function growSelected(by) {
+  /* One undo step per gesture, not per notch. A wheel roll is one decision
+   * and should take one press of Ctrl+Z to put back. */
+  const now = Date.now();
+  if (now - lastGrowAt > 700) remember();
+  lastGrowAt = now;
+
+  if (!selected) {
+    /* Nothing picked: this is the size of what comes NEXT, moved as a
+     * proportion of what this picture deserves rather than as an absolute -
+     * see naturalWeight. */
+    markScale = Math.max(0.2, Math.min(6, markScale * by));
+    sizeDefaults();
+    say('Next mark: ' + style.weight + 'px line, ' + style.fontSize + 'px text ('
+      + Math.round(markScale * 100) + '%).');
+    return;
+  }
+
+  const b = boundsOf(selected);
+  const cx = b.x + b.w / 2;
+  const cy = b.y + b.h / 2;
+  const about = (x, y) => [cx + (x - cx) * by, cy + (y - cy) * by];
+
+  const mark = selected;
+  if (mark.kind === 'line' || mark.kind === 'arrow') {
+    [mark.x1, mark.y1] = about(mark.x1, mark.y1);
+    [mark.x2, mark.y2] = about(mark.x2, mark.y2);
+  } else if (mark.kind === 'pen') {
+    mark.pts = mark.pts.map((q) => about(q[0], q[1]));
+  } else if (mark.kind === 'step') {
+    [mark.x, mark.y] = about(mark.x, mark.y);
+    mark.radius = Math.max(6, mark.radius * by);
+  } else {
+    /* Text and every box-shaped mark: the top-left moves about the centre
+     * and the size follows, which is what keeps it in place. */
+    [mark.x, mark.y] = about(mark.x, mark.y);
+    if (typeof mark.w === 'number') mark.w *= by;
+    if (typeof mark.h === 'number') mark.h *= by;
+    if (typeof mark.fontSize === 'number') {
+      mark.fontSize = Math.max(6, Math.min(600, mark.fontSize * by));
+      setFont(Math.round(mark.fontSize), true);
+    }
+    if (mark.fit) mark.fit = { w: mark.fit.w * by, h: mark.fit.h * by };
+  }
+  if (typeof mark.weight === 'number') {
+    mark.weight = Math.max(1, Math.min(200, mark.weight * by));
+    setWeight(Math.round(mark.weight), true);
+  }
+  redraw();
+}
+
 stage.addEventListener('wheel', (event) => {
   event.preventDefault();
+  /* THE ANNOTATION, NOT THE VIEW. */
+  if (event.ctrlKey || event.metaKey) {
+    growSelected(event.deltaY < 0 ? 1.1 : 1 / 1.1);
+    return;
+  }
   const room = stage.getBoundingClientRect();
   /* A fixed ratio per notch, so in and straight back out lands exactly where
    * it started rather than drifting. */
@@ -1236,6 +1666,8 @@ window.addEventListener('resize', () => {
     source = got.source || { width: 0, height: 0 };
     times = got.times || 1;
     how = got.how || '';
+    /* WHAT IS IN THE PICTURE, collected at the shutter - see Glass.map. */
+    chart = got.map || null;
     const picker = document.getElementById('how');
     if (picker && Array.isArray(got.ways)) {
       picker.textContent = '';
@@ -1254,6 +1686,9 @@ window.addEventListener('resize', () => {
     image.onload = () => {
       base = image;
       fit();
+      /* AFTER fit(), because it needs the canvas's real width - which is the
+       * picture's, not the window's. */
+      sizeDefaults();
       paintButtons();
       say(image.width + '×' + image.height + ' at ' + times + '×'
         + ' · already on your clipboard · draw on it, then Copy again.');

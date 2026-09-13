@@ -1027,7 +1027,7 @@ const shotWaiting = new Map();
  * Re-enlarging the enlarged copy would compound the interpolation: 2x of a 2x
  * is not 4x of the original.
  */
-function openShotEditor(png, original, times, how) {
+function openShotEditor(png, original, times, how, map) {
   const editor = new BrowserWindow({
     width: 1280,
     height: 860,
@@ -1053,7 +1053,11 @@ function openShotEditor(png, original, times, how) {
    * in the operator's face every time they shut the window. */
   const editorId = editor.webContents.id;
   shotWaiting.set(editorId, { png, original: original || png,
-    times: times || 1, how: how || '' });
+    times: times || 1, how: how || '',
+    /* WHAT IS IN THE PICTURE - regions and the station rows behind them,
+     * collected at the moment of capture. Inspection mode is built on this
+     * and cannot be truthful without it. */
+    map: map || null });
   editor.on("closed", () => shotWaiting.delete(editorId));
   editor.loadFile(path.join(__dirname, "renderer", "shot-editor.html"));
   return editor;
@@ -1406,6 +1410,8 @@ ipcMain.handle("shot:image", (event) => {
   const source = nativeImage.createFromBuffer(held.original).getSize();
   return { ok: true,
     dataUrl: "data:image/png;base64," + held.png.toString("base64"),
+    /* The regions, and what the station knows about each - see Glass.map. */
+    map: held.map || null,
     times: held.times,
     how: held.how || shotEnhance.WAYS[0].id,
     source,
@@ -1429,6 +1435,130 @@ ipcMain.handle("shot:resample", async (event, want) => {
   } catch (error) {
     return { ok: false, why: error.message };
   }
+});
+
+/* ============================================ inspecting a screenshot ====
+ *
+ * A region of a picture, turned back into the thing it was a picture OF.
+ * The map that makes this possible is collected at the shutter - see
+ * Glass.map - and every route below is one the station already serves.
+ */
+
+/** Where the sound for a region lives, and nothing invented. */
+function regionAudio(region) {
+  const cfg = readConfig();
+  const base = String(cfg.baseUrl || "").replace(/\/+$/, "");
+  if (!region) return null;
+
+  /* A track. The station serves music by id, and the row's own id carries
+   * the `music:` prefix the page uses. */
+  if (region.kind === "music" && region.track) {
+    return { url: base + "/music/" + encodeURIComponent(region.track),
+      what: "the track" };
+  }
+  /* THE CUT OF THIS LINE, which is what "play this line" means. */
+  if (region.clip_media) {
+    return { url: base + region.clip_media
+      + (region.clip_sig ? (region.clip_media.includes("?") ? "&" : "?")
+        + "t=" + encodeURIComponent(region.clip_sig) : ""),
+      what: "this line" };
+  }
+  /* The whole recording behind it. */
+  if (region.media) {
+    return { url: base + region.media
+      + (region.sig ? (region.media.includes("?") ? "&" : "?")
+        + "t=" + encodeURIComponent(region.sig) : ""),
+      what: "the recording" };
+  }
+  /* NOTHING STORED YET, so ask the booth to cut it. This is the road the
+   * sampler already uses, and `whole=1` is what "the entire playthrough of
+   * that script" means - the welded round rather than the one turn. */
+  if (region.id) {
+    return { url: base + "/api/booth/clip?line=" + encodeURIComponent(region.id),
+      what: "this line, cut by the booth", cuttable: true };
+  }
+  return null;
+}
+
+ipcMain.handle("inspect:play", (_event, region) => {
+  const heard = regionAudio(region);
+  if (!heard) return { ok: false, why: "there is no sound behind this one" };
+  if (!win || win.isDestroyed()) return { ok: false, why: "the panel is not open" };
+  try {
+    /* IN THE PANEL, because that is where this application makes noise and
+     * where its volume and routing already live. */
+    win.webContents.executeJavaScript(
+      "(function () { try { return pineInspectPlay("
+      + JSON.stringify(heard.url) + "); } catch (error) { return String(error); } })()",
+      true);
+    return { ok: true, url: heard.url, what: heard.what };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("inspect:download", async (event, region) => {
+  const { dialog } = require("electron");
+  const heard = regionAudio(region);
+  if (!heard) return { ok: false, why: "there is nothing to download for this one" };
+  try {
+    const response = await fetch(heard.url, { headers: authHeaders() });
+    if (!response.ok) {
+      return { ok: false, why: "the station said " + response.status };
+    }
+    const body = Buffer.from(await response.arrayBuffer());
+    /* THE EXTENSION FOLLOWS WHAT CAME BACK, not what was asked for.
+     * /api/booth/clip answers mp3 OR wav depending on what it had to do. */
+    const type = String(response.headers.get("content-type") || "");
+    const ext = type.includes("wav") ? "wav" : type.includes("mpeg") ? "mp3"
+      : (heard.url.match(/\.(mp3|wav|m4a|ogg)\b/i) || [, "mp3"])[1];
+    const name = (region.who || region.kind || "line") + "-"
+      + String(region.id || "").slice(0, 8);
+    let folder = app.getPath("music");
+    try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
+    catch { folder = app.getPath("downloads"); }
+    const picked = await dialog.showSaveDialog(
+      BrowserWindow.fromWebContents(event.sender), {
+        title: "Save " + heard.what,
+        defaultPath: path.join(folder, name.replace(/[^\w.-]+/g, "-") + "." + ext)
+      });
+    if (picked.canceled || !picked.filePath) return { ok: false, canceled: true };
+    fs.writeFileSync(picked.filePath, body);
+    shell.showItemInFolder(picked.filePath);
+    return { ok: true, path: picked.filePath, bytes: body.length };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* EVERYTHING THE STATION KNOWS ABOUT THIS ONE.
+ *
+ * The region already carries what the FEED knew. This adds what the booth
+ * kept: the prompt as sent, the script that came back, the model, the
+ * schedule slot - /api/dj/provenance answers for lines still in the live
+ * ring and 404s past it, which is a real limit and is reported as one
+ * rather than hidden behind an empty panel. */
+ipcMain.handle("inspect:deep", async (_event, region) => {
+  const cfg = readConfig();
+  const base = String(cfg.baseUrl || "").replace(/\/+$/, "");
+  const id = region && region.id;
+  if (!id) return { ok: false, why: "this one has no id to ask about" };
+  const out = { ok: true, id, provenance: null, why: "" };
+  try {
+    const response = await fetch(base + "/api/dj/provenance/"
+      + encodeURIComponent(id), { headers: authHeaders(cfg) });
+    if (response.ok) {
+      out.provenance = await response.json();
+    } else if (response.status === 404) {
+      out.why = "that line is no longer in the booth's live ring, so its "
+        + "paperwork is gone - the feed's own record above is what remains";
+    } else {
+      out.why = "the station said " + response.status;
+    }
+  } catch (error) {
+    out.why = error.message;
+  }
+  return out;
 });
 
 ipcMain.handle("shot:save", async (event, dataUrl) => {
@@ -1591,8 +1721,20 @@ async function plainStill(options, aim) {
     const png = image.toPNG();
     shot = { bytes: png.length, how: "this window", size: image.getSize() };
   } else {
-    shot = await (await terminalHost.glass()).still();
+    /* THE PICTURE AND WHAT IS IN IT, TOGETHER.
+     *
+     * The map has to be collected at the moment of the shutter or it
+     * describes a different screen - and it costs a page session of its
+     * own, so it is fetched alongside rather than after. See Glass.map. */
+    const glass = await terminalHost.glass();
+    const [took, chart] = await Promise.all([
+      glass.still(),
+      glass.map().catch((error) => ({ ok: false, why: error.message }))
+    ]);
+    shot = took;
     if (!shot.ok) return shot;
+    shot.map = chart && chart.ok ? chart : null;
+    shot.mapWhy = chart && chart.ok ? '' : ((chart && chart.why) || 'no map');
     /* TWICE THE SIZE, SHARPENED. The tablet's panel is 1340x800, which is a
      * small picture to paste into a conversation and a smaller one to draw
      * arrows on. Nothing is added that was not there - but the viewer's own
@@ -1639,12 +1781,17 @@ async function plainStill(options, aim) {
   if (options && options.edit) {
     try {
       openShotEditor(aim.where === "app" ? image.toPNG() : shot.png,
-        aim.where === "app" ? image.toPNG() : shot.raw, grew || 1, shot.how);
+        aim.where === "app" ? image.toPNG() : shot.raw, grew || 1, shot.how,
+        shot.map);
       edited = true;
     } catch (error) { edited = false; }
   }
   return { ok: true, width: size.width, height: size.height,
     bytes: shot.bytes, how: shot.how, edited,
+    /* How many things in this picture can be inspected, and why none can
+     * when that is the answer. */
+    regions: shot.map ? (shot.map.regions || []).length : 0,
+    mapWhy: shot.mapWhy || "",
     /* What it was enlarged by, and why it was not - the status line says
      * both rather than quietly handing over a smaller picture. */
     grew, grewWhy,

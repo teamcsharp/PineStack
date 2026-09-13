@@ -37,6 +37,14 @@
       <span id="fontSaid" class="said">28</span>
     </div>
 
+    <!-- THE SIZE OF WHAT COMES NEXT, or of what is selected. The same
+         action as Ctrl+wheel, which is a gesture nobody finds by looking. -->
+    <div class="group" role="group" aria-label="Annotation size">
+      <button id="smaller" class="act" title="Smaller (Ctrl+wheel down)">&minus;</button>
+      <span id="markScale" class="said" title="How big new marks are, against the size chosen for this picture">100%</span>
+      <button id="bigger" class="act" title="Bigger (Ctrl+wheel up)">+</button>
+    </div>
+
     <div class="sep"></div>
     <button id="undoBtn" class="act" title="Undo (Ctrl+Z)">&#8630;</button>
     <button id="redoBtn" class="act" title="Redo (Ctrl+Shift+Z)">&#8631;</button>
@@ -64,6 +72,12 @@
     <span id="zoomSaid" class="said" title="How far in the view is zoomed">100%</span>
 
     <div class="grow"></div>
+    <!-- INSPECTION MODE. The picture stops being pixels and becomes the
+         things it is a picture of: click to hear one, right-click for what
+         can be done with it. -->
+    <button id="inspectBtn" class="act" data-pine-icon="c:microscope"
+            aria-label="Inspection mode"
+            title="Inspection mode: click anything in the picture to hear it, right-click for more.&#10;The drawing tools wait while this is on."></button>
     <button id="copyBtn" class="go" title="Copy the marked-up picture to the clipboard (Ctrl+C)">Copy</button>
     <button id="saveBtn" class="act" title="Save it as a PNG (Ctrl+S)">Save</button>
   </div>
@@ -77,6 +91,19 @@
       <textarea id="typing" class="typing" spellcheck="false" hidden></textarea>
     </div>
   </div>
+
+  <!-- What the station knows about the thing that was clicked. -->
+  <aside id="deep" class="deep" hidden>
+    <header>
+      <span id="deepWhat">Nothing selected</span>
+      <button id="deepShut" class="act" title="Close (Esc)"
+              data-pine-icon="c:close--filled" aria-label="Close"></button>
+    </header>
+    <div id="deepBody"></div>
+  </aside>
+
+  <!-- Right-click: what can be done with this one. -->
+  <div id="menu" class="menu" hidden></div>
 
   <p id="say" class="say"></p>
   <!-- The station's vendored Carbon sprite, so the bin is a monochrome

@@ -248,6 +248,121 @@ function evaluate(wsUrl, expression, timeoutMs) {
   });
 }
 
+/* WHAT IS ON THE GLASS, AND WHAT EACH PART OF IT IS.
+ *
+ * Collected from the page at the moment of the capture, because a picture
+ * carries no identity and anything claimed about it afterwards would be a
+ * guess about pixels.
+ *
+ * Every rect is in CSS pixels of the viewport, which is what the screenshot
+ * is a picture of - so a region maps onto the image one to one, and onto an
+ * enlarged copy by multiplying.
+ */
+const MAP_QUESTION = `(function () {
+  try {
+    var seen = {};
+    var out = [];
+    var wide = window.innerWidth, tall = window.innerHeight;
+
+    /* The feed model, keyed by id, so a region can carry what the station
+     * knows about it rather than only what the pixels showed. */
+    var rows = {};
+    try {
+      if (typeof PineStationFeed !== 'undefined' && PineStationFeed.rows) {
+        var all = PineStationFeed.rows() || [];
+        for (var r = 0; r < all.length; r++) {
+          if (all[r] && all[r].id) rows[String(all[r].id)] = all[r];
+        }
+      }
+    } catch (err) { /* the map is still worth having without it */ }
+
+    var marked = document.querySelectorAll('[data-line],[data-row-id],[data-id]');
+    for (var i = 0; i < marked.length; i++) {
+      var el = marked[i];
+      var id = el.getAttribute('data-line') || el.getAttribute('data-row-id')
+        || el.getAttribute('data-id');
+      if (!id) continue;
+      var box = el.getBoundingClientRect();
+      /* NOT ON THE GLASS = NOT IN THE MAP. Zero-sized leftovers from a
+       * virtualised list, and anything scrolled out of the viewport, describe
+       * nothing in the photograph. */
+      if (box.width < 4 || box.height < 4) continue;
+      if (box.right <= 0 || box.bottom <= 0) continue;
+      if (box.left >= wide || box.top >= tall) continue;
+
+      /* THE OUTERMOST WINS. The same id sits on the row and on spans inside
+       * it, and a click means the row. */
+      var had = seen[id];
+      var area = box.width * box.height;
+      if (had && had.area >= area) continue;
+
+      var kind = 'element';
+      var trackId = '';
+      if (String(id).indexOf('music:') === 0) {
+        kind = 'music';
+        trackId = String(id).slice(6);
+      } else if (rows[id]) {
+        kind = rows[id].kind || rows[id].who || 'line';
+      }
+
+      var row = rows[id] || null;
+      var entry = {
+        id: String(id),
+        kind: kind,
+        track: trackId,
+        area: area,
+        x: Math.round(box.left), y: Math.round(box.top),
+        w: Math.round(box.width), h: Math.round(box.height),
+        cls: String(el.className || '').slice(0, 80),
+        text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200)
+      };
+      if (row) {
+        /* Only the fields that make a row actionable or explainable. The
+         * whole row would be megabytes across two hundred regions. */
+        entry.who = row.who || '';
+        entry.name = row.name || '';
+        entry.round = row.round || '';
+        entry.said = String(row.text || '').slice(0, 400);
+        entry.aired = row.aired || 0;
+        entry.ts = row.ts || 0;
+        entry.air_at = row.air_at || 0;
+        entry.sid = row.sid || '';
+        entry.turn = row.turn;
+        entry.turns = row.turns;
+        entry.voice = row.voice || '';
+        entry.engine = row.engine || '';
+        entry.caller = row.caller || '';
+        entry.source = row.source || '';
+        entry.media = row.media || '';
+        entry.sig = row.sig || '';
+        entry.clip_media = row.clip_media || '';
+        entry.clip_sig = row.clip_sig || '';
+        entry.clip_from = row.clip_from;
+        entry.clip_until = row.clip_until;
+        entry.seconds = row.seconds;
+      }
+      seen[id] = entry;
+    }
+
+    for (var key in seen) { if (seen.hasOwnProperty(key)) out.push(seen[key]); }
+    /* Smallest last, so a hit test walking the list finds the most specific
+     * region that contains the point. */
+    out.sort(function (a, b) { return b.area - a.area; });
+
+    var now = null;
+    try {
+      if (typeof PineStationFeed !== 'undefined' && PineStationFeed.now) {
+        now = PineStationFeed.now();
+      }
+    } catch (err) { now = null; }
+
+    return JSON.stringify({ ok: true, viewport: { w: wide, h: tall },
+      at: Date.now(), regions: out, now: now });
+  } catch (err) {
+    return JSON.stringify({ ok: false, why: String(err && err.message || err) });
+  }
+})()`;
+
 /* ONE DOOR, HELD OPEN. Every evaluate over the same socket, and the adb
  * forward removed exactly once. */
 class PageSession {
@@ -563,6 +678,37 @@ class Glass {
       return { ok: false, why: 'the tablet answered, but not with a PNG' };
     }
     return { ok: true, png, bytes: png.length, size: pngSize(png), how, at: this.now() };
+  }
+
+  /**
+   * WHAT IS ON THE GLASS, AND WHAT EACH PART OF IT IS.
+   *
+   * Taken alongside the picture, not from it: a photograph carries no
+   * identity, so the regions and their station rows have to be collected
+   * from the page at the moment the shutter fires or every later claim about
+   * "this line" is a guess about pixels. See MAP_QUESTION.
+   *
+   * Fetched in PARALLEL with the screenshot by the caller, because it costs
+   * a page session of its own and there is no reason to pay for it twice
+   * over in wall-clock.
+   */
+  async map() {
+    const pid = await this.pid();
+    if (!pid) return { ok: false, why: 'the kiosk app is not running' };
+    let page = null;
+    try {
+      page = await new PageSession(this.run, (a) => this.target(a), GLASS_PORT).open(pid);
+    } catch (error) {
+      return { ok: false, why: 'could not reach the tablet: ' + error.message };
+    }
+    try {
+      const said = await page.askJson(MAP_QUESTION, 20000);
+      return said || { ok: false, why: 'the page did not answer' };
+    } catch (error) {
+      return { ok: false, why: error.message };
+    } finally {
+      await page.close();
+    }
   }
 
   /* -------------------------------------------------------------- the clip */

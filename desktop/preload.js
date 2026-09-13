@@ -94,6 +94,11 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   /* The editor's resolution slider and algorithm picker. Always resampled
    * from the ORIGINAL, never from the copy already on screen. */
   shotResample: (want) => ipcRenderer.invoke("shot:resample", want),
+  /* Inspection mode: a region of a screenshot, turned back into the thing it
+   * was a picture of. See the note in main.js. */
+  inspectPlay: (region) => ipcRenderer.invoke("inspect:play", region),
+  inspectDownload: (region) => ipcRenderer.invoke("inspect:download", region),
+  inspectDeep: (region) => ipcRenderer.invoke("inspect:deep", region),
   glassClip: (seconds, options) => ipcRenderer.invoke("glass:clip", seconds, options),
   /* The export window: what is waiting, and what to make of it. */
   clipPending: () => ipcRenderer.invoke("clip:pending"),

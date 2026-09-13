@@ -1082,6 +1082,29 @@ $("glassClip")?.addEventListener("click", (event) => {
  * desktopPlayerEnabled() deliberately keeps the shell player silent. A
  * speaker icon lit in that state would be a lie the operator only catches by
  * listening for a sound that never comes. */
+/* THE SOUND FOR AN INSPECTED REGION, played here.
+ *
+ * "Click on any sample and be able to play it through the Pine box
+ *  application and hear the sample." The panel is where this application
+ *  makes noise; a second audio graph in the screenshot editor would be a
+ *  second opinion about volume, mute and routing. One element, reused, so
+ *  inspecting a second line replaces the first rather than layering. */
+let pineInspectHeard = null;
+
+window.pineInspectPlay = function (url) {
+  if (!pineInspectHeard) {
+    pineInspectHeard = new Audio();
+    pineInspectHeard.preload = "auto";
+  }
+  pineInspectHeard.pause();
+  pineInspectHeard.src = url;
+  pineInspectHeard.volume = typeof desktopMusicGain === "function"
+    ? Math.max(0.15, desktopMusicGain()) : 0.6;
+  const going = pineInspectHeard.play();
+  if (going && going.catch) going.catch(() => { /* the editor says so */ });
+  return "playing";
+};
+
 window.pineMonitorSay = function (want) {
   const box = $("boothMonitor");
   if (!box) return { ok: false, why: "this app has no monitor switch" };
