@@ -1226,6 +1226,32 @@ ipcMain.handle("mirror:sound", async (_event, want) => {
   }
 });
 
+/* LOOKING THROUGH THE TABLET'S CAMERA.
+ *
+ * The tablet puts its camera on its own SCREEN and the mirror carries it
+ * here - see camera/PineCameraActivity.kt for why that beats a second video
+ * pipeline. This only asks. */
+ipcMain.handle("tablet:camera", async (_event, want) => {
+  try {
+    const glass = await terminalHost.glass();
+    const facing = (want && want.facing) === "front" ? "front" : "rear";
+    const said = await glass.say(
+      (want && want.off)
+        ? "(async function () { var b = window.pineDesktop;"
+          + " if (!b || !b.cameraHide) return JSON.stringify({ok:false,"
+          + " why:'this terminal has no camera road'});"
+          + " return JSON.stringify(await b.cameraHide()); })()"
+        : "(async function () { var b = window.pineDesktop;"
+          + " if (!b || !b.cameraShow) return JSON.stringify({ok:false,"
+          + " why:'this terminal has no camera road'});"
+          + " return JSON.stringify(await b.cameraShow({facing: "
+          + JSON.stringify(facing) + "})); })()");
+    return said || { ok: false, why: "the tablet did not answer" };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
 ipcMain.handle("mirror:touch", async (_event, act) => {
   try {
     if (!poke) {

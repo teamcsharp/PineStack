@@ -1194,6 +1194,23 @@ $("glassMirror")?.addEventListener("dblclick", () => {
   api.mirrorShow({ full: true });
 });
 
+/* THE TABLET'S CAMERA, WATCHED THROUGH THE MIRROR. Both together, because
+ * one without the other is either a camera nobody can see or a live view of
+ * a station that is not showing a camera. */
+$("glassCam")?.addEventListener("click", () => {
+  glassDo("Opening the tablet's camera\u2026", async () => {
+    const seen = await api.mirrorShow({});
+    if (!seen || !seen.ok) {
+      return glassSay(seen && seen.why ? seen.why : "the live view would not open", true);
+    }
+    const said = await api.tabletCamera({ facing: "rear" });
+    glassSay(said && said.ok
+      ? "Looking through the tablet's rear camera. Front and rear are in the "
+        + "live view; close it there to put the terminal back."
+      : ((said && said.why) || "the camera would not open"), !(said && said.ok));
+  });
+});
+
 $("glassReport")?.addEventListener("click", () => glassDo(
   "Asking the tablet what it is doing\u2026", async () => {
     const said = await api.glassReport({ target: glassTarget() });

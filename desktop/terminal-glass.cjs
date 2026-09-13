@@ -681,6 +681,31 @@ class Glass {
   }
 
   /**
+   * Ask the page one question and hand back what it said.
+   *
+   * The small road for the bridge verbs that are a single call and a single
+   * answer - opening the camera, putting the terminal back - where a method
+   * of their own would be the same eight lines each time.
+   */
+  async say(question) {
+    const pid = await this.pid();
+    if (!pid) return { ok: false, why: 'the kiosk app is not running' };
+    let page = null;
+    try {
+      page = await new PageSession(this.run, (a) => this.target(a), GLASS_PORT).open(pid);
+    } catch (error) {
+      return { ok: false, why: 'could not reach the tablet: ' + error.message };
+    }
+    try {
+      return await page.askJson(question, 20000);
+    } catch (error) {
+      return { ok: false, why: error.message };
+    } finally {
+      await page.close();
+    }
+  }
+
+  /**
    * WHAT IS ON THE GLASS, AND WHAT EACH PART OF IT IS.
    *
    * Taken alongside the picture, not from it: a photograph carries no

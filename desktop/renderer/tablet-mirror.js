@@ -565,6 +565,47 @@ document.getElementById('back30').addEventListener('click', function () {
   });
 });
 
+/* --------------------------------------------------------- the camera */
+
+/* LOOKING THROUGH THE TABLET'S CAMERA. It goes on the TABLET's screen and
+ * this window is already watching that screen - so there is no second video
+ * road to keep alive. The buttons are here as well as on the tablet's own
+ * bar because a control you can only press by aiming at a picture of it is a
+ * control that fails the moment the picture stalls. */
+let camFacing = '';
+
+async function camera(want) {
+  try {
+    const said = await api.tabletCamera(want);
+    if (!said || !said.ok) {
+      cover((said && said.why) || 'the camera would not answer', true);
+      setTimeout(function () { cover(''); }, 3000);
+      return;
+    }
+    camFacing = want && want.off ? '' : (said.facing || '');
+    paintCam();
+    cover(want && want.off ? 'The terminal is back.'
+      : 'Looking through the ' + camFacing + ' camera.');
+    setTimeout(function () { cover(''); }, 2200);
+  } catch (error) {
+    cover(error.message, true);
+  }
+}
+
+function paintCam() {
+  const rear = document.getElementById('camRear');
+  const front = document.getElementById('camFront');
+  if (rear) rear.classList.toggle('on', camFacing === 'rear');
+  if (front) front.classList.toggle('on', camFacing === 'front');
+}
+
+document.getElementById('camRear')?.addEventListener('click',
+  function () { camera({ facing: 'rear' }); });
+document.getElementById('camFront')?.addEventListener('click',
+  function () { camera({ facing: 'front' }); });
+document.getElementById('camOff')?.addEventListener('click',
+  function () { camera({ off: true }); });
+
 /* ----------------------------------------------------------- the sound */
 
 /* MUTED UNTIL ASKED, and it does not reach into the panel and silence

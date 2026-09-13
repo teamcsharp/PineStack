@@ -77,6 +77,8 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   /* Reaching through the picture: a tap, a swipe, a key, or typed text, in
    * the DISPLAY's coordinates. See tablet-input.cjs. */
   mirrorTouch: (act) => ipcRenderer.invoke("mirror:touch", act),
+  /* The tablet's own camera, put on its screen so the mirror carries it. */
+  tabletCamera: (want) => ipcRenderer.invoke("tablet:camera", want),
   /* The speaker on the mirror. null asks, true/false sets - and what comes
    * back is what is AUDIBLE, not what was asked for. */
   mirrorSound: (want) => ipcRenderer.invoke("mirror:sound", want),
