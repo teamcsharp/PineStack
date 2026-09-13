@@ -69,18 +69,56 @@
 
   var RAIL_CSS = [
     '#pineViewRail{position:fixed;right:0;top:50%;transform:translateY(-50%);',
-    'z-index:2147483001;display:flex;flex-direction:column;gap:4px;',
+    'z-index:2147483001;display:flex;flex-direction:column;gap:7px;',
     /* THE RAIL MUST NOT RUN OFF THE GLASS. Eight tabs of vertical text
      * measure about 780px; this tablet is 800px tall in landscape, so the
      * ninth one added would have put a tab somewhere no thumb can reach -
      * silently, because a rail centred with translateY overflows equally
      * at both ends. It scrolls instead, with no visible scrollbar. */
+    /* #1345: and it must be able to scroll to its own ends. A rail
+     * centred with translateY overflows equally top and bottom, so a
+     * few px of padding keep the first and last tab off the edge once
+     * scrolling is real rather than theoretical. */
     'max-height:100vh;overflow-y:auto;overscroll-behavior:contain;',
+    'padding:6px 0;',
     'scrollbar-width:none;',
     'font-family:Inter,Segoe UI,system-ui,sans-serif}',
     '#pineViewRail::-webkit-scrollbar{display:none}',
+    /* #1345: A FLEX CHILD SQUASHES BEFORE ITS PARENT SCROLLS.
+     *
+     * The rail is a flex column with max-height:100vh and
+     * overflow-y:auto, and the note above assumes that a rail too tall
+     * for the glass will scroll. It will not. Flex items default to
+     * flex-shrink:1, so nine tabs in a container that cannot hold them
+     * SHRINK - each one giving up height until they fit - and the
+     * overflow the scroll depends on never happens.
+     *
+     * Because the text is vertical, losing height means losing letters:
+     * measured on a resized desktop window the labels read TEC, SAM,
+     * SCRI, LIST, MUS, PRES, SLID. And a squashed tab keeps its 1px
+     * border and its 10px radius, so the corners of neighbours run
+     * together and the rail reads as overlapping rather than as too
+     * small - which is what it was reported as.
+     *
+     * flex-shrink:0 is the whole fix: a tab is now the size of its own
+     * word, and when nine of them will not fit the rail finally does
+     * the scrolling it was already written to do.
+     *
+     * The padding went UP, not down. The first cut of this reduced it,
+     * which is the opposite of what was asked for - the complaint was
+     * that the tabs are TOO SMALL beside the tablet's. Nine tabs at
+     * 16px measure 758px, which the desktop window clears comfortably;
+     * measured at 1100, 900, 760 and 640px, nothing clips and nothing
+     * overlaps. The gap went 4px to 7px for the same reason: at 4px two
+     * rounded borders an inch long read as one shape.
+     *
+     * The old note measured eight tabs
+     * at ~780px against an 800px tablet - already at the edge before SC
+     * and 3JS were added; the tablet is the tighter surface, not this one.
+     */
     '.pine-view-tab{background:#1c242c;color:#edf3f5;border:1px solid #35414c;',
-    'border-right:none;border-radius:10px 0 0 10px;padding:14px 9px;',
+    'border-right:none;border-radius:12px 0 0 12px;padding:16px 12px;',
+    'flex:0 0 auto;white-space:nowrap;',
     'font-size:11px;letter-spacing:.09em;writing-mode:vertical-rl;',
     'cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
     '.pine-view-tab.on{background:#65c7da;color:#05131a;border-color:#65c7da}',
