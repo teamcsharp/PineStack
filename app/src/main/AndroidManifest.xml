@@ -21,6 +21,13 @@
          268,000 pixels.
          signature-level from `android`, so the platform key grants it. -->
     <uses-permission android:name="android.permission.CAPTURE_SECURE_VIDEO_OUTPUT" />
+    <!-- CAPTURING THE MIX WITHOUT THE PAGE. The page's ScriptProcessor loses
+         17-23% of the audio on a busy main thread (measured), and the
+         AudioWorklet that would fix it needs a secure context this station
+         does not serve. signature|privileged|role from `android`, so the
+         platform key grants it. See audio/AirTap.kt - it is OFF unless asked
+         for, because REMOTE_SUBMIX can reroute output on some builds. -->
+    <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT" />
     <!-- LOOKING THROUGH THE TABLET'S CAMERA, on request and never ambient:
          the preview holds the device only while its window is in front.
          Granted by deploy.sh, and asked for at runtime by the activity so a

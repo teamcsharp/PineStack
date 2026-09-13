@@ -262,8 +262,21 @@
         + response.status + ").");
     }
     const type = response.headers.get("content-type") || "";
-    if (!/^audio\//i.test(type) && !/^application\/octet-stream/i.test(type)) {
-      throw new Error("That was not audio.");
+    /* #1310: A VIDEO CARRIES AUDIO, and this pad wants that audio.
+     *
+     * This refused video/mp4 outright, so a clip from the SFX
+     * guy's library could never reach a pad - the operator's
+     * "assign that video to a sampler pad" answered "That was
+     * not audio."
+     *
+     * The guard's real job is to refuse an error page being fed
+     * to decodeAudioData, and it still does: a video's audio
+     * track decodes like any other sample, and a container the
+     * engine cannot read fails below with its own message
+     * rather than being waved through here. */
+    if (!/^audio\//i.test(type) && !/^video\//i.test(type)
+        && !/^application\/octet-stream/i.test(type)) {
+      throw new Error("That was neither audio nor video.");
     }
     return {
       bytes: await response.arrayBuffer(),
@@ -377,6 +390,17 @@
         at: Date.now(),
         gain: 1, pitch: 1, loop: false, reverse: false, trim: null, choke: ""
       };
+      /* #1310: AND WHETHER IT HAS A PICTURE.
+       *
+       * Taken from the response's own Content-Type rather than a flag
+       * a caller has to remember to pass, so it is right however the
+       * clip arrived - the set's icon, the script's detail sheet, or
+       * a kit off disk. The audio is already on the pad either way;
+       * this is what lets press() put the picture up with it. */
+      if (/^video\//.test(String(got.type || ""))) {
+        meta.video = true;
+        meta.url = source.url;
+      }
       await engine().load(key, got.bytes);
       meta.seconds = engine().seconds(key);
       layout[targetBank][targetPad] = meta;
@@ -592,6 +616,7 @@
      * playing the sample pad, allowing me to play the sample pad without
      * audio interference." On by default - see sampler-air.js. */
     duckForPads();
+    padPicture(layout[bank][sourceIndex]);                    /* #1310 */
 
     const pitch = modes.sixteen ? sixteenPitch(index) : undefined;
     const fire = () => audio.fire(key, options);
@@ -615,6 +640,36 @@
     held.set(index, record);
     if (element) element.classList.add("lit");
     if (!modes.sixteen) select(index);
+  }
+
+  /* #1310: A PAD THAT HOLDS A VIDEO POPS THE VIDEO.
+   *
+   * The sound is the engine's, exactly as before - an mp4's audio
+   * track decodes like any other sample, so a video pad has always
+   * played. This adds the picture, and hands the set the SAME trim
+   * the engine is using, so editing a pad's in and out edits both
+   * halves of it from the one editor that already exists.
+   *
+   * Silent about failure on purpose: the set not being on this
+   * surface must never stop the pad making its noise. */
+  function padPicture(meta) {
+    if (!meta || !meta.video || !meta.url) return;
+    const tv = root.PineSfxTv;
+    if (!tv || typeof tv.cut !== "function") return;
+    const clip = {
+      url: meta.url,
+      sting: meta.label || "pad",
+      id: meta.srcId || "",
+      video: true,
+      seconds: Number(meta.seconds) || 0,
+      ts: Date.now()
+    };
+    if (meta.trim) {
+      clip.from = Math.max(0, Number(meta.trim.start) || 0);
+      const to = Number(meta.trim.end) || 0;
+      if (to > clip.from) clip.to = to;
+    }
+    try { tv.cut(clip); } catch (err) { /* the pad still sounds */ }
   }
 
   /* THE BROADCAST COMES BACK WHEN THE LAST VOICE DIES, not when the finger

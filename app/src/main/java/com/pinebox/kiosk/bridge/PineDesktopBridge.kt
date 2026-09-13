@@ -98,12 +98,14 @@ class PineDesktopBridge(
             "replayState", "replaySave", "replayChunk",
             /* What the terminal confirmed on its way up - see net/Readiness. */
             "readyReport",
+            /* The mix, captured natively - see audio/AirTap.kt. */
+            "airStart", "airStop", "airState", "airSlice",
             /* Looking through the tablet's own camera - see camera/. */
             "cameraShow", "cameraHide",
             /* ...and without taking the screen, which is the one that
              * matters: cameraOpen streams frames to the desktop while
              * the terminal stays on the air. */
-            "cameraOpen", "cameraClose",
+            "cameraOpen", "cameraClose", "cameraTune", "cameraRange",
             /* Keeping a line: to the tablet, or to the working folder. */
             "keepClip", "jack", "wallpaper", "saveText", "saveBytes",
             "usbState", "usbPick", "usbSend", "usbList", "usbRead",
@@ -489,6 +491,60 @@ class PineDesktopBridge(
          * lay under a video - see terminal-glass.cjs. Nothing is transcribed
          * and nothing leaves the tablet here; the take is parked and read
          * out by micChunk. */
+        /* THE MIX, CAPTURED OFF THE PAGE.
+         *
+         * The page's own ring loses a fifth of the audio on a busy main
+         * thread; this one runs on a thread of its own and cannot be
+         * starved. It is started on request rather than at boot because
+         * REMOTE_SUBMIX can reroute output on some builds, and a radio
+         * station is the worst possible place to find that out. */
+        "airStart" -> {
+            val tap = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.airTap
+            val why = tap?.start()
+            BridgeEnvelope.ok(id, JSONObject()
+                .put("ok", tap != null && why == null)
+                .put("detail", why ?: JSONObject.NULL)
+                .put("seconds", tap?.seconds() ?: 0.0).toString())
+        }
+
+        "airStop" -> {
+            (context.applicationContext as? com.pinebox.kiosk.PineApp)?.airTap?.stop()
+            BridgeEnvelope.ok(id, JSONObject().put("ok", true).toString())
+        }
+
+        "airState" -> {
+            val tap = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.airTap
+            BridgeEnvelope.ok(id, JSONObject()
+                .put("ok", tap != null)
+                .put("running", tap?.running ?: false)
+                .put("seconds", tap?.seconds() ?: 0.0)
+                .put("rate", tap?.rate ?: 0)
+                .put("holds", com.pinebox.kiosk.audio.AirTap.HOLD_SECONDS)
+                .put("detail", tap?.lastError ?: JSONObject.NULL).toString())
+        }
+
+        /* One window of it, base64, the same shape the page's sliceWav
+         * answers with so the desktop does not care which road it came by. */
+        "airSlice" -> {
+            val tap = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.airTap
+            if (tap == null || !tap.running) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false)
+                    .put("detail", "the native tap is not running").toString())
+            } else {
+                val opts = args.optJSONObject(0) ?: JSONObject()
+                val from = opts.optDouble("fromAgo", 30.0)
+                val to = opts.optDouble("toAgo", 0.0)
+                val wav = tap.sliceWav(from, to)
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", true)
+                    .put("bytes", wav.size)
+                    .put("rate", tap.rate)
+                    .put("b64", android.util.Base64.encodeToString(
+                        wav, android.util.Base64.NO_WRAP)).toString())
+            }
+        }
+
         /* THE CAMERA AS A STREAM, WITH THE SCREEN LEFT ALONE.
          *
          * This is the road that matters: no preview, no activity, the
@@ -508,6 +564,27 @@ class PineDesktopBridge(
                     .put("ok", false)
                     .put("detail", err.message ?: "the camera would not open").toString())
             }
+        }
+
+        /* THE SENSOR'S DIALS. Gamma and the look transforms are
+         * deliberately not here - see PineCameraService.dial. */
+        "cameraTune" -> {
+            val svc = com.pinebox.kiosk.camera.PineCameraService.live
+            if (svc == null) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false).put("detail", "the camera is not open").toString())
+            } else {
+                svc.tune(args.optJSONObject(0) ?: JSONObject())
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", true).put("range", svc.range()).toString())
+            }
+        }
+
+        "cameraRange" -> {
+            val svc = com.pinebox.kiosk.camera.PineCameraService.live
+            BridgeEnvelope.ok(id, JSONObject()
+                .put("ok", svc != null)
+                .put("range", svc?.range() ?: JSONObject()).toString())
         }
 
         "cameraClose" -> {

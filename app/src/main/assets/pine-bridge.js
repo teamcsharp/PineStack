@@ -237,8 +237,25 @@
      * cameraHide() puts the terminal back. */
     /* THE ONE THAT LEAVES THE SCREEN ALONE. cameraOpen({facing}) starts the
      * stream to the desktop - no preview, the terminal stays on the air. */
+    /* THE MIX, CAPTURED OFF THIS PAGE.
+     *
+     * airStart() -> {ok, detail, seconds}   airStop() -> {ok}
+     * airState() -> {ok, running, seconds, rate, holds, detail}
+     * airSlice({fromAgo, toAgo}) -> {ok, bytes, rate, b64}
+     *
+     * The page's own ring loses a fifth of the audio on a busy main thread;
+     * this one runs on a thread of its own. See audio/AirTap.kt. */
+    airStart: promised("airStart"),
+    airStop: promised("airStop"),
+    airState: promised("airState"),
+    airSlice: promised("airSlice"),
+
     cameraOpen: promised("cameraOpen"),
     cameraClose: promised("cameraClose"),
+    /* The SENSOR's dials. cameraTune({auto, shutterNs, iso, ev, slowShutter})
+     * and cameraRange() -> what this sensor can actually be asked for. */
+    cameraTune: promised("cameraTune"),
+    cameraRange: promised("cameraRange"),
 
     cameraShow: promised("cameraShow"),
     cameraHide: promised("cameraHide"),

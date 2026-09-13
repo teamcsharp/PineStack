@@ -54,7 +54,11 @@ object SamplerAssets {
         // that file publishes and starts from its mount.
         "sampler-face.js",
         "sampler-grab.js",    // tap an empty pad: scrub the air, or a clip
-        "sampler-kits.js"     // presets, and kit files that carry the audio
+        "sampler-kits.js",    // presets, and kit files that carry the audio
+        // #1310: the SFX guy's little CRT set. A pad that holds a video
+        // pops the picture when it is pressed, and this surface is its
+        // own page - the set in the views bundle is not loaded here.
+        "sfx-tv.js"
     )
 
     private fun read(context: Context, name: String): String =
@@ -67,7 +71,8 @@ object SamplerAssets {
      * a double call cannot produce two samplers.
      */
     fun bundle(context: Context): String {
-        val css = JSONObject.quote(read(context, "sampler.css"))
+        val css = JSONObject.quote(
+            read(context, "sampler.css") + "\n" + read(context, "sfx-tv.css"))
         val boot = read(context, "boot.js")
         val libraries = SCRIPTS.joinToString("\n;\n") { read(context, it) }
 

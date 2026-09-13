@@ -35,6 +35,14 @@ class PineApp : Application() {
         com.pinebox.kiosk.replay.ScreenReplay(this)
     }
 
+    /* THE MIX, CAPTURED OFF THE PAGE. On the APPLICATION for the same reason
+     * the screen recorder is: it captures the tablet, not this activity, and
+     * must outlive any one of them. Not started here - see audio/AirTap.kt
+     * on why it is asked for rather than assumed. */
+    val airTap: com.pinebox.kiosk.audio.AirTap by lazy {
+        com.pinebox.kiosk.audio.AirTap(this)
+    }
+
     /** SupervisorJob: one failed bridge call must not cancel the feed. */
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 

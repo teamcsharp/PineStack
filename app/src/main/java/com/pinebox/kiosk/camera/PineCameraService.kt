@@ -77,6 +77,15 @@ class PineCameraService : Service() {
     private var thread: HandlerThread? = null
     private var hand: Handler? = null
 
+    /* THE DIALS, held across a lens change on purpose: switching to the
+     * front camera to check something and losing a carefully set exposure is
+     * worse than either camera. */
+    @Volatile private var auto = true
+    @Volatile private var shutterNs = 0L
+    @Volatile private var iso = 0
+    @Volatile private var ev = 0
+    @Volatile private var slowShutter = false
+
     @Volatile private var facing = REAR
     @Volatile private var going = false
     @Volatile private var watchers = 0
@@ -87,6 +96,7 @@ class PineCameraService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        live = this
         startForeground(NOTE_ID, note(),
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0)
@@ -218,6 +228,7 @@ class PineCameraService : Service() {
                          * is a black rectangle. */
                         ask.set(CaptureRequest.CONTROL_MODE,
                             CaptureRequest.CONTROL_MODE_AUTO)
+                        dial(ask, manager, id)
                         @Suppress("DEPRECATION")
                         camera.createCaptureSession(listOf(take.surface),
                             object : CameraCaptureSession.StateCallback() {
@@ -245,6 +256,101 @@ class PineCameraService : Service() {
             lastError = err.message ?: "the camera would not open"
             Log.w(TAG, lastError)
         }
+    }
+
+    /**
+     * Put the dials on a request.
+     *
+     * Clamped to what CameraCharacteristics reports, because a value outside
+     * the sensor's range is not rejected - it is ignored, which looks exactly
+     * like a control that does nothing.
+     */
+    private fun dial(ask: CaptureRequest.Builder, manager: CameraManager, id: String) {
+        try {
+            val about = manager.getCameraCharacteristics(id)
+            if (auto) {
+                ask.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON)
+                /* Exposure compensation is an instruction TO the metering,
+                 * so it only means anything while AE is on. */
+                val range = about.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+                if (range != null) {
+                    ask.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                        ev.coerceIn(range.lower, range.upper))
+                }
+                /* LOW LIGHT: no algorithm adds photons. Letting the sensor
+                 * integrate for longer does, and it costs frame rate - so it
+                 * is a switch, not a secret. */
+                if (slowShutter) {
+                    val fps = about.get(
+                        CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                    val slowest = fps?.minByOrNull { it.lower }
+                    if (slowest != null) {
+                        ask.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, slowest)
+                    }
+                }
+            } else {
+                ask.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_OFF)
+                val shutterRange = about.get(
+                    CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                if (shutterNs > 0 && shutterRange != null) {
+                    ask.set(CaptureRequest.SENSOR_EXPOSURE_TIME,
+                        shutterNs.coerceIn(shutterRange.lower, shutterRange.upper))
+                }
+                val isoRange = about.get(
+                    CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                if (iso > 0 && isoRange != null) {
+                    ask.set(CaptureRequest.SENSOR_SENSITIVITY,
+                        iso.coerceIn(isoRange.lower, isoRange.upper))
+                }
+                /* A manual exposure with no frame duration runs at whatever
+                 * the last auto value was, which can be SHORTER than the
+                 * exposure and quietly clamps it. */
+                if (shutterNs > 0) {
+                    ask.set(CaptureRequest.SENSOR_FRAME_DURATION,
+                        maxOf(shutterNs, 33333333L))
+                }
+            }
+        } catch (err: Exception) {
+            Log.w(TAG, "dials: " + err.message)
+        }
+    }
+
+    /** What the sensor on this lens can actually be asked for. */
+    fun range(): org.json.JSONObject {
+        val out = org.json.JSONObject()
+        try {
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val id = idFor(manager, facing) ?: return out
+            val about = manager.getCameraCharacteristics(id)
+            val shutter = about.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            val sens = about.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            val comp = about.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+            out.put("id", id).put("facing", facing)
+            if (shutter != null) {
+                out.put("shutterMinNs", shutter.lower).put("shutterMaxNs", shutter.upper)
+            }
+            if (sens != null) out.put("isoMin", sens.lower).put("isoMax", sens.upper)
+            if (comp != null) out.put("evMin", comp.lower).put("evMax", comp.upper)
+            out.put("auto", auto).put("shutterNs", shutterNs).put("iso", iso)
+                .put("ev", ev).put("slowShutter", slowShutter)
+        } catch (err: Exception) {
+            out.put("why", err.message ?: "the sensor would not answer")
+        }
+        return out
+    }
+
+    /** Move the dials and re-apply them. */
+    fun tune(want: org.json.JSONObject) {
+        if (want.has("auto")) auto = want.optBoolean("auto", true)
+        if (want.has("shutterNs")) shutterNs = want.optLong("shutterNs", 0L)
+        if (want.has("iso")) iso = want.optInt("iso", 0)
+        if (want.has("ev")) ev = want.optInt("ev", 0)
+        if (want.has("slowShutter")) slowShutter = want.optBoolean("slowShutter", false)
+        /* Rebuilding the session is the simple way to re-apply, and it is
+         * cheap: the socket stays and the watcher stays. */
+        if (watchers > 0) { shutCamera(); openCamera() }
     }
 
     /** The id the device reports for a facing, not a guessed 0 or 1. */
@@ -297,6 +403,7 @@ class PineCameraService : Service() {
     }
 
     override fun onDestroy() {
+        if (live === this) live = null
         going = false
         shutCamera()
         try { server?.close() } catch (err: Exception) { /* gone */ }
@@ -322,6 +429,13 @@ class PineCameraService : Service() {
     }
 
     companion object {
+        /* THE RUNNING ONE, so the bridge can turn its dials. A bound
+         * service would be the tidy answer and would mean a connection to
+         * manage for a handful of setters. */
+        @Volatile
+        var live: PineCameraService? = null
+            private set
+
         private const val TAG = "PineCameraSvc"
         private const val CHANNEL = "pine-camera"
         private const val NOTE_ID = 4302
