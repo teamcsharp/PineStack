@@ -42,6 +42,7 @@ import com.pinebox.kiosk.bridge.SamplerAssets
 import com.pinebox.kiosk.bridge.ViewAssets
 import com.pinebox.kiosk.kiosk.KioskController
 import com.pinebox.kiosk.net.PineNet
+import com.pinebox.kiosk.net.LoopDoor
 import com.pinebox.kiosk.net.Reach
 import com.pinebox.kiosk.rail.RailController
 import com.pinebox.kiosk.rail.RailState
@@ -978,8 +979,35 @@ class MainActivity : AppCompatActivity() {
             } catch (err: Exception) {
                 Log.w(TAG, "readiness could not be taken: " + err.message)
             }
-            stationHost = Uri.parse(base).host.orEmpty()
-            webView.loadUrl("$base/")
+            /* THROUGH THE LOOPBACK DOOR, so the panel is a SECURE
+             * CONTEXT and the broadcast tap can use an AudioWorklet instead
+             * of a ScriptProcessorNode that loses 17-23% of its buffers to a
+             * busy main thread. See net/LoopDoor.kt - the whole reasoning,
+             * and the measurement, live there.
+             *
+             * If the door will not open, the station's own address is used
+             * exactly as before: a worse audio tap is worth having, a blind
+             * terminal is not. */
+            val door = try {
+                LoopDoor.open(base)
+            } catch (err: Exception) {
+                Log.w(TAG, "loopback door refused: " + err.message)
+                null
+            }
+            val load = door ?: base
+            if (door != null) {
+                LoopDoor.aim(base)
+                Log.i(TAG, "panel via $door -> $base")
+            } else {
+                Log.w(TAG, "panel direct from $base - no secure context, so "
+                    + "the broadcast tap stays on the ScriptProcessor")
+            }
+            /* THE DOOR'S HOST, NOT THE STATION'S. shouldOverrideUrlLoading
+             * keeps stationHost in the panel and sends everything else to the
+             * browser, so this has to follow the address actually loaded or
+             * every link in the panel becomes a link OUT. */
+            stationHost = Uri.parse(load).host.orEmpty()
+            webView.loadUrl("$load/")
         }
     }
 
