@@ -65641,6 +65641,11 @@ def _sfx_video_pool() -> list[Path]:
     is waiting on - #826, #1199 and #1265 all say so already."""
     if sfx_video_warm():
         return list(_SFX_VIDEO_MEMO["pool"])
+    # #1311: called from the cue road's own thread while a refresh is
+    # already in flight? Hand back what we have rather than walking
+    # the share a second time underneath it.
+    if _SFX_VIDEO_BUILDING[0] and _SFX_VIDEO_MEMO.get("pool"):
+        return list(_SFX_VIDEO_MEMO["pool"])
     banned = sfx_bans()
     pool = [p for p in sfx_all()
             if sfx_is_video(p) and sfx_short(p)
@@ -120665,11 +120670,24 @@ async def sfx_video_cue_api(
     # that window used to run the walk inside the request; four taps
     # ran four of them, and all four returned nothing at 30s. A button
     # under the operator's thumb must answer.
+    # #1311: A STALE LIST IS STILL A LIST.
+    #
+    # #1306c refused whenever the memo was past its rest, and #1306d
+    # gave that rest ten minutes - so every ten minutes the first tap
+    # answered "still warming" and did nothing, and the operator (who
+    # could not see the message either - see the view side) read that
+    # as a dead button.
+    #
+    # Video clips do not evaporate. A list built ten minutes ago names
+    # the same files, so it is USED, and the rebuild is kicked behind
+    # the answer. Only a genuinely empty list - the first tap of a
+    # process, before any walk has finished - has nothing to serve.
     if not sfx_video_warm():
         sfx_video_kick()
-        return {"ok": False, "clip": None, "warming": True,
-                "say": "the clip library is still warming - tap again in "
-                       "a moment"}
+        if not _SFX_VIDEO_MEMO.get("pool"):
+            return {"ok": False, "clip": None, "warming": True,
+                    "say": "the clip library is still warming - tap again "
+                           "in a moment"}
     # #1309: the deck first - those are already read, so the WebView's
     # own fetch is the warm 0.5s one rather than the cold 4.5s one. An
     # empty deck (the first tap of a process) falls back to the random
