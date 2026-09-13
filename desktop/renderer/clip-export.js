@@ -401,6 +401,9 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     const done = await api.clipExport({
       inPoint: inAt,
       outPoint: outAt,
+      /* Null unless the box was actually moved: a crop at the full frame is
+       * a filter that does nothing and can still fail. */
+      crop: cropped && crop ? crop : null,
       mono: mono && bothIn(),
       use: {
         broadcast: tracks.broadcast.use && tracks.broadcast.there,
@@ -421,6 +424,172 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     button.disabled = false;
   }
 });
+
+/* ============================================================== the crop ===
+ *
+ * "I want an editor where I can set the crop and adjust the timeline."
+ *
+ * HELD IN SOURCE PIXELS. The window is resizable and the video is fitted
+ * into whatever room is left, so a box remembered as "where the mouse was"
+ * would slide every time the window changed shape. One scale factor converts
+ * in and out, and what the readout says - 640x480 - is exactly what ffmpeg is
+ * told.
+ *
+ * OFF UNTIL IT IS TOUCHED. A box sitting at the full frame would still emit a
+ * crop filter, and a filter that does nothing can still fail; `cropped` stays
+ * false until the operator moves something. */
+const cropLayer = document.getElementById('cropLayer');
+const cropBox = document.getElementById('cropBox');
+const cropSaid = document.getElementById('cropSaid');
+const stage = document.getElementById('stage');
+
+let cropping = false;       /* is the box being shown at all */
+let cropped = false;        /* has it been moved off the full frame */
+let crop = null;            /* {x, y, w, h} in SOURCE pixels */
+let cropDrag = null;
+const LEAST = 16;           /* the smallest crop worth allowing, in source px */
+
+function sourceSize() {
+  return { w: film.videoWidth || 0, h: film.videoHeight || 0 };
+}
+
+/* Where the VIDEO is on screen, which is not where the stage is: the picture
+ * is letterboxed inside it, and a box draggable over the letterboxing would
+ * describe pixels that do not exist. */
+function filmRect() {
+  const box = film.getBoundingClientRect();
+  const room = stage.getBoundingClientRect();
+  return { left: box.left - room.left, top: box.top - room.top,
+    width: box.width, height: box.height };
+}
+
+function scale() {
+  const src = sourceSize();
+  const seen = filmRect();
+  return src.w > 0 && seen.width > 0 ? src.w / seen.width : 1;
+}
+
+function wholeFrame() {
+  const src = sourceSize();
+  return { x: 0, y: 0, w: src.w, h: src.h };
+}
+
+/* EVEN IN ALL FOUR NUMBERS. libx264 with yuv420p refuses odd dimensions and
+ * blames the frames when it does; odd x/y offsets are the same trap wearing a
+ * different hat, putting the chroma planes half a pixel out. */
+function tidy(box) {
+  const src = sourceSize();
+  let x = Math.max(0, Math.min(src.w - LEAST, Math.round(box.x)));
+  let y = Math.max(0, Math.min(src.h - LEAST, Math.round(box.y)));
+  let w = Math.max(LEAST, Math.min(src.w - x, Math.round(box.w)));
+  let h = Math.max(LEAST, Math.min(src.h - y, Math.round(box.h)));
+  x -= x % 2; y -= y % 2; w -= w % 2; h -= h % 2;
+  if (x + w > src.w) w = src.w - x - ((src.w - x) % 2);
+  if (y + h > src.h) h = src.h - y - ((src.h - y) % 2);
+  return { x: x, y: y, w: Math.max(2, w), h: Math.max(2, h) };
+}
+
+function paintCrop() {
+  const src = sourceSize();
+  if (!crop || !src.w) {
+    cropSaid.textContent = '';
+    return;
+  }
+  const seen = filmRect();
+  const by = seen.width / src.w;
+  cropLayer.style.left = seen.left + 'px';
+  cropLayer.style.top = seen.top + 'px';
+  cropLayer.style.width = seen.width + 'px';
+  cropLayer.style.height = seen.height + 'px';
+  cropBox.style.left = (crop.x * by) + 'px';
+  cropBox.style.top = (crop.y * by) + 'px';
+  cropBox.style.width = (crop.w * by) + 'px';
+  cropBox.style.height = (crop.h * by) + 'px';
+  cropLayer.classList.toggle('hidden', !cropping);
+  cropSaid.textContent = cropped
+    ? src.w + '\u00d7' + src.h + ' \u2192 ' + crop.w + '\u00d7' + crop.h
+    : src.w + '\u00d7' + src.h;
+  const button = document.getElementById('cropBtn');
+  if (button) button.classList.toggle('on', cropping);
+}
+
+function cropStart() {
+  if (!crop) crop = wholeFrame();
+  cropping = true;
+  paintCrop();
+}
+
+function cropWhole() {
+  crop = wholeFrame();
+  cropped = false;
+  paintCrop();
+}
+
+document.getElementById('cropBtn').addEventListener('click', function () {
+  cropping ? (cropping = false, paintCrop()) : cropStart();
+});
+
+document.getElementById('cropAll').addEventListener('click', function () {
+  cropWhole();
+});
+
+/* Dragging: the body of the box moves it, a grip resizes from that edge.
+ * Both work in source pixels, so the arithmetic is the same either way. */
+cropBox.addEventListener('pointerdown', function (event) {
+  if (!crop) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const grip = event.target && event.target.dataset
+    ? event.target.dataset.grip : '';
+  cropDrag = { grip: grip || '', x: event.clientX, y: event.clientY,
+    from: { x: crop.x, y: crop.y, w: crop.w, h: crop.h } };
+  try { cropBox.setPointerCapture(event.pointerId); } catch (error) { /* fine */ }
+});
+
+cropBox.addEventListener('pointermove', function (event) {
+  if (!cropDrag) return;
+  const by = scale();
+  const dx = (event.clientX - cropDrag.x) * by;
+  const dy = (event.clientY - cropDrag.y) * by;
+  const was = cropDrag.from;
+  const grip = cropDrag.grip;
+  let next;
+  if (!grip) {
+    next = { x: was.x + dx, y: was.y + dy, w: was.w, h: was.h };
+    /* Moving must not resize: clamp the ORIGIN against the frame rather
+     * than letting tidy() shrink the box at the edge. */
+    const src = sourceSize();
+    next.x = Math.max(0, Math.min(src.w - was.w, next.x));
+    next.y = Math.max(0, Math.min(src.h - was.h, next.y));
+  } else {
+    next = { x: was.x, y: was.y, w: was.w, h: was.h };
+    if (grip.indexOf('w') >= 0) { next.x = was.x + dx; next.w = was.w - dx; }
+    if (grip.indexOf('e') >= 0) { next.w = was.w + dx; }
+    if (grip.indexOf('n') >= 0) { next.y = was.y + dy; next.h = was.h - dy; }
+    if (grip.indexOf('s') >= 0) { next.h = was.h + dy; }
+    /* Dragging an edge past its opposite would give a negative width, which
+     * ffmpeg reports as an unhelpful filter error. */
+    if (next.w < LEAST) { next.x = was.x + was.w - LEAST; next.w = LEAST; }
+    if (next.h < LEAST) { next.y = was.y + was.h - LEAST; next.h = LEAST; }
+  }
+  crop = tidy(next);
+  cropped = true;
+  paintCrop();
+});
+
+function cropLetGo(event) {
+  if (!cropDrag) return;
+  cropDrag = null;
+  try { cropBox.releasePointerCapture(event.pointerId); } catch (error) { /* fine */ }
+}
+
+cropBox.addEventListener('pointerup', cropLetGo);
+cropBox.addEventListener('pointercancel', cropLetGo);
+
+/* The picture moves when the window does, so the box has to be put back on
+ * it - it is stored against the SOURCE, so nothing is lost, but the overlay
+ * would be left behind. */
+window.addEventListener('resize', paintCrop);
 
 function close() {
   try { api.clipDone(); } catch (error) { window.close(); }
@@ -466,6 +635,10 @@ async function decode(name, dataUrl, offset) {
     outAt = duration;
     paintTrim();
     paintHead();
+    /* The crop box only exists once the source size is known - before
+     * loadedmetadata videoWidth is 0 and every conversion through it would
+     * be a division by zero. */
+    cropWhole();
     /* WRAPPED, NOT PASSED DIRECTLY.
      *
      * paintHead takes an optional time, so binding it straight to the event

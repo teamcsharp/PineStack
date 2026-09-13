@@ -937,6 +937,31 @@
         }
       }
     }
+    /* #1300b: WHICH SEGMENTS CHANGED, SETTLED BEFORE ANYTHING IS
+     * WRITTEN.
+     *
+     * This used to be decided inside the loop below, against segWas,
+     * which the same loop also updated - and a segment's SCENE HEADING
+     * is its first element in DOM order. The heading is excluded from
+     * the motion by `!head`, so it fell through and wrote segWas for
+     * the whole segment; by the time the members were reached the
+     * value they needed to compare against was already the new one,
+     * and not one of them ever animated. Measured on the tablet: a
+     * fold opening 51 members, `sp-fx` on zero of them.
+     *
+     * A loop must not both read and write the memo it is deciding by. */
+    var segsNow = Object.create(null);
+    var changed = Object.create(null);
+    for (var q = 0; q < all.length; q += 1) {
+      var qseg = all[q].getAttribute('data-seg') || '';
+      if (!qseg || segsNow[qseg] !== undefined) continue;
+      var qshut = !!(folded[qseg] && qseg !== liveSeg);
+      segsNow[qseg] = qshut;
+      if (segWas[qseg] !== undefined && segWas[qseg] !== qshut) {
+        changed[qseg] = 1;
+      }
+    }
+
     for (var i = 0; i < all.length; i += 1) {
       var node = all[i];
       var seg = node.getAttribute('data-seg') || '';
@@ -946,8 +971,7 @@
          one thing that must never be hidden by its own fold. */
       /* #1300: and when this segment has just CHANGED state, it is
          shown changing rather than simply being different. */
-      if (seg && motion && segWas[seg] !== undefined
-          && segWas[seg] !== shut && !head
+      if (seg && motion && changed[seg] && !head
           && (moving.length < FOLD_FX_MOST)) {
         moving.push(node);
         if (shut) {
@@ -960,10 +984,7 @@
           node.classList.add('sp-fx', 'sp-gone');
           opening.push(node);
         }
-        /* Recorded HERE too: this branch skips the tail of the loop,
-           and a state never recorded would animate again next pass. */
-        segWas[seg] = shut;
-        continue;
+        continue;                 /* segWas is settled after the loop */
       }
       node.hidden = shut && !head;
       if (head) {
@@ -983,8 +1004,10 @@
           node.setAttribute('data-inside', '');
         }
       }
-      if (seg) segWas[seg] = shut;                           /* #1300 */
     }
+    /* #1300b: and only now, once every element has been able to read
+       the old value. */
+    for (var done in segsNow) segWas[done] = segsNow[done];
     segSettle(shutting, opening);                            /* #1300 */
   }
 

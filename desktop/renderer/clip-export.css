@@ -44,6 +44,70 @@ html, body {
 }
 video { max-width: 100%; max-height: 100%; display: block; }
 
+/* ---------------------------------------------------------------- crop */
+
+/* THE STAGE IS THE POSITIONING PARENT, and the layer is moved onto the
+   VIDEO's rectangle rather than filling the stage - the video is letterboxed
+   inside it, and a crop box that could be dragged over the letterboxing
+   would describe pixels that do not exist. */
+.stage { position: relative; }
+
+.cropLayer { position: absolute; pointer-events: none; }
+.cropLayer.hidden { display: none; }
+
+/* Everything outside the box, dimmed - which is what actually communicates
+   "this part is going away". A bare outline leaves the operator working it
+   out from the geometry. */
+.cropBox {
+  position: absolute;
+  pointer-events: auto;
+  cursor: move;
+  outline: 1px solid rgba(255, 255, 255, .9);
+  box-shadow: 0 0 0 4000px rgba(3, 6, 9, .62);
+}
+
+/* The thirds, because a crop is a framing decision and this is the oldest
+   tool there is for making one. */
+.cropBox::before,
+.cropBox::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: .35;
+}
+.cropBox::before {
+  border-left: 1px solid #fff;
+  border-right: 1px solid #fff;
+  left: 33.33%;
+  right: 33.33%;
+}
+.cropBox::after {
+  border-top: 1px solid #fff;
+  border-bottom: 1px solid #fff;
+  top: 33.33%;
+  bottom: 33.33%;
+}
+
+.grip {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: #eaf6ff;
+  border: 1px solid #0b1015;
+  border-radius: 2px;
+  pointer-events: auto;
+}
+
+.grip[data-grip="nw"] { left: -6px; top: -6px; cursor: nwse-resize; }
+.grip[data-grip="n"]  { left: calc(50% - 6px); top: -6px; cursor: ns-resize; }
+.grip[data-grip="ne"] { right: -6px; top: -6px; cursor: nesw-resize; }
+.grip[data-grip="e"]  { right: -6px; top: calc(50% - 6px); cursor: ew-resize; }
+.grip[data-grip="se"] { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.grip[data-grip="s"]  { left: calc(50% - 6px); bottom: -6px; cursor: ns-resize; }
+.grip[data-grip="sw"] { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.grip[data-grip="w"]  { left: -6px; top: calc(50% - 6px); cursor: ew-resize; }
+
 /* ---------------------------------------------------------------- trim */
 
 .trim { display: grid; gap: 6px; }

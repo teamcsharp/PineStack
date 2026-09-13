@@ -539,23 +539,41 @@ document.getElementById('back30').addEventListener('click', function () {
  * the reasons in main.js. What comes back is what is AUDIBLE, so a route
  * that makes the monitor inert shows as off rather than as on-but-silent. */
 const soundBtn = document.getElementById('sound');
-let hearing = false;
+
+/* TWO FACTS, AND THEY ARE NOT THE SAME ONE.
+ *
+ *   monitorOn - what the switch says, and the only thing a click can
+ *               actually change. Tying the toggle to audibility instead
+ *               made the button one-way: on a route where the monitor is
+ *               inert, every click asked for ON again and it could never be
+ *               turned back off. Measured, not imagined.
+ *   audible   - whether that switch can do anything right now. */
+let monitorOn = false;
+let audible = false;
 
 function paintSound(said) {
-  hearing = !!(said && said.ok && said.monitor && said.effective);
-  soundBtn.classList.toggle('on', hearing);
+  monitorOn = !!(said && said.ok && said.monitor);
+  audible = monitorOn && !!(said && said.effective);
+
+  /* Lit by the SWITCH, so pressing it always visibly does something. */
+  soundBtn.classList.toggle('on', monitorOn);
+  /* The icon follows what can be HEARD, so "on but silent" is visible. */
   soundBtn.innerHTML = window.pineIcon
-    ? window.pineIcon(hearing ? 'c:volume--up--filled' : 'c:volume--mute--filled')
+    ? window.pineIcon(audible ? 'c:volume--up--filled' : 'c:volume--mute--filled')
     : '';
-  soundBtn.setAttribute('aria-label', hearing ? 'Mute the broadcast here'
+  soundBtn.setAttribute('aria-label', monitorOn ? 'Mute the broadcast here'
     : 'Hear the broadcast here');
-  /* WHY IT IS SILENT, when the switch is on but the route makes it inert. */
-  if (said && said.ok && said.monitor && !said.effective) {
-    soundBtn.title = 'The broadcast is already playing on the page feed'
-      + (said.musicRoute ? ' (music is routed ' + said.musicRoute + ')' : '')
-      + ', so this app is deliberately silent.';
+
+  if (monitorOn && !audible) {
+    /* The state that needed explaining: the switch is on and nothing is
+     * coming out, and without this the operator listens for a sound that
+     * was never going to arrive. */
+    soundBtn.title = 'On, but silent: the broadcast is already playing on the '
+      + 'page feed' + (said && said.musicRoute
+        ? ' (music is routed ' + said.musicRoute + ')' : '')
+      + ', so this app stays quiet to avoid playing it twice.';
   } else {
-    soundBtn.title = hearing
+    soundBtn.title = monitorOn
       ? 'Stop hearing the broadcast in this app'
       : 'Hear the broadcast in this app as well.\nOff by default - the tablet '
         + 'is usually already playing it.';
@@ -564,7 +582,7 @@ function paintSound(said) {
 
 soundBtn.addEventListener('click', async function () {
   try {
-    paintSound(await api.mirrorSound(!hearing));
+    paintSound(await api.mirrorSound(!monitorOn));
   } catch (error) {
     cover(error.message, true);
   }

@@ -166,8 +166,20 @@ function planArgs(plan) {
    * size the operator dragged it to - measured at 1983x1234 on the run that
    * found this - so roughly half of all window sizes would have failed. The
    * tablet is 1340x800 and would never have shown it. */
+  /* THE CROP GOES BEFORE THE EVEN-ROUNDING, so what is rounded is the
+   * cropped picture rather than the whole frame. The renderer has already
+   * clamped the box inside the source and rounded it - it is the only side
+   * that knows the video's real dimensions - and EVEN behind it is the belt
+   * to that braces. */
+  const cut = [];
+  const crop = plan.crop;
+  if (crop && Number(crop.w) > 0 && Number(crop.h) > 0) {
+    cut.push('crop=' + Math.round(crop.w) + ':' + Math.round(crop.h)
+      + ':' + Math.round(crop.x) + ':' + Math.round(crop.y));
+  }
   parts.push('[0:v]trim=start=' + inAt.toFixed(3) + ':end=' + outAt.toFixed(3)
-    + ',setpts=PTS-STARTPTS,' + EVEN + '[v]');
+    + ',setpts=PTS-STARTPTS,' + (cut.length ? cut.join(',') + ',' : '')
+    + EVEN + '[v]');
 
   let audioOut = '';
   if (sources.length === 2) {

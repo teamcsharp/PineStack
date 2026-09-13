@@ -1711,6 +1711,9 @@ ipcMain.handle("clip:export", async (event, choices) => {
       mic: use.mic && held.mic ? { path: held.mic, offset: held.micOffset } : null,
       inPoint: choices.inPoint,
       outPoint: choices.outPoint,
+      /* Null unless the operator actually moved the box - see the note in
+       * clip-mux.cjs on why a crop that does nothing is still a risk. */
+      crop: choices.crop || null,
       gains: choices.gains || {},
       mono: !!choices.mono,
       out: picked.filePath

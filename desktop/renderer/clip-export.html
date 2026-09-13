@@ -22,8 +22,23 @@
        and running ffmpeg twice. -->
 
   <div class="wrap">
-    <div class="stage">
+    <!-- The picture, and the box that says how much of it to keep. The
+         overlay is positioned onto the VIDEO's rectangle rather than the
+         stage's, because the video is letterboxed inside it. -->
+    <div class="stage" id="stage">
       <video id="film" playsinline></video>
+      <div id="cropLayer" class="cropLayer hidden">
+        <div id="cropBox" class="cropBox">
+          <span class="grip" data-grip="nw"></span>
+          <span class="grip" data-grip="n"></span>
+          <span class="grip" data-grip="ne"></span>
+          <span class="grip" data-grip="e"></span>
+          <span class="grip" data-grip="se"></span>
+          <span class="grip" data-grip="s"></span>
+          <span class="grip" data-grip="sw"></span>
+          <span class="grip" data-grip="w"></span>
+        </div>
+      </div>
     </div>
 
     <!-- The in and out points. The scrubber is the film's own length; the
@@ -40,6 +55,9 @@
         <button id="setIn" class="act" title="Put the in point where the playhead is (I)">Set in</button>
         <button id="setOut" class="act" title="Put the out point where the playhead is (O)">Set out</button>
         <button id="resetTrim" class="act" title="Use the whole recording">Whole</button>
+        <button id="cropBtn" class="act" title="Drag a box on the picture to keep only part of it">Crop</button>
+        <button id="cropAll" class="act" title="Keep the whole frame">Full frame</button>
+        <span id="cropSaid" class="said" title="What the exported picture will measure"></span>
         <span id="headSaid" class="said head-said" title="Where the playhead is"></span>
         <span id="trimSaid" class="said"></span>
       </div>
