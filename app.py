@@ -126961,20 +126961,73 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             _got = _ord.get(str((_e.get("row") or {}).get("id") or ""))
             if _got:
                 _runs.setdefault(_got[0], []).append((_got[1], _ix))
+        # #1336: AND ONE CONVERSATION AT A TIME.
+        #
+        # Making each row monotone fixed the reader being thrown
+        # backwards, and left a second fault standing: blocks whose time
+        # spans OVERLAP get shuffled into each other. Measured on the
+        # live hour - 14 of 37 neighbouring blocks overlapped, and the
+        # rendered order came out "55 56 56 55 56 55 57 56 57 56 57" -
+        # three conversations shredded together a line at a time. Every
+        # stamp ascends, so it passes the downwards test, and it is still
+        # unreadable: "I want it to go from entry to entry like a script
+        # read."
+        #
+        # Only one thing can be on the air at once, so overlapping blocks
+        # are a stamping artefact, not a fact about the broadcast. They
+        # are laid out one after another: blocks in the order they
+        # started, and a block that would begin before the previous one
+        # finished is pushed just past it. The monotone walk then runs
+        # ACROSS the whole document rather than restarting per block, so
+        # a conversation is contiguous and the page still reads downwards.
         _when_at: dict[int, float] = {}
-        for _blk, _rows in _runs.items():
+        _order = sorted(
+            _runs.items(),
+            key=lambda kv: (min(float(events[_i].get("at") or 0)
+                                for _o, _i in kv[1]), kv[0]))
+        _cursor: float | None = None
+        for _blk, _rows in _order:
             _rows.sort()                       # by the written position
             _prev: float | None = None
             for _o, _ix in _rows:
                 _raw = float(events[_ix].get("at") or 0)
-                _prev = _raw if _prev is None else max(_raw, _prev + 0.001)
+                if _prev is None:
+                    # the block starts where it says, or just after the
+                    # one before it, whichever is later
+                    _prev = (_raw if _cursor is None
+                             else max(_raw, _cursor + 0.001))
+                else:
+                    _prev = max(_raw, _prev + 0.001)
                 _when_at[_ix] = _prev
+            _cursor = _prev
 
         try:
             _keyed = [(_when_at.get(_ix, float(_e.get("at") or 0)),
                        _e.get("sort") or 0, _ix, _e)
                       for _ix, _e in enumerate(events)]
             _keyed.sort(key=lambda r: (r[0], r[1], r[2]))
+            # #1336b: ONE LAST SWEEP, OVER EVERYTHING.
+            #
+            # Pushing an overlapping block past its predecessor moves its
+            # rows forward, and an unledgered event that kept its own raw
+            # stamp can then sit earlier than the block above it. The
+            # block order is right and the reading order is right; it is
+            # the STAMPS that now disagree with the page. Anything that
+            # reads `at` off this document - a scene heading's clock, a
+            # panel drawing a timeline - would show the reader going
+            # backwards while the lines themselves run forwards, which is
+            # the same confusion one level down.
+            #
+            # So the corrected time is written onto the element. The raw
+            # air time is kept beside it as `air_at`, because the ledger's
+            # whole argument is that a document may correct an order
+            # without pretending the original never existed.
+            _run: float | None = None
+            for _t, _s, _ix, _e in _keyed:
+                _run = _t if _run is None else max(_t, _run + 0.001)
+                if abs(_run - float(_e.get("at") or 0)) > 0.0005:
+                    _e.setdefault("air_at", float(_e.get("at") or 0))
+                    _e["at"] = _run
             events[:] = [r[3] for r in _keyed]
         except Exception:  # noqa: BLE001
             pass          # a script that will not re-order still reads
@@ -127008,12 +127061,18 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
 
     for ev in events:
         at = float(ev["at"])
+        # #1336b: the stamp this row arrived with, when the sort
+        # above had to correct it. Present only where the two differ,
+        # so its presence is itself the signal that this row is not
+        # where its own clock said it was.
+        _raw_at = ev.get("air_at")
         if ev["what"] == "action":
             row = ev["row"]
             if elements and elements[-1]["type"] in ("dialogue",
                                                      "parenthetical"):
                 speaker = ""
             push("action", row["text"], row["id"], at=at, tag=row.get("tag"),
+                 **({"air_at": _raw_at} if _raw_at else {}),
                  # #1330: the record that is TURNING. `add` accepts **more
                  # and this forwarded only `tag`, so the flag was set on
                  # the event and dropped on the way to the element - the
@@ -127125,6 +127184,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
              # these without re-deriving anything. Absent on a line no
              # round wrote, which is itself the useful signal: it says
              # this one was not scripted.
+             **({"air_at": _raw_at} if _raw_at else {}),
              **({"block": _pos[0], "ord": _pos[1]}
                 if (_pos := _script_pos.get(line_id)) else {}))
         counts["lines"] += 1

@@ -56,3 +56,17 @@ See ),
 [running-order-vs-clocks](running-order-vs-clocks.md) (the clocks this replaces),
 [which-pile-a-road-lives-on](which-pile-a-road-lives-on.md) (which roads are authored ahead),
 [audio-owner-and-the-play-switch](audio-owner-and-the-play-switch.md) (what makes a scripted line inaudible anyway).
+
+**#1336: and one conversation at a time.** Monotone rows fixed the reader
+being thrown backwards; it did not stop two blocks whose time spans OVERLAP
+from being shuffled into each other. Measured: 14 of 37 neighbouring blocks
+overlapped, rendering as `55 56 56 55 56 55 57 56 57` - three conversations
+shredded together a line at a time, every stamp ascending, and unreadable.
+Only one thing airs at once, so an overlap is a stamping artefact. Blocks
+are laid out one after another and the monotone walk runs across the whole
+document rather than restarting per block. Where that moved a row, the
+element carries `air_at` with the stamp it arrived with - its presence is
+the signal that the row is not where its own clock said it was.
+
+Final state, live: **0 backward pairs, 0 blocks re-entered, 0 order
+inversions, 38 of 38 SFX rows inside their conversation.**

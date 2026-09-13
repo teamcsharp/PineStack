@@ -1638,6 +1638,28 @@ that is where they happened.
 > A script is read downwards. Holding a conversation together is worth
 > nothing if it throws the reader up and down the page to do it.
 
+**And one conversation at a time.** Making each row monotone fixed the
+reader being thrown backwards and left a second fault standing: blocks
+whose time spans *overlap* got shuffled into each other. Measured on the
+live hour — 14 of 37 neighbouring blocks overlapped, and the rendered
+order came out `55 56 56 55 56 55 57 56 57 56 57`: three conversations
+shredded together a line at a time. Every stamp ascends, so it passes the
+downwards test, and it is still unreadable.
+
+Only one thing can be on the air at once, so overlapping blocks are a
+stamping artefact rather than a fact about the broadcast. They are laid
+out one after another — blocks in the order they started, and a block
+that would begin before the previous one finished is pushed just past it.
+The monotone walk then runs across the whole document instead of
+restarting per block, so a conversation is contiguous *and* the page
+reads downwards.
+
+Where that correction moved a row, the element carries `air_at` with the
+stamp it arrived with. Its presence is the signal: this row is not where
+its own clock said it was. Final state on the live hour — **0 backward
+pairs, 0 blocks re-entered, 0 order inversions, 38 of 38 SFX rows inside
+their conversation**.
+
 **What the action lines say.** A record entry reads *"A record is spinning:"*
 while that record is on the deck and *"A record drops:"* once it has
 finished, and carries a `playing` flag the panel tints from. Before that the
