@@ -65,6 +65,13 @@ object LoopDoor {
     /** Tried first so the address is predictable; any port will do. */
     private const val WANTED_PORT = 8096
 
+    /* #1320: how much accept may fail before the door admits it is shut. */
+    private const val ACCEPT_GIVE_UP = 12
+    private const val ACCEPT_REST_MS = 250L
+
+    /* #1320: the longest a finished conversation may hold a pool thread. */
+    private const val JOIN_MS = 2000L
+
     private var server: ServerSocket? = null
     private var upstream: Pair<String, Int>? = null
     private val pumps = Executors.newCachedThreadPool { runnable ->
@@ -112,12 +119,38 @@ object LoopDoor {
         Log.i(TAG, "door open at $origin -> ${aim.first}:${aim.second}")
 
         pumps.execute {
+            /* #1320: ONE BAD ACCEPT MUST NOT SHUT THE DOOR FOR EVER.
+             *
+             * This loop used to return out of the pump on any exception.
+             * The ServerSocket stayed open, so isOpen() kept saying true
+             * and every readiness check kept passing - with nobody
+             * accepting. Every request the panel made would hang: no
+             * fetch, no <audio>, no <video>, which is indistinguishable
+             * from the WebView going deaf and has no cure but a revive.
+             *
+             * So a transient failure is slept off and retried. A storm
+             * is not: after enough in a row the socket is CLOSED, so
+             * isOpen() tells the truth and the next open() builds a new
+             * door rather than handing back a dead one. */
+            var bad = 0
             while (!sock.isClosed) {
                 val from = try {
-                    sock.accept()
+                    val got = sock.accept()
+                    bad = 0
+                    got
                 } catch (err: Exception) {
-                    if (!sock.isClosed) Log.w(TAG, "accept: " + err.message)
-                    return@execute
+                    if (sock.isClosed) return@execute
+                    bad += 1
+                    Log.w(TAG, "accept ($bad in a row): " + err.message)
+                    if (bad >= ACCEPT_GIVE_UP) {
+                        Log.w(TAG, "closing the door: $bad accepts failed " +
+                            "in a row. A shut door can be reopened; one " +
+                            "that only looks open cannot.")
+                        close()
+                        return@execute
+                    }
+                    try { Thread.sleep(ACCEPT_REST_MS) } catch (e: Exception) { }
+                    continue
                 }
                 pumps.execute { carry(from) }
             }
@@ -185,9 +218,41 @@ object LoopDoor {
             out.tcpNoDelay = true
             to = out
 
-            val up = pumps.submit { pump(from.getInputStream(), out.getOutputStream()) }
+            val up = pumps.submit {
+                pump(from.getInputStream(), out.getOutputStream())
+                /* #1321: THE BROWSER STOPPED TALKING, SO THIS IS OVER TOO.
+                 *
+                 * Without these two closes the response pump below stays
+                 * blocked reading a station that is holding the connection
+                 * open for keep-alive and has nothing left to say - so a
+                 * conversation nobody is having keeps two threads and two
+                 * sockets, and the socket sits in CLOSE_WAIT. Measured on
+                 * the tablet: connections 8 -> 15 and door threads 29 -> 37
+                 * in a few minutes, climbing.
+                 *
+                 * #1320 already did this for the other direction. A relay
+                 * has to hang up symmetrically or it only ever reclaims
+                 * half of what it opens. */
+                quietly(from)
+                quietly(out)
+            }
             pump(out.getInputStream(), from.getOutputStream())
-            up.get()
+            /* #1320: THE RESPONSE IS DONE, SO THE CONVERSATION IS DONE.
+             *
+             * This used to be a bare up.get(). The request-side pump is
+             * blocked reading from a browser socket held open for
+             * keep-alive, which may send nothing for minutes - and until
+             * it did, this held both sockets and two threads. Closing
+             * both ends makes that blocked read throw, so the join below
+             * is instant; the timeout is only there so nothing in this
+             * file can ever hang a pool thread for ever. */
+            quietly(from)
+            quietly(out)
+            try {
+                up.get(JOIN_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } catch (err: Exception) {
+                up.cancel(true)
+            }
         } catch (err: Exception) {
             /* A conversation ending early is ordinary - a panel navigating
              * away closes sockets mid-response all day. Only say something
