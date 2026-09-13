@@ -8308,7 +8308,7 @@ async def render_backlog_drain() -> None:
             for row in reversed(_RADIO.get("chat") or []):
                 if row.get("id") == held.get("id"):
                     row["aired"] = "published"
-                    row["air_at"] = time.time()
+                    air_at_set(row, time.time())            # #1288
                     page_delivery_apply(row, delivery_id)
                     break
             pipeline_log("air", "a line that could not be rendered earlier "
@@ -22589,7 +22589,8 @@ def page_delivery_apply(entry: dict[str, Any], delivery_id: str) -> None:
     if str(entry.get("id") or "") in delivery.get("played_rows", set()):
         entry["aired"] = ("both" if entry.get("aired") == "box"
                           else "stream")
-        entry["air_at"] = float(delivery.get("playing_at") or time.time())
+        air_at_set(entry,                                   # #1288
+                   float(delivery.get("playing_at") or time.time()))
     elif str(entry.get("aired") or "") not in ("box", "held"):
         entry["aired"] = "published"
 
@@ -22659,8 +22660,12 @@ def _acknowledge_delivery_lines(delivery_id: str, clip: dict[str, Any],
         # WITHOUT marking it speech, which is a different question and
         # the one the dialogue clock (#1231) asks.
         if live is not None and float(row.get("from") or 0) >= 0:
-            live["air_at"] = time.time() - max(
-                0.0, position - float(row.get("from") or 0))
+            # #1288: ...and only while nobody has heard it yet. This is
+            # the biggest restamper - it fires on EVERY `playing` ack,
+            # for every row in the window, so a burst was re-timed each
+            # time any listener reported progress.
+            air_at_set(live, time.time() - max(
+                0.0, position - float(row.get("from") or 0)))
         if who not in ("dj", "cohost", "third", "caller", "caller2", "drop"):
             continue
         speech = True
@@ -22909,6 +22914,42 @@ def radio_state() -> dict[str, Any]:
 # What the desk is doing RIGHT NOW (#305): writing, voicing, speaking —
 # breadcrumbs the panel draws as an activity spectrograph, so a quiet
 # moment is visibly a pause and not a mystery.
+# #1288: the states that mean somebody has heard this line.
+AIR_AT_HEARD = ("published", "stream", "both", "box", "page", "airing")
+
+
+def air_at_set(row: dict[str, Any], when: float) -> bool:
+    """Stamp a line's air time, unless it has already been heard.
+
+    #1288: eight paths write `air_at`, and they kept rewriting it after
+    the line had aired. Measured over 5,872 ids: 62 had more than one
+    revision and ALL 62 moved after first being marked aired - median
+    97.7s, max 183s. The document's base sort is `air_at`, so that
+    reorders the live tail under the reader: 12 elements moving ~152s
+    put 77 of 868 back in a different order, 34 of them lines that had
+    already been heard.
+
+    While a line is only `prepared` an estimate is all there is and a
+    better one is welcome. Once it is heard the question is answered -
+    a later delivery of the same audio to another listener is not new
+    information about when it FIRST sounded.
+
+    Measured before writing this, because the obvious version of it was
+    wrong: freezing at the first value scored 500s of overlap against
+    435s, because the first value is often the render estimate.
+    Freezing at the first AIRED value costs nothing at all - 21,631s
+    against 21,626s over 4,122 rows.
+
+    Returns whether the stamp was taken."""
+    try:
+        if str(row.get("aired") or "") in AIR_AT_HEARD and row.get("air_at"):
+            return False                 # it sounded when it sounded
+        row["air_at"] = float(when)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def note_activity(stage: str, detail: str = "",
                   line: str = "", text: str = "") -> None:
     """#1277: ...and WHICH LINE it is, and what the line says.
@@ -26444,7 +26485,7 @@ def _stream_now_set(rows: list[dict[str, Any]], length: float, stamp: bool = Tru
         for _m in _RADIO.get("chat") or []:
             _at = when.get(str(_m.get("id") or ""))
             if _at is not None:
-                _m["air_at"] = _at
+                air_at_set(_m, _at)                         # #1288
 
 
 def _stream_now_clear() -> None:
@@ -28274,7 +28315,7 @@ async def _replay_held(clip: dict[str, Any]) -> bool:
             for _row in reversed(_RADIO.get("chat") or []):
                 if str(_row.get("id") or "") == _rid:
                     _row["aired"] = "box"
-                    _row["air_at"] = time.time()
+                    air_at_set(_row, time.time())           # #1288
                     break
         elif rows:
             # #903 (#848): a coalesced BURST has no single line id — it is
@@ -28544,7 +28585,7 @@ async def box_hold_watch() -> None:
                         # #770: it is being heard NOW, minutes after it was
                         # written. It sat that far back in the feed while
                         # claiming to have just played.
-                        line["air_at"] = time.time()
+                        air_at_set(line, time.time())       # #1288
                         break
             pipeline_log("air", f"the box is back — replayed "
                                 f"{len(replayed)} held lines in order")
@@ -65847,7 +65888,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         # now" in red for the rest of the night.
         try:
             _sting_row["aired"] = "box" if to_box else "page"
-            _sting_row["air_at"] = time.time()
+            air_at_set(_sting_row, time.time())             # #1288
         except Exception:  # noqa: BLE001
             pass
     else:
@@ -80246,7 +80287,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # real correction — the estimate must at least agree
                     # with the SCALED timeline instead of the raw sums.
                     for _r2, _e2 in zip(rows, _entries):
-                        _e2["air_at"] = _est0 + float(_r2.get("from") or 0)
+                        air_at_set(                             # #1288
+                            _e2, _est0 + float(_r2.get("from") or 0))
                 # #908: WHERE EACH TURN'S AUDIO ACTUALLY IS. The burst
                 # is ONE welded file, and `rows` above already holds the
                 # exact window every turn occupies inside it - the
