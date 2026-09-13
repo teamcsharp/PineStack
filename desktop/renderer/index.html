@@ -36,6 +36,9 @@
   <link rel="stylesheet" href="./presentation.css">
   <link rel="stylesheet" href="./slideshow.css">
   <link rel="stylesheet" href="./spark-overlays.css">
+  <!-- #1263: the SFX guy's television. Mounted at BODY level so it floats
+       over whatever view is showing rather than living inside one. -->
+  <link rel="stylesheet" href="./sfx-tv.css">
   <!-- The SVG sprite, for icon-only buttons that need a real <svg> with an
        aria-label rather than a bare character. -->
   <script src="./pine-icons.js"></script>
@@ -696,6 +699,10 @@
   <script src="./spark-overlays.js"></script>
   <script src="./slideshow-source.js"></script>
   <script src="./slideshow.js"></script>
+  <!-- #1263: the SFX guy's television. It belongs to no view - renderer.js
+       mounts it once the base URL is known and it draws itself over
+       whatever is showing. -->
+  <script src="./sfx-tv.js"></script>
   <script src="./rail.js"></script>
   <!-- THE STARTUP ASSEMBLY. The tablet gets this from rail.js when the
        rail goes up; the desktop has no rail boot step of its own, so it is

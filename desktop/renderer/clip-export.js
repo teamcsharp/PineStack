@@ -30,7 +30,16 @@ let clip = null;            /* what the recorder brought back */
 let duration = 0;
 let inAt = 0;
 let outAt = 0;
-let mono = false;
+/* MONO BY DEFAULT.
+ *
+ * "Also automatically mix clips to mono."
+ *
+ * The two sources are a mono broadcast ring and a mono microphone, so
+ * "stereo" here never meant a stereo image - it meant the two kept apart,
+ * one in each ear, which is useful for pulling them back out later and
+ * strange to listen to. Mono is what these clips are for: showing someone
+ * what happened. The toggle is still there for when separation is wanted. */
+let mono = true;
 let busy = false;
 
 /* One decoded buffer per channel, kept for the preview and the waveforms. */
@@ -154,7 +163,7 @@ function moveEdge(edge, when) {
 track.addEventListener('pointerdown', (event) => {
   if (dragging) return;
   const when = timeAt(event);
-  if (playing) stop();
+  if (playing) stop('scrubbed');
   showAt(when);
 });
 
@@ -323,12 +332,17 @@ function stopVoices() {
 
 function follow() {
   paintHead();
-  if (playing && film.currentTime >= outAt - 0.02) { stop(); return; }
+  if (playing && film.currentTime >= outAt - 0.02) { stop('reached the out point'); return; }
   raf = requestAnimationFrame(follow);
 }
 
 function play() {
   if (!duration) return;
+  /* Any scrub still in flight is abandoned: its `seeked` handler would
+   * otherwise re-seek back to where the finger left off and yank the
+   * playhead out of playback. */
+  wantAt = null;
+  seeking = false;
   film.currentTime = inAt;
   film.muted = true;
   playing = true;
@@ -339,7 +353,18 @@ function play() {
   raf = requestAnimationFrame(follow);
 }
 
-function stop() {
+function stop(why) {
+  /* WHY IT STOPPED, said out loud.
+   *
+   * The preview pausing itself has cost two rounds of guessing - once when a
+   * NaN from a mis-bound event listener froze the playhead, and once when the
+   * video itself turned out to be paused with no error and a full buffer.
+   * Every caller now names itself, so the next time this happens the answer
+   * is one line in the console rather than an afternoon. */
+  try {
+    console.info('[clip] stop(' + (why || 'unsaid') + ') at '
+      + Number(film.currentTime).toFixed(2) + ' of ' + outAt.toFixed(2));
+  } catch (error) { /* a console is not always there */ }
   playing = false;
   document.getElementById('playBtn').innerHTML = '&#9654; Preview';
   try { film.pause(); } catch (error) { /* fine */ }
@@ -348,14 +373,14 @@ function stop() {
   paintHead();
 }
 
-function restart() { if (playing) { stop(); play(); } }
+function restart() { if (playing) { stop('the mix changed'); play(); } }
 
 document.getElementById('playBtn').addEventListener('click',
-  () => (playing ? stop() : play()));
+  () => (playing ? stop('pressed') : play()));
 
 window.addEventListener('keydown', (event) => {
   if (event.target && /input|textarea/i.test(event.target.tagName)) return;
-  if (event.key === ' ') { event.preventDefault(); playing ? stop() : play(); }
+  if (event.key === ' ') { event.preventDefault(); playing ? stop('space') : play(); }
   else if (event.key.toLowerCase() === 'i') moveEdge('in', film.currentTime);
   else if (event.key.toLowerCase() === 'o') moveEdge('out', film.currentTime);
   else if (event.key === 'Escape') { if (playing) stop(); else close(); }
@@ -368,7 +393,7 @@ document.getElementById('cancelBtn').addEventListener('click', () => close());
 document.getElementById('exportBtn').addEventListener('click', async () => {
   if (busy) return;
   busy = true;
-  stop();
+  stop('exporting');
   const button = document.getElementById('exportBtn');
   button.disabled = true;
   say('Laying the sound under the picture…');
@@ -441,7 +466,16 @@ async function decode(name, dataUrl, offset) {
     outAt = duration;
     paintTrim();
     paintHead();
-    film.addEventListener('timeupdate', paintHead);
+    /* WRAPPED, NOT PASSED DIRECTLY.
+     *
+     * paintHead takes an optional time, so binding it straight to the event
+     * hands it the Event object as that argument - `(event / duration)` is
+     * NaN, `left: NaN%` is ignored by CSS, and the playhead simply stops.
+     * timeupdate fires about four times a second during playback, so it was
+     * clobbering the correct positions the animation frame had just written.
+     * Reported as "the playhead isn't moving whenever I play the timeline",
+     * which is exactly what it does. */
+    film.addEventListener('timeupdate', function () { paintHead(); });
 
     await decode('broadcast', clip.broadcastUrl, clip.broadcastOffset);
     await decode('mic', clip.micUrl, clip.micOffset);

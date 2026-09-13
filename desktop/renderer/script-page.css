@@ -365,24 +365,44 @@
   scroll-margin: 96px 0;
 }
 .sp-el.sp-now::before {
-  content: "ON AIR";
+  /* #1295: and how much of the clip is left, under it. attr() on a
+     missing attribute is the empty string, so a line with no usable
+     window shows the label alone. */
+  content: "ON AIR\A" attr(data-left);
+  white-space: pre;
+  text-align: right;
+  line-height: 1.35;
   position: absolute;
   left: -66px;
   top: 1px;
+  width: 58px;
   font-size: 9px;
   letter-spacing: .16em;
   font-weight: 700;
   color: var(--sp-on, #65c7da);
   opacity: .95;
 }
+/* #1295: THE CLIP'S OWN TIMELINE, RUNNING ACROSS THE LINE.
+ *
+ * This slot held a 3px pulsing bar down the left edge - the FOURTH
+ * decoration on that same edge, beside the border-left, the box-shadow
+ * rule and the inset ring. It is given over to the one mark on this
+ * line that says something none of the others do: how far through the
+ * clip the station is, and therefore how long is left to say it.
+ *
+ * --sp-run is set on the node by markRun() at every tick, and the
+ * gradient is hard-stopped so it reads as a fill against a track
+ * rather than a smear. A line with no window carries no --sp-run and
+ * falls back to 0%, which is a bare track. */
 .sp-el.sp-now::after {
   content: '';
-  position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
-  background: var(--sp-on, #65c7da);
-  animation: spNowPulse 1.8s ease-in-out infinite;
+  position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  border-radius: 0 0 4px 4px;
+  background: linear-gradient(90deg,
+    var(--sp-on, #65c7da) var(--sp-run, 0%),
+    rgba(101, 199, 218, .16) var(--sp-run, 0%));
 }
 .sp-el.sp-now { position: relative; }
-@keyframes spNowPulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
 
 /* The one-line readout under the heading: what is happening with it. */
 .sp-now-line {
@@ -696,5 +716,18 @@
 }
 .sp-page.sp-beside .sp-scripthead,
 .sp-page.sp-beside .sp-now-line { grid-column: 1 / -1; }
+
+/* #1294: in `below` the plan hangs off the end of the screenplay -
+   measured at 60,242 px down a 62,386 px scroll, which is the whole
+   night to reach it. The hour heading is the handle: tap it to come
+   back to the line being said. */
+.sp-planjump { cursor: pointer; }
+.sp-planjump::after {
+  content: '   ↑ back to the air';
+  font-size: 10px;
+  letter-spacing: .12em;
+  opacity: .55;
+}
+.sp-page.sp-beside .sp-planjump::after { content: ''; }
 .sp-page.sp-beside .sp-crawl { grid-column: 1 / -1; }
 .sp-crawl-go.sp-planway.on { background: #2f5f6f; border-color: #4a9ab0; }

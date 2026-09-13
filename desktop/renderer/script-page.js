@@ -94,6 +94,11 @@
   var folded = Object.create(null);   /* #1285: seg id -> folded? */
   var byHand = Object.create(null);   /* #1285: the operator said so */
   var liveSeg = '';                   /* #1285: the segment on air */
+  var planHours = [];                 /* #1289: the director's entries */
+  var planAt = 0;                     /* when we last read them */
+  var planning = false;
+  var planWay = 'below';              /* #1289: 'below' | 'beside' */
+  var PLAN_REST_MS = 30000;           /* a running order is not news */
   var beat = 0;
 
   function api() { return root.pineDesktop || {get: function () { return Promise.reject(new Error('no bridge')); }}; }
@@ -738,11 +743,16 @@
       if (order[i] === cursor) { cursor = cursor.nextSibling; continue; }
       box.insertBefore(order[i], cursor);
     }
-    while (cursor) {                    /* not asked for any more */
+    /* #1289: the plan is not an element of the screenplay and must
+       survive the stitch. It is kept, and kept last. */
+    var plan = null;
+    while (cursor) {
       var next = cursor.nextSibling;
-      cursor.remove();
+      if (cursor.id === 'spPlan') { plan = cursor; }
+      else { cursor.remove(); }
       cursor = next;
     }
+    if (plan) box.appendChild(plan);
   }
 
   /* #1285: fold a finished segment, leave the one on air open.
@@ -755,6 +765,34 @@
     var box = el('spScript');
     if (!box) return;
     var all = box.querySelectorAll('.sp-el');
+    /* #1294: EVERYTHING BEHIND THE AIR IS SHUT, NOT ONLY THE SEGMENT
+     * IT JUST LEFT.
+     *
+     * segFollow folds the one the air walks out of, and `folded`
+     * starts empty - so every segment that had already finished when
+     * the page painted stayed open for ever. Measured: 0 to 3 shut of
+     * 51-57 scenes, ~2,100 elements and ~62,000 px of scroll. The fold
+     * worked; it was just never reached.
+     *
+     * DOM order is script order (the reconciler stitches the canonical
+     * list), so "behind" is "before the first element of the live
+     * segment". A hand still outranks this, and with nothing on air
+     * nothing is folded. */
+    if (liveSeg) {
+      var seen = Object.create(null);
+      var reached = false;
+      for (var p = 0; p < all.length; p += 1) {
+        var mark = all[p].getAttribute('data-seg') || '';
+        if (!mark) continue;                     /* plan rows, spacers */
+        if (mark === liveSeg) { reached = true; break; }
+        seen[mark] = 1;
+      }
+      if (reached) {
+        for (var key in seen) {
+          if (!byHand[key]) folded[key] = true;
+        }
+      }
+    }
     for (var i = 0; i < all.length; i += 1) {
       var node = all[i];
       var seg = node.getAttribute('data-seg') || '';
@@ -802,6 +840,51 @@
     folded[seg] = !folded[seg];
     byHand[seg] = true;              /* the operator's choice outranks */
     segApply();
+    foldSave();                                              /* #1294 */
+  }
+
+  /* #1294: THE READER'S PLACE OUTLIVES THE VIEW.
+   *
+   * The kiosk Activity is recreated roughly every five minutes - the
+   * gallery writes the device wallpaper, systemui regenerates the
+   * Material You overlays, and the resulting CONFIG_ASSETS_PATHS
+   * (0x80000000) is not in MainActivity's configChanges mask, so the
+   * WebView reloads. Seven relaunches in 33 minutes, each taking every
+   * fold and the scroll position with it.
+   *
+   * localStorage, NOT sessionStorage: a relaunch is a new session and
+   * would take session storage with it. Every read and write is
+   * guarded - the accessor itself throws in some contexts - and a page
+   * with nothing stored must render correctly, which here means the
+   * folds simply start closed-behind-the-air as they now do anyway. */
+  var FOLD_KEY = 'pine.script.folds.v1';
+
+  function foldSave() {
+    try {
+      var box = el('spScript');
+      root.localStorage.setItem(FOLD_KEY, JSON.stringify({
+        folded: folded, byHand: byHand, liveSeg: liveSeg,
+        top: box ? Math.round(box.scrollTop) : 0, at: Date.now()}));
+    } catch (err) { /* storage blocked: the view still works */ }
+  }
+
+  var foldTop = -1;                  /* the scroll to restore, once */
+
+  function foldLoad() {
+    var held = null;
+    try {
+      held = JSON.parse(root.localStorage.getItem(FOLD_KEY) || 'null');
+    } catch (err) { held = null; }
+    if (!held || typeof held !== 'object') return;
+    /* Stale beyond an hour is not this show any more. */
+    if (Date.now() - Number(held.at || 0) > 3600000) return;
+    if (held.folded && typeof held.folded === 'object') {
+      for (var a in held.folded) folded[a] = !!held.folded[a];
+    }
+    if (held.byHand && typeof held.byHand === 'object') {
+      for (var b in held.byHand) byHand[b] = !!held.byHand[b];
+    }
+    if (Number(held.top) > 0) foldTop = Number(held.top);
   }
 
   /* The air moved on: fold what it left, unless a hand opened it. */
@@ -812,6 +895,162 @@
     if (was && !byHand[was]) folded[was] = true;
     folded[seg] = false;
     segApply();
+    foldSave();                                              /* #1294 */
+  }
+
+  /* #1289: THE HOUR AHEAD. /api/director?hour=N is already the hour
+     as ordered entries, and a planned one carries its written turns. */
+  function loadPlan(force) {
+    if (planning) return;
+    if (!force && Date.now() - planAt < PLAN_REST_MS) return;
+    planning = true;
+    var want = [api().get('/api/director?hour=0')
+      .then(null, function () { return null; })];
+    want.push(api().get('/api/director?hour=1')
+      .then(null, function () { return null; }));
+    Promise.all(want).then(function (got) {
+      var fresh = got.filter(Boolean);
+      planning = false;
+      /* #1289b: a failed read must not WIPE the running order. Both
+         fetches swallow their own errors and return null, so a blip
+         used to hand back an empty list, paintPlan cleared the node,
+         and the hour ahead vanished until the next poll. Keep what we
+         have unless something better arrived. */
+      if (!fresh.length) return;
+      planHours = fresh;
+      planAt = Date.now();
+      paintPlan();
+    }, function () { planning = false; });
+  }
+
+  function planRow(cls, text) {
+    return make('div', 'sp-el ' + cls, String(text || ''));
+  }
+
+  /* #1294: the plan's own keyed nodes. paintPlan called
+     box.replaceChildren() on a thirty-second timer - 509 nodes
+     destroyed in one batch, ~1,012 a minute, and in one round of
+     sixteen it wiped every visible plan row. This is the stitch
+     paintScript has had since #1273, on the one pane that never got
+     it. */
+  var planNodes = new Map();
+  var planIn = null;
+
+  function planKeep(key, cls, text) {
+    var print = cls + '\u0001' + text;
+    var node = planNodes.get(key);
+    if (node && node.pinePrint !== print) {
+      node.className = cls;
+      node.textContent = text;
+      node.pinePrint = print;
+    }
+    if (!node) {
+      node = make('div', cls, text);
+      node.pinePrint = print;
+      planNodes.set(key, node);
+    }
+    return node;
+  }
+
+  function paintPlan() {
+    var box = el('spPlan');
+    if (!box) return;
+    if (planIn !== box) { planNodes.clear(); planIn = box; }
+    if (!planHours.length) {
+      if (planNodes.size) { box.replaceChildren(); planNodes.clear(); }
+      return;
+    }
+    var order = [];
+    var wanted = Object.create(null);
+    for (var h = 0; h < planHours.length; h += 1) {
+      var page = planHours[h] || {};
+      var rows = page.entries || [];
+      var ahead = [];
+      for (var i = 0; i < rows.length; i += 1) {
+        /* What has already been said is the screenplay's job; this pane
+           is only what is still to come. */
+        var st = String(rows[i].state || '');
+        if (st === 'aired' || st.indexOf('went by') === 0) continue;
+        ahead.push(rows[i]);
+      }
+      if (!ahead.length) continue;
+      var hourKey = 'h:' + h;
+      var when = planKeep(hourKey, 'sp-el sp-planhour sp-planjump',
+        (h === 0 ? 'STILL TO COME THIS HOUR' : 'THE HOUR AFTER')
+        + '  ·  ' + ahead.length
+        + (ahead.length === 1 ? ' segment' : ' segments'));
+      wanted[hourKey] = 1;
+      /* #1294: in `below` the plan sits 60,242 px down a 62,386 px
+         scroll - the whole night away from the line being said. The
+         heading is the handle back. Attached once, because planKeep
+         hands back the SAME node every repaint. */
+      if (!when.__jump) {
+        when.__jump = 1;
+        when.addEventListener('click', function () {
+          if (nowLineId) jumpToLine(nowLineId);
+        });
+      }
+      order.push(when);
+      for (var k = 0; k < ahead.length; k += 1) {
+        var e = ahead[k];
+        var sc = e.script || {};
+        var turns = sc.turns || [];
+        var mark = String(e.state || '');
+        var clock = e.start
+          ? new Date(Number(e.start) * 1000).toTimeString().slice(0, 5) : '';
+        var segKey = 'p:' + h + ':' + String(e.slot_id || e.ordinal || k);
+        var head = planKeep(segKey, 'sp-el sp-planseg'
+          + (mark === 'on air' ? ' sp-planlive' : '')
+          + (turns.length ? '' : ' sp-planbare'),
+          (clock ? clock + '  ' : '')
+          + String(e.label || e.kind || 'segment').toUpperCase()
+          + '   ' + (e.minutes ? e.minutes + ' MIN' : ''));
+        head.setAttribute('data-plan', String(e.slot_id || e.ordinal || k));
+        head.setAttribute('data-state', mark);
+        wanted[segKey] = 1;
+        order.push(head);
+        if (!turns.length) {
+          /* A hole is shown, not hidden: an operator who sees it before
+             the slot arrives can still do something about it. */
+          var bare = planKeep(segKey + ':why', 'sp-el sp-planwhy',
+            mark || 'nothing behind it');
+          wanted[segKey + ':why'] = 1;
+          order.push(bare);
+          continue;
+        }
+        for (var t2 = 0; t2 < turns.length; t2 += 1) {
+          var turn = turns[t2];
+          var cueKey = segKey + ':c' + t2;
+          var lineKey = segKey + ':l' + t2;
+          order.push(planKeep(cueKey, 'sp-el sp-character sp-plancue',
+            String(turn.who || turn.seat || '').toUpperCase()));
+          order.push(planKeep(lineKey, 'sp-el sp-dialogue sp-planline',
+            String(turn.text || '')));
+          wanted[cueKey] = 1;
+          wanted[lineKey] = 1;
+        }
+      }
+    }
+    planNodes.forEach(function (held, key) {
+      if (wanted[key]) return;
+      if (held.parentNode === box) held.remove();
+      planNodes.delete(key);
+    });
+    stitchScript(box, order);
+  }
+
+  /* #1289: the two layouts differ only in where the plan hangs. */
+  function planLayout(way) {
+    planWay = (way === 'beside') ? 'beside' : 'below';
+    var box = el('spPlan');
+    var script = el('spScript');
+    if (!box || !script || !script.parentNode) return;
+    host.classList.toggle('sp-beside', planWay === 'beside');
+    if (planWay === 'below') {
+      script.appendChild(box);                 /* one continuous scroll */
+    } else {
+      script.parentNode.insertBefore(box, script.nextSibling);
+    }
   }
 
   function scriptBlock(item) {
@@ -911,6 +1150,23 @@
     return String(row.clip_media || row.media || '');
   }
 
+  /* #1294: a row's window under EITHER name.
+   *
+   * The burst table calls them from/until; the feed calls them
+   * clip_from/clip_until, and 168 of 171 feed rows carry only the
+   * second pair. within() read only the first, so on the feed every
+   * multi-row file collapsed into the lone-row branch and the last row
+   * of the file won the whole file. */
+  function rowFrom(row) {
+    var v = Number(row.from);
+    return isFinite(v) ? v : Number(row.clip_from);
+  }
+
+  function rowUntil(row) {
+    var v = Number(row.until);
+    return isFinite(v) ? v : Number(row.clip_until);
+  }
+
   function activeRow() {
     var t = streamAt();
     var rows = (liveStream && liveStream.rows) || [];
@@ -922,7 +1178,7 @@
         var mine = rowFile(row);
         /* #1287: only rows of the file that is sounding. */
         if (file && mine && mine !== file) continue;
-        var from = Number(row.from), until = Number(row.until);
+        var from = rowFrom(row), until = rowUntil(row);
         if (!isFinite(from) || !isFinite(until)) {
           /* #1287: A ROW THAT IS THE WHOLE FILE HAS NO WINDOW.
            * Measured: 0 of 25 `interject` rows carry from/until - they
@@ -947,6 +1203,27 @@
       return null;
     }
     if (t >= 0) {
+      /* #1294: WHICHEVER TABLE CAN BE CHECKED AGAINST THE SOUND.
+       *
+       * liveStream.rows carry {id, from, until} and no media - probed
+       * on the tablet, that is the whole of streamKeys - so #1287's
+       * file guard above can never fire for them. When the sounding
+       * file moves on and stream_now has not, the old burst's window
+       * brackets the new file's currentTime and lights a row that is
+       * not being said, for the length of the clip: 12 of the 19 wrong
+       * samples measured were more than two seconds in, which is what
+       * separates this from the mark merely lagging.
+       *
+       * The feed's rows carry clip_media, so when we know the name of
+       * what is sounding they are the table that can be held to it.
+       * Where the two describe the same file they agree to three
+       * decimals, so this is a change of ORDER, not of arithmetic. */
+      var fed = [];
+      try { fed = (root.PineStationFeed.rows() || []); } catch (e1) { fed = []; }
+      if (file && fed.length) {
+        var named = within(fed, fed.length);
+        if (named) return named;
+      }
       var seat = within(rows, rows.length);
       if (seat) return seat;
       /* #1278: A CLIP OF ITS OWN IS STILL A LINE OF THE SCRIPT.
@@ -962,9 +1239,8 @@
        * the page, so it was never the screenplay being stale.
        *
        * The feed's full row list is where those clips live. */
-      var all = [];
-      try { all = (root.PineStationFeed.rows() || []); } catch (err) { all = []; }
-      if (all.length && all !== rows) {
+      var all = fed;
+      if (!file && all.length && all !== rows) {
         var loose = within(all, all.length);
         if (loose) return loose;
       }
@@ -1230,15 +1506,57 @@
 
   /* The 250 ms heartbeat: move the mark, move the readout. Nothing here
    * touches the network. */
+  /* #1295: HOW MUCH OF THIS CLIP IS LEFT, drawn on the line itself.
+   *
+   * Set as a custom property and an attribute, never as a child node:
+   * the reconciler re-dresses a changed line with textContent, so a
+   * child span would be wiped every repaint. The CSS paints the bar
+   * off --sp-run and the countdown off data-left.
+   *
+   * A row with no usable window (an interject is a clip of one line
+   * and carries neither end) gets no bar rather than a wrong one. */
+  var runNode = null;
+
+  function markRun(row) {
+    var node = (row && row.id)
+      ? document.querySelector('.sp-el[data-line="' + row.id + '"]')
+      : null;
+    if (runNode && runNode !== node) {
+      runNode.style.removeProperty('--sp-run');
+      runNode.removeAttribute('data-left');
+    }
+    runNode = node;
+    if (!node || !row) return;
+    var span = Number(row.until) - Number(row.from);
+    var gone = Number(row.at) - Number(row.from);
+    if (!isFinite(span) || span <= 0 || !isFinite(gone)) {
+      node.style.removeProperty('--sp-run');
+      node.removeAttribute('data-left');
+      return;
+    }
+    var run = Math.max(0, Math.min(1, gone / span));
+    node.style.setProperty('--sp-run', (run * 100).toFixed(1) + '%');
+    var left = Math.max(0, Math.round(span - gone));
+    node.setAttribute('data-left', left >= 60
+      ? (Math.floor(left / 60) + ':' + ('0' + (left % 60)).slice(-2))
+      : (left + 's'));
+  }
+
   function tick() {
     var row = activeRow();
     markNow(row ? row.id : '');
+    markRun(row);                                            /* #1295 */
     markFeedLive(row ? row.id : '');            /* #1279 */
     /* #1286: say when the room is quiet, instead of leaving a page full
        of `pending` and `tinted` marks to be read as though one of them
        were live. */
     try {
-      host.classList.toggle('sp-quiet', !(row && row.id));
+      /* #1294: the PLAYER, not the row. This read activeRow(), which
+         falls back to speaking_now, so quiet stayed off for a second
+         or two after a clip ended - 22 of 348 silent samples. What
+         "quiet" means is that nothing is sounding, and there is an
+         element that knows. */
+      host.classList.toggle('sp-quiet', !soundingPlayer() && !(row && row.id));
     } catch (err) { /* the mark still stands on its own */ }
     paintStatus();
   }
@@ -1521,7 +1839,23 @@
     rate.title = 'How fast it scrolls';
     tools.appendChild(run);
     tools.appendChild(rate);
+    /* #1289: the hour ahead, and which way to show it. */
+    var ahead = make('button', 'sp-crawl-go sp-planway');
+    ahead.type = 'button';
+    ahead.textContent = '⎘';
+    ahead.title = 'The hour ahead: below the script, or beside it';
+    ahead.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      planLayout(planWay === 'below' ? 'beside' : 'below');
+      ahead.classList.toggle('on', planWay === 'beside');
+      loadPlan(true);
+    });
+    tools.appendChild(ahead);
     right.appendChild(tools);
+
+    var plan = make('div', 'sp-plan');
+    plan.id = 'spPlan';
+    script.appendChild(plan);          /* 'below' is the default */
 
     function crawlRate() {
       /* 1..100 on the slider, about 2 to 220 px a second, curved so the
@@ -1594,6 +1928,7 @@
     build(node);
     wirePlayer();
     mounted = true;
+    foldLoad();                                              /* #1294 */
 
     var feed = root.PineStationFeed;
     if (feed && typeof feed.subscribe === 'function') {
@@ -1618,6 +1953,7 @@
         paintPlayer(state);
         paintFeed(state);
         loadScreenplay(false);
+        loadPlan(false);                              /* #1289 */
         tick();
       });
     } else {
@@ -1628,6 +1964,7 @@
        switch to this view. Forced, so it cannot be answered out of a
        twenty-second cache that predates the line now sounding. */
     loadScreenplay(true);
+    loadPlan(true);                                   /* #1289 */
     if (!beat) beat = setInterval(tick, 250);
     return Promise.resolve(true);
   }

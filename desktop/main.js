@@ -1423,9 +1423,16 @@ async function localClip(seconds) {
 ipcMain.handle("glass:clip", async (_event, seconds, options) => {
   try {
     const aim = await captureTarget(options && options.target);
-    const made = aim.where === "app"
-      ? await localClip(seconds)
-      : await (await terminalHost.glass()).clip(seconds, options);
+    /* CTRL+CLICK REACHES BACKWARDS. The tablet has been recording itself all
+     * along, so "the last thirty seconds" is a read rather than a wait. Only
+     * the tablet has a rolling recorder; this window does not, so a local
+     * capture still films forwards. */
+    const wantsReplay = !!(options && options.replay) && aim.where !== "app";
+    const made = wantsReplay
+      ? await (await terminalHost.glass()).clip_fromReplay(seconds)
+      : aim.where === "app"
+        ? await localClip(seconds)
+        : await (await terminalHost.glass()).clip(seconds, options);
     if (!made.ok) return made;
     /* Only a FALLBACK is worth saying. "chosen" is the operator's own
      * decision handed back to them as news. */

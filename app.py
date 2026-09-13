@@ -19011,9 +19011,18 @@ _VOICES_LOCK = RLock()
 VOICE_ID_SHAPE = re.compile(r"^vl_[a-f0-9]{8}\Z")
 
 
-def read_voices() -> list[dict[str, Any]]:
-    """Every meta.json in the library, newest first. Glob-per-call — the
-    library is tens of entries, not thousands (sfx_all reasoning)."""
+# #1293: the library off disk, rested. See read_voices.
+_VOICES_RAW_MEMO: dict[str, Any] = {"at": 0.0, "rows": None}
+VOICES_REST_S = 6.0
+
+
+def voices_forget() -> None:
+    """Drop the library memo - called wherever a clone changes on disk."""
+    _VOICES_RAW_MEMO.update({"at": 0.0, "rows": None})
+
+
+def _read_voices_disk() -> list[dict[str, Any]]:
+    """The glob and the stats. Everything expensive lives here."""
     voices: list[dict[str, Any]] = []
     try:
         for meta_path in VOICES_DIR.glob("*/meta.json"):
@@ -19024,17 +19033,50 @@ def read_voices() -> list[dict[str, Any]]:
                     meta["has_signature"] = (folder / "signature.json").exists()
                     meta["has_style"] = (folder / "style.json").exists()
                     meta["has_reference"] = (folder / "reference.wav").exists()
-                    # #746: what will ACTUALLY render this voice tonight.
-                    # The stored `engine` is a preference; dj.clone_engine
-                    # can move the whole library onto one engine, and a
-                    # picker grouped on the stored field would then be
-                    # lying in both directions at once.
-                    meta["engine_now"] = _engine_now(meta)
                     voices.append(meta)
             except Exception:
                 continue
     except Exception:
         pass
+    return voices
+
+
+def read_voices() -> list[dict[str, Any]]:
+    """Every meta.json in the library, newest first.
+
+    #1293: the old note here - "Glob-per-call, the library is tens of
+    entries, not thousands" - is true about the COUNT and says nothing
+    about the cost of a stat over SMB. With this station's clones each
+    call was ~35 file reads AND ~105 exists() checks (signature, style,
+    reference), and /api/pulse named it at 7.92s of blocked loop.
+
+    What is held is the DISK READ, for a few seconds. Two things are
+    still done per call, on purpose:
+
+      engine_now - _engine_now reads the station-wide clone_engine
+        dial. Freezing that is precisely the lie #746's own comment was
+        written to prevent, so it is recomputed every time.
+      a copy - "Callers WRITE into what this returns" is already the
+        stated rule for _voice_json_cached in this file, and it holds
+        here too.
+
+    voice_save and voice_delete call voices_forget(), so a new or
+    renamed clone appears at once rather than after the rest."""
+    now = time.time()
+    memo = _VOICES_RAW_MEMO
+    rows = memo.get("rows")
+    if rows is None or now - float(memo.get("at") or 0) >= VOICES_REST_S:
+        rows = _read_voices_disk()
+        memo.update({"at": now, "rows": rows})
+    voices: list[dict[str, Any]] = []
+    for row in rows:
+        meta = copy.deepcopy(row)
+        # #746: what will ACTUALLY render this voice tonight. The stored
+        # `engine` is a preference; dj.clone_engine can move the whole
+        # library onto one engine, and a picker grouped on the stored
+        # field would then be lying in both directions at once.
+        meta["engine_now"] = _engine_now(meta)
+        voices.append(meta)
     voices.sort(key=lambda m: m.get("created") or 0, reverse=True)
     return voices
 
@@ -19241,12 +19283,14 @@ def voice_save(meta: dict[str, Any], reference: bytes | None = None,
         if style is not None:
             (folder / "style.json").write_text(json.dumps(style))
         (folder / "meta.json").write_text(json.dumps(meta, indent=1))
+        voices_forget()                                        # #1293
         return meta
 
 
 def voice_delete(vid: str) -> bool:
     if not VOICE_ID_SHAPE.match(vid or ""):
         return False
+    voices_forget()                                            # #1293
     with _VOICES_LOCK:
         folder = VOICES_DIR / vid
         if not folder.is_dir():
@@ -48321,16 +48365,57 @@ def schedule_defaults() -> dict[str, Any]:
     }
 
 
+# #1293: the running order's PARSED FILE, rested. See _schedule_raw.
+_SCHEDULE_RAW_MEMO: dict[str, Any] = {"key": None, "raw": None, "at": 0.0}
+SCHEDULE_REST_S = 5.0
+
+
+def _schedule_raw() -> Any:
+    """The schedule file, parsed, at most once every few seconds.
+
+    #1293: schedule_read had no cache of any kind - a read from the
+    share and a json.loads on EVERY call, and the running order is
+    consulted constantly (schedule_take, the coordinator, the
+    director's room, the hour view). /api/pulse named it in the
+    blocking frames at 19.26s over two samples, worst 10.76s, on a
+    station where 90% of dead-air seconds are event-loop stalls.
+
+    Only the RAW is held. The cleaning still runs per call, so nothing
+    downstream is handed a shared object - see schedule_read."""
+    now = time.time()
+    memo = _SCHEDULE_RAW_MEMO
+    if memo["raw"] is not None and now - float(memo["at"] or 0) < SCHEDULE_REST_S:
+        return memo["raw"]
+    try:
+        stat = SCHEDULE_PATH.stat()
+        key = (stat.st_mtime_ns, stat.st_size)
+    except Exception:                          # noqa: BLE001
+        return None                # no file: the defaults, as before
+    if memo["raw"] is not None and memo["key"] == key:
+        memo["at"] = now
+        return memo["raw"]
+    try:
+        raw = json.loads(SCHEDULE_PATH.read_text(encoding="utf-8"))
+    except Exception:                          # noqa: BLE001
+        return None      # unparseable: retried every call, as before
+    memo.update({"key": key, "raw": raw, "at": now})
+    return raw
+
+
 def schedule_read() -> dict[str, Any]:
     """The schedule off disk, merged over the defaults and scrubbed.
 
     Anything that will not parse falls back to the seeded hour rather than
-    raising: a corrupt file must not stop the show choosing a round."""
+    raising: a corrupt file must not stop the show choosing a round.
+
+    #1293: the file is read through _schedule_raw now, but everything
+    below still runs on every call. _sched_slot, _sched_hours_clean and
+    _sched_prompt_blob build new objects and never touch their input, so
+    the store handed back shares nothing with the cached raw but
+    strings - a caller may scribble on it exactly as before, and an
+    id-less row still gets its id minted per call."""
     store = schedule_defaults()
-    try:
-        raw = json.loads(SCHEDULE_PATH.read_text(encoding="utf-8"))
-    except Exception:                          # noqa: BLE001
-        return store
+    raw = _schedule_raw()
     if not isinstance(raw, dict):
         return store
     try:
@@ -48404,6 +48489,16 @@ def schedule_write(store: dict[str, Any]) -> dict[str, Any]:
         tmp = SCHEDULE_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(store, indent=1), encoding="utf-8")
         tmp.replace(SCHEDULE_PATH)
+        # #1293: the writer already holds what the next reader wants, so
+        # a save costs the loop nothing. A deepcopy because the caller
+        # keeps `store` and may go on editing it.
+        try:
+            stat = SCHEDULE_PATH.stat()
+            _SCHEDULE_RAW_MEMO.update({
+                "key": (stat.st_mtime_ns, stat.st_size),
+                "raw": copy.deepcopy(store), "at": time.time()})
+        except Exception:                      # noqa: BLE001
+            _SCHEDULE_RAW_MEMO.update({"key": None, "raw": None, "at": 0.0})
     return store
 
 
@@ -64169,6 +64264,48 @@ def sfx_id(path: Path) -> str:
     return got
 
 
+# #1297: id -> path over the CACHED pool, built once per pool version.
+_SFX_POOL_IDS: dict[str, Any] = {"key": None, "map": {}}
+
+
+def sfx_pool_ids() -> dict[str, Path]:
+    """The cached pool as a lookup, not as a walk.
+
+    #1297: sfx_by_id used to scan sfx_pool_cached() - which is
+    `[Path(p) for p in _SFX_POOL_CACHE]`, so every lookup CONSTRUCTED
+    the whole pool (3,400-5,000 files, per the notes on #826 and
+    #1199) and then called str() back off each one to hash it. A
+    census of the gap log's stall stacks over three hours put sfx_id
+    at the top by a distance - 282.8s across 23 of 91 stalls - and
+    sfx_id is pure and memoised, so it was never the fault: it was
+    standing in for its caller.
+
+    The ids are minted through sfx_id(Path(p)) and NOT off the raw
+    string, because Path() normalises and #1204 is in this file
+    precisely because two spellings of one file made two ids and the
+    desk served a 404 on a clip that was sitting there.
+
+    The pool refreshes off-loop once a minute, so this rebuilds at
+    most that often; the refresh stamp is in the key, so a repointed
+    pack is picked up on the next call rather than after a timer."""
+    try:
+        cache = _SFX_POOL_CACHE
+        key = (len(cache), cache[0] if cache else "",
+               cache[-1] if cache else "", _SFX_POOL_AT[0])
+        if _SFX_POOL_IDS["key"] != key:
+            built: dict[str, Path] = {}
+            for path in cache:
+                # The entries ARE Paths (_SFX_POOL_CACHE: list[Path]),
+                # so the old Path(p) per entry per call was pure waste -
+                # and sfx_id off the entry is what _sting_draw_sets
+                # already does, so the ids agree by construction.
+                built[sfx_id(path)] = path
+            _SFX_POOL_IDS.update({"key": key, "map": built})
+        return _SFX_POOL_IDS["map"]
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def sfx_by_id(wanted: str) -> Path | None:
     # #1204: the CACHED pool first. sfx_id hashes str(path), and the
     # cached pool and sfx_all() do not always spell the same file the
@@ -64176,10 +64313,12 @@ def sfx_by_id(wanted: str) -> Path | None:
     # the other, and the SFX desk's play button served a 404 on a clip
     # that was sitting right there. Cheap, and it also spares the CIFS
     # walk on the common case.
+    #
+    # #1297: and it is a LOOKUP now, not a walk of the whole pool.
     try:
-        for path in sfx_pool_cached():
-            if sfx_id(path) == wanted:
-                return path
+        got = sfx_pool_ids().get(wanted)
+        if got is not None:
+            return got
     except Exception:  # noqa: BLE001
         pass
     # #1265: the indexed map, not a walk-and-hash of the whole pool.

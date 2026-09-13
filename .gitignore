@@ -20,3 +20,4 @@ docs/*.json.lock
 docs/*.png
 docs/*.jpg
 docs/system2-ui-images/
+airlog_tail.jsonl

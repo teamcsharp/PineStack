@@ -175,6 +175,16 @@ function desktopMusicGain() {
   return Math.max(0, Math.min(1, appVolume * share));
 }
 
+/* #1263: and the same arithmetic for the SFX guy's television, which is
+ * the shell's only other element that carries live broadcast audio. It
+ * rides the BOOTH share, because a sting is punctuation on the DJ's line
+ * and the operator turns the two down together. */
+function desktopVoiceGain() {
+  const share = (streamVolumes && Number.isFinite(streamVolumes.voice))
+    ? streamVolumes.voice : 1;
+  return Math.max(0, Math.min(1, appVolume * share));
+}
+
 function setAppVolume(value, persist = true) {
   const raw = Number(value);
   appVolume = Math.max(0, Math.min(1, Number.isFinite(raw) ? raw : 0.35));
@@ -764,6 +774,12 @@ function applyAppVolume() {
   ["controlFrame", "radioFrame", "guideFrame"].forEach((id) => {
     applyAppVolumeToFrame($(id));
   });
+  /* #1263: the television is a shell element, not a frame - the injected
+   * script above can never reach it, so its level is written here or it
+   * is the one sound in this window the sliders do not move. */
+  try {
+    if (window.PineSfxTv) window.PineSfxTv.level(desktopVoiceGain());
+  } catch (err) { /* the frames are already levelled */ }
 }
 
 function initAppVolume() {
@@ -979,21 +995,30 @@ $("glassStill")?.addEventListener("click", (event) => {
     });
 });
 
-$("glassClip")?.addEventListener("click", () => {
+/* CTRL+CLICK TAKES WHAT ALREADY HAPPENED. A plain click films the next few
+ * seconds; holding Ctrl pulls the last few out of the tablet's rolling
+ * recording, which is usually the ones you actually wanted - by the time
+ * anyone decides to record something, the thing worth recording is over. */
+$("glassClip")?.addEventListener("click", (event) => {
   const seconds = glassSeconds();
-  glassDo(`Recording ${seconds}s\u2026`, async () => {
+  const back = !!(event.ctrlKey || event.metaKey);
+  glassDo(back ? `Pulling the last ${seconds}s off the tablet\u2026`
+                : `Recording ${seconds}s\u2026`, async () => {
     /* The tablet is filming and will not answer until it has finished, so
      * the countdown is run here. Without it the app looks hung for exactly
      * as long as the operator asked it to be. */
+    /* No countdown when reaching backwards: there is nothing to wait for,
+     * only bytes to move. */
     let left = seconds;
-    const tick = setInterval(() => {
+    const tick = back ? 0 : setInterval(() => {
       left -= 1;
       glassSay(left > 0
         ? `Recording \u2014 ${left}s left`
         : "Fetching the clip from the tablet\u2026");
     }, 1000);
     try {
-      const made = await api.glassClip(seconds, { target: glassTarget() });
+      const made = await api.glassClip(seconds,
+        { target: glassTarget(), replay: back });
       if (!made || !made.ok) {
         return glassSay(made && made.why ? made.why : "the clip did not come back", true);
       }
@@ -1009,7 +1034,7 @@ $("glassClip")?.addEventListener("click", () => {
         + ((made.notes || []).length ? " \u2014 " + made.notes.join("; ") : ""),
         !made.broadcast && !made.mic);
     } finally {
-      clearInterval(tick);
+      if (tick) clearInterval(tick);
     }
   });
 });
@@ -1901,6 +1926,16 @@ async function loadConfig() {
   $("dataDirInput").value = config.dataDir || "";
   $("modeLaunch").classList.toggle("active", config.mode === "launch");
   $("modeAttach").classList.toggle("active", config.mode === "attach");
+  /* #1263: the SFX guy's television. It belongs to no view - it is mounted
+   * once, at body level, and draws itself over whatever is showing. mount()
+   * is idempotent, so a later loadConfig only re-bases it. */
+  try {
+    if (window.PineSfxTv) {
+      window.PineSfxTv.mount({baseUrl: config.baseUrl});
+      window.PineSfxTv.rebase(config.baseUrl);
+      window.PineSfxTv.level(desktopVoiceGain());
+    }
+  } catch (err) { /* the rest of the window still comes up */ }
   loadFrames();
 }
 

@@ -85,6 +85,16 @@
    * WebGL canvases, not this. */
   var BLOCK = 4096;
 
+  /* WHAT THE CAPTURE MISSES.
+   *
+   * A ScriptProcessor runs on the main thread, and a blocked main thread does
+   * not delay a buffer, it loses it. playbackTime is the AUDIO clock, so the
+   * distance between two callbacks is exactly how much audio should have
+   * arrived; anything beyond one buffer is what was dropped on the floor. */
+  var gaps = 0;             /* callbacks that came late enough to lose audio */
+  var gapSeconds = 0;       /* how much audio went missing in total          */
+  var lastHeard = 0;        /* the previous callback's playbackTime          */
+
   /* TWO RINGS, BECAUSE "THE AIR" MEANS TWO DIFFERENT THINGS.
    *
    * "The samples I am capturing from the air appear to be double playing and
@@ -186,6 +196,17 @@
     sink.connect(c.destination);
     capture = c.createScriptProcessor(BLOCK, 2, 1);
     capture.onaudioprocess = function (event) {
+      var due = event.playbackTime;
+      if (lastHeard) {
+        var slip = due - lastHeard - (BLOCK / c.sampleRate);
+        /* Half a buffer of slack: the clock is not exact and a drop is a
+         * WHOLE buffer, so nothing borderline is counted. */
+        if (slip > (BLOCK / c.sampleRate) * 0.5) {
+          gaps += 1;
+          gapSeconds += slip;
+        }
+      }
+      lastHeard = due;
       var input = event.inputBuffer;
       var left = input.getChannelData(0);
       var right = input.numberOfChannels > 1 ? input.getChannelData(1) : null;
@@ -799,6 +820,13 @@
 
   var api = {
     start: start, ready: ready, why: why, seconds: seconds, level: level,
+    /* For the diagnostics road and for proving a capture change worked:
+     * how many buffers the ring has lost since it started. */
+    drops: function () {
+      return { gaps: gaps, seconds: gapSeconds,
+               how: (typeof AudioWorkletNode === 'function' ? 'worklet-capable' : 'no worklet'),
+               block: BLOCK };
+    },
     sliceWav: sliceWav, measure: measure, quiet: quiet, spectrum: spectrum,
     haveVoices: haveVoices,
     /* Visible so the behaviour can be checked rather than believed. */

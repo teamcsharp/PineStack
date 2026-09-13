@@ -681,6 +681,104 @@ class Glass {
     }
   }
 
+  /* ------------------------------------------------------ the rolling one */
+
+  /**
+   * The last [seconds] of screen the tablet has ALREADY recorded.
+   *
+   * Nothing is filmed here - replay/ScreenReplay.kt has been running since
+   * the app started, and this only asks it to write out a piece of what it
+   * holds. That is the whole point: by the time anyone decides to record
+   * something, the thing worth recording has happened.
+   *
+   * The bytes come back through the bridge in chunks for the same reason the
+   * microphone's take does: a multi-megabyte return from a
+   * @JavascriptInterface is the kind of thing that works in a test and fails
+   * on a long clip.
+   */
+  async clip_fromReplay(seconds) {
+    const want = clampSeconds(seconds);
+    const pid = await this.pid();
+    if (!pid) return { ok: false, why: 'the kiosk app is not running' };
+    let page = null;
+    try {
+      page = await new PageSession(this.run, (a) => this.target(a), GLASS_PORT).open(pid);
+    } catch (error) {
+      return { ok: false, why: 'could not reach the tablet: ' + error.message };
+    }
+    try {
+      const state = await page.askJson(`(async function () {
+        try {
+          var b = window.pineDesktop;
+          if (!b || !b.replayState) return JSON.stringify({ok:false, why:'this terminal has no rolling recorder'});
+          var s = await b.replayState();
+          return JSON.stringify(s || {ok:false, why:'the recorder did not answer'});
+        } catch (err) { return JSON.stringify({ok:false, why:String(err && err.message || err)}); }
+      })()`, 15000);
+      if (!state || !state.ok) {
+        return { ok: false, why: (state && state.detail) || 'the recorder is not running' };
+      }
+      const held = Number(state.seconds) || 0;
+      if (held < 1) {
+        return { ok: false, why: 'the recorder has not caught anything yet' };
+      }
+      /* NEVER ASK FOR MORE THAN IS THERE. The ring holds what it holds -
+       * less than the ceiling for the first minute, and after the screen has
+       * been dark. Asking for 30 and silently getting 11 is a lie the
+       * operator only finds out on playback. */
+      const take = Math.min(want, held);
+
+      const got = await page.askJson(`(async function () {
+        try {
+          var b = window.pineDesktop;
+          var saved = await b.replaySave({seconds: ${take.toFixed(2)}});
+          if (!saved || !saved.ok) return JSON.stringify({ok:false, why:(saved && saved.detail) || 'it would not write'});
+          var out = '';
+          for (var at = 0; at < saved.bytes;) {
+            var part = await b.replayChunk({at: at, much: 1048576});
+            if (!part || !part.ok) return JSON.stringify({ok:false, why:(part && part.detail) || 'it could not be read out'});
+            out += part.b64;
+            at = part.at + part.sent;
+            if (part.done) break;
+          }
+          return JSON.stringify({ok:true, bytes:saved.bytes, seconds:saved.seconds, b64:out});
+        } catch (err) { return JSON.stringify({ok:false, why:String(err && err.message || err)}); }
+      })()`, 120000);
+
+      if (!got || !got.ok) {
+        return { ok: false, why: (got && got.why) || 'the replay did not come back' };
+      }
+      const mp4 = fromB64(got.b64);
+      const ran = Number(got.seconds) || take;
+
+      /* The same window of the broadcast, out of PineAir's ring. The video
+       * ends NOW, so the audio wanted is the same span ending now. */
+      const audio = { broadcast: null, mic: null };
+      const notes = ['from the tablet\u2019s rolling recording'];
+      try {
+        const heard = await page.askJson(
+          broadcastQuestion(ran.toFixed(3), '0'), 30000);
+        if (heard && heard.ok) {
+          audio.broadcast = { wav: fromB64(heard.b64), offset: 0 };
+        } else {
+          notes.push('no broadcast audio: ' + ((heard && heard.why) || 'the ring did not answer'));
+        }
+      } catch (error) {
+        notes.push('no broadcast audio: ' + error.message);
+      }
+      /* The microphone is not recorded continuously, so there is no past of
+       * it to fetch. Said once rather than left as a puzzle. */
+      notes.push('no microphone - it is not recorded continuously');
+      if (ran + 0.5 < want) {
+        notes.push('only ' + ran.toFixed(1) + 's had been recorded');
+      }
+      return { ok: true, mp4, bytes: mp4.length, seconds: ran, at: this.now(),
+        audio, notes };
+    } finally {
+      await page.close();
+    }
+  }
+
   /* ------------------------------------------------------------ the report */
 
   async pid() {
