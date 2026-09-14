@@ -195,7 +195,12 @@ function selfSyncFromShare() {
     const r = spawnSync("robocopy", [srcDesk,
       path.join(runner, "desktop"),
       "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP"],
-      { timeout: 25000 });
+      /* 2026-09-14: 25 s was not enough over the share - measured, a
+         launch at 17:33 mirrored NOTHING (sfx-tv.js still the 14:28
+         copy, main.js from the day before) and the operator saw none
+         of the afternoon's work. A mirror that is killed half way is
+         worse than a slow one. */
+      { timeout: 240000 });
     try {
       fs.copyFileSync(path.join(source, "package.json"),
         path.join(runner, "package.json"));
@@ -2346,6 +2351,29 @@ async function courierRound() {
     const jobs = (got && got.pending) || [];
     for (const job of jobs.slice(0, 4)) {
       let out = { ok: false, why: "" };
+      /* 2026-09-14: a DELETE owed - a clip set on the QuickSwap share,
+         which the station's container can only read. Each path is
+         removed if it exists; the job is done when none is left. */
+      if (job.what === "delete") {
+        const left = [];
+        let why = "";
+        for (const p of (job.paths || [])) {
+          const where = String(p || "");
+          if (!/^(\\\\[^\\]+\\[^\\]+|[A-Za-z]:\\)/.test(where)) { why = "not a Windows path: " + where; left.push(where); continue; }
+          try { fs.rmSync(where, { force: true }); } catch (error) { why = error.message; }
+          if (fs.existsSync(where)) left.push(where);
+        }
+        out = left.length ? { ok: false, why: (why || "still there") + ": " + left.join("; ") }
+                          : { ok: true, path: (job.paths || []).join("; ") };
+        try {
+          await fetchJson(`${cfg.baseUrl}/api/export/courier/done`, {
+            method: "POST", body: JSON.stringify({ id: job.id, ...out }) });
+        } catch (error) {
+          rememberLog(`[courier] could not report ${job.id}: ${error.message}`);
+        }
+        rememberLog(`[courier] delete ${job.name} -> ${out.ok ? "gone" : "failed: " + out.why}`);
+        continue;
+      }
       try {
         const dest = String(job.dest || "");
         if (!/^(\\\\[^\\]+\\[^\\]+|[A-Za-z]:\\)/.test(dest)) {

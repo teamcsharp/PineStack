@@ -597,3 +597,28 @@
 .pine-cam-rowbtn:hover { color: #dfe7ee; border-color: #35414c; }
 .pine-cam-rowbtn svg, .pine-cam-rowbtn .pi-icon { width: 13px; height: 13px; }
 .pine-cam-rowbtn .pine-cam-word { font-size: 9px; }
+
+/* 2026-09-14: the signal bars on the Pine Cam header - sweeping while the
+   radio searches, lit to the signal once seen, all lit once live. */
+.pine-cam-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+  margin: 0 6px 0 8px;
+  cursor: pointer;
+  flex: none;
+}
+.pine-cam-bars i {
+  display: block;
+  width: 3px;
+  border-radius: 1px;
+  background: #35414c;
+}
+.pine-cam-bars i.lit { background: #54d18b; }
+.pine-cam-bars.stale i.lit { background: #f5b83d; }
+.pine-cam-bars.searching i { animation: pine-cam-bar-sweep 1.2s ease-in-out infinite; }
+@keyframes pine-cam-bar-sweep {
+  0%, 100% { background: #35414c; }
+  50% { background: #65c7da; }
+}

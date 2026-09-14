@@ -653,7 +653,140 @@
    * the station's own voice bench (/v1/audio/speech), and the text stays
    * on screen underneath it.
    */
+  /* 2026-09-14: THE DICTATED PINE REPORT.
+   *
+   * "tap on the dot on the tablet and say I want to make a pine report
+   *  and it converts into a setup of a pop-up window where I can basically
+   *  file a pine report through dictation and then make corrections
+   *  through typing on the keyboard if necessary and then file that
+   *  report ... either confirm or decline sending it through."
+   *
+   * The dot already hears a sentence and hands it to act(). Two things are
+   * added and nothing is bypassed: a sentence that ASKS for a report opens
+   * the pad instead of going to the model, and while the pad is open a
+   * `capture` hook takes the NEXT heard sentence into the pad's text
+   * instead of to the model. Everything typed stays editable; Send posts
+   * to /api/pine-requests like the panel's own box (with the station's
+   * debug block by choice); Cancel throws it away. */
+  var capture = null;
+  var pad = null;
+
+  function wantsReport(text) {
+    var t = String(text || '').toLowerCase();
+    if (!/\breport\b/.test(t)) return false;
+    return /\b(pine|inbox|make|file|new|create|start|write|submit|send)\b/.test(t);
+  }
+
+  function padClose() {
+    capture = null;
+    if (pad && pad.parentNode) pad.parentNode.removeChild(pad);
+    pad = null;
+  }
+
+  function reportOpen(heard) {
+    padClose();
+    pad = document.createElement('div');
+    pad.id = 'pineReportPad';
+    pad.setAttribute('style', 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);'
+      + 'width:min(92vw,560px);max-height:88vh;display:flex;flex-direction:column;gap:10px;'
+      + 'padding:14px 16px;border:1px solid #2a3a44;border-radius:12px;background:#0b1116;'
+      + 'color:#dfe7ee;font:14px/1.4 system-ui,sans-serif;z-index:2147483040;'
+      + 'box-shadow:0 18px 60px rgba(0,0,0,.6)');
+    var head = document.createElement('b');
+    head.textContent = 'A Pine report';
+    head.style.fontSize = '16px';
+    var hint = document.createElement('div');
+    hint.setAttribute('style', 'color:#9fb3c0;font-size:12px');
+    hint.textContent = 'Dictate it, fix it on the keyboard, then Send it to the inbox - or Cancel.';
+    var area = document.createElement('textarea');
+    area.setAttribute('style', 'width:100%;min-height:160px;resize:vertical;padding:10px;'
+      + 'border:1px solid #2a3a44;border-radius:8px;background:#05080a;color:#dfe7ee;'
+      + 'font:15px/1.45 system-ui,sans-serif;box-sizing:border-box');
+    area.placeholder = 'What should the Pine Box do?';
+    var note = document.createElement('div');
+    note.setAttribute('style', 'color:#65c7da;font-size:12px;min-height:16px');
+    var debugRow = document.createElement('label');
+    debugRow.setAttribute('style', 'display:flex;align-items:center;gap:8px;font-size:12px;color:#9fb3c0');
+    var debug = document.createElement('input');
+    debug.type = 'checkbox';
+    debug.checked = true;
+    debugRow.appendChild(debug);
+    debugRow.appendChild(document.createTextNode("Attach the station's debug information to this report"));
+    var row = document.createElement('div');
+    row.setAttribute('style', 'display:flex;gap:8px;flex-wrap:wrap');
+    function btn(label, style, go) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.setAttribute('style', 'flex:1 1 auto;min-height:40px;padding:8px 12px;border-radius:8px;'
+        + 'border:1px solid #2a3a44;background:#111922;color:#dfe7ee;font-size:14px;' + (style || ''));
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); go(b); });
+      row.appendChild(b);
+      return b;
+    }
+    var dictate = btn('Dictate', '', function () {
+      note.textContent = 'listening - speak, then wait a moment';
+      capture = function (words) {
+        var had = area.value.trim();
+        area.value = (had ? had + ' ' : '') + String(words || '').trim();
+        note.textContent = 'heard - fix anything on the keyboard, or Dictate more';
+        try { area.focus(); } catch (e) {}
+      };
+      try { listen(); } catch (err) { note.textContent = 'could not listen: ' + (err && err.message || err); capture = null; }
+    });
+    btn('Send to the inbox', 'background:#1d4d5a;border-color:#2c7a8c', function (b) {
+      var text = area.value.trim();
+      if (!text) { note.textContent = 'there is nothing to send yet'; return; }
+      b.disabled = true;
+      note.textContent = 'sending...';
+      Promise.resolve(api().post('/api/pine-requests', {text: text, debug: !!debug.checked}))
+        .then(function (got) {
+          var id = got && got.submitted && got.submitted.id;
+          var said = 'Filed as Pine report #' + id + '.';
+          note.textContent = said;
+          announce(said);
+          try { speak(said); } catch (e) {}
+          setTimeout(padClose, 1600);
+        }, function (err) {
+          b.disabled = false;
+          note.textContent = 'the station refused it: ' + ((err && err.message) || err);
+        });
+    });
+    btn('Cancel', '', function () { padClose(); announce('Report cancelled.'); });
+    pad.appendChild(head);
+    pad.appendChild(hint);
+    pad.appendChild(area);
+    pad.appendChild(debugRow);
+    pad.appendChild(row);
+    pad.appendChild(note);
+    document.body.appendChild(pad);
+    /* The sentence that opened the pad may carry the report already:
+       "make a pine report: the sampler is silent". Keep what follows. */
+    var body = String(heard || '').replace(/^.*?\breport\b[\s:,.-]*/i, '').trim();
+    if (body.split(/\s+/).length >= 3) area.value = body;
+    note.textContent = body ? 'that is what was heard after "report" - edit it, or Dictate more' : 'press Dictate and say the report';
+    try { (body ? area : dictate).focus(); } catch (e) {}
+  }
+
   async function act(text) {
+    /* 2026-09-14: the pad first. A capture takes the sentence as text;
+     * a request for a report opens the pad; neither reaches the model. */
+    if (capture) {
+      var take = capture;
+      capture = null;
+      setState(IDLE);
+      announce('Heard: "' + text + '"');
+      try { take(text); } catch (err) { /* the pad still stands */ }
+      release(400);
+      return;
+    }
+    if (wantsReport(text)) {
+      setState(IDLE);
+      announce('A Pine report - dictate it, then send it.');
+      reportOpen(text);
+      release(400);
+      return;
+    }
     setState(THINKING);
     /* Tell him it understood BEFORE the thinking starts. The answer can
      * take seconds; being told you were heard should not wait for it. */
@@ -998,6 +1131,8 @@
      * assemble, ask, answer, speak. Anything that bypassed it would be a
      * second, quietly different experience. */
     act: act,
+    /* 2026-09-14: the report pad, for a button or a test. */
+    report: reportOpen,
     state: function () { return state; }
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineTalkDot;

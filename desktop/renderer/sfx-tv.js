@@ -633,6 +633,16 @@
     });
     host.addEventListener('pointercancel', forget);
 
+    /* 2026-09-14: "I'm not able to right click it and have an option to
+     * full screen it." On the desk a right-click is the menu gesture, so
+     * it opens the same sheet a tap opens (and closes an open one). */
+    host.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (sheetHeld()) { sheetClose(); return; }
+      if (playing) sheet(playing);
+    });
+
     host.appendChild(screen);
     grip(host);
     /* A sibling of <main>, never inside a view: that is the whole reason
@@ -1042,7 +1052,9 @@
     var id = clipId(clip);
     if (!id) { say('no id on this clip'); return; }
     post('/api/sfx/delete', {id: id}).then(
-      function () { say('deleted'); if (done) done(); },
+      /* 2026-09-14: the station says HOW it was deleted - unlinked here,
+         or handed to the desk because the share is read-only to it. */
+      function (got) { say(String((got && got.say) || 'deleted')); if (done) done(); },
       function (err) { say(String((err && err.message) || err).slice(0, 40)); });
   }
 

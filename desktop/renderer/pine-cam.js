@@ -189,7 +189,7 @@
       + '<b>PINE CAM</b>'
       + '<i id="pineCamWhy"></i>'
       + '<button type="button" class="pine-cam-x" '
-      + 'aria-label="Close the camera view">×</button>'
+      + 'aria-label="Close the camera view" title="Close the camera view">×</button>'
       + '</div>'
       + '<img id="pineCamImg" alt="The Pine Cam, live">';
     document.body.appendChild(box);
@@ -199,12 +199,18 @@
     return box;
   }
 
+  /* 2026-09-14: THE CACHE-BUSTER WORE THE TOKEN'S NAME. `?t=` is the
+   * frame route's viewer-token parameter (#1354), so every request from
+   * the desk read as a guest holding the token '1789...' and got 403 -
+   * 'the camera is not being shared with you' - measured from the PC.
+   * The tablet never saw it only because its loopback door needs no
+   * token. The buster is `?c=` now, on both pictures. */
   function paintFrame() {
     var img = document.getElementById('pineCamImg');
     if (!img || !shown) return;
     /* A cache-buster, because the frame is one URL that keeps changing and
      * every layer between here and the disk would happily hold on to it. */
-    img.src = base() + '/api/pinelink/frame.jpg?t=' + Date.now();
+    img.src = base() + '/api/pinelink/frame.jpg?c=' + Date.now();
   }
 
   function open() {
@@ -314,6 +320,7 @@
       : stale ? 'link stale - supervisor silent ' + silentSay
       : seen ? 'on the network - joining'
         : state === 'no-link' ? 'not on the network' : (state || 'looking…');
+    paintBars(isLive, seen, stale, Number(got.signal || 0));
     if (!stats) return;
     var mb = Math.round(Number(got.kept_bytes || 0) / 1048576);
     var rows = [
@@ -374,7 +381,7 @@
   function paintPipFrame() {
     if (!pip || !pip.isConnected || !live) return;
     var img = pip.querySelector('img');
-    if (img) img.src = base() + '/api/pinelink/frame.jpg?t=' + Date.now();
+    if (img) img.src = base() + '/api/pinelink/frame.jpg?c=' + Date.now();
   }
 
   function paintPip(stats, isLive) {
@@ -398,6 +405,47 @@
     }
     if (pip.parentNode !== stats) stats.appendChild(pip);
     if (!pipTimer) { paintPipFrame(); pipTimer = setInterval(paintPipFrame, FRAME_MS); }
+  }
+
+  /* 2026-09-14: "I want to see signal bars growing on this whenever it's
+   * searching for an element on the network and I want to be able to
+   * click it and be able to bring up a pop-up that allows me to find out
+   * more detailed information." Five bars on the card header: sweeping
+   * while the radio is looking, lit to the signal once the camera is
+   * seen, all lit and still once the link is live. A click opens the
+   * ladder (#1118) - the detailed account - without folding the row. */
+  function paintBars(isLive, seen, stale, signal) {
+    var row = document.getElementById('pineCamRow');
+    if (!row) return;
+    var bars = document.getElementById('pineCamBars');
+    if (!bars) {
+      bars = document.createElement('span');
+      bars.id = 'pineCamBars';
+      bars.className = 'pine-cam-bars';
+      bars.title = 'The radio, the scan, the link - click for the whole ladder';
+      bars.setAttribute('role', 'button');
+      for (var i = 0; i < 5; i += 1) {
+        var b = document.createElement('i');
+        b.style.height = (4 + i * 2) + 'px';
+        b.style.animationDelay = (i * 0.15) + 's';
+        bars.appendChild(b);
+      }
+      bars.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        try { openLadder(); } catch (e) { /* the row still folds by itself */ }
+      });
+      var brief = document.getElementById('pineCamBrief');
+      if (brief && brief.parentNode === row) row.insertBefore(bars, brief);
+      else row.appendChild(bars);
+    }
+    var lit = isLive ? 5 : (seen ? Math.max(1, Math.min(5, Math.ceil(signal / 20))) : 0);
+    bars.classList.toggle('searching', !isLive && !seen && !stale);
+    bars.classList.toggle('live', !!isLive);
+    bars.classList.toggle('stale', !!stale);
+    for (var k = 0; k < bars.children.length; k += 1) {
+      bars.children[k].classList.toggle('lit', k < lit);
+    }
   }
 
   /* --------------------------------------------------- the viewers */
@@ -970,7 +1018,7 @@
     prefsEl.className = 'pine-cam-prefs';
     prefsEl.innerHTML =
       '<div class="pine-cam-bar"><b>PINE CAM - WHERE THE CLIPS GO</b><i></i>'
-      + '<button type="button" class="pine-cam-x" aria-label="Close">×</button></div>'
+      + '<button type="button" class="pine-cam-x" aria-label="Close" title="Close">×</button></div>'
       + '<div class="pcp-body">'
       + '<label class="pcp-h" for="pineCamPrefKeep">Kept at</label>'
       + '<input id="pineCamPrefKeep" type="text" spellcheck="false" '
@@ -1338,7 +1386,7 @@
     ladderEl.innerHTML =
       '<div class="pine-cam-bar pcl-head"><b>PINE CAM - THE LADDER</b>'
       + '<i id="pineCamLadderLive"></i>'
-      + '<button type="button" class="pine-cam-x" aria-label="Close the ladder">×</button></div>'
+      + '<button type="button" class="pine-cam-x" aria-label="Close the ladder" title="Close the ladder">×</button></div>'
       + '<div class="pcl-bar">'
       + '<button type="button" id="pineCamLadderAll" '
       + 'title="Read the ladder and press each rung\'s fix in order, stopping at the first that stays red">'
@@ -1421,7 +1469,7 @@
       + '</b><span>'
       + (isLive ? 'tap to watch it' : 'tap to watch when it joins')
       + '</span></div>'
-      + '<button type="button" class="pine-cam-x" aria-label="Dismiss">×</button>';
+      + '<button type="button" class="pine-cam-x" aria-label="Dismiss" title="Dismiss">×</button>';
     toast.querySelector('.pine-cam-x').addEventListener('click', function (ev) {
       ev.stopPropagation();
       toastWaitUntil = 0;

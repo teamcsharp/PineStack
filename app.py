@@ -6835,13 +6835,33 @@ PINE_CONVERSATION_SECONDS = 600.0
 PINE_REQUEST_QUESTION = "What would you like to say for your Pine Box request?"
 _PINE_REQUEST_COMMAND = re.compile(
     r"^(?:(?:hey[, ]+)?(?:pine\s*box[, ]+)?|please\s+)?"
-    r"(?:(?:i(?:'d| would| want to| would like to)|can (?:i|you)|"
-    r"could (?:i|you)|let me|help me)\s+)?"
-    r"(?:like to\s+)?(?:file|submit|make|create|send|add)\s+"
-    r"(?:a\s+|an? new\s+|the\s+)?pine\s*box\s+request"
+    r"(?:(?:i(?:'d| would| want to| would like to| need to| wanna)|can (?:i|you)|"
+    r"could (?:i|you)|let me|help me|let'?s)\s+)?"
+    r"(?:like to\s+)?(?:file|submit|make|create|send|add|start|open|write|log)\s+"
+    r"(?:a\s+|an? new\s+|the\s+|another\s+|my\s+)?(?:pine\s*(?:box\s+)?)?(?:request|report)"
     r"(?:\s*(?:[:\-]|saying\b|that\s+says\b)\s*(?P<body>.+)|[.!?\s]*)$",
     re.I | re.S,
 )
+# 2026-09-14: "make a pine report from any device by saying 'I'd like to file
+# a report' ... it goes into the pine box inbox after I dictate it and confirm
+# it. On the nabu / pine box I can't edit so it has to just be sent after
+# dictation." So: the ask, the dictation, a READ-BACK with a yes/no, and only
+# then the file - with the station's account of the moment (#1379) on it,
+# which the old spoken road never attached.
+PINE_CONFIRM_TAIL = " Say yes to file it, or no to cancel."
+_PINE_YES = re.compile(
+    r"^(?:yes|yeah|yep|yup|sure|ok(?:ay)?|send it|file it|do it|confirm|"
+    r"go ahead|please do|that'?s right|correct)[.!\s]*$", re.I)
+_PINE_NO = re.compile(
+    r"^(?:no|nope|cancel|never mind|nevermind|forget it|stop|don'?t|"
+    r"scrap it|discard(?: it)?|drop it)[.!\s]*$", re.I)
+
+
+async def _pine_with_context(text: str) -> str:
+    try:
+        return (str(text) + await pine_context_block()).strip()
+    except Exception:  # noqa: BLE001
+        return str(text)
 
 
 async def pine_conversation(messages: list[dict[str, Any]],
@@ -6852,39 +6872,65 @@ async def pine_conversation(messages: list[dict[str, Any]],
     send one turn at a time, so their scoped session holds the question for
     ten minutes. No unscoped process-wide pending request can swallow another
     listener's next sentence.
+
+    2026-09-14: three states rather than one. ASKED ("what would you like to
+    say"), then DRAFTED - the dictation is read back with a yes/no - then
+    FILED. "yes" files the draft with the station's state attached; "no"
+    cancels; anything else is taken as more of the report and read back
+    again, so a Nabu that cannot edit still gets to add a sentence.
     """
     text = latest_user_text(messages).strip()
     if not text:
         return None
     now = time.time()
-    for old, until in list(_PINE_CONVERSATIONS.items()):
-        if until < now:
+    for old, row in list(_PINE_CONVERSATIONS.items()):
+        until = row.get("until") if isinstance(row, dict) else row
+        if float(until or 0) < now:
             _PINE_CONVERSATIONS.pop(old, None)
     last_user = max((i for i, m in enumerate(messages)
                      if m.get("role") == "user"), default=-1)
     previous = next((m for m in reversed(messages[:last_user])
                      if m.get("role") in ("assistant", "user")), {})
-    pending = (previous.get("role") == "assistant"
-               and str(previous.get("content") or "").strip()
-               == PINE_REQUEST_QUESTION)
-    pending = pending or bool(session and session in _PINE_CONVERSATIONS)
+    prev_text = (str(previous.get("content") or "").strip()
+                 if previous.get("role") == "assistant" else "")
+    row = _PINE_CONVERSATIONS.get(session) if session else None
+    if row is not None and not isinstance(row, dict):
+        row = {"until": float(row), "draft": ""}
+    pending = (bool(row) or prev_text == PINE_REQUEST_QUESTION
+               or prev_text.endswith(PINE_CONFIRM_TAIL))
     command = _PINE_REQUEST_COMMAND.fullmatch(text)
     body = str(command.group("body") or "").strip() if command else ""
     if command and not body:
         if session:
-            _PINE_CONVERSATIONS[session] = now + PINE_CONVERSATION_SECONDS
+            _PINE_CONVERSATIONS[session] = {"until": now + PINE_CONVERSATION_SECONDS,
+                                            "draft": ""}
         return {"reply": PINE_REQUEST_QUESTION, "state": "awaiting_request"}
     if not command and not pending:
         return None
-    if pending and re.fullmatch(r"(?:cancel|never mind|nevermind|forget it|stop)[.!\s]*",
-                                text, re.I):
+    draft = str((row or {}).get("draft") or "")
+    if not draft and prev_text.endswith(PINE_CONFIRM_TAIL):
+        # A client that carries its own history: the draft is in the
+        # read-back it just heard.
+        head = prev_text[:-len(PINE_CONFIRM_TAIL)]
+        got = re.search(r'Filing this Pine report: "(.*)"\.?\s*$', head, re.S)
+        draft = got.group(1).strip() if got else ""
+    if pending and _PINE_NO.fullmatch(text):
         _PINE_CONVERSATIONS.pop(session, None)
-        return {"reply": "Cancelled. No Pine Box request was filed.",
+        return {"reply": "Cancelled. No Pine report was filed.",
                 "state": "cancelled"}
-    item = await pine_append(body or text)
-    _PINE_CONVERSATIONS.pop(session, None)
-    return {"reply": f"Filed Pine Box request #{item['id']} in the inbox.",
-            "state": "submitted", "submitted": item}
+    if draft and _PINE_YES.fullmatch(text):
+        item = await pine_append(await _pine_with_context(draft))
+        _PINE_CONVERSATIONS.pop(session, None)
+        return {"reply": f"Filed Pine report #{item['id']} in the inbox.",
+                "state": "submitted", "submitted": item}
+    new_draft = body or text
+    if draft and not body:
+        new_draft = (draft + " " + text).strip()
+    if session:
+        _PINE_CONVERSATIONS[session] = {"until": now + PINE_CONVERSATION_SECONDS,
+                                        "draft": new_draft}
+    return {"reply": f'Filing this Pine report: "{new_draft}".' + PINE_CONFIRM_TAIL,
+            "state": "awaiting_confirm", "draft": new_draft}
 
 
 def pine_conversation_session(request: Request, payload: dict[str, Any]) -> str:
@@ -102524,7 +102570,11 @@ async def dj_video_api(
     require_read_auth(authorization)
     server_ms = int(time.time() * 1000)
     cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
-    if radio_paused():
+    # 2026-09-14: "allow me to use endless video mode even if the station
+    # is on pause ... endless video mode as a screensaver" while the rooms
+    # bank the show. The pause gate stands for the station's own stings;
+    # the endless set is the operator's explicit choice and rolls on.
+    if radio_paused() and not sfx_video_mode_on():
         return {"clips": [], "server_ms": server_ms,
                 "cut_ms": cut_ms, "paused": True}
     out = []
@@ -118275,6 +118325,20 @@ def courier_add(path: Path, dest: str, what: str = "broadcast") -> dict[str, Any
     return row
 
 
+def courier_add_delete(paths: list[str], name: str) -> dict[str, Any]:
+    """A DELETE the desk owes: files on a share this container cannot
+    write, in the share's own spelling."""
+    row = {"id": uuid.uuid4().hex[:10], "name": name, "what": "delete",
+           "paths": [str(p) for p in paths], "dest": "", "path": "",
+           "at": time.time(), "state": "pending", "bytes": 0}
+    with _COURIER_LOCK:
+        rows = courier_read()
+        rows.append(row)
+        courier_write(rows)
+    pipeline_log("air", "courier: delete %s owed (%d file(s))" % (name, len(paths)))
+    return row
+
+
 def courier_pending() -> list[dict[str, Any]]:
     """What the desk owes: the export ledger's pending rows, plus - when the
     Pine Cam preference says carry - every kept clip newer than the last
@@ -118283,6 +118347,10 @@ def courier_pending() -> list[dict[str, Any]]:
         rows = [r for r in courier_read() if r.get("state") == "pending"]
     out: list[dict[str, Any]] = []
     for r in rows:
+        if r.get("what") == "delete":
+            out.append({"id": r["id"], "name": r["name"], "what": "delete",
+                        "paths": list(r.get("paths") or []), "at": r.get("at")})
+            continue
         if Path(str(r.get("path") or "")).is_file():
             out.append({"id": r["id"], "name": r["name"], "dest": r["dest"],
                         "what": r.get("what"), "at": r.get("at"),
@@ -119544,6 +119612,9 @@ PUBLIC_ENABLED = os.getenv("SPARK_PUBLIC_LISTEN", "true").lower() in (
 _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                # #1263: which picture is up. Tiny, and audio-free.
                "/api/dj/video",
+               # #1264: installed to a home screen, it has to be able
+               # to fetch its own manifest and icon.
+               "/manifest.webmanifest",
                "/api/radio/clock",
                # #1253: the broadcast stream. This is the road a car
                # actually uses - one socket, held open, mixed here.
@@ -119571,7 +119642,8 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
 # refused its own assets. /icons serves two named files and takes no
 # auth at all; the picture road is read-only and now takes the same
 # tune-in token as everything else on this page.
-_PUBLIC_GET_PREFIX = ("/tune/", "/media/", "/music/", "/data/vendor/",
+_PUBLIC_GET_PREFIX = ("/app-icon-", "/tune/", "/media/", "/music/",
+                      "/data/vendor/",
                       "/icons/", "/api/generations/image/",
                       # #1253: the HLS segments an iPhone asks for.
                       "/hls/",
@@ -119839,6 +119911,7 @@ async def station_stream_mp3(
     request: Request,
     t: str = "",
     br: str = "",
+    split: int = 0,
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The broadcast, as one continuous mp3. Open it in a car.
@@ -119856,7 +119929,12 @@ async def station_stream_mp3(
     # #1253: the listener chooses the quality, exactly as they have for
     # the clips since #999. One mix, several encoders - a phone on 48k
     # and a desktop on 128k share every decode behind them.
-    sink = STATION_STREAM.attach(br)
+    # #1265: `split` sends the mix UNMIXED - record left, DJs right - so
+    # the listener's own browser can balance the two instantly. A mixer
+    # that is thirty seconds ahead of the ear cannot do that job; see the
+    # note in station_stream. Plain /stream.mp3 is untouched, because a
+    # head unit opening the .m3u has no Web Audio to undo a split with.
+    sink = STATION_STREAM.attach(br, split=bool(split))
 
     async def body() -> Any:
         since = 0
@@ -119933,6 +120011,7 @@ async def station_stream_hls(
     request: Request,
     t: str = "",
     br: str = "",
+    split: int = 0,
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The broadcast as HLS. This is the road an iPhone should take.
@@ -119955,7 +120034,7 @@ async def station_stream_hls(
     # exists, `ready()` is one stat and the playlist is a few hundred
     # bytes. All three cost the loop far less than a round trip through
     # a pool that 407 other call sites are hammering.
-    enc = STATION_STREAM.hls(br)
+    enc = STATION_STREAM.hls(br, split=bool(split))
     # The first playlist takes a moment to exist; the backlog prime means
     # it arrives with several segments already in it.
     for _ in range(40):
@@ -119970,10 +120049,13 @@ async def station_stream_hls(
     # ffmpeg writes bare segment names. They have to come back as URLs on
     # this door, carrying the same token the playlist itself needed.
     suffix = f"?t={quote(t)}" if t else ""
+    # The split variant is its own segment folder, so a listener on one
+    # shape can never be handed a segment of the other.
+    lane = f"{enc.bitrate}s" if enc.split else str(enc.bitrate)
     out = []
     for line in raw.splitlines():
         if line and not line.startswith("#"):
-            out.append(f"/hls/{enc.bitrate}/{line}{suffix}")
+            out.append(f"/hls/{lane}/{line}{suffix}")
         else:
             out.append(line)
     return Response(
@@ -119985,7 +120067,7 @@ async def station_stream_hls(
 
 @app.get("/hls/{rate}/{name}")
 async def station_stream_hls_segment(
-    rate: int,
+    rate: str,
     name: str,
     t: str = "",
     authorization: str | None = Header(default=None),
@@ -119995,7 +120077,11 @@ async def station_stream_hls_segment(
     require_listen_auth(t, authorization)
     if not re.fullmatch(r"seg\d{1,8}\.(ts|aac|m4s)", name):
         return Response(status_code=404)
-    enc = STATION_STREAM.hls_existing(int(rate))
+    if not re.fullmatch(r"\d{2,3}s?", str(rate)):
+        return Response(status_code=404)
+    lane_split = str(rate).endswith("s")
+    enc = STATION_STREAM.hls_existing(
+        int(str(rate).rstrip("s")), split=lane_split)
     if enc is None:
         return Response(status_code=404)
     path = enc.dir / name
@@ -120047,6 +120133,90 @@ async def station_stream_state(
     """
     require_listen_auth(t, authorization)
     return STATION_STREAM.state()
+
+
+PWA_ICON_SIZES = (180, 192, 512)
+
+
+def _pwa_icon_png(size: int) -> bytes:
+    """The app mark: single-colour, geometric, Carbon idiom.
+
+    Drawn rather than shipped, so it cannot drift out of step with the
+    icon language - and deliberately monochrome, because the operator
+    asked for no colour icons anywhere in this application. A broadcast
+    mark: a centre dot with two arcs either side.
+    """
+    from PIL import Image, ImageDraw
+
+    s = int(size)
+    img = Image.new("RGBA", (s, s), (4, 6, 11, 255))
+    d = ImageDraw.Draw(img)
+    ink = (232, 240, 248, 255)
+    cx = cy = s / 2
+    # Carbon draws on a 32px grid with a 2px stroke; scale that up.
+    stroke = max(2, round(s * 2 / 32))
+    d.ellipse([cx - stroke * 1.6, cy - stroke * 1.6,
+               cx + stroke * 1.6, cy + stroke * 1.6], fill=ink)
+    for i, r in enumerate((s * 0.17, s * 0.28, s * 0.39)):
+        box = [cx - r, cy - r, cx + r, cy + r]
+        w = max(1, stroke - (1 if i == 2 else 0))
+        d.arc(box, start=-58, end=58, fill=ink, width=w)
+        d.arc(box, start=122, end=238, fill=ink, width=w)
+    from io import BytesIO
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+_PWA_ICON_CACHE: dict[int, bytes] = {}
+
+
+@app.get("/app-icon-{size}.png")
+async def pwa_icon(size: int) -> Response:
+    """The home-screen icon. No auth: it is a monochrome logo, and iOS
+    fetches it without the credentials the page was opened with."""
+    if size not in PWA_ICON_SIZES:
+        return Response(status_code=404)
+    got = _PWA_ICON_CACHE.get(size)
+    if got is None:
+        try:
+            got = await asyncio.to_thread(_pwa_icon_png, size)
+        except Exception:  # noqa: BLE001
+            return Response(status_code=404)
+        _PWA_ICON_CACHE[size] = got
+    return Response(content=got, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/manifest.webmanifest")
+async def pwa_manifest(t: str = "") -> Response:
+    """Installs the station as a standalone app.
+
+    `start_url` carries the tune-in token, because the icon on a home
+    screen has no other way to remember which link it was installed
+    from - and without it the app opens to a 403 the next morning.
+    """
+    tail = f"?t={quote(t)}" if t else ""
+    body = {
+        "name": "Pine Box FM",
+        "short_name": "Pine Box",
+        "description": "The house station.",
+        "start_url": (f"/tune/{quote(t)}" if t else "/"),
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "any",
+        "background_color": "#04060b",
+        "theme_color": "#04060b",
+        "icons": [
+            {"src": f"/app-icon-{n}.png{tail}", "sizes": f"{n}x{n}",
+             "type": "image/png",
+             "purpose": "any maskable"} for n in PWA_ICON_SIZES
+        ],
+    }
+    return Response(content=json.dumps(body, indent=1),
+                    media_type="application/manifest+json",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/tune/{token}")
@@ -121990,14 +122160,57 @@ async def sfx_delete_api(
     if not path or not path.is_file():
         raise HTTPException(status_code=404, detail="No such sample")
     name = path.name
-    try:
-        path.unlink()
-    except OSError as exc:
-        raise HTTPException(status_code=500,
-                            detail=f"Could not delete it: {exc}")
+    # 2026-09-14: "if I delete the MP four, I also want to delete the MP
+    # three ... I treat them as a set" - and "it gave me an error thirty":
+    # errno 30 is EROFS. The clip lives on the QuickSwap share, which is
+    # mounted READ-ONLY in this container, so the station cannot unlink
+    # it however hard it tries. What can is the desk: the courier ledger
+    # (#1114) gets a delete job naming every file of the set in the
+    # share's own spelling, the id is banned so nothing draws it in the
+    # meantime, and the book forgets the rows.
+    mates: list[Path] = [path]
+    for ext in (".mp3", ".mp4", ".wav", ".m4a", ".webm", ".mov", ".m4v",
+                ".ogg", ".flac", ".aac"):
+        try:
+            twin = path.with_suffix(ext)
+            if twin != path and twin.is_file():
+                mates.append(twin)
+        except Exception:  # noqa: BLE001
+            continue
+    removed: list[str] = []
+    carried: list[str] = []
+    for one in mates:
+        try:
+            one.unlink()
+            removed.append(one.name)
+        except OSError:
+            unc = share_path_of(one)
+            if unc:
+                carried.append(unc)
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Could not delete {one.name}: the folder is "
+                           "read-only here and not on a share the desk "
+                           "can reach")
     sfx_ban_set(sid, True)          # so nothing re-picks it this session
-    pipeline_log("air", f"sample deleted from the shelf — {name} (#703)")
-    return {"deleted": sid, "name": name}
+    for one in mates:
+        try:
+            sfx_ban_set(sfx_id(one), True)
+        except Exception:  # noqa: BLE001
+            pass
+    sfx_db_forget([str(p) for p in mates])
+    job = None
+    if carried:
+        job = courier_add_delete(carried, name)
+    pipeline_log("air", "sample deleted from the shelf — %s%s%s (#703)"
+                 % (name, (" removed: " + ", ".join(removed)) if removed else "",
+                    (" - the desk removes: " + ", ".join(carried)) if carried else ""))
+    say = ("deleted" if not carried else
+           "banned now; the desk deletes %d file(s) from the share within "
+           "half a minute" % len(carried))
+    return {"deleted": sid, "name": name, "removed": removed,
+            "carried": carried, "job": (job or {}).get("id"), "say": say}
 
 
 @app.get("/api/sfx/review")
@@ -127964,6 +128177,34 @@ async def sfx_video_cue_api(
 
 
 
+def sfx_natural_key(name: str) -> tuple[Any, ...]:
+    """'2199 clip', '2200 out real' - the grabbed clips are numbered in the
+    order they were cut, so the number leads and the words break ties."""
+    got = re.match(r"\s*(\d+)(.*)$", str(name or ""))
+    if got:
+        return (0, int(got.group(1)), got.group(2).strip().lower())
+    return (1, 0, str(name or "").lower())
+
+
+def sfx_db_forget(paths: list[str]) -> int:
+    """Take rows out of the clip book - a deleted file must not be drawn."""
+    if not paths:
+        return 0
+    import sqlite3
+    try:
+        with _SFX_DB_LOCK:
+            con = sqlite3.connect(str(SFX_DB_PATH))
+            try:
+                cur = con.executemany("DELETE FROM clips WHERE path = ?",
+                                      [(str(p),) for p in paths])
+                con.commit()
+                return int(cur.rowcount or 0)
+            finally:
+                con.close()
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 @app.get("/api/sfx/video/neighbour")
 async def sfx_video_neighbour_api(
     id: str = "",
@@ -127976,10 +128217,20 @@ async def sfx_video_neighbour_api(
      the next video in that folder"; "if I expand it to say seven, it
      plays that clip and the next seven clips in a row sequentially".
 
-    Folder order is name order, wrapping at the ends; banned clips and
-    clips too short to count are skipped. Nothing is rung here - the set
-    that asked plays it and rings it through /api/sfx/video/cut, exactly
-    as a sampler pad does, so every other surface follows."""
+    ANSWERED FROM THE BOOK, NOT THE SHARE. The first build walked the
+    folder with iterdir() - measured on the tablet: the grabbed-clips
+    folder holds 18,570 files on a CIFS mount, `ls` of it takes over a
+    minute, the tablet's bridge gives up at 20 s, and the run printed
+    'timeout' and stopped. The clip book (sfx_clips.db) already lists
+    every clip with its folder and name, so the neighbour is one local
+    query and a sort. The folder walk is only the fallback for a folder
+    the book has not indexed yet.
+
+    Order is NATURAL - the leading number first ('2199 clip', '2200 out
+    real'), which is the order the clips were cut in - wrapping at the
+    ends; banned clips are skipped. Nothing is rung here: the set that
+    asked plays it and rings it through /api/sfx/video/cut, exactly as a
+    sampler pad does, so every other surface follows."""
     require_read_auth(authorization)
     here = sfx_by_id(str(id or ""))
     if here is None:
@@ -127988,37 +128239,53 @@ async def sfx_video_neighbour_api(
 
     def _pick() -> dict[str, Any]:
         folder = here.parent
-        rows = sorted((p for p in folder.iterdir()
-                       if p.is_file() and p.suffix.lower() in SFX_VIDEO_TYPES),
-                      key=lambda p: p.name.lower())
+        rows: list[tuple[str, str, float]] = []      # (path, name, seconds)
+        try:
+            con = sfx_db_reader()
+            if con is not None:
+                with _SFX_DB_LOCK:
+                    got = con.execute(
+                        "SELECT path, name, seconds FROM clips WHERE folder = ? "
+                        "AND video = 1 AND playable = 1", (folder.name,)).fetchall()
+                rows = [(str(r[0]), str(r[1]), float(r[2] or 0)) for r in got
+                        if str(r[0]).startswith(str(folder))]
+        except Exception:  # noqa: BLE001
+            rows = []
+        if len(rows) < 2:
+            # The slow road, for a folder the book has not reached.
+            try:
+                rows = [(str(p), p.stem, 0.0) for p in folder.iterdir()
+                        if p.is_file() and p.suffix.lower() in SFX_VIDEO_TYPES]
+            except Exception:  # noqa: BLE001
+                rows = []
         if not rows:
             return {"ok": False, "clip": None, "say": "the folder is empty"}
-        names = [p.name for p in rows]
-        try:
-            at = names.index(here.name)
-        except ValueError:
-            at = -1
+        rows.sort(key=lambda r: sfx_natural_key(r[1]))
+        paths = [r[0] for r in rows]
+        at = paths.index(str(here)) if str(here) in paths else -1
         bans = sfx_bans()
         step = -1 if back else 1
         for hop in range(1, len(rows) + 1):
-            cand = rows[(at + step * hop) % len(rows)]
+            ix = (at + step * hop) % len(rows)
+            cand = Path(rows[ix][0])
             key = sfx_id(cand)
             if key in bans:
                 continue
-            try:
-                if cand.stat().st_size < 4096:
+            secs = rows[ix][2]
+            if not secs:
+                try:
+                    if cand.stat().st_size < 4096:
+                        continue
+                    secs = round(sfx_seconds(cand), 2)
+                except OSError:
                     continue
-            except OSError:
-                continue
-            secs = round(sfx_seconds(cand), 2)
-            return {"ok": True, "index": (at + step * hop) % len(rows),
-                    "count": len(rows), "folder": folder.name,
+            return {"ok": True, "index": ix, "count": len(rows),
+                    "folder": folder.name,
                     "clip": {"url": f"/sfx/{key}?t={media_sign(key)}",
                              "text": "", "sting": cand.stem, "video": True,
-                             "seconds": secs, "id": key},
+                             "seconds": round(float(secs), 2), "id": key},
                     "say": "%s (%d of %d in %s)"
-                           % (cand.stem, ((at + step * hop) % len(rows)) + 1,
-                              len(rows), folder.name)}
+                           % (cand.stem, ix + 1, len(rows), folder.name)}
         return {"ok": False, "clip": None,
                 "say": "every other clip in %s is banned or empty" % folder.name}
 
@@ -148851,7 +149118,10 @@ async def pine_submit(
     # #1379: the station's own account of the moment rides on every
     # report, BEFORE the attachments, so _PINE_ATTACH_RE still finds
     # them at the end and _pine_gist still folds a repeat.
-    if text:
+    # 2026-09-14: "asking me whether or not I wanted to add debug
+    # information to the report" - the panel sends `debug`; absent means
+    # yes, so every older sender keeps the block.
+    if text and bool(payload.get("debug", True)):
         try:
             text = (text + await pine_context_block()).strip()
         except Exception:  # noqa: BLE001
@@ -148889,6 +149159,45 @@ async def pine_submit(
     except Exception:
         pass
     return {"submitted": item, "count": len(pine_read())}
+
+
+@app.put("/api/pine-requests/{req_id}")
+async def pine_edit(
+    req_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-14: "double click reports in the pine inbox and edit them ...
+    delete / discard diagnostics info from the report (if its irrelevant)".
+
+    {"text": "<the whole body>"} replaces the item's text; {"drop_debug":
+    true} strips the '### Station at the time' block and keeps the
+    attachments. The file is the canonical store, so it is rewritten under
+    the same lock every other writer takes."""
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    async with _pine_lock:
+        items = pine_read()
+        it = next((r for r in items if int(r.get("id") or 0) == int(req_id)), None)
+        if it is None:
+            raise HTTPException(status_code=404, detail="No such request")
+        text = str(payload.get("text") if payload.get("text") is not None
+                   else it["text"])
+        if payload.get("drop_debug"):
+            tail = _pine_attachments(text)
+            text = text.split(PINE_CONTEXT_MARK)[0].rstrip()
+            if tail and tail not in text:
+                text = text + "\n\n" + tail.strip()
+        # a body line starting with "## #" would read as a new block
+        text = "\n".join(("\u200b" + ln) if ln.startswith("## #") else ln
+                         for ln in text.strip().split("\n"))
+        if not text:
+            raise HTTPException(status_code=400, detail="A request cannot be empty")
+        it["text"] = text
+        PINE_REQUESTS_PATH.write_text(_pine_render(items), encoding="utf-8")
+    note_action("you edited Pine request #%d" % int(req_id))
+    return {"ok": True, "edited": it, "count": len(items)}
 
 
 @app.post("/api/pine-requests/{req_id}/resolve")
@@ -152309,15 +152618,15 @@ and levels, properly labelled (#405)"
     <button aria-label="Have the DJ say something" class="act-refresh" title="Have the DJ say something"
             onclick="djSayMenu(event)">🗣</button>
     <button class="act-refresh" title="Play that last line again"
-            onclick="djReplay()">⟲</button>
+            onclick="djReplay()" aria-label="Play that last line again">⟲</button>
     <button class="act-refresh" title="Up next"
-            onclick="djPanel('djQueue')">▤</button>
+            onclick="djPanel('djQueue')" aria-label="Up next">▤</button>
     <button aria-label="Talk to the DJ" class="act-refresh" title="Talk to the DJ"
             onclick="djPanel('djChat')">💬</button>
     <button aria-label="What has been on" class="act-refresh" title="What has been on — play it again"
             onclick="djPanel('djPlayed')">🕘</button>
     <button class="act-refresh" title="Send the DJ home"
-            onclick="djToggleSession()">✕</button>
+            onclick="djToggleSession()" aria-label="Send the DJ home">✕</button>
   </span>
 </div>
 
@@ -152351,8 +152660,19 @@ links and restart the agent."
             title="Broadcast this station beyond the house — Tailscale
 status, and a link you can hand to somebody so they can tune in"
             onclick="remotePanel()"
-            style="font-size:15px;line-height:1;position:relative">🌐<span
+            style="font-size:15px;line-height:1;position:relative" aria-label="Broadcast this station beyond the house — Tailscale
+status, and a link you can hand to somebody so they can tune in">🌐<span
       id="remoteDot" style="position:absolute;right:3px;bottom:3px;width:7px;
+height:7px;border-radius:50%;background:#764"></span></button>
+    <!-- 2026-09-14: the endless video set, from the header - and allowed
+         while the station is paused: a screensaver over a banked show.
+         Flips /api/sfx/video/mode; the tube keeps rolling on a pause
+         because /api/dj/video no longer answers empty while it is on. -->
+    <button id="endlessBtn" class="pine-restart"
+            title="Endless video - the SFX guy's clips one after another, at random. On or off. It keeps going while the station is paused, as a screensaver while the rooms bank the show."
+            onclick="endlessToggle()"
+            style="font-size:15px;line-height:1;position:relative" aria-label="Endless video on or off">▶︎<span
+      id="endlessDot" style="position:absolute;right:3px;bottom:3px;width:7px;
 height:7px;border-radius:50%;background:#764"></span></button>
   </div>
 
@@ -152463,7 +152783,7 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
     <button id="voicePresetBtn" class="pine-restart"
             title="Speak the saved test sequence — every event voice in order"
             onclick="voicePresetRun()"
-            style="font-size:15px;line-height:1">▶︎</button>
+            style="font-size:15px;line-height:1" aria-label="Speak the saved test sequence — every event voice in order">▶︎</button>
     <select id="fontSelect" title="Interface font"
             onchange="applyFont(this.value)"
             style="width:auto;max-width:170px;flex:0 1 auto;min-width:0;
@@ -152496,11 +152816,11 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
          rewritten, tinted line by line, or sent straight to the recording
          room as it stands. The count is scripts nobody has looked at. -->
     <button id="scriptsBtn" class="tray-btn" title="Scripts prepared for the show"
-            onclick="scriptsOpen()" style="font-size:18px;line-height:1;position:relative">📝<span id="scriptsCount" class="tray-count"></span></button>
+            onclick="scriptsOpen()" style="font-size:18px;line-height:1;position:relative" aria-label="Scripts prepared for the show">📝<span id="scriptsCount" class="tray-count"></span></button>
     <!-- 2026-09-08: the retirement desk - every round about to leave the
          cupboard waits for a decision; rules by type; a life timer on each. -->
     <button id="retireBtn" class="tray-btn" title="The retirement desk — every round about to leave the cupboard waits here for your decision; the rules by type; a life timer on every item"
-            onclick="retireDeskOpen()" style="font-size:18px;line-height:1;position:relative">⏳<span id="retireCount" class="tray-count"></span></button>
+            onclick="retireDeskOpen()" style="font-size:18px;line-height:1;position:relative" aria-label="The retirement desk — every round about to leave the cupboard waits here for your decision; the rules by type; a life timer on every item">⏳<span id="retireCount" class="tray-count"></span></button>
     <button id="trayBtn" class="tray-btn" title="Everything that popped up"
             onclick="toggleTray()">
       <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor"
@@ -152571,7 +152891,7 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
 <div id="pbModal" class="pb-modal" style="display:none"
      onclick="if(event.target===this)closeModal()">
   <div class="pb-modal-card">
-    <button class="pb-modal-x" onclick="closeModal()">✕</button>
+    <button class="pb-modal-x" onclick="closeModal()" title="Close" aria-label="Close">✕</button>
     <div id="pbModalBody" class="pb-modal-body"></div>
   </div>
 </div>
@@ -152586,9 +152906,9 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
             onclick="showLastRender()">🖼</button>
     <span id="actStatus" class="act-status">Idle</span>
     <button class="act-refresh" title="Good reply — more like this"
-            onclick="sendVote('up')">▲</button>
+            onclick="sendVote('up')" aria-label="Good reply — more like this">▲</button>
     <button class="act-refresh" title="Bad reply — never talk like this again"
-            onclick="sendVote('down')">▼</button>
+            onclick="sendVote('down')" aria-label="Bad reply — never talk like this again">▼</button>
     <button id="filmRefresh" class="act-refresh"
             onclick="refreshFilmstrip()">↻ Refresh gallery</button>
     <button id="livePineRepair" class="act-refresh pine-live-repair"
@@ -152671,7 +152991,7 @@ then the tabloid, scrolling down the right half of the screen"
       <button class="primary" onclick="djConverse()">Start</button>
       <button id="djConverseHist" title="Past conversation starters"
               onclick="djConverseHistory()"
-              style="flex:0 0 auto">↺</button>
+              style="flex:0 0 auto" aria-label="Past conversation starters">↺</button>
     </div>
   </div>
   <div class="console">
@@ -152693,7 +153013,7 @@ then the tabloid, scrolling down the right half of the screen"
     <span id="tfMeta" class="muted"></span>
     <span class="tf-ask">
       <span class="tf-histwrap">
-        <button onclick="toggleTechHistory()" title="Past lookups">▾</button>
+        <button onclick="toggleTechHistory()" title="Past lookups" aria-label="Past lookups">▾</button>
         <div id="tfHistory" class="tf-history" style="display:none">
           <input id="tfHistFilter" placeholder="filter…"
                  oninput="renderTechHistory()">
@@ -152718,7 +153038,7 @@ then the tabloid, scrolling down the right half of the screen"
     <div class="db-tabs">
       <span class="prompt-quick">
         <button id="promptQuick" title="Switch system prompt"
-                onclick="togglePromptMenu()">▤</button>
+                onclick="togglePromptMenu()" aria-label="Switch system prompt">▤</button>
         <div id="promptMenu" class="prompt-menu" style="display:none"></div>
       </span>
       <button id="tabPrompt" class="on"
@@ -152745,7 +153065,7 @@ then the tabloid, scrolling down the right half of the screen"
             onclick="togglePromptCollapse()"
             style="position:absolute;top:0;right:0;background:none;border:0;
                    cursor:pointer;font-size:13px;opacity:.55;padding:2px 4px;
-                   line-height:1;z-index:2">●</button>
+                   line-height:1;z-index:2" aria-label="Collapse the system prompt area">●</button>
     <div id="promptBody">
     <label>Stored system prompt</label>
     <div class="row arrows">
@@ -153071,7 +153391,7 @@ then the tabloid, scrolling down the right half of the screen"
           <button id="panelSideBtn" title="Move this panel to the other side"
                   onclick="event.preventDefault();event.stopPropagation();
                            panelSideToggle()"
-                  style="font-size:12px;padding:2px 7px;margin-left:6px">⇄</button>
+                  style="font-size:12px;padding:2px 7px;margin-left:6px" aria-label="Move this panel to the other side">⇄</button>
           <!-- The desk's pulse (#305): what the DJs' pipeline is doing
                right now, and the trail of the last few minutes. -->
           <span id="pineActWord" class="muted"
@@ -153089,6 +153409,13 @@ border-radius:4px;background:var(--panel2)"></canvas>
         </p>
         <textarea id="pineInput" style="min-height:80px"
           placeholder="Ask the Borg to do something…"></textarea>
+        <!-- 2026-09-14: whether the station's own account of the moment
+             (#1379) rides on this report. Asked every time, answered by
+             the tick; on by default. -->
+        <label class="toggle" style="margin-top:6px" title="Attach the station's state at the time - what is playing, what is being said, the last five lines, the script position, the loop, the dead air, the tablet">
+          <input id="pineDebug" type="checkbox" checked>
+          Attach the station's debug information to this report
+        </label>
         <button class="primary" style="margin-top:10px"
                 onclick="submitPine()">Send request</button>
         <div id="pineStatus" class="status"></div>
@@ -153122,14 +153449,14 @@ border-radius:4px;background:var(--panel2)"></canvas>
             <select id="phraseSetName"></select>
             <button onclick="loadPhraseSet()" title="Load this set">Load</button>
             <button onclick="savePhraseSet()" title="Save current as a set">Save as…</button>
-            <button class="danger" onclick="deletePhraseSet()">✕</button>
+            <button class="danger" onclick="deletePhraseSet()" title="Delete this phrase set" aria-label="Delete this phrase set">✕</button>
           </div>
           <label>Spoken when a request is submitted
-            <button class="phrase-add" onclick="addPhrase('submit')">+</button>
+            <button class="phrase-add" onclick="addPhrase('submit')" title="Add a phrase" aria-label="Add a phrase">+</button>
           </label>
           <div id="pineSubmitList" class="phrase-list"></div>
           <label>Spoken when a request is completed
-            <button class="phrase-add" onclick="addPhrase('complete')">+</button>
+            <button class="phrase-add" onclick="addPhrase('complete')" title="Add a phrase" aria-label="Add a phrase">+</button>
           </label>
           <div id="pineCompleteList" class="phrase-list"></div>
           </div>
@@ -153196,7 +153523,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
         <div class="row">
           <select id="voiceEngine" onchange="describeEngine()"></select>
           <button onclick="loadVoiceEngines()"
-                  title="Re-check which engines are up">↻</button>
+                  title="Re-check which engines are up" aria-label="Re-check which engines are up">↻</button>
         </div>
         <div id="voiceEngineNote" class="muted"
              style="font-size:12px;margin:6px 0"></div>
@@ -153210,7 +153537,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
         <div class="row">
           <select id="voicePlayer"></select>
           <select id="replyPlayer" title="Response speaker"></select>
-          <button onclick="loadVoicePlayers()" title="Refresh speakers">↻</button>
+          <button onclick="loadVoicePlayers()" title="Refresh speakers" aria-label="Refresh speakers">↻</button>
         </div>
 
         <label>Voice</label>
@@ -153263,7 +153590,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
           <button aria-label="Hear this voice on the Pine Box" onclick="djTestVoice('djVoice')"
                   title="Hear this voice on the Pine Box">▶</button>
           <button id="djVoiceStar" onclick="djStarVoice('djVoice')"
-                  title="Keep this voice at the top of the list">☆</button>
+                  title="Keep this voice at the top of the list" aria-label="Keep this voice at the top of the list">☆</button>
         </label>
         <label class="film-size" style="flex:1;min-width:230px"
                title="The voice the co-host speaks in.">
@@ -153272,7 +153599,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
           <button aria-label="Hear this voice on the Pine Box" onclick="djTestVoice('djCohostVoice')"
                   title="Hear this voice on the Pine Box">▶</button>
           <button id="djCohostVoiceStar" onclick="djStarVoice('djCohostVoice')"
-                  title="Keep this voice at the top of the list">☆</button>
+                  title="Keep this voice at the top of the list" aria-label="Keep this voice at the top of the list">☆</button>
         </label>
         <span id="djVoiceStatus" class="muted" style="font-size:12px"></span>
       </div>
@@ -153485,6 +153812,7 @@ into every clip instead — the software volume knob for the box.">
         <span class="prompt-quick" style="position:relative">
           <button onclick="djRequestMenu(event)"
                   title="Every song requested and fulfilled — pick one to
+request it again" aria-label="Every song requested and fulfilled — pick one to
 request it again">▾</button>
         </span>
         <button onclick="djRequest(false)" title="Add to the queue">Queue</button>
@@ -153608,7 +153936,7 @@ Glass</button>
           <input id="adText" placeholder="What the DJ says…"
                  onkeydown="if(event.key==='Enter')saveAd()">
           <button class="primary" onclick="saveAd()">Add</button>
-          <button onclick="loadAds()" title="Refresh">↻</button>
+          <button onclick="loadAds()" title="Refresh" aria-label="Refresh">↻</button>
         </div>
         <div id="adsOutput" style="margin-top:10px;max-height:300px;
              overflow-y:auto"></div>
@@ -153654,7 +153982,7 @@ Glass</button>
             <span id="themeStrengthVal" class="val">70%</span>
           </label>
           <button onclick="themeDrop()" title="Forget the selected theme"
-                  style="font-size:12px">✕</button>
+                  style="font-size:12px" aria-label="Forget the selected theme">✕</button>
         </div>
         <!-- #766: ring in about ONE report off the shelf, chosen and read
              before you commit to it. -->
@@ -154038,7 +154366,7 @@ is banked for when you come back. This is not the FM switch."
         <button class="primary" onclick="musicSearch()">Find</button>
         <button aria-label="Everything you have searched for, newest" onclick="musicHistoryOpen()" title="Everything you have
 searched for, newest first — click one to run it again">🕘</button>
-        <button onclick="musicReindex()" title="Rescan the library">↻</button>
+        <button onclick="musicReindex()" title="Rescan the library" aria-label="Rescan the library">↻</button>
       </div>
       <div class="row" style="margin-top:8px">
         <button onclick="musicFlowToggle()" id="musicFlowBtn"
@@ -154078,7 +154406,7 @@ searched for, newest first — click one to run it again">🕘</button>
         <label class="muted" style="font-size:12px;align-self:center">Radio</label>
         <select id="radioStation" style="width:auto"></select>
         <button class="primary" onclick="radioTune()">Tune in</button>
-        <button class="danger" onclick="radioStop()">■</button>
+        <button class="danger" onclick="radioStop()" title="Stop the radio" aria-label="Stop the radio">■</button>
         <label class="toggle" style="margin:0;align-self:center">
           <input id="radioDJ" type="checkbox" checked> DJ
         </label>
@@ -154090,7 +154418,7 @@ searched for, newest first — click one to run it again">🕘</button>
                 title="Previous song">⏮</button>
         <audio id="musicPlayer" data-pine-live="music" controls playsinline></audio>
         <button class="tbtn" id="musicDownload" onclick="downloadTrack()"
-                title="Download the track that is playing">⤓</button>
+                title="Download the track that is playing" aria-label="Download the track that is playing">⤓</button>
         <button aria-label="Next song" class="tbtn" onclick="djCall('next')"
                 title="Next song">⏭</button>
       </div>
@@ -154121,7 +154449,7 @@ searched for, newest first — click one to run it again">🕘</button>
                  onkeydown="if(event.key==='Enter')voteAddTrack(-1)">
           <button aria-label="Add as a thumbs up" onclick="voteAddTrack(1)" title="Add as a thumbs up">👍</button>
           <button aria-label="Add as a thumbs down" onclick="voteAddTrack(-1)" title="Add as a thumbs down">👎</button>
-          <button onclick="loadVotes()" title="Refresh">↻</button>
+          <button onclick="loadVotes()" title="Refresh" aria-label="Refresh">↻</button>
         </div>
         <div id="votesOutput" style="margin-top:10px;max-height:260px;
              overflow-y:auto"></div>
@@ -154175,7 +154503,7 @@ used. Right: colour by how recently — newest red/yellow, oldest white/blue.">
         <input id="crystalQuery" placeholder="Request any song…"
                onkeydown="if(event.key==='Enter')crystalRequest()">
         <button class="primary" onclick="crystalRequest()">Play it</button>
-        <button onclick="loadCrystals()" title="Refresh">↻</button>
+        <button onclick="loadCrystals()" title="Refresh" aria-label="Refresh">↻</button>
       </div>
       <div id="crystalsOutput" style="margin-top:10px;max-height:320px;
            overflow-y:auto"></div>
@@ -174525,7 +174853,7 @@ async function djGuestRefresh() {
              + "to work\">🚪 send home</button>"
            : "")
         + "<button onclick=\"djGuestDelete('"
-        + djGuestEsc(g.id) + "')\" style='font-size:12px'>✕</button></div>";
+        + djGuestEsc(g.id) + "')\" style='font-size:12px' title='Close' aria-label='Close'>✕</button></div>";
     }
   }
   body.innerHTML = html;
@@ -201073,6 +201401,41 @@ function renderPineThumbs() {
   });
 }
 
+
+/* 2026-09-14: THE HEADER'S ENDLESS-VIDEO SWITCH. "Put an option here for
+ * enabling endless video mode that is able to be enabled even if the
+ * station is paused." The mode is the station's held setting (#1366); this
+ * reads it every fifteen seconds and flips it on a click, and the dot says
+ * which way it is. Nothing here asks whether the station is paused - that
+ * is the point. */
+async function endlessRead() {
+  const b = document.getElementById("endlessBtn");
+  const d = document.getElementById("endlessDot");
+  if (!b || !d) return;
+  try {
+    const st = await api("/api/sfx/video/mode");
+    const on = !!(st && st.on);
+    b.classList.toggle("on", on);
+    d.style.background = on ? "#54d18b" : "#764";
+    b.title = (on ? "Endless video is ON - " + String(st.say || "")
+               : "Endless video is off - click to start the set")
+      + ". It keeps going while the station is paused, as a screensaver "
+      + "while the rooms bank the show.";
+  } catch (e) { /* the click still flips it */ }
+}
+async function endlessToggle() {
+  const d = document.getElementById("endlessDot");
+  try {
+    const st = await api("/api/sfx/video/mode");
+    if (d) d.style.background = "#f5b83d";
+    await api("/api/sfx/video/mode", {method: "POST",
+      body: JSON.stringify({on: !(st && st.on)})});
+  } catch (e) { alert("the set would not flip: " + e.message); }
+  endlessRead();
+}
+setTimeout(endlessRead, 2500);
+setInterval(endlessRead, 15000);
+
 let pineSending = false;
 
 async function submitPine() {
@@ -201092,7 +201455,8 @@ async function submitPine() {
   try {
     const r = await api("/api/pine-requests", {
       method: "POST",
-      body: JSON.stringify({ text, images: pinePasted, files: pineFiles })
+      body: JSON.stringify({ text, images: pinePasted, files: pineFiles,
+        debug: !!((document.getElementById("pineDebug") || {checked: true}).checked) })
     });
     ta.value = "";
     pinePasted = [];
@@ -201107,6 +201471,56 @@ async function submitPine() {
   } finally {
     pineSending = false;                                       // #1007
   }
+}
+
+
+/* 2026-09-14: DOUBLE-CLICK A REPORT TO EDIT IT. "I want to be able to delete
+ * / discard diagnostics info from the report (if its irelevant) and make
+ * edits to reports easily via double clicking." The card becomes a box with
+ * the whole body; "Drop the debug block" cuts the station's account (#1379)
+ * and keeps the attachments; Save PUTs it back to the file. */
+function pineEdit(rq, card) {
+  if (card.querySelector("textarea")) return;
+  const body = card.querySelector(".body");
+  if (body) body.hidden = true;
+  const box = document.createElement("textarea");
+  box.value = rq.text || "";
+  box.style.cssText = "width:100%;min-height:180px;margin-top:6px;font:13px/1.4 monospace;box-sizing:border-box";
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin:6px 0";
+  const note = document.createElement("span");
+  note.className = "muted";
+  note.style.cssText = "align-self:center;font-size:12px";
+  const mk = (label, go, cls) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = label; if (cls) b.className = cls;
+    b.onclick = (ev) => { ev.stopPropagation(); go(b); };
+    row.appendChild(b); return b;
+  };
+  mk("Drop the debug block", () => {
+    const mark = "\n\n### Station at the time";
+    const v = box.value;
+    const at = v.indexOf(mark);
+    if (at < 0) { note.textContent = "no debug block on this one"; return; }
+    const tailAt = v.search(/\n\nAttached (?:images|files):\n/);
+    const tail = tailAt > at ? v.slice(tailAt) : "";
+    box.value = (v.slice(0, at).trimEnd() + tail).trim();
+    note.textContent = "debug block dropped - Save to keep it that way";
+  });
+  mk("Save", async (b) => {
+    b.disabled = true; note.textContent = "saving\u2026";
+    try {
+      await api("/api/pine-requests/" + rq.id, {method: "PUT",
+        body: JSON.stringify({text: box.value})});
+      note.textContent = "saved";
+      loadPineInbox();
+    } catch (e) { b.disabled = false; note.textContent = e.message; }
+  }, "primary");
+  mk("Cancel", () => { loadPineInbox(); });
+  row.appendChild(note);
+  card.appendChild(box);
+  card.appendChild(row);
+  box.focus();
 }
 
 async function loadPineInbox() {
@@ -201147,6 +201561,8 @@ async function loadPineInbox() {
       .trim();
     card.appendChild(top);
     card.appendChild(body);
+    card.title = "Double-click to edit this report";
+    card.addEventListener("dblclick", (ev) => { ev.stopPropagation(); pineEdit(rq, card); });
     if (imgRefs.length) {
       const strip = document.createElement("div");
       strip.className = "pine-thumbs";
@@ -205730,8 +206146,22 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- viewport-fit=cover so the driving layout can reach the edges of a
+     notched phone; the body pads itself back with env(safe-area-*). -->
+<meta name="viewport" content="width=device-width, initial-scale=1,
+      viewport-fit=cover">
 <title>Pine Box FM</title>
+<!-- #1264: a home-screen app. Standalone means no Safari chrome, which
+     matters in a car more than anywhere: nothing to mis-tap, and the
+     audio session behaves like an app rather than a tab. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Pine Box FM">
+<meta name="theme-color" content="#04060b">
+<link rel="apple-touch-icon" href="/app-icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/app-icon-192.png">
+<link id="pwaManifest" rel="manifest" href="/manifest.webmanifest">
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
 <link rel="stylesheet" href="/icons/pineicons.css">
@@ -205756,6 +206186,28 @@ RADIO_PAGE_HTML = r"""<!doctype html>
     padding: 24px;
   }
   .set { width: min(560px, 100%); }
+  body { padding-left: max(24px, env(safe-area-inset-left));
+         padding-right: max(24px, env(safe-area-inset-right));
+         padding-top: max(24px, env(safe-area-inset-top));
+         padding-bottom: max(24px, env(safe-area-inset-bottom)); }
+
+  /* #1264: THE DRIVING LAYOUT.
+     Everything that needs a considered tap is gone; what remains is
+     large, high-contrast and unambiguous at a glance. This is a mounted
+     phone at speed, not a control surface. */
+  body.car .levels, body.car .patter, body.car .row,
+  body.car #build, body.car .gallery-caption { display: none; }
+  body.car .set { width: 100%; max-width: none; }
+  body.car h1 { font-size: 34px; }
+  body.car .title { font-size: 34px; line-height: 1.15; }
+  body.car .artist { font-size: 20px; }
+  body.car #cover { width: 108px !important; height: 108px !important; }
+  body.car button.big { font-size: 26px; padding: 30px 16px; }
+  body.car .dial { padding: 26px; }
+  body.car .times { font-size: 16px; }
+  #carToggle { position: fixed; top: max(10px, env(safe-area-inset-top));
+    right: max(10px, env(safe-area-inset-right)); z-index: 40;
+    padding: 9px 13px; font-size: 15px; opacity: .75; }
   h1 { margin: 0 0 2px; font-size: 26px; letter-spacing: .01em; }
   .sub { color: #7f8ea3; font-size: 13px; margin-bottom: 20px; }
   .dial {
@@ -205866,6 +206318,8 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
+<button id="carToggle" onclick="toggleCar()"
+        aria-label="Driving layout" title="Driving layout">Drive</button>
 <div class="set">
   <h1>Pine Box FM</h1>
   <div class="sub" id="sub">Tune in to hear what everyone else is hearing.</div>
@@ -205969,7 +206423,7 @@ the library files untouched">📶 quality</label>
     ▶ Unpause the broadcast</button>
 
   <div class="row" style="margin-top:12px">
-    <button onclick="save()" title="Download this track">⤓</button>
+    <button onclick="save()" title="Download this track" aria-label="Download this track">⤓</button>
     <button aria-label="More like this" onclick="vote(1)" title="More like this">👍</button>
     <button aria-label="Never play this again" onclick="vote(-1)" title="Never play this again">👎</button>
     <input id="req" placeholder="Request a song…"
@@ -205989,7 +206443,7 @@ the library files untouched">📶 quality</label>
     <button aria-label="They are being funny" onclick="shout('😂')" title="They are being funny">😂</button>
     <button aria-label="What was that" onclick="shout('😱')" title="What was that">😱</button>
     <button aria-label="They have killed it" onclick="shout('💀')" title="They have killed it">💀</button>
-    <button onclick="shout('❤')" title="Love">❤</button>
+    <button onclick="shout('❤')" title="Love" aria-label="Love">❤</button>
   </div>
 
   <div class="patter" id="patter"></div>
@@ -206063,11 +206517,25 @@ function applyLevels() {
   }
   /* #1416: a sting rides the voice element at the SFX level. */
   if (voice) setPlayerLevel(voice, voiceSting ? sfxLevel : voiceLevel);
-  /* #1416: and the stage's video is a clip, not the broadcast. */
+  /* #1265: on the stream road the balance lives in the gain nodes, and
+   * this is the line that makes the sliders mean anything there at all. */
+  applySplitLevels();
+  /* #1416: the stage's video is a clip, not the broadcast - on the road
+   * where this page is the one making the sound.
+   *
+   * #1265: on the STREAM road it is not. The mixer resolves /sfx/ and
+   * the sting is already in the broadcast, so a picture with audio is
+   * the same sting heard twice a few seconds apart - the #1008 fault on
+   * a new surface. The picture is silent there, always. */
   const tv = document.getElementById("galleryVideo");
   if (tv) {
-    tv.volume = Math.max(0, Math.min(1, sfxLevel));
-    tv.muted = sfxLevel <= 0;
+    if (streamMode) {
+      tv.muted = true;
+      tv.volume = 0;
+    } else {
+      tv.volume = Math.max(0, Math.min(1, sfxLevel));
+      tv.muted = sfxLevel <= 0;
+    }
   }
   try {
     if (window.PineSfxTv && window.PineSfxTv.level) window.PineSfxTv.level(sfxLevel);
@@ -207371,6 +207839,64 @@ function wantsHls() {
   } catch (e) { return false; }
 }
 
+/* #1265: THE BALANCE HAPPENS HERE, NOT ON THE BOX.
+ *
+ * The listener is ~30 s behind live by design - that burst is what rides
+ * out the box's stalls - so anything the mixer changes is heard half a
+ * minute later, which is useless for a slider you are trying to set by
+ * ear while driving. So the stream is requested UNMIXED (record left,
+ * DJs right) and these two gain nodes do the mixing in this browser.
+ * Moving a slider is then a gain change on a live audio node: instant.
+ *
+ * If Web Audio cannot be established we do NOT ask for the split shape -
+ * a split stream played raw is the record in one ear and the talk in the
+ * other, which is a far worse failure than a slider that needs a moment.
+ */
+let splitCtx = null, splitMusic = null, splitVoice = null, splitOn = false;
+
+function buildSplitGraph(el) {
+  if (splitOn) return true;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx || !el) return false;
+    splitCtx = splitCtx || new Ctx();
+    const src = splitCtx.createMediaElementSource(el);
+    const splitter = splitCtx.createChannelSplitter(2);
+    const merger = splitCtx.createChannelMerger(2);
+    splitMusic = splitCtx.createGain();
+    splitVoice = splitCtx.createGain();
+    src.connect(splitter);
+    splitter.connect(splitMusic, 0);      /* left  = the record */
+    splitter.connect(splitVoice, 1);      /* right = the DJs   */
+    /* Both gains feed both ears, so the result is centred mono rather
+     * than the two sources sitting in opposite speakers. */
+    splitMusic.connect(merger, 0, 0); splitMusic.connect(merger, 0, 1);
+    splitVoice.connect(merger, 0, 0); splitVoice.connect(merger, 0, 1);
+    merger.connect(splitCtx.destination);
+    splitOn = true;
+    applySplitLevels();
+    return true;
+  } catch (e) {
+    splitOn = false;
+    return false;
+  }
+}
+
+function applySplitLevels() {
+  if (!splitOn || !splitCtx) return;
+  try {
+    const now = splitCtx.currentTime;
+    /* A short ramp rather than a step: instant to the hand, no zipper
+     * noise in the ear. */
+    splitMusic.gain.cancelScheduledValues(now);
+    splitVoice.gain.cancelScheduledValues(now);
+    splitMusic.gain.setTargetAtTime(
+      Math.max(0, Math.min(1.5, musicLevel)), now, 0.03);
+    splitVoice.gain.setTargetAtTime(
+      Math.max(0, Math.min(1.5, voiceLevel)), now, 0.03);
+  } catch (e) {}
+}
+
 function streamUrl() {
   /* The quality selector governs the stream too. 0 ("Original") has no
    * meaning for a live mix, so it takes the station default. */
@@ -207379,7 +207905,38 @@ function streamUrl() {
   let url = road + "?_=" + Date.now();
   if (GUEST) url += "&t=" + encodeURIComponent(KEY);
   if (rate > 0) url += "&br=" + rate;
+  /* Only ask for the unmixed shape if this browser can put it back
+   * together. See buildSplitGraph. */
+  if (splitOn) url += "&split=1";
   return url;
+}
+
+/* #1264: the driving layout, remembered. A car is a place you arrive at
+ * repeatedly; having to set this up each time is the same as not having
+ * it. Also switched on automatically when the page is running as an
+ * installed app in landscape on a phone-sized screen, which is what a
+ * dash mount looks like. */
+function toggleCar(force) {
+  const on = (force === undefined)
+    ? !document.body.classList.contains("car") : !!force;
+  document.body.classList.toggle("car", on);
+  try { localStorage.pbfmCar = on ? "1" : "0"; } catch (e) {}
+  const b = document.getElementById("carToggle");
+  if (b) b.setAttribute("aria-pressed", on ? "true" : "false");
+}
+
+function initCar() {
+  let saved = null;
+  try { saved = localStorage.pbfmCar; } catch (e) {}
+  if (saved === "1") { toggleCar(true); return; }
+  if (saved === "0") return;
+  try {
+    const standalone = window.matchMedia("(display-mode: standalone)").matches
+      || window.navigator.standalone === true;
+    if (standalone && Math.min(screen.width, screen.height) <= 500) {
+      toggleCar(true);
+    }
+  } catch (e) {}
 }
 
 function initMode() {
@@ -207440,6 +207997,9 @@ function streamElement() {
    * the same self-feeding stall #998 documents for the record element,
    * rebuilt on a new road. Only the watchdog below may give up, and only
    * after the playhead has genuinely stopped moving. */
+  /* Wire the balance BEFORE any src is set: the decision to ask for the
+   * split shape depends on whether this succeeded. */
+  buildSplitGraph(radio);
   radio.onplaying = () => {
     streamTries = 0;
     const note = document.getElementById("note");
@@ -207526,8 +208086,16 @@ function paintMediaSession(state) {
       title: now.title || "Pine Box FM",
       artist: now.artist || "Pine Box FM",
       album: "Pine Box FM",
-      artwork: now.art ? [{src: now.art, sizes: "512x512", type: "image/jpeg"}]
-                       : [],
+      /* #1264: THIS is the in-car surface. A CarPlay or Bluetooth head
+       * unit draws its Now Playing screen from exactly these fields, so
+       * the artwork is offered at the sizes those units actually ask
+       * for, and the station mark stands in when a record has no sleeve
+       * - an empty artwork array is what leaves a grey box in the dash. */
+      artwork: (now.art
+        ? [{src: now.art, sizes: "512x512", type: "image/jpeg"},
+           {src: now.art, sizes: "256x256", type: "image/jpeg"}]
+        : [{src: "/app-icon-512.png", sizes: "512x512", type: "image/png"},
+           {src: "/app-icon-192.png", sizes: "192x192", type: "image/png"}]),
     });
     navigator.mediaSession.playbackState = playing ? "playing" : "paused";
     navigator.mediaSession.setActionHandler("play", () => {
@@ -207700,6 +208268,15 @@ async function request() {
 
 initLevels();
 initMode();                     // #1253: which road this page takes
+initCar();                      // #1264: the driving layout
+/* The manifest has to carry this page's token, or the installed app
+ * opens to a 403 the next time it is launched. */
+try {
+  const mf = document.getElementById("pwaManifest");
+  if (mf && GUEST) {
+    mf.href = "/manifest.webmanifest?t=" + encodeURIComponent(KEY);
+  }
+} catch (e) {}
 /* #1263: the set checks often enough to catch a short sting, and cheaply
  * enough that a car does not notice - a couple of hundred bytes. */
 setInterval(() => { try { tvPoll(); } catch (e) {} }, 2500);
