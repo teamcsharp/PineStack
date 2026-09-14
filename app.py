@@ -118317,6 +118317,7 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                # contents as it grows.
                "/spark/asset/sfx-tv.js",
                "/spark/asset/sfx-tv.css",
+               "/spark/asset/slideshow.css",   # #1415,
                # #1354: the camera, for a listener who has been
                # ticked. Both routes decide for themselves from the
                # ?t= token; being on this list only means they are
@@ -152945,27 +152946,79 @@ if (PINE_TABLET) {
   ].join(" ");   /* a space: this script lives in a Python string, where 
  is a newline */
   (document.head || document.documentElement).appendChild(paceStyle);
+  // #1413g: A WRITE THAT CHANGES NOTHING STILL COSTS A LAYOUT. Counted on
+  // the tablet over five seconds: 158 of ~200 textContent writes set the
+  // value already there (spTitle, spWho, spAt, spLen, spNow on every
+  // beat), and Blink replaces the text node and invalidates layout for
+  // each. Same for a style property or an attribute set to itself. On
+  // the tablet those writes are dropped at the prototype, where every
+  // writer meets them; the desktop is left as it is.
+  (function pineSameWrite() {
+    try {
+      const td = Object.getOwnPropertyDescriptor(Node.prototype, "textContent");
+      if (td && td.set && td.get) {
+        Object.defineProperty(Node.prototype, "textContent", {
+          configurable: true, enumerable: td.enumerable, get: td.get,
+          set: function (v) {
+            if (typeof v === "string" && this.nodeType === 1
+                && this.childNodes.length <= 1 && td.get.call(this) === v) return;
+            return td.set.call(this, v);
+          }
+        });
+      }
+      const sp = CSSStyleDeclaration.prototype.setProperty;
+      CSSStyleDeclaration.prototype.setProperty = function (name, value, priority) {
+        if (!priority && this.getPropertyValue(name) === String(value)) return;
+        return sp.call(this, name, value, priority);
+      };
+      const sa = Element.prototype.setAttribute;
+      Element.prototype.setAttribute = function (name, value) {
+        if (this.getAttribute(name) === String(value)) return;
+        return sa.call(this, name, value);
+      };
+    } catch (err) { /* the page runs as before */ }
+  })();
 }
 if (PINE_PACE > 1) {
+  // #1413f: A FRAME IS ASKED FOR ONLY WHEN A GROUP IS DUE. The first cut
+  // skipped callbacks by re-arming a REAL requestAnimationFrame on every
+  // skipped frame, and ran a counter loop every vsync besides - so the
+  // page still produced a frame at every vsync and Chromium ran the full
+  // style/layout/paint/commit lifecycle for each: traced on the tablet
+  // as ProxyMain::BeginMainFrame at 66% of wall time with the callbacks
+  // themselves at 15%. Now callbacks queue, and one real frame is asked
+  // for per PACE_MS group; between groups the page asks for nothing.
   (function () {
     const rafReal = window.requestAnimationFrame.bind(window);
-    const cafReal = window.cancelAnimationFrame.bind(window);
-    let frameNo = 0;
-    rafReal(function count() { frameNo += 1; rafReal(count); });
-    const live = new Map();
+    const PACE_MS = Math.round(1000 / 60 * PINE_PACE);
+    let queue = [];
+    let armed = false;
+    let nextId = 1;
+    let lastGroup = 0;
+    function flush(t) {
+      armed = false;
+      lastGroup = performance.now();
+      const run = queue;
+      queue = [];
+      for (const job of run) {
+        try { job.cb(t); }
+        catch (err) { setTimeout(function () { throw err; }, 0); }
+      }
+    }
+    function arm() {
+      if (armed) return;
+      armed = true;
+      const wait = Math.max(0, PACE_MS - (performance.now() - lastGroup));
+      setTimeout(function () { rafReal(flush); }, wait);
+    }
     window.requestAnimationFrame = function (cb) {
-      const id = rafReal(function fire(t) {
-        if (frameNo % PINE_PACE) { live.set(id, rafReal(fire)); return; }
-        live.delete(id);
-        cb(t);
-      });
-      live.set(id, id);
+      const id = nextId++;
+      queue.push({id: id, cb: cb});
+      arm();
       return id;
     };
     window.cancelAnimationFrame = function (id) {
-      const real = live.get(id);
-      live.delete(id);
-      cafReal(real === undefined ? id : real);
+      queue = queue.filter(function (job) { return job.id !== id; });
     };
   })();
 }
@@ -204294,6 +204347,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
      video ring is not offered. offer() de-duplicates on ts|url, so
      a clip arriving down both roads shows once. -->
 <link rel="stylesheet" href="/spark/asset/sfx-tv.css">
+<link rel="stylesheet" href="/spark/asset/slideshow.css">
 <script src="/spark/asset/sfx-tv.js"></script>
 <style>
   :root { color-scheme: dark; }
@@ -204366,6 +204420,14 @@ RADIO_PAGE_HTML = r"""<!doctype html>
     display:none; background:#000; }
   .gallery-stage.tv video { display:block; }
   .gallery-stage.tv img { display:none; }
+  /* #1415: the hand-back from the video runs one of the ported
+     slideshow's transitions (slideshow.css, class sl-t-*): both
+     pictures stay up for its 600 ms, the new one on top. */
+  .gallery-stage { perspective:1400px; transform-style:preserve-3d; }
+  .gallery-stage.handing img, .gallery-stage.handing video {
+    display:block !important; position:absolute; inset:0;
+    backface-visibility:hidden; }
+  .gallery-stage .sl-in { z-index:2; } .gallery-stage .sl-out { z-index:1; }
   .gallery-caption { position:absolute; left:0; right:0; bottom:0; padding:9px 12px;
     background:rgba(4,6,11,.78); color:#dce8f5; font-size:12px; white-space:nowrap;
     overflow:hidden; text-overflow:ellipsis; }
@@ -204427,6 +204489,14 @@ RADIO_PAGE_HTML = r"""<!doctype html>
       <input id="lvVoice" type="range" min="0" max="100" value="100"
              oninput="setLevels()" onchange="setLevels()">
       <span class="val" id="lvVoiceVal">100%</span>
+    </div>
+    <!-- #1416: the SFX guy's clips - the video on the stage and the
+         stings - at their own level, like the two above. -->
+    <div class="lev">
+      <label for="lvSfx">🎬 SFX</label>
+      <input id="lvSfx" type="range" min="0" max="100" value="60"
+             oninput="setLevels()" onchange="setLevels()">
+      <span class="val" id="lvSfxVal">60%</span>
     </div>
     <!-- #999: the LISTENER's bitrate, not the station's. Two people on
          two different links must be able to choose differently, so this
@@ -204594,8 +204664,21 @@ function applyLevels() {
     // meaningful at every position instead of flattening to one floor.
     setPlayerLevel(audio, musicLevel * (ducking ? 0.3 : 1));
   }
-  if (voice) setPlayerLevel(voice, voiceLevel);
+  /* #1416: a sting rides the voice element at the SFX level. */
+  if (voice) setPlayerLevel(voice, voiceSting ? sfxLevel : voiceLevel);
+  /* #1416: and the stage's video is a clip, not the broadcast. */
+  const tv = document.getElementById("galleryVideo");
+  if (tv) {
+    tv.volume = Math.max(0, Math.min(1, sfxLevel));
+    tv.muted = sfxLevel <= 0;
+  }
+  try {
+    if (window.PineSfxTv && window.PineSfxTv.level) window.PineSfxTv.level(sfxLevel);
+  } catch (e) { /* no set on this page */ }
 }
+
+let sfxLevel = 0.6;          /* #1416 */
+let voiceSting = false;      /* #1416: the voice element is playing a sting */
 
 function setLevels(save) {
   const m = document.getElementById("lvMusic");
@@ -204604,9 +204687,16 @@ function setLevels(save) {
   voiceLevel = Number(v.value) / 100;
   document.getElementById("lvMusicVal").textContent = m.value + "%";
   document.getElementById("lvVoiceVal").textContent = v.value + "%";
+  const sfx = document.getElementById("lvSfx");                    /* #1416 */
+  if (sfx) {
+    sfxLevel = Number(sfx.value) / 100;
+    const sv = document.getElementById("lvSfxVal");
+    if (sv) sv.textContent = sfx.value + "%";
+  }
   try {
     localStorage.pbfmMusic = m.value;
     localStorage.pbfmVoice = v.value;
+    if (sfx) localStorage.pbfmSfx = sfx.value;
   } catch (e) { /* private browsing — the levels just do not persist */ }
   applyLevels();
 }
@@ -204709,6 +204799,10 @@ function initLevels() {
     if (saved.pbfmMusic != null) m.value = saved.pbfmMusic;
     if (saved.pbfmVoice != null) v.value = saved.pbfmVoice;
   }
+  try {                                                            /* #1416 */
+    const sfx = document.getElementById("lvSfx");
+    if (sfx && saved.pbfmSfx != null) sfx.value = saved.pbfmSfx;
+  } catch (e) { /* the default stands */ }
   setLevels();
   initRate();                                                   // #999
 }
@@ -205278,10 +205372,14 @@ function tvShow(v, into) {
   if (!stage || !el) return;
   if (tvNow !== v.url) {
     tvNow = v.url;
-    el.muted = true;                 /* belt and braces - see the markup */
+    /* #1416: at the SFX slider's level. The listener pressed play to get
+     * here, so an unmuted clip is allowed; if the engine still refuses,
+     * the picture goes up muted rather than not at all. */
+    el.muted = sfxLevel <= 0;
+    el.volume = Math.max(0, Math.min(1, sfxLevel));
     el.src = clipUrl ? v.url : v.url;
     el.currentTime = Math.max(0, into);
-    el.play().catch(() => {});
+    el.play().catch(() => { el.muted = true; el.play().catch(() => {}); });
     if (cap) cap.textContent = v.name || v.sting || "";          /* #1414 */
     stage.classList.add("show");
     stage.classList.add("tv");
@@ -205297,13 +205395,50 @@ function tvShow(v, into) {
   }
 }
 
+/* #1415: THE HAND-BACK IS ONE OF THE SLIDESHOW'S TRANSITIONS.
+ *
+ * "When going back from the video to the comfy ui slideshow ... use a
+ *  random transition effect from the media_slideshow screensaver we
+ *  ported." The ported set (desktop/renderer/slideshow.css) is a pair of
+ * classes per effect, sl-t-<name> with sl-in on the incoming picture and
+ * sl-out on the outgoing one, 600 ms, fill-mode both. The pure-CSS ones
+ * are used here; mosaic and shatter are built by the slideshow's own JS
+ * (a canvas resample, tiles) and delete is its 900 ms special. The
+ * artwork keeps rotating underneath the whole time, as before. */
+const TUNE_TRANSITIONS = ["slide", "swirl", "rotate", "flip", "fold", "bump",
+  "bash", "unroll", "origami", "sand", "cube", "tv", "crt", "vaporwave",
+  "unfold", "liquid"];
+let tvHanding = null;
+
 function tvHide() {
   const stage = document.getElementById("galleryStage");
   const el = document.getElementById("galleryVideo");
+  const img = document.getElementById("galleryImage");
   if (!stage || !el || tvNow === null) return;
   tvNow = null;
-  try { el.pause(); el.removeAttribute("src"); el.load(); } catch (e) {}
+  if (tvHanding) tvHanding();
+  const kind = TUNE_TRANSITIONS[Math.floor(Math.random() * TUNE_TRANSITIONS.length)];
+  const cls = "sl-t-" + kind;
+  stage.classList.add("handing");
   stage.classList.remove("tv");
+  if (img) img.classList.add("sl-in", cls);
+  el.classList.add("sl-out", cls);
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    tvHanding = null;
+    /* The video is released first: fill-mode both is holding it at its
+     * final frame, and taking the class off before that snaps a full
+     * picture back over the artwork for a frame. */
+    try { el.pause(); el.removeAttribute("src"); el.load(); } catch (e) {}
+    el.classList.remove("sl-out", cls);
+    if (img) img.classList.remove("sl-in", cls);
+    stage.classList.remove("handing");
+  };
+  tvHanding = finish;
+  if (img) img.addEventListener("animationend", finish, {once: true});
+  setTimeout(finish, 850);
   /* The artwork gets its frame back; renderGallery decides whether the
    * stage stays up at all. */
 }
@@ -205792,7 +205927,9 @@ function voiceNext() {
   const hand = (src) => {
     if (handed || finished || stale()) return;
     handed = true;
+    voiceSting = !!(clip && clip.sting);                            /* #1416 */
     voice.src = src || clip.url;
+    applyLevels();
     startGuard = setTimeout(() => retry("audio never began"), 15000);
     voice.play().catch(retry);
   };

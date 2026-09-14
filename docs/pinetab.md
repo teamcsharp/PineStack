@@ -2358,3 +2358,47 @@ by the listener's own lag — but it read `data.videos` and the ring answers
 SFX guy's clips and the tailnet listener kept the painting. Fixed, with the
 caption from the clip's `sting`, and the floating set no longer offered a
 second copy on a page that has a stage to give the clip to.
+
+**A frame is asked for only when a group is due (#1413f).** The first pacing
+wrapper skipped callbacks by re-arming a *real* `requestAnimationFrame` on
+every skipped frame, with a counter loop at every vsync besides — so the page
+still produced a frame at every vsync and Chromium ran the full
+style/layout/paint/commit lifecycle for each: traced on the tablet as
+`ProxyMain::BeginMainFrame` at 66% of wall time with the callbacks themselves
+at 15%. Now callbacks queue and one real frame is asked for per 67 ms group;
+between groups the page asks for nothing. Measured after: rAF requests 7/s.
+What the trace named next was not an animation at all — the SCRIPT view's
+`paintFeed` re-dressing every feed row on every poll, ~1,000 layout
+invalidations a second (#1413g, below).
+
+**The hand-back is one of the slideshow's transitions (#1415).** On the
+tailnet page, when a clip ends and the gallery comes back, the stage keeps
+both pictures up for 600 ms and runs one of the ported `media_slideshow`
+effects at random — `slide, swirl, rotate, flip, fold, bump, bash, unroll,
+origami, sand, cube, tv, crt, vaporwave, unfold, liquid` — the same
+`sl-t-<name>` + `sl-in`/`sl-out` classes the tablet's slideshow uses, from the
+same `slideshow.css`, now served through the public door. `mosaic` and
+`shatter` are built by the slideshow's own JS (a canvas resample, tiles) and
+`delete` is its 900 ms special, so those three stay out. The artwork keeps
+rotating underneath the whole time, as before, and the stage gets the
+slideshow's `perspective` so `flip` and `cube` have a camera.
+
+**An SFX slider on the tailnet page (#1416).** A third level beside *music*
+and *DJs*: **SFX**, default 60%, kept in this browser like the other two
+(`pbfmSfx`). It sets the volume of the clip on the gallery stage — which had
+been muted for good, so once the stage took the clip (#1414) the tailnet
+listener would have seen it silent — and of any sting the page plays through
+its voice element, and it is handed to the floating set where a page has one.
+At 0% the stage video is muted rather than merely quiet. The listener pressed
+play to get here, so an unmuted clip is allowed; if the engine still refuses,
+the picture goes up muted rather than not at all.
+
+**Same-value writes are dropped on the tablet (#1413g).** Counted over five
+seconds: 158 of ~200 `textContent` writes set the value already there
+(`spTitle`, `spWho`, `spAt`, `spLen`, `spNow`, on every beat), and Blink
+replaces the text node and invalidates layout for each; likewise a style
+property or an attribute set to itself. On the tablet those writes are
+dropped at the prototype, where every writer meets them. Measured after the
+whole series (#1413a–g): the WebView process 289% → 157%, the kiosk 255% →
+132%, the audio render thread with a third of a core to spare, main-thread
+task time 98% → 84%.

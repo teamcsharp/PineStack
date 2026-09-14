@@ -170,3 +170,16 @@ the audio thread to 35%, with the main thread's remaining load being the CSS
 animations #1413e switches off. The measurement to keep: the tablet's user
 agent is `Linux; X11; TrebleDroid`, not Android — an `/Android/` test throttles
 nothing there.
+
+**The trace, not the profiler (14:20).** With rAF paced and 363 of 380
+animations gone the tablet's main thread was still 96% busy and only 22% of it
+script. Chromium's `Performance.getMetrics` gave the split (task 96%, script 18%,
+layout 7%, style 4%) and hiding every canvas and video changed nothing; a 3 s
+`Tracing.start` with `devtools.timeline` + `.stack` + `.invalidationTracking`
+gave the names: `ProxyMain::BeginMainFrame` 66% (my own pacing wrapper was
+re-arming a real rAF per skipped frame — #1413f), then, with that fixed, 55
+frames and 47 paints a second driven by `LayoutInvalidationTracking @
+paintFeed` — 3,000 invalidations in 3 s from the SCRIPT view re-dressing every
+row of a 300-row feed on every poll. Recipe worth keeping: aggregate `X` events
+on the `CrRendererMain` tid by name; count `*InvalidationTracking` events by
+`args.data.stackTrace[0]`.
