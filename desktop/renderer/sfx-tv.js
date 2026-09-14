@@ -61,6 +61,7 @@
   var level = 1;
   var marks = Object.create(null);
   var mounted = false;
+  var warm = null;                 // #1411: the next clip, already fetching
 
   function api() { return root.pineDesktop; }
 
@@ -161,7 +162,7 @@
     node.appendChild(handle);
   }
 
-  function build(name) {
+  function build(name, ready) {      /* #1411: `ready` is a warmed <video> */
     /* #1312: one set at a time, always. A stray from an earlier cut
        would otherwise sit here holding a connection for ever. */
     try {
@@ -229,7 +230,7 @@
     screen.className = 'sfx-tv-screen';
     tube = document.createElement('div');
     tube.className = 'sfx-tv-tube';
-    video = document.createElement('video');
+    video = ready || document.createElement('video');   /* #1411 */
     video.playsInline = true;
     video.preload = 'auto';
     video.controls = false;
@@ -390,7 +391,8 @@
   function play(clip) {
     playing = clip;                                        /* #1306b */
     var tries = Number(clip.__tries) || 0;                 /* #1311d */
-    var parts = build(clip.sting || clip.text || 'SFX');
+    var ready = warmTake(clip);                            /* #1411 */
+    var parts = build(clip.sting || clip.text || 'SFX', ready);
     /* Held locally, because every handler and timer below can fire after
      * the module's own references have moved on. */
     var screen = video;
@@ -447,6 +449,7 @@
         glass.classList.add('on');   // dot -> line -> picture
         parts.flash.classList.add('pop');
       } catch (err) { /* the picture is there either way */ }
+      setTimeout(warmUp, WARM_AFTER_MS);                  /* #1411 */
     };
     /* loadeddata is the first frame; playing covers a clip that was
        already buffered. Both are harmless twice - reveal guards. */
@@ -488,7 +491,11 @@
     };
     screen.addEventListener('ended', finish);
     screen.addEventListener('error', failed);
-    screen.src = base.replace(/\/+$/, '') + String(clip.url || '');
+    /* #1411: a warmed tube already has its source; assigning the same
+       src again runs the load algorithm from scratch and throws the
+       buffer away, which is the whole thing being avoided. */
+    if (!ready) screen.src = srcOf(clip);
+    screen.addEventListener('canplaythrough', function () { warmUp(); });
     screen.volume = level;
     /* #1310: THE PAD'S IN AND OUT, ON THE PICTURE TOO.
      *
@@ -504,6 +511,10 @@
       screen.addEventListener('loadedmetadata', function () {
         try { screen.currentTime = from; } catch (err) { /* whole clip */ }
       });
+      /* #1411: a warmed element may have had its metadata for a while. */
+      if (ready && screen.readyState >= 1) {
+        try { screen.currentTime = from; } catch (err) { /* whole clip */ }
+      }
     }
     if (isFinite(to) && to > 0) {
       screen.addEventListener('timeupdate', function () {
@@ -679,6 +690,82 @@
     host.appendChild(wrap);
   }
 
+  /* #1411: THE NEXT CLIP IS FETCHED BEFORE ITS MOMENT.
+   *
+   * "Make sure the endless video icon is endless ... clip after clip
+   *  after clip. It should ... cache a list and execute it fluidly in
+   *  the background."
+   *
+   * The station now rings the list ahead (#1395) - three clips, each
+   * stamped to start when the last one ends - and this set held them
+   * as URLs only. At the moment, it built a <video>, set the src, and
+   * waited for tens of megabytes to come over the link; on the desktop
+   * that was measured as 24 of 39 seconds NOT playing, one dark run of
+   * eleven seconds, between clips the station had handed over half a
+   * minute earlier.
+   *
+   * So the head of the queue is warmed: a detached <video> with
+   * preload=auto starts fetching it as soon as the tube reports
+   * canplaythrough for the clip on screen (or a few seconds after its
+   * first frame - a clip that never says canplaythrough must not hold
+   * the next one back), and play() puts THAT element in the tube. One
+   * warm element at a time, released when the clip is played, cut,
+   * dropped as late or the set stops - #1312's rule about orphans that
+   * hold connections stands, this just holds one on purpose. */
+  /* #1411b: 1.5 s, not 4 - measured on the desktop, a six-second clip
+     left the next one four seconds to arrive and it did not. */
+  var WARM_AFTER_MS = 1500;
+
+  function srcOf(clip) {
+    return base.replace(/\/+$/, '') + String((clip && clip.url) || '');
+  }
+
+  function warmDrop() {
+    if (!warm) return;
+    var el = warm.el;
+    warm = null;
+    try { el.pause(); el.removeAttribute('src'); el.load(); }
+    catch (err) { /* already gone */ }
+  }
+
+  function warmUp() {
+    if (!mounted) return;
+    var head = queue[0];
+    if (!head || !head.url) return;
+    if (warm && warm.clip === head) return;
+    warmDrop();
+    var el;
+    try {
+      el = document.createElement('video');
+      el.preload = 'auto';
+      el.playsInline = true;
+      el.controls = false;
+      el.src = srcOf(head);
+      el.load();
+    } catch (err) { return; }
+    warm = {clip: head, el: el};
+  }
+
+  /* The warm element for this clip, if it is the one that was warmed
+     and it has not already failed - a failed one is thrown away here so
+     play() builds a fresh element and hears the error itself. */
+  function warmTake(clip) {
+    if (!warm || warm.clip !== clip) return null;
+    var el = warm.el;
+    warm = null;
+    if (el.error) {
+      try { el.removeAttribute('src'); el.load(); } catch (err) {}
+      return null;
+    }
+    return el;
+  }
+
+  /* A warm element for a clip that is no longer the next one - dropped
+     as late, or cut past - is let go. */
+  function warmSync(clip) {
+    if (warm && warm.clip !== clip && queue.indexOf(warm.clip) < 0) warmDrop();
+  }
+
   function next() {
     if (showing || !mounted) return;
     var clip = queue.shift();
@@ -686,12 +773,14 @@
       clip = queue.shift();
     }
     if (!clip) return;
+    warmSync(clip);                                        /* #1411 */
     var wait = Number(clip.at || 0) - now();
     if (wait > 250) {
       /* Early is not late: the station stamps an air moment a lead ahead
        * of delivery, and a picture that jumps the gun lands over the line
        * it was meant to punctuate. */
       queue.unshift(clip);
+      warmUp();                                            /* #1411 */
       if (hold) clearTimeout(hold);
       hold = setTimeout(function () { hold = null; next(); }, wait);
       return;
@@ -750,6 +839,10 @@
     markOf(clip);
     queue.push(clip);
     if (queue.length > 4) queue.splice(0, queue.length - 4);
+    /* #1411b: a clip that arrives while one is on screen is warmed at
+       once if the one on screen already has what it needs. */
+    if (!showing || (video && (video.readyState >= 4
+                               || Number(video.currentTime) > 1.5))) warmUp();
     next();
   }
 
@@ -802,6 +895,7 @@
       if (hold) clearTimeout(hold);
       timer = hold = null;
       mounted = false;
+      warmDrop();                                          /* #1411 */
       teardown();
     },
     /* Numbers the operator can look at rather than a claim in a comment. */
@@ -840,6 +934,7 @@
       try { markOf(clip); }
       catch (err) { /* the play below still stands */ }
       queue.length = 0;
+      warmDrop();                                          /* #1411 */
       if (hold) { clearTimeout(hold); hold = null; }
       try { clip.__cut = true; } catch (err) { /* frozen: no retry */ }
       /* Down without waiting out the CRT collapse - the next picture

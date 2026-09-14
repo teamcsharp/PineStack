@@ -374,25 +374,51 @@
   var scopeWide = 0;
   var scopeHigh = 0;
 
+  /* #1413: THE SCOPE AT A TABLET'S PACE. Profiled on the PineTab
+     2026-09-14 over the WebView's devtools socket: this loop and the
+     panel's drawScope were a quarter of the page's main thread, at
+     60 fps, and the clientWidth/offsetParent reads here forced a layout
+     of a document the feed keeps dirty - Chromium's own "(program)"
+     was 43% on top. The kiosk sat at 250% CPU with the video set OFF,
+     and the native audio engine shares those cores; that is the
+     stutter. Every 4th frame on Android, every 2nd elsewhere, and the
+     layout reads once a second. */
+  /* #1413d: the panel paces requestAnimationFrame itself on the tablet
+     (window.PINE_PACE > 1), so the view draws on every paced frame there
+     and on every second frame elsewhere. */
+  var SCOPE_EVERY = (Number(root.PINE_PACE) > 1) ? 1 : 2;
+  var scopeTick = 0;
+  var scopeSizeAt = 0;
+  var scopeSeen = false;
   function paintScope() {
     scopeFrame = root.requestAnimationFrame(paintScope);
+    scopeTick = (scopeTick + 1) % SCOPE_EVERY;
+    if (scopeTick) return;
     var canvas = el('spSayingScope');
-    /* #745's lesson, on our own canvas: it costs nothing while it
-       cannot be seen. */
-    if (!canvas || !canvas.offsetParent) return;
+    if (!canvas) return;
+    var dpr = root.devicePixelRatio || 1;
+    var nowMs = Date.now();
+    if (nowMs - scopeSizeAt > 1000) {
+      scopeSizeAt = nowMs;
+      /* #745's lesson, on our own canvas: it costs nothing while it
+         cannot be seen. */
+      scopeSeen = !!canvas.offsetParent;
+      if (scopeSeen) {
+        var wide = Math.round(canvas.clientWidth * dpr);
+        var high = Math.round(canvas.clientHeight * dpr);
+        /* #745 again: writing canvas.width resets the whole 2D context, so
+           it is measured and compared, never assigned every frame. */
+        if (wide && high && (wide !== scopeWide || high !== scopeHigh)) {
+          canvas.width = wide; canvas.height = high;
+          scopeWide = wide; scopeHigh = high;
+        }
+      }
+    }
+    if (!scopeSeen) return;
     var player = soundingPlayer();
     var ctx2d = null;
     try { ctx2d = canvas.getContext('2d'); } catch (err) { return; }
     if (!ctx2d) return;
-    var dpr = root.devicePixelRatio || 1;
-    var wide = Math.round(canvas.clientWidth * dpr);
-    var high = Math.round(canvas.clientHeight * dpr);
-    /* #745 again: writing canvas.width resets the whole 2D context, so
-       it is measured and compared, never assigned every frame. */
-    if (wide && high && (wide !== scopeWide || high !== scopeHigh)) {
-      canvas.width = wide; canvas.height = high;
-      scopeWide = wide; scopeHigh = high;
-    }
     if (!scopeWide || !scopeHigh) return;
     ctx2d.clearRect(0, 0, scopeWide, scopeHigh);
     var scope = null;
@@ -711,10 +737,22 @@
     /* The meters and the playhead ride requestAnimationFrame - numbers the
      * browser already has, no request of any kind. */
     var frame = 0;
+    var tickN = 0;                    /* #1413c: the meters at the scope's pace */
+    var specAt = 0;
+    var specOk = false;
     var tick = function () {
       frame = requestAnimationFrame(tick);
+      tickN = (tickN + 1) % SCOPE_EVERY;
+      if (tickN) return;
       var spectrum = el('spSpectrum');
-      if (!spectrum || !spectrum.isConnected || !spectrum.clientWidth) return;
+      /* #1413c: the layout read once a second - clientWidth forces a
+         layout of a document the feed keeps dirty, every frame. */
+      var nowMs = Date.now();
+      if (nowMs - specAt > 1000) {
+        specAt = nowMs;
+        specOk = !!(spectrum && spectrum.isConnected && spectrum.clientWidth);
+      }
+      if (!spectrum || !specOk) return;
       var meters = root.PineMeters;
       if (meters) {
         meters.attach(['musicPlayer', 'djVoiceAudio0', 'djVoiceAudio1']);

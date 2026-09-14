@@ -138,3 +138,35 @@ rung ahead from the clip book (three deep, ~20 s ahead, each clip stamped to sta
 when the previous ends); #1399 made the desktop shell's tube mount itself; #1405 kept
 the ladder from reading the rung-ahead pictures as a stuck queue. PineTab §27 has the
 user-facing account.
+
+## The second boot (13:04:52, with the agent's #1407/#1408), clean ten minutes
+
+Pulse 13:05–13:15: 24 stalls, 76.4 s, worst 13.0 s — the one 13 s row is the
+startup parse again (`sfx_history_add` as bystander at boot+9 s); the vector
+store's dump now shows as four rows of under 2 s (`outside: run`, worst 1.95 s)
+where it was one of 12–16 s. Gap ledger since boot: 2 gaps, 90 s in 9.3 minutes
+(16%; the previous hour read 48%). System2: 5 of 18 slots empty, 3 past deadline
+(was 14 of 18). The station heard one second ago; the set rung 60 clips.
+
+Names new to the pulse, for the next pass: `gold_pick` (2×, worst 6.1 s),
+`<genexpr>` at 6.8 s beside it, `speakbox_heard` (2×, worst 4.3 s),
+`pinelink_state` (5.5 s — a subprocess or a socket on the loop). The waiting
+count's decay is #1410, on disk for the next boot.
+
+## The other half: the tablet (14:00)
+
+The operator said *the station is stuttering*. The station's stalls were one
+cause (the vector store's five-minute save, #1412 — every file touch on the loop
+waited behind a 684 MB write). The other was the tablet, and it was not the
+video set: with the set off for five minutes the kiosk sat at 255% and its
+WebView at 289%. Per thread (`cat /proc/<pid>/task/*/stat` twice, diffed by
+comm): `CrRendererMain` saturated, `Realtime AudioWorklet` ~80% of a core,
+`Chrome_InProcGpu` + `RenderThread` + `mali` ~150%. The Chrome profiler over
+`webview_devtools_remote_<pid>` (adb forward, `Profiler.start/stop`) named the
+JS: `drawScope` 17%, `paintScope` 6%, `querySelectorAll` 6% — and 43–72% in
+`(program)`. `document.getAnimations()` counted 380. Cures #1413a–e are in
+PineTab §28; after #1413d the kiosk's GPU/render threads fell to 53/47/30% and
+the audio thread to 35%, with the main thread's remaining load being the CSS
+animations #1413e switches off. The measurement to keep: the tablet's user
+agent is `Linux; X11; TrebleDroid`, not Android — an `/Android/` test throttles
+nothing there.

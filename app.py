@@ -9545,6 +9545,9 @@ _PAGE_WEDGE_AT = [0.0]
 PAGE_WEDGE_REST = 180.0
 
 
+PAGE_WAIT_LATE_S = 120.0     # #1410: a clip this late is history, not a wedge
+
+
 def page_delivery_waits(delivery: dict[str, Any]) -> bool:
     """#1405: is this delivery a clip the page holds and has not started?
     Received, not a picture, and not rung for a moment still to come."""
@@ -9555,7 +9558,17 @@ def page_delivery_waits(delivery: dict[str, Any]) -> bool:
         if clip.get("picture_only"):
             return False
         try:
-            if float(clip.get("broadcast_ms") or 0) > time.time() * 1000.0:
+            moment = float(clip.get("broadcast_ms") or 0)
+            now_ms = time.time() * 1000.0
+            if moment > now_ms:
+                return False
+            # #1410: and not one whose moment passed long ago. A video
+            # sting handed to the tube (djVideoTv) acks nothing after
+            # "received", so it sat in this count for ever - eleven of
+            # them, the head 568 s old, on a station heard one second
+            # ago. A wedge is clips NOT starting NOW: the last two
+            # minutes are the count, the rest is history.
+            if moment and now_ms - moment > PAGE_WAIT_LATE_S * 1000.0:
                 return False
         except (TypeError, ValueError):
             pass
@@ -13560,6 +13573,31 @@ def pantry_spoken_now() -> set[str]:
         return set()
 
 
+_PANTRY_PRESENT_MEMO: dict[str, tuple[bool, float]] = {}
+PANTRY_PRESENT_MEMO_S = 20.0
+
+
+def _pantry_file_present(name: str) -> bool:
+    """#1412: one exists() per name per twenty seconds. pantry_get is
+    called far too often (its own words, #1106) and each call asked the
+    disk; with the vector store being written beside it the pulse caught
+    pantry_get eleven times in ten minutes, 3.3 s worst. A render file
+    does not come and go within twenty seconds, and a row whose file is
+    gone is refused at shelf_take anyway."""
+    now = time.time()
+    held = _PANTRY_PRESENT_MEMO.get(name)
+    if held is not None and now - held[1] < PANTRY_PRESENT_MEMO_S:
+        return held[0]
+    try:
+        ok = (VOICE_MEDIA_DIR / name).exists()
+    except OSError:
+        ok = False
+    if len(_PANTRY_PRESENT_MEMO) > 8192:
+        _PANTRY_PRESENT_MEMO.clear()
+    _PANTRY_PRESENT_MEMO[name] = (ok, now)
+    return ok
+
+
 def pantry_get(key: str) -> dict[str, Any] | None:
     """A ready clip, if it is still on the shelf AND still on disk."""
     row = _PANTRY.get(key)
@@ -13583,7 +13621,7 @@ def pantry_get(key: str) -> dict[str, Any] | None:
         return None
     clip = row.get("clip") or {}
     name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
-    if name and not (VOICE_MEDIA_DIR / name).exists():
+    if name and not _pantry_file_present(name):             # #1412
         _PANTRY.pop(key, None)          # pruned out from under us
         return None
     row["used"] = int(row.get("used") or 0) + 1
@@ -61767,7 +61805,7 @@ def _load_vectors(rid: str = "") -> dict[str, Any]:
         try:
             store = mind_state(key, "vectors")
             if store.is_file():
-                data = json.loads(store.read_text())
+                data = _fast_loads(store.read_bytes())    # #1412b: orjson when present
         except Exception:
             pass
         data["loaded"] = True
@@ -61957,28 +61995,69 @@ def _vector_chunks_n(rid: str = "") -> int:
 # written - same keys in the same order - produced a few hundred chunks
 # per C call (about 3 MB, tens of milliseconds) with the GIL handed back
 # between slices, the #1392 shape from the decode side.
-VECTOR_SAVE_SLICE = 200
+# #1412: THE SAVE THAT STARVED EVERYTHING ELSE.
+#
+# #1407 sliced the 684 MB store into 200-chunk json.dumps calls with a
+# sleep(0) between them. Measured on the 13:04 boot: a slice of these
+# chunks is ~24 MB of text, ~1.8 s of held GIL, thirty of them per save,
+# a save every five minutes while the library is assimilating - and every
+# file touch on the loop (gold_pick, pantry_get, load_settings, the feeds)
+# then waited on the disk the store was being written to. The pulse read
+# 66 stalls / 165 s in ten minutes and the gap ledger 195 s of dead air.
+#
+# So: twenty chunks per slice (~2.4 MB), orjson when it is installed (C,
+# about ten times json's encode of floats), a real 50 ms breath between
+# slices, and a progress save no oftener than fifteen minutes. The whole
+# store still lands in one atomic replace.
+VECTOR_SAVE_SLICE = 20
+VECTOR_SAVE_BREATH = 0.05
+
+try:
+    import orjson as _orjson            # #1412: optional, see requirements.txt
+except Exception:  # noqa: BLE001
+    _orjson = None
+
+
+def _fast_loads(raw: bytes) -> Any:
+    """#1412b: the parse of the store, through orjson when it is there -
+    a 684 MB parse held the GIL for ~12 s at every boot through json."""
+    if _orjson is not None:
+        try:
+            return _orjson.loads(raw)
+        except Exception:  # noqa: BLE001
+            pass
+    return json.loads(raw.decode("utf-8"))
+
+
+def _fast_dumps(obj: Any) -> bytes:
+    """orjson when present, json otherwise - always bytes."""
+    if _orjson is not None:
+        try:
+            return _orjson.dumps(obj)
+        except Exception:  # noqa: BLE001
+            pass
+    return json.dumps(obj).encode("utf-8")
 # ...and a rebuild persists its progress at most this often. At 684 MB a
 # progress save IS a 684 MB write, and the every-25-files rule (#597)
 # made sixteen of them for a rebuild that touched four hundred files, on
 # the disk that also serves the records.
-VECTOR_PROGRESS_SAVE_SECONDS = 300.0
+VECTOR_PROGRESS_SAVE_SECONDS = 900.0     # #1412: was 300
 
 
 def _json_write_sliced(path: Path, payload: dict[str, Any]) -> None:
     chunks = payload.get("chunks")
     if not isinstance(chunks, list) or len(chunks) <= VECTOR_SAVE_SLICE:
-        path.write_text(json.dumps(payload))
+        path.write_bytes(_fast_dumps(payload))
         return
     head = {k: v for k, v in payload.items() if k != "chunks"}
-    with open(path, "w", encoding="utf-8") as fh:
-        prefix = json.dumps(head)
-        fh.write(prefix[:-1] + (", " if head else "") + '"chunks": [')
+    with open(path, "wb") as fh:
+        prefix = _fast_dumps(head)
+        fh.write(prefix[:-1] + (b", " if head else b"") + b'"chunks": [')
         for i in range(0, len(chunks), VECTOR_SAVE_SLICE):
-            piece = json.dumps(chunks[i:i + VECTOR_SAVE_SLICE])
-            fh.write((", " if i else "") + piece[1:-1])
-            time.sleep(0)                # the loop's turn, between slices
-        fh.write("]}")
+            piece = _fast_dumps(chunks[i:i + VECTOR_SAVE_SLICE])
+            fh.write((b", " if i else b"") + piece[1:-1])
+            time.sleep(VECTOR_SAVE_BREATH)   # #1412: the loop's turn, for real
+        fh.write(b"]}")
 
 
 def _save_vectors(rid: str = "") -> None:
@@ -68861,15 +68940,24 @@ def gold_pick(exclude_who: str = "", min_rest: float | None = None) -> dict[str,
     try:
         now = time.time()
         rest = GOLD_REST if min_rest is None else float(min_rest)
+        # #1412: THE STAT COMES LAST. This stat'ed every gold row - 1,400
+        # of them - on the event loop per pick, against a disk the vector
+        # store was being written to; the pulse caught it at 6.8 s, five
+        # times in ten minutes. Same draw: uniform among the least-fired
+        # bars whose take is on disk - only the tier that qualifies is
+        # looked at, one file at a time, until one is there.
         pool = [r for r in _gold_rows()
                 if str(r.get("who") or "") != str(exclude_who or "")
-                and now - float(r.get("last") or 0) >= rest
-                and (VOICE_MEDIA_DIR / str(r.get("path") or "")).is_file()]
-        if not pool:
-            return None
-        least = min(int(r.get("fired") or 0) for r in pool)
-        pool = [r for r in pool if int(r.get("fired") or 0) == least]
-        return random.choice(pool)
+                and now - float(r.get("last") or 0) >= rest]
+        while pool:
+            least = min(int(r.get("fired") or 0) for r in pool)
+            tier = [r for r in pool if int(r.get("fired") or 0) == least]
+            random.shuffle(tier)
+            for r in tier:
+                if (VOICE_MEDIA_DIR / str(r.get("path") or "")).is_file():
+                    return r
+            pool = [r for r in pool if int(r.get("fired") or 0) != least]
+        return None
     except Exception:  # noqa: BLE001
         return None
 
@@ -152823,6 +152911,64 @@ used. Right: colour by how recently — newest red/yellow, oldest white/blue.">
 </div>
 
 <script>
+// #1413d: THE TABLET'S PACE, FOR EVERY ANIMATION AT ONCE.
+//
+// Profiled on the PineTab 2026-09-14 (devtools over adb, per-thread
+// /proc): CrRendererMain saturated, the WebAudio render thread at ~80%
+// of a core, the kiosk's GPU/Render threads ~150% between them - twelve
+// requestAnimationFrame loops (scopes, meters, the cover flow, two 3JS
+// scenes, the marquee) at 60 fps, most of them under a view that covers
+// them. The audio engine shares those cores; the operator hears the
+// shortage as a stutter. So on the tablet every rAF callback runs on
+// every fourth frame (15 fps): one wrapper here, and the injected views
+// inherit it. cancelAnimationFrame follows the re-armed id. The desktop
+// keeps 60.
+const PINE_UA = String(navigator.userAgent || "");
+const PINE_TABLET = /TrebleDroid|Android/i.test(PINE_UA)
+  || (!/Electron/i.test(PINE_UA) && /Linux/i.test(PINE_UA));
+const PINE_PACE = PINE_TABLET ? 4 : 1;
+window.PINE_PACE = PINE_PACE;
+if (PINE_TABLET) {
+  // #1413e: AND THE ANIMATIONS THAT NEVER ASKED FOR A FRAME. With rAF paced,
+  // the tablet's main thread was still 72% inside Chromium's own style,
+  // layout and paint: document.getAnimations() counted 380 - rhetFloat on
+  // 110 <i>s of the rhetoric cloud, left/top/filter transitions on its
+  // words (layout and repaint every frame), and pendSweep/pendBar on 29
+  // pending rows of the SCRIPT view (58 compositor layers), all under a
+  // view that covers them. Off, on the tablet only.
+  const paceStyle = document.createElement("style");
+  paceStyle.id = "pineTabletPace";
+  paceStyle.textContent = [
+    ".rhet-word, .rhet-word > i { animation: none !important; transition: none !important;",
+    "  filter: none !important; text-shadow: none !important; will-change: auto !important; }",
+    ".pending::before, .pending::after { animation: none !important; }"
+  ].join(" ");   /* a space: this script lives in a Python string, where 
+ is a newline */
+  (document.head || document.documentElement).appendChild(paceStyle);
+}
+if (PINE_PACE > 1) {
+  (function () {
+    const rafReal = window.requestAnimationFrame.bind(window);
+    const cafReal = window.cancelAnimationFrame.bind(window);
+    let frameNo = 0;
+    rafReal(function count() { frameNo += 1; rafReal(count); });
+    const live = new Map();
+    window.requestAnimationFrame = function (cb) {
+      const id = rafReal(function fire(t) {
+        if (frameNo % PINE_PACE) { live.set(id, rafReal(fire)); return; }
+        live.delete(id);
+        cb(t);
+      });
+      live.set(id, id);
+      return id;
+    };
+    window.cancelAnimationFrame = function (id) {
+      const real = live.get(id);
+      live.delete(id);
+      cafReal(real === undefined ? id : real);
+    };
+  })();
+}
 let settings = null;
 // Injected by the server so any computer on the LAN is authenticated without
 // pasting the key. Empty string if SPARK_AGENT_AUTOFILL_KEY is disabled.
@@ -161032,8 +161178,17 @@ function drawScope(canvas, player) {
   // night. That is the compounding cost that made typing stutter. Measure,
   // compare, and only resize when it has really changed.
   const ratio = window.devicePixelRatio || 1;
-  const wantW = Math.max(1, Math.round(canvas.clientWidth * ratio));
-  const wantH = Math.max(1, Math.round(canvas.clientHeight * ratio));
+  // #1413: clientWidth/Height are read once a second, not once a frame.
+  // Reading them forces a synchronous layout whenever the document is
+  // dirty - and on the tablet the SCRIPT view keeps it dirty - so this
+  // read was most of the 43% "(program)" in the tablet's profile.
+  const nowMs = performance.now();
+  let size = canvas.__scopeSize;
+  if (!size || nowMs - size.at > 1000) {
+    size = canvas.__scopeSize = {at: nowMs, w: canvas.clientWidth, h: canvas.clientHeight};
+  }
+  const wantW = Math.max(1, Math.round(size.w * ratio));
+  const wantH = Math.max(1, Math.round(size.h * ratio));
   if (canvas.width !== wantW) canvas.width = wantW;
   if (canvas.height !== wantH) canvas.height = wantH;
   const width = canvas.width, height = canvas.height;
@@ -161068,12 +161223,24 @@ function drawScope(canvas, player) {
   ctx.globalAlpha = 1;
 }
 
+// #1413: THE SCOPE AT A TABLET'S PACE. Profiled on the PineTab 2026-09-14
+// (Profiler over the WebView's devtools socket, 6 s): drawScope was 17% of
+// the page's main thread by itself, at 60 fps on two canvases, with the
+// layout it forced on top of that; the kiosk sat at 250% CPU with the
+// video set OFF, and the native audio engine shares those cores - which
+// is what the operator hears as a stutter. Every 4th frame on Android
+// (15 fps), every 2nd elsewhere (30 fps): nobody can see the difference
+// on a bar scope, and the audio can.
+const SCOPE_EVERY = PINE_TABLET ? 1 : 2;   // #1413d: the tablet's rAF is already paced
+let scopeTick = 0;
 function scopeLoop() {
   // #745: reschedule FIRST, then bail — so a hidden tab costs nothing and
   // the loop still resumes when it comes back. Same shape boothGlassDraw
   // already uses.
   requestAnimationFrame(scopeLoop);
   if (document.hidden) return;
+  scopeTick = (scopeTick + 1) % SCOPE_EVERY;                 // #1413
+  if (scopeTick) return;
   drawScope(document.getElementById("musicScope"),
             document.getElementById("musicPlayer"));
   drawScope(document.getElementById("boothScope"),
@@ -205082,7 +205249,12 @@ async function tvPoll() {
   const lagMs = tvLagSeconds() * 1000;
   const now = Date.now();
   let best = null;
-  (data.videos || []).forEach((v) => {
+  /* #1414: the ring answers `clips` and has done since the picture door
+   * was built; this read `videos`, so the stage never took a picture
+   * and the tailnet listener kept the artwork while every other surface
+   * saw the clip. "Make sure the video popup also happens on the
+   * tailscale stream replacing the pine box gallery." */
+  (data.videos || data.clips || []).forEach((v) => {
     if (!v.url || !v.seconds) return;
     /* The station's on-air instant, moved into THIS page's clock, then
      * held back by this listener's own lag so the picture lands on the
@@ -205110,7 +205282,7 @@ function tvShow(v, into) {
     el.src = clipUrl ? v.url : v.url;
     el.currentTime = Math.max(0, into);
     el.play().catch(() => {});
-    if (cap) cap.textContent = v.name || "";
+    if (cap) cap.textContent = v.name || v.sting || "";          /* #1414 */
     stage.classList.add("show");
     stage.classList.add("tv");
   } else {
@@ -205322,7 +205494,10 @@ async function pollOnce() {
            * the local moment as `broadcastAt`. It mounts itself on any
            * http page, so there is nothing to start. */
           try {
-            if (window.PineSfxTv) {
+            /* #1414: the gallery stage takes the picture on this page
+             * (tvPoll); the floating set is for a page that has no
+             * stage to give it. Two copies of one clip is not a feature. */
+            if (window.PineSfxTv && !document.getElementById("galleryStage")) {
               clip.at = clip.broadcastAt;
               window.PineSfxTv.offer(clip);
             }

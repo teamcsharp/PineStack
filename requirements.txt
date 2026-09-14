@@ -2,6 +2,7 @@ fastapi==0.116.1
 uvicorn[standard]==0.35.0
 httpx==0.28.1
 sniffio==1.3.1          # #1406: httpcore imports it on EVERY request and paid a failed import each time it was missing
+orjson==3.12.0              # #1412: the vector store is written in slices through it (json.dumps of floats held the GIL 1.8 s a slice)
 # Pinned to the versions verified running (audit: unpinned meant a
 # container RECREATE — the documented recovery path — silently pulled
 # whatever PyPI served, or hung if PyPI was down).

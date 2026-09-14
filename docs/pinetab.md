@@ -2301,3 +2301,60 @@ could have cured a fault that did not exist. `page_delivery_waits()` now
 excludes picture-only rows and any clip whose `broadcast_ms` is still to
 come, and every counter — the wedge state, the LOOK line, the ladder's rung
 and the oldest-waiting list — reads through it.
+
+**…and a clip whose moment passed long ago is history (#1410).** A video sting
+handed to the tube (`djVideoTv`) acks nothing after "received", so it sat in
+that count for ever — eleven of them, the head 568 s old, on a station heard one
+second before. A wedge is clips *not starting now*: the count is the last two
+minutes (`PAGE_WAIT_LATE_S`), the rest is a ledger. The ack itself — from the
+tube on play and skip, in the panel and in `sfx-tv.js` — is written up as open in
+the continuity note.
+
+**The set holds the next clip in its hand (#1411).** The station rings the
+list ahead; the set used to hold it as URLs and build a `<video>` at the
+moment, then wait for tens of megabytes to come over the link — measured on
+the desktop as 24 of 39 seconds *not* playing, one dark run of eleven
+seconds. Now the head of the queue is warmed: a detached `<video
+preload=auto>` starts fetching once the tube reports `canplaythrough` for the
+clip on screen (or 1.5 s after its first frame, and at once when a clip
+arrives while the tube already has what it needs), and `play()` puts *that*
+element in the tube. One warm element at a time, released when played, cut,
+dropped as late or the set stops. After: 26 of 39 seconds playing, longest
+dark run 8 s — and the rest of the dark is the station's own request
+latency while its loop is busy, which is the dead-air work, not the set's.
+
+## 28. The tablet's pace, and the tune-in gallery
+
+**Why the station stuttered (#1413).** Profiled on the PineTab over adb —
+`/proc/<pid>/task` by thread name and the Chrome profiler over the WebView's
+devtools socket — the tablet had **five cores busy** with the video set OFF:
+the WebView's main thread saturated, its WebAudio render thread at ~80% of a
+core, the kiosk's in-process GPU thread, `RenderThread` and the Mali backend
+another ~150% between them. The page was animating at 60 fps under a view
+that covered most of it: two bar scopes (`drawScope`, `paintScope`), the
+meters, the cover flow, two 3JS scenes, the marquee — twelve
+`requestAnimationFrame` loops — and, when those were paced, still 72% of the
+main thread inside Chromium's own style/layout/paint: `document.getAnimations()`
+counted **380** — `rhetFloat` on 110 `<i>`s of the rhetoric cloud, `left/top/
+filter` transitions on its words (a layout *and* a repaint every frame), and
+`pendSweep`/`pendBar` on 29 pending rows. The audio engine shares those cores;
+that is what a stutter is.
+
+The cures live at the top of the panel script and are tablet-only (the
+kiosk's WebView calls itself `Linux; X11; TrebleDroid`, not Android, so the
+key is *not Electron and Linux*): `#1413d` paces every `requestAnimationFrame`
+to every fourth frame (15 fps) with one wrapper the injected views inherit —
+`cancelAnimationFrame` follows the re-armed id; `#1413e` injects a stylesheet
+that switches those animations off; `#1413a–c` throttle the two scopes and
+the meters themselves and read `clientWidth` once a second instead of once a
+frame (a layout read forces a layout of a document the feed keeps dirty).
+The desktop keeps 60 fps and every animation.
+
+**The tune-in gallery takes the clip (#1414).** The tailnet page has had the
+machinery all along — `tvPoll` polls `/api/dj/video`, and `#galleryStage.tv`
+swaps the artwork for a muted `<video>` at the clip's on-air moment, corrected
+by the listener's own lag — but it read `data.videos` and the ring answers
+`data.clips`, so the stage never took a picture; every other surface saw the
+SFX guy's clips and the tailnet listener kept the painting. Fixed, with the
+caption from the clip's `sting`, and the floating set no longer offered a
+second copy on a page that has a stage to give the clip to.
