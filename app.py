@@ -5903,6 +5903,11 @@ async def _startup_retention() -> None:
 
 
 @app.on_event("startup")
+async def _startup_gc_freeze() -> None:
+    fire_and_forget(_gc_freeze_clock())                # #1421
+
+
+@app.on_event("startup")
 async def _startup_tidy() -> None:
     """#995/#998: the one-time housekeeping, on every boot rather than on
     every radio start.
@@ -61855,6 +61860,44 @@ def _gc_freeze_after_load(key: str, chunks: int) -> None:
 
 
 _GC_REPORT_MEMO: dict[str, Any] = {"at": 0.0, "value": {}}
+
+# #1421: THE HEAP IS FROZEN AGAIN EVERY QUARTER HOUR.
+#
+# #1393 froze the vector stores once, after they loaded. Everything made
+# since - pantry rows, the chat ring, the larder, the ledgers - is walked by
+# every gen-2 collection, and there are about six of those a minute here
+# (pulse.gc: 12 -> 31 in 180 s). On a fresh heap they cost nothing; an hour
+# in, the pulse read them as 2-second "outside: run" stalls, twelve in ten
+# minutes, with the pool threads named as bystanders in stat(). So every
+# GC_FREEZE_EVERY_S the loop takes ONE full collection on purpose, at a
+# moment the air is not first, and freezes what survived: the next
+# collections skip it. What is freed by refcount is still freed; only
+# cyclic garbage born before a freeze waits for the next boot.
+GC_FREEZE_EVERY_S = 900.0
+
+
+async def _gc_freeze_clock() -> None:
+    while True:
+        await asyncio.sleep(GC_FREEZE_EVERY_S)
+        try:
+            for _ in range(40):
+                if not air_first():
+                    break
+                await asyncio.sleep(3.0)
+            t0 = time.perf_counter()
+            collected = gc.collect()
+            gc.freeze()
+            _GC_FROZEN.update({"at": time.time(),
+                               "loads": int(_GC_FROZEN.get("loads") or 0) + 1,
+                               "frozen": gc.get_freeze_count()})
+            _GC_REPORT_MEMO["at"] = 0.0
+            pipeline_log("model", "gc: collected %d, froze the heap again (%d objects) "
+                         "in %.2f s (#1421)" % (collected, gc.get_freeze_count(),
+                                                time.perf_counter() - t0))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _gc_report() -> dict[str, Any]:
@@ -169152,6 +169195,57 @@ function djLevels() {
 
 let djSpeaking = false;
 
+/* #1419: THE MIXER. Four levels the listener sets from the SCRIPT view's dot
+ * - voices, music, SFX (a sting on the voice element), videos (the set and
+ * the page's own tube) - as multipliers on top of the station's own levels,
+ * kept in this browser's localStorage under `pineMixer`. Inside the desktop
+ * app the SHELL owns every live element's volume (#1147) and defines the
+ * same window.pineMixer itself, so here the multipliers are all 1 there and
+ * the shell's copy is the one that counts; on the tablet and in a plain
+ * browser this is the one. */
+const PINE_MIXER_KEY = "pineMixer";
+function pineMixerRead() {
+  if (window.__pineDesktopVolume !== undefined) {
+    return {voice: 1, music: 1, sfx: 1, video: 1};
+  }
+  const one = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(1.5, n)) : 1; };
+  let m = {};
+  try { m = JSON.parse(localStorage.getItem(PINE_MIXER_KEY) || "{}") || {}; } catch (e) { m = {}; }
+  return {voice: one(m.voice), music: one(m.music), sfx: one(m.sfx), video: one(m.video)};
+}
+function pineMixerVoiceLevel(el_, base) {
+  const m = pineMixerRead();
+  const sting = !!(el_ && el_.dataset && el_.dataset.pineSting === "1");
+  return Math.max(0, Math.min(1, Number(base) * (sting ? m.sfx : m.voice)));
+}
+function pineMixerApply() {
+  const m = pineMixerRead();
+  try { djApplyGain(); } catch (e) { /* the sliders may not be built yet */ }
+  try {
+    document.querySelectorAll(".sfx-tv-tube video").forEach((v) => {
+      v.volume = Math.max(0, Math.min(1, m.video));
+    });
+  } catch (e) { /* no tube up */ }
+  try {
+    if (window.PineSfxTv && window.PineSfxTv.level
+        && !(typeof pineInsideDesktopShell === "function" && pineInsideDesktopShell())) {
+      window.PineSfxTv.level(Math.max(0, Math.min(1, m.video)));
+    }
+  } catch (e) { /* no set on this page */ }
+}
+if (!window.pineMixer) {
+  window.pineMixer = {
+    get: pineMixerRead,
+    set: (values) => {
+      const m = Object.assign(pineMixerRead(), values || {});
+      try { localStorage.setItem(PINE_MIXER_KEY, JSON.stringify(m)); } catch (e) { /* private mode */ }
+      pineMixerApply();
+      return m;
+    },
+    apply: pineMixerApply,
+  };
+}
+
 function djApplyGain() {
   const level = djLevels();
   ["djGainMusic", "djGainVoice", "djDuck"].forEach((id) => {
@@ -169169,7 +169263,8 @@ function djApplyGain() {
     // #744: an ad preview ducks the music exactly the way the DJs do,
     // at the operator's own duck depth and with the same click-free ramp.
     const target = level.music
-      * ((djSpeaking || adPreviewUrl) ? (1 - level.duck) : 1);
+      * ((djSpeaking || adPreviewUrl) ? (1 - level.duck) : 1)
+      * pineMixerRead().music;                                     /* #1419 */
     music.node.gain.setTargetAtTime(target, music.context.currentTime, 0.12);
   }
   // The DJ-voice <audio> elements play directly (not through the mixer), so
@@ -169185,7 +169280,7 @@ function djApplyGain() {
    * slider in a plain browser. */
   if (typeof djVoiceEls !== "undefined"
       && window.__pineDesktopVolume === undefined) {
-    djVoiceEls.forEach((a) => { if (a) a.volume = vlvl; });
+    djVoiceEls.forEach((a) => { if (a) a.volume = pineMixerVoiceLevel(a, vlvl); });   /* #1419 */
   }
 }
 
@@ -175839,6 +175934,7 @@ function djTvShow(clip) {
    * reads "audio,video" and reaches this too. A sting that skipped the
    * tag would be the one sound on the page nobody could turn down. */
   video.dataset.pineLive = "voice";
+  try { video.volume = Math.max(0, Math.min(1, pineMixerRead().video)); } catch (e) {}   /* #1419 */
   /* No br=: that road is an AUDIO transcode (#1210). The signature in
    * the url is what gets it past the guard, so it is passed through
    * exactly as the station wrote it. */
@@ -176320,6 +176416,15 @@ function djVoiceNext() {
   try {
     player.dataset.pineLive = (String(clip.kind || "") === "reply")
       ? "reply" : "voice";
+    player.dataset.pineSting = clip.sting ? "1" : "";              /* #1419 */
+  } catch (e) { /* the clip still plays */ }
+  /* #1419: at the mixer's level for what it is about to carry - a sting
+   * at the SFX level, a line at the voices' - where this page owns the
+   * element's volume (the shell does inside the desktop app). */
+  try {
+    if (window.__pineDesktopVolume === undefined && typeof djLevels === "function") {
+      player.volume = pineMixerVoiceLevel(player, Math.max(0, Math.min(1, djLevels().voice)));
+    }
   } catch (e) { /* the clip still plays */ }
   djVoiceSlot = 1 - djVoiceSlot;
   djVoiceBusy = true;

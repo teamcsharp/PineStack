@@ -183,3 +183,27 @@ paintFeed` — 3,000 invalidations in 3 s from the SCRIPT view re-dressing every
 row of a 300-row feed on every poll. Recipe worth keeping: aggregate `X` events
 on the `CrRendererMain` tid by name; count `*InvalidationTracking` events by
 `args.data.stackTrace[0]`.
+
+## The stutter that came back (15:00) — a graph that grows
+
+With every rAF paced and the animations off, the tablet stuttered again an hour
+later. Per-thread: `Realtime AudioWorklet` 103%. `sampler-air.js` taps every
+element that plays; the set makes a new `<video>` per clip; each tap is a
+`MediaElementSource` + analyser cached by element and never disconnected —
+counted on a fresh page with `AudioContext.prototype.createMediaElementSource`
+wrapped: 4 new sources/min, all `VIDEO.sfx-tv-tube`. The endless set (#1395) turned
+a slow leak into a twenty-minute one. #1420: tap only id-bearing, non-video
+elements. The measurement to keep: a stutter that *grows back* after a reload is
+a graph or a queue growing, not a load — count node creations, don't sample CPU.
+
+## Full collections, and the heap frozen again (15:10, #1421)
+
+After the disk storm was cured the pulse still showed 2-second `outside: run`
+rows, a dozen in ten minutes, with pool threads in `stat()` named as the GIL
+holders — bystanders, since `stat` releases it. The main thread's own C time is
+the collector: `pulse.gc` counted gen-2 collections 12 → 31 in 180 s (~6 a
+minute). On a fresh heap they are free (0 blind rows in that window); an hour in,
+with everything made since boot on the walk, each one is the 2-second row. #1421
+takes one deliberate full collection every fifteen minutes, when the air is not
+first, and freezes what survived, so the next collections skip it — the same
+trick #1393 played once for the vector stores, repeated for everything else.

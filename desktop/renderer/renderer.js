@@ -188,10 +188,39 @@ function initRailResizer() {
  * that product is the ONLY thing that should ever be written to the
  * element. Keeping it in one function is what stops the two ideas being
  * confused again. */
+/* #1419: THE MIXER. Four levels the listener sets from the SCRIPT view's
+ * dot - voices, music, SFX (a sting on the voice element), videos (the
+ * set) - as multipliers on top of the master and the shares, kept in
+ * this machine's localStorage and applied wherever the shell already
+ * writes a level: the radio player here, the tagged elements inside the
+ * panel webview (appVolumeScript carries them in), the SFX television.
+ * The panel page defines the same window.pineMixer on the tablet, so
+ * the view calls one name on both surfaces. */
+const PINE_MIXER_KEY = "pineMixer";
+function pineMixerRead() {
+  const one = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(1.5, n)) : 1; };
+  let m = {};
+  try { m = JSON.parse(localStorage.getItem(PINE_MIXER_KEY) || "{}") || {}; } catch (err) { m = {}; }
+  return {voice: one(m.voice), music: one(m.music), sfx: one(m.sfx), video: one(m.video)};
+}
+let mixerLevels = pineMixerRead();
+window.pineMixer = {
+  get: () => Object.assign({}, mixerLevels),
+  set: (values) => {
+    mixerLevels = Object.assign(pineMixerRead(), mixerLevels, values || {});
+    try { localStorage.setItem(PINE_MIXER_KEY, JSON.stringify(mixerLevels)); } catch (err) {}
+    const player = $("desktopRadioPlayer");
+    if (player) { player.volume = desktopMusicGain(); player.muted = desktopMusicGain() <= 0; }
+    applyAppVolume();
+    return Object.assign({}, mixerLevels);
+  },
+  apply: () => applyAppVolume(),
+};
+
 function desktopMusicGain() {
   const share = (streamVolumes && Number.isFinite(streamVolumes.music))
     ? streamVolumes.music : 1;
-  return Math.max(0, Math.min(1, appVolume * share));
+  return Math.max(0, Math.min(1, appVolume * share * mixerLevels.music));   /* #1419 */
 }
 
 /* #1263: and the same arithmetic for the SFX guy's television, which is
@@ -238,6 +267,7 @@ function appVolumeScript(audible = true) {
     window.__pineDesktopVolume = ${JSON.stringify(appVolume)};
     window.__pineDesktopAudible = ${JSON.stringify(audible)};
     window.__pineDesktopStreams = ${JSON.stringify(streamVolumes)};
+    window.__pineDesktopMixer = ${JSON.stringify(mixerLevels)};     /* #1419 */
     /* ...and the rAF latch is cleared, because a hidden or throttled
      * webview can leave it set for ever and every hook becomes a no-op. */
     window.__pineDesktopVolumePending = false;
@@ -286,7 +316,13 @@ function appVolumeScript(audible = true) {
         const share = live
           ? (streams[tag === "1" ? "voice" : tag] ?? 1)
           : 1;
-        const nextVolume = nodeAudible ? volume * share : 0;
+        /* #1419: the listener's mixer, by what the element is carrying. */
+        const mixer = window.__pineDesktopMixer || {};
+        const kind = node.tagName === "VIDEO" ? "video"
+          : (node.dataset && node.dataset.pineSting === "1") ? "sfx"
+          : (tag === "music" ? "music" : "voice");
+        const mix = Number.isFinite(Number(mixer[kind])) ? Number(mixer[kind]) : 1;
+        const nextVolume = nodeAudible ? Math.min(1, volume * share * mix) : 0;
         if (Math.abs(node.volume - nextVolume) > 0.001) node.volume = nextVolume;
         /* #1147: MUTE ONLY, NEVER FORCE-UNMUTE. The page's solo gate
          * (#1008 pineSoloGate) gags this surface when another listener
@@ -797,7 +833,7 @@ function applyAppVolume() {
    * script above can never reach it, so its level is written here or it
    * is the one sound in this window the sliders do not move. */
   try {
-    if (window.PineSfxTv) window.PineSfxTv.level(desktopVoiceGain());
+    if (window.PineSfxTv) window.PineSfxTv.level(Math.min(1, desktopVoiceGain() * mixerLevels.video));   /* #1419 */
   } catch (err) { /* the frames are already levelled */ }
 }
 
@@ -2786,15 +2822,15 @@ const THREEJS_VIEWS = [
     systems: "three.module.js · /api/dj/crystal",
     what: "Everything they have ever said, crystallised",
     desc: "The whole spoken history as a growing point cloud, one cluster per speaker, placed by phrase embedding so reruns crystallise together. Hover reads a phrase; right-click deletes it from the DJ's memory." },
-  { key: "shelf", icon: "❄️", name: "The shelf", since: "the chunk ledger",
+  { key: "shelf", icon: "❄", name: "The shelf", since: "the chunk ledger",
     systems: "/api/chunks",
     what: "What the crystal and the speakbox hold, chunk by chunk",
     desc: "Both shelves - the crystal's and the speakbox's - every chunk with how often it has been used and how long it has been resting; filter to one shelf or to the chunks that are resting." },
-  { key: "slots", icon: "⏱️", name: "The half hours", since: "the slot ledger",
+  { key: "slots", icon: "⏱", name: "The half hours", since: "the slot ledger",
     systems: "/api/slots",
     what: "The hour in half-hour slots, and what each is owed",
     desc: "Every half hour the running order owns: what it asks for, what has been staged against it and what is still missing, refreshed as the desks work." },
-  { key: "asks", icon: "🎛️", name: "The orchestrator asks", since: "#1058",
+  { key: "asks", icon: "🎛", name: "The orchestrator asks", since: "#1058",
     systems: "/api/orchestrator/asks",
     what: "The questions the orchestrator has for you",
     desc: "Nothing until it has a question; then the evidence behind each ask and a way to answer it, with the rejected-lines review one click away." },
@@ -4620,7 +4656,7 @@ function initWorksPopup() {
     b.style.cssText = "font-size:10px;line-height:1.5;white-space:pre-wrap;"
       + "max-height:26vh;overflow:auto;padding:5px 7px;border-radius:6px;"
       + "background:#05090f;border:1px solid #24384a"
-      + (mono ? ";font-family:ui-monospace,Consolas,monospace,PineIcons" : "");
+      + (mono ? ";font-family:PineIcons, ui-monospace, Consolas, monospace, PineIcons" : "");
     drawer.appendChild(b);
   }
 
@@ -7725,7 +7761,7 @@ function worksSchedule(anchorPop) {
     d.appendChild(mk("div", "wk-note", "THE SYSTEM PROMPT"));
     const ta = mk("textarea", "");
     ta.style.cssText = "width:100%;height:170px;font-size:10.5px;"
-      + "font-family:ui-monospace,Consolas,monospace,PineIcons";
+      + "font-family:PineIcons, ui-monospace, Consolas, monospace, PineIcons";
     d.appendChild(ta);
 
     /* STORE IT. A name AND the scenario it suits, because that is the
@@ -8029,7 +8065,7 @@ function worksSchedule(anchorPop) {
     d.appendChild(mk("div", "wk-note", "THE SYSTEM PROMPT FOR THIS ENTRY"));
     const ta = mk("textarea", "");
     ta.style.cssText = "width:100%;height:150px;font-size:10.5px;"
-      + "font-family:ui-monospace,Consolas,monospace,PineIcons";
+      + "font-family:PineIcons, ui-monospace, Consolas, monospace, PineIcons";
     ta.placeholder = "Leave empty to use whatever is armed for a "
       + slot.kind + " round.";
     d.appendChild(ta);
@@ -8761,7 +8797,7 @@ function wkPutInto(box, label, text, mono) {
   b.style.cssText = "font-size:10px;line-height:1.5;white-space:pre-wrap;"
     + "max-height:26vh;overflow:auto;padding:5px 7px;border-radius:6px;"
     + "background:#05090f;border:1px solid #24384a"
-    + (mono ? ";font-family:ui-monospace,Consolas,monospace,PineIcons" : "");
+    + (mono ? ";font-family:PineIcons, ui-monospace, Consolas, monospace, PineIcons" : "");
   box.appendChild(b);
 }
 
@@ -9561,7 +9597,7 @@ function wkReviewPopup(kind, id) {
     scriptBox.style.cssText = "width:100%;min-height:170px;font-size:10px;"
       + "line-height:1.55;background:#05090f;color:#cfe3f4;"
       + "border:1px solid #24384a;border-radius:6px;padding:6px 8px;"
-      + "font-family:ui-monospace,Consolas,monospace,PineIcons";
+      + "font-family:PineIcons, ui-monospace, Consolas, monospace, PineIcons";
     body.appendChild(scriptBox);
 
     const note = document.createElement("input");

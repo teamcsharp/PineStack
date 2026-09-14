@@ -238,6 +238,7 @@
 /* ------------------------------------------------------------------- 5 */
 
 .sp-player {
+  position: relative;                      /* #1419: the dot sits in the corner */
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 10px;
@@ -283,6 +284,34 @@
   color: var(--sp-muted); font-variant-numeric: tabular-nums;
 }
 .sp-transport { display: flex; flex-direction: column; gap: 5px; }
+/* #1419: the mixer dot and its sheet */
+.sp-mixdot {
+  position: absolute; top: 5px; right: 6px; width: 12px; height: 12px;
+  padding: 0; border: 1px solid rgba(255,255,255,.35); border-radius: 50%;
+  background: var(--sp-accent, #65c7da); box-shadow: 0 0 6px var(--sp-accent, #65c7da);
+  cursor: pointer; opacity: .85; z-index: 3;
+}
+.sp-mixdot:hover { opacity: 1; transform: scale(1.15); }
+.sp-mix-back {
+  position: fixed; inset: 0; z-index: 2147483006; display: flex;
+  align-items: center; justify-content: center; background: rgba(0,0,0,.55);
+}
+.sp-mix-box {
+  width: min(360px, 92vw); background: var(--sp-panel, #131c24); color: var(--sp-text, #edf3f5);
+  border: 1px solid var(--sp-line, #35414c); border-radius: 12px; padding: 10px 14px 14px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.7); font-size: 13px;
+}
+.sp-mix-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--sp-line, #35414c); }
+.sp-mix-head b { flex: 1 1 auto; font-size: 15px; }
+.sp-mix-reset, .sp-mix-shut {
+  border: 1px solid var(--sp-line, #35414c); border-radius: 7px; background: var(--sp-panel-2, #0e151b);
+  color: var(--sp-text, #edf3f5); font: inherit; font-size: 12px; padding: 4px 9px; cursor: pointer;
+}
+.sp-mix-row { display: grid; grid-template-columns: 64px 1fr 44px; gap: 10px; align-items: center; padding: 9px 0 0; }
+.sp-mix-name { font-size: 12px; color: var(--sp-muted, #b9c6cf); }
+.sp-mix-range { width: 100%; min-width: 0; }
+.sp-mix-val { font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; color: var(--sp-muted, #b9c6cf); }
+.sp-mix-note { padding-top: 10px; font-size: 10.5px; color: var(--sp-muted, #b9c6cf); }
 .sp-tbtn {
   width: 36px; height: 30px; padding: 0;
   border: 1px solid var(--sp-line); border-radius: 7px;

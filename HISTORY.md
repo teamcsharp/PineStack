@@ -437,7 +437,7 @@ the gagged light came on with the station audible`.
 
 ---
 
-## Era 12 — Continuous, measured (Sep 14, 4 commits)
+## Era 12 — Continuous, measured (Sep 14, 8 commits)
 
 The operator's requirement for the day was one sentence: *the station has to be
 continuous and the voices cannot stop.* The day's commits are the census that

@@ -696,6 +696,8 @@
       + '<input id="spSeek" class="sp-seek" type="range" min="0" max="1000" value="0">'
       + '<i id="spLen" class="sp-time"></i>'
       + '</div></div>'
+      + '<button id="spMixDot" class="sp-mixdot" type="button" '
+      + 'title="Levels: voices, music, SFX, videos" aria-label="Levels"></button>'
       + '<div class="sp-transport">'
       + '<button id="spPrev" class="sp-tbtn" title="The station’s previous track">⏮</button>'
       + '<button id="spNext" class="sp-tbtn" title="Skip to the next track">⏭</button>'
@@ -729,6 +731,8 @@
       });
     }
     seek && (seek.dataset.dragging = '');
+    var dot = el('spMixDot');                                    /* #1419 */
+    if (dot) dot.addEventListener('click', function (ev) { ev.stopPropagation(); mixerOpen(); });
     var prev = el('spPrev');
     var next = el('spNext');
     if (prev) prev.addEventListener('click', function () { api().post('/api/dj/prev', {}); });
@@ -774,6 +778,93 @@
       if (root.PineMeters) root.PineMeters.wake();
     });
   }
+
+  /* #1419: THE MIXER DOT.
+   *
+   * "Put a dot here that whenever I click it or tap it it brings up a
+   *  pop-up that shows volume sliders for the voices, the music, the SFX,
+   *  and the videos, and it allows me to adjust the volume levels of each
+   *  of them individually and have it retain these settings and remember
+   *  it next time."
+   *
+   * The levels are multipliers (0-100%) on top of whatever the station and
+   * the shell already set, kept in this device's localStorage under
+   * `pineMixer` and applied through window.pineMixer - the panel's on the
+   * tablet (the view is injected into that page), the shell's on the
+   * desktop (the view runs in the shell there and the panel is a webview
+   * the shell levels). Either way one call, one name. */
+  var MIXER_ROWS = [
+    ['voice', 'Voices'], ['music', 'Music'], ['sfx', 'SFX'], ['video', 'Videos']
+  ];
+  function mixerRead() {
+    var m = null;
+    try { if (root.pineMixer && root.pineMixer.get) m = root.pineMixer.get(); } catch (err) { m = null; }
+    if (!m) { try { m = JSON.parse(root.localStorage.getItem('pineMixer') || '{}'); } catch (err) { m = {}; } }
+    var out = {};
+    MIXER_ROWS.forEach(function (row) {
+      var v = Number(m && m[row[0]]);
+      out[row[0]] = isFinite(v) ? Math.max(0, Math.min(1.5, v)) : 1;
+    });
+    return out;
+  }
+  function mixerWrite(values) {
+    try { root.localStorage.setItem('pineMixer', JSON.stringify(values)); } catch (err) { /* private mode */ }
+    try { if (root.pineMixer && root.pineMixer.set) root.pineMixer.set(values); } catch (err) { /* applied next time */ }
+  }
+  function mixerOpen() {
+    var old = document.getElementById('spMixBack');
+    if (old) { old.remove(); return; }
+    var levels = mixerRead();
+    var back = make('div', 'sp-mix-back');
+    back.id = 'spMixBack';
+    var box = make('div', 'sp-mix-box');
+    var head = make('div', 'sp-mix-head');
+    head.appendChild(make('b', '', 'Levels'));
+    var reset = make('button', 'sp-mix-reset', 'Reset');
+    reset.type = 'button';
+    var shut = make('button', 'sp-mix-shut', '\u2715');
+    shut.type = 'button';
+    head.appendChild(reset);
+    head.appendChild(shut);
+    box.appendChild(head);
+    var inputs = {};
+    MIXER_ROWS.forEach(function (row) {
+      var line = make('label', 'sp-mix-row');
+      line.appendChild(make('span', 'sp-mix-name', row[1]));
+      var range = document.createElement('input');
+      range.type = 'range'; range.min = '0'; range.max = '100'; range.step = '1';
+      range.value = String(Math.round(levels[row[0]] * 100));
+      range.className = 'sp-mix-range';
+      var val = make('span', 'sp-mix-val', range.value + '%');
+      range.addEventListener('input', function () {
+        val.textContent = range.value + '%';
+        levels[row[0]] = Number(range.value) / 100;
+        mixerWrite(levels);
+      });
+      inputs[row[0]] = {range: range, val: val};
+      line.appendChild(range);
+      line.appendChild(val);
+      box.appendChild(line);
+    });
+    box.appendChild(make('div', 'sp-mix-note',
+      'Remembered on this device. On top of the station\u2019s own levels.'));
+    reset.addEventListener('click', function () {
+      MIXER_ROWS.forEach(function (row) {
+        levels[row[0]] = 1;
+        inputs[row[0]].range.value = '100';
+        inputs[row[0]].val.textContent = '100%';
+      });
+      mixerWrite(levels);
+    });
+    shut.addEventListener('click', function () { back.remove(); });
+    back.addEventListener('click', function (ev) { if (ev.target === back) back.remove(); });
+    box.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    back.appendChild(box);
+    document.body.appendChild(back);
+  }
+  /* Applied once at load too, so a remembered level is heard before the
+     dot is ever touched. */
+  try { if (root.pineMixer && root.pineMixer.apply) root.pineMixer.apply(); } catch (err) { /* later */ }
 
   function clock(v) {
     var t = Math.max(0, Math.round(Number(v) || 0));

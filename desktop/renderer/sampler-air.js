@@ -262,7 +262,29 @@
       !!element.duration;
   }
 
+  /* #1420: ONLY THE FIXED PLAYERS ARE TAPPED.
+   *
+   * tap() ran for every element that ever played - the play() hook below
+   * and the audioScope hook both fed it - and each tap is a
+   * createMediaElementSource plus the panel's analyser, cached by element
+   * and connected for good. The SFX guy's set builds a NEW <video> for
+   * every clip (#1312), so with the endless set on the graph grew by one
+   * dead source per clip: measured on the PineTab 2026-09-14, four new
+   * sources a minute, the WebAudio render thread from 33% after a reload
+   * to 103% of a core twenty minutes later - which is what the operator
+   * heard as "suddenly the Pine Tab stream started stuttering". A clip
+   * is heard through its own element; it is not sampled from the air.
+   * Only an element with an id - the station's fixed players - is
+   * tapped, and never a video. */
+  function tappable(element) {
+    if (!element || !element.tagName) return false;
+    if (String(element.tagName).toUpperCase() === 'VIDEO') return false;
+    if (!element.id) return false;
+    return true;
+  }
+
   function tap(element) {
+    if (!tappable(element)) return null;                 /* #1420 */
     if (!element || taps.has(element)) return taps.get(element) || null;
     if (known.indexOf(element) < 0) known.push(element);
 
@@ -337,7 +359,7 @@
       var original = proto.play;
       proto.play = function () {
         try {
-          if (!isOurs(this)) tap(this);
+          if (!isOurs(this) && tappable(this)) tap(this);   /* #1420 */
         } catch (err) { /* never let bookkeeping stop playback */ }
         return original.apply(this, arguments);
       };
@@ -361,7 +383,7 @@
         var scope = scoped.apply(this, arguments);
         try {
           if (scope && scope.analyser && player && !isOurs(player)
-            && !taps.has(player)) {
+            && tappable(player) && !taps.has(player)) {   /* #1420 */
             ctx = ctx || scope.context;
             if (scope.context === context() && ensureRing()) {
               scope.analyser.connect(capture);

@@ -2417,3 +2417,43 @@ gets the same feed row and history entry it always did, marked `endless`. An
 audio-only sting waits for the tube to be free — in endless mode that is his
 next cadence after the set has nothing planned. `/api/sfx/video/mode` shows
 `asked`: his clips waiting their turn.
+
+**"Suddenly the Pine Tab stream started stuttering" (#1420).** Not the
+station (its pulse was calm) and not the frame pipeline (paced): the WebView's
+audio render thread was at **103% of a core**, up from 33% after a reload
+twenty minutes earlier. `sampler-air.js` — the sampler's record-from-the-air
+tap — hooks `HTMLMediaElement.play` and taps *every element that plays*: a
+`createMediaElementSource` plus the panel's analyser, cached by element and
+connected for good. The SFX guy's set builds a **new `<video>` for every clip**
+(#1312), so with the endless set on the graph grew by one dead source per
+clip — measured after a reload: four new sources a minute, all on
+`VIDEO.sfx-tv-tube` — until the render thread could not keep up, which the ear
+hears as a stutter. Now only an element with an id (the station's fixed
+players) is tapped, and never a video; a clip is heard through its own
+element and is not sampled from the air. Both copies carry it: the tablet's
+(`pine-sampler/sampler-air.js` in the kiosk, the one with the worklet) and the
+desktop shell's.
+
+## 29. The mixer dot
+
+**A dot on the player card, and four sliders (#1419).** "Put a dot here that
+whenever I click it or tap it it brings up a pop-up that shows volume sliders
+for the voices, the music, the SFX, and the videos … and have it retain these
+settings and remember it next time." The dot sits in the top-right corner of
+the SCRIPT view's player card. Tap it and a sheet opens with **Voices, Music,
+SFX, Videos** (0–100%) and a Reset. The levels are multipliers on top of
+whatever the station and the shell already set, kept on *this device*
+(`localStorage.pineMixer`) and applied again at load, before the dot is ever
+touched.
+
+How it reaches the sound, which differs by surface: on the tablet the view is
+injected into the panel page, and the panel's `window.pineMixer` applies the
+levels where it writes them — the music gain node, the voice elements (a
+sting, flagged `pineSting` at play time, takes the SFX level; a line takes
+the voices'), the page's own tube and the set (`PineSfxTv.level`). On the
+desktop the view runs in the shell, whose `window.pineMixer` (same name, same
+shape) folds the levels into the master × share arithmetic it already
+injects into the panel webview (`__pineDesktopMixer`, by what each element is
+carrying: a video, a sting, music, a voice) and into the SFX television's
+level. Inside the desktop app the panel's own copy stays at 1 so the two
+never multiply.
