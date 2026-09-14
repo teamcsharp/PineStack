@@ -437,6 +437,42 @@ the gagged light came on with the station audible`.
 
 ---
 
+## Era 12 — Continuous, measured (Sep 14, 4 commits)
+
+The operator's requirement for the day was one sentence: *the station has to be
+continuous and the voices cannot stop.* The day's commits are the census that
+requirement forced, and what it found was never the script. `The ARP table was full,
+so the radio could never finish a handshake` and `The clip doctor, a heal button for
+the camera, and the orb's two broken roads` put the camera and the clips back — a
+stale Docker bind under a later mount, a neighbour table at its ceiling, a share
+walked on the event loop — and gave each cure a rung. `The panel did not parse, so
+nobody heard the DJs; the loop taken off its knees` found fifty-two minutes of
+silence in eight mangled `font:` lines, and then built the dead-air census
+(`/api/deadair`), which read 93% of the hour's dead air as *the loop blocked*, not the
+script thin: the pool's quadratic publish, the learning desks' fsyncs, the rap
+evidence rebuilt per line. `Twenty inbox items closed` gave the agent's roads their
+buttons.
+
+**Then the profile.** The pulse names stalls of a second and a half; it cannot see a
+loop that is eighty percent busy with nothing that long. Twenty seconds of py-spy on
+uvicorn's own pid did: a quarter of the main thread under `/api/dj`, and under that a
+one-string read (`crystal_acceptance_mode`) taking the learning store's lock that the
+learning desk — moved off the loop the day before — now held through every commit;
+the collector's report walking half a million frozen objects per poll; a tenth of
+every sample in `importlib`, because `sniffio` was not installed, httpcore imports it
+on every request, and a failed import is never cached. Beside it the continuity agent
+measured the empty hour: every System2 row pinned forever to the slot it was
+commissioned for, so a slot that passed unfilled locked its output to a dead
+occurrence (297 of 495 callers); a catalogue that was an archive (2,467 rows, 89 MB,
+re-serialised per refresh); a `reserve()` that decoded 99 MB per dispatch on the main
+thread; and a 684 MB vector store dumped in one `json.dumps` that held the GIL for
+the twelve to sixteen seconds the watchdog calls deaf. The endless set became a
+playlist rung twenty seconds ahead from the clip book, so a stall on the station
+changes nothing on the tube, and the wedge detector learned that a picture rung for a
+moment still to come is not a clip waiting to start.
+
+---
+
 ## What the whole thing taught
 
 Read in order, the same five lessons keep arriving with different names on them.

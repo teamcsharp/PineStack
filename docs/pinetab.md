@@ -2255,3 +2255,49 @@ stops at the marker. The point is the one #1095 made: *"the station is
 playing on the tablet, yet the application is saying it's unable to locate
 the tablet"* — the report now arrives with the evidence that would have
 settled it.
+
+## 27. The endless set is a playlist, and the desktop's tube lights itself
+
+**Clip after clip (#1395).** The loop button's first cut rang *one* clip, a
+second before the one on the tube ran out, and drew it from the memo pool.
+Measured on the desktop with the mode lit and "the room is quiet" on the
+strip, three things made that gap-ridden: the sets poll `/api/dj/video`
+every 2.5 s, so a clip rung one second early was seen up to 1.5 s *after*
+the tube went dark; a set discards a clip more than 8 s late, and this
+station's loop stalled for 8 s often enough that a stall at the wrong
+moment dropped the clip and the tube stayed dark for the whole length of
+the one that never played; and the memo pool is empty for minutes after
+every restart while the clip book (#1362) already holds tens of thousands
+of playable clips. Now the station keeps a short playlist rung *ahead*
+from the book: each clip is stamped with a start after the previous one's
+end, three deep and about twenty seconds ahead. The sets hold the next clip
+before they need it and light each on its own timer ("early is not late"),
+so a stall of a few seconds on the station changes nothing on the screen.
+`/api/sfx/video/mode` says how far ahead it is — `queued` (clips the sets
+hold), `ahead_s`, `book` (48,103 playable video clips today), `rung` (total
+since boot). Measured: three different clips on the tablet in twelve
+seconds with no black between them; on the desktop the tube's `currentTime`
+went 2.5 → 7.5 s across a five-second probe at readyState 4. The picture
+door's own rule still holds — no lead, no reservation, no claim on the air —
+so an endless set cannot mortgage the show.
+
+**The desktop's tube (#1399).** On the desktop the set lives in the *shell*,
+not the panel webview, so it floats over every view — and it used to wait
+for the shell to mount it. After a reload the shell never did: `PineSfxTv`
+was there, the tube was not, and the loop button lit a set nobody could
+see. `sfx-tv.js` now mounts itself when it loads in the desktop shell (base
+URL from the station setting, `http://127.0.0.1:8096` as the fallback) and
+on any http(s) page with `baseUrl ''`; inside the kiosk the bridge still
+mounts it with the tablet's base. Verified over CDP: `.sfx-tv` present with
+a playing `<video>` thirteen minutes after a reload. (Numbered #1399 — the
+continuity agent's #1397 in `app.py` is a different thing.)
+
+**Pictures are not a stuck queue (#1405).** The reinitialise ladder's LOOK
+and the wedge detector counted every delivery the page had *received* and
+not *started* as "handed over and not started". With the playlist rung
+ahead that read *19 waiting, the head 690 s old* on a station that was
+audibly playing — past `PAGE_WEDGE_WAITING` (4), which is to say the ladder
+could have cured a fault that did not exist. `page_delivery_waits()` now
+excludes picture-only rows and any clip whose `broadcast_ms` is still to
+come, and every counter — the wedge state, the LOOK line, the ladder's rung
+and the oldest-waiting list — reads through it.

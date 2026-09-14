@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import stat as stat_module          # #1394
 import threading
 import time
 import uuid
@@ -32,6 +33,8 @@ class SfxSpeechBank:
         self.clock, self.capacity = clock, capacity
         self.lock = threading.RLock()
         self._rows = None
+        # #1394: name -> (ready, when). See media_ready.
+        self._media_memo = {}
 
     def _load(self):
         if self._rows is None:
@@ -123,14 +126,37 @@ class SfxSpeechBank:
                       key=lambda row: (bool(row.get("clip")), int(row.get("attempts") or 0),
                                        float(row.get("last_attempt") or 0), row["at"]))
 
+    MEDIA_MEMO_S = 20.0
+
     def media_ready(self, row):
         clip = row.get("clip") or {}
         name = str(clip.get("path") or "").split("?", 1)[0].rsplit("/", 1)[-1]
         try:
             seconds = float(clip.get("seconds") or 0)
-            return bool(name and name not in {".", ".."} and Path(name).name == name
-                        and 0 < seconds <= 12 and (self.media_dir / name).is_file()
-                        and (self.media_dir / name).stat().st_size > 0)
+            if not (name and name not in {".", ".."} and Path(name).name == name
+                    and 0 < seconds <= 12):
+                return False
+            # #1394: ONE STAT PER NAME PER TWENTY SECONDS. This did is_file()
+            # and then stat() - two disk round trips - for every row of the
+            # bank on every pick and every eligibility sweep, on the event
+            # loop, against a disk that also carries the pantry flusher's
+            # 13.5 MB dumps and the clip book's commits. 141 rows, 282
+            # stats, 7.4 s measured. A render file does not come and go
+            # within twenty seconds; when it does appear, twenty seconds is
+            # sooner than the next cadence window anyway.
+            now = self.clock()
+            held = self._media_memo.get(name)
+            if held is not None and now - held[1] < self.MEDIA_MEMO_S:
+                return held[0]
+            try:
+                st = (self.media_dir / name).stat()
+                ok = bool(stat_module.S_ISREG(st.st_mode) and st.st_size > 0)
+            except OSError:
+                ok = False
+            if len(self._media_memo) > 4096:
+                self._media_memo.clear()
+            self._media_memo[name] = (ok, now)
+            return ok
         except (OSError, TypeError, ValueError):
             return False
 

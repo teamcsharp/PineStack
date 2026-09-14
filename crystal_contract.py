@@ -400,13 +400,41 @@ def _discourse_question_text(text):
     return re.sub(r',\s*you\s+know\s*\?',replace,text,flags=re.I),tags
 
 
+# #1401: THE VOCABULARY IS CANONICALISED ONCE.
+#
+# extract_contract rebuilt {_canonical_word(w) for w in vocabulary} on
+# every call, and the vocabulary the station hands it is the crystal's
+# whole lexicon - tens of thousands of words, the same frozenset object
+# call after call. Measured in the container with a 150k-word set: 65 ms
+# per extract, 130 ms per compare (two extracts), against 1 ms for the
+# text itself. call_tint_report asks for a contract of BOTH sides of
+# every turn of a call - 22 asks for an eleven-turn script - on the event
+# loop, and the pulse read it at 8 stalls / 32 s in ten minutes with
+# crystal_source_contract just behind it. Only an immutable vocabulary
+# is remembered, by identity, and the memo keeps a reference so the
+# identity cannot be reused underneath it.
+_VOCAB_CANON = {'source': None, 'size': -1, 'canon': frozenset()}
+
+
+def _canonical_vocabulary(vocabulary):
+    if not vocabulary:
+        return frozenset()
+    memo = _VOCAB_CANON
+    if memo['source'] is vocabulary and memo['size'] == len(vocabulary):
+        return memo['canon']
+    canon = frozenset(_canonical_word(word) for word in vocabulary)
+    if isinstance(vocabulary, frozenset):
+        memo.update(source=vocabulary, size=len(vocabulary), canon=canon)
+    return canon
+
+
 def extract_contract(text, stopwords=(), vocabulary=()):
     source = str(text or '')
     normalized = normalize_text(source)
     expanded = _expanded(normalized)
     tokens = [_canonical_word(match.group()) for match in _WORDS.finditer(expanded)]
     stops = _DEFAULT_STOP | {_canonical_word(word) for word in stopwords}
-    vocab = {_canonical_word(word) for word in vocabulary}
+    vocab = _canonical_vocabulary(vocabulary)          # #1401
     names, seen = [], set()
     # #1076: a source written as 'Name: "quote"' carries the speaker in its
     # label; the rewrite speaks the quote and need not say the name. The

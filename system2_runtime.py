@@ -300,12 +300,54 @@ class System2Runtime:
                       "system2_trace_id", "system2_trace_ids", "system2_job", "system2_slot", "tint_retry_budget",
                       "system2_guest", "system2_source_evidence", "system2_authoring_budget") if k in entry}),
                   "why": reason, "created_at": float(entry.get("at") or row.get("at") or 0)}
-        if entry.get("system2_slot"):
-            result["slot_id"] = entry["system2_slot"]
+        if entry.get("system2_slot") and self.binding_live(entry["system2_slot"]):
+            result["slot_id"] = entry["system2_slot"]        # #1390: a live pin only
         if kind == "track_talk":
             result.update(track_id=resolved.get("track_id") or row.get("track_id"), part=resolved.get("part") or row.get("part"))
         self._rows[identity] = (kind, row)
         return result
+
+    def binding_live(self, slot_id):
+        """#1390: IS THE OCCURRENCE THIS ROW WAS WRITTEN FOR STILL AHEAD?
+
+        A sitting stamps its rows with the slot it was commissioned for
+        (system2_slot), and the planner honours that pin absolutely:
+        _slot_matches refuses the row for every other slot, and prepare()
+        skips it for every other job. Right while the slot is ahead - the
+        scene was written to its brief. Wrong forever after: when the slot
+        passes unfilled (a stalled loop, a refused transport, a restart)
+        the row stays pinned to an occurrence that can never be filled
+        again, and so does every half-made row the sitting left behind,
+        because prepare() will not pick those up for any other job either.
+
+        Measured on the live store, 2026-09-14 12:03: 39 finished, verified
+        rounds and 234 half-made ones bound to slots of PAST hours - nine
+        callers, eight memos and three gallery rounds ready to air - while
+        the running hour read '12 of 18 slots carry nothing', every caller
+        slot refusing 297 rows as slot_binding, and the unbound pool of that
+        road holding ONE. The hour was empty because its own output was
+        locked in the past.
+
+        So a binding is honoured only while its slot's deadline is ahead.
+        The in-memory plan is asked first (it carries the real deadline); a
+        slot the plan no longer holds is judged by the hour in its id; an
+        event occurrence, or an id of a shape we do not know, keeps its
+        binding - the require_slot_binding jobs check it themselves."""
+        sid = str(slot_id or "")
+        if not sid:
+            return False
+        now = time.time()
+        for hour in list(self._plans) + list(self._event_plans):
+            for slot in hour.get("slots", []):
+                if str(slot.get("id") or "") == sid:
+                    return float(slot.get("deadline") or 0) > now
+        if sid.startswith("event-"):
+            return True
+        try:
+            start = int(sid.split(":", 1)[0].split("-", 1)[1]) / 1000.0
+        except (ValueError, IndexError):
+            return True
+        return now < start + 3600
 
     def inventory(self):
         self._rows = {}
@@ -333,8 +375,9 @@ class System2Runtime:
         happened to change. A skipped row reads as absent from the inventory,
         which is what it is until it can be described."""
         try:
-            offered = self.candidate(kind, row, identity)
-            validate_candidate(offered)
+            # #1390: the validated (normalised) row is what is kept, so the
+            # store does not normalise it all over again - see sync_candidates.
+            offered = validate_candidate(self.candidate(kind, row, identity))
             if offered["id"] in seen:
                 raise ValueError("duplicate candidate id " + offered["id"])
         except Exception as exc:
@@ -387,15 +430,32 @@ class System2Runtime:
             # stall of the class the host watchdog restarts the station for.
             # The store is lock-protected; every other store call in this
             # refresh already runs in a worker thread.
-            await asyncio.to_thread(self.store.sync_candidates, candidates, replace=True)
+            await asyncio.to_thread(self.store.sync_candidates, candidates, replace=True,
+                                    normalized=True)                       # #1390
             self._candidates = candidates
             first = self.host._sched_hour_epoch(self.host._sched_hour_key())
             plans = []
             for offset in range(int(self.config["horizon_hours"])):
                 hour = first + offset * 3600
                 templates = self.templates(hour)
+                # #1408: the revision is digested WITHOUT the prompt. The brief
+                # embeds the battle's round counter ("THE BATTLE (#1090) ...
+                # Round 17321."), which advances as the show goes, so the
+                # digest changed on every refresh: s2_hours showed the 12:00
+                # hour at revision 60 and the 13:00 hour at 42, one per
+                # minute. Each bump made plan_hour drop every allocation and
+                # rebuild it, replace every prepare job - so every sitting
+                # ended in "Preparation job ownership changed" (three in ten
+                # minutes today, one per sitting) - and raise System2Conflict
+                # whenever a System2 round was on the air. A finished round
+                # does not stop fitting a slot because its brief was reworded;
+                # the stored slot still carries the current prompt (plan_hour
+                # rebuilds slots from the templates every pass), only the
+                # revision stops churning.
                 plan = await asyncio.to_thread(self.store.plan_hour, hour, templates,
-                                               config_revision=digest(templates))
+                                               config_revision=digest(
+                                                   [{k: v for k, v in t.items() if k != "prompt"}
+                                                    for t in templates]))
                 plans.append(plan)
             events = await asyncio.to_thread(                      # #1224
                 self.store.events, states=["pending", "working"], limit=100)
@@ -589,8 +649,8 @@ class System2Runtime:
                     if not entry or entry.get("tinting") or entry.get("preparing"):
                         continue
                     bound = entry.get("system2_slot")
-                    if bound and bound != job["slot_id"]:
-                        continue
+                    if bound and bound != job["slot_id"] and self.binding_live(bound):
+                        continue                    # #1390: a stale pin does not hold
                     if job["template"].get("require_slot_binding") and bound != job["slot_id"]:
                         continue
                     if not h.tint_retry_due(entry, kind):
@@ -632,6 +692,8 @@ class System2Runtime:
                     if useful:
                         row = useful[0]
                         entry = h.dialogue_entry(row)
+                        if not self.binding_live(entry.get("system2_slot")):
+                            entry.pop("system2_slot", None)   # #1390: re-pin to this occurrence
                         stamp_entry(entry)
                         work["candidate_id"] = h.alt_sid(kind, row)
                         changed = bool(await h.larder_prepare(entry))
@@ -653,6 +715,8 @@ class System2Runtime:
                 elif useful:
                     row = useful[0]
                     entry = h.dialogue_entry(row)
+                    if not self.binding_live(entry.get("system2_slot")):
+                        entry.pop("system2_slot", None)       # #1390: re-pin to this occurrence
                     stamp_entry(entry)
                     work["action"] = "Finish retained tint and recordings"
                     work["candidate_id"] = h.alt_sid(kind, row)
@@ -909,7 +973,15 @@ class System2Runtime:
                 # Admission is checked again after assembly and immediately
                 # before publication by can_handoff below.
                 try:
-                    reservation = self.store.reserve(slot["id"], candidate["id"], "system2-air",
+                    # #1400: OFF THE LOOP. reserve() is a write - BEGIN
+                    # IMMEDIATE, an INSERT and a commit that fsyncs - and until
+                    # the request_id index it also decoded 99 MB of reservation
+                    # bodies first; py-spy found the main thread inside it in a
+                    # fifth of its samples. #1325's rule, one road over: a
+                    # receipt is not worth the event loop, and neither is a
+                    # reservation.
+                    reservation = await asyncio.to_thread(
+                        self.store.reserve, slot["id"], candidate["id"], "system2-air",
                         expected_revision=slot["revision"], lease_seconds=300,
                         request_id=uuid.uuid4().hex)
                 except System2Conflict:

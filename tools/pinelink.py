@@ -48,6 +48,8 @@ STATE = OUT / "state.json"
 
 STATION_IF = "wlP9s9"           # holds 10.89.1.246 - never touched
 SPARE_IF = "wlx984827b6b478"
+# #1388: how long without a new frame before the link is declared gone.
+FRAME_STALL_S = 20.0
 # #1359: the TP-Link Archer T2U PLUS (RTL8821AU) that IS the spare
 # radio. Used only to find it on the USB bus for a reset, and matched
 # exactly - never as a prefix.
@@ -392,6 +394,15 @@ def ffmpeg_cmd() -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-rtsp_transport", "tcp",
+        # #1388: a read that gets nothing for twenty seconds is a dead
+        # link, and ffmpeg must EXIT on it. Without this it sat on a
+        # dropped camera for 12.9 hours (measured: pid alive, the radio
+        # disconnected, the last frame from the night before) and the
+        # supervisor, blocked on its pipe, never got back to its loop.
+        # #1388b: measured on ffmpeg 6.1.1 - -rw_timeout is accepted but the
+        # RTSP socket still opened with ?timeout=0; -timeout is the one that
+        # reaches it (?timeout=20000000). Microseconds.
+        "-timeout", str(int(FRAME_STALL_S * 1_000_000)),
         # The camera sets no PTS. Without this the copy is unplayable
         # later in ways that do not show up now.
         "-use_wallclock_as_timestamps", "1",
@@ -463,12 +474,49 @@ def supervise(once: bool = False) -> None:
         proc = subprocess.Popen(ffmpeg_cmd(), stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True)
         say("live", pid=proc.pid, hls="data/pinelink/live/index.m3u8")
+        # #1388: WATCH THE FRAMES, NOT THE PIPE.
+        #
+        # proc.communicate() blocks until ffmpeg exits, and an ffmpeg on a
+        # dead RTSP link did not exit - so this loop stood still for 12.9
+        # hours with state.json saying 'live' and `at` from the night
+        # before. The station's readers were honest about it (fresh=False)
+        # and the desktop's row was not, but the fault was here: a
+        # supervisor that cannot see its own child has stopped supervising.
+        #
+        # frame.jpg is rewritten four times a second while the stream is
+        # alive, so its mtime IS the heartbeat. No new frame for
+        # FRAME_STALL_S seconds with ffmpeg still running means the link
+        # is gone: kill it, say so, and go back to looking. The heartbeat
+        # is also written into the state every pass, so `fresh` means
+        # what it says while a stream is healthy.
+        err = ""
+        last_frame = time.time()
+        stalled = False
         try:
-            _, err = proc.communicate()
+            while proc.poll() is None:
+                time.sleep(2.5)
+                try:
+                    m = (OUT / "frame.jpg").stat().st_mtime
+                    if m > last_frame:
+                        last_frame = m
+                except OSError:
+                    pass
+                if time.time() - last_frame > FRAME_STALL_S:
+                    stalled = True
+                    proc.kill()
+                    break
+                say("live", pid=proc.pid, hls="data/pinelink/live/index.m3u8",
+                    frame_age=round(time.time() - last_frame, 1))
+            try:
+                _, err = proc.communicate(timeout=10)
+            except Exception:  # noqa: BLE001
+                err = ""
         except KeyboardInterrupt:
             proc.terminate()
             say("stopped", why="asked to stop")
             return
+        if stalled:
+            err = (err or "") + "\nno new frame for %ds - the link is gone; ffmpeg killed (#1388)" % int(FRAME_STALL_S)
         tail = "\n".join((err or "").strip().splitlines()[-4:])
         # An ffmpeg that exits is not an error to swallow: the camera
         # sleeps, wanders out of range, or its battery goes. Say which,

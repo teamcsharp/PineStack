@@ -115,6 +115,13 @@ def _candidate(row):
 
 
 class System2Store:
+    # #1390: the reservations that can still hold anything. A 'reserved' row
+    # whose lease has run out is skipped by every reader below, so it is not
+    # decoded either: the live store held 87 reserved rows, 86 of them dead,
+    # 65 KB apiece, and _eligible read all of them once per candidate weighed.
+    _LIVE_RESERVATIONS = ("SELECT body FROM s2_reservations WHERE state IN ('playing','suspended')"
+                          " OR (state='reserved' AND COALESCE(json_extract(body,'$.lease_until'),0) > ?)")
+
     def __init__(self, path, *, now=time.time):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,6 +142,19 @@ class System2Store:
                 CREATE TABLE IF NOT EXISTS s2_heard(fingerprint TEXT PRIMARY KEY,at REAL,reservation_id TEXT,receipt_id TEXT);
                 CREATE TABLE IF NOT EXISTS s2_events(id TEXT PRIMARY KEY,request_id TEXT UNIQUE,state TEXT,deadline REAL,priority INTEGER,body TEXT);
             ''')
+            # #1400: reserve() answers a request_id by INDEX. It used to
+            # json.loads EVERY reservation row looking for one - and the
+            # dispatcher hands it a fresh uuid on every call, so the scan
+            # could never hit and always ran to the end: 1,528 rows, 99.4 MB,
+            # 4.14 s measured in the container, on the MAIN THREAD, once per
+            # dispatch (py-spy: raw_decode under reserve under _torrent_talk
+            # in 12 of 60 main-thread samples). The column is added once and
+            # back-filled from the bodies; reserve() writes it from then on.
+            columns = {row[1] for row in db.execute('PRAGMA table_info(s2_reservations)')}
+            if 'request_id' not in columns:
+                db.execute('ALTER TABLE s2_reservations ADD COLUMN request_id TEXT')
+                db.execute("UPDATE s2_reservations SET request_id=json_extract(body,'$.request_id')")
+            db.execute('CREATE INDEX IF NOT EXISTS s2_reservation_request ON s2_reservations(request_id)')
 
     def _connect(self):
         db = sqlite3.connect(str(self.path), timeout=15, isolation_level=None)
@@ -186,24 +206,79 @@ class System2Store:
                    ','.join('?' for _ in fields) + ') ON CONFLICT(id) DO UPDATE SET ' +
                    ','.join(key + '=excluded.' + key for key in fields[1:]), values)
 
-    def sync_candidates(self, candidates, *, replace=False):
-        normalized = [_candidate(row) for row in candidates]
-        if len({row['id'] for row in normalized}) != len(normalized):
+    def sync_candidates(self, candidates, *, replace=False, normalized=False):
+        # #1390: `normalized` says the rows already went through _candidate().
+        # The runtime validates every offer with it and used to throw the
+        # result away, so each refresh paid the deepcopy and both
+        # serialisations twice over 45 MB of live bodies. _candidate is
+        # idempotent; a caller that kept its normalised rows hands them in.
+        rows = list(candidates) if normalized else [_candidate(row) for row in candidates]
+        if len({row['id'] for row in rows}) != len(rows):
             raise ValueError('candidate IDs must be unique')
         with self._tx() as db:
-            self._sync(db, normalized, replace)
-        return {'candidates': len(normalized)}
+            self._sync(db, rows, replace)
+        return {'candidates': len(rows)}
 
     def _sync(self, db, rows, replace=False):
+        # #1390: THE CATALOGUE IS NOT AN ARCHIVE.
+        #
+        # Measured on the live store, 2026-09-14 12:03: 2,467 candidate rows,
+        # 89 MB of JSON, of which 2,073 were marked absent_from_current_
+        # inventory - the median one 111 hours old, the oldest fifteen days -
+        # and 73 were eligible for anything at all. Every refresh (once a
+        # minute, and again after every sitting) re-read all 2,467 bodies
+        # here, json.loads-ed and re-serialised the 2,073 absent ones to mark
+        # them absent AGAIN, and rewrote every live row whether or not a byte
+        # had changed; plan_hour then decoded the whole 89 MB once per
+        # planned hour. The C decoder and encoder hold the GIL for their
+        # whole run, so the air clock on the main thread lost the contest:
+        # py-spy caught a pool thread inside raw_decode in 21 of 60 samples,
+        # and _system2_repeat_rows sat 8-9 s on the main thread waiting for
+        # the store lock this was holding - past the host watchdog's 8 s
+        # probe. Two restarts before noon were that.
+        #
+        # An absent row is one the inventory no longer offers. Nothing can
+        # select it (_eligible refuses it before reading anything else), no
+        # allocation survives on it (the retain check fails the same way
+        # whether the row is absent or gone), and a reservation carries its
+        # own copy of the candidate it holds. So: a row newly absent is
+        # marked, as before; a row that was ALREADY marked last pass and is
+        # held by no live reservation is deleted. Two strikes, so one bad
+        # inventory pass (a road that raised, every row of a kind skipped)
+        # marks and the next pass restores, rather than wiping. And a live
+        # row whose body is byte-identical to what is stored is not
+        # rewritten at all - that was 45 MB of WAL a minute on the disk that
+        # also serves the records.
+        stored = {}
         if replace:
             keep = {row['id'] for row in rows}
-            for raw in db.execute('SELECT id,body FROM s2_candidates').fetchall():
-                if raw['id'] not in keep:
-                    old = json.loads(raw['body']); old.update(ready=False, eligible=False,
-                        blocked_reasons=['absent_from_current_inventory'])
-                    self._save(db, 's2_candidates', old, ('kind',))
+            held = {raw[0] for raw in db.execute(
+                "SELECT candidate_id FROM s2_reservations WHERE state IN ('playing','suspended')"
+                " OR (state='reserved' AND COALESCE(json_extract(body,'$.lease_until'),0) > ?)",
+                (self.now(),))}
+            for raw in db.execute("SELECT id, body, json_extract(body,'$.blocked_reasons[0]') AS first"
+                                  " FROM s2_candidates").fetchall():
+                if raw['id'] in keep:
+                    stored[raw['id']] = raw['body']
+                    continue
+                if raw['first'] == 'absent_from_current_inventory':
+                    if raw['id'] not in held:
+                        db.execute('DELETE FROM s2_candidates WHERE id=?', (raw['id'],))
+                    continue            # marked last pass; nothing to rewrite
+                old = json.loads(raw['body']); old.update(ready=False, eligible=False,
+                    blocked_reasons=['absent_from_current_inventory'])
+                self._save(db, 's2_candidates', old, ('kind',))
         for row in rows:
-            self._save(db, 's2_candidates', row, ('kind',))
+            body = _json(row)
+            if replace:
+                before = stored.get(row['id'])
+            else:
+                got = db.execute('SELECT body FROM s2_candidates WHERE id=?', (row['id'],)).fetchone()
+                before = got[0] if got else None
+            if before == body:
+                continue
+            db.execute('INSERT INTO s2_candidates(id,kind,body) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET '
+                       'kind=excluded.kind,body=excluded.body', (row['id'], row['kind'], body))
 
     def _repeat_reason(self, db, candidate, when, own=''):
         for fingerprint in candidate['fingerprints']:
@@ -220,7 +295,7 @@ class System2Store:
         repeat = self._repeat_reason(db, candidate, when, own)
         if repeat:
             return repeat
-        for raw in db.execute("SELECT body FROM s2_reservations WHERE state IN ('reserved','playing','suspended')"):
+        for raw in db.execute(self._LIVE_RESERVATIONS, (self.now(),)):    # #1390
             reserved = json.loads(raw[0])
             if reserved['id'] == own: continue
             if reserved['state'] == 'reserved' and reserved['lease_until'] <= self.now(): continue
@@ -318,7 +393,11 @@ class System2Store:
         if len({r['id'] for r in enabled}) != len(enabled): raise ValueError('template IDs must be unique')
         normalized = [_candidate(row) for row in candidates]
         if len({row['id'] for row in normalized}) != len(normalized): raise ValueError('duplicate candidate IDs')
-        config = _hash(_json([config_revision, enabled]))
+        # #1408: the prompt is not part of the plan's identity - see the
+        # runtime's refresh(); a counter inside the brief re-planned every
+        # hour every minute.
+        config = _hash(_json([config_revision,
+                              [{k: v for k, v in row.items() if k != 'prompt'} for row in enabled]]))
         hour_id = _name(plan_id, 'plan_id') if plan_id is not None else 'hour-' + str(int(hour_start * 1000))
         with self._tx() as db:
             old = self._get(db, 's2_hours', hour_id)
@@ -354,7 +433,12 @@ class System2Store:
                 if occupied: raise System2Conflict('An active performance must finish or remain on its original plan.')
             if changed: revision += 1
             self._sync(db, normalized)
-            catalogue = [json.loads(raw[0]) for raw in db.execute('SELECT body FROM s2_candidates')]
+            # #1390: only a row with no blocked reason can be chosen -
+            # _eligible refuses every other before it reads anything else -
+            # so only those are decoded. Measured in the container: 73
+            # rows in 0.13 s, against 2,467 rows and 89 MB per planned hour.
+            catalogue = [json.loads(raw[0]) for raw in db.execute(
+                "SELECT body FROM s2_candidates WHERE json_array_length(json_extract(body,'$.blocked_reasons'))=0")]
             bookings = []
             # #1227: WHAT WAS ACTUALLY HEARD, not what was merely planned.
             # A booking exists to stop the same material going out twice
@@ -373,7 +457,13 @@ class System2Store:
                     heard_pairs.add((row['slot_id'], row['candidate_id']))
                 except Exception:
                     continue
-            for raw in db.execute('SELECT body FROM s2_slots WHERE hour_id<>?', (hour_id,)):
+            # #1390: a booking can only matter while its performance is
+            # within REPEAT_SECONDS of now, and an allocation is never planned
+            # outside its own hour - so only hours that started inside the
+            # last four are read. Measured: 90 slots, against 2,966 (six days
+            # of them, 17.7 MB) decoded here per planned hour.
+            for raw in db.execute('SELECT s.body FROM s2_slots s JOIN s2_hours h ON h.id=s.hour_id'
+                                  ' WHERE s.hour_id<>? AND h.start>?', (hour_id, self.now() - 4 * 3600)):
                 other = json.loads(raw[0])
                 for allocation in other.get('allocations') or []:
                     at = allocation['planned_start']
@@ -506,8 +596,9 @@ class System2Store:
             catalogue = [json.loads(raw[0]) for raw in
                          db.execute('SELECT body FROM s2_candidates')]
             bookings = []
-            for raw in db.execute('SELECT body FROM s2_slots WHERE hour_id<>?',
-                                  (identity,)):
+            for raw in db.execute('SELECT s.body FROM s2_slots s JOIN s2_hours h ON h.id=s.hour_id'
+                                  ' WHERE s.hour_id<>? AND h.start>?',
+                                  (identity, self.now() - 4 * 3600)):    # #1390
                 other = json.loads(raw[0])
                 for allocation in other.get('allocations') or []:
                     at = allocation['planned_start']
@@ -628,7 +719,9 @@ class System2Store:
         with self._lock, closing(self._connect()) as db:
             slot = self._get(db, 's2_slots', slot_id)
             if not slot: return []
-            rows = [json.loads(raw[0]) for raw in db.execute('SELECT body FROM s2_candidates WHERE kind=?', (slot['kind'],))]
+            rows = [json.loads(raw[0]) for raw in db.execute(    # #1390: the pin is read in SQL, not after a decode
+                "SELECT body FROM s2_candidates WHERE kind=? AND json_extract(body,'$.slot_id')=?",
+                (slot['kind'], slot_id))]
             return [row for row in rows if row.get('slot_id') == slot_id and self._slot_matches(row, slot)]
 
     def candidates_by_slot(self, slot_ids):
@@ -645,8 +738,12 @@ class System2Store:
                 if slot: slots[sid] = slot
             kinds = sorted({slot['kind'] for slot in slots.values()})
             if not kinds: return out
-            marks = ','.join('?' * len(kinds))
-            for raw in db.execute('SELECT body FROM s2_candidates WHERE kind IN (%s)' % marks, tuple(kinds)):
+            # #1390: only a row pinned to one of these slots can be a draft of
+            # it, so the pin is read in SQL and nothing else is decoded - the
+            # kinds of an hour are very nearly the whole catalogue.
+            marks = ','.join('?' * len(slots))
+            for raw in db.execute("SELECT body FROM s2_candidates WHERE json_extract(body,'$.slot_id') IN (%s)" % marks,
+                                  tuple(slots)):
                 row = json.loads(raw[0])
                 slot = slots.get(row.get('slot_id'))
                 if slot and self._slot_matches(row, slot):
@@ -771,8 +868,12 @@ class System2Store:
         _name(owner, 'owner')
         freed = []
         with self._tx() as db:
+            # #1390: ...and a 'reserved' row whose dispatch never happened.
+            # Every reader already skips a reserved row past its lease, but
+            # 86 of them had accumulated (one live) and each was decoded by
+            # every reader that skipped it.
             rows = db.execute(
-                "SELECT id, body FROM s2_reservations WHERE state IN ('playing','suspended')"
+                "SELECT id, body FROM s2_reservations WHERE state IN ('reserved','playing','suspended')"
             ).fetchall()
             for row in rows:
                 try:
@@ -781,9 +882,12 @@ class System2Store:
                     body = {}
                 if float(body.get('lease_until') or 0) > self.now():
                     continue            # still live; leave it alone
+                was = str(body.get('state') or '')
                 body['state'] = 'released'
                 body['released_at'] = self.now()
                 body['release_reason'] = (
+                    'the process that reserved this never dispatched it; its lease expired'
+                    if was == 'reserved' else
                     'the process that was airing this did not finish; its lease expired')
                 db.execute("UPDATE s2_reservations SET state='released', body=? WHERE id=?",
                            (_json(body), row[0]))
@@ -818,12 +922,13 @@ class System2Store:
         if request_id is not None: _name(request_id, 'request_id')
         with self._tx() as db:
             if request_id:
-                for raw in db.execute('SELECT body FROM s2_reservations'):
+                raw = db.execute('SELECT body FROM s2_reservations WHERE request_id=?',   # #1400: indexed
+                                 (request_id,)).fetchone()
+                if raw:
                     held = json.loads(raw[0])
-                    if held.get('request_id') == request_id:
-                        if (held['slot_id'], held['candidate_id'], held['owner']) != (slot_id, candidate_id, owner):
-                            raise System2Conflict('Reservation request ID belongs to different work.')
-                        return held
+                    if (held['slot_id'], held['candidate_id'], held['owner']) != (slot_id, candidate_id, owner):
+                        raise System2Conflict('Reservation request ID belongs to different work.')
+                    return held
             slot = self._get(db, 's2_slots', slot_id)
             if not slot: raise ValueError('Unknown configured slot')
             if expected_revision is not None and slot['revision'] != expected_revision: raise System2Conflict('Slot revision changed.')
@@ -848,7 +953,7 @@ class System2Store:
                 'state': 'reserved', 'lease_until': self.now() + lease_seconds, 'reserved_at': self.now(),
                 'candidate': copy.deepcopy(candidate), 'actual_seconds': candidate['seconds'], 'position_seconds': 0,
                 'heard_lines': [], 'heard_seconds': 0.0, 'delivered_seconds': 0.0, 'receipts': []}
-            self._save(db, 's2_reservations', row, ('slot_id', 'candidate_id', 'state'))
+            self._save(db, 's2_reservations', row, ('slot_id', 'candidate_id', 'state', 'request_id'))   # #1400
             self._slot_totals(db, slot)
             self._save(db, 's2_slots', slot, ('hour_id', 'ordinal'))
             return row
@@ -904,7 +1009,10 @@ class System2Store:
         with self._lock, closing(self._connect()) as db:
             reason = self._repeat_reason(db, {'fingerprints': fingerprints}, when, reservation_id)
             if not reason:
-                for raw in db.execute("SELECT body FROM s2_reservations WHERE state IN ('reserved','playing','suspended')"):
+                # #1390: this runs on the MAIN THREAD (repeat_allowed, from
+                # _system2_repeat_rows, once per round and again per line);
+                # 87 reservation bodies at 65 KB were decoded here each time.
+                for raw in db.execute(self._LIVE_RESERVATIONS, (self.now(),)):
                     held = json.loads(raw[0])
                     if held['id'] == reservation_id: continue
                     if held['state'] == 'reserved' and held['lease_until'] <= self.now(): continue

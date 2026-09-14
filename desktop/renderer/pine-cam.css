@@ -101,9 +101,14 @@
 .pine-cam-pref input { margin-top: 2px; }
 /* #1361b: the troubleshoot icon beside the Pine Cam fold. */
 #pineCamBox2, #vitalsBox { position: relative; }   /* #1386: the tablet row too */
+/* #1387: the icon sits at the far edge and the fold keeps the brief text
+   clear of it. Measured: at right:34px the tablet row's '17% · 264 ms'
+   (58px wide) ran underneath the icon; the Pine Cam row escaped only
+   because 'live' is four letters. */
+#vitalsBox > .vitals-fold, #pineCamBox2 > .vitals-fold { padding-right: 42px; }
 #pineCamHeal, #tabletHeal {
   position: absolute;
-  right: 34px;
+  right: 8px;
   top: 6px;
   width: 26px;
   height: 26px;

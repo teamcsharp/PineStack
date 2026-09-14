@@ -447,9 +447,19 @@ class LineReviewStore:
             self._instance_scope.reset(token)
 
     def scoped_instances(self):
-        with self._lock:
-            return tuple(key for key in self._instance_scope.get()
-                         if self._instances.get(key, {}).get('review_status') == 'allowed')
+        # #1397: LOCK-FREE, the policy() argument from #1070 and the
+        # preference_examples one from 2026-09-10. This is asked on the
+        # event loop by _tint_output_note and tint_output_ready - after
+        # every accepted bar and before every graded one - and the lock it
+        # took is the one a pool thread holds while it writes to a 3.0 GB
+        # review store. It reads a tuple out of a contextvar and does
+        # dict.get on an in-memory table; neither needs the lock, and a
+        # reader that sees the table a write early or late answers the
+        # same question it would have answered a moment later.
+        scope = self._instance_scope.get()
+        table = self._instances
+        return tuple(key for key in scope
+                     if (table.get(key) or {}).get('review_status') == 'allowed')
 
     def pending_instances(self):
         with self._lock:

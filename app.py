@@ -16,6 +16,14 @@ import time
 import traceback
 import uuid
 import wave
+import gc                              # #1393: the collector, made to leave the stores alone
+# #1393b: MEASURED after #1393 - 74 generation-2 collections in the first
+# three minutes of a boot, about sixteen a minute. Each one walks every
+# unfrozen tracked object under the GIL. Gen 0 and 1 stay at their defaults
+# (cheap, and what catches short-lived cycles); gen 2 waits for six times as
+# many gen-1 passes, so a full walk happens a few times a minute at most. The
+# pulse's `gc` field says whether this held.
+gc.set_threshold(700, 10, 60)
 import queue as _queue_mod             # #1371: the learning desk's line
 from contextvars import ContextVar, copy_context
 from contextlib import ExitStack
@@ -246,8 +254,33 @@ def line_review_policy() -> dict[str, Any]:
     return got
 
 
+# #1397: the last acceptance mode this process read. settings() is an
+# in-memory read, but it takes the learning store's lock - the lock the
+# learning desk's writer (#1371) holds through every BEGIN IMMEDIATE ..
+# commit, which is an fsync on the disk that also serves the records.
+# The pulse caught this call on the main thread at 5.5 s today, five
+# times in ten minutes, from tint_output_ready and the graders; the
+# stall census charged it 17 s over two hours. The mode changes when the
+# operator changes it, not by the second: three seconds of memory is
+# nothing, and while the air is at risk (air_first, #1314) the last
+# reading is the reading. Same shape as line_review_policy above.
+_ACCEPTANCE_MODE_MEMO: dict[str, Any] = {"at": 0.0, "value": ""}
+
+
 def crystal_acceptance_mode() -> str:
-    return _PROMPT_LEARNING.settings()["mode"]
+    memo = _ACCEPTANCE_MODE_MEMO
+    if memo["value"] and (time.time() - memo["at"] < 3.0 or air_first()):
+        return memo["value"]
+    # #1402: settings() takes the learning store's lock and deep-copies
+    # its state - and that lock is held by the learning desk's worker
+    # (#1371) for the length of a SQLite commit. py-spy 2026-09-14 12:50:
+    # 8.1% of main-thread samples sat on that line, under hour_needs ->
+    # dialogue_row_ready -> tint_coverage_ready - i.e. under every
+    # /api/dj poll. The mode is one string; read it without the lock.
+    reader = getattr(_PROMPT_LEARNING, "mode", None)
+    got = str(reader() if callable(reader) else _PROMPT_LEARNING.settings()["mode"])
+    memo.update({"at": time.time(), "value": got})
+    return got
 
 
 def crystal_fluid_proof(report: Any) -> bool:
@@ -487,7 +520,8 @@ def line_review_capture(gate: str, source: str, candidate: str = "",
         step = _LAB_RUNTIME.record("rejection_decision", {"gate": gate,
             "source": source, "candidate": candidate, "reasons": reasons,
             "evaluation": evaluation, "technical": technical,
-            "turn": context.get("turn"), "marker": context.get("marker")})
+            "turn": context.get("turn"), "marker": context.get("marker")},
+            wait=True)   # #1398: the one record whose row is kept (lab_cut_step)
         if step:
             context["lab_cut_step"] = step["seq"]
     if gate == "tint" and not technical and str(disposition or "") == "cut":
@@ -9511,6 +9545,23 @@ _PAGE_WEDGE_AT = [0.0]
 PAGE_WEDGE_REST = 180.0
 
 
+def page_delivery_waits(delivery: dict[str, Any]) -> bool:
+    """#1405: is this delivery a clip the page holds and has not started?
+    Received, not a picture, and not rung for a moment still to come."""
+    if str(delivery.get("state") or "") != "received":
+        return False
+    clip = delivery.get("clip") or {}
+    if isinstance(clip, dict):
+        if clip.get("picture_only"):
+            return False
+        try:
+            if float(clip.get("broadcast_ms") or 0) > time.time() * 1000.0:
+                return False
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
 def page_wedge_state() -> dict[str, Any]:
     """#1200: is the page holding clips it never starts?
 
@@ -9540,8 +9591,14 @@ def page_wedge_state() -> dict[str, Any]:
             return out
         out["owner"] = owner = audio_owner()
         rows = list(_PAGE_DELIVERIES.values())
-        out["waiting"] = waiting = sum(
-            1 for r in rows if str(r.get("state") or "") == "received")
+        # #1405: A PICTURE IS NOT A CLIP WAITING TO START. The endless set
+        # (#1395) rings clips with a start in the future and the sets
+        # report them received the moment they poll them; a count that
+        # took every received delivery as "handed over and not started"
+        # read 19 waiting with the head 690 s old and called a sounding
+        # station wedged (PAGE_WEDGE_WAITING is 4). Early is not late,
+        # and a picture-only row has nothing to start on the air.
+        out["waiting"] = waiting = sum(1 for r in rows if page_delivery_waits(r))
         now = time.time()
         stalls = 0
         for ev in list(_PAGE_ACK_EVENTS[-80:]):
@@ -10233,6 +10290,7 @@ def pulse_report(window: float = 600.0) -> dict[str, Any]:
             reading += (" - past the host watchdog's 8s probe; this is "
                         "what restarts the station")
     return {"window_s": window, "stalls": len(recent),
+            "gc": _gc_report(),                      # #1393
             "worst_s": round(worst, 2), "stalled_s": total,
             "recent": recent[-12:],
             "top": [{"frame": k, **v} for k, v in top],
@@ -23564,6 +23622,30 @@ VOICE_CLIP_FEED_KEEP = int(os.getenv("VOICE_CLIP_FEED_KEEP", "2000"))
 # A shared on-air instant gives each listener time to fetch a clip, then seek
 # into the exact same point if its network delivery was late.
 VOICE_BROADCAST_LEAD_MS = int(os.getenv("VOICE_BROADCAST_LEAD_MS", "7000"))
+# #1396: HOW LATE A LINE IS STILL WORTH HEARING.
+#
+# The operator's requirement is that the station is continuous and the
+# voices cannot stop. Measured 2026-09-14 11:57: /api/deadair read 1,530 s
+# of dead air in the hour, 94% of it while the event loop was blocked, and
+# the panel page had ten clips handed over and not started, the head one
+# 429 s old, acknowledged as "clip expired before playback". A stall does
+# not just delay the clips it holds up - it turned every one of them into
+# SILENCE, twice over: /api/dj/voice stopped OFFERING a plain line 20 s
+# after its air moment, and the page threw away any line later than its
+# own length, and started the survivors mid-word (lateBy - 0.25 s in).
+#
+# For the device that owns the air (the solo gate, #1008/#1185: exactly
+# one page sounds), being in step with a clock nobody else is listening
+# to is worth nothing, and a line heard forty seconds late is worth the
+# line. So a plain line is offered for this long past its air moment
+# (was 20 s), a stream for its length plus this, and the owning page
+# plays a late clip from its first word, in order, until it is further
+# behind than this - only then is it history. Every gagged page keeps the
+# old law, so it is in step on the day it is handed the air. 45 s covers
+# the measured stalls at p90 (36 s, [[dead-air-has-a-named-frame]]);
+# PINE_VOICE_LATE_MS moves it. The page constant VOICE_LATE_PLAY_MS is
+# its twin and the two must agree.
+VOICE_LATE_OFFER_MS = int(os.getenv("PINE_VOICE_LATE_MS", "45000"))
 
 # #1147: how far ahead the page's air is SOLD, across every producer.
 # The paced burst road (#1146) kept this knowledge in a local variable,
@@ -23737,8 +23819,14 @@ def page_feed_append(clip: dict[str, Any]) -> str:
         return ""
 
 
-def page_picture_append(clip: dict[str, Any]) -> dict[str, Any]:
+def page_picture_append(clip: dict[str, Any], at_ms: int = 0) -> dict[str, Any]:
     """#1322: a PICTURE, rung for every surface, with no claim on the air.
+
+    #1395: `at_ms` stamps a start in the FUTURE. `ts` stays now, so every
+    set's since-cursor sees the clip on its next poll; `broadcast_ms` is
+    when the tube should light, and the set already holds a clip whose
+    moment has not come (sfx-tv.js next(): 'early is not late'). That is
+    what lets the endless set be rung AHEAD.
 
     page_feed_append is THE door onto the page voice feed and it is the
     right door for anything the station is broadcasting. It does two
@@ -23782,7 +23870,8 @@ def page_picture_append(clip: dict[str, Any]) -> dict[str, Any]:
         "seconds": round(seconds, 2),
         "ts": stamp,
         # NOW, not a lead ahead of now: the sound is already in the room.
-        "broadcast_ms": stamp,
+        # #1395: ...unless the caller is planning ahead on purpose.
+        "broadcast_ms": int(at_ms) if at_ms and int(at_ms) > stamp else stamp,
     }
     for edge in ("from", "to"):
         try:
@@ -61558,20 +61647,51 @@ def _vec_norm(v: list[float]) -> list[float]:
     return [x / mag for x in v]
 
 
+EMBED_CHUNK = 48
+
+
 async def _embed_texts(texts: list[str]) -> list[list[float]]:
     """Embed a batch through the local nomic-embed-text on Ollama (already on
     the box). Returns UNIT vectors so a later cosine is just a dot product; []
-    on any failure, so indexing degrades to a no-op instead of a dead show."""
+    on any failure, so indexing degrades to a no-op instead of a dead show.
+
+    #1392: IN PIECES, AND THE ARITHMETIC OFF THE LOOP.
+
+    This is an async function, so it looks harmless, and its two slow parts
+    are both synchronous: r.json() is a C parse that holds the GIL for the
+    whole response, and the list comprehension below it normalised every
+    vector in pure Python ON THE EVENT LOOP. The speakbox reindex sends up
+    to 1,200 texts in one request - 1,200 x 768 floats, about ten
+    megabytes of JSON, then 1.8 million multiplies, all between two awaits.
+    /api/deadair over the last hour put _embed_texts in 201 seconds of
+    stalled air.
+
+    So: chunks of EMBED_CHUNK texts per request, the parse and the
+    normalisation of each chunk on a worker thread, and a loop turn between
+    chunks. The result is identical; the loop gets to speak in between.
+    Single-text callers (a query, a decision) pay one small request as
+    before."""
     texts = [t for t in texts if t and t.strip()]
     if not texts:
         return []
+    out: list[list[float]] = []
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(f"{OLLAMA_URL}/api/embed",
-                                  json={"model": EMBED_MODEL, "input": texts})
-        if r.status_code != 200:
-            return []
-        return [_vec_norm(v) for v in r.json().get("embeddings", [])]
+            for start in range(0, len(texts), EMBED_CHUNK):
+                part = texts[start:start + EMBED_CHUNK]
+                r = await client.post(f"{OLLAMA_URL}/api/embed",
+                                      json={"model": EMBED_MODEL, "input": part})
+                if r.status_code != 200:
+                    return []
+                # The parse and the arithmetic, off the loop. A thread does
+                # not stop C json from holding the GIL, but a chunk this
+                # size parses in milliseconds; it is the Python normalisation
+                # that took the seconds, and that yields.
+                got = await asyncio.to_thread(
+                    lambda body=r: [_vec_norm(v) for v in body.json().get("embeddings", [])])
+                out.extend(got)
+                await asyncio.sleep(0)
+        return out
     except Exception:
         return []
 
@@ -61652,6 +61772,7 @@ def _load_vectors(rid: str = "") -> dict[str, Any]:
             pass
         data["loaded"] = True
         _VEC_CACHE[key] = data
+    _gc_freeze_after_load(key, len(data.get("chunks") or []))
     # #1156: a cold load is the expensive moment; leave the sidecar behind
     # so the next process never needs to repeat it for a count.
     try:
@@ -61660,6 +61781,70 @@ def _load_vectors(rid: str = "") -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     return data
+
+
+_GC_FROZEN: dict[str, Any] = {"at": 0.0, "loads": 0, "frozen": 0}
+
+
+def _gc_freeze_after_load(key: str, chunks: int) -> None:
+    """#1393: A STORE THAT NEVER DIES SHOULD NEVER BE WALKED.
+
+    The doom mind's vectors are 625 MB of JSON parsed into Python
+    objects - millions of small floats and lists that live for the whole
+    process. CPython's generation-2 collection walks every tracked object
+    it can reach, under the GIL, and it fires whenever enough new objects
+    have accumulated - which on a station writing rounds all day is
+    continually. The pulse's thread census caught `remove (weakref.py)`
+    in 18 of 46 blind stalls over half an hour: finalisation, the tail of
+    exactly that walk.
+
+    gc.freeze() moves everything alive right now into a permanent
+    generation the collector ignores. Called after a store loads, so the
+    thing frozen is the store; objects made later are collected as ever.
+    The same trick Instagram published for the same reason. Cheap: one
+    call, no copy."""
+    try:
+        gc.collect()                   # take out today's garbage first, once
+        gc.freeze()
+        _GC_FROZEN.update({"at": time.time(),
+                           "loads": int(_GC_FROZEN.get("loads") or 0) + 1,
+                           "frozen": gc.get_freeze_count()})
+        pipeline_log("model", "vectors for %s loaded (%d chunks); %d objects frozen "
+                     "out of the collector's reach (#1393)"
+                     % (key, chunks, gc.get_freeze_count()))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_GC_REPORT_MEMO: dict[str, Any] = {"at": 0.0, "value": {}}
+
+
+def _gc_report() -> dict[str, Any]:
+    """How hard the collector has been working - the number the pulse
+    could not name before.
+
+    #1402: gc.get_freeze_count() WALKS the permanent generation - half a
+    million objects once the vector stores are frozen (#1393) - and this
+    report was built for every poll of every surface. py-spy on the live
+    process, 2026-09-14 12:50 (20 s, 1,746 main-thread samples): 13% of
+    them were on that one line. The count only changes when something
+    is frozen, and _gc_freeze_after_load already writes it down; the
+    rest is memoised for five seconds."""
+    memo = _GC_REPORT_MEMO
+    now = time.time()
+    if memo["value"] and now - float(memo["at"]) < 5.0:
+        return memo["value"]
+    try:
+        stats = gc.get_stats()
+        got = {"gen2_collections": int(stats[2].get("collections", 0)),
+               "gen2_collected": int(stats[2].get("collected", 0)),
+               "frozen": int(_GC_FROZEN.get("frozen") or 0),
+               "loads_frozen": int(_GC_FROZEN.get("loads") or 0),
+               "threshold": list(gc.get_threshold())}
+    except Exception:  # noqa: BLE001
+        got = {}
+    memo.update({"at": now, "value": got})
+    return got
 
 
 def _vector_meta_path(key: str) -> Path:
@@ -61757,6 +61942,45 @@ def _vector_chunks_n(rid: str = "") -> int:
     return 0
 
 
+# #1407: A 684 MB STORE IS WRITTEN IN SLICES.
+#
+# _save_vectors serialised the whole speakbox store with one json.dumps.
+# #816 moved that off the lock and into a worker thread and measured
+# 4.8 s for 410 MB; the store is 683,870,963 bytes today (40,000 chunks
+# of 768 floats, 411 files), and the C encoder holds the GIL for its
+# entire run, so the thread it moved to bought the event loop nothing.
+# An 80-sample py-spy burst at 12:52 found a pool thread inside the
+# encoder under _save_vectors in 43 samples, and the pulse read those
+# minutes as "outside: run", worst 16.0 s - past the host watchdog's 8 s
+# probe, which is what restarts the station ([[event-loop-starvation-
+# watchdog]]). The bytes written are what json.dumps(payload) would have
+# written - same keys in the same order - produced a few hundred chunks
+# per C call (about 3 MB, tens of milliseconds) with the GIL handed back
+# between slices, the #1392 shape from the decode side.
+VECTOR_SAVE_SLICE = 200
+# ...and a rebuild persists its progress at most this often. At 684 MB a
+# progress save IS a 684 MB write, and the every-25-files rule (#597)
+# made sixteen of them for a rebuild that touched four hundred files, on
+# the disk that also serves the records.
+VECTOR_PROGRESS_SAVE_SECONDS = 300.0
+
+
+def _json_write_sliced(path: Path, payload: dict[str, Any]) -> None:
+    chunks = payload.get("chunks")
+    if not isinstance(chunks, list) or len(chunks) <= VECTOR_SAVE_SLICE:
+        path.write_text(json.dumps(payload))
+        return
+    head = {k: v for k, v in payload.items() if k != "chunks"}
+    with open(path, "w", encoding="utf-8") as fh:
+        prefix = json.dumps(head)
+        fh.write(prefix[:-1] + (", " if head else "") + '"chunks": [')
+        for i in range(0, len(chunks), VECTOR_SAVE_SLICE):
+            piece = json.dumps(chunks[i:i + VECTOR_SAVE_SLICE])
+            fh.write((", " if i else "") + piece[1:-1])
+            time.sleep(0)                # the loop's turn, between slices
+        fh.write("]}")
+
+
 def _save_vectors(rid: str = "") -> None:
     # #816: snapshot under the lock, SERIALIZE outside it. The 410MB
     # json.dumps measured 4.8s and ran lock-held on the event loop —
@@ -61769,7 +61993,7 @@ def _save_vectors(rid: str = "") -> None:
         store = mind_state(key, "vectors")
         store.parent.mkdir(parents=True, exist_ok=True)
         tmp = store.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload))
+        _json_write_sliced(tmp, payload)             # #1407
         tmp.replace(store)
     except Exception:
         pass
@@ -62115,6 +62339,7 @@ async def speakbox_reindex(force: bool = False,
         return speakbox_vector_stats(key)             # already in step
     changed_names = {n for n, _p, _m in changed}
     chunks = [c for c in chunks if c.get("file") not in changed_names]
+    _progress_saved = time.time()                    # #1407
     for i, (name, path, mt) in enumerate(changed):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -62138,7 +62363,7 @@ async def speakbox_reindex(force: bool = False,
         mtimes[name] = mt
         # Persist progress every 25 files (#597) so a restart mid-rebuild does
         # not lose the whole pass — the next run resumes from the saved mtimes.
-        if i % 25 == 24:
+        if i % 25 == 24 and time.time() - _progress_saved >= VECTOR_PROGRESS_SAVE_SECONDS:   # #1407
             with _VEC_LOCK:
                 held = _VEC_CACHE.setdefault(key, {})
                 held["mtimes"] = {n: m for n, m in mtimes.items()
@@ -62147,6 +62372,7 @@ async def speakbox_reindex(force: bool = False,
                 held["model"] = EMBED_MODEL
                 held["loaded"] = True
             await asyncio.to_thread(_save_vectors, key)
+            _progress_saved = time.time()            # #1407
     if len(chunks) > SPEAKBOX_VEC_MAX:
         # #816: when the cut drops a file to ZERO chunks, forget its mtime
         # too — otherwise the gate says "indexed" forever and the document
@@ -63743,13 +63969,23 @@ def _sfxguy_ready_profile() -> str:
         "grade_version": 6}, sort_keys=True).encode()).hexdigest()[:24]
 
 
-def _sfxguy_ready_valid(row: dict[str, Any], voice: str = "") -> bool:
-    """Pure readiness check: never repair, render or consume a pantry row."""
+def _sfxguy_ready_valid(row: dict[str, Any], voice: str = "",
+                        profile: str = "") -> bool:
+    """Pure readiness check: never repair, render or consume a pantry row.
+
+    #1394: `profile` may be handed in. _sfxguy_ready_profile() reads five
+    settings, dumps them to JSON and hashes them - and pick() called this
+    once PER ROW of a 141-row bank, on the event loop, beside two stats
+    per row in media_ready. The pulse caught sfxguy_ready_pick at 7.4 s.
+    The profile is the same for every row of one pick; the caller works
+    it out once and passes it. A caller that does not still gets the old
+    behaviour."""
     voice = str(voice or dj_settings().get("drop_voice") or "")
     text = str(row.get("text") or "").strip()
     engine = voice_engine_for(voice) if voice else ""
+    want_profile = profile or _sfxguy_ready_profile()
     if (not text or row.get("who") != "drop" or row.get("voice") != voice
-            or row.get("profile") != _sfxguy_ready_profile()
+            or row.get("profile") != want_profile
             or row.get("recorded_text") != text or row.get("recorded_voice") != voice
             or row.get("engine") != engine
             or row.get("key") != pantry_key(text, voice, engine)
@@ -63770,8 +64006,9 @@ def sfxguy_ready_pick(context: str = "", voice: str = "") -> dict[str, Any] | No
     if not current or (voice and voice != current):
         return None
     try:
-        row = _SFX_READY_BANK.pick(context, current, _sfxguy_ready_profile(),
-                                  lambda item: _sfxguy_ready_valid(item, current))
+        _profile = _sfxguy_ready_profile()               # #1394: once
+        row = _SFX_READY_BANK.pick(context, current, _profile,
+                                  lambda item: _sfxguy_ready_valid(item, current, _profile))
         if row:
             row["seconds"] = float(row["clip"]["seconds"])
         return row
@@ -66896,42 +67133,90 @@ _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
                               "clip": "", "why": ""}
 
 
+# #1395: THE PLAYLIST, RUNG AHEAD.
+#
+# "Make sure the endless video icon is endless and consistent with the SFX
+#  guy able to play clip after clip after clip. It should make the SFX guy
+#  cache a list and execute it fluidly in the background."
+#
+# The first cut of this (#1366) rang ONE clip, one second before the one on
+# the tube ran out, and drew it from the memo pool. Three things made that
+# gap-ridden, each measured on the desktop with the mode lit and "the room
+# is quiet" on the strip:
+#
+#   - the set polls /api/dj/video every 2.5 s, so a clip rung 1 s early is
+#     seen up to 1.5 s AFTER the tube went dark - a black gap on every
+#     hand-over;
+#   - the set discards a clip more than 8 s late, and this station's loop
+#     stalls for 8 s often enough to trip the host watchdog - so a stall at
+#     the wrong moment dropped the clip and the tube stayed dark for the
+#     whole length of the one that never played;
+#   - the memo pool is empty for minutes after every restart ("the clip
+#     library is still warming") while the clip book (#1362) already holds
+#     tens of thousands of playable clips.
+#
+# So: a short playlist drawn from the BOOK, each clip rung with a start
+# stamped after the previous clip's end, kept SFX_CYCLE_AHEAD seconds ahead
+# of the clock. The set holds the next two or three before it needs them
+# and lights each on its own timer; a stall of a few seconds on this side
+# changes nothing on the screen, because the screen already has what it
+# needs. The picture door's own rule still holds - no lead, no reservation,
+# no claim on the air - so an endless set cannot mortgage the show.
+SFX_CYCLE_AHEAD = 20.0           # keep this much picture rung ahead of now
+SFX_CYCLE_QUEUE = 3              # never more than this many queued at the set
+SFX_CYCLE_GAP = 0.0              # back to back; the set fades one into the next
+
+
 async def sfx_video_cycle() -> None:
-    """Keep a picture on the set for as long as the mode is on."""
+    """Keep the set's queue topped up for as long as the mode is on."""
+    plan: list[dict[str, Any]] = []          # what has been rung, in order
     while True:
         try:
             if not sfx_video_mode_on():
-                _SFX_CYCLE["why"] = "the endless set is off"
-                _SFX_CYCLE["until"] = 0.0
-                await asyncio.sleep(5.0)
+                if plan:
+                    plan = []
+                _SFX_CYCLE.update({"why": "the endless set is off", "until": 0.0,
+                                   "queued": 0})
+                await asyncio.sleep(3.0)
                 continue
             now = time.time()
-            if now < float(_SFX_CYCLE.get("until") or 0) - SFX_CYCLE_LEAD:
-                await asyncio.sleep(0.5)
+            # Forget what has already played; what is left is the queue the
+            # set is holding.
+            plan = [p for p in plan if p["end"] > now]
+            last_end = plan[-1]["end"] if plan else now
+            if plan and (last_end - now >= SFX_CYCLE_AHEAD or len(plan) >= SFX_CYCLE_QUEUE):
+                _SFX_CYCLE.update({"queued": len(plan), "until": last_end,
+                                   "clip": plan[0]["sting"], "why": ""})
+                await asyncio.sleep(1.0)
                 continue
-            if not sfx_video_warm():
-                sfx_video_kick()
-                if not _SFX_VIDEO_MEMO.get("pool"):
-                    _SFX_CYCLE["why"] = "the clip library is still warming"
-                    await asyncio.sleep(5.0)
+            # The book first - instant, and full the moment the process is up.
+            got = await sfx_db_pick_row_async(True)
+            pick = got[0] if got else None
+            seconds = float(got[1]) if got else 0.0
+            if pick is None:
+                # The old road, for the minutes after a fresh install only.
+                pick = sfx_deck_take()
+                if pick is None:
+                    pick = await asyncio.to_thread(_sfx_any_video)
+                if pick is None:
+                    _SFX_CYCLE["why"] = ("no video clip qualifies - the book is "
+                                         "empty and the pool has nothing")
+                    await asyncio.sleep(10.0)
                     continue
-            pick = sfx_deck_take()
-            if pick is None:
-                pick = await asyncio.to_thread(_sfx_any_video)
-            if pick is None:
-                _SFX_CYCLE["why"] = ("no video clip qualifies - check the "
-                                     "folders, the length dials and the bans")
-                await asyncio.sleep(10.0)
-                continue
-            key = sfx_id(pick)
-            seconds = await asyncio.to_thread(sfx_seconds, pick)
+                seconds = await asyncio.to_thread(sfx_seconds, pick)
             seconds = max(SFX_CYCLE_FLOOR, round(float(seconds or 0), 2))
+            key = sfx_id(pick)
+            start = max(now, last_end + SFX_CYCLE_GAP)
             page_picture_append({
                 "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
-                "sting": pick.stem, "id": key, "seconds": seconds})
-            _SFX_CYCLE.update({"at": now, "until": now + seconds,
+                "sting": pick.stem, "id": key, "seconds": seconds},
+                at_ms=int(start * 1000))
+            plan.append({"sting": pick.stem, "start": start,
+                         "end": start + seconds})
+            _SFX_CYCLE.update({"at": now, "until": plan[-1]["end"],
                                "rung": int(_SFX_CYCLE.get("rung") or 0) + 1,
-                               "clip": pick.stem, "why": ""})
+                               "clip": plan[0]["sting"], "queued": len(plan),
+                               "why": ""})
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -66945,6 +67230,10 @@ def sfx_video_mode_state() -> dict[str, Any]:
     return {"on": sfx_video_mode_on(), "share": sfx_video_share(),
             "dial": int((dj_settings() or {}).get("sfx_video_share") or 0),
             "cycle": cycle, "pool": len(_SFX_VIDEO_MEMO.get("pool") or []),
+            # #1395: the book is what the set is fed from now.
+            "book": sfx_db_counts().get("video_playable", 0),
+            "queued": int(cycle.get("queued") or 0),
+            "ahead_s": max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1)),
             "say": ("the endless set is on - %d clip(s) rung, %s is on the "
                     "tube with %.0fs left"
                     % (cycle.get("rung") or 0, cycle.get("clip") or "nothing",
@@ -67619,7 +67908,7 @@ def sfx_queue_deep() -> int:
     way past it the way a stretching air cursor could."""
     try:
         return sum(1 for r in _PAGE_DELIVERIES.values()
-                   if str(r.get("state") or "") == "received")
+                   if page_delivery_waits(r))               # #1405b
     except Exception:  # noqa: BLE001
         return 0
 
@@ -77228,18 +77517,49 @@ def hangup_pick(name: str = "", success_rate: int | None = None) -> dict[str, An
         return pick
 
 
+# #1403: THE CALL LOG IS READ FROM MEMORY AND WRITTEN OFF THE LOOP.
+#
+# call_log_read() parsed the whole file - 2.6 MB, 5,000 rows with their
+# transcripts and flow reports - on every call, and it is called from the
+# novelty check, the caller card, the records lists and every hang-up.
+# /api/pulse caught it at 3.4 s on the event loop four times in ten
+# minutes. call_log_add() then graded the finished call on the loop
+# (call_flow_report -> call_tint_report -> two contract extractions per
+# turn, the same work #1070 moved to a thread for prompts) and wrote the
+# file back with an indent, also on the loop.
+#
+# Now: the rows live in memory, keyed on the file's (mtime, size) with a
+# two-second grace like crystals_read; a hang-up appends to the panel's
+# ring at once and hands the grading and the write to one daemon thread,
+# in order. The desk appends the graded row to the same in-memory list,
+# so a reader sees it the moment it is graded, before the disk has it.
+_CALL_LOG_MEMO: dict[str, Any] = {"key": None, "rows": [], "at": 0.0,
+                                  "errors": 0, "last_error": ""}
+_CALL_LOG_DESK: Any = _queue_mod.Queue()
+_CALL_LOG_DESK_THREAD: list[Any] = [None]
+
+
 def call_log_read() -> list[dict[str, Any]]:
+    memo = _CALL_LOG_MEMO
+    now = time.time()
     try:
+        if memo["key"] is not None and now - float(memo["at"]) < 2.0:
+            return memo["rows"]
+        st = CALL_LOG_PATH.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if key == memo["key"]:
+            memo["at"] = now
+            return memo["rows"]
         rows = json.loads(CALL_LOG_PATH.read_text())
-        return rows if isinstance(rows, list) else []
+        rows = rows if isinstance(rows, list) else []
+        memo.update({"key": key, "rows": rows, "at": now})
+        return rows
     except Exception:
-        return []
+        return memo["rows"] if memo["key"] is not None else []
 
 
-def call_log_add(entry: dict[str, Any]) -> None:
-    """One finished call, written down: who, how long, and which rule ended
-    it. Kept on disk so the ledger survives a restart."""
-    entry = dict(entry or {})
+def _call_log_write_now(entry: dict[str, Any]) -> None:
+    """The desk's work: grade, append, write. Never on the event loop."""
     transcript = list(entry.get("transcript") or [])
     if transcript:
         entry.setdefault("fingerprint", call_fingerprint(transcript))
@@ -77250,20 +77570,51 @@ def call_log_add(entry: dict[str, Any]) -> None:
                    if isinstance(entry.get("story"), dict) else None),
             plot=(entry.get("plot")
                   if isinstance(entry.get("plot"), dict) else None)))
-    entry.setdefault("id", uuid.uuid4().hex[:12])
     with _HANGUP_LOCK:
         rows = call_log_read()
         rows.append(entry)
+        del rows[:-CALL_LOG_KEPT]
+        snapshot = list(rows)
+    try:
+        CALL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CALL_LOG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, indent=1) + "\n")
+        tmp.replace(CALL_LOG_PATH)
+        st = CALL_LOG_PATH.stat()
+        _CALL_LOG_MEMO.update({"key": (st.st_mtime_ns, st.st_size),
+                               "rows": rows, "at": time.time()})
+    except OSError:
+        pass
+
+
+def _call_log_desk_worker() -> None:
+    while True:
+        entry = _CALL_LOG_DESK.get()
         try:
-            CALL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            tmp = CALL_LOG_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(rows[-CALL_LOG_KEPT:], indent=1) + "\n")
-            tmp.replace(CALL_LOG_PATH)
-        except OSError:
-            pass
+            _call_log_write_now(entry)
+        except Exception as exc:  # noqa: BLE001
+            _CALL_LOG_MEMO["errors"] = int(_CALL_LOG_MEMO.get("errors") or 0) + 1
+            _CALL_LOG_MEMO["last_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:80])
+        finally:
+            _CALL_LOG_DESK.task_done()
+
+
+def call_log_add(entry: dict[str, Any]) -> None:
+    """One finished call, written down: who, how long, and which rule ended
+    it. Kept on disk so the ledger survives a restart. #1403: the panel's
+    ring gets it now; the grade and the file come from the desk thread."""
+    entry = dict(entry or {})
+    entry.setdefault("id", uuid.uuid4().hex[:12])
     ring = _RADIO.setdefault("call_log", [])
     ring.append(entry)
     del ring[:-40]
+    worker = _CALL_LOG_DESK_THREAD[0]
+    if worker is None or not worker.is_alive():
+        worker = Thread(target=_call_log_desk_worker, name="call-log-desk",
+                        daemon=True)
+        _CALL_LOG_DESK_THREAD[0] = worker
+        worker.start()
+    _CALL_LOG_DESK.put_nowait(entry)
 
 
 # #977: ONE LINE, ONE CALLER.
@@ -95327,8 +95678,36 @@ async def crystal_rhyme_shutdown() -> None:
         await asyncio.gather(task, return_exceptions=True)
 
 
+# #1401: THE SAME LINE IS NOT CONTRACTED TWICE. A source contract is a
+# pure function of the text and the vocabulary, and the station asks for
+# the same one over and over: call_tint_report contracts both sides of
+# every turn of a call, the regrade sweeps ask it again for every entry
+# on the shelf, and tint_evaluate asks for each bar it grades - all on
+# the event loop. The stall census charged crystal_source_contract
+# 18-42 s frames today; timed in the container the extraction itself is
+# 1 ms warm (those frames were the main thread parked while a worker held
+# the GIL - see #1390), and the real repeated cost was canonicalising the
+# whole vocabulary per call (crystal_contract #1401). This memo takes the
+# repeats to a dict lookup. Keyed on the text and on the identity of the
+# vocabulary object, which _crystal_vocab() rebuilds only when the pool
+# or the crystal changes; the caller gets a copy because
+# crystal_prompt_contract writes into the dict it is handed.
+_SOURCE_CONTRACT_MEMO: dict[str, Any] = {"vocab": None, "rows": {}}
+
+
 def crystal_source_contract(text: str) -> dict[str, Any]:
-    return crystal_extract_contract(text, _TINT_EVAL_STOP, _crystal_vocab())
+    vocab = _crystal_vocab()
+    memo = _SOURCE_CONTRACT_MEMO
+    if memo["vocab"] is not vocab:
+        memo.update({"vocab": vocab, "rows": {}})
+    key = hashlib.sha1(str(text or "").encode("utf-8", "ignore")).hexdigest()
+    got = memo["rows"].get(key)
+    if got is None:
+        got = crystal_extract_contract(text, _TINT_EVAL_STOP, vocab)
+        if len(memo["rows"]) >= 4000:
+            memo["rows"].clear()
+        memo["rows"][key] = got
+    return copy.deepcopy(got)
 
 
 def crystal_landing_pairs(text: str, answering: str = "", want: int = 4) -> Any:
@@ -101911,8 +102290,11 @@ async def dj_voice_api(
         # #1147 review: a sting is punctuation (5s of grace), a stream
         # gets its own length, and a plain line gets 20s - matching the
         # clients' own staleness rules with room to spare.
-        _grace = (int(_slen * 1000) if _slen > 0
-                  else 5000 if clip.get("sting") else 20000)
+        # #1396: a plain line for VOICE_LATE_OFFER_MS (45 s, was 20), a
+        # stream for its length plus the same - the page that owns the
+        # air now plays what a stalled loop handed over late.
+        _grace = (int(_slen * 1000) + VOICE_LATE_OFFER_MS if _slen > 0
+                  else 5000 if clip.get("sting") else VOICE_LATE_OFFER_MS)
         if server_ms > _bm + _grace:
             continue
         clips.append({**clip, "broadcast_ms": _bm})
@@ -120099,12 +120481,33 @@ _PUSHED_LOCK = RLock()
 _PUSHED_USES = 3                        # airings before a pushed section retires
 
 
+_PUSHED_MEMO: dict[str, Any] = {"key": None, "rows": [], "at": 0.0}
+
+
 def pushed_sections() -> list[dict[str, Any]]:
+    """#1404: memoised on the file's (mtime, size) with a two-second grace,
+    the way crystals_read works. GET /api/dj/sections is polled by every
+    surface and this opened, read and parsed the file for each poll;
+    py-spy 2026-09-14 12:50 put 5 of 60 main-thread samples on it while
+    the disk was busy under the pantry flusher. A copy goes back, as
+    before, so a caller may append to it."""
+    memo = _PUSHED_MEMO
+    now = time.time()
     try:
+        if memo["key"] is not None and now - float(memo["at"]) < 2.0:
+            return list(memo["rows"])
+        st = PUSHED_SECTIONS_PATH.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if key == memo["key"]:
+            memo["at"] = now
+            return list(memo["rows"])
         rows = json.loads(PUSHED_SECTIONS_PATH.read_text())
-        return [r for r in rows if isinstance(r, dict)] \
-            if isinstance(rows, list) else []
+        rows = ([r for r in rows if isinstance(r, dict)]
+                if isinstance(rows, list) else [])
+        memo.update({"key": key, "rows": rows, "at": now})
+        return list(rows)
     except Exception:
+        memo.update({"key": None, "rows": [], "at": 0.0})
         return []
 
 
@@ -120115,6 +120518,11 @@ def _pushed_write(rows: list[dict[str, Any]]) -> None:
             tmp = PUSHED_SECTIONS_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(rows[-100:]))
             tmp.replace(PUSHED_SECTIONS_PATH)
+            st = PUSHED_SECTIONS_PATH.stat()                        # #1404
+            _PUSHED_MEMO.update({"key": (st.st_mtime_ns, st.st_size),
+                                 "rows": [r for r in rows[-100:]
+                                          if isinstance(r, dict)],
+                                 "at": time.time()})
         except OSError:
             pass
 
@@ -123191,7 +123599,7 @@ def broadcast_triangulate(since: float = 0.0) -> dict[str, Any]:
                     "reload_pages", who)
 
         waiting = sum(1 for r in _PAGE_DELIVERIES.values()
-                      if str(r.get("state") or "") == "received")
+                      if page_delivery_waits(r))            # #1405b
         if waiting >= 3:
             return verdict(
                 "not_started",
@@ -123530,7 +123938,7 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                        if state.get("gagged") else ""))
         oldest = sorted(
             [r for r in _PAGE_DELIVERIES.values()
-             if str(r.get("state") or "") == "received"],
+             if page_delivery_waits(r)],                    # #1405b
             key=lambda r: float(r.get("at") or 0))
         if oldest:
             said.append("head       %s, handed over %.0fs ago"
@@ -174929,6 +175337,33 @@ function djVoiceUnstick() {
   return true;
 }
 
+/* #1396: LATE IS NOT DEAD, FOR THE DEVICE THAT OWNS THE AIR.
+ *
+ * Measured 2026-09-14 11:57, an hour with 1,530 s of dead air of which
+ * 94% was the server's event loop blocked: this page held ten clips
+ * handed over and not started, the head one 429 s old, and answered
+ * "clip expired before playback" for it. Three laws below turned every
+ * stall into silence: djVoiceNext dropped a plain line 15 s late, the
+ * metadata handler dropped anything later than its own length and
+ * started what survived mid-word, and retry() gave up on a line 15 s
+ * past its moment. Each was written for a LISTENER page keeping step
+ * with the world. The page that owns the air (pineSoloGate: one page
+ * sounds, every other is gagged) has no world to keep step with - it
+ * IS the air - and a line heard forty seconds late is the line, where
+ * a dropped one is a hole in the programme.
+ *
+ * So the owning page keeps a late clip up to VOICE_LATE_PLAY_MS behind
+ * and plays it through from its first word, in order; only past that
+ * bound is it history. Latency, not silence, and bounded. A gagged
+ * page keeps the strict law so it is in step on the day it is handed
+ * the air. The server offers late clips for exactly this long
+ * (VOICE_LATE_OFFER_MS); the two must agree. */
+const VOICE_LATE_PLAY_MS = 45000;
+function djLatePlay() {
+  /* Not gagged = this page owns the air, or no owner is set at all
+   * (then every page sounds and every page may run late alike). */
+  return !window.__pineGagged;
+}
 let djVoiceCut = 0;                      // #1147: server feed epoch - clips
                                          // older than this are history
 /* #1147 review: the PLAYER epoch. A cut flush (or FM-off) silences the
@@ -175572,11 +176007,15 @@ function djVoiceNext() {
      * given far longer than anything else - its own length plus two
      * minutes - because holding a conversation together is worth waiting
      * for; it is not worth waiting forever for. */
+    /* #1396: the page that owns the air keeps a late line up to
+     * VOICE_LATE_PLAY_MS and plays it through; a gagged page keeps the
+     * old law so it stays in step for the day it is handed the air. */
+    const lateBound = djLatePlay() ? VOICE_LATE_PLAY_MS / 1000 : 15;
     const hopeless = (clip.keepWhole
       ? lateNow > 120 + streamLen
-      : ((streamLen > 0 && lateNow >= streamLen)
+      : ((streamLen > 0 && lateNow >= Math.max(streamLen, lateBound))
          || (clip.sting && lateNow > 3)
-         || (!clip.stream && !clip.sting && lateNow > 15)))
+         || (!clip.stream && !clip.sting && lateNow > lateBound)))
       || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= djVoiceCut);
     if (!hopeless) break;
     djVoiceAck(clip, "error", null, "clip became stale before playback");
@@ -175700,8 +176139,8 @@ function djVoiceNext() {
        * seconds past its air moment is history, not programme -
        * re-queueing it forever built the very backlog the drop-run then
        * garbled. */
-      if (Date.now() - Number(clip.broadcastAt || 0) > 15000
-          || Number(clip.ts || 0) <= djVoiceCut) {
+      if (Date.now() - Number(clip.broadcastAt || 0) > (djLatePlay() ? VOICE_LATE_PLAY_MS : 15000)
+          || Number(clip.ts || 0) <= djVoiceCut) {          /* #1396: the owner keeps it longer */
         djVoiceNext();
         return;
       }
@@ -175786,7 +176225,14 @@ function djVoiceNext() {
      * when it happens a second behind the world beats a decapitated
      * word. Only a clip with honestly nothing left to play is dropped. */
     const lateBy = Math.max(0, (Date.now() - broadcastAt) / 1000);
-    if (!clip.keepWhole && isFinite(player.duration) && lateBy >= player.duration) {
+    /* #1396: on the device that owns the air a late clip is LATE, not
+     * expired - it plays from its first word, in order, until it is more
+     * than VOICE_LATE_PLAY_MS behind; only then is it history. The old
+     * law (dropped once later than its own length, otherwise started
+     * mid-word) stays for every gagged page. */
+    const latePlay = !clip.keepWhole && djLatePlay();
+    if (!clip.keepWhole && isFinite(player.duration)
+        && (latePlay ? lateBy * 1000 > VOICE_LATE_PLAY_MS : lateBy >= player.duration)) {
       djVoiceAck(clip, "error", player, "clip expired before playback");
       /* #1147: SILENCE the element before advancing. done() alone left
        * the pending play() to fire - the "dropped" clip kept sounding
@@ -175797,8 +176243,8 @@ function djVoiceNext() {
     }
     if (clip.keepWhole && Number(clip.resumeAt || 0) > 0) {
       try { player.currentTime = Number(clip.resumeAt); } catch (e) {}
-    } else if (!clip.keepWhole && lateBy > 1.0 && isFinite(player.duration)) {
-      try { player.currentTime = Math.max(0, lateBy - 0.25); } catch (e) {}
+    } else if (!clip.keepWhole && !latePlay && lateBy > 1.0 && isFinite(player.duration)) {
+      try { player.currentTime = Math.max(0, lateBy - 0.25); } catch (e) {}   /* not for the owner (#1396) */
     }
     // Two presenters tread on each other; a sting does not tread on the line
     // it is punctuating. If the next clip up is a sample, wait for the end

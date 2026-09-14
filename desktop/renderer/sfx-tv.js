@@ -870,8 +870,23 @@
     if (root.document && root.setTimeout) {
       root.setTimeout(function () {
         try {
-          if (!mounted && /^https?:$/.test(String(root.location.protocol))) {
+          if (mounted) return;
+          if (/^https?:$/.test(String(root.location.protocol))) {
             root.PineSfxTv.mount({baseUrl: ''});
+          } else if (root.pineDesktop) {
+            /* #1399: AND ON THE DESKTOP, WHERE THE SHELL'S OWN MOUNT CAN
+             * RUN TOO EARLY. renderer.js mounts this inside loadConfig,
+             * and loadConfig runs before this file has been evaluated -
+             * so window.PineSfxTv was undefined at that instant and the
+             * mount was skipped. Measured: with the endless set ringing
+             * three clips ahead and the tablet playing them, the desktop's
+             * tube stayed dark until mount() was called by hand, after
+             * which it lit within twelve seconds. The base is the one the
+             * chrome already knows (#1348). */
+            var b = '';
+            try { b = root.pineStationBase ? String(root.pineStationBase() || '') : ''; }
+            catch (err) { b = ''; }
+            root.PineSfxTv.mount({baseUrl: b || 'http://127.0.0.1:8096'});
           }
         } catch (err) { /* no set is better than a broken view */ }
       }, 3000);

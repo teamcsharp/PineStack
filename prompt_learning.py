@@ -635,6 +635,16 @@ class PromptLearningStore:
         with self._lock:
             return {key: copy.deepcopy(value) for key, value in self._state.items() if key != "hints"}
 
+    def mode(self):
+        """#1402: the acceptance mode alone, without the lock or the copy.
+        One dict read of one string is atomic under the GIL; the worst
+        case is a value one write behind, which the three-second memo in
+        front of this (crystal_acceptance_mode) already allows."""
+        try:
+            return str(self._state.get("mode") or "strict")
+        except Exception:
+            return "strict"
+
     def status(self):
         with self._lock:
             return copy.deepcopy(self._status)

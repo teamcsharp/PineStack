@@ -241,7 +241,8 @@
       }
       var why = document.getElementById('pineCamWhy');
       if (why && got) {
-        why.textContent = live ? 'live' : String(got.state || '');
+        why.textContent = live ? 'live'
+          : (got.state === 'live' && !got.fresh) ? 'stale' : String(got.state || '');   /* #1387 */
       }
       paintRow(got, live);
       /* If it goes while the view is open, say so rather than freezing on
@@ -265,7 +266,18 @@
     if (!got) { brief.textContent = 'the station did not answer'; return; }
     var state = String(got.state || '');
     var seen = !!got.seen;
+    /* #1387: A STALE CLAIM IS NOT A STATE. The supervisor writes
+     * `state` on transitions and `at` on every pass; when it stops
+     * passing - measured: state=live, at 13 hours old, frame.jpg from
+     * the night before, the radio seeing no camera - the file still
+     * says 'live', and this fell through to printing that word. The
+     * row read 'live' over a dead link for a whole morning. `fresh` is
+     * the supervisor's heartbeat and it outranks the word. */
+    var stale = (state === 'live' && got && !got.fresh);
+    var silentFor = (got && got.at) ? Math.max(0, Math.round(Date.now() / 1000 - Number(got.at))) : 0;
+    var silentSay = silentFor >= 3600 ? Math.round(silentFor / 3600) + 'h' : Math.round(silentFor / 60) + 'm';
     brief.textContent = isLive ? 'live'
+      : stale ? 'link stale - supervisor silent ' + silentSay
       : seen ? 'on the network - joining'
         : state === 'no-link' ? 'not on the network' : (state || 'looking…');
     if (!stats) return;
@@ -273,7 +285,9 @@
     var rows = [
       ['where', String(got.ssid || '') + ' · ' + String(got.camera || '')],
       ['signal', got.signal ? got.signal + '%' : (seen ? 'seen' : '—')],
-      ['link', isLive ? 'joined, recording' : state || 'not joined'],
+      ['link', isLive ? 'joined, recording'
+        : stale ? 'the supervisor stopped reporting ' + silentSay + ' ago - press Reconnect'
+        : state || 'not joined'],
       ['kept', (got.clips || 0) + ' clip(s) · ' + mb + ' MB'],
       ['newest', String(got.newest || '—')]
     ];
