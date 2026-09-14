@@ -146,6 +146,17 @@
           <span>Pine Cam</span>
           <span id="pineCamBrief" class="vitals-brief">looking…</span>
         </button>
+        <!-- #1361b: "put an icon for troubleshooting and attempting to
+             go through the troubleshooting steps to connect to the
+             camera and get the picture in picture window showing."
+             A real button beside the fold, not inside it, so it is
+             reachable whether the row is open or shut. It runs the
+             doctor, presses the cure the doctor names, and opens the
+             picture the moment the link is live. -->
+        <button id="pineCamHeal" class="vitals-tool" type="button"
+                title="Troubleshoot the Pine Cam: find it, fix what the doctor names, and open the picture">
+          <span data-pine-icon="c:tools" aria-hidden="true"></span>
+        </button>
         <div id="pineCamStats" class="pv"></div>
         <!-- #1349: three faults look identical from here - a dead radio,
              a camera out of range, a camera that slept its Wi-Fi. Look

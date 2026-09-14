@@ -416,7 +416,17 @@
        out its own 2.5s poll. Rapid taps therefore cycle. */
     api().post('/api/sfx/video/cue', {who: 'operator'}).then(function (got) {
       var clip = got && got.clip;
-      if (!clip) { done(String((got && got.say) || 'no clip'), true); return; }
+      if (!clip) {
+        done(String((got && got.say) || 'no clip'), true);
+        /* #1361b: A MISS IS A QUESTION, NOT A VERDICT. Four different
+           faults have printed the same four words on this strip, and
+           only one of them is cured by tapping again. The doctor
+           names which one this is and puts the cure under a thumb. */
+        try {
+          if (root.PineClipDoctor) root.PineClipDoctor.open(String((got && got.say) || ''));
+        } catch (err) { /* the strip already said it */ }
+        return;
+      }
       /* #1311b: an answer that has been overtaken is dropped rather
          than cutting the picture backwards. */
       if (mine !== reelTurn) return;

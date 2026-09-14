@@ -1,0 +1,101 @@
+/* THE CLIP DOCTOR (clip-doctor.js). A sheet over whatever view is up, the
+   same dark glass as the talk dot's transcript and the Pine Cam box, so it
+   reads as the station explaining itself and not as a browser dialog. */
+.cd-back {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483006;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 6, 11, .62);
+}
+.cd-back.show { display: flex; }
+.cd-box {
+  width: min(560px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  border: 1px solid #35414c;
+  border-radius: 12px;
+  background: rgba(10, 14, 18, .97);
+  color: #edf3f5;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .6);
+  font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+}
+.cd-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid #35414c;
+  letter-spacing: .08em;
+  font-size: 11px;
+  color: #8ea0ad;
+}
+.cd-bar b { color: #edf3f5; }
+.cd-x {
+  margin-left: auto;
+  background: none;
+  border: 0;
+  color: #8ea0ad;
+  font: 20px/1 inherit;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.cd-x:hover { color: #edf3f5; }
+.cd-verdict {
+  padding: 12px 14px 4px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #e46b6b;
+}
+.cd-verdict.good { color: #65c7da; }
+.cd-steps {
+  margin: 4px 0 8px;
+  padding: 0 14px 0 34px;
+  color: #cfe0e6;
+}
+.cd-steps li { margin: 3px 0; }
+.cd-counts {
+  padding: 6px 14px 10px;
+  font-size: 11px;
+  color: #8ea0ad;
+  border-bottom: 1px solid #24323a;
+}
+.cd-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 12px;
+}
+.cd-btn {
+  flex: 1 1 auto;
+  min-height: 40px;            /* a thumb, not a pointer */
+  padding: 8px 12px;
+  border: 1px solid #35414c;
+  border-radius: 9px;
+  background: #1c242c;
+  color: #edf3f5;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cd-btn:hover { border-color: #65c7da; }
+.cd-btn.cure {
+  border-color: #65c7da;
+  background: rgba(101, 199, 218, .16);
+}
+.cd-out {
+  margin: 0 12px 12px;
+  padding: 8px 10px;
+  border: 1px solid #24323a;
+  border-radius: 8px;
+  background: #0b1114;
+  color: #cfe0e6;
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.cd-out[hidden] { display: none !important; }

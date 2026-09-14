@@ -795,6 +795,38 @@
    * that makes this work on the tablet. Cached, because a reply should not
    * cost a config read every time. */
   var cachedKey = '';
+  /* #1360: WHERE THE STATION IS, FOR THE TWO ROADS THAT BYPASS THE
+   * BRIDGE.
+   *
+   * "Failed to fetch", in the red box over the dot, on the desktop.
+   *
+   * Both of the fetches below were written with a bare '/api/...' path,
+   * and on the tablet that is correct - the panel IS served by the
+   * station there, so a relative URL follows the host it was opened on.
+   * In the Electron chrome the document is file://, so the same string
+   * resolves to file:///api/listen/transcribe, which is a path on the
+   * disk, is not there, and fails with exactly that message.
+   *
+   * So the orb could hear you on the desktop and could never send what
+   * it heard, and could never speak its answer. Everything else in this
+   * file goes through pineDesktop, which builds an absolute URL out in
+   * the shell - which is why only these two broke, and why it broke
+   * silently on the one surface nobody tests the tablet on.
+   *
+   * Same shape as slideshow-source's base() (#1348): empty where the
+   * document is already served over http, so nothing about the tablet
+   * changes.
+   */
+  function where() {
+    try {
+      if (root.location && /^https?:$/.test(root.location.protocol)) {
+        return '';
+      }
+      if (root.pineStationBase) return root.pineStationBase();
+    } catch (err) { /* fall through to the last resort */ }
+    return 'http://127.0.0.1:8096';
+  }
+
   function serverKey() {
     if (cachedKey) return Promise.resolve(cachedKey);
     if (typeof root.SERVER_KEY === 'string' && root.SERVER_KEY) {
@@ -875,7 +907,7 @@
   function sayIt(words, key, voice) {
     var headers = {'Content-Type': 'application/json'};
     headers.Authorization = 'Bearer ' + key;
-    fetch('/v1/audio/speech', {
+    fetch(where() + '/v1/audio/speech', {   /* #1360 */
       method: 'POST', headers: headers,
       body: JSON.stringify({
         input: String(words).slice(0, 600),
@@ -921,7 +953,7 @@
       if (!key) {
         throw new Error('no station key on this terminal to authorise the clip');
       }
-      return fetch(url, {
+      return fetch(where() + url, {          /* #1360 */
         method: 'POST',
         headers: {
           'Authorization': 'Bearer ' + key,

@@ -481,6 +481,68 @@
       }).catch(function () { say('the station did not answer'); });
   }
 
+  /* #1361b: THE WHOLE LADDER, FROM ONE PRESS.
+   *
+   * "Earlier I clicked it and it wasn't able to show the picture in
+   *  picture window." The row folds; the Look button watches; the
+   * troubleshooter describes; Reset radio and Reconnect each do one
+   * thing. Four controls for one intent. This is the intent: get the
+   * picture up, doing whatever the doctor says is needed on the way.
+   *
+   * It asks the doctor, presses the cure the doctor names (reset-radio
+   * or reconnect), waits for the link, and opens the box - and if the
+   * link is already live it just opens the box, because the operator
+   * pressed a button that says 'show me the picture'. */
+  var healing = false;
+
+  function heal() {
+    if (healing) return;
+    healing = true;
+    var doc = document.getElementById('pineCamDoc');
+    var tools = document.getElementById('pineCamTools');
+    if (tools) tools.hidden = false;
+    var stats = document.getElementById('pineCamStats');
+    if (stats) stats.hidden = false;
+    function tell(t) { if (doc) { doc.hidden = false; doc.textContent = t; } }
+    function finish(t) { healing = false; tell(t); look(); }
+    if (live) { healing = false; open(); return; }
+    tell('asking the link doctor…');
+    Promise.resolve(ask('/api/pinelink/doctor')).then(function (d) {
+      if (!d) { finish('the station did not answer'); return; }
+      var lines = [d.verdict || 'no verdict'].concat((d.steps || []).map(
+        function (t, i) { return (i + 1) + '. ' + t; }));
+      var cure = String(d.cure || '');
+      var road = cure === 'reset' ? '/api/pinelink/reset-radio'
+        : (d.camera ? '/api/pinelink/connect' : '');
+      if (!road) {
+        /* Nothing this side can press: the camera itself is not on
+         * the air. Say so plainly - the next move is a button on the
+         * camera, not one here. */
+        finish(lines.concat(['', 'nothing here can fix that - the camera '
+          + 'has to be on the air first']).join(String.fromCharCode(10)));
+        return;
+      }
+      lines.push('', 'pressing ' + (cure === 'reset' ? 'Reset radio' : 'Reconnect') + '…');
+      tell(lines.join(String.fromCharCode(10)));
+      return Promise.resolve(post(road, {})).then(function (r) {
+        lines.push((r && r.say) || 'no answer');
+        tell(lines.join(String.fromCharCode(10)));
+        /* The link joins in its own time - up to fifteen seconds after
+         * a reset. Poll rather than guess, and open the picture the
+         * moment it is there. */
+        var left = 8;
+        (function wait() {
+          Promise.resolve(ask('/api/pinelink/state')).then(function (got) {
+            var up = !!(got && got.state === 'live' && got.fresh);
+            if (up) { live = true; showButton(true); healing = false; tell(lines.concat(['linked - opening the picture']).join(String.fromCharCode(10))); open(); look(); return; }
+            if (left -= 1) { setTimeout(wait, 3000); return; }
+            finish(lines.concat(['still not linked after the cure - press Troubleshoot for the current reading']).join(String.fromCharCode(10)));
+          }, function () { finish('the station did not answer'); });
+        }());
+      });
+    }).catch(function () { finish('the station did not answer'); });
+  }
+
   /* #1359: the cure the troubleshooter can only describe. */
   function resetRadio() {
     var out = document.getElementById('pineCamDoc');
@@ -584,6 +646,14 @@
       recBtn.addEventListener('click', function (ev) {
         ev.stopPropagation();
         record();
+      });
+    }
+    var healBtn = document.getElementById('pineCamHeal');
+    if (healBtn && !healBtn.__wired) {
+      healBtn.__wired = true;
+      healBtn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        heal();
       });
     }
     var resetBtn = document.getElementById('pineCamReset');
