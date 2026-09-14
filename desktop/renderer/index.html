@@ -142,6 +142,18 @@
                 title="Find the tablet on the network and reattach this app to it: look, sweep, adopt, wake, adb connect, look again">
           <span data-pine-icon="c:tools" aria-hidden="true"></span>
         </button>
+        <!-- #1116: "Collapse the output for the tablet troubleshooter into
+             an icon." The transcript below used to unfold across the card
+             on every run; now it stays behind this receipt icon, which
+             appears once a run has printed anything. A dot on it says how
+             the run ended (ok / bad / busy) and its title carries the one-
+             line verdict, so hovering answers without opening. The fold
+             is remembered in localStorage (pineTabletDocOpen). -->
+        <button id="tabletDocFold" class="vitals-tool vitals-tool-2" type="button" hidden
+                aria-expanded="false" aria-controls="tabletDoc"
+                title="Show the troubleshooter's transcript">
+          <span data-pine-icon="c:receipt" aria-hidden="true"></span>
+        </button>
         <div id="vitals" class="pv"></div>
         <pre id="tabletDoc" class="pine-cam-doc" hidden></pre>
       </div>

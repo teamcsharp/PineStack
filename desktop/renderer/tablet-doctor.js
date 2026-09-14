@@ -36,11 +36,48 @@
   function post(path, body) {
     return api().post ? api().post(path, body || {}) : Promise.reject(new Error('no bridge'));
   }
+  /* #1116: "Collapse the output for the tablet troubleshooter into an
+   * icon." The transcript is still written in full to the <pre>, but the
+   * <pre> is no longer un-hidden by writing to it. What appears instead is
+   * the receipt icon (#tabletDocFold) beside the wrench; the operator opens
+   * the transcript from there, and the choice is remembered in
+   * localStorage['pineTabletDocOpen'] ('1'/'0') so a run that starts with
+   * the transcript left open shows live, and one that starts with it shut
+   * stays out of the way. */
+  var DOC_OPEN_KEY = 'pineTabletDocOpen';
+  function docOpenPref() {
+    try { return localStorage.getItem(DOC_OPEN_KEY) === '1'; } catch (err) { return false; }
+  }
+  function rememberDocOpen(open) {
+    try { localStorage.setItem(DOC_OPEN_KEY, open ? '1' : '0'); } catch (err) { /* private window; the choice lasts the session */ }
+  }
+  function setDocOpen(open) {
+    var d = document.getElementById('tabletDoc');
+    var f = document.getElementById('tabletDocFold');
+    if (d) d.hidden = !open;
+    if (f) f.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  /* The icon's state: 'busy' while the ladder climbs, 'ok' when the last
+   * run ended with the tablet here, 'bad' when it did not or the run
+   * failed. The dot is CSS on the class; the title carries the one-line
+   * verdict so a hover answers without opening the transcript. */
+  function docState(state, brief) {
+    var f = document.getElementById('tabletDocFold');
+    if (!f) return;
+    f.hidden = false;
+    f.classList.remove('ok', 'bad', 'busy');
+    if (state) f.classList.add(state);
+    f.title = (brief ? brief + ' \u00b7 ' : '') + 'click for the troubleshooter\'s transcript';
+  }
   function out(text) {
     var d = document.getElementById('tabletDoc');
     if (!d) return;
-    d.hidden = false;
     d.textContent = text;
+    /* Never un-hide the <pre> here - only honour a fold the operator left
+     * open, so a live run shows only where it was wanted. */
+    var f = document.getElementById('tabletDocFold');
+    if (f) f.hidden = false;
+    if (docOpenPref()) setDocOpen(true);
   }
   function tell(t) { lines.push(t); out(lines.join(String.fromCharCode(10))); }
   function mark(ok, t) { tell((ok ? '  ✓ ' : '  ✗ ') + t); }
@@ -55,10 +92,13 @@
     busy = true;
     lines = [];
     var brief = document.getElementById('vitalsBrief');
+    var verdict = 'ended without a verdict';   /* #1116: what the icon's title will say */
+    var good = false;
+    docState('busy', 'running');
     try {
       tell('$ locate the tablet');
       var look = await ask('/api/tablet/look');
-      if (!look) { tell('  the station did not answer'); return; }
+      if (!look) { tell('  the station did not answer'); verdict = 'the station did not answer'; return; }
       (look.steps || []).forEach(function (s) { tell('  - ' + s); });
       tell('  verdict: ' + (look.verdict || ''));
       var host = String(look.host || '');
@@ -99,9 +139,10 @@
       var again = null;
       try { again = await ask('/api/tablet/look'); } catch (err) { again = null; }
       ((again && again.steps) || []).forEach(function (s) { tell('  - ' + s); });
-      var good = !!(again && again.fetching && again.adb_port_open);
+      good = !!(again && again.fetching && again.adb_port_open);
       mark(good, good ? 'the tablet is here, playing the station, and its port answers'
                       : ((again && again.verdict) || 'still not there'));
+      verdict = good ? 'attached' : ((again && again.verdict) || 'still not there');
       if (!good) {
         tell('  fallbacks, in order:');
         tell('   1. on the tablet, toggle Wi-Fi off and on - the station keeps sweeping and adopts a moved address');
@@ -115,8 +156,10 @@
       }
     } catch (err) {
       tell('  failed: ' + String(err && err.message || err));
+      verdict = 'failed: ' + String(err && err.message || err);
     } finally {
       busy = false;
+      docState(good ? 'ok' : 'bad', verdict);
     }
   }
 
@@ -125,6 +168,19 @@
     if (b && !b.__wired) {
       b.__wired = true;
       b.addEventListener('click', function (ev) { ev.stopPropagation(); heal(); });
+    }
+    /* #1116: the receipt icon opens and shuts the transcript, and the
+     * choice is remembered for the next run. */
+    var f = document.getElementById('tabletDocFold');
+    if (f && !f.__wired) {
+      f.__wired = true;
+      f.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        var d = document.getElementById('tabletDoc');
+        var open = !!(d && d.hidden);
+        setDocOpen(open);
+        rememberDocOpen(open);
+      });
     }
   }
 

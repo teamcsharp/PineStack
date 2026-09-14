@@ -22,6 +22,13 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   /* #1356: pull a still or a cut clip off the camera and put a Save As
      in front of it. The route is checked on the other side. */
   camSave: (opts) => ipcRenderer.invoke("cam:save", opts),
+  /* #1118: the clips folder in Explorer, and a folder picker for the
+     preference sheet. #1112: reveal one file. #1115: a picture of this
+     window for the script view's report. */
+  openFolder: (target) => ipcRenderer.invoke("open:folder", target),
+  showInFolder: (target) => ipcRenderer.invoke("show:in-folder", target),
+  pickFolder: (opts) => ipcRenderer.invoke("pick:folder", opts),
+  shotView: () => ipcRenderer.invoke("shot:view"),
   lcdState: () => ipcRenderer.invoke("lcd:state"),
   lcdConfigure: (cfg) => ipcRenderer.invoke("lcd:configure", cfg),
   lcdDiscover: () => ipcRenderer.invoke("lcd:discover"),

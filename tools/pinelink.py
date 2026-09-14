@@ -33,6 +33,7 @@ import argparse
 import glob                  # #1359: finding the adapter on the bus
 import json
 import os
+import re                    # #1118: the clips folder preference
 import shutil
 import signal
 import subprocess
@@ -45,6 +46,27 @@ OUT = ROOT / "data" / "pinelink"
 LIVE = OUT / "live"
 CLIPS = OUT / "clips"
 STATE = OUT / "state.json"
+PREF = ROOT / "data" / "pinelink_pref.json"
+
+
+def clips_dir() -> Path:
+    """#1118: the operator may move the kept clips. The station writes the
+    choice to data/pinelink_pref.json as data/<folder> and refuses anything
+    outside data/ (the container that serves the clips can see nothing
+    else), so only that shape is honoured here; anything else is the
+    default. Read at every (re)start of the recorder, which is when the
+    segmenter's output pattern is fixed."""
+    try:
+        raw = str(json.loads(PREF.read_text()).get("clips_dir") or "")
+    except Exception:  # noqa: BLE001
+        raw = ""
+    flat = raw.replace("\\", "/").strip().strip("/")
+    m = re.search(r"(?:^|/)data/(.+)$", flat) if flat else None
+    if m:
+        parts = [p for p in m.group(1).split("/") if p and p not in (".", "..")]
+        if parts:
+            return ROOT.joinpath("data", *parts)
+    return OUT / "clips"
 
 STATION_IF = "wlP9s9"           # holds 10.89.1.246 - never touched
 SPARE_IF = "wlx984827b6b478"
@@ -434,6 +456,7 @@ def ffmpeg_cmd() -> list[str]:
 
 
 def supervise(once: bool = False) -> None:
+    global CLIPS                                          # #1118
     if not station_safe():
         say("refused", why="%s is not holding 10.89.1.246 - refusing to "
             "touch the radios" % STATION_IF)
@@ -467,6 +490,9 @@ def supervise(once: bool = False) -> None:
             time.sleep(8)
             continue
 
+        # #1118: the folder may have been moved since the last start.
+        CLIPS = clips_dir()
+        CLIPS.mkdir(parents=True, exist_ok=True)
         trimmed = trim_old()
         say("live", pid=0, trimmed=trimmed,
             hls="data/pinelink/live/index.m3u8")

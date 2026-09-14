@@ -2236,7 +2236,12 @@ ipcMain.handle("cam:save", async (event, opts) => {
     const video = String((opts && opts.kind) || "") === "video";
     const ext = video ? "mp4" : "jpg";
     const when = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    let folder = app.getPath(video ? "videos" : "pictures");
+    /* #1118: the Pine Cam preference names the export folder; the Save
+       As opens there. Anything else falls back to the old defaults. */
+    let folder = String((opts && opts.dir) || "");
+    try { if (folder) fs.mkdirSync(folder, { recursive: true }); }
+    catch { folder = ""; }
+    if (!folder) folder = app.getPath(video ? "videos" : "pictures");
     try { if (!folder || !fs.existsSync(folder)) folder = app.getPath("downloads"); }
     catch { folder = app.getPath("downloads"); }
     const picked = await dialog.showSaveDialog(
@@ -2257,6 +2262,130 @@ ipcMain.handle("cam:save", async (event, opts) => {
     return { ok: false, why: error.message };
   }
 });
+
+/* #1118: THE CLIPS FOLDER, IN EXPLORER; A FOLDER PICKER FOR THE PREFERENCE
+ * SHEET. #1112: reveal one sample. #1115: a picture of this window.
+ *
+ * shell.openPath resolves to '' on success and to a reason on failure -
+ * the reason is what the renderer prints, so it is handed back as `why`. */
+ipcMain.handle("open:folder", async (_event, target) => {
+  try {
+    const where = String(target || "");
+    if (!where) return { ok: false, why: "no folder was named" };
+    const why = await shell.openPath(where);
+    return why ? { ok: false, why } : { ok: true, path: where };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("show:in-folder", (_event, target) => {
+  try {
+    const where = String(target || "");
+    if (!where) return { ok: false, why: "no file was named" };
+    shell.showItemInFolder(where);
+    return { ok: true, path: where };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("pick:folder", async (event, opts) => {
+  const { dialog } = require("electron");
+  try {
+    const picked = await dialog.showOpenDialog(
+      BrowserWindow.fromWebContents(event.sender), {
+        title: String((opts && opts.title) || "Choose a folder"),
+        defaultPath: String((opts && opts.defaultPath) || "") || undefined,
+        properties: ["openDirectory", "createDirectory"]
+      });
+    if (picked.canceled || !picked.filePaths || !picked.filePaths[0]) {
+      return { ok: true, canceled: true };
+    }
+    return { ok: true, path: picked.filePaths[0] };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+ipcMain.handle("shot:view", async (event) => {
+  try {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const image = await win.webContents.capturePage();
+    return { ok: true, dataUrl: image.toDataURL() };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* #1114 / #1118: THE COURIER.
+ *
+ * "ive been saving pine box recordings to \\10.89.1.125\QuickSwap\
+ *  PineBoxRecordings when i export a file. When i tell the pine box i want
+ *  to export a broadcast, I want it placed there."
+ *
+ * The station cannot put it there: that share is mounted READ-ONLY in its
+ * container (docker inspect: rw=false). This app, on the Windows machine,
+ * can. So the station keeps a ledger of copies owed (/api/export/courier:
+ * spoken exports bound for `export_desk_dir`, and kept Pine Cam clips when
+ * the camera preference says carry) and this rounds it every twenty
+ * seconds: fetch the bytes with the station key, write them beside a
+ * .part name, rename into place, and report back - so a copy that failed
+ * is said, not assumed. A file already there at the same size is not
+ * fetched again. */
+const COURIER_MS = 20000;
+let courierBusy = false;
+
+async function courierRound() {
+  if (courierBusy) return;
+  courierBusy = true;
+  try {
+    const cfg = readConfig();
+    if (!cfg.baseUrl) return;
+    const got = await fetchJson(`${cfg.baseUrl}/api/export/courier`);
+    const jobs = (got && got.pending) || [];
+    for (const job of jobs.slice(0, 4)) {
+      let out = { ok: false, why: "" };
+      try {
+        const dest = String(job.dest || "");
+        if (!/^(\\\\[^\\]+\\[^\\]+|[A-Za-z]:\\)/.test(dest)) {
+          throw new Error("not a Windows folder: " + dest);
+        }
+        fs.mkdirSync(dest, { recursive: true });
+        const target = path.join(dest, String(job.name || "export"));
+        let already = false;
+        try {
+          const st = fs.statSync(target);
+          already = Number(job.bytes) > 0 && st.size === Number(job.bytes);
+        } catch { already = false; }
+        if (!already) {
+          const response = await fetch(`${cfg.baseUrl}${job.url}`,
+            { headers: authHeaders(cfg) });
+          if (!response.ok) throw new Error(`the station said ${response.status}`);
+          const bytes = Buffer.from(await response.arrayBuffer());
+          if (!bytes.length) throw new Error("the station sent nothing");
+          const part = target + ".part";
+          fs.writeFileSync(part, bytes);
+          fs.renameSync(part, target);
+        }
+        out = { ok: true, path: target };
+      } catch (error) {
+        out = { ok: false, why: error.message };
+      }
+      try {
+        await fetchJson(`${cfg.baseUrl}/api/export/courier/done`, {
+          method: "POST", body: JSON.stringify({ id: job.id, ...out }) });
+      } catch (error) {
+        rememberLog(`[courier] could not report ${job.id}: ${error.message}`);
+      }
+      rememberLog(`[courier] ${job.name} -> ${out.ok ? out.path : "failed: " + out.why}`);
+    }
+  } catch (error) {
+    /* the station is away; the next round asks again */
+  } finally {
+    courierBusy = false;
+  }
+}
 
 ipcMain.handle("flow:pending", (event) => {
   const held = flowWaiting.get(event.sender.id);
@@ -3008,6 +3137,9 @@ app.commandLine.appendSwitch(
 app.whenReady().then(async () => {
   selfSyncFromShare();
   createWindow();
+  /* #1114: the courier starts once the window is up and rounds forever. */
+  setTimeout(courierRound, 8000);
+  setInterval(courierRound, COURIER_MS);
   if (process.env.PINE_DESKTOP_PLAYBACK_PROBE === "1") {
     delete process.env.PINE_DESKTOP_PLAYBACK_PROBE;
     require("./playback-probe.cjs").capture({lcdState, lcdFrame: () => lcdAgent.lastFrame})

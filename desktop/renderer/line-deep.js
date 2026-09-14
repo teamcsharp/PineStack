@@ -7,7 +7,7 @@
  * how many times it played, how often it's played, when the last time it
  * played was, and why it keeps coming up so often."
  *
- * FOUR STATIONS ARE ASKED, and each answers a different half of that:
+ * FIVE STATIONS ARE ASKED, and each answers a different half of that:
  *
  *   /api/dj/provenance/{id}   the writing room - the brief, the prompt as
  *                             sent, the script that came back, the crystal
@@ -26,6 +26,28 @@
  *   /api/airlog               every time this line actually went out, so
  *                             "how often" and "when last" are read off the
  *                             air log rather than inferred.
+ *   /api/dj/scenario          the scene (#1113). "Offer a dropdown that
+ *                             shows what the scenario was that is being
+ *                             used for setting the scenario. Also next to
+ *                             it put a drop down arrow that I can hit and
+ *                             it basically opens a box showing all the
+ *                             scenarios that are currently being used to
+ *                             basically create this scene. So if there's a
+ *                             topic, if there's a guest star, if there's
+ *                             any of these options inside the pine box
+ *                             agent that's affecting this scenario to make
+ *                             it happen, I want access to them so I can
+ *                             see how the scenario came to be." The
+ *                             station answers with the scenario in force
+ *                             for the line and EVERY input the agent has -
+ *                             topic, plotline, guest, theme, crystals,
+ *                             tint, prompt, persona, mood, running order -
+ *                             each marked on or off. The off ones are
+ *                             drawn dimmed rather than left out, so the
+ *                             operator sees the option exists and is not
+ *                             shaping this scene. With no line id it is
+ *                             still asked, and answers with the scene in
+ *                             force now.
  *
  * THE 3D IS THE SHAPE, THE TEXT IS THE RECORD. The flow is drawn because a
  * path with branches is worth seeing as space; every number under it is
@@ -107,6 +129,12 @@
       + '<b>How this line came to be</b>'
       + '<button class="ld-close" type="button" aria-label="close">×</button>'
       + '</div>'
+      /* #1113 the scene row. Until the station answers, the select says
+       * so; sceneRow() replaces the whole row once gather() is back. */
+      + '<div class="ld-scene"><div class="ld-scene-bar">'
+      + '<select class="ld-scene-pick" disabled aria-label="the scenario">'
+      + '<option>reading the scene…</option></select>'
+      + '</div></div>'
       + '<p class="ld-said"></p>'
       + '<div class="ld-flow"><canvas class="ld-canvas"></canvas>'
       + '<div class="ld-flowwhy"></div></div>'
@@ -126,14 +154,19 @@
       paint(line, all);
     }, function (err) {
       if (!box) return;
+      sceneRow(line, null);
       body.replaceChildren();
       body.appendChild(make('p', 'ld-wait',
         'the station could not say: ' + ((err && err.message) || err)));
     });
   }
 
-  /* Four asks, in parallel, each allowed to fail on its own. A missing
-   * provenance must not cost the repetition count. */
+  /* Five asks, in parallel, each allowed to fail on its own. A missing
+   * provenance must not cost the repetition count, and a scene the station
+   * cannot read (#1113) must not cost the sheet. The scene is asked even
+   * when the line has no id: `line=` empty is the station's cue to answer
+   * with the scene in force now. encodeURIComponent(undefined) would send
+   * the word "undefined", which is why the id is defaulted first. */
   function gather(line) {
     var soft = function (p) {
       return p.then(function (v) { return v; }, function () { return null; });
@@ -142,9 +175,10 @@
       soft(api().get('/api/dj/provenance/' + encodeURIComponent(line.id))),
       soft(api().get('/api/pipeline/detail?kind=voice')),
       soft(api().get('/api/cupboard/worn?most=60')),
-      soft(api().get('/api/airlog?limit=400'))
+      soft(api().get('/api/airlog?limit=400')),
+      soft(api().get('/api/dj/scenario?line=' + encodeURIComponent(line.id || '')))
     ]).then(function (got) {
-      return {prov: got[0], road: got[1], worn: got[2], air: got[3]};
+      return {prov: got[0], road: got[1], worn: got[2], air: got[3], scene: got[4]};
     });
   }
 
@@ -170,12 +204,162 @@
     box.querySelector('.ld-flowwhy').textContent =
       steps.map(function (s) { return s.label; }).join('  →  ');
 
+    sceneRow(line, all.scene);
+
     section(body, 'how often it has gone out', timesNode(line, all));
     section(body, 'why it keeps coming up', whyNode(line, all));
     section(body, 'the room that wrote it', wroteNode(all));
     section(body, 'what it was shown', shownNode(all));
     section(body, 'the road, step by step', roadNode(all));
     section(body, 'if you never want to hear it again', retireNode(line, all));
+  }
+
+  /* ------------------------------------------------------------ the scene */
+
+  /* #1113 THE SCENE ROW, directly under the head. Two controls:
+   *
+   *   the select   its first, selected option is the scenario in force for
+   *                this line ("call with banter · caller road"); the rest
+   *                are the inputs that are ON, one per line ("Topic: ...").
+   *                Choosing one is a jump, not a setting: it opens the box,
+   *                lights and unfolds that input's card, then the select
+   *                goes straight back to the scenario option, so it always
+   *                reads as "what scene is this" at a glance.
+   *   the caret    opens the box that lists EVERY input as a card, on and
+   *                off alike. Off cards are dimmed, not dropped: "if there's
+   *                any of these options inside the pine box agent that's
+   *                affecting this scenario ... I want access to them" - and
+   *                the option he does not see is the one he cannot reach
+   *                for. The box is shut by default; the head row is the
+   *                glance and the box is the record.
+   *
+   * Called with null when the station could not say, in which case the row
+   * says so in one line and nothing else on the sheet is touched. */
+  function sceneRow(line, got) {
+    var row = box && box.querySelector('.ld-scene');
+    if (!row) return;
+    row.replaceChildren();
+    /* Clicks in a select or the box must not read as a tap outside. */
+    row.addEventListener('click', function (e) { e.stopPropagation(); });
+
+    if (!got || !got.ok || !got.scenario) {
+      row.classList.add('unread');
+      row.appendChild(make('span', 'ld-scene-none', 'the scene could not be read'));
+      return;
+    }
+    var sc = got.scenario || {};
+    var inputs = (got.inputs || []).filter(function (i) { return i && i.key; });
+    var on = inputs.filter(function (i) { return !!i.on; });
+
+    var pick = make('select', 'ld-scene-pick');
+    pick.setAttribute('aria-label', 'the scenario this line was written to');
+    var first = make('option', '', String(sc.label || 'the scene')
+      + (sc.road ? ' · ' + String(sc.road) + ' road' : ''));
+    first.value = '';
+    pick.appendChild(first);
+    on.forEach(function (i) {
+      var opt = make('option', '', String(i.label || i.key) + ': '
+        + String(i.value || '').slice(0, 80));
+      opt.value = String(i.key);
+      pick.appendChild(opt);
+    });
+    pick.selectedIndex = 0;
+
+    var caret = make('button', 'ld-scene-caret');
+    caret.type = 'button';
+    caret.setAttribute('aria-expanded', 'false');
+    caret.setAttribute('aria-label', 'everything shaping this scene');
+    caret.title = 'everything shaping this scene';
+    if (typeof root.pineIcon === 'function') {
+      caret.innerHTML = root.pineIcon('c:caret--right');
+    } else {
+      caret.textContent = '>';
+    }
+
+    var sheet = make('div', 'ld-scene-box');
+    sheet.hidden = true;
+    var top = make('div', 'ld-scene-top');
+    top.appendChild(make('b', '', String(sc.label || 'the scene')));
+    var bits = [];
+    if (sc.kind) bits.push(String(sc.kind));
+    if (sc.road) bits.push(String(sc.road) + ' road');
+    if (sc.where) bits.push('set on ' + String(sc.where));
+    if (Number(sc.since) > 0) {
+      bits.push('in force since ' + ago(Date.now() / 1000 - Number(sc.since)));
+    }
+    if (bits.length) top.appendChild(make('i', '', bits.join('  ·  ')));
+    if (sc.brief) top.appendChild(make('p', 'ld-dim', String(sc.brief).slice(0, 600)));
+    sheet.appendChild(top);
+    if (!inputs.length) {
+      sheet.appendChild(make('p', 'ld-dim',
+        'the station listed nothing that is shaping this scene'));
+    }
+    inputs.forEach(function (i) { sheet.appendChild(sceneCard(i)); });
+    if (got.say) sheet.appendChild(make('p', 'ld-dim ld-scene-say', String(got.say)));
+
+    function show(want) {
+      sheet.hidden = !want;
+      caret.setAttribute('aria-expanded', want ? 'true' : 'false');
+      caret.classList.toggle('open', !!want);
+    }
+    caret.addEventListener('click', function (e) {
+      e.stopPropagation();
+      show(sheet.hidden);
+    });
+    pick.addEventListener('change', function () {
+      var key = pick.value;
+      pick.selectedIndex = 0;
+      if (!key) return;
+      show(true);
+      var card = null;
+      Array.prototype.some.call(sheet.querySelectorAll('.ld-scene-card'), function (c) {
+        if (c.getAttribute('data-key') === key) { card = c; return true; }
+        return false;
+      });
+      if (!card) return;
+      var fold = card.querySelector('details');
+      if (fold) fold.open = true;
+      card.classList.add('lit');
+      setTimeout(function () { card.classList.remove('lit'); }, 1600);
+      try { card.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+      catch (e) { card.scrollIntoView(); }
+    });
+
+    var bar = make('div', 'ld-scene-bar');
+    bar.appendChild(pick);
+    bar.appendChild(caret);
+    row.appendChild(bar);
+    row.appendChild(sheet);
+  }
+
+  /* One input, as a card: what it is, whether it is on, its value, the
+   * whole of it behind a fold, why it shapes the scene, and which desk
+   * it is managed on. */
+  function sceneCard(i) {
+    var card = make('div', 'ld-scene-card' + (i.on ? '' : ' off'));
+    card.setAttribute('data-key', String(i.key));
+    var head = make('div', 'ld-scene-cardhead');
+    head.appendChild(make('b', '', String(i.label || i.key)));
+    head.appendChild(make('i', 'ld-scene-state',
+      i.on ? 'shaping this scene' : 'off'));
+    card.appendChild(head);
+    if (i.value) {
+      card.appendChild(make('p', 'ld-scene-value', String(i.value)));
+    } else if (!i.on) {
+      card.appendChild(make('p', 'ld-scene-value ld-dim', 'nothing set'));
+    }
+    if (i.detail) {
+      var d = make('details', 'ld-fold');
+      d.appendChild(make('summary', '', 'the whole of it'));
+      d.appendChild(make('pre', 'ld-pre', String(i.detail)));
+      card.appendChild(d);
+    }
+    if (i.why) card.appendChild(make('p', 'ld-scene-why', String(i.why)));
+    if (i.desk) {
+      card.appendChild(make('span', 'ld-scene-desk',
+        'manage on the ' + String(i.desk) + ' desk'));
+    }
+    return card;
   }
 
   /* The path, as stations. Each one knows whether it was REACHED, which is

@@ -101,6 +101,38 @@
   var PLAN_REST_MS = 30000;           /* a running order is not news */
   var beat = 0;
 
+  /* #1115: THE LAST ERRORS THIS PAGE SAW.
+   *
+   * A report about "the highlighted line is wrong" is worth little
+   * without the throw that may have stranded the highlight - and by the
+   * time the operator taps, the console that printed it is long gone
+   * (on the tablet it was never visible at all: the WebView hides a
+   * cross-origin throw behind "Script error."). So the page keeps its
+   * own short ring, twelve entries, and ships it with every report. */
+  var caught = [];
+
+  function caughtNote(kind, what) {
+    var msg = '';
+    try {
+      if (what && what.message) msg = String(what.message);
+      else if (what && what.reason) {
+        msg = String((what.reason && what.reason.message) || what.reason);
+      } else msg = String(what);
+    } catch (err) { msg = '(unprintable)'; }
+    caught.push({at: Date.now(), kind: kind, msg: msg.slice(0, 200)});
+    if (caught.length > 12) caught.splice(0, caught.length - 12);
+  }
+  try {
+    if (typeof root.addEventListener === 'function') {
+      root.addEventListener('error', function (ev) {
+        caughtNote('error', (ev && ev.error && ev.error.message) ? ev.error : ev);
+      });
+      root.addEventListener('unhandledrejection', function (ev) {
+        caughtNote('rejection', (ev && ev.reason) || ev);
+      });
+    }
+  } catch (err) { /* an engine without listeners has no errors to keep */ }
+
   function api() { return root.pineDesktop || {get: function () { return Promise.reject(new Error('no bridge')); }}; }
   function el(id) { return document.getElementById(id); }
   function make(tag, cls, text) {
@@ -216,11 +248,41 @@
       if (ev.key === 'Enter') { ev.preventDefault(); findOpen(find.value); }
     });
 
+    /* #1115: THE SCRIPT ICON THAT FILES A REPORT.
+     *
+     * "place an icon here of a script that I can tap whenever the
+     *  script view is not displaying the active line being said
+     *  correctly. Whenever I tap the icon, place a report in the Pine
+     *  inbox, along with capturing advanced diagnostic information of
+     *  the script, the placement of the cursor, the activity happening
+     *  with the server, and why the script display isn't displaying
+     *  the active line being spoken ... capture yourself an image of a
+     *  screenshot of the display of the script or the display that I'm
+     *  looking at so you can see what I'm seeing."
+     *
+     * Everything the page knows about the highlight - the lit node and
+     * whether it is even in the pane, what activeRow() and the read
+     * playhead say, the scroll geometry, the errors it caught - goes to
+     * /api/script/report with a picture where the chrome can take one
+     * and a plain-text print of the visible script where it cannot.
+     * The station adds its own reading and files the inbox report. */
+    var report = make('button', 'sp-btn sp-report', '');
+    report.title = 'The highlighted line is wrong? Tap: a picture of this view and everything the page knows goes to the Pine inbox';
+    report.setAttribute('aria-label', 'Report the script view');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        report.innerHTML = root.pineIcon('c:script', 'Report the script view');
+      }
+    } catch (err) { /* the title still names it */ }
+    if (!report.innerHTML) report.textContent = 'report';
+    report.addEventListener('click', function () { reportFire(report); });
+
     bar.appendChild(back);
     bar.appendChild(pick);
     bar.appendChild(reel);                                   /* #1303 */
     bar.appendChild(loop);                                   /* #1385 */
     bar.appendChild(find);                                   /* #1385 */
+    bar.appendChild(report);                                 /* #1115 */
     bar.appendChild(again);
     return bar;
   }
@@ -534,23 +596,450 @@
       (d.by_round || []).slice(0, 4).forEach(function (r) { bits.push(r.name + ' \u00d7' + r.n); });
       (d.by_who || []).slice(0, 3).forEach(function (r) { bits.push(r.name + ' \u00d7' + r.n); });
       facts.textContent = bits.join('  \u00b7  ');
+      var dated = d.rows || [];
+      /* #1117: a repeated row is a tally, not a line, so it has no id
+         of its own. It borrows the first dated row that says the same
+         words - the station's paperwork is per line, and any one of
+         the airings is the same line. */
+      function idFor(text) {
+        var want = findNorm(text);
+        if (!want) return '';
+        var i, have;
+        for (i = 0; i < dated.length; i += 1) {
+          if (dated[i] && dated[i].id && findNorm(dated[i].text) === want) return String(dated[i].id);
+        }
+        /* The tally may quote a cut of the line; a prefix either way
+           is still the same line. */
+        for (i = 0; i < dated.length; i += 1) {
+          have = dated[i] && dated[i].id ? findNorm(dated[i].text) : '';
+          if (have && (have.indexOf(want) === 0 || want.indexOf(have) === 0)) return String(dated[i].id);
+        }
+        return '';
+      }
       (d.repeated || []).slice(0, 5).forEach(function (t) {
         if (t.n < 2) return;
         var row = make('div', 'sp-find-rep');
-        row.appendChild(make('b', null, '\u00d7' + t.n + ' '));
-        row.appendChild(make('span', null, (t.who ? t.who + ': ' : '') + t.text));
+        var line = make('div', 'sp-find-line');
+        line.appendChild(findTri(row, idFor(t.text)));               /* #1117 */
+        var main = make('span', 'sp-find-main');
+        main.appendChild(make('b', null, '\u00d7' + t.n + ' '));
+        main.appendChild(make('span', null, (t.who ? t.who + ': ' : '') + t.text));
+        line.appendChild(main);
+        row.appendChild(line);
         list.appendChild(row);
       });
-      (d.rows || []).forEach(function (r) {
+      dated.forEach(function (r) {
         var row = make('div', 'sp-find-row');
+        var line = make('div', 'sp-find-line');
+        line.appendChild(findTri(row, r.id ? String(r.id) : ''));    /* #1117 */
+        var main = make('div', 'sp-find-main');
         var ago = r.ago >= 3600 ? Math.round(r.ago / 3600) + 'h ago' : Math.round(r.ago / 60) + 'm ago';
-        row.appendChild(make('span', 'sp-find-when', ago + ' \u00b7 ' + (r.who || '?') + ' \u00b7 ' + (r.round || r.kind || '')));
-        row.appendChild(make('span', 'sp-find-text', r.text || ''));
+        main.appendChild(make('span', 'sp-find-when', ago + ' \u00b7 ' + (r.who || '?') + ' \u00b7 ' + (r.round || r.kind || '')));
+        main.appendChild(make('span', 'sp-find-text', r.text || ''));
+        line.appendChild(main);
+        row.appendChild(line);
         list.appendChild(row);
       });
       if (!(d.rows || []).length) list.appendChild(make('div', 'sp-find-row', 'not said on the air in the last two days'));
     }, function (err) {
       why.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 80);
+    });
+  }
+
+  /* ---- #1117: the triangle at the front of every row ------------- */
+
+  /* "I want an expandable triangle at the beginning of all of these
+   *  that allows me to see what property set this and allow me to
+   *  change or manage those or adjust them in the system prompt or see
+   *  what systems contributed to making them the way that they are,
+   *  whatever I search for them."
+   *
+   * The station answers GET /api/said/why/{id} with three lists: what
+   * SET the line (only the properties in force), the per-road system
+   * prompt (saved back through POST /api/said/prompt, in force from
+   * the next round), and what contributed, on or off. This draws them
+   * under the row and nothing more. The answer is cached on the row
+   * node, so a second tap costs the station nothing. */
+  function findNorm(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  }
+
+  function findTri(row, id) {
+    var tri = make('button', 'sp-find-tri', '');
+    tri.type = 'button';
+    tri.setAttribute('aria-expanded', 'false');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        tri.innerHTML = root.pineIcon('c:caret--right', 'What set this line');
+      }
+    } catch (err) { /* the text below stands in */ }
+    if (!tri.innerHTML) tri.textContent = '>';
+    if (!id) {
+      tri.disabled = true;
+      tri.title = 'no line id to ask about';
+      return tri;
+    }
+    tri.title = 'What set this line, the system prompt for its road, and what contributed';
+    tri.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var open = tri.getAttribute('aria-expanded') === 'true';
+      tri.setAttribute('aria-expanded', open ? 'false' : 'true');
+      row.classList.toggle('open', !open);
+      var panel = row.querySelector('.sp-find-why-panel');
+      if (open) { if (panel) panel.hidden = true; return; }
+      if (!panel) {
+        panel = make('div', 'sp-find-why-panel', 'asking the station…');
+        row.appendChild(panel);
+      }
+      panel.hidden = false;
+      if (row.pineWhy || row.pineWhyAsking) return;   /* held, or in flight */
+      if (!api() || !api().get) { panel.textContent = 'no bridge to ask through'; return; }
+      row.pineWhyAsking = true;
+      Promise.resolve(api().get('/api/said/why/' + encodeURIComponent(id))).then(function (d) {
+        row.pineWhyAsking = false;
+        if (!d || d.ok === false) {
+          panel.textContent = 'the station did not answer'
+            + (d && d.say ? ': ' + String(d.say).slice(0, 120) : '');
+          return;
+        }
+        row.pineWhy = d;
+        findWhyPaint(panel, d);
+      }, function (err) {
+        row.pineWhyAsking = false;
+        panel.textContent = 'the station did not answer: '
+          + String((err && err.message) || err).slice(0, 80);
+      });
+    });
+    return tri;
+  }
+
+  function findWhyPaint(panel, d) {
+    panel.replaceChildren();
+    var i;
+
+    /* (1) what set this - the properties in force, name -> value, and
+       the desk each one lives on in a dim aside. */
+    panel.appendChild(make('div', 'sp-why-h', 'what set this'));
+    var props = d.properties || [];
+    if (!props.length) {
+      panel.appendChild(make('div', 'sp-why-dim', 'nothing on record set this line'));
+    } else {
+      var dl = make('dl', 'sp-why-dl');
+      for (i = 0; i < props.length; i += 1) {
+        var p = props[i] || {};
+        dl.appendChild(make('dt', null, String(p.name || '')));
+        var dd = make('dd', null, (p.value === undefined || p.value === null) ? '' : String(p.value));
+        if (p.where) {
+          dd.appendChild(document.createTextNode(' '));
+          dd.appendChild(make('i', null, String(p.where)));
+        }
+        dl.appendChild(dd);
+      }
+      panel.appendChild(dl);
+    }
+
+    /* (2) the system prompt for this road - folded, because it is the
+       long one; editable where the station says so. */
+    var prompt = d.prompt || {};
+    var det = make('details', 'sp-why-prompt');
+    det.appendChild(make('summary', null, 'the system prompt for this road'
+      + (prompt.kind ? ' (' + String(prompt.kind) + ')' : '')));
+    var ta = make('textarea', 'sp-why-ta', '');
+    ta.rows = 6;
+    ta.spellcheck = false;
+    ta.value = String(prompt.text || '');
+    ta.readOnly = !prompt.editable;
+    det.appendChild(ta);
+    if (prompt.editable) {
+      var saveRow = make('div', 'sp-why-save');
+      var save = make('button', 'sp-btn sp-why-savebtn', 'Save to the prompt book');
+      save.type = 'button';
+      var said = make('span', 'sp-why-dim', '');
+      save.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        if (!api() || !api().post) { said.textContent = 'no bridge to save through'; return; }
+        save.disabled = true;
+        said.textContent = 'saving…';
+        Promise.resolve(api().post('/api/said/prompt', {kind: prompt.kind, text: ta.value})).then(function (got) {
+          save.disabled = false;
+          if (got && got.ok === false) {
+            said.textContent = 'not saved' + (got.say ? ': ' + String(got.say).slice(0, 120) : '');
+            return;
+          }
+          said.textContent = String((got && got.say)
+            || 'saved - it takes effect on the next round');
+        }, function (err) {
+          save.disabled = false;
+          said.textContent = 'not saved: ' + String((err && err.message) || err).slice(0, 80);
+        });
+      });
+      saveRow.appendChild(save);
+      saveRow.appendChild(said);
+      det.appendChild(saveRow);
+    } else {
+      det.appendChild(make('div', 'sp-why-dim',
+        String(prompt.why || prompt.say || 'this prompt cannot be changed from here')
+        + (prompt.where ? ' - it lives in ' + String(prompt.where) : '')));
+    }
+    panel.appendChild(det);
+
+    /* (3) what contributed - each system on or off, with its note;
+       the ones that stood aside are dimmed, not hidden, because "the
+       crystal was off" is itself part of the answer. */
+    panel.appendChild(make('div', 'sp-why-h', 'what contributed'));
+    var systems = d.systems || [];
+    if (!systems.length) {
+      panel.appendChild(make('div', 'sp-why-dim', 'no system is on record for this line'));
+    } else {
+      var ul = make('ul', 'sp-why-sys');
+      for (i = 0; i < systems.length; i += 1) {
+        var s = systems[i] || {};
+        var li = make('li', s.on ? 'on' : 'off');
+        li.appendChild(make('b', null, String(s.name || '')));
+        li.appendChild(make('span', 'sp-why-onoff', s.on ? 'on' : 'off'));
+        if (s.note) li.appendChild(make('span', 'sp-why-note', String(s.note)));
+        ul.appendChild(li);
+      }
+      panel.appendChild(ul);
+    }
+
+    /* (4) the honesty line: without the booth's ring the properties
+       above are the air log's word alone. */
+    if (d.provenance_ok === false) {
+      panel.appendChild(make('div', 'sp-why-dim sp-why-noprov',
+        'the booth no longer holds this line’s paperwork - only the air log speaks for it'));
+    }
+    if (d.say) panel.appendChild(make('div', 'sp-why-say', String(d.say)));
+  }
+
+  /* ---- #1115: the report of a wrong highlight -------------------- */
+
+  /* Everything is gathered BEFORE the picture is asked for, so the
+   * numbers describe the moment of the tap and not the moment the
+   * chrome got round to it. Every reading is guarded: a report about
+   * a fault must not be the thing the fault breaks. */
+  var reportTurn = 0;
+
+  function jsonSafe(v) {
+    try { return JSON.parse(JSON.stringify(v === undefined ? null : v)); }
+    catch (err) { try { return String(v); } catch (e2) { return null; } }
+  }
+
+  function attempt(fn) {
+    try { return jsonSafe(fn()); }
+    catch (err) { return {error: String((err && err.message) || err).slice(0, 200)}; }
+  }
+
+  function reportNode(n, paneRect, chars) {
+    var r = n.getBoundingClientRect();
+    return {
+      el: n.getAttribute('data-el') || '',
+      line: n.getAttribute('data-line') || '',
+      seg: n.getAttribute('data-seg') || '',
+      cls: String(n.className || ''),
+      text: String(n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, chars),
+      top: Math.round(r.top - paneRect.top),
+      bottom: Math.round(r.bottom - paneRect.top),
+      inView: r.height > 0 && r.bottom > paneRect.top && r.top < paneRect.bottom
+    };
+  }
+
+  function reportGather() {
+    var pane = el('spScript');
+    var paneRect = pane ? pane.getBoundingClientRect()
+      : {top: 0, bottom: 0, left: 0, right: 0, height: 0};
+    var all = pane ? pane.querySelectorAll('.sp-el') : [];
+    var litList = document.querySelectorAll('.sp-el.sp-now');
+    var lit = [];
+    var litIndex = -1;
+    var i;
+    for (i = 0; i < litList.length; i += 1) lit.push(reportNode(litList[i], paneRect, 160));
+    if (litList.length) {
+      for (i = 0; i < all.length; i += 1) { if (all[i] === litList[0]) { litIndex = i; break; } }
+    }
+    var around = [];
+    if (litIndex >= 0) {
+      for (i = Math.max(0, litIndex - 3); i <= Math.min(all.length - 1, litIndex + 3); i += 1) {
+        if (i === litIndex) continue;
+        var near = reportNode(all[i], paneRect, 80);
+        near.offset = i - litIndex;
+        around.push(near);
+      }
+    }
+    var litLine = lit.length ? lit[0].line : '';
+    var stream = liveStream ? jsonSafe(liveStream) : null;
+    if (stream && stream.rows && stream.rows.length) {
+      stream.rowCount = stream.rows.length;
+      stream.rows = stream.rows.slice(0, 40);        /* the head is enough */
+    }
+    return {
+      request: 1115,
+      at: Date.now(),
+      hourKey: hourKey,
+      beforeKey: beforeKey,
+      fetchedAgeMs: fetchedAt ? Date.now() - fetchedAt : null,
+      fetching: !!fetching,
+      chasedAgoMs: chasedAt ? Date.now() - chasedAt : null,
+      nowLineId: nowLineId,
+      nowLineOnPage: nowLineId
+        ? !!document.querySelector('.sp-el[data-line="' + nowLineId + '"]') : null,
+      lit: lit,
+      litCount: litList.length,
+      litIndex: litIndex,
+      litLineOnPage: litLine
+        ? !!document.querySelector('.sp-el[data-line="' + litLine + '"]') : null,
+      around: around,
+      activeRow: attempt(activeRow),
+      bridgeHead: attempt(bridgeHead),
+      headIsRead: attempt(headIsRead),
+      follow: !!follow,
+      stick: !!stick,
+      adrift: adrift,
+      selfScrollMsLeft: selfScrollUntil ? selfScrollUntil - Date.now() : 0,
+      liveSeg: liveSeg,
+      stationPaused: !!stationPaused,
+      skewMs: skewMs,
+      lastOffMs: lastOffMs,
+      liveStream: stream,
+      speakingNow: jsonSafe(speakingNow),
+      flow: jsonSafe(flow),
+      pane: pane ? {
+        scrollTop: pane.scrollTop,
+        scrollHeight: pane.scrollHeight,
+        clientHeight: pane.clientHeight,
+        top: Math.round(paneRect.top),
+        bottom: Math.round(paneRect.bottom),
+        atEnd: pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 40
+      } : null,
+      counts: {
+        el: all.length,
+        withLine: pane ? pane.querySelectorAll('.sp-el[data-line]').length : 0,
+        elements: elements.length,
+        keyed: scriptNodes.size
+      },
+      page: {
+        userAgent: String(navigator.userAgent || ''),
+        href: String(location.href || ''),
+        innerWidth: root.innerWidth || 0,
+        innerHeight: root.innerHeight || 0,
+        visibility: String(document.visibilityState || ''),
+        mounted: !!mounted
+      },
+      caught: caught.slice()
+    };
+  }
+
+  /* The visible slice of the script as plain text - the picture that
+     cannot fail. One line per element in the pane's viewport, the lit
+     one marked, bounded so a folded-open hour cannot flood the file. */
+  function reportText() {
+    var pane = el('spScript');
+    if (!pane) return '(no script pane on this surface)';
+    var box = pane.getBoundingClientRect();
+    var all = pane.querySelectorAll('.sp-el');
+    var out = [];
+    for (var i = 0; i < all.length; i += 1) {
+      var r = all[i].getBoundingClientRect();
+      if (r.height <= 0 || r.bottom <= box.top || r.top >= box.bottom) continue;
+      var t = String(all[i].textContent || '').replace(/\s+/g, ' ').trim();
+      var id = all[i].getAttribute('data-line') || '';
+      out.push((all[i].classList.contains('sp-now') ? '>>> ' : '    ')
+        + (id ? '[' + id + '] ' : '') + t);
+      if (out.length >= 120) { out.push('    ... (cut at 120 lines)'); break; }
+    }
+    if (!out.length) out.push('(no script element is in the pane’s viewport)');
+    return out.join('\n');
+  }
+
+  /* The picture. On the desktop the chrome can take one
+     (pineDesktop.shotView); on the tablet the kiosk may offer
+     screenshot(); either may be missing, slow or broken, and none of
+     that may hold the report - five seconds and it goes without. */
+  function reportImage() {
+    var bridge = api();
+    var ask = null;
+    try {
+      if (bridge && typeof bridge.shotView === 'function') ask = bridge.shotView();
+      else if (bridge && typeof bridge.screenshot === 'function') ask = bridge.screenshot();
+    } catch (err) { ask = null; }
+    if (!ask) return Promise.resolve(null);
+    return new Promise(function (resolve) {
+      var settled = false;
+      var late = setTimeout(function () {
+        if (!settled) { settled = true; resolve(null); }
+      }, 5000);
+      Promise.resolve(ask).then(function (got) {
+        if (settled) return;
+        settled = true; clearTimeout(late);
+        var url = (got && typeof got === 'object')
+          ? (got.dataUrl || got.data_url || got.image || got.png || '') : got;
+        if (typeof url !== 'string' || !url) { resolve(null); return; }
+        if (/^data:image\//.test(url)) { resolve(url); return; }
+        /* a bare base64 body is a picture too */
+        if (/^[A-Za-z0-9+\/=\s]+$/.test(url) && url.length > 64) {
+          resolve('data:image/png;base64,' + url.replace(/\s+/g, ''));
+          return;
+        }
+        resolve(null);
+      }, function () {
+        if (!settled) { settled = true; clearTimeout(late); resolve(null); }
+      });
+    });
+  }
+
+  /* THE PHOTOGRAPHY EFFECT. A white flash over the whole view, the
+     word "captured" on the strip. It fires AFTER the picture has been
+     asked for - a real shutter is heard after the exposure, and a
+     flash painted before the chrome grabbed the frame would put a
+     white sheet in the report - with a 400 ms cap so a slow capture
+     never leaves the tap feeling dead. */
+  function reportShutter() {
+    var into = host || document.body;
+    var flash = make('div', 'sp-shutter');
+    into.appendChild(flash);
+    setTimeout(function () { try { flash.remove(); } catch (err) { /* gone */ } }, 520);
+  }
+
+  function reportFire(btn) {
+    var mine = (reportTurn += 1);
+    if (!api() || !api().post) { say('no bridge to file the report through'); return; }
+    btn.classList.add('sp-firing');
+    function done(text, bad) {
+      if (mine !== reportTurn) return;  /* a newer tap owns the strip */
+      btn.classList.remove('sp-firing');
+      btn.classList.toggle('sp-fired-bad', !!bad);
+      say(text);
+      setTimeout(function () { btn.classList.remove('sp-fired-bad'); }, 2600);
+    }
+    var view, text;
+    try { view = reportGather(); }
+    catch (err) {
+      view = {request: 1115, at: Date.now(),
+        gatherError: String((err && err.message) || err).slice(0, 200),
+        nowLineId: nowLineId, caught: caught.slice()};
+    }
+    try { text = reportText(); }
+    catch (err) { text = '(the visible script could not be read: ' + String((err && err.message) || err) + ')'; }
+    var flashed = false;
+    function flash() {
+      if (flashed) return;
+      flashed = true;
+      reportShutter();
+      say('captured');
+    }
+    var shot = reportImage();
+    setTimeout(flash, 400);
+    shot.then(flash, flash);
+    shot.then(function (image) {
+      return api().post('/api/script/report', {view: view, image: image || null, text: text});
+    }).then(function (got) {
+      if (got && got.ok === false) {
+        done(String(got.say || 'the station refused the report').slice(0, 100), true);
+        return;
+      }
+      done(String((got && got.say) || (got && got.id ? 'filed as #' + got.id : 'filed')).slice(0, 100));
+    }, function (err) {
+      done('not filed: ' + String((err && err.message) || err).slice(0, 80), true);
     });
   }
 

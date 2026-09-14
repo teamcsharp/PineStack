@@ -140,6 +140,90 @@
   overflow-wrap: anywhere;
 }
 
+/* THE SCENE ROW (#1113). "Offer a dropdown that shows what the scenario
+   was ... and next to it put a drop down arrow that I can hit and it
+   basically opens a box showing all the scenarios that are currently being
+   used to basically create this scene." The select is the glance and the
+   box under the caret is the record: every input the agent has, the off
+   ones dimmed so the operator sees the option is there and not in play. */
+.ld-scene {
+  flex: 0 0 auto;
+  padding: 7px 13px;
+  border-bottom: 1px solid var(--line, #35414c);
+  background: rgba(101, 199, 218, .04);
+  font-size: 12px;
+}
+.ld-scene-bar { display: flex; gap: 8px; align-items: center; }
+.ld-scene-pick {
+  flex: 1 1 auto; min-width: 0;
+  height: 30px; padding: 0 8px;
+  border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: var(--panel-2, #222b35); color: var(--cyan, #65c7da);
+  font: inherit; font-size: 12px; font-weight: 600;
+  text-overflow: ellipsis; cursor: pointer;
+}
+.ld-scene-pick:disabled {
+  color: var(--muted, #8fa0ad); font-weight: 500; cursor: default;
+}
+.ld-scene-pick option {
+  color: var(--text, #edf3f5); font-weight: 500;
+  background: var(--panel-2, #222b35);
+}
+.ld-scene-caret {
+  flex: 0 0 auto; width: 30px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: var(--panel-2, #222b35); color: var(--cyan, #65c7da);
+  cursor: pointer;
+}
+.ld-scene-caret svg {
+  width: 16px; height: 16px; fill: currentColor;
+  transition: transform .18s ease;
+}
+.ld-scene-caret.open svg { transform: rotate(90deg); }
+.ld-scene-none { color: var(--muted, #8fa0ad); }
+
+/* The box. Shut by default; when open it scrolls inside itself so the
+   said line and the flow below are never pushed off the sheet. */
+.ld-scene-box {
+  margin-top: 7px; max-height: 40vh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.ld-scene-box[hidden] { display: none; }
+.ld-scene-top { padding: 4px 2px 2px; }
+.ld-scene-top b { display: block; font-size: 12.5px; color: var(--cyan, #65c7da); }
+.ld-scene-top i {
+  font-style: normal; font-size: 10.5px; color: var(--muted, #8fa0ad);
+}
+.ld-scene-top p { margin: 4px 0 0; }
+.ld-scene-card {
+  padding: 7px 10px;
+  border: 1px solid var(--line, #35414c); border-radius: 8px;
+  background: var(--bg, #101419);
+  transition: border-color .3s ease, opacity .3s ease;
+}
+.ld-scene-card.off { opacity: .55; }
+.ld-scene-card.lit { border-color: var(--cyan, #65c7da); }
+.ld-scene-cardhead {
+  display: flex; justify-content: space-between; gap: 10px;
+  align-items: baseline;
+}
+.ld-scene-cardhead b { font-size: 12px; }
+.ld-scene-state {
+  flex: 0 0 auto; font-style: normal; font-size: 10px;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted, #8fa0ad);
+}
+.ld-scene-card:not(.off) .ld-scene-state { color: var(--green, #54d18b); }
+.ld-scene-value { margin: 3px 0 0; overflow-wrap: anywhere; }
+.ld-scene-card .ld-fold { margin: 4px 0 0; }
+.ld-scene-why { margin: 4px 0 0; font-size: 11px; color: var(--muted, #8fa0ad); }
+.ld-scene-desk {
+  display: block; margin-top: 3px; font-size: 10.5px;
+  color: var(--cyan, #65c7da); opacity: .8;
+}
+.ld-scene-say { margin: 2px 2px 0; font-size: 11px; }
+
 /* The path. A fixed slice, so the record below is never pushed off. */
 .ld-flow {
   flex: 0 0 auto;

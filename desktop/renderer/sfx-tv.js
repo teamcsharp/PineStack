@@ -62,8 +62,92 @@
   var marks = Object.create(null);
   var mounted = false;
   var warm = null;                 // #1411: the next clip, already fetching
+  /* #1112: THE SHEET HOLDS THE SET.
+   *
+   * "When this menu is up, keep the video pop-up window on screen so I
+   *  can finish using the dialogue pop-up. I want to be able to use this
+   *  to basically permanently delete videos from the repository or
+   *  choose to have videos not play anymore or even inspect the location
+   *  and find out where videos are located."
+   *
+   * A clip is a few seconds long and the sheet is opened by a half-second
+   * hold, so the operator was routinely still reading the sheet when
+   * `ended` fired, the CRT collapsed and teardown() took the host - and
+   * the sheet with it, mid-decision. So while the sheet is up, a finish
+   * is OWED rather than run: the picture sits on its last frame and the
+   * finish happens when the sheet goes, by whichever road it goes.
+   *
+   * `sheetWrap` is the open sheet (null when none), `curtain` is the
+   * finish of the set on screen, `owed` says the clip ended under a
+   * sheet. All three are module-level because the sheet lives outside
+   * play()'s closure, and every road that closes the sheet goes through
+   * sheetClose() so the owed finish cannot be missed. */
+  var sheetWrap = null;
+  var curtain = null;
+  var owed = false;
+  /* #1121-#1124: THE COUNTERS LIVE HERE, NOT IN play()'s CLOSURE.
+   *
+   * "Allow me to double tap a video that's playing on tablet to replay
+   *  the video. And if I continue double tapping it, I want to play it
+   *  X amount of times." (#1121)
+   * "offer a slider for playing the next sequential clips ... if I
+   *  expand it to say seven, it plays that clip and the next seven
+   *  clips in a row sequentially." (#1124)
+   *
+   * Next, Prev and the run all go through cut(), and cut() runs
+   * teardownNow() - every reference play() holds is gone with the set.
+   * A counter kept in the closure would be zero again on the very
+   * clip it was meant to govern. So the replays owed and the clips
+   * left in the run are module state; play() reads them on `ended`
+   * and the only things that clear them are the operator's own Stop,
+   * the slider at 0, a folder with nothing more, and stop().
+   *
+   * `rewind` is this set's own "back to the start and play", installed
+   * by play() the way `curtain` is, because the double tap lands on a
+   * closure it cannot otherwise reach. `full` is #1122's toggle, with
+   * `fullBox` the windowed geometry it goes back to; `badge` and
+   * `askWrap` are the two small things drawn over the picture. */
+  var replays = 0;                 // #1121: plays still owed after this one
+  var lastDouble = 0;              // #1121: when the last double tap landed
+  var rewind = null;               // #1121: play()'s own replay, or null
+  var runLeft = 0;                 // #1124: clips still to play after this one
+  var runFrom = '';                // #1124: the clip the run was set from
+  var full = false;                // #1122: the set fills the window
+  var fullBox = null;              // #1122: the box to go back to
+  var badge = null;                // the "x3" / "7 to go" over the picture
+  var askWrap = null;              // #1121's hold bubble, while it is up
+  var FULL_KEY = 'pineSfxTvFull';  // #1122: '1' when the next set opens full
+  var DOUBLE_MS = 350;             // two taps closer than this are one gesture
+  var DOUBLE_RUN_MS = 2500;        // a double tap within this ADDS a replay
+  var HOLD_MS = 500;
+  var TAP_MS = 300;
+  var SLOP_PX = 8;
 
   function api() { return root.pineDesktop; }
+
+  /* #1112: is the hold sheet up on the set that is on screen? Checked
+   * by parentage rather than a DOM query so a set that was swept by
+   * build() or teardownNow() no longer counts as held. */
+  function sheetHeld() {
+    return !!(sheetWrap && host && sheetWrap.parentNode === host);
+  }
+
+  /* #1112: THE ONE DOOR OUT OF THE SHEET. Close, the second hold, Stop,
+   * a delete or a ban that is done - every one of them comes through
+   * here, because a road that removed the sheet by hand would leave an
+   * owed finish owed for ever: a set on its last frame that nothing
+   * ever takes down. */
+  function sheetClose() {
+    var wrap = sheetWrap;
+    sheetWrap = null;
+    try { if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap); }
+    catch (err) { /* already gone */ }
+    var due = owed;
+    owed = false;
+    if (due && curtain) {
+      try { curtain(); } catch (err) { /* the set is already going */ }
+    }
+  }
 
   function now() { return Date.now(); }
 
@@ -93,6 +177,11 @@
 
   function writeBox() {
     if (!host) return;
+    /* #1122: NEVER THE FULL-SCREEN GEOMETRY. The set fills the window
+       while `full` is on, and a finish or a drop writing 0,0 x the whole
+       screen would make that the windowed size for ever after - the
+       toggle off would have nowhere to go back to. */
+    if (full) return;
     var box = {left: host.offsetLeft, top: host.offsetTop,
                width: host.offsetWidth, height: host.offsetHeight};
     if (box.width < MIN.w || box.height < MIN.h) return;
@@ -106,6 +195,7 @@
     handle.addEventListener('pointerdown', function (event) {
       if (event.button !== 0) return;
       if (event.target.closest('button')) return;
+      if (full) return;              /* #1122: a full screen has nowhere to go */
       var from = {x: event.clientX, y: event.clientY,
                   left: node.offsetLeft, top: node.offsetTop};
       try { handle.setPointerCapture(event.pointerId); } catch (err) {}
@@ -136,6 +226,7 @@
     handle.title = 'Drag to resize';
     handle.addEventListener('pointerdown', function (event) {
       if (event.button !== 0) return;
+      if (full) return;              /* #1122 */
       var from = {x: event.clientX, y: event.clientY,
                   w: node.offsetWidth, h: node.offsetHeight};
       try { handle.setPointerCapture(event.pointerId); } catch (err) {}
@@ -162,6 +253,147 @@
     node.appendChild(handle);
   }
 
+  /* #1122: FULL SCREEN, AND BACK.
+   *
+   * "the video menu on tablet also offer an option to full screen the
+   *  video pop-up window. So that way I could just view the video
+   *  window full screen whenever it pops up. Allow me to toggle it off
+   *  and on."
+   *
+   * Nothing here asks the browser for its fullscreen API - the kiosk
+   * WebView would refuse it without a user gesture it can see, and the
+   * shell has chrome of its own the set must stay under. The host is
+   * simply told to fill the window, inline, over the stylesheet. The
+   * windowed box is remembered FIRST so the toggle off lands where the
+   * set was; and the choice is written to localStorage so the next set
+   * comes on the same way - "whenever it pops up" - until it is turned
+   * off again. `writeBox()` refuses to record the filled geometry. */
+  function setFull(on) {
+    on = !!on;
+    try { root.localStorage.setItem(FULL_KEY, on ? '1' : '0'); }
+    catch (err) { /* the toggle still works for this set */ }
+    if (!host) { full = on; return; }
+    if (on && !full) {
+      fullBox = {left: host.offsetLeft, top: host.offsetTop,
+                 width: host.offsetWidth, height: host.offsetHeight};
+    }
+    full = on;
+    if (on) {
+      host.classList.add('sfx-tv-full');
+      host.style.left = '0px';
+      host.style.top = '0px';
+      host.style.width = '100vw';
+      host.style.height = '100vh';
+      host.style.borderRadius = '0';
+      return;
+    }
+    host.classList.remove('sfx-tv-full');
+    host.style.borderRadius = '';
+    var box = fullBox || readBox();
+    host.style.left = Math.round(box.left) + 'px';
+    host.style.top = Math.round(box.top) + 'px';
+    host.style.width = Math.round(box.width) + 'px';
+    host.style.height = Math.round(box.height) + 'px';
+    writeBox();
+  }
+
+  function fullWanted() {
+    try { return String(root.localStorage.getItem(FULL_KEY) || '') === '1'; }
+    catch (err) { return false; }
+  }
+
+  /* #1121/#1124: THE BADGE, top left of the picture (the pad icon has
+   * the top right). "x3" while replays are owed, "7 to go" while a run
+   * is on, both when both; and a line of its own for a moment when the
+   * run stops - "nothing more in that folder". Hidden when there is
+   * nothing to say. Styled inline: sfx-tv.css is not this change's to
+   * edit. */
+  var badgeTimer = 0;
+  function paintBadge(text, forMs) {
+    if (!badge) return;
+    if (badgeTimer) { clearTimeout(badgeTimer); badgeTimer = 0; }
+    var bits = [];
+    if (text) {
+      bits.push(String(text));
+      badgeTimer = setTimeout(function () {
+        badgeTimer = 0; paintBadge();
+      }, forMs || 3000);
+    } else {
+      if (replays > 0) bits.push('×' + replays);
+      if (runLeft > 0) bits.push(runLeft + ' to go');
+    }
+    badge.textContent = bits.join('  ');
+    badge.hidden = !bits.length;
+    badge.style.display = bits.length ? 'inline-block' : 'none';
+  }
+
+  /* #1121: THE HOLD BUBBLE. "If I tap and hold on the video, then show
+   * a pop-up asking me if I would like to assign it to the sampler."
+   * A small question over the picture, two answers, and it goes away
+   * by itself after six seconds so a hold that was a fumble leaves
+   * nothing behind. The hold used to open the sheet (#1306b); that is
+   * the tap's job now. */
+  function ask(screen) {
+    if (!screen || !playing) return;
+    askDrop();
+    var wrap = document.createElement('div');
+    wrap.className = 'sfx-tv-ask';
+    var s = wrap.style;
+    s.position = 'absolute'; s.left = '50%'; s.top = '50%';
+    s.transform = 'translate(-50%, -50%)';
+    s.zIndex = '5'; s.maxWidth = '88%'; s.boxSizing = 'border-box';
+    s.padding = '10px 12px'; s.borderRadius = '8px';
+    s.border = '1px solid #65c7da'; s.background = '#0b1116';
+    s.color = '#dfe7ee'; s.font = 'inherit'; s.fontSize = '12px';
+    s.textAlign = 'center';
+    var q = document.createElement('div');
+    q.textContent = 'Put this clip on a sampler pad?';
+    q.style.marginBottom = '8px';
+    var row = document.createElement('div');
+    row.style.display = 'flex'; row.style.gap = '8px';
+    row.style.justifyContent = 'center';
+    var say = function (text) {
+      q.textContent = String(text || '');
+      setTimeout(function () { if (askWrap === wrap) askDrop(); }, 2400);
+    };
+    var answer = function (label, go) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      var bs = b.style;
+      bs.minHeight = '32px'; bs.minWidth = '32px'; bs.padding = '6px 12px';
+      bs.font = 'inherit'; bs.fontSize = '12px'; bs.borderRadius = '6px';
+      bs.border = '1px solid #65c7da'; bs.background = '#0b1116';
+      bs.color = '#dfe7ee'; bs.cursor = 'pointer';
+      b.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        go();
+      });
+      row.appendChild(b);
+      return b;
+    };
+    var yes = answer('Yes, to a pad', function () {
+      row.style.display = 'none';
+      toPad(playing, say);
+    });
+    yes.style.background = '#65c7da'; yes.style.color = '#0b1116';
+    answer('No', function () { askDrop(); });
+    wrap.appendChild(q);
+    wrap.appendChild(row);
+    /* A press on the bubble is not a press on the picture. */
+    wrap.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
+    screen.appendChild(wrap);
+    askWrap = wrap;
+    setTimeout(function () { if (askWrap === wrap) askDrop(); }, 6000);
+  }
+
+  function askDrop() {
+    var wrap = askWrap;
+    askWrap = null;
+    try { if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap); }
+    catch (err) { /* already gone */ }
+  }
+
   function build(name, ready) {      /* #1411: `ready` is a warmed <video> */
     /* #1312: one set at a time, always. A stray from an earlier cut
        would otherwise sit here holding a connection for ever. */
@@ -174,6 +406,9 @@
         if (old[i].parentNode) old[i].parentNode.removeChild(old[i]);
       }
     } catch (err) { /* nothing to sweep */ }
+    /* #1112: a sheet on a swept set is gone with it, and so is any
+       finish it was holding. play() installs the new curtain. */
+    sheetWrap = null; curtain = null; owed = false;
     var box = readBox();
     host = document.createElement('div');
     /* #1308b: `waiting` until the first frame - see play(). */
@@ -183,6 +418,21 @@
     host.style.top = Math.round(box.top) + 'px';
     host.style.width = Math.round(box.width) + 'px';
     host.style.height = Math.round(box.height) + 'px';
+    /* #1122: "whenever it pops up" - the toggle the operator left on
+       is the way the next set comes on too. The windowed box just laid
+       out is what Windowed goes back to. */
+    full = false;
+    fullBox = null;
+    if (fullWanted()) {
+      fullBox = {left: box.left, top: box.top, width: box.width, height: box.height};
+      full = true;
+      host.classList.add('sfx-tv-full');
+      host.style.left = '0px';
+      host.style.top = '0px';
+      host.style.width = '100vw';
+      host.style.height = '100vh';
+      host.style.borderRadius = '0';
+    }
     /* #1306e/#1322: HIGH ENOUGH TO BE SEEN, ON EVERY SURFACE.
      *
      * The stylesheet puts the set at 900. On the kiosk that buried it
@@ -275,34 +525,113 @@
     });
     screen.appendChild(pad);
 
-    /* #1306b: A HOLD ON THE PICTURE opens the sheet. Told apart from a
-     * drag the same way the script strip does it - time AND movement -
-     * because this window is draggable by its head and the screen is
-     * the one part of it that is not. */
-    var held = null, heldTimer = 0;
-    screen.addEventListener('pointerdown', function (ev) {
-      if (ev.target.closest('button')) return;
-      held = {x: ev.clientX, y: ev.clientY};
-      if (heldTimer) clearTimeout(heldTimer);
-      heldTimer = setTimeout(function () {
-        heldTimer = 0;
-        if (playing) sheet(playing);
-      }, 500);
+    /* #1121/#1124: the badge, top left, opposite the pad icon. */
+    badge = document.createElement('i');
+    badge.className = 'sfx-tv-badge';
+    var bs = badge.style;
+    bs.position = 'absolute'; bs.left = '8px'; bs.top = '8px'; bs.zIndex = '4';
+    bs.display = 'none'; bs.padding = '3px 8px'; bs.borderRadius = '6px';
+    bs.border = '1px solid #65c7da'; bs.background = '#0b1116';
+    bs.color = '#dfe7ee'; bs.font = 'inherit'; bs.fontSize = '12px';
+    bs.fontStyle = 'normal'; bs.lineHeight = '18px'; bs.pointerEvents = 'none';
+    badge.hidden = true;
+    screen.appendChild(badge);
+
+    /* #1121-#1124: THREE GESTURES ON THE PICTURE, TOLD APART.
+     *
+     *   a TAP        - down and up inside 300 ms, under 8 px of travel -
+     *                  opens the sheet, or closes the one that is up.
+     *                  "Whenever I tap on the pop-up and it shows the
+     *                  menu" (#1124).
+     *   a DOUBLE TAP - two taps inside 350 ms - replays the clip from
+     *                  its start; each further double tap within a
+     *                  couple of seconds adds one more replay (#1121).
+     *   a HOLD       - 500 ms down without moving - asks whether the
+     *                  clip should go on a sampler pad (#1121). This
+     *                  used to open the sheet (#1306b).
+     *
+     * A single tap's action is DELAYED by the double-tap window and
+     * cancelled by a second tap, so a replay never also opens the
+     * sheet. The drag is untouched: drag() moves the set on any travel
+     * and the press below forgets itself past 8 px, so a real drag is
+     * never read as a tap or a hold.
+     *
+     * WHY THE LISTENERS ARE ON THE HOST AND NOT THE SCREEN. drag()
+     * takes pointer capture on the host at pointerdown, and from then
+     * the pointer's move, up and cancel are delivered to the host,
+     * never to the screen under it. The old hold code listened on the
+     * screen and so never heard the release; it only ever worked
+     * because a hold does not need one. A tap does. So the host hears
+     * everything and asks whether the press began on the picture. */
+    var press = null, pressTimer = 0, tapTimer = 0, lastTap = 0;
+    var onScreen = function (ev) {
+      var t = ev && ev.target;
+      if (!t || typeof t.closest !== 'function') return false;
+      if (t.closest('button')) return false;
+      return !!t.closest('.sfx-tv-screen');
+    };
+    var forget = function () {
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = 0; }
+      press = null;
+    };
+    var tapped = function () {
+      /* One tap, and no second one came: the sheet. */
+      if (!host) return;
+      if (sheetHeld()) { sheetClose(); return; }
+      askDrop();
+      if (playing) sheet(playing);
+    };
+    var doubled = function () {
+      /* #1121: the first double tap replays now; the next ones, while
+         they keep coming, each owe one more play after this one. */
+      askDrop();
+      var t = now();
+      var soon = lastDouble && (t - lastDouble) < DOUBLE_RUN_MS;
+      lastDouble = t;
+      if (soon) {
+        replays += 1;
+        paintBadge();
+        return;
+      }
+      if (rewind) { try { rewind(); } catch (err) { /* it is going */ } }
+      paintBadge();
+    };
+    host.addEventListener('pointerdown', function (ev) {
+      if (!onScreen(ev)) { forget(); return; }
+      if (ev.button !== undefined && ev.button !== 0) return;
+      press = {x: Number(ev.clientX) || 0, y: Number(ev.clientY) || 0, t: now()};
+      if (pressTimer) clearTimeout(pressTimer);
+      pressTimer = setTimeout(function () {
+        pressTimer = 0;
+        /* A hold: still down, never moved. Not a tap on release. */
+        press = null;
+        if (tapTimer) { clearTimeout(tapTimer); tapTimer = 0; }
+        if (playing) ask(screen);
+      }, HOLD_MS);
     });
-    screen.addEventListener('pointermove', function (ev) {
-      if (!held) return;
-      if (Math.abs(ev.clientX - held.x) > 8
-          || Math.abs(ev.clientY - held.y) > 8) {
-        if (heldTimer) { clearTimeout(heldTimer); heldTimer = 0; }
-        held = null;
+    host.addEventListener('pointermove', function (ev) {
+      if (!press) return;
+      if (Math.abs((Number(ev.clientX) || 0) - press.x) > SLOP_PX
+          || Math.abs((Number(ev.clientY) || 0) - press.y) > SLOP_PX) {
+        forget();
       }
     });
-    ['pointerup', 'pointercancel'].forEach(function (name) {
-      screen.addEventListener(name, function () {
-        if (heldTimer) { clearTimeout(heldTimer); heldTimer = 0; }
-        held = null;
-      });
+    host.addEventListener('pointerup', function () {
+      var was = press;
+      forget();
+      if (!was || now() - was.t >= TAP_MS) return;
+      var t = now();
+      if (tapTimer && (t - lastTap) < DOUBLE_MS) {
+        clearTimeout(tapTimer); tapTimer = 0;
+        lastTap = 0;
+        doubled();
+        return;
+      }
+      lastTap = t;
+      if (tapTimer) clearTimeout(tapTimer);
+      tapTimer = setTimeout(function () { tapTimer = 0; tapped(); }, DOUBLE_MS);
     });
+    host.addEventListener('pointercancel', forget);
 
     host.appendChild(screen);
     grip(host);
@@ -345,6 +674,8 @@
       }
     } catch (err) { /* nothing stray */ }
     host = video = tube = null;
+    sheetWrap = null; curtain = null; owed = false;     /* #1112 */
+    rewind = null; badge = null; askWrap = null;        /* #1121 */
     showing = false;
     setTimeout(next, 120);
   }
@@ -383,6 +714,8 @@
       catch (err) { /* already gone */ }
     }
     host = video = tube = null;
+    sheetWrap = null; curtain = null; owed = false;     /* #1112 */
+    rewind = null; badge = null; askWrap = null;        /* #1121 */
     showing = false;
   }
 
@@ -400,6 +733,16 @@
     var done = false;
     var finish = function () {
       if (done) return;
+      /* #1112: NOT WHILE THE SHEET IS UP. The clip has ended (or hit
+       * its out, or the watchdog found it stopped) under the operator's
+       * open sheet, so the picture stays on its last frame and the
+       * finish is owed to sheetClose(). Only the set on screen can be
+       * held - a finish arriving for an older set runs as before. */
+      if (video === screen && sheetHeld()) {
+        try { screen.pause(); } catch (err) { /* it has ended anyway */ }
+        owed = true;
+        return;
+      }
       done = true;
       writeBox();                    // wherever it ended up is the preference
       try {
@@ -417,6 +760,77 @@
       writeBox();
       teardown(screen);
     };
+    /* #1112: the sheet's roads reach this set's finish through here. */
+    curtain = finish;
+    /* #1121/#1124: THE END OF THE CLIP IS NOT ALWAYS THE END.
+     *
+     * Before the finish - and before #1112's owed/held rule, because a
+     * replay is not a finish and neither is the next clip of a run -
+     * `ended` asks two module-level counters. Replays owed: back to
+     * the start and play again. Clips left in the run: the station is
+     * asked for the next one in the folder and cut() puts it up (that
+     * takes this set down with it - the operator asked for the next
+     * picture, not this one). Only when both are spent does the CRT
+     * collapse. A trimmed clip (#1310) reaches its `to` the same way,
+     * through `passed`, so the out point cannot fire the counter down
+     * on every timeupdate before the seek lands. */
+    var from = Number(clip.from);
+    var to = Number(clip.to);
+    var over = false;              // the run's next clip is being fetched
+    var passed = false;            // the out point has been met this pass
+    var restart = function () {
+      passed = false;
+      owed = false;                /* #1112: it is playing again */
+      try { screen.currentTime = (isFinite(from) && from > 0) ? from : 0; }
+      catch (err) { /* it plays on from where it is */ }
+      var again = screen.play();
+      if (again && again.catch) again.catch(function () {});
+    };
+    rewind = function () {
+      if (done || over || video !== screen) return;
+      restart();
+    };
+    var ended = function () {
+      if (done) return;
+      if (video !== screen) { finish(); return; }
+      if (replays > 0) {
+        replays -= 1;
+        paintBadge();
+        restart();
+        return;
+      }
+      if (runLeft > 0) {
+        runLeft -= 1;
+        paintBadge();
+        over = true;
+        try { screen.pause(); } catch (err) { /* it has ended anyway */ }
+        var stopRun = function (why) {
+          if (done || video !== screen) return;
+          over = false;
+          runLeft = 0;
+          runFrom = '';
+          paintBadge(why, 4000);
+          /* Long enough for the reason to be read before the collapse. */
+          setTimeout(function () { if (video === screen) finish(); }, 1600);
+        };
+        neighbour(clipId(clip), 'next').then(function (got) {
+          if (done || video !== screen) return;
+          if (got && got.ok && got.clip && got.clip.url) {
+            runFrom = clipId(got.clip);
+            if (!root.PineSfxTv.cut(got.clip, {ring: true})) {
+              stopRun('the next one would not open');
+            }
+            return;
+          }
+          stopRun(String((got && got.say) || 'nothing more in that folder'));
+        }, function (err) {
+          stopRun(String((err && err.message) || err || 'no answer').slice(0, 40));
+        });
+        return;
+      }
+      finish();
+    };
+    paintBadge();                  // a run or replays owed show on this set too
 
     parts.shut.addEventListener('click', close);
 
@@ -472,6 +886,13 @@
      * a substitute would land after the moment it was for. */
     var failed = function () {
       if (done) return;
+      /* #1112: a clip that has shown a frame and is now sitting under
+       * the operator's sheet is not a failure - the watchdog sees it
+       * `paused` after it ended, and `error` can fire late on a file
+       * the operator has just deleted. The finish below is owed, not
+       * run, while the sheet is up; nothing here tears down through
+       * it. A clip that never showed a frame is still skipped. */
+      if (shown && sheetHeld()) { finish(); return; }
       if (!shown && clip.__cut && tries < 3 && api() && api().post) {
         done = true;                 /* this attempt is over */
         try { teardownNow(); } catch (err) { /* nothing up */ }
@@ -489,7 +910,7 @@
       }
       finish();
     };
-    screen.addEventListener('ended', finish);
+    screen.addEventListener('ended', ended);               /* #1121/#1124 */
     screen.addEventListener('error', failed);
     /* #1411: a warmed tube already has its source; assigning the same
        src again runs the load algorithm from scratch and throws the
@@ -504,9 +925,8 @@
      * waits for metadata - currentTime cannot be set before the
      * duration is known - and the out is watched on timeupdate rather
      * than with a timer, because a clip that stalls should stop where
-     * the operator said, not where a clock guessed. */
-    var from = Number(clip.from);
-    var to = Number(clip.to);
+     * the operator said, not where a clock guessed. (`from` and `to`
+     * are read above, where the replay needs them too.) */
     if (isFinite(from) && from > 0) {
       screen.addEventListener('loadedmetadata', function () {
         try { screen.currentTime = from; } catch (err) { /* whole clip */ }
@@ -518,7 +938,9 @@
     }
     if (isFinite(to) && to > 0) {
       screen.addEventListener('timeupdate', function () {
-        if (Number(screen.currentTime) >= to) finish();
+        if (passed || Number(screen.currentTime) < to) return;
+        passed = true;
+        ended();                   /* #1121/#1124: the out is an end too */
       });
     }
     /* THE WATCHDOG. `error` does not fire for every way a clip can fail
@@ -527,6 +949,11 @@
      * with a black tube holds every clip behind it. */
     setTimeout(function () {
       if (done || video !== screen) return;
+      /* #1112: a set the operator is holding open with the sheet is
+         never the watchdog's business once it has shown a picture. */
+      if (shown && sheetHeld()) return;
+      /* #1124: nor is a set waiting on the next clip of its run. */
+      if (over) return;
       /* #1311d: a clip that never started is skipped the same way one
          that errored is - a stalled range request and a missing
          decoder look identical from here and deserve the same answer. */
@@ -547,6 +974,9 @@
    * Every one of these already has a door and the clip already
    * carries the handle they want - its sfx id. Nothing here invents
    * an endpoint.
+   *
+   * #1112: and two more - "never again" (the ban switch) and "where is
+   * it" (the info route's paths) - on the same rule.
    */
   function clipId(clip) {
     if (!clip) return '';
@@ -560,6 +990,40 @@
     var bridge = api();
     if (!bridge || !bridge.post) return Promise.reject(new Error('no bridge'));
     return bridge.post(path, body || {});
+  }
+
+  /* #1123/#1124: THE CLIP BESIDE THIS ONE IN ITS FOLDER.
+   *
+   * "allow me to go to the next video or the previous video and it goes
+   *  to the next video in that folder to the next clip. Or the previous
+   *  clip."
+   *
+   * /api/sfx/video/neighbour is the station's own answer: {ok, clip,
+   * index, count, folder, say}, with ok:false and a `say` when the
+   * folder has nothing more that way. The clip it hands back is played
+   * through cut() with {ring: true}, the way a sampler pad's clip is -
+   * so the other surfaces' sets show it too. */
+  function neighbour(id, dir) {
+    var bridge = api();
+    if (!id) return Promise.reject(new Error('no id on this clip'));
+    if (!bridge || !bridge.get) return Promise.reject(new Error('no bridge'));
+    return bridge.get('/api/sfx/video/neighbour?id=' + encodeURIComponent(id)
+                      + '&dir=' + (dir === 'prev' ? 'prev' : 'next'));
+  }
+
+  function step(clip, dir, say) {
+    var id = clipId(clip);
+    if (!id) { say('no id on this clip'); return; }
+    say(dir === 'prev' ? 'the one before...' : 'the next one...');
+    neighbour(id, dir).then(function (got) {
+      if (got && got.ok && got.clip && got.clip.url) {
+        /* #1124: a run in progress carries on from the clip stepped to. */
+        if (runLeft > 0) runFrom = clipId(got.clip);
+        if (!root.PineSfxTv.cut(got.clip, {ring: true})) say('it would not open');
+        return;
+      }
+      say(String((got && got.say) || 'nothing else in that folder'));
+    }, function (err) { say(String((err && err.message) || err).slice(0, 40)); });
   }
 
   function weigh(clip, up, say) {
@@ -579,6 +1043,47 @@
     if (!id) { say('no id on this clip'); return; }
     post('/api/sfx/delete', {id: id}).then(
       function () { say('deleted'); if (done) done(); },
+      function (err) { say(String((err && err.message) || err).slice(0, 40)); });
+  }
+
+  /* #1112: "choose to have videos not play anymore" - the file stays
+   * on the station, the draw stops picking it. /api/sfx/ban is the
+   * station's own switch for that; nothing is unlinked. */
+  function ban(clip, say, done) {
+    var id = clipId(clip);
+    if (!id) { say('no id on this clip'); return; }
+    post('/api/sfx/ban', {id: id, banned: true}).then(
+      function () { say('never again'); if (done) done(); },
+      function (err) { say(String((err && err.message) || err).slice(0, 40)); });
+  }
+
+  /* #1112: "inspect the location and find out where videos are
+   * located." /api/sfx/info answers with `where` (the station's label,
+   * samples/mwc/clip-6.mp4), `path` (inside the container) and
+   * `host_path` (a Windows or UNC path when the folder is on a share,
+   * else ''). The most reachable of the three is printed; and where the
+   * desktop bridge can reveal a file in Explorer, the folder is opened
+   * on the host path too. */
+  function locate(clip, say) {
+    var id = clipId(clip);
+    var bridge = api();
+    if (!id || !bridge || !bridge.get) { say('no id on this clip'); return; }
+    bridge.get('/api/sfx/info?id=' + encodeURIComponent(id)).then(
+      function (got) {
+        var hostPath = String((got && got.host_path) || '');
+        var where = hostPath || String((got && (got.path || got.where)) || '');
+        if (!where) { say('the station does not know where it lives'); return; }
+        var desk = root.pineDesktop;
+        if (hostPath && desk && typeof desk.showInFolder === 'function') {
+          try {
+            Promise.resolve(desk.showInFolder(hostPath)).then(
+              function () { say('opened the folder  -  ' + where); },
+              function () { say(where); });
+            return;
+          } catch (err) { /* the path is still worth printing */ }
+        }
+        say(where);
+      },
       function (err) { say(String((err && err.message) || err).slice(0, 40)); });
   }
 
@@ -607,7 +1112,13 @@
         var bits = [];
         if (got && got.name) bits.push(got.name);
         if (got && got.seconds) bits.push(Number(got.seconds).toFixed(1) + 's');
-        if (got && got.folder) bits.push(got.folder);
+        /* #1112: this read `got.folder`, and the route's field is
+           `where` - so the location never printed, on any surface,
+           and nothing said so. The container and host paths follow it
+           when the station knows them. */
+        if (got && got.where) bits.push(got.where);
+        if (got && got.path && got.path !== got.where) bits.push(got.path);
+        if (got && got.host_path) bits.push(got.host_path);
         if (got && got.plays !== undefined) bits.push(got.plays + ' plays');
         if (got && got.weight !== undefined) bits.push('weight ' + got.weight);
         say(bits.join('  -  ') || 'nothing known about it');
@@ -615,11 +1126,13 @@
       function (err) { say(String((err && err.message) || err).slice(0, 40)); });
   }
 
-  /* The sheet itself: a hold on the picture opens it. */
+  /* The sheet itself: a tap on the picture opens it (a hold did, until
+   * #1121 gave the hold to the sampler question). */
   function sheet(clip) {
     if (!host) return;
-    var old = host.querySelector('.sfx-tv-sheet');
-    if (old) { old.remove(); return; }        /* a second hold shuts it */
+    /* #1112: a second hold shuts it - through the one door, so a clip
+       that ended under the sheet is finished now, not left standing. */
+    if (sheetHeld()) { sheetClose(); return; }
     var wrap = document.createElement('div');
     wrap.className = 'sfx-tv-sheet';
     var name = document.createElement('b');
@@ -632,6 +1145,24 @@
     rowA.className = 'sfx-tv-sheetrow';
     var rowB = document.createElement('div');
     rowB.className = 'sfx-tv-sheetrow';
+    /* #1112: a third row for the two that take the picture away, so
+       the labels stay short enough for a 420 px set on the tablet. */
+    var rowC = document.createElement('div');
+    rowC.className = 'sfx-tv-sheetrow';
+
+    /* #1112: a delete or a ban is the end of this clip's time on the
+       set: the note is left long enough to read, then the sheet goes
+       through the one door and the picture is brought down - whether
+       the clip had already ended under the sheet or is still running
+       off its buffer. Nothing happens if the operator closed the sheet
+       by hand in the meantime. */
+    function finishUp() {
+      setTimeout(function () {
+        if (sheetWrap !== wrap) return;
+        sheetClose();
+        if (curtain) { try { curtain(); } catch (err) { /* going */ } }
+      }, 900);
+    }
 
     function button(into, label, title, go) {
       var b = document.createElement('button');
@@ -648,12 +1179,16 @@
 
     button(rowA, 'Inspect', 'What the station knows about this clip',
            function () { inspect(clip, say); });
+    button(rowA, 'Where is it', 'Show where this clip lives',
+           function () { locate(clip, say); });
     button(rowA, '\u25b2 More', 'Play it more often',
            function () { weigh(clip, true, say); });
     button(rowA, '\u25bc Less', 'Play it less often',
            function () { weigh(clip, false, say); });
     button(rowB, 'Send to a pad', 'Put it on the first free sampler pad',
            function () { toPad(clip, say); });
+    button(rowB, 'Never again', 'Keep the file but never play it on the air again',
+           function () { ban(clip, say, finishUp); });
     var kill = button(rowB, 'Delete', 'Remove the file permanently',
       function () {
         /* The one action here that cannot be taken back, so it asks. */
@@ -667,27 +1202,96 @@
           }, 3000);
           return;
         }
-        scrap(clip, say, function () { wrap.remove(); });
+        scrap(clip, say, finishUp);
       });
     kill.className = 'bad';
-    var shut = button(rowB, 'Close', 'Put this away',
-                      function () { wrap.remove(); });
+    var shut = button(rowC, 'Close', 'Put this away',
+                      function () { sheetClose(); });      /* #1112 */
     shut.className = 'quiet';
     /* #1309b: and the only way left to dismiss the picture itself,
-       now that the title bar with its ✕ is gone. */
-    var away = button(rowB, 'Stop', 'Take the picture off the screen',
+       now that the title bar with its ✕ is gone. #1112: the sheet goes
+       through the one door first; the set comes down at once after,
+       which is what Stop has always meant. */
+    var away = button(rowC, 'Stop', 'Take the picture off the screen',
       function () {
-        wrap.remove();
+        /* #1121/#1124: Stop is the operator's own end of the run and of
+           any replays owed - the one road, besides the slider at 0,
+           that clears them. cut() never does. */
+        runLeft = 0; runFrom = ''; replays = 0;
+        sheetClose();
         try { teardownNow(); } catch (err) { /* already gone */ }
       });
     away.className = 'quiet';
 
+    /* #1122/#1123: A FOURTH ROW - the clip beside this one either way,
+       and the window filled or put back. Three short labels, so a
+       420 px set on the tablet still fits them; and 32 px tall inline,
+       because the stylesheet's sheet buttons are sized for a mouse. */
+    var rowD = document.createElement('div');
+    rowD.className = 'sfx-tv-sheetrow';
+    var tall = function (b) { b.style.minHeight = '32px'; return b; };
+    tall(button(rowD, 'Prev', 'The clip before this one in its folder',
+                function () { step(clip, 'prev', say); }));
+    tall(button(rowD, 'Next', 'The clip after this one in its folder',
+                function () { step(clip, 'next', say); }));
+    var fill = tall(button(rowD, full ? 'Windowed' : 'Full screen',
+      'Fill the window with the picture, or put it back in its box',
+      function () {
+        setFull(!full);
+        fill.textContent = full ? 'Windowed' : 'Full screen';
+        say(full ? 'full screen, until it is turned off'
+                 : 'back in its window');
+      }));
+
+    /* #1124: THE RUN. "offer a slider for playing the next sequential
+       clips. So I can basically expand it. So if I expand it to say
+       seven, it plays that clip and the next seven clips in a row
+       sequentially." The value is the module's `runLeft`, so a sheet
+       opened on the third clip of a run shows what is still to come,
+       and dragging it changes the run from here. */
+    var rowE = document.createElement('div');
+    rowE.className = 'sfx-tv-sheetrow';
+    rowE.style.alignItems = 'center';
+    var range = document.createElement('input');
+    range.type = 'range';
+    range.min = '0'; range.max = '12'; range.step = '1';
+    range.value = String(runLeft > 0 ? runLeft : 0);
+    range.setAttribute('aria-label', 'Play the next clips in the folder');
+    range.style.flex = '1 1 52%'; range.style.minWidth = '0';
+    range.style.minHeight = '32px'; range.style.margin = '0';
+    range.style.accentColor = '#65c7da'; range.style.cursor = 'pointer';
+    var count = document.createElement('i');
+    count.className = 'sfx-tv-note';
+    count.style.flex = '1 1 48%'; count.style.minHeight = '0';
+    count.style.textAlign = 'right'; count.style.whiteSpace = 'nowrap';
+    count.style.overflow = 'hidden'; count.style.textOverflow = 'ellipsis';
+    count.style.color = '#dfe7ee'; count.style.fontSize = '11px';
+    var wordFor = function (n) {
+      return n > 0 ? 'then the next ' + n + ' in the folder' : 'just this one';
+    };
+    count.textContent = wordFor(Number(range.value) || 0);
+    var chose = function () {
+      var n = Math.max(0, Math.min(12, Math.round(Number(range.value) || 0)));
+      count.textContent = wordFor(n);
+      runLeft = n;
+      runFrom = n > 0 ? clipId(clip) : '';
+      paintBadge();
+    };
+    range.addEventListener('input', chose);
+    range.addEventListener('change', chose);
+    rowE.appendChild(range);
+    rowE.appendChild(count);
+
     wrap.appendChild(name);
     wrap.appendChild(rowA);
     wrap.appendChild(rowB);
+    wrap.appendChild(rowD);
+    wrap.appendChild(rowE);
+    wrap.appendChild(rowC);
     wrap.appendChild(note);
     wrap.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
     host.appendChild(wrap);
+    sheetWrap = wrap;                                      /* #1112 */
   }
 
   /* #1411: THE NEXT CLIP IS FETCHED BEFORE ITS MOMENT.
@@ -873,7 +1477,7 @@
       /* A window that shrank under a set left near the edge would strand
        * it off screen; the clamp is the same one the opener uses. */
       root.addEventListener('resize', function () {
-        if (!host) return;
+        if (!host || full) return;   /* #1122: 100vw follows by itself */
         host.style.left = Math.max(0, Math.min((root.innerWidth || 0) - 60,
           host.offsetLeft)) + 'px';
         host.style.top = Math.max(0, Math.min((root.innerHeight || 0) - 30,
@@ -896,6 +1500,7 @@
       timer = hold = null;
       mounted = false;
       warmDrop();                                          /* #1411 */
+      replays = 0; runLeft = 0; runFrom = ''; lastDouble = 0;  /* #1121/#1124 */
       teardown();
     },
     /* Numbers the operator can look at rather than a claim in a comment. */
@@ -924,7 +1529,13 @@
      * the station has never heard of it - a sampler pad, not the cue
      * road - so it is also published for the other surfaces' sets. A
      * clip that came back FROM the station is already in the ring and
-     * must not be rung again. */
+     * must not be rung again.
+     *
+     * #1121/#1124: `replays` and `runLeft` are NOT touched here. Next,
+     * Prev and the run itself all arrive through this door, and a
+     * fresh tap on the video button mid-run is "and also this one",
+     * not "and stop the run" - the operator's Stop and the slider at 0
+     * are the roads that end it. */
     cut: function (clip, opts) {
       if (!clip || !clip.url) return false;
       /* Before the mount check, deliberately: a surface with no set of

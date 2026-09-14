@@ -1800,6 +1800,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # writable from the container); see export_resolve for the forms
     # the operator may speak.
     "export_dir": "data/export/broadcasts",
+    # #1114: a Windows/UNC folder the DESK carries every export to. The
+    # container cannot write there (the QuickSwap share is mounted read-
+    # only at /samples), so the Pine Box desktop app polls
+    # /api/export/courier and copies each file across itself.
+    "export_desk_dir": "",
     # #1157: how many Gazette entries the gallery filmstrip may list at
     # once. The press files a snapshot every hour AND one for every
     # "Print now", so the newspapers were crowding the renders off the
@@ -2664,6 +2669,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "long_term_memory": bool(data.get("long_term_memory", True)),
         "export_dir": str(data.get("export_dir")
                           or "data/export/broadcasts").strip()[:400],  # #1025
+        "export_desk_dir": str(data.get("export_desk_dir")
+                               or "").strip()[:400],               # #1114
         # #1157: one is the floor (a single pile is still an entry), forty
         # the ceiling (past that the cap is not capping anything - the
         # strip only draws twenty-four tiles).
@@ -106080,13 +106087,16 @@ def pinelink_state() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         got["fresh"] = False
     try:
-        clips = sorted(PINELINK_CLIPS.glob("*.mp4"),
+        clips = sorted(pinelink_clips_dir().glob("*.mp4"),
                        key=lambda p: p.stat().st_mtime, reverse=True)
         got["clips"] = len(clips)
         got["kept_bytes"] = sum(p.stat().st_size for p in clips)
         got["newest"] = clips[0].name if clips else ""
     except Exception:  # noqa: BLE001
         got["clips"] = 0
+    # #1118: the operator pressed the camera on from a desk - the tablet
+    # watches this stamp and puts its notice in the middle of the screen.
+    got["announce_at"] = float(_PINELINK_ANNOUNCE.get("at") or 0)
     got["playlist"] = "/api/pinelink/live/index.m3u8"
     return got
 
@@ -106676,6 +106686,529 @@ async def said_search_api(
             "say": ("%d airing(s) in %dh, %d distinct line(s)" % (total, hours, distinct))}
 
 
+
+# --- #1113 / #1117 / #1115: WHAT SET A LINE, THE SCENE, AND THE PAGE'S REPORT --
+#
+# #1117: "an expandable tri[angle] at the beginning of all of these that
+#  allows me to see what property set this and allow me to change or manage
+#  those or adjust them in the system prompt or see what systems contributed
+#  to making them the way that they are"
+# #1113: "a dropdown that shows what the scenario was ... all the scenarios
+#  that are currently being used to create this scene ... a topic, a guest
+#  star, any of these options inside the pine box agent"
+# #1115: "an icon of a script that I can tap whenever the script view is not
+#  displaying the active line being said correctly ... capture advanced
+#  diagnostic information ... put it in a markdown file, and then capture it
+#  to a pine box report"
+#
+# Nothing here is measured for the occasion: scene_inputs() reads the desks
+# that already exist (topics, plots, guests, themes, crystals, the prompt
+# shelf, the personas, the director's weather), and said_why reads the same
+# provenance /api/dj/provenance already gathers. The script report joins the
+# page's own reading to the station's and writes a verdict the resolver can
+# argue with.
+def scene_kind_label(kind: str) -> str:
+    for k in SCHEDULE_KINDS:
+        if k.get("kind") == kind:
+            return str(k.get("label") or kind)
+    return kind or "the schedule"
+
+
+def scene_inputs(kind: str = "", who: str = "") -> list[dict[str, Any]]:
+    """#1113: every option inside the agent that shapes the scene right
+    now, on or off - a reader sees the option exists even when it is off."""
+    out: list[dict[str, Any]] = []
+
+    def put(key: str, label: str, on: Any, value: Any, detail: Any = "",
+            desk: str = "", why: str = "") -> None:
+        out.append({"key": key, "label": label, "on": bool(on),
+                    "value": str(value or "")[:300],
+                    "detail": str(detail or "")[:1600], "desk": desk,
+                    "why": why})
+
+    try:
+        dj = dj_settings()
+    except Exception:  # noqa: BLE001
+        dj = {}
+    k = str(kind or _RADIO.get("sched_kind") or "")
+    try:
+        put("schedule", "The hour's running order", k,
+            scene_kind_label(k) + ((" (" + k + ")") if k else ""),
+            str(_RADIO.get("sched_prompt") or "")[:900], "Calendar",
+            "the schedule names the kind of segment on air; each kind "
+            "writes from its own prompt shelf")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sp = schedule_segment_prompt(kind=k) if k else {}
+        put("prompt", "System prompt for this road", sp.get("text"),
+            (sp.get("variant") or {}).get("name") or sp.get("source")
+            or "none on the shelf", sp.get("text") or "",
+            "Calendar > the prompt book",
+            str(sp.get("source") or "the armed variant for every entry "
+                                    "of this kind"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        seat = {"host": "persona", "cohost": "cohost_persona",
+                "third": "third_persona", "guest": "third_persona"
+                }.get(str(who or "").lower(), "")
+        text = str(dj.get(seat) or "") if seat else ""
+        put("persona", "Who is speaking", text,
+            (booth_actor_name(who) if who else "") or who or "-", text,
+            "Voices", "the seat's character instructions go into every "
+                      "prompt for that voice")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rows = [r for r in read_bombshells() if isinstance(r, dict)]
+        fresh = [r for r in rows if not int(r.get("used") or 0)]
+        put("topic", "Topics in the bank", fresh,
+            ("%d waiting, %d dropped" % (len(fresh), len(rows) - len(fresh)))
+            if rows else "empty",
+            "\n".join("- " + str(r.get("text") or "")[:160]
+                      + (" (used)" if r.get("used") else "")
+                      for r in rows[:12]), "Topics",
+            "a planted topic is dropped into a round when the writing room "
+            "reaches for one")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        now_ = plotline_now()
+        put("plot", "Plotline",
+            now_.get("id") or now_.get("title") or now_.get("name"),
+            str(now_.get("title") or now_.get("name") or "no plot running"),
+            json.dumps({a: b for a, b in now_.items() if a != "turned"},
+                       default=str)[:1200], "Plot",
+            "while a plot is active the pair weave its current act into "
+            "their rounds")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        gid = str(dj.get("guest_id") or "") if dj.get("guest_mode") else ""
+        g = next((r for r in read_guests() if str(r.get("id")) == gid), {}) \
+            if gid else {}
+        put("guest", "Guest in the studio", g,
+            str(g.get("name") or "nobody seated"),
+            ((g.get("who") or "") + "\n" + (g.get("why") or "")).strip(),
+            "Guest", "a seated guest rides the third seat and is written "
+                     "into every round")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        th = themes_read()
+        active = str(th.get("active") or "")
+        row = next((t for t in (th.get("themes") or [])
+                    if str(t.get("name")) == active), {})
+        on = bool(active and active not in ("-", "\u2014"))
+        put("theme", "What the callers are calling about", on,
+            (active + " \u00b7 share %s%%" % th.get("strength")) if on
+            else "the callers roam",
+            str(row.get("text") or "")
+            + (("\nreport: " + str(th.get("doc"))) if th.get("doc") else ""),
+            "Callers", "a theme biases the phone line by its share without "
+                       "taking it over")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ons = crystal_active()
+        put("crystal", "Crystals", ons,
+            ", ".join(str(c.get("name") or c.get("id"))
+                      + " %s%%" % c.get("strength", 50) for c in ons)
+            or "none switched on", "", "Crystal",
+            "a crystal tints every prompt and, at its strength, replaces "
+            "the mind the passages are drawn from")
+        put("tint", "The tint", ons,
+            ("two-pass" if crystal_tint_two_pass() else "one pass")
+            + (", holds unproved dialogue" if crystal_tint_holds() else "")
+            + (", strict grading" if crystal_grade_strict()
+               else ", meaning grading"),
+            "", "Crystal", "how a written line is coloured before it is "
+                           "recorded")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        disp = station_disposition_text(1200)
+        put("station", "The station's disposition", disp,
+            (disp[:120] + "\u2026") if len(disp) > 120 else disp, disp,
+            "Station", "the standing instructions every seat writes under")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        st = _RADIO.get("speaker_state") or {}
+        mac = _RADIO.get("speaker_macro") or {}
+        put("mood", "The director's weather", mac or st,
+            ", ".join("%s: %s" % (a, b) for a, b in mac.items())
+            or "no macro set", json.dumps(st, default=str)[:1200],
+            "Director", "the emotional state per speaker leans on the "
+                        "delivery and the wording")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+@app.get("/api/dj/scenario")
+async def dj_scenario_api(
+    line: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1113: the scenario a line was written under, and every input
+    shaping the scene - on or off."""
+    require_read_auth(authorization)
+    row: dict[str, Any] = {}
+    want = str(line or "").strip()
+    if want:
+        _ensure_chat_ids()
+        for c in reversed(_RADIO.get("chat") or []):
+            if isinstance(c, dict) and str(c.get("id") or "") == want:
+                row = dict(c)
+                break
+    trace = dict(row.get("trace") or {})
+    written = dict(trace.get("written") or {})
+    kind = (str(written.get("kind") or "") if row
+            else str(_RADIO.get("sched_kind") or ""))
+    kind = kind.split("/")[-1] if kind else kind
+    brief = (str(written.get("sched") or "") if row
+             else str(_RADIO.get("sched_prompt") or ""))
+    who = str(row.get("who") or "")
+    inputs = await asyncio.to_thread(scene_inputs, kind, who)
+    on = [i for i in inputs if i["on"]
+          and i["key"] not in ("schedule", "prompt", "persona", "station")]
+    label = scene_kind_label(kind) if kind else "the show as it runs"
+    scenario = {"label": label, "kind": kind,
+                "road": str(row.get("round") or row.get("kind")
+                            or _RADIO.get("sched_kind") or ""),
+                "brief": brief[:900],
+                "since": float(row.get("ts") or 0) if row else 0.0,
+                "where": "the schedule desk"}
+    return {"ok": True, "scenario": scenario, "inputs": inputs,
+            "line": {"id": want, "kind": row.get("kind"),
+                     "round": row.get("round"), "who": who,
+                     "name": row.get("name")},
+            "say": ("%s, shaped by %s"
+                    % (label, ", ".join(i["label"].lower() for i in on)))
+            if on else ("%s - nothing else is steering the scene" % label)}
+
+
+@app.get("/api/said/why/{line_id}")
+async def said_why_api(
+    line_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1117: what SET a line, what could be changed, what contributed."""
+    require_read_auth(authorization)
+    want = str(line_id or "").strip()
+    prov: dict[str, Any] = {}
+    try:
+        prov = await dj_provenance_api(want, authorization)
+    except HTTPException:
+        prov = {}
+    except Exception:  # noqa: BLE001
+        prov = {}
+    row = dict(prov.get("line") or {})
+    if not row:
+        # past the booth's ring: the air log still knows the line
+        now = time.time()
+
+        def _find() -> dict[str, Any]:
+            for r in airlog_rows(now - 48 * 3600, now, quiet=True):
+                if str(r.get("id") or "") == want:
+                    return dict(r)
+            return {}
+        row = await asyncio.to_thread(_find)
+    if not row:
+        raise HTTPException(status_code=404,
+                            detail="that line is in neither the booth nor "
+                                   "the air log")
+    written = dict(prov.get("written") or {})
+    sched = dict(prov.get("schedule") or {})
+    kind = (str(sched.get("kind") or "").split("/")[-1]
+            or str(row.get("kind") or ""))
+    who = str(row.get("who") or "")
+    inputs = await asyncio.to_thread(scene_inputs, kind, who)
+    by_key = {i["key"]: i for i in inputs}
+    properties: list[dict[str, Any]] = [
+        {"name": "the road",
+         "value": "%s/%s" % (row.get("kind") or "?", row.get("round") or "?"),
+         "where": "the schedule desk"},
+        {"name": "the seat", "value": str(row.get("name") or who),
+         "where": "Voices"}]
+    if row.get("voice") or row.get("engine"):
+        properties.append({"name": "the voice",
+                           "value": "%s%s" % (row.get("voice") or "",
+                                              (" \u00b7 " + str(row.get("engine")))
+                                              if row.get("engine") else ""),
+                           "where": "Voices"})
+    if written.get("model"):
+        properties.append({"name": "the model",
+                           "value": "%s \u00b7 %s ms" % (written.get("model"),
+                                                       written.get("ms") or "?"),
+                           "where": "the writing desk"})
+    if sched.get("prompt"):
+        properties.append({"name": "the brief",
+                           "value": str(sched.get("prompt"))[:300],
+                           "where": "Calendar"})
+    for key in ("persona", "theme", "plot", "guest", "crystal", "tint",
+                "station", "mood", "topic"):
+        i = by_key.get(key)
+        if i and i["on"]:
+            properties.append({"name": i["label"].lower(), "value": i["value"],
+                               "where": i["desk"]})
+    pr = by_key.get("prompt") or {}
+    shelved = any(k.get("kind") == kind for k in SCHEDULE_KINDS)
+    prompt: dict[str, Any] = {"kind": kind, "text": str(pr.get("detail") or ""),
+                              "editable": bool(kind and shelved),
+                              "where": "the prompt book (Calendar)"}
+    if not kind:
+        prompt["why"] = ("this line names no schedule kind, so there is no "
+                         "shelf to edit")
+    elif not shelved:
+        prompt["why"] = ("the %s road has no prompt shelf of its own - what "
+                         "shapes it is the seat's character on the Voices "
+                         "desk and the station's disposition" % kind)
+    ptxt = str(written.get("prompt") or "")
+    crystal = prov.get("crystal") or []
+    docs = prov.get("documents") or []
+    vectors = prov.get("vectors") or []
+    systems: list[dict[str, Any]] = [
+        {"name": "the writing room", "on": bool(ptxt),
+         "note": ("wrote it (%s, %s ms)" % (written.get("model") or "?",
+                                             written.get("ms") or "?"))
+         if ptxt else "no paperwork held for this line"},
+        {"name": "the crystal", "on": any(c.get("in_prompt") for c in crystal),
+         "note": ("%d shard(s) in the prompt"
+                  % sum(1 for c in crystal if c.get("in_prompt")))
+         if crystal else "no shard was staged"},
+        {"name": "the tint", "on": bool((by_key.get("tint") or {}).get("on")),
+         "note": (by_key.get("tint") or {}).get("value") or "off"},
+        {"name": "the speakbox",
+         "on": any(str(d.get("how") or "").startswith("the swath") for d in docs),
+         "note": ", ".join(str(d.get("file")) for d in docs[:3])
+         or "no document was read"},
+        {"name": "the vector index", "on": bool(vectors),
+         "note": ("%d search(es)" % len(vectors)) if vectors else "no search"},
+        {"name": "the shelf", "on": prov.get("how") == "shelf",
+         "note": str(prov.get("prepared") or "")},
+    ]
+    for key in ("theme", "plot", "guest"):
+        i = by_key.get(key)
+        if i:
+            systems.append({"name": i["label"].lower(), "on": i["on"],
+                            "note": i["value"]})
+    return {"ok": True, "id": want, "said": str(row.get("text") or "")[:400],
+            "who": who, "name": row.get("name"), "kind": row.get("kind"),
+            "round": row.get("round"), "voice": row.get("voice"),
+            "engine": row.get("engine"), "model": written.get("model"),
+            "aired": row.get("aired"), "properties": properties,
+            "prompt": prompt, "systems": systems, "provenance_ok": bool(prov),
+            "say": "%s on the %s road; %d thing(s) set it"
+                   % (row.get("name") or who,
+                      row.get("round") or row.get("kind") or "?",
+                      len(properties))}
+
+
+@app.post("/api/said/prompt")
+async def said_prompt_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1117: rewrite the armed variant of one road's system prompt from the
+    word-search sheet. The same store and lock as /api/schedule/prompts, so
+    the entry on air re-reads it on its next round."""
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    kind = str(payload.get("kind") or "").strip()[:40]
+    text = str(payload.get("text") or "")[:4000]
+    if not kind:
+        raise HTTPException(status_code=400, detail="which road?")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        prompts = dict(store.get("prompts") or {})
+        blob = _sched_prompt_blob(prompts.get(kind)) or {"active": 0,
+                                                         "variants": []}
+        variants = list(blob.get("variants") or [])
+        if variants:
+            variants[int(blob.get("active") or 0) % len(variants)]["text"] = text
+        else:
+            variants = [{"id": f"pv-{uuid.uuid4().hex[:10]}",
+                         "name": "from the script view", "text": text}]
+        prompts[kind] = {"active": int(blob.get("active") or 0),
+                         "variants": variants}
+        store["prompts"] = prompts
+        schedule_write(store)
+    _RADIO["sched_prompt"] = ""
+    note_action("\U0001f5d3 %s prompt rewritten from the script view (#1117)" % kind)
+    return {"ok": True, "kind": kind,
+            "say": "saved - every %s entry writes from it on its next round"
+                   % kind}
+
+
+SCRIPT_REPORTS_DIR = data_path("script_reports")
+
+
+def _view_num(view: dict[str, Any], *keys: str) -> float:
+    for k in keys:
+        try:
+            v = view.get(k)
+            if v is not None and v != "":
+                return float(v)
+        except Exception:  # noqa: BLE001
+            continue
+    return 0.0
+
+
+def script_report_reading(view: dict[str, Any]) -> dict[str, Any]:
+    """#1115: the station's side of the picture - what it is saying, where
+    the ledger stands, and a verdict on why the page's mark may be wrong."""
+    now = time.time()
+    out: dict[str, Any] = {}
+    sp = dict(_SPEAKING_NOW)
+    out["speaking"] = {k: sp.get(k) for k in ("id", "who", "name", "kind",
+                                               "text", "at", "voice", "engine")}
+    out["speaking_age_s"] = (round(now - float(sp.get("at") or 0), 1)
+                             if sp.get("at") else None)
+    try:
+        led = script_ledger_rows()
+        out["ledger"] = {"rows": len(led),
+                         "tail": [{k: r.get(k) for k in
+                                   ("block", "ord", "who", "kind", "id",
+                                    "line_id", "at")} for r in led[-6:]]}
+    except Exception as exc:  # noqa: BLE001
+        out["ledger"] = {"error": str(exc)[:120]}
+    try:
+        rows = [r for r in list(_RADIO.get("chat") or [])[-40:]
+                if isinstance(r, dict) and r.get("text")
+                and str(r.get("who") or "") in AIRLOG_CAST + ("drop",)][-6:]
+        out["last_lines"] = [{"id": r.get("id"),
+                              "who": r.get("name") or r.get("who"),
+                              "kind": r.get("kind"), "round": r.get("round"),
+                              "aired": r.get("aired"), "air_at": r.get("air_at"),
+                              "text": str(r.get("text"))[:160]} for r in rows]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out["quiet_s"] = round(float(talk_quiet_for() or 0), 1)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out["loop"] = pulse_report(600).get("reading")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out["air"] = {"owner": audio_owner(), "listeners": _radio_listeners(),
+                      "on": bool(_RADIO.get("on")),
+                      "paused": bool(radio_paused())}
+    except Exception:  # noqa: BLE001
+        pass
+    # the verdict
+    why: list[str] = []
+    lit = str(view.get("nowLineId") or view.get("now_line_id") or "")
+    litrows = view.get("lit") if isinstance(view.get("lit"), list) else []
+    if not lit and litrows and isinstance(litrows[0], dict):
+        lit = str(litrows[0].get("line") or litrows[0].get("id") or "")
+    said_id = str(sp.get("id") or "")
+    if not sp.get("text"):
+        why.append("nothing is being said right now (quiet %ss) - a highlight "
+                   "has nothing to sit on; the last mark stays until the next "
+                   "line airs" % out.get("quiet_s"))
+    elif lit and said_id and lit != said_id:
+        why.append("the page marks line %s while the station is saying %s "
+                   "(%ss into it) - the page's copy of the script is behind, "
+                   "or the ids differ between the feed and the screenplay"
+                   % (lit, said_id, out.get("speaking_age_s")))
+    elif not lit and said_id:
+        why.append("the station is saying %s but the page has nothing lit - "
+                   "the line is not on the page yet (the screenplay is re-read "
+                   "every 20 s; the chase asks sooner)" % said_id)
+    if view.get("headIsRead") is False or view.get("head_is_read") is False:
+        why.append("the position is ESTIMATED from the clock, not read from "
+                   "the sound - on the desktop that means the playhead bridge "
+                   "is not answering")
+    age = _view_num(view, "fetchedAgeMs", "fetched_age_ms", "fetchedAge") / 1000
+    if age > 45:
+        why.append("the page's screenplay is %.0fs old" % age)
+    try:
+        if litrows and isinstance(litrows[0], dict) \
+                and litrows[0].get("inView") is False:
+            why.append("the lit line is off screen (follow=%s) - the highlight "
+                       "exists but is not where the eye is" % view.get("follow"))
+    except Exception:  # noqa: BLE001
+        pass
+    if "stall" in str(out.get("loop") or ""):
+        why.append("the loop reports stalls - the feed itself may be late: "
+                   + str(out.get("loop"))[:160])
+    out["verdict"] = why or ["no fault the station can see from here - the "
+                             "picture and the page's own reading decide"]
+    return out
+
+
+@app.post("/api/script/report")
+async def script_report_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1115: the script view's own report - what the page saw, what the
+    station was doing, a picture - into a markdown file and the inbox."""
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
+    text = str(payload.get("text") or "")[:20000]
+    image = str(payload.get("image") or "")
+    reading = await asyncio.to_thread(script_report_reading, view)
+    stamp = time.strftime("%Y-%m-%d_%H%M%S")
+    SCRIPT_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    saved = _save_pine_images([image]) if image else []
+    md = ["# Script view report - %s" % time.strftime("%Y-%m-%d %H:%M:%S"), "",
+          "## Verdict",
+          *("- " + v for v in (reading.get("verdict") or [])), "",
+          "## What the page saw", "```json",
+          json.dumps(view, indent=1, default=str)[:30000], "```", "",
+          "## The screen, as text", "```",
+          text or "(no text rendering)", "```", "",
+          "## What the station was doing", "```json",
+          json.dumps(reading, indent=1, default=str)[:30000], "```"]
+    if saved:
+        md += ["", "## The picture",
+               *("![the view](data/pine_uploads/%s)" % n for n in saved)]
+    path = SCRIPT_REPORTS_DIR / ("script_%s.md" % stamp)
+    try:
+        path.write_text("\n".join(md), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500,
+                            detail="could not write the report: %s"
+                                   % str(exc)[:120])
+    lit = str(view.get("nowLineId") or view.get("now_line_id") or "-")
+    said = (reading.get("speaking") or {}).get("id") or "-"
+    head = "read" if (view.get("headIsRead") or view.get("head_is_read")) \
+        else "estimated"
+    age = int(_view_num(view, "fetchedAgeMs", "fetched_age_ms",
+                        "fetchedAge") / 1000)
+    summary = ("#1115 script view report: %s\n\nthe page marks `%s`; the "
+               "station is saying `%s`; playhead %s; the script on the page "
+               "is %ss old.\n\nfull report: data/script_reports/%s"
+               % ("; ".join(reading.get("verdict") or []), lit, said, head,
+                  age, path.name))
+    try:
+        summary = (summary + await pine_context_block()).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    if saved:
+        summary += "\n\nAttached images:\n" + "\n".join(
+            "![pasted image](data/pine_uploads/%s) [img:%s]" % (n, n)
+            for n in saved)
+    item = await pine_append(summary)
+    pipeline_log("air", "script view report filed as #%s -> %s (#1115)"
+                 % (item.get("id"), path.name))
+    return {"ok": True, "id": item.get("id"),
+            "file": "data/script_reports/" + path.name,
+            "verdict": reading.get("verdict"),
+            "say": "filed as #%s - %s"
+                   % (item.get("id"),
+                      (reading.get("verdict") or [""])[0][:90])}
+
+
 @app.get("/api/tablet/look")
 async def tablet_look_api(
     authorization: str | None = Header(default=None),
@@ -107189,7 +107722,7 @@ async def pinelink_cut_api(
         # times - written with strftime by the supervisor - so this needs no
         # index and cannot drift out of step with one.
         want: list[tuple[float, Path]] = []
-        for f in sorted(PINELINK_CLIPS.glob("*.mp4")):
+        for f in sorted(pinelink_clips_dir().glob("*.mp4")):
             try:
                 at = _dt.strptime(
                     f.stem, "%Y-%m-%d_%H-%M-%S").timestamp()
@@ -107390,6 +107923,345 @@ async def pinelink_frame_api(
         "Access-Control-Allow-Origin": "*"})
 
 
+
+# --- #1118: THE PINE CAM'S LADDER, ITS FOLDER, AND THE TABLET'S NOTICE ----
+#
+# "Put a radio icon here that whenever I click it, it just goes through the
+#  process of attempting to locate and connect to and display the pine cam.
+#  Showing an interactive flow chart tree ... Also I need an icon of a folder
+#  ... I want to have the ability to choose where those clips are being kept
+#  ... whenever I activate the pine camera, I want the pine tablet to show a
+#  display notification in the middle of the screen."
+#
+# The ladder is READ, not invented: every rung is a fact the supervisor, the
+# state file and the disk already hold, graded here so a surface can draw the
+# tree and press the one fix each rung has. The clips folder is a preference
+# in pinelink_pref.json - it must stay under the station's data folder
+# because that is the only place this container can write, and the
+# supervisor (tools/pinelink.py, root on the host) reads the same key. Where
+# the clips are EXPORTED to is a Windows folder the desk carries them to
+# (the courier, #1114); the station never touches it.
+SAMPLES_SHARE_ROOT = r"\\10.89.1.125\QuickSwap"
+_PINELINK_ANNOUNCE: dict[str, float] = {"at": 0.0}
+
+
+def share_path_of(path: Path | str) -> str:
+    r"""The Windows/UNC spelling of a container path, when the folder is on
+    a share this house can open: /samples/x -> \\10.89.1.125\QuickSwap\x,
+    /app/data/x -> the station's data share. '' when it is nowhere a
+    Windows machine can reach."""
+    try:
+        flat = str(path).replace("\\", "/")
+    except Exception:  # noqa: BLE001
+        return ""
+    roots = ((str(SFX_ROOT).replace("\\", "/"), SAMPLES_SHARE_ROOT),
+             (str(DATA_DIR).replace("\\", "/"), EXPORT_SHARE_ROOT))
+    for root, unc in roots:
+        root = root.rstrip("/")
+        if flat == root or flat.startswith(root + "/"):
+            rest = flat[len(root):].strip("/")
+            return unc + (("\\" + rest.replace("/", "\\")) if rest else "")
+    return ""
+
+
+def pinelink_prefs_read() -> dict[str, Any]:
+    try:
+        got = json.loads(PINELINK_PREF.read_text())
+        return got if isinstance(got, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def pinelink_prefs_write(patch: dict[str, Any]) -> dict[str, Any]:
+    """MERGE, as #1354 taught: one key at a time, the rest untouched."""
+    got = pinelink_prefs_read()
+    got.update(patch)
+    PINELINK_PREF.parent.mkdir(parents=True, exist_ok=True)
+    PINELINK_PREF.write_text(json.dumps(got))
+    return got
+
+
+def pinelink_pref_clips_raw() -> str:
+    raw = str(pinelink_prefs_read().get("clips_dir") or "").strip()
+    return raw or "data/pinelink/clips"
+
+
+def pinelink_clips_dir() -> Path:
+    """Where the kept clips live - the preference when it names a folder
+    under the station's data tree, the default otherwise."""
+    raw = pinelink_pref_clips_raw()
+    try:
+        got = export_resolve(raw)
+    except Exception:  # noqa: BLE001
+        got = None
+    return got or PINELINK_CLIPS
+
+
+def pinelink_prefs_view(say: str = "") -> dict[str, Any]:
+    prefs = pinelink_prefs_read()
+    clips = pinelink_clips_dir()
+    return {"ok": True,
+            "clips_dir": pinelink_pref_clips_raw(),
+            "clips_container": str(clips),
+            "clips_host": share_path_of(clips),
+            "export_dir": str(prefs.get("export_dir") or ""),
+            "carry": bool(prefs.get("carry")),
+            "carried_until": float(prefs.get("carried_until") or 0),
+            "say": say or ("clips are kept at %s" % share_path_of(clips))}
+
+
+@app.get("/api/pinelink/prefs")
+async def pinelink_prefs_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return pinelink_prefs_view()
+
+
+@app.post("/api/pinelink/prefs")
+async def pinelink_prefs_set_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    patch: dict[str, Any] = {}
+    said: list[str] = []
+    if "clips_dir" in body:
+        raw = str(body.get("clips_dir") or "").strip()
+        dest = export_resolve(raw) if raw else PINELINK_CLIPS
+        if dest is None:
+            return {**pinelink_prefs_view(), "ok": False,
+                    "say": ("I can't keep clips at %s - the station can only "
+                            "write inside its data folder (%s). Name a folder "
+                            "under it, or leave it blank for the default."
+                            % (raw[:120], EXPORT_SHARE_ROOT))}
+        try:
+            rel = dest.relative_to(DATA_DIR)
+            stored = "data/" + str(rel).replace("\\", "/")
+        except Exception:  # noqa: BLE001
+            stored = "data/pinelink/clips"
+        if stored != pinelink_pref_clips_raw():
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+            except Exception as err:  # noqa: BLE001
+                return {**pinelink_prefs_view(), "ok": False,
+                        "say": "could not create %s: %s" % (stored, str(err)[:120])}
+            patch["clips_dir"] = stored
+            said.append("clips are now kept at %s" % share_path_of(dest))
+    if "export_dir" in body:
+        raw = str(body.get("export_dir") or "").strip()[:400]
+        patch["export_dir"] = (raw.replace("/", "\\")
+                               if re.match(r"^(\\\\|//)", raw) else raw)
+        said.append("exports go to %s"
+                    % (patch["export_dir"] or "the Save As dialog's own default"))
+    if "carry" in body:
+        patch["carry"] = bool(body.get("carry"))
+        if patch["carry"]:
+            # only clips kept from NOW on: nobody asked for two days of
+            # footage to be copied across the moment the box was ticked
+            patch.setdefault("carried_until", time.time())
+        said.append("the desk %s every kept clip there"
+                    % ("carries" if patch["carry"] else "no longer carries"))
+    if not patch:
+        return pinelink_prefs_view("nothing to change")
+    try:
+        pinelink_prefs_write(patch)
+    except Exception as err:  # noqa: BLE001
+        return {**pinelink_prefs_view(), "ok": False,
+                "say": "could not remember that: " + str(err)[:160]}
+    if "clips_dir" in patch:
+        # The supervisor holds the segmenter; only a restart moves it.
+        pinelink_kick("connect", "restarting the link so the recorder "
+                                 "writes to the new folder")
+    pipeline_log("air", "pine cam prefs: " + "; ".join(said) + " (#1118)")
+    return pinelink_prefs_view("; ".join(said))
+
+
+@app.post("/api/pinelink/announce")
+async def pinelink_announce_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The operator activated the camera from a desk: every surface that
+    polls /api/pinelink/state sees a newer announce_at, and the tablet puts
+    its notice in the middle of the screen."""
+    require_auth(authorization)
+    _PINELINK_ANNOUNCE["at"] = time.time()
+    return {"ok": True, "at": _PINELINK_ANNOUNCE["at"]}
+
+
+def pinelink_ladder() -> dict[str, Any]:
+    """Every rung of 'find, connect, show', graded from what is on disk."""
+    now = time.time()
+    got = pinelink_state()
+    doc = dict(got.get("doctor") or {})
+    state = str(got.get("state") or "")
+    fresh = bool(got.get("fresh"))
+    age = now - float(got.get("at") or 0)
+    live = bool(state == "live" and fresh)
+    rungs: list[dict[str, Any]] = []
+    reset = {"label": "Reset radio", "route": "/api/pinelink/reset-radio",
+             "method": "POST", "body": {}}
+    connect = {"label": "Reconnect", "route": "/api/pinelink/connect",
+               "method": "POST", "body": {}}
+
+    def rung(rid: str, label: str, st: str, detail: str,
+             data: dict[str, Any] | None = None,
+             fix: dict[str, Any] | None = None,
+             help_: list[str] | None = None) -> None:
+        rungs.append({"id": rid, "label": label, "state": st,
+                      "detail": detail, "data": data or {}, "fix": fix,
+                      "help": help_ or []})
+
+    # 1. the radio
+    iface_up = bool(doc.get("iface_up"))
+    nearby = int(doc.get("nearby") or 0)
+    if not doc:
+        rung("radio", "The spare radio", "unknown",
+             "the link supervisor has not reported yet",
+             {"reading_age_s": round(age)}, reset,
+             ["the pinelink service runs on the DGX (systemctl status "
+              "pinelink); if it has never reported, start it there",
+              "the spare USB radio (TP-Link Archer T2U) must be plugged "
+              "into the DGX"])
+    elif iface_up and nearby > 0:
+        rung("radio", "The spare radio", "ok",
+             "up, sees %d network(s)" % nearby,
+             {"iface": doc.get("iface"), "nearby": nearby,
+              "iface_up": iface_up, "reading_age_s": round(age)}, None,
+             ["nothing to do here"])
+    else:
+        rung("radio", "The spare radio", "bad",
+             "up but scanning nothing" if iface_up
+             else "the interface is down",
+             {"iface": doc.get("iface"), "nearby": nearby,
+              "iface_up": iface_up}, reset,
+             ["this chipset stops scanning after a refused association - "
+              "Reset radio re-binds it on the USB bus (about 15 s)",
+              "if it stays down, reseat the USB adapter on the DGX"])
+    # 2. the scan
+    seen = bool(doc.get("camera") or got.get("seen"))
+    signal = int(got.get("signal") or 0)
+    strongest = doc.get("strongest") or []
+    rung("scan", "Find the camera's network",
+         "ok" if seen else ("bad" if doc else "unknown"),
+         ("%s seen at %d%%" % (PINELINK_SSID, signal)) if seen
+         else ("%s is not in the scan" % PINELINK_SSID),
+         {"ssid": PINELINK_SSID, "seen": seen, "signal": signal,
+          "strongest": strongest[:5], "verdict": doc.get("verdict")},
+         {"label": "Scan again", "route": "/api/pinelink/look?fresh=1",
+          "method": "GET", "body": {}},
+         ["switch the camera on - its network appears within a few "
+          "seconds of power",
+          "bring it within about ten metres of the DGX; the link is rated "
+          "for that",
+          "the camera sleeps its Wi-Fi to save battery: press its power "
+          "button once to wake it",
+          "the network it makes is %s; another H88_ name is a different "
+          "camera" % PINELINK_SSID])
+    # 3. join
+    if live:
+        j_state, j_detail = "ok", "joined - the camera is at %s" % got.get("camera")
+    elif state == "joining":
+        j_state, j_detail = "wait", "joining now"
+    elif state == "dropped":
+        j_state, j_detail = "ok", "joined before; the stream dropped"
+    elif seen:
+        j_state, j_detail = "bad", "not joined"
+    else:
+        j_state, j_detail = "wait", "waits for the camera to be found"
+    rung("join", "Join that network", j_state, j_detail,
+         {"state": state, "camera": got.get("camera"),
+          "iface": got.get("iface"), "steps": doc.get("steps")}, connect,
+         ["the DGX keeps its station address on the other radio; only the "
+          "spare joins the camera",
+          "a refused join three times in a row wedges the radio - the rung "
+          "above then needs Reset radio"])
+    # 4. stream
+    why = str(got.get("why") or "")
+    last_why = [l for l in why.strip().splitlines() if l.strip()]
+    rung("stream", "Pull the picture (RTSP)",
+         "ok" if live else ("bad" if state == "dropped"
+                            else ("wait" if state == "joining" else "unknown")),
+         "streaming" if live else (last_why[-1][:160] if last_why else "no stream"),
+         {"rtsp": got.get("rtsp"), "state": state, "fresh": fresh,
+          "why": why[-600:]}, connect,
+         ["the camera allows ONE viewer: close any phone app watching it",
+          "'no new frame for 20s' means the camera stalled - move closer "
+          "or wake it",
+          "the supervisor retries every 15 s by itself; Reconnect only "
+          "hurries it"])
+    # 5. frames
+    try:
+        f_age = now - PINELINK_FRAME.stat().st_mtime
+        f_bytes = PINELINK_FRAME.stat().st_size
+    except Exception:  # noqa: BLE001
+        f_age, f_bytes = 1e9, 0
+    rung("frames", "Frames arriving",
+         "ok" if f_age < 5 else ("wait" if live else
+                                 ("bad" if state == "dropped" else "unknown")),
+         ("a frame %.1fs ago" % f_age) if f_age < 3600
+         else "no frame for over an hour",
+         {"frame_age_s": round(min(f_age, 1e8), 1), "frame_bytes": f_bytes,
+          "frame": "/api/pinelink/frame.jpg"}, None,
+         ["ffmpeg writes frame.jpg four times a second while the stream is up",
+          "frames stopping with the stream up means the camera is stalling "
+          "- closer, or a fresh battery"])
+    # 6. record
+    clips = int(got.get("clips") or 0)
+    newest = str(got.get("newest") or "")
+    n_age = 1e9
+    try:
+        if newest:
+            n_age = now - (pinelink_clips_dir() / newest).stat().st_mtime
+    except Exception:  # noqa: BLE001
+        pass
+    rung("record", "Keeping the recording",
+         "ok" if (clips and n_age < 120) else
+         ("wait" if live else ("unknown" if not clips else "bad")),
+         ("%d clip(s) kept, newest %ds ago" % (clips, min(n_age, 1e8)))
+         if clips else "nothing kept yet",
+         {"clips": clips,
+          "kept_mb": round(float(got.get("kept_bytes") or 0) / 1048576),
+          "newest": newest, "dir": pinelink_pref_clips_raw(),
+          "host_dir": share_path_of(pinelink_clips_dir())}, None,
+         ["five-minute segments land in %s and are kept two days"
+          % share_path_of(pinelink_clips_dir()),
+          "Record marks a span and cuts it out of these; the folder icon "
+          "opens them"])
+    # 7. the picture - the surface's own rung
+    rung("picture", "The picture on this screen", "ok" if live else "wait",
+         "the link is live - open the picture" if live
+         else "waits for the stream",
+         {"frame": "/api/pinelink/frame.jpg", "on_air": pinelink_on_air()},
+         None, ["tap Look or the CAM flag; the box shows the camera four "
+                "times a second"])
+    bad = [r for r in rungs if r["state"] == "bad"]
+    if live:
+        verdict = "the camera is linked and recording"
+    elif bad:
+        verdict = "stuck at: %s - %s" % (bad[0]["label"], bad[0]["detail"])
+    else:
+        verdict = "waiting - " + next(
+            (r["detail"] for r in rungs if r["state"] == "wait"),
+            "no reading yet")
+    return {"ok": True, "at": now, "live": live, "state": state,
+            "verdict": verdict, "say": str(doc.get("verdict") or verdict),
+            "rungs": rungs}
+
+
+@app.get("/api/pinelink/ladder")
+async def pinelink_ladder_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await asyncio.to_thread(pinelink_ladder)
+
+
 @app.get("/api/pinelink/clips")
 async def pinelink_clips_api(
     authorization: str | None = Header(default=None),
@@ -107398,7 +108270,7 @@ async def pinelink_clips_api(
     require_read_auth(authorization)
     out: list[dict[str, Any]] = []
     try:
-        for p in sorted(PINELINK_CLIPS.glob("*.mp4"),
+        for p in sorted(pinelink_clips_dir().glob("*.mp4"),
                         key=lambda q: q.stat().st_mtime, reverse=True)[:400]:
             st = p.stat()
             out.append({"name": p.name, "bytes": st.st_size,
@@ -107406,7 +108278,10 @@ async def pinelink_clips_api(
                         "url": "/api/pinelink/clip/" + p.name})
     except Exception:  # noqa: BLE001
         pass
-    return {"clips": out, "count": len(out)}
+    return {"clips": out, "count": len(out),
+            # #1118: where they are, in both spellings
+            "dir": pinelink_pref_clips_raw(),
+            "host_dir": share_path_of(pinelink_clips_dir())}
 
 
 @app.get("/api/pinelink/clip/{filename}")
@@ -107424,7 +108299,7 @@ async def pinelink_clip_api(
     require_read_auth(authorization)
     if not PINELINK_NAME.match(filename or ""):
         raise HTTPException(status_code=400, detail="bad name")
-    path = PINELINK_CLIPS / filename
+    path = pinelink_clips_dir() / filename          # #1118
     if not path.is_file():
         raise HTTPException(status_code=404, detail="no such clip")
     return FileResponse(path, media_type="video/mp4",
@@ -117273,6 +118148,13 @@ def export_after_cut(job: str, what: str) -> str:
         dest = dest_dir / f"{stamp}-{station_slug()}-{what}.mp3"
         shutil.copy2(CUTS_DIR / str(row["name"]), dest)
         row["exported"] = str(dest)
+        # #1114: and, when a Windows folder is named, the desk owes a copy.
+        desk = export_desk_dir()
+        if desk:
+            try:
+                row["carried"] = courier_add(dest, desk, what)["id"]
+            except Exception:  # noqa: BLE001
+                pass
         pipeline_log("air", f"spoken export landed: {export_host_words(dest)} "
                             "(#1025)")
         swept = export_sweep()
@@ -117327,6 +118209,254 @@ async def export_lines_run(job: str, count: int, label: str) -> None:
                                 f"lines-{int(count)}")
 
 
+
+# --- #1114: THE COURIER - exports carried to a Windows folder by the desk ---
+#
+# "ive been saving pine box recordings to \\10.89.1.125\QuickSwap\
+#  PineBoxRecordings when i export a file. When i tell the pine box i want
+#  to export a broadcast, I want it placed there. Offer settings that let me
+#  specify where things get exported to."
+#
+# The station cannot: compose mounts that share READ-ONLY at /samples
+# (measured - `docker inspect` says rw=false and /etc/fstab says ro), and
+# the container can write nowhere but /app. What CAN write there is the
+# Pine Box desktop app on the Windows machine. So a Windows/UNC destination
+# is remembered as `export_desk_dir`, every export still lands in the
+# station's own export folder, and a courier ledger names the copies owed;
+# the desk polls it, copies each file across, and reports back.
+EXPORT_COURIER_PATH = data_path("export_courier.json")
+_COURIER_LOCK = RLock()
+_COURIER_KEEP = 200
+
+
+def export_desk_dir() -> str:
+    try:
+        return str(load_settings().get("export_desk_dir") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def export_dir_windows(raw: str) -> str:
+    r"""A Windows spelling the desk can open - \\host\share\... or C:\... -
+    normalised to backslashes; '' otherwise. The UNC lead is TWO separators
+    and must stay two; every other run of separators collapses to one."""
+    said = str(raw or "").strip().strip("\"'`")
+    if not re.match(r"^(\\\\|//)[^\\/]+[\\/][^\\/]+|^[A-Za-z]:[\\/]", said):
+        return ""
+    lead = "\\\\" if re.match(r"^[\\/]{2}", said) else ""
+    body = said[2:] if lead else said
+    return lead + re.sub(r"[\\/]+", lambda _m: "\\", body).strip("\\")
+
+
+def courier_read() -> list[dict[str, Any]]:
+    try:
+        rows = json.loads(EXPORT_COURIER_PATH.read_text())
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def courier_write(rows: list[dict[str, Any]]) -> None:
+    EXPORT_COURIER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = EXPORT_COURIER_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows[-_COURIER_KEEP:], indent=1))
+    tmp.replace(EXPORT_COURIER_PATH)
+
+
+def courier_add(path: Path, dest: str, what: str = "broadcast") -> dict[str, Any]:
+    row = {"id": uuid.uuid4().hex[:10], "name": path.name, "path": str(path),
+           "dest": dest, "what": what, "at": time.time(), "state": "pending",
+           "bytes": int(path.stat().st_size) if path.is_file() else 0}
+    with _COURIER_LOCK:
+        rows = courier_read()
+        rows.append(row)
+        courier_write(rows)
+    pipeline_log("air", "courier: %s owed to %s (#1114)" % (path.name, dest))
+    return row
+
+
+def courier_pending() -> list[dict[str, Any]]:
+    """What the desk owes: the export ledger's pending rows, plus - when the
+    Pine Cam preference says carry - every kept clip newer than the last
+    one carried and old enough to be complete (#1118)."""
+    with _COURIER_LOCK:
+        rows = [r for r in courier_read() if r.get("state") == "pending"]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if Path(str(r.get("path") or "")).is_file():
+            out.append({"id": r["id"], "name": r["name"], "dest": r["dest"],
+                        "what": r.get("what"), "at": r.get("at"),
+                        "bytes": r.get("bytes"),
+                        "url": "/api/export/courier/%s/file" % r["id"]})
+    try:
+        prefs = pinelink_prefs_read()
+        if prefs.get("carry") and prefs.get("export_dir"):
+            floor = float(prefs.get("carried_until") or 0)
+            now = time.time()
+            clips = sorted(pinelink_clips_dir().glob("*.mp4"),
+                           key=lambda p: p.stat().st_mtime)
+            for p in clips:
+                st = p.stat()
+                # a segment is still being written for its first minutes
+                if st.st_mtime <= floor or now - st.st_mtime < 150:
+                    continue
+                out.append({"id": "cam-" + p.name, "name": p.name,
+                            "dest": str(prefs["export_dir"]),
+                            "what": "pinecam", "at": st.st_mtime,
+                            "bytes": st.st_size,
+                            "url": "/api/pinelink/clip/" + p.name})
+                if len(out) >= 8:
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+@app.get("/api/export/courier")
+async def export_courier_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    pending = await asyncio.to_thread(courier_pending)
+    prefs = pinelink_prefs_read()
+    return {"ok": True, "pending": pending, "desk_dir": export_desk_dir(),
+            "pinecam": {"export_dir": str(prefs.get("export_dir") or ""),
+                        "carry": bool(prefs.get("carry"))}}
+
+
+@app.get("/api/export/courier/{jid}/file")
+async def export_courier_file_api(
+    jid: str,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    require_read_auth(authorization)
+    row = next((r for r in courier_read() if str(r.get("id")) == jid), None)
+    if not row or not Path(str(row.get("path") or "")).is_file():
+        raise HTTPException(status_code=404, detail="no such export")
+    return FileResponse(row["path"], filename=str(row.get("name") or "export"))
+
+
+@app.post("/api/export/courier/done")
+async def export_courier_done_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    jid = str(body.get("id") or "")
+    ok = bool(body.get("ok"))
+    where = str(body.get("path") or "")[:400]
+    why = str(body.get("why") or "")[:200]
+    if jid.startswith("cam-"):
+        name = jid[4:]
+        if ok:
+            try:
+                at = (pinelink_clips_dir() / name).stat().st_mtime
+                prefs = pinelink_prefs_read()
+                pinelink_prefs_write({"carried_until": max(
+                    float(prefs.get("carried_until") or 0), at)})
+            except Exception:  # noqa: BLE001
+                pass
+        pipeline_log("air", "courier: pine cam clip %s %s (#1118)"
+                     % (name, ("carried to " + where) if ok
+                        else ("not carried: " + why)))
+        return {"ok": True, "id": jid}
+    with _COURIER_LOCK:
+        rows = courier_read()
+        for r in rows:
+            if str(r.get("id")) == jid:
+                r["state"] = "delivered" if ok else "failed"
+                r["done_at"] = time.time()
+                r["delivered"] = where
+                r["why"] = why
+                # A failure is retried by the desk on its next round; three
+                # failures and it stays failed so the ledger cannot loop.
+                if not ok:
+                    r["tries"] = int(r.get("tries") or 0) + 1
+                    if r["tries"] < 3:
+                        r["state"] = "pending"
+                break
+        courier_write(rows)
+    pipeline_log("air", "courier: %s %s (#1114)"
+                 % (jid, ("delivered to " + where) if ok else ("failed: " + why)))
+    return {"ok": True, "id": jid}
+
+
+def export_where_view() -> dict[str, Any]:
+    here = export_dir_path()
+    with _COURIER_LOCK:
+        rows = courier_read()
+    return {"ok": True,
+            "export_dir": str(load_settings().get("export_dir") or EXPORT_DEFAULT_DIR),
+            "export_host": export_host_words(here),
+            "export_share": share_path_of(here),
+            "export_desk_dir": export_desk_dir(),
+            "pending": sum(1 for r in rows if r.get("state") == "pending"),
+            "recent": [{k: r.get(k) for k in ("name", "dest", "state", "delivered",
+                                              "why", "at", "done_at")}
+                       for r in rows[-8:]]}
+
+
+@app.get("/api/export/where")
+async def export_where_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return export_where_view()
+
+
+@app.post("/api/export/where")
+async def export_where_set_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The settings the operator asked for: where exports go. A folder
+    under the station's data tree becomes export_dir; a Windows/UNC folder
+    becomes export_desk_dir (the desk carries it); '' clears the latter."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    settings = load_settings()
+    said: list[str] = []
+    if "export_desk_dir" in body:
+        raw = str(body.get("export_desk_dir") or "").strip()
+        win = export_dir_windows(raw) if raw else ""
+        if raw and not win:
+            return {"ok": False,
+                    "say": "that is not a Windows folder the desk can open - "
+                           "say \\\\host\\share\\folder or C:\\folder"}
+        settings["export_desk_dir"] = win
+        said.append(("the desk carries every export to " + win) if win
+                    else "the desk carries nothing; exports stay on the station")
+    if "export_dir" in body:
+        raw = str(body.get("export_dir") or "").strip()
+        dest = export_resolve(raw) if raw else (DATA_DIR / "export" / "broadcasts")
+        if dest is None:
+            return {"ok": False, "say": "I can't write to %s. %s"
+                    % (raw[:120], export_where_words())}
+        try:
+            rel = dest.relative_to(DATA_DIR)
+            settings["export_dir"] = "data/" + str(rel).replace("\\", "/")
+        except Exception:  # noqa: BLE001
+            settings["export_dir"] = EXPORT_DEFAULT_DIR
+        said.append("exports land at " + export_host_words(dest))
+    if not said:
+        return {**export_where_view(), "say": "nothing to change"}
+    try:
+        await asyncio.to_thread(save_settings, settings)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "say": "the setting would not save: %s" % str(exc)[:160]}
+    pipeline_log("air", "export settings: " + "; ".join(said) + " (#1114)")
+    return {**export_where_view(), "say": "; ".join(said)}
+
+
 async def export_command_run(cmd: dict[str, Any],
                              settings: dict[str, Any]) -> str:
     """#1025: act on parse_export_command's verdict and return what the
@@ -117335,6 +118465,21 @@ async def export_command_run(cmd: dict[str, Any],
         raw = str(cmd["dir"])
         dest = export_resolve(raw)
         if dest is None:
+            # #1114: a Windows folder is the DESK's to write, not this
+            # container's: remember it as the courier's destination.
+            win = export_dir_windows(raw)
+            if win:
+                try:
+                    await asyncio.to_thread(
+                        save_settings, {**settings, "export_desk_dir": win})
+                except Exception as exc:  # noqa: BLE001
+                    return f"The setting would not save: {exc}"
+                pipeline_log("air", f"spoken: exports are carried to {win} "
+                                    "by the desk (#1114)")
+                return (f"Broadcast exports now go to {win}. Every cut lands "
+                        f"in {export_host_words(export_dir_path())} and the "
+                        "Pine Box desk carries a copy across within half a "
+                        "minute while it is open.")
             return (f"I can't write to {raw}. " + export_where_words()
                     + " Exports stay at "
                     + export_host_words(export_dir_path()) + " for now.")
@@ -117361,7 +118506,7 @@ async def export_command_run(cmd: dict[str, Any],
     for old, row in list(_CUT_JOBS.items()):          # bounded
         if time.time() - float(row.get("at") or 0) > 3600:
             _CUT_JOBS.pop(old, None)
-    where = export_host_words(export_dir_path())
+    where = export_desk_dir() or export_host_words(export_dir_path())   # #1114
     if cmd.get("sentences"):
         n = int(cmd["sentences"])
         label = f"the last {n} sentence{'s' if n != 1 else ''} - spoken order"
@@ -121086,6 +122231,9 @@ async def sfx_info_api(
         "banned": sid in sfx_bans(),
         "weight": sfx_weights().get(sid, 1.0),
         "url": f"/sfx/{sid}?t={media_sign(sid)}",
+        # #1112: WHERE it lives, in the spelling a Windows machine can open.
+        "path": str(sample),
+        "host_path": share_path_of(sample),
         "spec_url": f"/api/sfx/spec/{sid}?t={media_sign(sid)}",
     }
 
@@ -126813,6 +127961,68 @@ async def sfx_video_cue_api(
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, "clip": clip, "say": pick.stem + " is on the set"}
+
+
+
+@app.get("/api/sfx/video/neighbour")
+async def sfx_video_neighbour_api(
+    id: str = "",
+    dir: str = "next",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1123/#1124: the clip AFTER (or before) this one in its own folder.
+
+    "allow me to go to the next video or the previous video and it goes to
+     the next video in that folder"; "if I expand it to say seven, it
+     plays that clip and the next seven clips in a row sequentially".
+
+    Folder order is name order, wrapping at the ends; banned clips and
+    clips too short to count are skipped. Nothing is rung here - the set
+    that asked plays it and rings it through /api/sfx/video/cut, exactly
+    as a sampler pad does, so every other surface follows."""
+    require_read_auth(authorization)
+    here = sfx_by_id(str(id or ""))
+    if here is None:
+        raise HTTPException(status_code=404, detail="No such clip")
+    back = str(dir or "next").lower().startswith("p")
+
+    def _pick() -> dict[str, Any]:
+        folder = here.parent
+        rows = sorted((p for p in folder.iterdir()
+                       if p.is_file() and p.suffix.lower() in SFX_VIDEO_TYPES),
+                      key=lambda p: p.name.lower())
+        if not rows:
+            return {"ok": False, "clip": None, "say": "the folder is empty"}
+        names = [p.name for p in rows]
+        try:
+            at = names.index(here.name)
+        except ValueError:
+            at = -1
+        bans = sfx_bans()
+        step = -1 if back else 1
+        for hop in range(1, len(rows) + 1):
+            cand = rows[(at + step * hop) % len(rows)]
+            key = sfx_id(cand)
+            if key in bans:
+                continue
+            try:
+                if cand.stat().st_size < 4096:
+                    continue
+            except OSError:
+                continue
+            secs = round(sfx_seconds(cand), 2)
+            return {"ok": True, "index": (at + step * hop) % len(rows),
+                    "count": len(rows), "folder": folder.name,
+                    "clip": {"url": f"/sfx/{key}?t={media_sign(key)}",
+                             "text": "", "sting": cand.stem, "video": True,
+                             "seconds": secs, "id": key},
+                    "say": "%s (%d of %d in %s)"
+                           % (cand.stem, ((at + step * hop) % len(rows)) + 1,
+                              len(rows), folder.name)}
+        return {"ok": False, "clip": None,
+                "say": "every other clip in %s is banned or empty" % folder.name}
+
+    return await asyncio.to_thread(_pick)
 
 
 @app.post("/api/sfx/video/cut")
@@ -139487,7 +140697,8 @@ def parse_export_command(text: str) -> dict[str, Any] | None:
     got = re.search(
         _EXPORT_VERB_RX + r".{0,24}?\b(?:the\s+)?(?:last|past|previous|"
         r"latest|recent|final)\s+(?:" + _EXPORT_NUM_RX + r"\s+)?"
-        r"(?P<unit>seconds?|secs?|minutes?|mins?|hours?|sentences?|lines?)"
+        r"(?P<unit>seconds?|secs?|minutes?|mins?|hours?|sentences?|lines?|"
+        r"pieces?|bits?|exchanges?|turns?)"
         r"\b" + _EXPORT_SUBJECT_RX, lowered)
     if not got:
         # "save out five minutes of radio", "cut me half an hour of the show"
@@ -139495,8 +140706,21 @@ def parse_export_command(text: str) -> dict[str, Any] | None:
         got = re.search(
             _EXPORT_VERB_RX + r".{0,16}?\b(?:" + _EXPORT_NUM_RX + r"\s+)"
             r"(?P<unit>seconds?|secs?|minutes?|mins?|hours?|sentences?|"
-            r"lines?)\b" + _EXPORT_SUBJECT_CORE, lowered)
+            r"lines?|pieces?|bits?|exchanges?|turns?)\b"
+            + _EXPORT_SUBJECT_CORE, lowered)
     if not got:
+        # #1114: "export this dialogue" - no window named: the exchange
+        # on the air now, taken as its last six sentences.
+        this = re.search(
+            _EXPORT_VERB_RX + r"\s+(?:this|that|the current|the present)\s+"
+            r"(?P<subject>dialogue|dialog|exchange|conversation|call|chat|"
+            r"banter|bit)\b", lowered)
+        if this:
+            residue = lowered[:this.start()] + " " + lowered[this.end():]
+            residue = re.sub(r"[^a-z ]+", " ", residue)
+            if len([w for w in residue.split()
+                    if w not in _EXPORT_FILLER]) <= 3:
+                return {"sentences": 6}
         return None
     if not got.group("subject") and any(
             str(got.group("verb") or "").startswith(v)
@@ -139513,7 +140737,8 @@ def parse_export_command(text: str) -> dict[str, Any] | None:
     left = [w for w in residue.split() if w not in _EXPORT_FILLER]
     if len(left) > 3:
         return None
-    if unit.startswith("sentence") or unit.startswith("line"):
+    if unit.startswith(("sentence", "line", "piece", "bit", "exchange",
+                        "turn")):                                  # #1114
         n = int(round(count))
         if n < 1 or n > 40:
             return None
@@ -151628,6 +152853,14 @@ then the tabloid, scrolling down the right half of the screen"
         Log conversations to Open WebUI (Pinebox)
       </label>
 
+      <!-- #1114: where a spoken export lands, and the Windows folder the
+           desk carries it to - the station cannot write to that share. -->
+      <label>Exports land at (a folder under the station's data)</label>
+      <input id="exportDir" type="text" placeholder="data/export/broadcasts">
+      <label>The desk carries every export to (a Windows folder; blank = nowhere)</label>
+      <input id="exportDeskDir" type="text"
+             placeholder="\\10.89.1.125\QuickSwap\PineBoxRecordings">
+
       <label>Context window (num_ctx)</label>
       <input id="numCtx" type="number"
              min="2048" max="32768" step="1024">
@@ -155175,6 +156408,10 @@ function writeEditorIntoSettings() {
     document.getElementById("longTermMemory").checked;
   settings.openwebui_logging =
     document.getElementById("openwebuiLogging").checked;
+  settings.export_dir =                                          /* #1114 */
+    (document.getElementById("exportDir").value.trim() || "data/export/broadcasts");
+  settings.export_desk_dir =
+    document.getElementById("exportDeskDir").value.trim();
   settings.num_ctx =
     Number(document.getElementById("numCtx").value);
   settings.render_replies =
@@ -155230,6 +156467,10 @@ function render() {
     settings.long_term_memory;
   document.getElementById("openwebuiLogging").checked =
     settings.openwebui_logging;
+  if (document.getElementById("exportDir")) {                    /* #1114 */
+    document.getElementById("exportDir").value = settings.export_dir || "";
+    document.getElementById("exportDeskDir").value = settings.export_desk_dir || "";
+  }
   document.getElementById("numCtx").value = settings.num_ctx;
   document.getElementById("renderReplies").value =
     (settings.render_replies || []).join("\n");
