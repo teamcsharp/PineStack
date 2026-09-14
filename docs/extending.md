@@ -168,11 +168,33 @@ commit.
 | the control panel | `CONTROL_PANEL_HTML` inside `app.py` |
 | the radio page | `RADIO_PAGE_HTML` inside `app.py` |
 | the desktop shell | `desktop/main.js`, `desktop/preload.js` |
-| the desk UI | `desktop/renderer/` — **many files, not three**: `index.html`, `renderer.js`, `styles.css`, plus `webview-preload.js` (the webview bridge), `script-page.js`/`script-page.css` (the SCRIPT view), `sampler.js` (the sample forge), `sfx-tv.js` (the CRT set) and the rest |
-| persisted state | `data/` — `prep_shelf.json`, `settings.json`, `pine_requests.md`, `crystals/`, `speakbox/` |
+| the desk UI | `desktop/renderer/` — **many files, not three**: `index.html`, `renderer.js`, `styles.css`, plus `webview-preload.js` (the webview bridge), `script-page.js`/`script-page.css` (the SCRIPT view), `sampler.js` (the sample forge), `sfx-tv.js` (the CRT set), `pine-cam.js` (the camera), `clip-doctor.js` (why the video button gave nothing), `talk-dot.js` (the orb) and the rest |
+| the tablet's copy of the desk UI | `C:\_tools\pinebox-android\PineBoxKiosk\app\src\main\assets\pine-views\` — byte-identical copies, injected by `ViewAssets.kt`; a change here needs `./deploy.sh`, never a bare gradle build (`docs/pinetab.md` §18) |
+| persisted state | `data/` — `prep_shelf.json`, `settings.json`, `pine_requests.md`, `crystals/`, `speakbox/`, `sfx_clips.db` (the clip book), `pinelink/` (camera state, recordings, cuts), `pinelink_pref.json`, `shares.json` (tune-in links, with the camera tick), `gap_log.jsonl` (every silence, with its cause) |
+| host-side units | `tools/pinelink.service`, `tools/pinelink-kick.{path,service}` (the flag-file door from the container to the radio), `tools/99-pine-neigh.conf` (the ARP ceiling) |
 
 The booth window, the hour view and The Works all live in
 `desktop/renderer/renderer.js`. The top status strip is
 `desktop/renderer/index.html`. Everything else has been split out into its
 own file beside them — look there first, `renderer.js` is no longer the whole
 desk.
+
+### 6.1 The roads added on 2026-09-14
+
+Each of these exists because a fault was measured that nothing could see.
+They are listed here so the next person finds the door before rebuilding it.
+
+| road | what it answers |
+| --- | --- |
+| `GET /api/deadair?hours=N` | The dead-air census: every silence in the window by hour, by cause and by the frame that was blocking the loop, with a verdict that says which of two *opposite* faults it was — a famine (more material) or a stall (take the named function off the loop). `learning_desk` reports the queue that #1371 moved the SQLite writes onto. |
+| `GET /api/sfx/doctor`, `POST /api/sfx/doctor/{ping,folders,rebuild}` | Why there is no clip, in terms that name a cure. Its first line is the tell for a stale Docker bind: the device id of `/samples` against the station's own data directory. |
+| `GET /api/sfx/db`, `POST /api/sfx/db/rebuild` | The clip book — `data/sfx_clips.db`. Every clip with its length and whether it is playable; the video button draws from it in about a millisecond and never touches the share. |
+| `GET /api/pinelink/look`, `/state`, `/doctor`, `/frame.jpg`, `/clips` | The Pine Cam, seen from the station. `doctor` asks the neighbour-table question first, because that is the one fault where the radio and the camera are both healthy and the join still fails. |
+| `POST /api/pinelink/{connect,reset-radio,on-air,public,cut}` | The cures and the switches. `connect` and `reset-radio` go through the host bridge (`pinelink-kick.path`) — there is no `systemctl` in the container. |
+| `GET /api/pinelink/viewers`, `GET /api/pinelink/mine`, `POST /api/share/camera` | Who outside the house may see the camera: nobody, the ticked tune-in links, or anyone with a link. The tick lives *on the link*, so revoking the link revokes the camera. `mine` answers for the caller's own token and lists nobody else's. |
+
+The public door (`:8097`) allows exactly `/api/pinelink/mine` and
+`/api/pinelink/frame.jpg` from that set, and both refuse a request that
+arrived through it without a token. The first cut did not — measured, a bare
+`GET` on `:8097` returned the frame — so read `PublicListenerGate` before
+widening `_PUBLIC_GET` again.

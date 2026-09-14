@@ -2022,3 +2022,151 @@ want is not on the screen you are looking at.
 `/api/pinebox/recover`. It does not touch `/api/broadcast/*`, and Reinitialise
 does not touch `/api/pinebox/*`. Two buttons, two disjoint trees; if one has
 not helped, the other is not a repeat.
+
+## 24. The Pine Cam
+
+A 4K Wi-Fi body camera (`H88_…`, an access point at `192.168.1.254`). It is
+held by the **spare USB radio** on the DGX (`wlx984827b6b478`, an RTL8821AU),
+never by the station's own (`wlP9s9`, which carries `10.89.1.246` and the
+broadcast); `tools/pinelink.py` refuses to run at all unless the station's
+radio still holds that address, and the camera's NetworkManager profile is
+pinned to the spare interface at priority −10 so it cannot be brought up on
+the wrong one. One ffmpeg pulls the RTSP stream and writes two things with
+`-c copy`: five-minute recordings under `data/pinelink/clips/` and an HLS
+playlist, plus a `frame.jpg` four times a second. That JPEG is what every
+surface shows — Chromium plays no HLS without a library this project does
+not vendor, and the tablet's WebView is the same engine.
+
+### On the tablet
+
+The tablet has no glass bar to hang a camera button in, so `pine-cam.js`
+builds its own: a small pulsing **CAM** flag on the right edge, above the
+view rail, that appears only while the link is live and goes when the camera
+does. Tap it for the picture-in-picture box — draggable, remembers where you
+left it, closes itself if the link drops rather than freezing on the last
+frame. (Before #1358 the file answered `undefined` for the station's address
+off the desktop and looked for a button that only the Electron chrome has,
+so on this tablet it did nothing at all.)
+
+### On the desktop
+
+The **Pine Cam** row in the sidebar reads like the tablet's row: what it is,
+whether it is reachable, what it is costing. It is always listed, because a
+device that only appears when it is working cannot tell you it is not. The
+tools icon beside the fold is the whole ladder from one press: ask the
+doctor, press the cure it names, wait for the link, open the picture — or
+say plainly that the camera itself is not on the air, because then the next
+move is a button on the camera. Under the fold: Look, Troubleshoot, **Reset
+radio**, Snapshot, Record, the on-air preference, and the viewer picker.
+
+Record is a **cut, not a capture**: the link is recording continuously
+anyway, so the button marks a moment, marks another, and the station cuts
+that span out of what is already on disk (`POST /api/pinelink/cut`). Nothing
+is missed at the head while a stream opens, stopping is instant, and the
+camera is never asked for a second client — these access-point cameras
+commonly refuse one. Save As goes through the Electron shell; a page cannot
+save a file where you want it.
+
+### Who may see it
+
+Three positions, not a switch: **nobody**, **picked**, **anyone with a
+link**. "Picked" is a tick beside each tune-in link on the Share panel, and
+the tick is stored *on the link* (`shares.json`), so revoking the link
+revokes the camera and no orphan permission is left pointing at nobody. The
+tune-in page asks `GET /api/pinelink/mine?t=<token>` — which answers for
+that token and lists no one else — and draws the same JPEG in a corner box.
+Every branch was measured against the running station: ticked 200, unticked
+403, forged tag 403, mode off 403, no token on `:8097` 403. That last one was
+a hole this work opened and closed on the same day; see `docs/extending.md`
+§6.1.
+
+### When it will not join
+
+The troubleshooter names the fault and the cure, and asks the questions in
+the order that matters:
+
+1. **Is the kernel still accepting neighbours?** On 2026-09-14 the camera was
+   on, the radio associated, and authentication timed out three tries
+   running while every reading said "healthy". The ARP table held 1,019
+   entries against a ceiling of 1,024 — five Docker bridges holding ~250
+   each — and a kernel that cannot record a new neighbour cannot finish an
+   ARP exchange with a device it has just met. `tools/99-pine-neigh.conf`
+   raises the ceiling (1024/4096/8192) and lets the collector run; the
+   table went from 1,019 to 23 the moment it did.
+2. **Does the radio see anything at all?** After refused associations this
+   chipset stops scanning entirely — admin-UP, no carrier, zero networks
+   with no error. `ip link` down/up does not clear it. **Reset radio** does:
+   an unbind/re-bind on the USB bus, through the host bridge
+   (`pinelink-kick.path`), because there is no `systemctl` inside the
+   container and the old Connect button could never have worked.
+3. **Is the camera on the air?** If the radio sees other networks and not
+   the camera's, the camera has slept its Wi-Fi to save battery or is out of
+   its ten-metre reach. Press the camera's Wi-Fi button; bring it closer.
+
+## 25. The clip doctor and the clip book
+
+### The day the station played no clips
+
+`/samples` inside the container held **zero files** while the same path on
+the host held 44 entries and 32,367 video clips. The share had not gone
+away; the container's bind had. On the host `/home/ehm_eckx/samples` was
+`dev=122` (the CIFS filesystem); inside, `/samples` was `dev=66306` — the
+host's root disk. The container was looking at the empty directory
+*underneath* the mount.
+
+A Docker bind is resolved when the container is **created** and is
+`rprivate`, so a share mounted on the host afterwards never propagates in.
+`docker compose restart` does not recreate the container — restarting, the
+obvious move and the ladder's last rung, could never have fixed this. Only
+`docker compose up -d --force-recreate spark-agent` does. Every reader in
+the station answered "no samples", which is indistinguishable from an empty
+library, so nothing could see it. `GET /api/sfx/doctor` now prints the tell
+first: the device id of `SFX_ROOT` against the station's own data directory.
+
+### The book (#1362)
+
+Four earlier attempts at "the video button must be instant" were all a memo
+in RAM in front of the same share walk, so every restart put the button back
+at *still warming* for as long as the walk took — and the walk was dying
+silently behind an `except Exception: pass`. `data/sfx_clips.db` is a SQLite
+book of every clip: path, length, playable. An indexer thread writes it,
+commits **per folder**, and starts at boot; a tap is one indexed read on a
+reader connection of its own, on an executor of its own, and never touches
+the share. Measured with the indexer still walking: `/healthz` 5–22 ms, the
+tap 11–25 ms on eleven of twelve; after a restart the book already held
+20,724 playable video clips before any walk began.
+
+Two things only measuring found: a random-rowid pick returned the **same
+clip four times in ten** (rows are written a folder at a time, so the first
+clip after each run of audio wins — it is `COUNT`+`OFFSET` now, uniform);
+and the length lookup keyed the ledger by `path:mtime`, a stat on CIFS —
+the book hands the length over with the path.
+
+### The popup
+
+A miss on the video button used to print *"still warming — tap again"* for
+four different faults, only one of which tapping again cures. It opens the
+**clip doctor** instead: the station's verdict, the steps, the counts, and
+four thumb-sized buttons — **Rebuild** (every clip cache cleared and the
+library read again), **Ping the server** (is the share answering, and how
+fast — a slow answer is as much the diagnosis as a failed one), **Query the
+folders** (what is actually in each named clip folder), **Try a clip**. The
+cure the doctor named gets the accent. One file serves both surfaces:
+`clip-doctor.js` uses bare paths where the page is served by the station and
+the bridge where the document is `file://`.
+
+### The dead air was not the script
+
+The operator's model was that the hour has holes because the scripts are not
+dense enough. `GET /api/deadair` reads the gap ledger and says which of two
+*opposite* faults an hour was — a famine (write more) or a stall (take the
+named function off the loop). Over 24 hours: **93% of all dead air was a
+blocked event loop**, and the record named the blockers. The largest single
+one was the sample pool's `publish` callback re-filtering the whole
+accumulated list through `sfx_id()` twice per path on every emit, on the
+loop, ~2,500 times per walk, once a minute (#1370). The next were the
+learning desks writing SQLite synchronously from inside the tint pass
+(#1371). `air_first()` now reads the pulse sentinel and stands the desks
+down the moment the loop is late rather than after twelve seconds of
+silence (#1372). The census carries the numbers; the note
+`docs/notes/the-bind-underneath-the-mount.md` carries the day.

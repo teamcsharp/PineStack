@@ -16,7 +16,8 @@ import time
 import traceback
 import uuid
 import wave
-from contextvars import ContextVar
+import queue as _queue_mod             # #1371: the learning desk's line
+from contextvars import ContextVar, copy_context
 from contextlib import ExitStack
 from functools import wraps
 from html import escape as html_escape, unescape as html_unescape
@@ -262,13 +263,87 @@ def crystal_fluid_proof(report: Any) -> bool:
     return isinstance(turns, list) and any(crystal_fluid_proof(turn) for turn in turns)
 
 
+# --- #1371: THE LEARNING DESK IS NOT THE BROADCAST ---------------------
+#
+# _PROMPT_LEARNING is a SQLite store. observe(), decision() and outcome()
+# each open a connection, BEGIN IMMEDIATE, write, and commit - which is
+# an fsync - and every one of them was called synchronously on the event
+# loop, from inside the tint pass that is writing the next line. #1314
+# measured 16.73s in a single call and put an air_first() guard in front,
+# but a guard that reads 'has the air gone quiet for 12 seconds' can only
+# ever fire AFTER the dead air it exists to prevent.
+#
+# /api/deadair over 24h: prompt_learning_observe 3,798s across 43 gaps,
+# crystal_learning_note 2,387s across 42 - 88 seconds per gap, which is
+# not one commit but the loop stuck behind a disk that is also being
+# asked to serve records. Together, one fifth of every stalled second.
+#
+# So the store is written by ONE daemon thread, in order, from a queue.
+# The call sites hand over the row and carry on; every one of them
+# discarded the return value already (measured: four callers, none read
+# it). contextvars are copied at the hand-over, because _LAB_RUNTIME
+# reads its trace id from one and a bare thread would see none - the
+# lab trace would have quietly lost every learning_outcome row.
+_LEARNING_DESK: Any = _queue_mod.Queue()
+_LEARNING_DESK_MOST = 4000          # a wedged store must not eat memory
+_LEARNING_DESK_STATE: dict[str, Any] = {"thread": None, "dropped": 0,
+                                        "done": 0}
+_LEARNING_DESK_LOCK = RLock()
+
+
+def _learning_desk_worker() -> None:
+    while True:
+        ctx, fn, args = _LEARNING_DESK.get()
+        try:
+            ctx.run(fn, *args)
+        except Exception:  # noqa: BLE001
+            pass                    # each body already records its own errors
+        finally:
+            _LEARNING_DESK_STATE["done"] += 1
+            _LEARNING_DESK.task_done()
+
+
+def _learning_desk_post(fn: Any, *args: Any) -> None:
+    """Hand a store write to the desk. Never blocks, never raises."""
+    try:
+        with _LEARNING_DESK_LOCK:
+            t = _LEARNING_DESK_STATE.get("thread")
+            if t is None or not t.is_alive():
+                t = Thread(target=_learning_desk_worker,
+                           name="learning-desk", daemon=True)
+                _LEARNING_DESK_STATE["thread"] = t
+                t.start()
+        if _LEARNING_DESK.qsize() >= _LEARNING_DESK_MOST:
+            _LEARNING_DESK_STATE["dropped"] += 1
+            return
+        _LEARNING_DESK.put_nowait((copy_context(), fn, args))
+    except Exception:  # noqa: BLE001
+        _LEARNING_DESK_STATE["dropped"] += 1
+
+
+def learning_desk_state() -> dict[str, Any]:
+    t = _LEARNING_DESK_STATE.get("thread")
+    return {"queued": _LEARNING_DESK.qsize(),
+            "done": int(_LEARNING_DESK_STATE.get("done") or 0),
+            "dropped": int(_LEARNING_DESK_STATE.get("dropped") or 0),
+            "alive": bool(t is not None and t.is_alive())}
+
+
 def prompt_learning_observe(row: dict[str, Any], *, decision: bool = False) -> dict[str, Any] | None:
-    """Learn only from durable refusals and explicit individual reviews."""
-    # #1314: and not while the air is at risk - 16.73s of blocked loop
-    # in a single measured call. The refusal it would have learned from
-    # is still on the record; only the learning is skipped.
+    """Learn only from durable refusals and explicit individual reviews.
+
+    #1371: queued to the learning desk; the write happens off the loop.
+    Returns None - every caller already discarded the result."""
+    # #1314: not while the air is at risk. Kept at the call site, where
+    # its timing is what it always was; the desk itself never asks.
     if air_first():
-        return
+        return None
+    _learning_desk_post(_prompt_learning_observe_now, row, decision)
+    return None
+
+
+def _prompt_learning_observe_now(row: dict[str, Any], decision: bool = False) -> dict[str, Any] | None:
+    """The body of prompt_learning_observe, run on the learning desk."""
     if _REJECTION_LAB_PREVIEW.get():
         return
     try:
@@ -1124,6 +1199,26 @@ DEFAULT_DJ = {
     "caller_carefree": 12,
     # #835: how often the SFX Guy pipes up, per host statement (0-100).
     "sfxguy_rate": 40,
+    # #1366: of the clips he draws, what share should carry a PICTURE.
+    #
+    # "I want a slider for the SFX guy that allows me to choose between if
+    #  he uses MP fours more often or MP threes. I basically want him by
+    #  default using twice as many MP fours as MP threes."
+    #
+    # Twice as many is two in three, so 67. #1122 opened the draw to video
+    # at all (2,779 .mp4 against 11,257 .mp3 in the library at the time) by
+    # putting both families in SFX_TYPES, and from that day the mix was
+    # whatever the folder happened to hold - roughly one picture in five,
+    # with no way to say otherwise. This is that dial. 0 is the behaviour
+    # before #1122, sound only; 100 is pictures only, which is what the
+    # video mode below turns it into while it is on.
+    #
+    # It re-weights the DRAW; it removes nothing from the library, so every
+    # mp3 he has now is still one he can play.
+    "sfx_video_share": 67,
+    # #1366: the endless set. Off by default - it changes what the
+    # operator's own screens are doing, so it only ever starts by hand.
+    "sfx_video_mode": False,
     "sfx_every_units": 0,
     "sfxguy_every_units": 4,
     # #799: how often what he says is a freshly WARPED invention (0-100).
@@ -2158,6 +2253,17 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "sfxguy_rate": max(0, min(100, int(
             raw_dj.get("sfxguy_rate",
                        DEFAULT_DJ["sfxguy_rate"]) or 0))),
+        # #1366: the picture share rides it too. `or 0` would turn a
+        # deliberate 0 into the default on every other dial here, which is
+        # why this one asks whether the key is present instead - "sound
+        # only" is a setting somebody may actually want.
+        "sfx_video_share": max(0, min(100, int(
+            raw_dj.get("sfx_video_share",
+                       DEFAULT_DJ["sfx_video_share"]) if
+            raw_dj.get("sfx_video_share") is not None else
+            DEFAULT_DJ["sfx_video_share"]))),
+        "sfx_video_mode": bool(raw_dj.get("sfx_video_mode",
+                                          DEFAULT_DJ["sfx_video_mode"])),
         "sfxguy_warp": max(0, min(100, int(
             raw_dj.get("sfxguy_warp",
                        DEFAULT_DJ["sfxguy_warp"]) or 0))),
@@ -4023,10 +4129,10 @@ def te_self_page_svg(doc: dict[str, Any], page: dict[str, Any]) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}"'
         f' width="{width}" height="{height}">'
         '<style>'
-        '.t{font:600 15px Georgia,serif,PineIcons;fill:#8a8578;letter-spacing:.09em}'
-        '.h{font:700 27px Georgia,serif,PineIcons;fill:#20242b}'
-        '.b{font:17px Georgia,serif,PineIcons;fill:#3b4048}'
-        '.p{font:13px Georgia,serif,PineIcons;fill:#8a8578}'
+        '.t{font:600 15px PineIcons, PineIcons, Georgia, serif;fill:#8a8578;letter-spacing:.09em}'
+        '.h{font:700 27px PineIcons, PineIcons, Georgia, serif;fill:#20242b}'
+        '.b{font:17px PineIcons, PineIcons, Georgia, serif;fill:#3b4048}'
+        '.p{font:13px PineIcons, PineIcons, Georgia, serif;fill:#8a8578}'
         '</style>'
         f'<rect width="{width}" height="{height}" fill="#f4f1ea"/>'
         f'<text x="46" y="58" class="t">'
@@ -13486,16 +13592,43 @@ def box_depth() -> float:
 _VOICE_MEDIA_SNAP: dict[str, Any] = {"at": 0.0, "names": frozenset()}
 
 
-def _voice_media_names() -> frozenset:
-    now = time.time()
-    if now - float(_VOICE_MEDIA_SNAP["at"]) < 5.0:
-        return _VOICE_MEDIA_SNAP["names"]
+_VOICE_MEDIA_SNAP_BUSY = [False]
+
+
+def _voice_media_snap_refresh() -> None:
+    """#1376: the scandir, on a thread of its own."""
     try:
         names = frozenset(e.name for e in os.scandir(VOICE_MEDIA_DIR))
     except OSError:
         names = frozenset()
-    _VOICE_MEDIA_SNAP.update({"at": now, "names": names})
-    return names
+    _VOICE_MEDIA_SNAP.update({"at": time.time(), "names": names})
+    _VOICE_MEDIA_SNAP_BUSY[0] = False
+
+
+def _voice_media_names() -> frozenset:
+    """#1376: A SNAPSHOT IS ANSWERED, NEVER TAKEN, ON THE LOOP.
+
+    #1142 replaced a Path.exists() per key with one scandir every five
+    seconds, which was right. But the scandir itself still ran on the
+    loop, and the pulse caught it at 8.2s: the voice store is on the
+    same disk the pantry flusher writes 13.5 MB to every twenty seconds
+    and the clip book commits to per folder, so a readdir of forty
+    thousand entries waits behind that queue. The first call of a
+    process takes the snapshot inline (there is nothing to answer
+    with yet); every later refresh is kicked to a daemon thread and the
+    caller gets the previous snapshot, at most five seconds old."""
+    now = time.time()
+    if not _VOICE_MEDIA_SNAP["at"]:
+        _voice_media_snap_refresh()
+        return _VOICE_MEDIA_SNAP["names"]
+    if now - float(_VOICE_MEDIA_SNAP["at"]) >= 5.0 and not _VOICE_MEDIA_SNAP_BUSY[0]:
+        _VOICE_MEDIA_SNAP_BUSY[0] = True
+        try:
+            Thread(target=_voice_media_snap_refresh, name="voice-media-snap",
+                   daemon=True).start()
+        except Exception:  # noqa: BLE001
+            _VOICE_MEDIA_SNAP_BUSY[0] = False
+    return _VOICE_MEDIA_SNAP["names"]
 
 
 def _pantry_key_ready(key: str) -> bool:
@@ -15594,6 +15727,46 @@ SILENCE_LOSES_AFTER = 20.0
 # stand down. Shorter than SILENCE_LOSES_AFTER on purpose, so the loop
 # is already clearing when the rescue above needs it.
 AIR_FIRST_AFTER = 12.0
+# #1372: ...and how long after a measured stall the desks keep standing
+# down, so the loop clears before they ask it for anything.
+AIR_FIRST_AFTER_STALL = 10.0
+# #1372b: ...but only after a stall the gap ledger would call one. The
+# pulse marks a stall at 1.5s and this station's baseline is a blip of
+# 1.6-3.0s every ten seconds or so - C-level json.dumps in the flusher
+# threads holding the GIL, with no app.py frame on the main thread.
+# Measured 21 minutes after #1372 landed: 107 such blips, the learning
+# desk at done=0 and never started, because a ten-second hold after
+# each one is a hold that never lifts. _gap_cause counts a stall from
+# 3.0s; so does this.
+AIR_FIRST_STALL_MIN_S = 3.0
+
+
+def _loop_just_stalled() -> bool:
+    """#1372: PROACTIVE, NOT POST-MORTEM.
+
+    air_first() asked one question: has the cast been quiet for twelve
+    seconds? That is the SYMPTOM of a blocked loop, so the desks stood
+    down only after the dead air had started, and #1314's guard could
+    never have prevented what it was added to prevent.
+
+    The pulse sentinel (#1156) already knows the loop is late - its
+    watcher thread marks a stall open at 1.5s and records it when it
+    closes. This reads that: a stall open now, or one that closed in the
+    last few seconds, is reason enough for anything that is not the
+    broadcast to wait its turn. Two dict reads; no lock, because a torn
+    read here costs one skipped grade and nothing else."""
+    try:
+        open_stall = _PULSE.get("open")
+        if (open_stall is not None
+                and float(open_stall.get("seconds") or 0) >= AIR_FIRST_STALL_MIN_S):
+            return True
+        last = _PULSE.get("last") or {}
+        if float(last.get("seconds") or 0) < AIR_FIRST_STALL_MIN_S:
+            return False                    # #1372b: a blip, not a stall
+        ended = float(last.get("at") or 0) + float(last.get("seconds") or 0)
+        return bool(ended and time.time() - ended < AIR_FIRST_AFTER_STALL)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def air_first() -> bool:
@@ -15610,9 +15783,13 @@ def air_first() -> bool:
     try:
         if not _RADIO.get("on") or radio_paused():
             return False
-        return talk_quiet_for() >= AIR_FIRST_AFTER
+        if talk_quiet_for() >= AIR_FIRST_AFTER:
+            return True
+        return _loop_just_stalled()          # #1372
     except Exception:  # noqa: BLE001
         return False
+
+
 UNHEARD_QUIET_AFTER = 20.0     # seconds of cast silence
 UNHEARD_QUIET_EVERY = 15.0     # the rest that replaces the interval
 UNHEARD_RETRY_EVERY = 20.0     # what a refused pick costs instead
@@ -15972,15 +16149,87 @@ def unheard_state() -> dict[str, Any]:
     return dict(out)
 
 
+def cupboard_cued() -> list[tuple[str, dict[str, Any], float]]:
+    """#1364: the rounds an operator has forced into the queue by hand.
+
+    "Offer me an option that allows me to click on a segment and cue it
+     for play on the station where it's basically forced to be played and
+     it's forced into queue and the orchestrator fits it into a dead air
+     moment."
+
+    `top` (#1260) was the whole of "cue it up" before this, and it is
+    positional only: it moves the row to the head of its list, where the
+    next shelf_put, trim or take of that road can undo it silently and
+    nothing anywhere records that a person asked. A cue is written ONTO
+    the row instead, so it survives a save, a restart and a reorder, and
+    the standing consumer reads it ahead of everything else.
+
+    Every road, not only the four that are open out of turn - the whole
+    point of the ask is "I want this to be able to execute everything
+    that we ever [put] in the cupboard" - and no dial: a cued round does
+    not have to have waited two hours to be wanted, because it was just
+    asked for. Oldest cue first, so pressing it five times airs them in
+    the order they were pressed."""
+    out: list[tuple[str, dict[str, Any], float]] = []
+    try:
+        piles: list[tuple[str, list[Any]]] = [("banter", list(_LARDER))]
+        piles += [(str(k), list(v or [])) for k, v in list(_SHELF.items())]
+        for kind, rows in piles:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                at = float(row.get("cue_at") or 0)
+                if at <= 0:
+                    continue
+                if not row_unaired(row):
+                    row.pop("cue_at", None)     # spent: it went out
+                    continue
+                out.append((kind, row, at))
+    except Exception:  # noqa: BLE001
+        pass
+    out.sort(key=lambda r: r[2])
+    return out
+
+
+def cupboard_cue_state() -> dict[str, Any]:
+    """What is cued, and whether each one can actually go out."""
+    rows = []
+    for kind, row, at in cupboard_cued():
+        rows.append({"id": retire_id(kind, row), "kind": kind,
+                     "label": retire_kind_label(kind),
+                     "text": retire_text(kind, row),
+                     "cued_at": at, "waited": round(time.time() - at),
+                     "ready": bool(dialogue_row_ready(kind, row)),
+                     **cupboard_row_progress(kind, row)})
+    ready = sum(1 for r in rows if r["ready"])
+    return {"at": time.time(), "cued": len(rows), "ready": ready, "rows": rows,
+            "say": ("%d round(s) are cued by hand, %d of them finished and "
+                    "waiting for the next gap" % (len(rows), ready))
+                   if rows else "nothing is cued by hand"}
+
+
 def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
     """The one round that has waited longest and can actually go out.
 
     Oldest first across every road that is open out of turn, so the
     cupboard drains in the order it filled and no road can starve another
-    by being busier."""
+    by being busier.
+
+    #1364: a HAND-CUED round comes before all of that, on any road and
+    with no dial under it. That is what "forced into queue" means, and it
+    is the only thing here that a person asked for directly."""
     now = time.time()
     after = cupboard_unheard_after()
     best: tuple[str, dict[str, Any] | None, float] = ("", None, 0.0)
+    try:
+        for kind, row, at in cupboard_cued():
+            if id(row) in _READY_SHELF_BUSY:
+                continue
+            if not dialogue_row_ready(kind, row):
+                continue
+            return (kind, row, max(0.0, now - float(row.get("at") or now)))
+    except Exception:  # noqa: BLE001
+        pass
     try:
         for kind in RESCUE_ROADS_OPEN:
             for row in shelf_rows(kind):
@@ -16052,6 +16301,313 @@ def unheard_replace_sweep() -> list[str]:
             "can write something that will go out (#1260)"
             % (len(asked), cupboard_ago(CUPBOARD_REPLACE_AFTER)))
     return asked
+
+
+
+# --- #1363: THE RECORDING ROOM COMES BACK ------------------------------------
+#
+# "I want an option at the top of the retirement desk to resume having the
+#  recording room record the dialogue that's present ... I need options at
+#  the top that basically allows me to send these back to the recording
+#  room ... finish these, cue these up to be complete."
+#
+# WHY THE CUPBOARD IS FULL OF THINGS THAT CANNOT AIR. Counted off the live
+# shelf the morning this went in (data/prep_shelf.json, 2026-09-14):
+#
+#     road      rows   off brief   part recorded   FULLY RECORDED
+#     manager     40          10              29                1
+#     gallery    106          23              82                1
+#     caller     135           0             117                2
+#     recap        6           6               0                0
+#     news         2           0               1                1
+#
+# Five rounds out of two hundred and eighty-nine are finished radio. The
+# rest are paid-for writes holding half their audio. /api/cupboard/unheard
+# agreed from the other side that minute: manager 40 rows, 21 never heard,
+# READY ZERO; gallery 106 rows, 87 never heard, READY ZERO; recap 6 of 6
+# never heard, READY ZERO. That is the whole of "I never hear the manager
+# messages" (#1101) and "the hourly recaps never run" (#1103). It is not a
+# scheduling fault, a quota or a closed road: there was nothing finished
+# for the schedule to choose.
+#
+# The reason is one line in pantry_keeper, and it is deliberate:
+#
+#     _committed_unready = committed_stock_ids(ready=False)
+#     # The rooms may finish only rows that the next four hours have
+#     # actually selected; surplus cupboard material is neither tinted
+#     # nor recorded merely because it happens to exist.
+#
+# A round the four-hour desk has stopped naming is never worked on again.
+# It was named once, took 50% of its lines in the slice it was given, the
+# hour turned, and it became "surplus" - so it holds 50% of its lines for
+# ever. Nothing sweeps those up, because from the desk's point of view they
+# no longer exist. #1106 already found half this fault from the other end
+# and let a round air as its opening, but larder_part_ok wants 45% of the
+# lines AND 75 seconds, and the measured rounds are at 20-25%.
+#
+# That gate is RIGHT for the automatic rooms - it is what stops the station
+# recording a thousand rounds nobody asked for. It is wrong as an answer to
+# an operator looking straight at the round and saying finish that one. So
+# this is a second, explicit work list the keeper honours ALONGSIDE the
+# desk's picks, never instead of them. Nothing enters it on the station's
+# own say-so; every id in it was put there by a hand.
+#
+# Two locks come off on the way in, or the room refuses the row it has just
+# been handed:
+#
+#   off_brief - larder_prepare returns False on it outright, and so does
+#       dialogue_row_viable, which the keeper's own pool test calls. A
+#       brief belongs to ONE hour: a recap written for the 4 PM hour can
+#       never pass 5 PM's brief, which is why all six recap rounds carry it
+#       and why cupboard_why_row's advice for that code is the flat "this
+#       one will never air". An operator asking for it now is a better
+#       authority than an hour that has already gone, so the flag comes off
+#       and WHY it came off is written onto the row where the desk can see.
+#
+#   yielded - the round stood aside for live work and was never asked back.
+#
+# `preparing` is NOT cleared. That one is a live lock held by a sitting in
+# progress, and clearing it would let two sittings render the same line
+# twice.
+CUPBOARD_FINISH_PATH = data_path("cupboard_finish.json")
+CUPBOARD_FINISH_MOST = 500          # a bounded list, not a second shelf
+_FINISH_QUEUE: dict[str, Any] = {"ids": [], "why": {}, "at": 0.0,
+                                 "done": [], "added": 0, "finished": 0}
+_FINISH_LOADED = [False]
+
+
+def _cupboard_finish_load() -> dict[str, Any]:
+    """The queue outlives the process - a restart must not lose the ask."""
+    if _FINISH_LOADED[0]:
+        return _FINISH_QUEUE
+    _FINISH_LOADED[0] = True
+    try:
+        raw = json.loads(CUPBOARD_FINISH_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            _FINISH_QUEUE["ids"] = [str(x) for x in (raw.get("ids") or [])][:CUPBOARD_FINISH_MOST]
+            _FINISH_QUEUE["why"] = dict(raw.get("why") or {})
+            _FINISH_QUEUE["done"] = [str(x) for x in (raw.get("done") or [])][-60:]
+            _FINISH_QUEUE["added"] = int(raw.get("added") or 0)
+            _FINISH_QUEUE["finished"] = int(raw.get("finished") or 0)
+            _FINISH_QUEUE["at"] = float(raw.get("at") or 0)
+    except FileNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    return _FINISH_QUEUE
+
+
+def _cupboard_finish_save() -> None:
+    try:
+        CUPBOARD_FINISH_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CUPBOARD_FINISH_PATH.write_text(
+            json.dumps(_FINISH_QUEUE, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def cupboard_finish_ids() -> set[str]:
+    """The ids the keeper must work whatever the four-hour desk thinks.
+
+    Read on every keeper lap, so it stays a plain set lookup and never
+    touches the disk after the first call."""
+    try:
+        return set(_cupboard_finish_load()["ids"])
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def cupboard_row_complete(kind: str, row: Any) -> bool:
+    """Is this a finished recording, or a round still being built?
+
+    #1107: "if an entry is incomplete, it needs to be greyed out because
+    that's not a valid entry ... we only need to be putting in the cupboard
+    complete recordings that are able to be used as segments."
+
+    The same three questions dialogue_stock_items._audio asks, which is the
+    definition the air itself uses: every line planned, every line made, and
+    every clip still in the pantry. A produced spot carries its own mp3 and
+    has no plan at all, so it is complete by having nothing owed."""
+    try:
+        entry = dialogue_entry(row)
+        if entry is None:
+            return bool(row.get("produced") or str(row.get("key") or "") in _PANTRY)
+        want = int(entry.get("chunks") or 0)
+        made = int(entry.get("made") or 0)
+        if want <= 0 or made < want or entry.get("partial"):
+            return False
+        keys = [str(k) for k in (entry.get("keys") or []) if str(k)]
+        keys += [str(t.get("key") or "") for t in (entry.get("takes") or [])
+                 if isinstance(t, dict) and str(t.get("key") or "")]
+        return bool(keys and all(k in _PANTRY for k in set(keys)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def cupboard_row_progress(kind: str, row: Any) -> dict[str, Any]:
+    """made / wanted / the share of it, for the desk's grey-out and bar."""
+    out = {"made": 0, "want": 0, "share": 0.0, "complete": False,
+           "off_brief": False, "queued": False}
+    try:
+        entry = dialogue_entry(row) or {}
+        out["want"] = int(entry.get("chunks") or 0)
+        out["made"] = int(entry.get("made") or 0)
+        out["share"] = round(out["made"] / float(out["want"]), 3) if out["want"] else 0.0
+        out["complete"] = cupboard_row_complete(kind, row)
+        out["off_brief"] = bool(row.get("off_brief") or entry.get("off_brief"))
+        out["queued"] = retire_id(kind, row) in cupboard_finish_ids()
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def cupboard_finish_add(kind: str, row: Any, why: str = "") -> dict[str, Any]:
+    """Send ONE round back to the recording room, and take its locks off."""
+    rid = retire_id(str(kind), row)
+    if not rid:
+        return {"ok": False, "id": "", "say": "that row has no id to queue"}
+    if cupboard_row_complete(str(kind), row):
+        return {"ok": False, "id": rid, "complete": True,
+                "say": "it is already a complete recording - nothing is owed"}
+    queue = _cupboard_finish_load()
+    entry = dialogue_entry(row)
+    cleared: list[str] = []
+    for holder in (row, entry):
+        if not isinstance(holder, dict):
+            continue
+        if holder.get("off_brief"):
+            holder["off_brief"] = False
+            holder["off_brief_cleared_at"] = time.time()
+            holder["off_brief_cleared_why"] = (
+                str(why or "the operator sent it back to the recording room")[:200])
+            cleared.append("off_brief")
+        if holder.get("yielded"):
+            holder.pop("yielded", None)
+            holder.pop("yielded_at", None)
+            cleared.append("yielded")
+    if rid not in queue["ids"]:
+        queue["ids"].append(rid)
+        queue["added"] = int(queue.get("added") or 0) + 1
+        del queue["ids"][CUPBOARD_FINISH_MOST:]
+    queue["why"][rid] = str(why or "sent back by hand")[:160]
+    queue["at"] = time.time()
+    _cupboard_finish_save()
+    if cleared:
+        try:
+            _pantry_save(True)
+        except Exception:  # noqa: BLE001
+            pass
+    progress = cupboard_row_progress(str(kind), row)
+    return {"ok": True, "id": rid, "kind": str(kind), "cleared": sorted(set(cleared)),
+            "progress": progress,
+            "say": "it is back in front of the recording room - %d of %d line(s) "
+                   "recorded%s" % (progress["made"], progress["want"],
+                                   (", and its stale %s flag is off"
+                                    % " and ".join(sorted(set(cleared))))
+                                   if cleared else "")}
+
+
+def cupboard_finish_sweep() -> int:
+    """Drop the ids that have become finished radio, and say so.
+
+    Called off the keeper's own lap, so the queue empties itself as the
+    room works through it and the desk's count is always live."""
+    queue = _cupboard_finish_load()
+    ids = list(queue.get("ids") or [])
+    if not ids:
+        return 0
+    gone = 0
+    for rid in ids:
+        kind, row = cupboard_find(rid)
+        if row is None:
+            # It aired, or the retirement desk took it. Either way the
+            # room owes nothing on it.
+            queue["ids"].remove(rid)
+            queue["why"].pop(rid, None)
+            gone += 1
+            continue
+        if cupboard_row_complete(kind, row):
+            queue["ids"].remove(rid)
+            queue["why"].pop(rid, None)
+            queue["done"] = (list(queue.get("done") or [])
+                             + [{"id": rid, "kind": kind, "at": time.time(),
+                                 "seconds": round(float((dialogue_entry(row) or {}).get("seconds") or 0), 1)}])[-60:]
+            queue["finished"] = int(queue.get("finished") or 0) + 1
+            gone += 1
+            pipeline_log("lookahead",
+                         "(#1363) a round the operator sent back to the "
+                         "recording room is finished: %s, %ss of audio - "
+                         "%d still owed"
+                         % (kind, round(float((dialogue_entry(row) or {}).get("seconds") or 0), 1),
+                            len(queue["ids"])))
+    if gone:
+        _cupboard_finish_save()
+    return gone
+
+
+def cupboard_finish_state() -> dict[str, Any]:
+    """What the room still owes the operator, row by row."""
+    queue = _cupboard_finish_load()
+    rows: list[dict[str, Any]] = []
+    made = want = 0
+    for rid in list(queue.get("ids") or []):
+        kind, row = cupboard_find(rid)
+        if row is None:
+            rows.append({"id": rid, "kind": "", "gone": True,
+                         "why": queue["why"].get(rid, "")})
+            continue
+        progress = cupboard_row_progress(kind, row)
+        made += progress["made"]
+        want += progress["want"]
+        rows.append({"id": rid, "kind": kind, "label": retire_kind_label(kind),
+                     "text": retire_text(kind, row), "gone": False,
+                     "why": queue["why"].get(rid, ""), **progress})
+    left = want - made
+    return {"at": time.time(), "queued": len(queue.get("ids") or []),
+            "rows": rows, "lines_made": made, "lines_wanted": want,
+            "lines_owed": max(0, left),
+            "added": int(queue.get("added") or 0),
+            "finished": int(queue.get("finished") or 0),
+            "done": list(queue.get("done") or [])[-12:],
+            "say": ("the recording room owes %d line(s) across %d round(s) "
+                    "the operator sent back; %d round(s) finished so far"
+                    % (max(0, left), len(queue.get("ids") or []),
+                       int(queue.get("finished") or 0)))
+                   if queue.get("ids") else
+                   ("nothing is waiting for the recording room - %d round(s) "
+                    "have been finished this way"
+                    % int(queue.get("finished") or 0))}
+
+
+def cupboard_incomplete_rows(kind: str = "") -> list[tuple[str, dict[str, Any]]]:
+    """Every cupboard round that is written but not finished recording.
+
+    The population the top-of-desk button acts on. A row already in the
+    queue is still listed - the desk shows it as queued rather than
+    pretending it is done."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    try:
+        piles: list[tuple[str, list[Any]]] = [("banter", list(_LARDER))]
+        piles += [(str(k), list(v or [])) for k, v in list(_SHELF.items())]
+        for road, rows in piles:
+            if kind and road != kind:
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if cupboard_row_complete(road, row):
+                    continue
+                entry = dialogue_entry(row) or {}
+                # Words are the one thing the room cannot supply. A row with
+                # no script at all is a writing-desk problem, not a recording
+                # one, and queueing it would only make the queue lie.
+                if not str(entry.get("script_plain") or entry.get("script")
+                           or row.get("text_plain") or row.get("text") or "").strip():
+                    continue
+                out.append((road, row))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 async def unheard_stock_air(force: bool = False) -> str:
@@ -24843,6 +25399,11 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                    ("speech_rate", "Speech rate", "range", 75, 125, 1)],
         "third": [("third_name", "Third-seat name", "text", 0, 0, 0),
                   ("sfxguy_rate", "SFX Guy interjections", "range", 0, 100, 1),
+                  # #1366: sound at one end, pictures at the other. 67 is
+                  # two mp4 for every mp3, which is where it starts.
+                  ("sfx_video_share",
+                   "SFX Guy pictures (mp3 \u2190 \u2192 mp4)",
+                   "range", 0, 100, 1),
                   # #1232: the one dial over every clock he obeys - how
                   # soon he calls silence dead, how long he rests, how
                   # many clips go out in a row, how readily he cuts in.
@@ -28118,7 +28679,23 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
     # their own quota they are - measured at one call an hour against a
     # target of five. This only ever fires when BOTH are due and a call
     # genuinely fits; otherwise nothing about the order changes.
+    # #1365: ...BUT NOT WHILE THE MANAGER IS BEHIND HIMSELF.
+    #
+    # "Manager message are never to be skipped. They are more important
+    #  than anything else. It is super imperative that they play because
+    #  they're very short and they're very funny."
+    #
+    # #839's trade is sound when one road is due and the other is starving.
+    # It is not sound as a standing order, and as a standing order is how
+    # it read: the test is a pure comparison of two fractions, so whenever
+    # the phones carry the larger target they are permanently the worse
+    # off, the manager loses every scarce opening, and the hour ends 81
+    # call lines to 0 memos - which is the hour that was actually measured.
+    # A road that is itself behind its own dial has nothing left to give
+    # away, so the trade is only offered out of a manager who is up to
+    # date. He is short: he keeps the slot.
     if (_mgr_open and _room() > 90
+            and not quota_behind("manager", dj)
             and _quota_open("caller", "caller_every")
             and _quota_short("caller") > _quota_short("manager")):
         _mgr_open = False
@@ -34777,8 +35354,14 @@ async def pantry_keeper() -> None:
             # rounds without their audio finishes them before it stands
             # still, whatever the desk says about the next four hours.
             _finish_all = bool(radio_paused() and _pause_unfinished_rows())
+            # #1363: a hand-picked round is never "covered". The four-hour
+            # desk being happy is the commonest reason the keeper stands
+            # down, and standing down on a full cover is exactly what left
+            # the manager road at READY ZERO with twenty-one rounds banked -
+            # the cover was all banter, and no amount of it finishes a memo.
+            _finish_ids = cupboard_finish_ids()
             if (prepared_seconds() >= target and not _calls_short
-                    and not _hour_short and not _finish_all):
+                    and not _hour_short and not _finish_all and not _finish_ids):
                 continue                # the hours asked for are covered
             if pantry_bytes() >= PANTRY_MAX_BYTES:
                 continue                # the allowance is spent (#894)
@@ -34787,6 +35370,22 @@ async def pantry_keeper() -> None:
             # cupboard material is neither tinted nor recorded merely because
             # it happens to exist.
             _committed_unready = committed_stock_ids(ready=False)
+            # #1363: ...AND WHATEVER THE OPERATOR SENT BACK BY HAND.
+            #
+            # The line above is the whole reason 284 of 289 cupboard rounds
+            # were holding half their audio: a row the four-hour desk has
+            # stopped naming is "surplus" and is never worked again, so a
+            # round that took 50% of its lines in the slice it was given
+            # keeps 50% of its lines for ever. The desk's judgment stands
+            # for everything the STATION wants; this adds the rows a person
+            # pointed at. It is a union, never a replacement, and it is
+            # bounded by CUPBOARD_FINISH_MOST and emptied by the sweep
+            # below as each round becomes finished radio.
+            _committed_unready = set(_committed_unready) | _finish_ids
+            try:
+                cupboard_finish_sweep()
+            except Exception:  # noqa: BLE001
+                pass
             # #1155: paused, the finishing rooms take EVERY written row,
             # not only the desk's picks - the desk binds the finished
             # ones and forgets the rest exist.
@@ -63814,9 +64413,22 @@ _SFX_LEN_DIRTY = [0]
 _SFX_LEN_SAVED = [0.0]      # #1251c: last write of the ledger
 
 
-def _sfx_len_load() -> None:
+_SFX_LEN_LOADED = [False]
+
+
+def _sfx_len_load(force: bool = False) -> None:
+    """#1374: ONCE. This was called at the top of every pool walk - once a
+    minute - and it is a json.loads of a 7.6 MB file: a C call that holds
+    the GIL for its whole run, in a worker thread, so the event loop
+    froze for a second or two every minute with no app.py frame on it.
+    The pulse's thread census names it: raw_decode (decoder.py) in 12 of
+    42 blind stalls. The file is written FROM this very cache, so once
+    it has been read there is nothing new in it to learn."""
+    if _SFX_LEN_LOADED[0] and not force:
+        return
     try:
         rows = json.loads(SFX_LEN_PATH.read_text())
+        _SFX_LEN_LOADED[0] = True
         if isinstance(rows, dict):
             _SFX_LEN_CACHE.update({str(k): float(v)
                                    for k, v in rows.items()})
@@ -64895,7 +65507,14 @@ def scratch_stock(want: int = 12) -> list[Path]:
 # bigger library and an unbounded map of every path this station has ever
 # seen is a slow leak.
 _SFX_ID_MEMO: dict[str, str] = {}
-SFX_ID_MEMO_MOST = 40000
+# #1370: SIZED TO THE LIBRARY, NOT TO A GUESS. This was 40,000 against
+# a share that holds 82,159 samples, so the memo could never hold the
+# library: it filled, cleared wholesale, and refilled - twice per walk -
+# and every pass re-hashed every path. The reverse map (#1307) was
+# cleared with it, so an id minted early in a walk could not be looked
+# up by the end of it. 200,000 entries of a 16-char id keyed by a
+# ~80-char path is under 40 MB; the walk that fills it costs far more.
+SFX_ID_MEMO_MOST = 200000
 
 
 # #1307: the way back from an id to its path, written as the id is
@@ -65678,12 +66297,24 @@ async def _sfx_pool_refresh() -> None:
         return _SFX_POOL_JOB[0] is job and _sfx_pool_signature() == signature
 
     def publish(paths: tuple[Path, ...]) -> None:
-        # This callback runs on the event loop; only memory/local policy reads.
+        # This callback runs on the event loop, so it does ONE thing: the
+        # assignment. #1370: it used to filter as well - every path in
+        # `paths` through sfx_id() twice, against the bans and the
+        # weights - and `paths` is the WHOLE accumulated list, re-sent on
+        # every emit, which fires every 32 files or half a second for the
+        # length of a walk. Over 82,159 files that is ~2,500 publishes of
+        # ~41,000 paths each: two hundred million memoised-hash calls on
+        # the event loop per walk, and the walk repeats every minute.
+        #
+        # Measured by /api/deadair over 24h: sfx_id 9,405s, <genexpr>
+        # 6,005s and publish 4,322s of loop-blocked dead air - one bug,
+        # attributed to its three frames, 68% of every stall on the
+        # record. The station was silent because it was counting its
+        # sound effects. The filtering now happens once per path, in
+        # the worker, as each path is met; this is a C-speed copy.
         if not current():
             return
-        banned, weights = sfx_bans(), sfx_weights()
-        _SFX_POOL_CACHE[:] = [p for p in dict.fromkeys(paths)
-            if sfx_id(p) not in banned and weights.get(sfx_id(p), 1.0) > 0.05]
+        _SFX_POOL_CACHE[:] = list(paths)
         if _SFX_POOL_CACHE:
             _SFX_POOL_READY_AT[0] = time.time()
 
@@ -65698,8 +66329,28 @@ async def _sfx_pool_refresh() -> None:
             _sfx_len_load()
             folders = sfx_folders()
             cap = signature[3]
+            # #1370: the bans and the weights are read ONCE, here in the
+            # worker, and every path is judged once as it is met. A ban
+            # placed mid-walk lands at the next walk - a minute - and
+            # the draw itself re-applies bans anyway (_sting_draw_sets),
+            # so nothing banned airs in the meantime.
+            banned, weights = sfx_bans(), sfx_weights()
+
+            def keep(path: Path) -> bool:
+                sid = sfx_id(path)
+                return sid not in banned and weights.get(sid, 1.0) > 0.05
+
             warm = (list(baseline) if baseline else
-                    _sfx_pool_warm(folders, cap, current, emit))
+                    _sfx_pool_warm(folders, cap, current,
+                                   lambda ps: emit(tuple(
+                                       p for p in ps if keep(p)))))
+            warm = [p for p in warm if keep(p)]
+            # The incremental emits send warm + what the walk has found
+            # so far; a walk re-finds the warm files, so `fresh` is the
+            # walk minus warm, or the pool would carry duplicates for
+            # the length of the walk and the draw would lean on them.
+            warm_set = {str(p) for p in warm}
+            fresh: list[Path] = []
             pool: list[Path] = []
             have: set[str] = set()
             last_publish = time.monotonic()
@@ -65711,10 +66362,14 @@ async def _sfx_pool_refresh() -> None:
                 seconds = sfx_seconds(path)
                 if not (0 < seconds <= cap or seconds <= 0 and SFX_MADE_DIR in path.parents):
                     return
-                pool.append(path)
                 have.add(str(path))
+                if not keep(path):                      # #1370
+                    return
+                pool.append(path)
+                if str(path) not in warm_set:
+                    fresh.append(path)
                 if len(pool) == 1 or len(pool) % 32 == 0 or time.monotonic() - last_publish >= .5:
-                    emit(tuple(warm + pool))
+                    emit(tuple(warm + fresh))
                     last_publish = time.monotonic()
 
             if signature[2]:
@@ -65833,6 +66488,10 @@ async def sfx_keeper() -> None:
 async def _startup_sfx_keeper() -> None:
     fire_and_forget(_sfx_pool_refresh())
     fire_and_forget(sfx_keeper())       # #835
+    # #1366: the endless set's pacer. Always alive, asleep in five-second
+    # naps while the mode is off, so turning the mode on is a settings
+    # write and nothing else has to be started or stopped.
+    fire_and_forget(sfx_video_cycle())  # #1366
 
 
 def _sfx_cadence_enabled() -> bool:
@@ -66069,6 +66728,116 @@ def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
             sfxguy_ready_commit(str(row["sfxguy_reservation"]))
 
 
+
+def sfx_video_share() -> int:
+    """#1366: what share of the SFX Guy's clips should carry a picture.
+
+    The video MODE is the same dial held at one end: while it is on he is
+    playing mp4s and nothing else, which is the whole of "he stops playing
+    MP three clips and is only playing MP four clips"."""
+    try:
+        dj = dj_settings()
+        if dj.get("sfx_video_mode"):
+            return 100
+        return max(0, min(100, int(dj.get("sfx_video_share") or 0)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def sfx_video_mode_on() -> bool:
+    try:
+        return bool(dj_settings().get("sfx_video_mode"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# --- #1366: THE ENDLESS SET --------------------------------------------------
+#
+# "Put a play button next to the video button that if I click it puts the
+#  SFX guy into video play mode where the videos are being played one after
+#  another chosen at random from the collection ... a permanent video
+#  display that's just cycling endlessly randomly through all the videos."
+#
+# The sets already poll /api/dj/video and play whatever is in the ring -
+# the app's CRT set and the tablet's both (#1322). So "permanent" needs no
+# client at all: something has to keep putting the next clip in the ring
+# before the last one runs out, and that is all this is.
+#
+# It rings through page_picture_append, NOT page_feed_append, and the
+# difference is the whole reason this is safe to leave running: the picture
+# door takes no lead, reserves no air and chains behind nothing, so an
+# endless cycle of clips cannot mortgage the show's air the way twenty
+# stings through the feed door would. The station's own voice road is
+# untouched - "he still does his dialogue" is true because this never
+# speaks.
+#
+# Paced off each clip's own measured length with a second of overlap, so
+# the set is handed the next picture just before the tube would go dark.
+# A clip whose length is unknown gets the floor below rather than a guess.
+SFX_CYCLE_FLOOR = 6.0            # never busier than this, whatever a clip says
+SFX_CYCLE_LEAD = 1.0             # hand the set the next one this early
+_SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
+                              "clip": "", "why": ""}
+
+
+async def sfx_video_cycle() -> None:
+    """Keep a picture on the set for as long as the mode is on."""
+    while True:
+        try:
+            if not sfx_video_mode_on():
+                _SFX_CYCLE["why"] = "the endless set is off"
+                _SFX_CYCLE["until"] = 0.0
+                await asyncio.sleep(5.0)
+                continue
+            now = time.time()
+            if now < float(_SFX_CYCLE.get("until") or 0) - SFX_CYCLE_LEAD:
+                await asyncio.sleep(0.5)
+                continue
+            if not sfx_video_warm():
+                sfx_video_kick()
+                if not _SFX_VIDEO_MEMO.get("pool"):
+                    _SFX_CYCLE["why"] = "the clip library is still warming"
+                    await asyncio.sleep(5.0)
+                    continue
+            pick = sfx_deck_take()
+            if pick is None:
+                pick = await asyncio.to_thread(_sfx_any_video)
+            if pick is None:
+                _SFX_CYCLE["why"] = ("no video clip qualifies - check the "
+                                     "folders, the length dials and the bans")
+                await asyncio.sleep(10.0)
+                continue
+            key = sfx_id(pick)
+            seconds = await asyncio.to_thread(sfx_seconds, pick)
+            seconds = max(SFX_CYCLE_FLOOR, round(float(seconds or 0), 2))
+            page_picture_append({
+                "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
+                "sting": pick.stem, "id": key, "seconds": seconds})
+            _SFX_CYCLE.update({"at": now, "until": now + seconds,
+                               "rung": int(_SFX_CYCLE.get("rung") or 0) + 1,
+                               "clip": pick.stem, "why": ""})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _SFX_CYCLE["why"] = "%s: %s" % (type(exc).__name__, str(exc)[:120])
+            await asyncio.sleep(5.0)
+
+
+def sfx_video_mode_state() -> dict[str, Any]:
+    cycle = dict(_SFX_CYCLE)
+    cycle["left"] = max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1))
+    return {"on": sfx_video_mode_on(), "share": sfx_video_share(),
+            "dial": int((dj_settings() or {}).get("sfx_video_share") or 0),
+            "cycle": cycle, "pool": len(_SFX_VIDEO_MEMO.get("pool") or []),
+            "say": ("the endless set is on - %d clip(s) rung, %s is on the "
+                    "tube with %.0fs left"
+                    % (cycle.get("rung") or 0, cycle.get("clip") or "nothing",
+                       cycle.get("left") or 0))
+                   if sfx_video_mode_on() else
+                   ("the endless set is off - %d%% of his clips carry a "
+                    "picture" % sfx_video_share())}
+
+
 def sting_due() -> Path | None:
     """Whether to drop one now, and which. Spontaneous means unpredictable,
     not constant: a roll of the dice, and never twice inside the gap."""
@@ -66104,6 +66873,25 @@ def sting_due() -> Path | None:
     pool, names_pool, fresh = _sting_draw_sets()
     if not pool:
         return None
+    # #1366: THE PICTURE SHARE. Before any of the roads below, because
+    # this is a question about the POPULATION he draws from, not about
+    # which of the three preference roads gets to answer - a fresh clip
+    # and a never-heard clip are both still either an mp3 or an mp4.
+    #
+    # It narrows the pool and then lets the ordinary draw run over what
+    # is left, so freshness, the never-heard rule, the per-clip weights
+    # and the unrepeated ring all keep working exactly as they do now.
+    # A side with nothing in it is not narrowed to - a library of pure
+    # mp3 still plays, at any setting of the dial.
+    _share = sfx_video_share()
+    if 0 < _share < 100 or _share in (0, 100):
+        _want_video = random.random() * 100.0 < _share
+        _side = [n for n in names_pool if sfx_is_video(n) == _want_video]
+        if _side:
+            names_pool = _side
+            _sided = {str(p) for p in _side}
+            pool = [p for p in pool if str(p) in _sided] or pool
+            fresh = {n for n in fresh if n in _sided}
     # #1251: NEVER HEARD GOES FIRST. Ahead of the fresh road, because
     # "each and every clip" is a stronger promise than "the new ones
     # first" and the two only disagree while there are still clips that
@@ -69376,6 +70164,8 @@ _LAST_SAID = [0.0]
 # and stock-first after a long hole. Nothing here touches page sizes, the
 # leads or the floor lock (#1146/#1151 invariants).
 GAP_LOG_PATH = data_path("gap_log.jsonl")
+# #1368b: when THIS process came up - the hour it started in is tainted.
+_DEADAIR_BOOTED = time.time()
 GAP_MIN_SECONDS = 10.0            # under this a silence is a beat, not a gap
 # 2026-09-08 (the flow scan): twelve, not forty. At forty the stock-first
 # rule only ever armed AFTER the operator's ten-second rule had already
@@ -70353,7 +71143,24 @@ def _ready_shelf_row(kind: str, rescue: bool = False,
     of its own, so opening that list to caller changed the count and
     nothing else - dead_air_rescue tried the road, came through here,
     and got None."""
-    if kind not in RESCUE_ROADS_OPEN:
+    # #1364: A NAMED ROW IS NOT CHOOSING A ROAD.
+    #
+    # RESCUE_ROADS_OPEN answers "which shelves may the station help itself
+    # from when nobody asked" - and as an answer to that it is right. It
+    # was also the answer given to an operator pointing at one round and
+    # pressing Play now, which is a different question with a different
+    # authority behind it, and it made two roads unplayable by any means
+    # at all: cupboard_why_row's own words for it are "this is why recap
+    # stock never moves". Measured the morning this went in: 22 finished
+    # adverts, the oldest waited 2d 14h, on a road with no out-of-turn
+    # door - and six recap rounds in the same position.
+    #
+    # `pick` is passed by IDENTITY and is re-checked against the live
+    # shelf below, so a named row still has to be there, still has to have
+    # its takes, and still has to pass `eligible`. It gets no power the
+    # head of its own queue would not have had - it simply stops being
+    # refused for the road it is standing on.
+    if pick is None and kind not in RESCUE_ROADS_OPEN:
         return None
     window = None if rescue else _ready_slot_window(kind)
 
@@ -70752,6 +71559,231 @@ def gap_kind_policy(kind: str, dj: dict[str, Any] | None = None,
     if want and want != kind:
         return want, why
     return kind, ""
+
+
+# --- #1368: THE DEAD-AIR CENSUS --------------------------------------------
+#
+# "do a deep scan measuring the dead air and what is causing it because I'm
+#  supposed to have these scripts be dense enough to have the hour the
+#  segments filled out ... I need the orchestrator able to understand
+#  what's going on with that and to resolve it."
+#
+# Measured by hand on 2026-09-14 over the whole gap log (976 gaps, two
+# days): 47,146 seconds of dead air, and 42,991 of them - 91% - carry the
+# cause `event-loop stall`. Per hour it ran between 1,000 and 2,400 dead
+# seconds out of 3,600. That is not a thin script. A blocked loop cannot
+# speak a line it has, cannot start a clip it has, and cannot be cured by
+# writing more material for it not to play.
+#
+# So the first thing this census says is WHICH KIND of dead air the hour
+# was, because the two kinds have opposite cures: a famine wants more
+# material on the shelf, a stall wants the named function taken off the
+# loop. Reading the wrong one has cost this station weeks.
+#
+# The stall_top frames are counted per FRAME, not per sample list: the
+# by-hand pass that counted whole lists as strings split one offender
+# across a dozen combinations and hid it. Flattened, the record named its
+# top blockers by seconds of gaps they appeared in: prompt_learning_observe
+# (4,681s), pantry_get (6,408s), crystal_learning_note (4,668s), publish
+# (4,963s), prepared_seconds, _read_gpu_temp, load_settings - and sfx_id
+# and <genexpr>, which are pure and memoised and stand in for the loops
+# draining them (their own notes say so).
+_DEADAIR_MEMO: dict[str, Any] = {"at": 0.0, "hours": 0, "value": None}
+DEADAIR_MEMO_S = 60.0
+
+
+def _deadair_rows(hours: int,
+                  live: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """#1368c: the ledger's in-memory copy plus the live rows, by key.
+
+    The first cut read the file from disk on every call and then looked
+    for live rows under _RADIO['gap_log'] - a key nothing writes - so the
+    hour in progress was invisible until the keeper's next flush, and
+    the very first reading after a restart said `gaps=0`. gap_keeper
+    already holds the file's rows in memory (_GAP_FILE), and gap_rows()
+    is the live truth, computed on the loop once a minute. The census
+    reads both and prefers the live version of a row, because an open
+    gap is still growing.
+    """
+    since = time.time() - hours * 3600.0
+    by_key: dict[str, dict[str, Any]] = {}
+    held = list(_GAP_FILE.get("rows") or [])
+    if not held:
+        held = _deadair_rows_file(hours)      # the first minute after boot
+    for row in held:
+        try:
+            if float(row.get("at") or 0) >= since:
+                by_key[str(row.get("key") or id(row))] = row
+        except Exception:  # noqa: BLE001
+            continue
+    for row in (live or []):
+        try:
+            if float(row.get("at") or 0) >= since:
+                by_key[str(row.get("key") or id(row))] = row
+        except Exception:  # noqa: BLE001
+            continue
+    out = list(by_key.values())
+    out.sort(key=lambda r: float(r.get("at") or 0))
+    return out
+
+
+def _deadair_rows_file(hours: int) -> list[dict[str, Any]]:
+    """The gap log off the disk - only until the keeper has loaded it."""
+    since = time.time() - hours * 3600.0
+    out: list[dict[str, Any]] = []
+    try:
+        with open(GAP_LOG_PATH, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                try:
+                    at = float(row.get("at") or 0)
+                except Exception:  # noqa: BLE001
+                    at = 0.0
+                if at >= since:
+                    out.append(row)
+    except Exception:  # noqa: BLE001
+        pass
+    out.sort(key=lambda r: float(r.get("at") or 0))
+    return out
+
+
+def deadair_census(hours: int = 24,
+                   live: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Every dead second, by hour, by cause, by blocker - with a verdict.
+
+    `tainted` marks the hour this process started in. A restart brings a
+    grace period and an empty ring, both of which flatter the reading, so
+    the standing rule is never to quote a rate from a window that
+    contains one (see dead-air-has-a-named-frame).
+    """
+    import re as _re
+    rows = _deadair_rows(hours, live)
+    started_hour = int(float(_RADIO.get("started_at") or _DEADAIR_BOOTED)
+                       // 3600)
+
+    def secs(r: dict[str, Any]) -> float:
+        try:
+            return max(0.0, float(r.get("seconds") or 0))
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    by_hour: dict[int, dict[str, Any]] = {}
+    causes: dict[str, list[float]] = {}
+    frames: dict[str, list[float]] = {}
+    funcs: dict[str, list[float]] = {}
+    total = 0.0
+    stall = 0.0
+    for r in rows:
+        s = secs(r)
+        total += s
+        cause = str(r.get("cause") or "unnamed")
+        causes.setdefault(cause, [0, 0.0])
+        causes[cause][0] += 1
+        causes[cause][1] += s
+        h = int(float(r.get("at") or 0) // 3600)
+        slot = by_hour.setdefault(h, {"dead": 0.0, "gaps": 0, "causes": {}})
+        slot["dead"] += s
+        slot["gaps"] += 1
+        slot["causes"][cause] = slot["causes"].get(cause, 0.0) + s
+        if cause != "event-loop stall":
+            continue
+        stall += s
+        tops = r.get("stall_top") or []
+        if isinstance(tops, str):
+            tops = [tops]
+        for t in {str(x) for x in tops if str(x).strip()}:
+            frames.setdefault(t, [0, 0.0])
+            frames[t][0] += 1
+            frames[t][1] += s
+            m = _re.match(r"^(.*?)\s*\(app\.py:(\d+)\)$", t)
+            fn = m.group(1) if m else t
+            funcs.setdefault(fn, [0, 0.0])
+            funcs[fn][0] += 1
+            funcs[fn][1] += s
+
+    hours_out = []
+    for h in sorted(by_hour):
+        slot = by_hour[h]
+        top = max(slot["causes"].items(), key=lambda kv: kv[1]) \
+            if slot["causes"] else ("", 0.0)
+        hours_out.append({
+            "hour": time.strftime("%Y-%m-%d %H:00", time.localtime(h * 3600)),
+            "dead_s": round(slot["dead"]),
+            "dead_share": round(min(1.0, slot["dead"] / 3600.0), 3),
+            "gaps": slot["gaps"],
+            "top_cause": top[0], "top_cause_s": round(top[1]),
+            "tainted": (h == started_hour),
+        })
+    clean = [x for x in hours_out[:-1] if not x["tainted"]]
+    last_clean = clean[-1] if clean else None
+
+    def ranked(d: dict[str, list[float]], n: int) -> list[dict[str, Any]]:
+        return [{"name": k, "gaps": int(v[0]), "seconds": round(v[1])}
+                for k, v in sorted(d.items(), key=lambda kv: -kv[1][1])[:n]]
+
+    stall_share = (stall / total) if total else 0.0
+    if not rows:
+        verdict = "no dead air on the record for this window"
+        kind = "none"
+    elif stall_share >= 0.5:
+        verdict = ("the loop was BLOCKED for %d%% of the dead air - this is "
+                   "not a thin script, and more material will not fill it; "
+                   "the cure is taking the named functions off the loop"
+                   % round(stall_share * 100))
+        kind = "stall"
+    else:
+        famine = sum(v[1] for k, v in causes.items()
+                     if k in ("mid-round hole", "pantry miss on a banked round",
+                              "round turnover"))
+        verdict = ("the loop was mostly free - %d%% of the dead air is holes "
+                   "in the material itself, which the shelf and the larder "
+                   "can fill" % round(100 * famine / max(1.0, total)))
+        kind = "famine"
+    return {
+        "window_hours": hours, "gaps": len(rows),
+        "dead_s": round(total), "stall_s": round(stall),
+        "stall_share": round(stall_share, 3),
+        "kind": kind, "verdict": verdict,
+        "last_clean_hour": last_clean,
+        "hours": hours_out[-48:],
+        "causes": ranked(causes, 10),
+        "blocking_functions": ranked(funcs, 15),
+        "blocking_sites": ranked(frames, 15),
+        # #1371: is the desk keeping up, or is it the next thing to look at.
+        "learning_desk": learning_desk_state(),
+        "say": verdict,
+    }
+
+
+@app.get("/api/deadair")
+async def deadair_api(
+    hours: int = 24,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The census, memoised a minute - it is a file read and a sort."""
+    require_read_auth(authorization)
+    hours = max(1, min(24 * 14, int(hours or 24)))
+    now = time.time()
+    if (_DEADAIR_MEMO["value"] is not None
+            and _DEADAIR_MEMO["hours"] == hours
+            and now - float(_DEADAIR_MEMO["at"]) < DEADAIR_MEMO_S):
+        return _DEADAIR_MEMO["value"]
+    # #1368c: the live rows are computed HERE, on the loop, where gap_rows
+    # is designed to run - the keeper calls it there every minute - and
+    # only the sorting and counting go to a thread, with their own copy.
+    try:
+        live = gap_rows(now=now)
+    except Exception:  # noqa: BLE001
+        live = []
+    got = await asyncio.to_thread(deadair_census, hours, live)
+    _DEADAIR_MEMO.update({"at": now, "hours": hours, "value": got})
+    return got
 
 
 def _gap_log_slim(row: dict[str, Any]) -> dict[str, Any]:
@@ -94496,7 +95528,31 @@ def _rap_coda_equal(a, b):
         return False
 
 
+_RAP_EVIDENCE_MEMO: dict[tuple, dict] = {}
+RAP_EVIDENCE_MEMO_MOST = 4096
+
+
 def rap_rhyme_evidence(text, answering=""):
+    """#1375: memoised by (text, answering) - the grade is a pure function
+    of them and the inner loops are quadratic in the words.
+
+    Measured on the loop: _sfxguy_ready_valid blocked it for 6.4s in one
+    sample, and that function calls this once per candidate row in the
+    SFX guy's ready bank on every pick - the same rows, the same texts,
+    regraded on every draw. A bounded dict; a cleared memo costs one
+    regrade per row and nothing else."""
+    key = (str(text or ""), str(answering or ""))
+    got = _RAP_EVIDENCE_MEMO.get(key)
+    if got is not None:
+        return dict(got)
+    got = _rap_rhyme_evidence_now(text, answering)
+    if len(_RAP_EVIDENCE_MEMO) >= RAP_EVIDENCE_MEMO_MOST:
+        _RAP_EVIDENCE_MEMO.clear()
+    _RAP_EVIDENCE_MEMO[key] = dict(got)
+    return got
+
+
+def _rap_rhyme_evidence_now(text, answering=""):
     """What the bar proves: end rhymes across its own bars, a chain with the
     previous bar's end, nearby internal pairs, or a two-nucleus pair."""
     words = _rap_content(text)
@@ -95367,11 +96423,25 @@ def crystal_learning_note(ticket, original, candidate, evaluation, row=None):
         "grader_version": report.get("version"),
         "contract_version": semantic.get("contract_version"),
         "faults": crystal_learning_patterns({**report, "call_contract": caller})}
+    # #1371: everything above this line is pure and cheap and stays on
+    # the loop. The row's attempt_id is set NOW rather than after the
+    # store accepts it, because the next attempt reads it for its
+    # prior_attempt_id microseconds from here - a deferred set would
+    # break every repair's link to what it repaired. The one difference
+    # from before: a row the store then refuses (not a production
+    # outcome, or malformed) carries an id the store never recorded, and
+    # a prior lookup on it finds nothing - which is what an unset id
+    # produced too.
+    if isinstance(row, dict):
+        row["attempt_id"] = ticket["attempt_id"]
+    _learning_desk_post(_crystal_learning_outcome_now, measured, ticket, report)
+
+
+def _crystal_learning_outcome_now(measured: dict[str, Any], ticket: dict[str, Any],
+                                  report: dict[str, Any]) -> None:
+    """The store write of crystal_learning_note, run on the learning desk."""
     try:
         result = _PROMPT_LEARNING.outcome(measured)
-        if result.get("recorded") or result.get("reason") == "duplicate":
-            if isinstance(row, dict):
-                row["attempt_id"] = ticket["attempt_id"]
         if result.get("recorded"):
             _LAB_RUNTIME.record("learning_outcome", {key: measured.get(key) for key in
                 ("attempt_id", "prior_attempt_id", "kind", "model", "stage", "prompt_version",
@@ -100882,11 +101952,16 @@ def dj_state_lean(state: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/api/dj")
 async def dj_status(
+    request: Request,
     listener: str = "",
     lean: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_read_auth(authorization)
+    # #1367: every surface polls this, continuously, including the tablet.
+    # One dict write here is how the station learns that the tablet is
+    # alive - see seen_note() for why this is not middleware.
+    seen_note(request, "dj")
     if listener:
         _radio_listeners(listener[:64])
     state = dj_state()
@@ -104399,6 +105474,452 @@ def pinelink_scan(fresh: bool = False) -> dict[str, Any]:
         got["why"] = str(err)[:200]
     _PINELINK_SEEN.update({"at": now, "got": got})
     return dict(got)
+
+
+
+# --- #1367: FINDING THE TABLET, FROM THE STATION -----------------------------
+#
+# "So right now the station is playing on the tablet, yet the application
+#  is saying it's unable to locate the tablet." (#1095)
+# "Put a button here that allows me to locate on the network and reconnect
+#  to and reattach the application to the tablet." (#1096)
+# "Have the system able to go to a troubleshooter ... locating the tablet
+#  and pinging a connection to it ... There should be fallback systems for
+#  ensuring that this works even if the initial system fails." (#1097)
+# "I want the system able to scan and locate and identify and triage ...
+#  this tablet over the network no matter what." (#1109)
+#
+# THE WHOLE OF THE #1095 CONTRADICTION, AND WHY IT IS NOT A CONTRADICTION.
+#
+# The application had exactly ONE way of knowing whether the tablet exists:
+# `adb devices -l`, in TerminalHost.glassSerial(), and the first AUTHORIZED
+# row in it. Nothing else. So "no tablet is attached" has never meant the
+# tablet is missing - it means the adb transport is not up, which happens
+# when the tablet reboots, when the wireless debugging port cycles, or when
+# the daemon on this desk is restarted. The tablet can be sitting there
+# playing the station, on the same network, and that sentence is still
+# printed, because adb is not how the tablet gets the station.
+#
+# The station has the other half of the truth and has never been asked for
+# it. Measured from inside the container the day this went in:
+#
+#     10.89.1.154:5555   OPEN, 14 ms          (the adb port IS listening)
+#     10.89.1.154        36:63:f9:5d:06:32    (in the host's own ARP table)
+#     /api/dj            polled from that address, continuously
+#
+# The container is on the host's network namespace, so it reads the same
+# ARP table and reaches the same subnet the tablet is on. It cannot run
+# adb - there is none in the image, and there is deliberately none: the
+# desktop owns that (see the kiosk rung of the broadcast ladder). But every
+# question BELOW adb it can answer, and those are the questions that tell
+# an operator whether the problem is the tablet, the network, or the
+# transport.
+#
+# THE FALLBACK #1097 ASKS FOR is the sweep. Until now the tablet's address
+# was a constant in three places; the moment a DHCP lease moved it, nothing
+# in the system could find it and the only cure was a person with a
+# keyboard. The sweep walks the station's own /24 for anything answering on
+# the adb port and reports every candidate, so a tablet that moved is
+# FOUND rather than declared missing - and `adopt` writes the new address
+# down so the rest of the ladder uses it.
+#
+# Nothing here changes the tablet. Every rung is a question except `wake`,
+# which stamps the kiosk kick the desktop already watches for.
+TABLET_HOST = os.getenv("PINE_TABLET_HOST", "10.89.1.154")
+TABLET_ADB_PORT = int(os.getenv("PINE_TABLET_ADB_PORT", "5555") or 5555)
+TABLET_PATH = data_path("tablet_link.json")
+TABLET_PROBE_TIMEOUT = 1.2
+TABLET_SWEEP_TIMEOUT = 0.35
+TABLET_SWEEP_WIDE = 64
+
+# #1367: who has asked this station for anything lately, by address. The
+# ONLY reason this exists is the #1095 sentence - the tablet proves it is
+# alive every few seconds by fetching /api/dj, and nothing was writing that
+# down. It is stamped from the panel's own status route rather than from
+# middleware: the note at the top of this file records that an
+# @app.middleware("http") stalled this station's audio, and a dict write on
+# a route that already runs is the cheapest honest place to do it.
+_SEEN: dict[str, dict[str, Any]] = {}
+SEEN_MOST = 40
+
+
+def seen_note(request: Any, what: str = "") -> None:
+    try:
+        host = str(getattr(getattr(request, "client", None), "host", "") or "")
+        if not host:
+            return
+        row = _SEEN.get(host)
+        if row is None:
+            if len(_SEEN) >= SEEN_MOST:
+                oldest = min(_SEEN, key=lambda k: _SEEN[k].get("at") or 0)
+                _SEEN.pop(oldest, None)
+            row = _SEEN.setdefault(host, {"first": time.time(), "hits": 0})
+        row["at"] = time.time()
+        row["hits"] = int(row.get("hits") or 0) + 1
+        row["what"] = str(what or "")[:40]
+        agent = str((request.headers or {}).get("user-agent") or "")[:160]
+        if agent:
+            row["agent"] = agent
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tablet_address() -> str:
+    """The address to use - the adopted one if a sweep found it moved."""
+    try:
+        raw = json.loads(TABLET_PATH.read_text(encoding="utf-8"))
+        got = str((raw or {}).get("host") or "").strip()
+        if got:
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    return TABLET_HOST
+
+
+def _tablet_remember(host: str, why: str = "") -> None:
+    try:
+        TABLET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TABLET_PATH.write_text(json.dumps(
+            {"host": str(host), "at": time.time(), "why": str(why)[:160]}),
+            encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _tcp_open(host: str, port: int, timeout: float) -> dict[str, Any]:
+    """Is something listening, and how fast did it say so?
+
+    A plain connect, not ICMP: the container has no raw sockets and does
+    not need them. The TIME matters as much as the answer - a wedged
+    Wi-Fi link does not refuse, it hangs until the timeout, and those two
+    look identical in a boolean."""
+    import socket                      # local: this is the only user in the module
+    started = time.monotonic()
+    sock = socket.socket()
+    try:
+        sock.settimeout(float(timeout))
+        sock.connect((str(host), int(port)))
+        return {"open": True, "ms": round((time.monotonic() - started) * 1000, 1)}
+    except Exception as err:  # noqa: BLE001
+        return {"open": False, "ms": round((time.monotonic() - started) * 1000, 1),
+                "why": type(err).__name__}
+    finally:
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _arp_table() -> list[dict[str, str]]:
+    """The host's own neighbour table, which this container shares."""
+    rows: list[dict[str, str]] = []
+    try:
+        text = Path("/proc/net/arp").read_text(encoding="utf-8", errors="ignore")
+    except Exception:  # noqa: BLE001
+        return rows
+    for line in text.splitlines()[1:]:
+        bits = line.split()
+        if len(bits) < 6:
+            continue
+        rows.append({"ip": bits[0], "flags": bits[2], "mac": bits[3],
+                     "device": bits[5]})
+    return rows
+
+
+def _arp_of(host: str) -> dict[str, str] | None:
+    for row in _arp_table():
+        if row["ip"] == str(host):
+            # 0x0 is an INCOMPLETE entry - the address was asked about and
+            # nothing answered. Saying "it is in the table" about one of
+            # those would be the same lie adb tells the other way round.
+            if row.get("flags") == "0x0":
+                return None
+            return row
+    return None
+
+
+def _local_subnet() -> str:
+    """The /24 the station itself sits on, read off the neighbour table.
+
+    Derived rather than configured, so a station moved to another network
+    sweeps the network it is actually on."""
+    counts: dict[str, int] = {}
+    for row in _arp_table():
+        if row.get("flags") == "0x0":
+            continue
+        bits = row["ip"].split(".")
+        if len(bits) != 4:
+            continue
+        if bits[0] == "172" or row["ip"].startswith("169.254."):
+            continue                  # docker's own bridges, and link-local
+        base = ".".join(bits[:3])
+        counts[base] = counts.get(base, 0) + 1
+    if not counts:
+        return ".".join(str(TABLET_HOST).split(".")[:3])
+    return max(counts, key=lambda k: counts[k])
+
+
+def tablet_sweep(port: int = 0, base: str = "") -> dict[str, Any]:
+    """Walk the station's own /24 for anything answering on the adb port.
+
+    This is #1097's "fallback system for ensuring that this works even if
+    the initial system fails". A tablet whose lease moved is not missing,
+    it is at a different number, and nothing in the station could ever say
+    so before: the address was a constant.
+
+    254 connects at a 0.35s timeout would be 89 seconds one at a time, so
+    they go out in a pool. Blocking work - the caller runs it in a thread."""
+    port = int(port or TABLET_ADB_PORT)
+    base = str(base or _local_subnet())
+    started = time.monotonic()
+    found: list[dict[str, Any]] = []
+    arp = {row["ip"]: row for row in _arp_table()}
+    hosts = ["%s.%d" % (base, n) for n in range(1, 255)]
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=TABLET_SWEEP_WIDE) as pool:
+            for host, got in zip(hosts, pool.map(
+                    lambda h: _tcp_open(h, port, TABLET_SWEEP_TIMEOUT), hosts)):
+                if got.get("open"):
+                    row = arp.get(host) or {}
+                    found.append({"host": host, "ms": got.get("ms"),
+                                  "mac": row.get("mac", ""),
+                                  "device": row.get("device", ""),
+                                  "known": host == tablet_address()})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "base": base, "port": port, "found": [],
+                "why": "%s: %s" % (type(exc).__name__, str(exc)[:120]),
+                "say": "the sweep could not run"}
+    return {"ok": True, "base": base, "port": port, "found": found,
+            "scanned": len(hosts),
+            "seconds": round(time.monotonic() - started, 2),
+            "say": ("%d device(s) on %s.0/24 answer on port %d: %s"
+                    % (len(found), base, port,
+                       ", ".join(r["host"] for r in found)))
+                   if found else
+                   ("nothing on %s.0/24 answers on port %d - the tablet's "
+                    "wireless debugging is off, or it is on another network"
+                    % (base, port))}
+
+
+def tablet_look() -> dict[str, Any]:
+    """Every layer of "is the tablet there", from the wire upwards.
+
+    The order is the order the answers become useful: a MAC in the
+    neighbour table says it is ON this network; the adb port says the
+    transport COULD come up; a recent fetch says it is RUNNING THE
+    STATION. The last one is the one the application never had, and it is
+    the one that settles #1095 - a tablet that asked us for the show three
+    seconds ago is not missing, whatever adb says about it."""
+    host = tablet_address()
+    out: dict[str, Any] = {"at": time.time(), "host": host,
+                           "configured": TABLET_HOST,
+                           "port": TABLET_ADB_PORT}
+    out["arp"] = _arp_of(host) or {}
+    out["adb"] = _tcp_open(host, TABLET_ADB_PORT, TABLET_PROBE_TIMEOUT)
+    seen = _SEEN.get(host) or {}
+    out["seen"] = dict(seen)
+    out["seen_ago"] = (round(time.time() - float(seen.get("at") or 0), 1)
+                       if seen.get("at") else None)
+    out["fetching"] = bool(out["seen_ago"] is not None and out["seen_ago"] < 120)
+    out["on_network"] = bool(out["arp"].get("mac"))
+    out["adb_port_open"] = bool(out["adb"].get("open"))
+    out["kiosk_kick"] = float(_RADIO.get("kiosk_kick") or 0)
+
+    steps: list[str] = []
+    if out["fetching"]:
+        steps.append("it asked this station for the show %.0fs ago - it is "
+                     "running and it is on the network"
+                     % (out["seen_ago"] or 0))
+    if out["on_network"]:
+        steps.append("it is in the neighbour table at %s (%s)"
+                     % (host, out["arp"].get("mac")))
+    else:
+        steps.append("nothing at %s is in the neighbour table - either it is "
+                     "asleep or its address has moved" % host)
+    if out["adb_port_open"]:
+        steps.append("the wireless debugging port answers in %.0fms, so adb "
+                     "can attach to it" % (out["adb"].get("ms") or 0))
+    else:
+        steps.append("the wireless debugging port does not answer (%s) - adb "
+                     "cannot attach until it does"
+                     % (out["adb"].get("why") or "shut"))
+    out["steps"] = steps
+
+    if out["fetching"] and out["adb_port_open"]:
+        out["verdict"] = ("the tablet is here and ready - it is playing the "
+                          "station and its debugging port is open. If the "
+                          "application still says no tablet is attached, the "
+                          "adb transport on the desk is what is down, not the "
+                          "tablet: run the connect rung.")
+        out["cure"] = "connect"
+    elif out["fetching"]:
+        out["verdict"] = ("the tablet is playing the station but its wireless "
+                          "debugging port is shut, so the mirror, the camera "
+                          "and the terminal cannot reach it. Nothing is wrong "
+                          "with the broadcast.")
+        out["cure"] = "wake"
+    elif out["adb_port_open"]:
+        out["verdict"] = ("the tablet is on the network and adb can attach, "
+                          "but it has not asked this station for the show. "
+                          "The kiosk app is not running, or it is showing "
+                          "something else.")
+        out["cure"] = "wake"
+    elif out["on_network"]:
+        out["verdict"] = ("the tablet is on the network but answers nothing - "
+                          "it is most likely asleep, or its Chromium net "
+                          "stack has wedged, which a force-stop cures.")
+        out["cure"] = "wake"
+    else:
+        out["verdict"] = ("nothing answers at %s at all. Sweep the network - "
+                          "if its lease moved, the sweep finds it and adopt "
+                          "writes the new address down." % host)
+        out["cure"] = "sweep"
+    out["say"] = out["verdict"]
+    return out
+
+
+# The ladder, in the shape the broadcast console already renders: one row
+# per rung, each with the words to put under the operator's thumb. #1109
+# asked for "a series of troubleshooting tasks" that can be walked through
+# from the panel, and #1104 asks for the same shape for the camera - this
+# is the tablet's half of it.
+TABLET_STEPS: list[dict[str, str]] = [
+    {"key": "look", "label": "Look",
+     "say": "Ask every layer at once: the neighbour table, the debugging "
+            "port, and whether the tablet has fetched the show from us.",
+     "tone": "look"},
+    {"key": "ping", "label": "Ping the tablet",
+     "say": "Open a connection to the tablet's debugging port and time it. "
+            "A wedged link hangs rather than refusing, so the timing is "
+            "half the answer.",
+     "tone": "look"},
+    {"key": "arp", "label": "Read the neighbour table",
+     "say": "Layer two: has anything on this network answered for that "
+            "address recently, and with which MAC.",
+     "tone": "look"},
+    {"key": "sweep", "label": "Sweep the network",
+     "say": "Walk the whole /24 for anything answering on the debugging "
+            "port. This is what finds a tablet whose address has moved.",
+     "tone": "deep"},
+    {"key": "adopt", "label": "Use the address we found",
+     "say": "Write the swept address down as the tablet's, so the mirror, "
+            "the camera and the terminal all use it from now on.",
+     "tone": "do"},
+    {"key": "wake", "label": "Wake the kiosk",
+     "say": "Stamp the kiosk kick. The desktop watches for it and brings "
+            "the kiosk app back to the front.",
+     "tone": "do"},
+]
+TABLET_ACTIONS = tuple(s["key"] for s in TABLET_STEPS)
+
+
+def tablet_step(action: str, host: str = "") -> dict[str, Any]:
+    """One rung. Blocking - every caller runs it in a thread."""
+    action = str(action or "").lower()
+    if action == "look":
+        return tablet_look()
+    if action == "ping":
+        target = str(host or tablet_address())
+        got = _tcp_open(target, TABLET_ADB_PORT, TABLET_PROBE_TIMEOUT)
+        return {"ok": bool(got.get("open")), "action": action, "host": target,
+                "port": TABLET_ADB_PORT, **got,
+                "say": ("%s:%d answered in %.0fms"
+                        % (target, TABLET_ADB_PORT, got.get("ms") or 0))
+                       if got.get("open") else
+                       ("%s:%d did not answer (%s) after %.0fms"
+                        % (target, TABLET_ADB_PORT, got.get("why") or "shut",
+                           got.get("ms") or 0))}
+    if action == "arp":
+        target = str(host or tablet_address())
+        row = _arp_of(target)
+        return {"ok": bool(row), "action": action, "host": target,
+                "row": row or {}, "table": len(_arp_table()),
+                "say": ("%s is on this network as %s via %s"
+                        % (target, (row or {}).get("mac"),
+                           (row or {}).get("device")))
+                       if row else
+                       ("%s has no live neighbour entry - nothing on this "
+                        "network has answered for it" % target)}
+    if action == "sweep":
+        return {"action": action, **tablet_sweep()}
+    if action == "adopt":
+        got = tablet_sweep()
+        picks = [r for r in got.get("found") or []
+                 if not str(r.get("host") or "").endswith(".1")]
+        if host:
+            picks = [r for r in picks if r.get("host") == host] or [{"host": host}]
+        if not picks:
+            return {"ok": False, "action": action, **got,
+                    "say": "the sweep found nothing to adopt"}
+        chosen = str(picks[0]["host"])
+        _tablet_remember(chosen, "adopted after a sweep")
+        return {"ok": True, "action": action, "host": chosen, **got,
+                "say": "the tablet is %s from now on - the mirror, the "
+                       "camera and the terminal use that address" % chosen}
+    if action == "wake":
+        _RADIO["kiosk_kick"] = time.time()
+        return {"ok": True, "action": action,
+                "kiosk_kick": _RADIO["kiosk_kick"],
+                "say": "the kiosk kick is stamped - the desktop brings the "
+                       "kiosk app back to the front when it next reads the "
+                       "pulse"}
+    raise HTTPException(status_code=400,
+                        detail="the tablet doctor cannot " + action)
+
+
+@app.get("/api/tablet/look")
+async def tablet_look_api(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """#1367: is the tablet there - every layer, in one row."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    got = await asyncio.to_thread(tablet_look)
+    got["steps_available"] = TABLET_STEPS
+    return got
+
+
+@app.post("/api/tablet/doctor/{action}")
+async def tablet_doctor_api(
+    action: str,
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1367: one rung of the tablet ladder.
+
+    Every rung but `adopt` and `wake` is a QUESTION, and neither of those
+    two touches the tablet: `adopt` writes an address down on this side and
+    `wake` stamps a flag the desktop reads. Nothing here can take the
+    station off air, which is what makes it safe under a thumb."""
+    require_auth(authorization)
+    if action not in TABLET_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="the tablet doctor does %s, not %s"
+                   % (", ".join(TABLET_ACTIONS), action))
+    host = str((payload or {}).get("host") or "").strip()
+    return await asyncio.to_thread(tablet_step, action, host)
+
+
+@app.get("/api/tablet/seen")
+async def tablet_seen_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1367: who has asked this station for anything, and how recently.
+
+    The answer to "the station is playing on the tablet, yet the
+    application says it cannot locate the tablet" is in this list."""
+    require_read_auth(authorization)
+    now = time.time()
+    rows = [{"host": host, "ago": round(now - float(row.get("at") or 0), 1),
+             **row} for host, row in _SEEN.items()]
+    rows.sort(key=lambda r: r["ago"])
+    return {"at": now, "rows": rows, "tablet": tablet_address(),
+            "say": "%d address(es) have asked this station for something; "
+                   "the tablet is %s" % (len(rows), tablet_address())}
 
 
 @app.get("/api/pinelink/look")
@@ -116068,6 +117589,8 @@ PUBLIC_ENABLED = os.getenv("SPARK_PUBLIC_LISTEN", "true").lower() in (
 # Exact paths, or prefixes ending in "/". Nothing is matched loosely: a
 # regex over a public surface is how an allowlist quietly grows a hole.
 _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
+               # #1263: which picture is up. Tiny, and audio-free.
+               "/api/dj/video",
                "/api/radio/clock",
                # #1253: the broadcast stream. This is the road a car
                # actually uses - one socket, held open, mixed here.
@@ -116151,6 +117674,24 @@ class PublicListenerGate:
 
 
 @app.on_event("startup")
+async def _startup_clip_book() -> None:
+    """#1362b: start writing the clip book the moment the station is up.
+
+    Not awaited and not blocking: sfx_db_kick starts a daemon thread
+    and returns. If the book is already written this costs one walk
+    of the folders to notice nothing has changed; if it is not, the
+    operator gets a working button minutes sooner than the first tap
+    would have given them, because the walk is no longer something a
+    thumb has to trigger.
+    """
+    try:
+        sfx_db_kick()
+    except Exception as exc:  # noqa: BLE001
+        print("[sfx-db] could not start the indexer: %s" % exc,
+              flush=True)
+
+
+@app.on_event("startup")
 async def _startup_public_door() -> None:
     """Bring up the listener door beside the main app, in this process."""
     if not PUBLIC_ENABLED or PUBLIC_PORT == STATION_PORT:
@@ -116203,23 +117744,48 @@ STREAM_BITRATE = int(os.getenv("STREAM_BITRATE", "128"))
 STREAM_ICY_INTERVAL = 16000
 
 
-def _stream_clip_path(url: str) -> str:
-    """The local file behind a voice clip's URL, or "".
+_STREAM_SFX_CACHE: dict[str, str] = {}
 
-    The feed hands out "/media/<key>?t=<signature>"; the key is the file
-    name under VOICE_MEDIA_DIR. Anything that is not exactly that shape
-    is refused rather than resolved - this runs off a mixer thread with
-    no request context, so it must not be a road to arbitrary paths.
+
+def _stream_clip_path(url: str) -> str:
+    """The local file behind a page-feed clip URL, or "".
+
+    TWO shapes, and for a long time this knew only the first:
+
+      /media/<32hex>.<ext>  a spoken clip, under VOICE_MEDIA_DIR
+      /sfx/<16hex>          a sting, resolved through the sample index
+
+    Missing the second meant the car stream silently skipped EVERY sound
+    effect the station played - the SFX guy fills dead air, and none of
+    it reached the road. Anything that is not exactly one of these two
+    shapes is refused rather than resolved: this runs off a mixer thread
+    with no request context, so it must not become a road to arbitrary
+    paths.
     """
     try:
         raw = str(url or "").split("?", 1)[0]
-        if not raw.startswith("/media/"):
-            return ""
-        key = raw[len("/media/"):]
-        if not MEDIA_KEY_SHAPE.match(key):
-            return ""
-        path = VOICE_MEDIA_DIR / key
-        return str(path) if path.is_file() else ""
+        if raw.startswith("/media/"):
+            key = raw[len("/media/"):]
+            if not MEDIA_KEY_SHAPE.match(key):
+                return ""
+            path = VOICE_MEDIA_DIR / key
+            return str(path) if path.is_file() else ""
+        if raw.startswith("/sfx/"):
+            key = raw[len("/sfx/"):]
+            if not re.fullmatch(r"[a-f0-9]{16}", key):
+                return ""
+            # Memoised: the snapshot runs four times a second and the id
+            # map is rebuilt whenever the pool changes, so this must not
+            # become a walk on the mixer thread.
+            got = _STREAM_SFX_CACHE.get(key)
+            if got is None:
+                found = sfx_by_id(key)
+                got = str(found) if found is not None else ""
+                if len(_STREAM_SFX_CACHE) > 512:
+                    _STREAM_SFX_CACHE.clear()
+                _STREAM_SFX_CACHE[key] = got
+            return got if got and Path(got).is_file() else ""
+        return ""
     except Exception:  # noqa: BLE001
         return ""
 
@@ -116266,9 +117832,16 @@ def _stream_snapshot() -> dict[str, Any]:
                 length = float((clip.get("stream") or {}).get("length") or 0)
             except Exception:  # noqa: BLE001
                 length = 0.0
+            _u = str(clip.get("url") or "")
             clips.append({"key": f"{ts}|{clip.get('url')}",
                           "air_at": air / 1000.0,
-                          "path": path, "length": length})
+                          "path": path, "length": length,
+                          # A sting is punctuation under the DJ, not a
+                          # line - it is mixed a little below the voice
+                          # so a hot sample cannot out-shout the show
+                          # (the same intent as sfx_levelled on the
+                          # HTTP road, without its decode-to-wav).
+                          "sfx": _u.startswith("/sfx/")})
 
         return {"on": bool(_RADIO.get("on")), "paused": radio_paused(),
                 "music": music, "clips": clips}
@@ -116592,6 +118165,55 @@ async def dj_shout(
                    f"station, live: \"{text}\" Read it out, take it "
                    "personally, and answer them by name on air.")))
     return {"heard": text, "on_air": bool(_RADIO.get("on"))}
+
+
+@app.get("/api/dj/video")
+async def dj_video_now(
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The clip with a PICTURE that is on air, or about to be (#1263).
+
+    Deliberately tiny and deliberately separate from /api/dj/voice. The
+    stream road does not pull the voice feed at all - that feed announces
+    clips and the page then DOWNLOADS them, which is megabytes of audio a
+    stream listener never plays. This carries no audio and no queue: a
+    couple of hundred bytes saying which picture is up and when, cheap
+    enough for a car to ask every couple of seconds.
+
+    `broadcast_ms` is the station's honest on-air instant. The page is
+    responsible for holding it back by its own buffer depth, because a
+    stream listener is deliberately behind live and the picture has to
+    land on the sound.
+    """
+    require_listen_auth(t, authorization)
+    now_ms = int(time.time() * 1000)
+    out: list[dict[str, Any]] = []
+    try:
+        cut = int(_RADIO.get("voice_cut_ms") or 0)
+        for clip in list(_RADIO.get("voice_clips") or [])[-40:]:
+            if not clip.get("video"):
+                continue
+            ts = int(clip.get("ts") or 0)
+            if ts <= cut:
+                continue
+            air = int(clip.get("broadcast_ms")
+                      or ts + VOICE_BROADCAST_LEAD_MS)
+            secs = float(clip.get("seconds") or 0)
+            # Everything from a little before now to a couple of minutes
+            # back: a listener thirty seconds behind live still needs the
+            # one that "finished" twenty seconds ago.
+            if now_ms - (air + int(secs * 1000)) > 180000:
+                continue
+            out.append({
+                "url": str(clip.get("url") or ""),
+                "name": str(clip.get("sting") or clip.get("text") or ""),
+                "broadcast_ms": air,
+                "seconds": round(secs, 2),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    return {"server_ms": now_ms, "videos": out[-6:]}
 
 
 @app.get("/api/dj/reacts")
@@ -119091,7 +120713,7 @@ KIT_SETUP = """\
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin:0; background:#04060b; color:#dfe7f2; min-height:100vh;
-         font:15px/1.65 system-ui,-apple-system,Segoe UI,sans-serif,PineIcons; }
+         font:15px/1.65 PineIcons, PineIcons, system-ui, -apple-system, Segoe UI, sans-serif; }
   canvas#bg { position:fixed; inset:0; z-index:0; }
   .wrap { position:relative; z-index:1; max-width:720px; margin:0 auto;
           padding:40px 22px 80px; }
@@ -119109,7 +120731,7 @@ KIT_SETUP = """\
   .card.done .n { background:#2f7d52; color:#dfe; }
   p { margin:8px 0; color:#c2cede; }
   code, pre { background:#050810; border:1px solid #22304a; border-radius:8px;
-              font:13px ui-monospace,Consolas,monospace,PineIcons; color:#9fd0ff; }
+              font:13px PineIcons, PineIcons, ui-monospace, Consolas, monospace; color:#9fd0ff; }
   code { padding:2px 6px; } pre { padding:12px; overflow:auto; }
   a { color:#7fd1ff; }
   button { background:#123; color:#dfe7f2; border:1px solid #2b3a52;
@@ -119411,7 +121033,7 @@ KIT_BOOT = """\
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Pine Chat · booting</title>
 <style>
- body{margin:0;background:#02040a;color:#cfe3ff;font-family:system-ui,PineIcons;
+ body{margin:0;background:#02040a;color:#cfe3ff;font-family:PineIcons, system-ui;
       overflow:hidden}
  #hud{position:fixed;left:0;right:0;bottom:26px;text-align:center;
       font-size:13px;letter-spacing:.08em}
@@ -119526,7 +121148,7 @@ KIT_EXPORT_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin:0; background:#04060b; color:#dfe7f2; min-height:100vh;
-         font:14px/1.6 system-ui,-apple-system,Segoe UI,sans-serif,PineIcons;
+         font:14px/1.6 PineIcons, PineIcons, system-ui, -apple-system, Segoe UI, sans-serif;
          display:flex; flex-direction:column; align-items:center;
          justify-content:center; padding:24px; }
   h1 { font-size:19px; letter-spacing:.18em; font-weight:600;
@@ -123220,6 +124842,20 @@ async def cupboard_act_api(
               the whole of "cue it up".
     judge   - the orchestrator examines it and records a verdict.
     remove  - the existing retirement road, unchanged.
+
+    #1364:
+    cue     - written onto the row, so it survives a save and a reorder,
+              and read by unheard_pick ahead of everything else: the
+              standing consumer puts it out at the next gap. `top` is
+              positional and any later take can undo it; this cannot be
+              undone by accident.
+    uncue   - take that back.
+
+    #1363:
+    finish  - send it back to the recording room until its audio is
+              complete. This is the one that matters for the 284 of 289
+              cupboard rounds that were holding half their lines: they
+              are not badly scheduled, they were never finished.
     """
     if key and not authorization:
         authorization = "Bearer " + str(key)
@@ -123260,13 +124896,42 @@ async def cupboard_act_api(
         return {"ok": True, "action": action, "id": rid, "kind": kind, **got,
                 "say": "the orchestrator says %s: %s"
                        % (got.get("verdict"), got.get("why") or "")}
+    if action in ("cue", "uncue"):
+        # #1364: durable, and on every road. See cupboard_cued().
+        if action == "cue":
+            row["cue_at"] = time.time()
+        else:
+            row.pop("cue_at", None)
+        try:
+            _pantry_save(True)
+        except Exception:  # noqa: BLE001
+            pass
+        ready = dialogue_row_ready(kind, row)
+        note_action("you %s a %s round for the next gap"
+                    % ("cued" if action == "cue" else "un-cued", kind))
+        return {"ok": True, "action": action, "id": rid, "kind": kind,
+                "item": cupboard_why_row(kind, row),
+                "cue": cupboard_cue_state(),
+                "say": ("it is un-cued" if action == "uncue" else
+                        ("it is cued - the next gap on the air is its own"
+                         if ready else
+                         "it is cued, but it is not finished radio yet: "
+                         "send it to the recording room and it will go out "
+                         "as soon as it is"))}
+    if action == "finish":
+        got = cupboard_finish_add(kind, row, "sent back from the retirement desk")
+        if got.get("ok"):
+            note_action("you sent a %s round back to the recording room" % kind)
+            pipeline_log("lookahead",
+                         "OPERATOR: a %s round was sent back to the recording "
+                         "room by hand - %s (#1363)" % (kind, got.get("say")))
+        return {"action": action, "id": rid, "kind": kind,
+                "queue": cupboard_finish_state(), **got}
     if action == "play":
-        if kind not in RESCUE_ROADS_OPEN:
-            raise HTTPException(
-                status_code=400,
-                detail="%s cannot be aired out of turn - the roads that "
-                       "can are %s" % (retire_kind_label(kind),
-                                       ", ".join(RESCUE_ROADS_OPEN)))
+        # #1364: the road gate is gone from here for the same reason it is
+        # gone from _ready_shelf_row - this is one named row, not a road
+        # helping itself. The air's own door still refuses anything that is
+        # not finished, which is the guard that actually matters.
         if not _RADIO.get("on") or radio_paused():
             raise HTTPException(status_code=409,
                                 detail="the station is not on air")
@@ -123291,7 +124956,97 @@ async def cupboard_act_api(
                        "the air's own door refused it - the reasons are on "
                        "the item"}
     raise HTTPException(status_code=400,
-                        detail="action is one of play, top, judge, remove")
+                        detail="action is one of play, cue, uncue, finish, "
+                               "top, judge, remove")
+
+
+@app.get("/api/cupboard/finish")
+async def cupboard_finish_get_api(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """#1363: what the recording room still owes the operator."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    got = cupboard_finish_state()
+    got["cue"] = cupboard_cue_state()
+    return got
+
+
+@app.post("/api/cupboard/finish")
+async def cupboard_finish_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """#1363: THE BUTTON AT THE TOP OF THE RETIREMENT DESK.
+
+    "I want an option at the top of the retirement desk to resume having
+     the recording room record the dialogue that's present."
+
+    {}                      - every incomplete round in the cupboard
+    {"kind": "manager"}     - one road's worth
+    {"ids": ["manager-..."]} - exactly these
+
+    Queues only; it does not record anything itself. The keeper is the
+    recording room and it works on its own clock in its own windows - the
+    point of this door is that the keeper is ALLOWED to see these rows at
+    all, which before #1363 it was not once the four-hour desk stopped
+    naming them. Watch it drain with GET on the same path.
+
+    `clear` empties the queue without recording anything, for when a
+    sweep was asked for by mistake.
+    """
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    if body.get("clear"):
+        queue = _cupboard_finish_load()
+        gone = len(queue.get("ids") or [])
+        queue["ids"] = []
+        queue["why"] = {}
+        _cupboard_finish_save()
+        return {"ok": True, "cleared": gone, **cupboard_finish_state(),
+                "say": "the finishing queue is empty - %d round(s) dropped"
+                       % gone}
+    ids = [str(x) for x in (body.get("ids") or []) if str(x)]
+    kind = str(body.get("kind") or "").strip()
+    wanted: list[tuple[str, dict[str, Any]]] = []
+    if ids:
+        for rid in ids[:CUPBOARD_FINISH_MOST]:
+            road, row = cupboard_find(rid)
+            if row is not None:
+                wanted.append((road, row))
+    else:
+        wanted = cupboard_incomplete_rows(kind)
+    added: list[dict[str, Any]] = []
+    already = 0
+    for road, row in wanted[:CUPBOARD_FINISH_MOST]:
+        if retire_id(road, row) in cupboard_finish_ids():
+            already += 1
+            continue
+        got = await asyncio.to_thread(cupboard_finish_add, road, row,
+                                      "the operator resumed recording")
+        if got.get("ok"):
+            added.append(got)
+    state = cupboard_finish_state()
+    if added:
+        note_action("you sent %d unfinished round(s) back to the recording "
+                    "room" % len(added))
+        pipeline_log(
+            "lookahead",
+            "OPERATOR: %d unfinished round(s) were sent back to the recording "
+            "room by hand - %d line(s) of audio are owed. The keeper works "
+            "these alongside the four-hour desk's own picks until they are "
+            "complete (#1363)" % (len(added), state.get("lines_owed") or 0))
+    return {"ok": True, "queued": len(added), "already_queued": already,
+            "considered": len(wanted), "kind": kind, **state}
 
 @app.post("/api/sfx/fill")
 async def sfx_fill_now_api(
@@ -123357,6 +125112,723 @@ async def sfx_fill_now_api(
             or "no clip or prepared line was free"))}
 
 
+# --- #1361: THE CLIP DOCTOR ------------------------------------------------
+#
+# "Right now the station isn't playing clips and I need that not only
+#  reconnected but able to be troubleshot and repaired ... if it's unable to
+#  find a clip, then allow me to troubleshoot via popup and tap options to
+#  rebuild the connection and to ping the server and to query the folders."
+#
+# WHAT WENT WRONG THIS TIME, WRITTEN DOWN SO THE NEXT ONE IS FASTER.
+#
+# /samples inside this container was EMPTY - zero files - while the same
+# path on the host held 44 entries and 32,367 video clips. The share had
+# not gone away; the container's bind had. Measured: the host's
+# /home/ehm_eckx/samples was dev=122 (the CIFS filesystem) and the
+# container's /samples was dev=66306, the host's own root disk. The
+# container was looking at the empty directory UNDERNEATH the mount.
+#
+# That happens because a Docker bind is rprivate: it is resolved when the
+# container is CREATED, and a mount that appears on the host afterwards
+# never propagates in. `docker compose restart` does not re-create the
+# container, so restarting the station - the obvious thing to try, and the
+# thing the ladder does - could never have fixed it. Only a recreate can.
+#
+# Nothing in the station could see this, because every reader it had
+# answered "no samples", which is indistinguishable from an empty library.
+# So the first thing this reports is the one number that tells them apart:
+# the device id of /samples, against whether anything is in it.
+SFX_DOCTOR_ACTIONS = ("look", "ping", "folders", "rebuild")
+
+
+def _sfx_share_facts() -> dict[str, Any]:
+    """Is the library actually THERE, and is it the real one?"""
+    out: dict[str, Any] = {"root": str(SFX_ROOT)}
+    try:
+        st = SFX_ROOT.stat()
+        out["present"] = True
+        # The tell. A bind that has come adrift from its mount reports the
+        # device of whatever is underneath it - and the station's own
+        # writable data lives on that same device, so comparing the two is
+        # a check that needs no hard-coded number.
+        out["device"] = st.st_dev
+        out["data_device"] = DATA_DIR.stat().st_dev
+        out["same_device_as_data"] = (st.st_dev == DATA_DIR.stat().st_dev)
+    except Exception as err:  # noqa: BLE001
+        out["present"] = False
+        out["why"] = str(err)[:200]
+        return out
+    try:
+        top = sorted(p.name for p in SFX_ROOT.iterdir())
+        out["entries"] = len(top)
+        out["sample_names"] = top[:8]
+    except Exception as err:  # noqa: BLE001
+        out["entries"] = 0
+        out["why"] = str(err)[:200]
+    return out
+
+
+def sfx_doctor_look() -> dict[str, Any]:
+    """Everything a popup needs to explain an empty clip button.
+
+    Cheap by construction: it reads what is already in memory and stats
+    the share's top level. It deliberately does NOT walk - a doctor that
+    takes ninety seconds to say the library is still being read is a
+    doctor nobody presses twice.
+    """
+    share = _sfx_share_facts()
+    # #1361c: THE DOCTOR DOES NOT WALK THE SHARE. The first cut counted
+    # the files in every named folder with iterdir() + is_file() - a
+    # stat per file over CIFS, 82,159 of them - and measured against the
+    # live station it hung for over four minutes, because the boot
+    # indexer and the pool keeper were walking the same share at the same
+    # time. A doctor that takes four minutes to say the library is still
+    # being read is the fault it was written to diagnose. The counts come
+    # from the book; only Ping touches the share, and it says so.
+    folders = sfx_db_folders()
+    pool_n = len(_SFX_POOL_CACHE)
+    vid = list(_SFX_VIDEO_MEMO.get("pool") or [])
+    out = {
+        "share": share,
+        "folders": folders,
+        "folder_count": len(folders),
+        "files_seen": sum(f["files"] for f in folders if f["files"] > 0),
+        "pool": pool_n,
+        # #1361d: measured, not assumed. After #1370 the pool read 119,603
+        # against 82,159 files on the share; either the walk now lists
+        # more folders than the doctor counts, or the cache carries
+        # duplicates. This number settles it without a debugger.
+        "pool_unique": len({str(p) for p in list(_SFX_POOL_CACHE)}),
+        "pool_filling": bool(_SFX_POOL_FILLING[0]),
+        "video_pool": len(vid),
+        "video_warm": sfx_video_warm(),
+        "video_building": bool(_SFX_VIDEO_BUILDING[0]),
+        "video_built_once": bool(_SFX_VIDEO_MEMO.get("built")),
+        "lengths_held": len(_SFX_LEN_CACHE),
+        "banned": len(sfx_bans()),
+        # #1362b: the book is what a tap actually draws from now, so
+        # it is the first number worth reading, not the last.
+        "book": sfx_db_counts(),
+        "book_scan": dict(_SFX_DB_SCAN),
+    }
+
+    # One sentence, and it must name the CURE, not the symptom.
+    # #1362b: the book outranks every other reading, because when the
+    # book is full the button works whatever the share is doing - and
+    # when it is empty, nothing else being healthy will help.
+    if out["book"].get("video_playable"):
+        out["verdict"] = ("the clip book holds %d video clip(s) - taps are instant"
+            % out["book"]["video_playable"])
+        out["steps"] = ["nothing to repair"]
+        out["cure"] = ""
+        return out
+    if not share.get("present"):
+        out["verdict"] = "the sample share is not mounted in this container"
+        out["steps"] = [
+            "SFX_ROOT does not exist inside the station at all",
+            "check the bind in compose.yaml, then recreate the container: "
+            "docker compose up -d --force-recreate spark-agent"]
+        out["cure"] = "recreate"
+    elif not share.get("entries"):
+        out["verdict"] = ("the share is mounted but EMPTY - almost certainly "
+                          "a stale bind, not an empty library")
+        out["steps"] = [
+            ("/samples is on the same device as the station's own data, "
+             "which means it is the empty folder underneath the mount "
+             "rather than the mount itself"
+             if share.get("same_device_as_data") else
+             "the share is its own device but has nothing in it"),
+            "a Docker bind is resolved when the container is CREATED, so a "
+            "share mounted on the host afterwards never appears inside a "
+            "container that is merely RESTARTED",
+            "recreate it: docker compose up -d --force-recreate spark-agent",
+            "if the host mount itself is gone, remount it first - Ping the "
+            "server to find out which of the two it is"]
+        out["cure"] = "recreate"
+    elif not out["files_seen"] and (out.get("book_scan") or {}).get("running"):
+        # #1361c: the book is empty because it is being written, not
+        # because the folders are.
+        _scan = out.get("book_scan") or {}
+        out["verdict"] = ("the clip book is being written - %d row(s) so far, "
+                          "folder %s of %s"
+                          % (int(_scan.get("added") or 0),
+                             _scan.get("done"), _scan.get("folders")))
+        out["steps"] = ["it commits per folder, so clips become drawable "
+                        "as it goes - the video button works before it "
+                        "finishes"]
+        out["cure"] = ""
+    elif not out["files_seen"]:
+        out["verdict"] = ("the share is there, but the named clip folders "
+                          "hold nothing")
+        out["steps"] = [
+            "SFX_DROP_FOLDERS names which folders are in the rotation: "
+            + ", ".join(SFX_DROP_FOLDERS),
+            "Query the folders to see what is actually in each one",
+            "if the pack moved, point SFX_DROP_FOLDERS at where it went"]
+        out["cure"] = "folders"
+    elif out["video_building"] or (not out["video_pool"]
+                                   and not out["video_built_once"]):
+        out["verdict"] = ("the clips are there - the video list is still "
+                          "being read")
+        out["steps"] = [
+            "%d clip file(s) are visible across %d folder(s)"
+            % (out["files_seen"], out["folder_count"]),
+            "%d clip lengths are already held, so that part is free"
+            % out["lengths_held"],
+            "this is a walk of a network share and it is slow; it publishes "
+            "as it goes, so the button starts working before it finishes",
+            "Rebuild forces it to start again if it has stalled"]
+        out["cure"] = "rebuild"
+    elif not out["video_pool"]:
+        out["verdict"] = ("the library has been read and not one video clip "
+                          "qualifies")
+        out["steps"] = [
+            "every clip was rejected as too long, too short, or silent",
+            "%d sample(s) are banned" % out["banned"],
+            "Query the folders to see what is in them, and check the length "
+            "dials"]
+        out["cure"] = "folders"
+    else:
+        out["verdict"] = ("the clip library is healthy - %d video clip(s) "
+                          "ready" % out["video_pool"])
+        out["steps"] = ["nothing to repair"]
+        out["cure"] = ""
+    return out
+
+
+@app.get("/api/sfx/doctor")
+async def sfx_doctor_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Why there is no clip, in terms that name a cure."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(sfx_doctor_look)
+
+
+@app.post("/api/sfx/doctor/{action}")
+async def sfx_doctor_do_api(
+    action: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The three buttons on the popup.
+
+    `ping` and `folders` are questions; `rebuild` is the only one that
+    changes anything, and what it changes is a cache. None of them can
+    take the station off air, which is why they are safe to put under a
+    thumb on a tablet.
+    """
+    require_auth(authorization)
+    if action not in SFX_DOCTOR_ACTIONS:
+        raise HTTPException(status_code=400,
+                            detail="the clip doctor cannot " + action)
+
+    def _ping() -> dict[str, Any]:
+        """Is the share answering, and how fast?
+
+        A CIFS share that has gone away does not fail quickly - it hangs
+        until the mount's timeout - so the TIME this takes is as much of
+        the answer as the result. `soft` is in the mount options here, so
+        it does return, but slowly.
+        """
+        got: dict[str, Any] = {"root": str(SFX_ROOT)}
+        t0 = time.monotonic()
+        try:
+            names = []
+            for ix, p in enumerate(SFX_ROOT.iterdir()):
+                names.append(p.name)
+                if ix >= 40:
+                    break
+            got["ok"] = True
+            got["entries_seen"] = len(names)
+        except Exception as err:  # noqa: BLE001
+            got["ok"] = False
+            got["why"] = str(err)[:200]
+        got["ms"] = round((time.monotonic() - t0) * 1000, 1)
+        # A second read, of one real file's first bytes, because listing a
+        # directory can be served from cache while the data road is dead.
+        t1 = time.monotonic()
+        try:
+            one = next((p for f in sfx_folders()[:3] for p in f.iterdir()
+                        if p.is_file()), None)
+            if one is not None:
+                with open(one, "rb") as fh:
+                    fh.read(4096)
+                got["read_file"] = one.name
+                got["read_ms"] = round((time.monotonic() - t1) * 1000, 1)
+            else:
+                got["read_file"] = ""
+        except Exception as err:  # noqa: BLE001
+            got["read_why"] = str(err)[:200]
+        slow = float(got.get("ms") or 0) > 4000
+        got["say"] = (
+            "the share is not answering: " + str(got.get("why") or "")
+            if not got.get("ok") else
+            "the share answered in %.0f ms, which is slow enough to be the "
+            "whole problem" % got["ms"] if slow else
+            "the share answered in %.0f ms - it is healthy" % got["ms"])
+        return got
+
+    def _folders() -> dict[str, Any]:
+        # #1361c: from the book. The named folders that the book has
+        # never seen are listed with -1 so their absence is visible, and
+        # nothing here touches the share - that is Ping's job.
+        known = {r["name"]: r for r in sfx_db_folders()}
+        rows = []
+        try:
+            named = [f.name for f in sfx_folders()[:80]]
+        except Exception:  # noqa: BLE001
+            named = []
+        for name in named:
+            got = known.pop(name, None)
+            rows.append(got or {"name": name, "files": -1, "video": 0,
+                                "playable": 0, "newest": "",
+                                "why": "not in the book yet"})
+        rows.extend(known.values())
+        total = sum(r["files"] for r in rows if r["files"] > 0)
+        return {"folders": rows, "total": total,
+                "named": list(SFX_DROP_FOLDERS),
+                "say": "%d file(s) across %d folder(s), as the clip book "
+                       "has them - press Ping to test the share itself"
+                       % (total, len(rows))}
+
+    def _rebuild() -> dict[str, Any]:
+        """Throw every cache away and start the walk again.
+
+        Caches only - no file is touched. This is the "reconnect" button:
+        after a share comes back, the station is still holding the answers
+        it worked out while the share was missing, and those answers say
+        there is nothing there.
+        """
+        sfx_all_index_reset()
+        _SFX_POOL_SIGNATURE[0] = None
+        _SFX_VIDEO_MEMO.update({"key": None, "pool": [], "at": 0.0,
+                                "built": False})
+        _SFX_ID_MEMO.clear()
+        _SFX_ID_REVERSE.clear()
+        _SFX_POOL_IDS.update({"key": None, "map": {}})
+        sfx_video_kick()
+        return {"ok": True,
+                "say": "every clip cache is cleared and the library is "
+                       "being read again - the list fills in as it goes"}
+
+    if action == "look":
+        return await asyncio.to_thread(sfx_doctor_look)
+    if action == "ping":
+        return await asyncio.to_thread(_ping)
+    if action == "folders":
+        return await asyncio.to_thread(_folders)
+    got = await asyncio.to_thread(_rebuild)
+    got["look"] = await asyncio.to_thread(sfx_doctor_look)
+    return got
+
+
+# --- #1362: THE CLIP LIBRARY, WRITTEN DOWN -------------------------------
+#
+# "I want to be able to tap the video button, and a video is able to load up
+#  instantly on the pine tab randomly whenever I tap the button instead of
+#  having to wait a few seconds. So I need it to be instantaneous."
+#
+# WHY A DATABASE AND NOT ANOTHER CACHE. There have been four attempts at
+# this already - #1303c, #1306c, #1306d, #1311, #1321 - and every one of
+# them is a memo in RAM in front of the same share walk. They all share two
+# faults that no amount of tuning removes:
+#
+#   * a restart throws the whole thing away. The station restarts often -
+#     the ladder does it, the watchdog does it, a deploy does it - and
+#     every restart put the operator back at "still warming" for as long
+#     as the walk takes.
+#   * the walk is the precondition. _sfx_video_pool builds two lists over
+#     every file on the share BEFORE it judges any of them, so nothing is
+#     available until the walk is done, however cheap the judging is.
+#
+# Measured on 2026-09-14 on this box: 82,159 sample files across 31
+# folders, 32,367 of them video, on a CIFS share. And the build was dying
+# silently - `except Exception: pass` around the whole thread body - so
+# the pool stayed at zero and nothing anywhere said why.
+#
+# A database fixes the category of problem rather than this instance of
+# it. The walk happens once, in the background, and is WRITTEN DOWN; a
+# pick is then an indexed query against local disk, which is microseconds
+# and cannot be slow whatever the share is doing. A restart loads nothing
+# at all - the file is already there.
+#
+# sqlite3 is in the standard library, the file is one file, and it is
+# already how this project stores anything it cannot afford to rebuild.
+SFX_DB_PATH = data_path("sfx_clips.db")
+_SFX_DB_LOCK = RLock()
+_SFX_DB: list[Any] = [None]
+# The indexer's own report, so the doctor can say how far it has got
+# rather than the operator having to guess from a number that is not
+# moving.
+_SFX_DB_SCAN: dict[str, Any] = {"running": False, "at": 0.0, "seen": 0,
+                                "added": 0, "folder": "", "folders": 0,
+                                "done": 0, "why": "", "finished": 0.0}
+
+
+def sfx_db() -> Any:
+    """The connection, opened once.
+
+    check_same_thread=False because the indexer runs on its own daemon
+    thread and the pick runs on the request's. Every write goes through
+    _SFX_DB_LOCK; sqlite's own locking would serialise them anyway, but
+    the lock makes the ordering obvious to a reader.
+    """
+    if _SFX_DB[0] is not None:
+        return _SFX_DB[0]
+    with _SFX_DB_LOCK:
+        if _SFX_DB[0] is not None:
+            return _SFX_DB[0]
+        import sqlite3
+        SFX_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(SFX_DB_PATH), check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        # WAL, because the indexer writes for minutes at a time and a
+        # reader must never be blocked behind it - the whole point of this
+        # is that a pick cannot wait.
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("""CREATE TABLE IF NOT EXISTS clips (
+            path     TEXT PRIMARY KEY,
+            sid      TEXT,
+            name     TEXT,
+            folder   TEXT,
+            video    INTEGER NOT NULL DEFAULT 0,
+            bytes    INTEGER,
+            mtime    REAL,
+            seconds  REAL,
+            playable INTEGER NOT NULL DEFAULT 0,
+            seen_at  REAL
+        )""")
+        # The pick's index. `playable` first because every pick filters on
+        # it, then `video`, so one index serves both the sting draw and
+        # the set's draw.
+        con.execute("CREATE INDEX IF NOT EXISTS clips_pick "
+                    "ON clips(playable, video)")
+        con.execute("CREATE INDEX IF NOT EXISTS clips_sid ON clips(sid)")
+        con.commit()
+        _SFX_DB[0] = con
+        return con
+
+
+_SFX_DB_READ: list[Any] = [None]
+
+# #1362f: A THREAD OF ITS OWN.
+#
+# Measured after #1362e, six taps interleaved with /healthz: healthz
+# 5-22 ms every time; the tap 28, 33, 40, 73 - and 334 and 561. The pick
+# itself is one indexed read on a reader connection and takes about a
+# millisecond. The rest was asyncio.to_thread, which hands work to the
+# default ThreadPoolExecutor - the same one every other to_thread call
+# in this file competes for (#1311c said so about the video walk), and
+# right after a restart that queue is full of startup work. The pick
+# was not slow; it was standing in line.
+#
+# One worker, used by nothing else, so a tap is never behind anything.
+from concurrent.futures import ThreadPoolExecutor as _SfxPickExecutor
+_SFX_DB_EXEC = _SfxPickExecutor(max_workers=1, thread_name_prefix="sfx-db-pick")
+
+
+async def sfx_db_pick_row_async(video: bool = True) -> tuple[Path, float] | None:
+    """sfx_db_pick_row, on the pick's own thread, never queued."""
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            _SFX_DB_EXEC, sfx_db_pick_row, video)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sfx_db_reader() -> Any:
+    """#1362d: THE PICK'S OWN CONNECTION, SO IT NEVER QUEUES BEHIND
+    THE WRITER.
+
+    Measured with the indexer running: ten taps took 12 ms, 66 ms,
+    218 ms ... 2,665 ms, 3,159 ms, 3,401 ms. The slow ones were not
+    sqlite being slow - they were the pick waiting on _SFX_DB_LOCK
+    while the indexer committed a folder of several thousand rows.
+    WAL lets a reader proceed while a writer writes, but only on a
+    SEPARATE connection; sharing one connection (and one lock) threw
+    that away.
+
+    This connection is read-only in practice and takes no lock: the
+    writer commits atomically, so the worst a concurrent read can see
+    is the book as it was a folder ago.
+    """
+    if _SFX_DB_READ[0] is not None:
+        return _SFX_DB_READ[0]
+    with _SFX_DB_LOCK:
+        if _SFX_DB_READ[0] is not None:
+            return _SFX_DB_READ[0]
+        sfx_db()                     # the schema exists before we read
+        import sqlite3
+        con = sqlite3.connect(str(SFX_DB_PATH), check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        _SFX_DB_READ[0] = con
+        return con
+
+
+def sfx_db_folders() -> list[dict[str, Any]]:
+    """#1361c: what the book holds, per folder. One indexed query."""
+    try:
+        con = sfx_db_reader()
+        rows = con.execute(
+            "SELECT folder, COUNT(*) AS n, SUM(video) AS v, "
+            "SUM(playable) AS p, MAX(name) AS newest FROM clips "
+            "GROUP BY folder ORDER BY n DESC LIMIT 80").fetchall()
+        return [{"name": str(r["folder"] or ""), "files": int(r["n"] or 0),
+                 "video": int(r["v"] or 0), "playable": int(r["p"] or 0),
+                 "newest": str(r["newest"] or "")[:60]} for r in rows]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def sfx_db_counts() -> dict[str, int]:
+    try:
+        con = sfx_db()
+        with _SFX_DB_LOCK:
+            row = con.execute(
+                "SELECT COUNT(*) AS n, "
+                "SUM(video) AS v, "
+                "SUM(playable) AS p, "
+                "SUM(video AND playable) AS vp FROM clips").fetchone()
+        return {"rows": int(row["n"] or 0), "video": int(row["v"] or 0),
+                "playable": int(row["p"] or 0),
+                "video_playable": int(row["vp"] or 0)}
+    except Exception:  # noqa: BLE001
+        return {"rows": 0, "video": 0, "playable": 0, "video_playable": 0}
+
+
+def sfx_db_pick_row(video: bool = True,
+                    tries: int = 6) -> tuple[Path, float] | None:
+    """#1362e: the path AND its length, so the cue road needs no stat.
+
+    Measured after #1362d with the indexer running: ten taps took 33,
+    33, 34, 87, 106, 205, 511, 682, 772 and 1,397 ms. The pick itself
+    was the 33. The rest was sfx_seconds(pick), which is a ledger read
+    - but the ledger is keyed by path:mtime, and the mtime is a stat
+    on the share, and the share was being walked by the indexer at
+    the time. The book already holds the length it judged the clip
+    playable by; handing it over makes the tap road share-free end
+    to end.
+    """
+    got = _sfx_db_pick_any(video, tries)
+    return got
+
+
+def sfx_db_pick(video: bool = True, tries: int = 6) -> Path | None:
+    got = _sfx_db_pick_any(video, tries)
+    return got[0] if got else None
+
+
+def _sfx_db_pick_any(video: bool = True,
+                     tries: int = 6) -> tuple[Path, float] | None:
+    """One random clip, in microseconds.
+
+    NOT `ORDER BY RANDOM()`. That sorts the whole matching set on every
+    call, which on 32,000 rows is exactly the few seconds this exists to
+    remove. This takes a random rowid in range and walks forward to the
+    first match, which is one index seek; `tries` covers the case where
+    the random point lands in a run of rows that do not match.
+
+    Returns None rather than raising: a missing clip is a picture that
+    does not appear, and the show carries on.
+    """
+    try:
+        con = sfx_db_reader()          # #1362d: never behind the writer
+        want = 1 if video else 0
+        if True:
+            for _ in range(max(1, tries)):
+                # #1362c: UNIFORM. The first cut of this took a random
+                # rowid and walked forward to the first match, and three
+                # taps in a row produced the same clip. Rows are written a
+                # folder at a time, so the video clips sit in contiguous
+                # runs, and every random point that lands in the audio
+                # before a run resolves to the FIRST clip of that run.
+                # Measured with 30 playable clips: one of them, every time.
+                #
+                # COUNT and OFFSET over the covering index instead. On
+                # 32,000 rows that is a few milliseconds - still nothing
+                # against a frame - and every clip is as likely as every
+                # other, which is what "random" was supposed to mean.
+                n = con.execute(
+                    "SELECT COUNT(*) AS n FROM clips WHERE playable = 1 "
+                    "AND video = ?", (want,)).fetchone()
+                count = int((n and n["n"]) or 0)
+                if not count:
+                    return None
+                row = con.execute(
+                    "SELECT path, seconds FROM clips WHERE playable = 1 "
+                    "AND video = ? LIMIT 1 OFFSET ?",
+                    (want, random.randrange(count))
+                ).fetchone()
+                if row is None:
+                    return None
+                # #1362d: NO STAT. The first cut checked path.is_file()
+                # here, which is a round trip to the share - and the share
+                # is the one thing a pick must never touch, because when
+                # it is slow it is slow for seconds. A clip that has been
+                # deleted since the walk fails to LOAD, and the set already
+                # asks for another on a load error (#1311d); the miss road
+                # prunes the row then. Nothing is lost and nothing waits.
+                return (Path(str(row["path"])),
+                        float(row["seconds"] or 0.0))
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sfx_db_index(limit_seconds: float = 0.0) -> dict[str, Any]:
+    """Walk the folders once and write down what is in them.
+
+    Deliberately NOT a generator feeding a memo. It commits per folder, so
+    a walk that is interrupted - a restart, a share that goes away
+    halfway - keeps everything it had already learned, and the next run
+    continues rather than starting again.
+
+    `playable` is decided here, once, using the length ledger that already
+    exists. That is the expensive judgement (#1321: 10,641 of 14,354 clips
+    needed an ffprobe across CIFS) and it is exactly the thing that must
+    not happen while a thumb is waiting.
+    """
+    started = time.time()
+    _SFX_DB_SCAN.update({"running": True, "at": started, "seen": 0,
+                         "added": 0, "folder": "", "done": 0, "why": "",
+                         "finished": 0.0})
+    seen = added = 0
+    try:
+        con = sfx_db()
+        folders = sfx_folders()
+        _SFX_DB_SCAN["folders"] = len(folders)
+        banned = sfx_bans()
+        for ix, folder in enumerate(folders):
+            _SFX_DB_SCAN.update({"folder": folder.name, "done": ix})
+            if limit_seconds and time.time() - started > limit_seconds:
+                _SFX_DB_SCAN["why"] = "stopped at the time limit"
+                break
+            try:
+                files = [p for p in folder.iterdir()
+                         if p.is_file() and p.suffix.lower() in SFX_TYPES]
+            except OSError as err:
+                _SFX_DB_SCAN["why"] = str(err)[:160]
+                continue
+            rows = []
+            for path in files:
+                seen += 1
+                # #1373: this is CPU-bound Python on a daemon thread, and
+                # a thread that never sleeps holds the GIL for its whole
+                # switch interval against the loop. Two milliseconds
+                # every two hundred files is invisible to the walk and
+                # hands the loop a clean turn each time.
+                if seen % 200 == 0:
+                    time.sleep(0.002)
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                sid = sfx_id(path)
+                if sid in banned:
+                    continue
+                secs = sfx_seconds_held(path)
+                is_video = 1 if sfx_is_video(path) else 0
+                # Unmeasured clips still go in the book, marked unplayable,
+                # so the next pass knows they exist and the length pass can
+                # find them without walking the share again. A clip is
+                # playable when it has a length and that length is inside
+                # the dials.
+                playable = 0
+                if secs is not None and (
+                        sfx_floor_seconds() <= secs <= sfx_cap_seconds()):
+                    # The same two dials sfx_short reads, asked once here
+                    # instead of once per draw. The silence gate is NOT
+                    # applied to video: #1263 established that a silent
+                    # clip is still something to watch, and it is exactly
+                    # the kind of clip the little CRT set exists for.
+                    playable = 1 if is_video else (
+                        0 if sfx_is_silent(path) else 1)
+                rows.append((str(path), sid, path.stem, folder.name,
+                             is_video, int(st.st_size), float(st.st_mtime),
+                             float(secs) if secs is not None else None,
+                             playable, time.time()))
+            if rows:
+                with _SFX_DB_LOCK:
+                    con.executemany(
+                        "INSERT INTO clips (path, sid, name, folder, video,"
+                        " bytes, mtime, seconds, playable, seen_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(path) DO UPDATE SET "
+                        " sid=excluded.sid, name=excluded.name,"
+                        " folder=excluded.folder, video=excluded.video,"
+                        " bytes=excluded.bytes, mtime=excluded.mtime,"
+                        " seconds=COALESCE(excluded.seconds, clips.seconds),"
+                        " playable=MAX(excluded.playable, clips.playable),"
+                        " seen_at=excluded.seen_at", rows)
+                    con.commit()
+                added += len(rows)
+                _SFX_DB_SCAN.update({"seen": seen, "added": added})
+        _SFX_DB_SCAN.update({"done": len(folders)})
+    except Exception as err:  # noqa: BLE001
+        # #1362: SAID OUT LOUD. The road this replaces wrapped its whole
+        # body in `except Exception: pass`, so when the build died the
+        # pool simply stayed at zero and nothing anywhere explained it -
+        # which is how it went unnoticed long enough for the operator to
+        # report the button as dead.
+        _SFX_DB_SCAN["why"] = str(err)[:200]
+        print("[sfx-db] index failed: %s" % err, flush=True)
+    finally:
+        _SFX_DB_SCAN.update({"running": False, "seen": seen, "added": added,
+                             "finished": time.time()})
+    return dict(_SFX_DB_SCAN)
+
+
+_SFX_DB_THREAD: list[Any] = [None]
+
+
+def sfx_db_kick(force: bool = False) -> bool:
+    """Index in the background, one at a time, never on the loop."""
+    if _SFX_DB_SCAN.get("running") and not force:
+        return False
+    t = _SFX_DB_THREAD[0]
+    if t is not None and t.is_alive():
+        return False
+    thread = Thread(target=sfx_db_index, name="sfx-db-index", daemon=True)
+    _SFX_DB_THREAD[0] = thread
+    thread.start()
+    return True
+
+
+@app.get("/api/sfx/db")
+async def sfx_db_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the clip book holds, and how the last walk went."""
+    require_read_auth(authorization)
+    counts = await asyncio.to_thread(sfx_db_counts)
+    scan = dict(_SFX_DB_SCAN)
+    return {"counts": counts, "scan": scan,
+            "path": str(SFX_DB_PATH),
+            "ready": bool(counts.get("video_playable")),
+            "say": ("%d video clip(s) ready to draw instantly"
+                    % counts.get("video_playable", 0)
+                    if counts.get("video_playable") else
+                    "the clip book is still being written"
+                    if scan.get("running") else
+                    "the clip book is empty - press Rebuild")}
+
+
+@app.post("/api/sfx/db/rebuild")
+async def sfx_db_rebuild_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Walk the share again and write down what is there now."""
+    require_auth(authorization)
+    started = sfx_db_kick(force=False)
+    return {"ok": True, "started": started,
+            "say": ("reading the library into the clip book - it commits "
+                    "per folder, so clips become drawable as it goes"
+                    if started else
+                    "a walk is already running - it commits per folder, so "
+                    "the book is filling while you watch")}
+
+
 @app.post("/api/sfx/video/cue")
 async def sfx_video_cue_api(
     payload: dict[str, Any] | None = None,
@@ -123405,8 +125877,26 @@ async def sfx_video_cue_api(
     # the same files, so it is USED, and the rebuild is kicked behind
     # the answer. Only a genuinely empty list - the first tap of a
     # process, before any walk has finished - has nothing to serve.
-    if not sfx_video_warm():
+    # #1362b: THE BOOK FIRST, AND ALMOST ALWAYS THE BOOK.
+    #
+    # "I need it to be instantaneous."
+    #
+    # Everything below this draw is the old road - a memo in RAM in
+    # front of a share walk - and it is now only reached in the
+    # minutes after a fresh install, before the book has been
+    # written. A draw from the book is one indexed seek against local
+    # disk: it never touches the share, so it cannot be slow, and it
+    # survives a restart, so it cannot be empty afterwards.
+    #
+    # to_thread rather than inline because sqlite is blocking, and a
+    # microsecond of blocking on this loop is still blocking on a loop
+    # that was measured holding 42,991 seconds of dead air.
+    _got = await sfx_db_pick_row_async(True)              # #1362e/#1362f
+    _book = _got[0] if _got else None
+    _book_secs = float(_got[1]) if _got else 0.0
+    if _book is None and not sfx_video_warm():
         sfx_video_kick()
+        sfx_db_kick()          # and start writing the book down
         if not _SFX_VIDEO_MEMO.get("pool"):
             # #1321: and say WHICH of the two silences this is. A walk
             # that finished and found nothing is not a walk still
@@ -123424,7 +125914,14 @@ async def sfx_video_cue_api(
     # own fetch is the warm 0.5s one rather than the cold 4.5s one. An
     # empty deck (the first tap of a process) falls back to the random
     # pick rather than waiting for a refill.
-    pick = sfx_deck_take()
+    pick = _book                                   # #1362b
+    # #1362d: the deck (#1309) pre-warms three clips into the page
+    # cache, which mattered when every pick was a cold share walk. It
+    # also hands back the SAME clip until it is refilled - measured,
+    # one clip four times in ten taps - so it only stands in when the
+    # book has nothing, never in front of it.
+    if pick is None:
+        pick = sfx_deck_take()
     if pick is None:
         pick = await asyncio.to_thread(_sfx_any_video)
     if pick is None:
@@ -123433,7 +125930,10 @@ async def sfx_video_cue_api(
                        "enough, unbanned and carrying sound"}
     key = sfx_id(pick)
     signature = media_sign(key)
-    seconds = round(sfx_seconds(pick), 2)
+    # #1362e: a book pick already knows its length; only the old road
+    # has to go and look, and only the old road may touch the share.
+    seconds = (round(_book_secs, 2) if (_book is not None and _book_secs > 0)
+               else round(sfx_seconds(pick), 2))
     stamp = int(time.time() * 1000)
     clip = {
         "url": f"/sfx/{key}?t={signature}",
@@ -123524,6 +126024,53 @@ async def sfx_video_cut_api(
     return {"ok": True, "clip": clip,
             "say": str(clip.get("sting") or "clip") + " is on every set"}
 
+
+
+@app.get("/api/sfx/video/mode")
+async def sfx_video_mode_get_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1366: is the endless set running, and what is the picture dial."""
+    require_read_auth(authorization)
+    return sfx_video_mode_state()
+
+
+@app.post("/api/sfx/video/mode")
+async def sfx_video_mode_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1366: THE PLAY BUTTON NEXT TO THE VIDEO BUTTON.
+
+    {"on": true}        - endless video, and his clips go mp4-only
+    {"on": false}       - back to the dial
+    {"share": 67}       - move the dial without touching the mode
+
+    The mode is a held setting rather than a running task's flag, so it
+    survives a restart: an operator who left the set running finds it
+    running. sfx_video_cycle() is always alive and reads it every few
+    seconds, which is also why turning it off takes effect at the end of
+    the clip that is already on the tube rather than cutting it.
+    """
+    require_auth(authorization)
+    body = payload or {}
+    changed: dict[str, Any] = {}
+    if "on" in body:
+        changed["sfx_video_mode"] = bool(body.get("on"))
+    if body.get("share") is not None:
+        changed["sfx_video_share"] = max(0, min(100, int(body.get("share") or 0)))
+    if changed:
+        settings = load_settings()
+        dj = dict(settings.get("dj") or {})
+        dj.update(changed)
+        save_settings({**settings, "dj": dj})
+        note_action("you %s" % (
+            ("turned the endless video set %s"
+             % ("on" if changed["sfx_video_mode"] else "off"))
+            if "sfx_video_mode" in changed else
+            ("set the SFX Guy's picture share to %d%%"
+             % changed["sfx_video_share"])))
+    return {"ok": True, "changed": changed, **sfx_video_mode_state()}
 
 @app.get("/api/sfx/anxiety")
 async def sfx_anxiety_get_api(
@@ -123745,7 +126292,7 @@ MANUAL_READ_HTML = """<!doctype html>
 <link rel="stylesheet" href="/icons/pineicons.css">
 <style>
  :root{color-scheme:light dark}
- body{margin:0;font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif,PineIcons}
+ body{margin:0;font:16px/1.6 PineIcons, PineIcons, system-ui, -apple-system, Segoe UI, sans-serif}
  .bar{position:sticky;top:0;display:flex;gap:10px;align-items:center;
       padding:8px 14px;background:Canvas;border-bottom:1px solid #8884;
       font-size:13px}
@@ -136842,7 +139389,7 @@ svg.plexus .nlab{font-family:"Helvetica Neue",Arial,sans-serif;font-size:10px;fi
 .notice.paused{background:var(--red)}
 .pgtabs{display:none}
 /* #1047: the jump line and the continuation head. */
-.jump{margin:2px 0 0;text-align:right;font:italic 700 11.5px/1.3 Georgia,serif,PineIcons;color:var(--red);text-transform:none;break-before:avoid}
+.jump{margin:2px 0 0;text-align:right;font:italic 700 11.5px/1.3 PineIcons, PineIcons, Georgia, serif;color:var(--red);text-transform:none;break-before:avoid}
 .jump b{font-style:normal}
 .conthead{border-top:3px solid var(--ink);border-bottom:1px solid var(--ink);padding:3px 0;margin:0 0 7px;font:800 12px/1.25 "Helvetica Neue",Arial,sans-serif;text-transform:uppercase;letter-spacing:.08em;break-after:avoid}
 .conthead i{font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink2)}
@@ -136864,7 +139411,7 @@ article.cont .body p:first-of-type::first-letter{float:none;font-size:inherit;pa
 .filler.rule{border:0;border-top:2px solid var(--ink);border-bottom:2px solid var(--ink);text-align:center;font-weight:900;text-transform:uppercase;letter-spacing:.18em;padding:2px 0;font-size:9.5px}
 .filler.k-crime,.filler.k-wanted{border-width:2px}
 article.hint-obituary{border-top:6px solid var(--ink)}.hint-obituary figure.plate img{filter:grayscale(1) contrast(1.1)}
-.hint-obituary h2::before{content:"In memoriam";display:block;font-family:Georgia,serif,PineIcons;font-style:italic;font-weight:400;font-size:12px;letter-spacing:.08em;color:var(--ink2)}
+.hint-obituary h2::before{content:"In memoriam";display:block;font-family:PineIcons, Georgia, serif;font-style:italic;font-weight:400;font-size:12px;letter-spacing:.08em;color:var(--ink2)}
 article.hint-wanted,article.hint-crime{border:4px double var(--ink);padding:10px 12px 6px;background:var(--tint)}
 .hint-wanted .kicker,.hint-crime .kicker{display:block;text-align:center;font-size:26px;letter-spacing:.2em;color:var(--ink);margin:0 0 6px;line-height:1}
 .hint-crime .kicker{background:var(--red);color:#fff;font-size:18px;padding:5px 0}
@@ -139924,6 +142471,60 @@ async def paper_snapshot_clock(edition_id: str) -> None:
         pipeline_log("drop", f"gazette snapshot clock tripped: {exc}"[:200])
 
 
+
+# --- #1369: THE GAZETTE'S PICTURES CARRY THEIR OWN TICKET --------------------
+#
+# "Make sure that the Pinebox newspaper always is able to show the images
+#  related to the newspaper." (#1102)
+#
+# Measured on the live station the morning this went in, against the lead
+# plate of the 5 AM edition:
+#
+#     GET /api/generations/image/Ernie-Image-Turbo_00195_.png
+#         without a header ........ 401
+#         with the Bearer key ..... 200
+#
+# The paper's TEXT loads because the panel fetches the page with the key in
+# a header and pours it into the window. The plates do not, because an
+# <img> tag makes its own request and an <img> tag cannot send a header -
+# and the plate route stopped being read-open when #1253 put the public
+# door on it (its docstring still says "open (read) auth"; the code says
+# require_listen_auth). Every picture in every edition has 401'd since, and
+# the broken-image glyph the operator photographed is what that looks like
+# once the containment pass has stripped the onerror= that used to hide it.
+#
+# The route already accepts the answer: a tune-in token in ?t=, the same
+# "the URL is the credential" contract /media has always carried. The paper
+# simply never stamped one. It is stamped HERE, at the door, rather than in
+# the typesetter, for two reasons: editions are cached on disk and a token
+# baked into the cache would expire while the page did not; and stamping at
+# the door mends the eighty-odd editions already written as well as the
+# next one. #1253's route is not touched.
+PAPER_PLATE_TOKEN_HOURS = 12
+_PAPER_PLATE_SRC = re.compile(r'(src=")(/api/generations/image/[^"]+)(")')
+
+
+def paper_plates_tokened(html: str) -> str:
+    """Every plate src gets a fresh tune-in token, good for the sitting."""
+    if not html or "/api/generations/image/" not in html:
+        return html
+    try:
+        token = listen_token(int(time.time()) + PAPER_PLATE_TOKEN_HOURS * 3600,
+                             "paper")
+    except Exception:  # noqa: BLE001
+        token = ""
+    if not token:
+        return html
+
+    def _stamp(m: re.Match) -> str:
+        url = m.group(2)
+        if "?" in url and "t=" in url.split("?", 1)[1]:
+            return m.group(0)                       # already carries one
+        return "%s%s%st=%s%s" % (m.group(1), url, "&" if "?" in url else "?",
+                                 token, m.group(3))
+    return _PAPER_PLATE_SRC.sub(_stamp, html)
+
+
 def paper_html_for(edition_id: str, style: str) -> str | None:
     """#1037: the typeset page for a style, cached as edition.<style>.html
     (edition.html stays the broadsheet). A cached page whose stamp is older
@@ -142136,7 +144737,7 @@ html,body{height:100%;margin:0;padding:0;overflow:hidden;background:#15130f;
 #notice{position:absolute;inset:0;z-index:6;display:none;
   flex-direction:column;align-items:center;justify-content:center;gap:8px;
   text-align:center;padding:24px;background:#15130f}
-#notice b{font:700 17px/1.3 Georgia,serif,PineIcons;color:#f0e9da}
+#notice b{font:700 17px/1.3 PineIcons, PineIcons, Georgia, serif;color:#f0e9da}
 #notice span{color:#8d8677;max-width:32em}
 </style>
 </head>
@@ -142777,7 +145378,8 @@ async def api_paper_html(
     html = await asyncio.to_thread(paper_html_for, edition_id, style)
     if html is None:
         raise HTTPException(status_code=404, detail="No such edition")
-    return HTMLResponse(html)
+    # #1369: the plates get their ticket at the door. See paper_plates_tokened.
+    return HTMLResponse(paper_plates_tokened(html))
 
 
 @app.get("/api/paper/{edition_id}/text")
@@ -144322,8 +146924,7 @@ RETIRE_PAGE_HTML = r"""<!doctype html>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #04060b; color: #dbe7f5;
-         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif,
-               PineIcons; }
+         font: 14px/1.5 PineIcons, PineIcons, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   header { position: sticky; top: 0; z-index: 3; background: #0b1220; border-bottom: 1px solid #1e2a3a;
            padding: 8px 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   button, select, input { font: inherit; font-size: 13px; padding: 4px 9px; background: #101a2a; color: #dbe7f5;
@@ -145393,7 +147994,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, sans-serif, PineIcons;
+  font-family: PineIcons, system-ui, sans-serif;
   overflow-x: hidden;
 }
 header {
@@ -146344,7 +148945,7 @@ button.danger {
   display: inline-block; padding-left: 100%;
   animation: hp-scroll 30s linear infinite;
   color: #9fd0ff; font-size: 11px;
-  font-family: ui-monospace, Menlo, Consolas, monospace,PineIcons;
+  font-family: PineIcons, ui-monospace, Menlo, Consolas, monospace;
 }
 
 /* ---- Shared full-screen popup ---- */
@@ -146468,7 +149069,7 @@ button.danger {
 .hp-ok { color: #9df2b4; } .hp-bad { color: var(--danger); }
 .hp-term {
   background: #05070b; border-radius: 7px; padding: 7px 9px; margin-top: 8px;
-  font-family: ui-monospace, Menlo, Consolas, monospace,PineIcons; font-size: 11px;
+  font-family: PineIcons, ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
   color: #9fb8a9; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
 }
 .hp-restart {
@@ -146657,12 +149258,12 @@ button.danger {
 }
 .gaz-count {
   position: absolute; top: 4px; right: 15px; z-index: 4; color: #05080d;
-  font: 700 11px/1 ui-monospace, Consolas, monospace,PineIcons; padding: 3px 7px;
+  font: 700 11px/1 PineIcons, PineIcons, ui-monospace, Consolas, monospace; padding: 3px 7px;
   border-radius: 999px; background: var(--accent); box-shadow: 0 1px 5px rgba(0,0,0,.6);
 }
 .gaz-lab {
   position: absolute; left: 0; right: 11px; bottom: 11px; z-index: 4; padding: 6px 6px 4px;
-  font: 700 10px/1.3 system-ui, sans-serif,PineIcons; color: #f4efe2; display: flex;
+  font: 700 10px/1.3 PineIcons, PineIcons, system-ui, sans-serif; color: #f4efe2; display: flex;
   justify-content: space-between; align-items: flex-end; gap: 4px;
   border-radius: 0 0 6px 6px;
   background: linear-gradient(transparent, rgba(3,5,9,.94) 62%);
@@ -146702,19 +149303,19 @@ button.danger {
 .gaz-page.zoom { width: min(1040px, 90vw); }
 .gaz-cap {
   flex: none; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
-  color: #e8eef7; font: 12px/1.45 system-ui, sans-serif,PineIcons;
+  color: #e8eef7; font: 12px/1.45 PineIcons, PineIcons, system-ui, sans-serif;
 }
 .gaz-cap b { font-size: 13px; font-variant-numeric: tabular-nums; }
 .gaz-kick {
   text-transform: uppercase; letter-spacing: .08em; color: #05080d;
-  font: 700 9px/1.7 system-ui, sans-serif,PineIcons; background: #c9b071;
+  font: 700 9px/1.7 PineIcons, PineIcons, system-ui, sans-serif; background: #c9b071;
   padding: 1px 6px; border-radius: 3px;
 }
 .gaz-kick.hourly { background: var(--accent); }
 .gaz-pause { color: #ffd479; font-size: 11px; }
 .gaz-headline { color: #cfd8e6; }
 .gaz-deck {
-  flex: none; color: #8e99aa; font: 11px/1.4 system-ui, sans-serif,PineIcons; max-width: 100%;
+  flex: none; color: #8e99aa; font: 11px/1.4 PineIcons, PineIcons, system-ui, sans-serif; max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 /* #1157: the sheet is as tall as the page it holds, no taller - flex:1
@@ -146726,7 +149327,7 @@ button.danger {
   border: 1px solid #3a4a63; border-radius: 6px; box-shadow: 0 18px 60px rgba(0,0,0,.65);
 }
 .gaz-page img { display: block; width: 100%; height: auto; }
-.gaz-empty { color: #9ba6b7; font: 13px system-ui, sans-serif,PineIcons; padding: 30px; }
+.gaz-empty { color: #9ba6b7; font: 13px PineIcons, PineIcons, system-ui, sans-serif; padding: 30px; }
 
 .conv-wrap {
   display: flex; gap: 10px; margin-top: 10px;
@@ -146810,7 +149411,7 @@ button.danger {
 .cx-marquee span {
   display: inline-block; padding-left: 100%;
   animation: hp-scroll 45s linear infinite;
-  font-family: ui-monospace, Menlo, Consolas, monospace,PineIcons;
+  font-family: PineIcons, ui-monospace, Menlo, Consolas, monospace;
   font-size: 12px; color: #9fd0ff;
 }
 .pb-collapsible:not(.collapsed) > .cx-marquee { display: none; }
@@ -147040,7 +149641,7 @@ h2 .film-size select { flex: 0 1 auto; min-width: 0; }
 }
 .tf-textpage {
   position: absolute; inset: 0; padding: 24px 18px 12px; overflow: hidden;
-  background: #f4f1ea; color: #20242b; font-family: Georgia, serif,PineIcons;
+  background: #f4f1ea; color: #20242b; font-family: PineIcons, Georgia, serif;
 }
 .tf-textpage .tp-head {
   font-size: 15px; font-weight: 700; margin-bottom: 7px;
@@ -147077,7 +149678,7 @@ h2 .film-size select { flex: 0 1 auto; min-width: 0; }
   max-height: 240px; overflow-y: auto;
   background: #05070b; border: 1px solid var(--border); border-radius: 10px;
   padding: 12px 14px; font-size: 13px; line-height: 1.5;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace,PineIcons;
+  font-family: PineIcons, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .cx-entry {
   padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.05);
@@ -148198,7 +150799,7 @@ then the tabloid, scrolling down the right half of the screen"
                     font-size:10.5px;line-height:1.5;color:#dfe;text-align:right;
                     background:#000a;padding:6px 9px;border-radius:8px;
                     border:1px solid #2b3a52;pointer-events:none;
-                    font-family:ui-monospace,monospace,PineIcons"></div>
+                    font-family:PineIcons, ui-monospace, monospace, PineIcons"></div>
         <div id="sparkShowNote"
              style="position:absolute;left:8px;bottom:34px;font-size:10px;
                     color:#9fe;background:#0009;padding:2px 7px;border-radius:6px;
@@ -148212,7 +150813,7 @@ then the tabloid, scrolling down the right half of the screen"
         <style>
           .sparkDeep{display:none;position:absolute;top:34px;bottom:64px;
             width:min(27%,360px);flex-direction:column;gap:8px;
-            pointer-events:none;font-family:ui-monospace,monospace,PineIcons;
+            pointer-events:none;font-family:PineIcons, ui-monospace, monospace;
             overflow:hidden}
           #sparkShowStage:fullscreen #sparkShowDeepL,
           #sparkShowStage:fullscreen #sparkShowDeepR{display:flex}
@@ -148231,7 +150832,7 @@ then the tabloid, scrolling down the right half of the screen"
              style="position:absolute;left:0;right:0;bottom:0;padding:8px 10px;
                     font-size:11px;line-height:1.5;color:#cfe;
                     background:linear-gradient(transparent,#000c);
-                    pointer-events:none;font-family:ui-monospace,monospace,PineIcons"></div>
+                    pointer-events:none;font-family:PineIcons, ui-monospace, monospace, PineIcons"></div>
       </div>
       <div class="muted" style="font-size:11px;margin-top:6px">
         Live from <b>~/ComfyUI/output</b> with the Spark's own vitals over it —
@@ -149927,13 +152528,13 @@ const PINE_3JS = [
   {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen(),
    frame: {box: () => document.getElementById("crystalBox"),
            close: () => crystalClose()}},
-  {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen(),
+  {key: "shelf",    label: "❄ The shelf",       open: () => chunkOpen(),
    frame: {box: () => chunkBox, close: () => chunkClose(),
            width: 700, height: 600}},
-  {key: "slots",    label: "⏱️ The half hours", open: () => slotOpen(),
+  {key: "slots",    label: "⏱ The half hours", open: () => slotOpen(),
    frame: {box: () => slotBox, close: () => slotClose(),
            width: 660, height: 640}},
-  {key: "asks",     label: "🎛️ The orchestrator asks", open: () => orchOpen(),
+  {key: "asks",     label: "🎛 The orchestrator asks", open: () => orchOpen(),
    frame: {box: () => orchBox, close: () => orchClose(),
            width: 620, height: 680}},
   {key: "rejected", label: "Rejected lines", open: () => lineReviewOpen(),
@@ -150173,7 +152774,7 @@ async function rhymeCloudWin() {
       const row = el("div", "", "");
       row.style.cssText = "margin-bottom:6px";
       const tail = el("span", "", f.tail);
-      tail.style.cssText = "font-family:ui-monospace,monospace,PineIcons;font-size:11px;opacity:.7";
+      tail.style.cssText = "font-family:PineIcons, ui-monospace, monospace;font-size:11px;opacity:.7";
       row.appendChild(tail);
       row.appendChild(el("div", "", f.words.map((x) => x.word + (x.count > 1 ? "×" + x.count : "")).join(" · ")));
       side.appendChild(row);
@@ -150443,7 +153044,7 @@ async function pine3JSMenu() {
     const name = el("div", "", "");
     name.style.cssText = "flex:1;min-width:0";
     const t = el("div", "", entry.label);
-    t.style.cssText = "font:600 12.5px system-ui,PineIcons;color:#dff6ff";
+    t.style.cssText = "font:600 12.5px PineIcons, PineIcons, system-ui;color:#dff6ff";
     const b = el("div", "muted", PINE_3JS_BLURB[entry.key] || "");
     b.style.cssText = "font-size:11px;color:#7f92a6";
     name.appendChild(t); name.appendChild(b);
@@ -150478,7 +153079,7 @@ function pine3JSInstall() {
     b.title = "every three.js experience the station has";
     b.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:300;"
       + "padding:7px 12px;border-radius:9px;border:1px solid #22304a;"
-      + "background:#0b1420;color:#9fd0e3;font:600 12px system-ui,PineIcons;cursor:pointer";
+      + "background:#0b1420;color:#9fd0e3;font:600 12px PineIcons, PineIcons, system-ui;cursor:pointer";
     b.onclick = () => pine3JSMenu();
     document.body.appendChild(b);
     const want = new URLSearchParams(location.search).get("view");
@@ -152785,7 +155386,7 @@ async function exportConversationPdf(g) {
   win.document.write(
     "<!doctype html><html><head><meta charset='utf-8'><title>" + esc(title) +
     "</title><style>" +
-    "body{font:14px/1.65 -apple-system,Segoe UI,Roboto,sans-serif,PineIcons;color:#111;" +
+    "body{font:14px/1.65 PineIcons, PineIcons, -apple-system, Segoe UI, Roboto, sans-serif;color:#111;" +
     "max-width:44em;margin:32px auto;padding:0 18px}" +
     "h1{font-size:22px;margin:0 0 4px}.meta{color:#666;font-size:12px;" +
     "margin-bottom:22px}.u{font-weight:700;color:#0b6b8a;margin-top:18px}" +
@@ -155948,7 +158549,7 @@ async function trackCard(id) {
     const row = el("div", "", "");
     row.style.cssText = "display:flex;gap:10px;padding:2px 0;font-size:12px";
     const name = el("span", "muted", key);
-    name.style.cssText = "flex:0 0 150px;font-family:ui-monospace,monospace,PineIcons";
+    name.style.cssText = "flex:0 0 150px;font-family:PineIcons, ui-monospace, monospace, PineIcons";
     const text = el("span", "", String(value));
     text.style.cssText = "flex:1;word-break:break-word";
     row.appendChild(name);
@@ -156234,9 +158835,9 @@ async function boothOpen() {
     {name: "🧠 Dialogue Mind", open: () => mindOpen()},
     {name: "🕸 The machine", open: () => djGraphPanel()},
     {name: "💠 Data crystal", open: () => crystalOpen()},
-    {name: "❄️ The shelf", open: () => chunkOpen()},
-    {name: "⏱️ The half hours", open: () => slotOpen()},
-    {name: "🎛️ The orchestrator asks", open: () => orchOpen()},
+    {name: "❄ The shelf", open: () => chunkOpen()},
+    {name: "⏱ The half hours", open: () => slotOpen()},
+    {name: "🎛 The orchestrator asks", open: () => orchOpen()},
   ];
   let viewIdx = Number(localStorage.booth3jsIdx || 0);
   const viewBtn = el("button", "", "🧠 3JS Views ⟳");
@@ -156973,7 +159574,7 @@ function usbConsole() {
   out.id = "usbOut";
   out.style.cssText = "flex:1;min-height:240px;max-height:44vh;overflow-y:auto;"
     + "background:#04070c;border:1px solid var(--border);border-radius:8px;"
-    + "padding:10px;margin:10px 0 0;font:12px/1.5 ui-monospace,monospace,PineIcons;"
+    + "padding:10px;margin:10px 0 0;font:12px/1.5 PineIcons, PineIcons, ui-monospace, monospace;"
     + "white-space:pre-wrap";
   card.appendChild(out);
 
@@ -157953,7 +160554,7 @@ async function stageSheet(track) {
       const row = el("div", "", "");
       row.style.cssText = "display:flex;gap:8px;padding:1px 0";
       const key = el("span", "muted", name);
-      key.style.cssText = "flex:0 0 116px;font-family:ui-monospace,monospace,PineIcons";
+      key.style.cssText = "flex:0 0 116px;font-family:PineIcons, ui-monospace, monospace, PineIcons";
       const text = el("span", "", String(value));
       text.style.cssText = "flex:1;word-break:break-word";
       row.appendChild(key);
@@ -166166,7 +168767,7 @@ function pineCodeChip(id) {
   chip.title = "Copy this message's code " + id + " — quote it back to give "
     + "a critique of this exact line";
   chip.style.cssText = "background:none;border:0;padding:0 0 0 5px;cursor:"
-    + "pointer;font-size:10px;opacity:.4;font-family:ui-monospace,monospace,PineIcons";
+    + "pointer;font-size:10px;opacity:.4;font-family:PineIcons, ui-monospace, monospace, PineIcons";
   chip.onclick = (ev) => {
     ev.stopPropagation();
     pineCopy(id).then(() => {
@@ -166385,7 +168986,7 @@ const SFX_FACES = [
   [/explos|boom|blast|bomb/i, "💥"],
   [/glass|smash|break|crash/i, "🔨"],
   [/gun|shot|blaster|laser/i, "🔫"],
-  [/phone|ring|dial|call/i, "☎️"],
+  [/phone|ring|dial|call/i, "☎"],
   [/whoosh|swish|swoosh|zoom|transition/i, "💨"],
   [/water|splash|rain|drip|ocean/i, "💧"],
   [/fire|burn|flame/i, "🔥"],
@@ -169245,7 +171846,7 @@ async function speakboxEdit(name, passage) {
   const editor = document.createElement("textarea");
   editor.spellcheck = false;
   editor.style.cssText = "flex:1;min-width:0;resize:none;"
-    + "font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace,PineIcons";
+    + "font:12px/1.65 PineIcons, PineIcons, ui-monospace, SFMono-Regular, Menlo, monospace, PineIcons";
   const preview = el("div", "", "");
   preview.style.cssText = "flex:1;min-width:0;overflow-y:auto;padding:0 10px;"
     + "border-left:1px solid var(--border);font-size:13px;line-height:1.6";
@@ -174046,7 +176647,7 @@ function djCutTheater(tray, running) {
     th.id = "djCutTheater";
     th.style.cssText = "margin-top:8px;background:#04070d;"
       + "border:1px solid #1d3a2a;border-radius:8px;padding:8px 10px;"
-      + "font:10.5px ui-monospace,Consolas,monospace,PineIcons;color:#7ce8a9;"
+      + "font:10.5px PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#7ce8a9;"
       + "line-height:1.5";
     const ico = el("pre", "", "");
     ico.style.cssText = "margin:0 0 6px;color:#3fd68f;font-size:9px;"
@@ -176276,7 +178877,7 @@ function deskPanel(anchor) {
             + "white-space:pre-wrap;max-height:30vh;overflow:auto;"
             + "padding:5px 7px;border-radius:6px;background:#05090f;"
             + "border:1px solid var(--border)"
-            + (mono ? ";font-family:ui-monospace,Consolas,monospace,PineIcons" : "");
+            + (mono ? ";font-family:PineIcons, ui-monospace, Consolas, monospace, PineIcons" : "");
           b.appendChild(box);
         };
         put("GOVERNED BY", (c.armed ? "system prompt: " + c.armed : "")
@@ -179235,7 +181836,7 @@ async function cacheTranscript(base, r) {
       const chip = el("span", "", Math.floor(at / 60) + ":"
         + String(at % 60).padStart(2, "0"));
       chip.style.cssText = "color:var(--accent);font-size:10.5px;"
-        + "font-family:ui-monospace,monospace,PineIcons;margin-right:7px";
+        + "font-family:PineIcons, ui-monospace, monospace;margin-right:7px";
       row.appendChild(chip);
     }
     if (m) {
@@ -181406,7 +184007,7 @@ async function djCallersPanel() {
     names.value = (desk.names || []).join("\n");
     names.spellcheck = false;
     names.style.cssText = "width:100%;min-height:110px;font-size:11px;"
-      + "font-family:ui-monospace,Menlo,monospace,PineIcons";
+      + "font-family:PineIcons, ui-monospace, Menlo, monospace, PineIcons";
     names.onchange = async () => {
       try {
         await api("/api/dj/callers/names", {method: "POST",
@@ -182239,7 +184840,7 @@ function mindFlowToggle(stage) {
       + '<div style="font-weight:700;color:#9fe">' + s.ic + ' ' + s.t + '</div>'
       + '<div style="color:#c3cfdd;margin:3px 0;line-height:1.4">' + s.d
       + '</div><div class="muted" style="font-size:10.5px;'
-      + 'font-family:ui-monospace,monospace,PineIcons">▸ ' + s.tool + '</div></div>';
+      + 'font-family:PineIcons, ui-monospace, monospace, PineIcons">▸ ' + s.tool + '</div></div>';
     if (i < MIND_FLOW.length - 1)
       html += '<div style="text-align:center;color:#4a6;font-size:15px;'
         + 'line-height:1.1">↓</div>';
@@ -182498,7 +185099,7 @@ function mindOpen(opts) {
   cap.style.cssText = "position:absolute;left:0;right:0;bottom:0;z-index:3;"
     + "padding:8px 14px;font-size:11px;color:#bcd;background:linear-gradient("
     + "transparent,#000c);pointer-events:none;max-height:26%;overflow:hidden;"
-    + "font-family:ui-monospace,monospace,PineIcons;line-height:1.5";
+    + "font-family:PineIcons, ui-monospace, monospace;line-height:1.5";
   stage.appendChild(cap);
 
   // the stack of sections pushed into the pair's heads (#482)
@@ -184408,7 +187009,7 @@ async function djBanterPanel() {
     fxFolders.value = (dj.sfx_folders || []).join("\n");
     fxFolders.spellcheck = false;
     fxFolders.style.cssText = "width:100%;min-height:52px;font-size:11px;"
-      + "font-family:ui-monospace,Menlo,monospace,PineIcons";
+      + "font-family:PineIcons, ui-monospace, Menlo, monospace, PineIcons";
     fxFolders.onchange = () => push({
       sfx_folders: fxFolders.value.split("\n")
         .map((s) => s.trim()).filter(Boolean),
@@ -185380,7 +187981,7 @@ function glassOpen() {
 
   const feed = el("div", "", "");
   feed.style.cssText = "flex:1;overflow-y:auto;font-size:11px;"
-    + "font-family:ui-monospace,Menlo,monospace,PineIcons;line-height:1.5";
+    + "font-family:PineIcons, ui-monospace, Menlo, monospace;line-height:1.5";
   box.appendChild(feed);
   document.body.appendChild(box);
 
@@ -187731,7 +190332,7 @@ async function comfyDoctorPanel() {
   box.appendChild(head);
   const term = el("div", "", "");
   term.style.cssText = "flex:1;overflow:auto;padding:12px 14px;"
-    + "font:12px/1.7 ui-monospace,Consolas,monospace,PineIcons;color:#9fd0a6;"
+    + "font:12px/1.7 PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#9fd0a6;"
     + "background:#04070b;white-space:pre-wrap;min-height:220px";
   term.textContent = "connecting to the doctor…";
   box.appendChild(term);
@@ -189145,7 +191746,7 @@ function paperReadOpen(url, label) {
     const st = document.createElement("style");
     st.id = "paperReadCss";
     st.textContent = "@keyframes pinespin{to{transform:rotate(360deg)}}"
-      + ".rdrcol h1{font:700 32px/1.12 Georgia,serif,PineIcons;margin:0 0 8px;letter-spacing:-.01em}"
+      + ".rdrcol h1{font:700 32px/1.12 PineIcons, PineIcons, Georgia, serif;margin:0 0 8px;letter-spacing:-.01em}"
       + ".rdrcol .rdrby{font:11px/1.4 'Helvetica Neue',Arial,sans-serif;text-transform:uppercase;"
       + "letter-spacing:.12em;color:#4a4741;margin:0 0 16px;padding:0 0 10px;border-bottom:1px solid #9c9686}"
       + ".rdrcol p{margin:0 0 15px}"
@@ -189310,7 +191911,7 @@ async function paperOpen() {
 
   paperConsole = el("div", "", "");
   paperConsole.style.cssText = "flex:none;max-height:96px;overflow:auto;padding:6px 12px;"
-    + "font:11px/1.6 ui-monospace,Consolas,monospace,PineIcons;color:#9fd0a6;"
+    + "font:11px/1.6 PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#9fd0a6;"
     + "background:#04070b;border-top:1px solid #1b2735;white-space:pre-wrap;display:none";
   box.appendChild(paperConsole);
 
@@ -189415,7 +192016,7 @@ async function paperRefresh(jumpLatest) {
   if (paperCur) await paperShow(paperCur);
   else if (paperFrame) {
     paperFrame.onload = null;
-    paperFrame.srcdoc = "<div style='font:15px Georgia,serif,PineIcons;padding:40px;max-width:640px'>"
+    paperFrame.srcdoc = "<div style='font:15px PineIcons, PineIcons, Georgia, serif;padding:40px;max-width:640px'>"
       + "<h2 style='font-size:34px;margin:0 0 8px'>Nothing on the shelf yet</h2>"
       + "<p>The press runs on the hour, every hour, and files the hour just gone. "
       + "Press <b>Print now</b> for an extra on the last sixty minutes, or say "
@@ -189536,12 +192137,12 @@ const SCRIPT_CSS = ""
   + ".sp-note.crit{border-left-color:#a33b2c;background:#f0dfd8}"
   + ".sp-ins{border-left:3px solid #2f6fb5;padding-left:8px;background:#e6ecf3}"
   + ".sp-char.sp-ins{background:none;color:#1d4a7d}"
-  + ".sp-drop{font:10px ui-monospace,Consolas,monospace,PineIcons;padding:1px 7px;"
+  + ".sp-drop{font:10px PineIcons, PineIcons, ui-monospace, Consolas, monospace;padding:1px 7px;"
   + "border:1px solid #a08243;background:#e3d3ab;color:#3a2f14;"
   + "border-radius:3px;cursor:pointer;margin-top:5px}"
   + ".sp-ctl{margin:2px 0 0 4ch;display:flex;gap:4px;align-items:center;"
-  + "flex-wrap:wrap;font:10px/1.4 ui-monospace,Consolas,monospace,PineIcons;color:#6a675c}"
-  + ".sp-ctl button,.sp-ctl a{font:10px/1 ui-monospace,Consolas,monospace,PineIcons;"
+  + "flex-wrap:wrap;font:10px/1.4 PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#6a675c}"
+  + ".sp-ctl button,.sp-ctl a{font:10px/1 PineIcons, PineIcons, ui-monospace, Consolas, monospace;"
   + "padding:2px 5px;border:1px solid #c3bba4;background:#e9e3d2;color:#2c2a22;"
   + "border-radius:4px;cursor:pointer;text-decoration:none}"
   + ".sp-ctl button:hover,.sp-ctl a:hover{background:#dcd4bd}"
@@ -189549,7 +192150,7 @@ const SCRIPT_CSS = ""
   + "border-radius:3px;padding:1px 5px;font-weight:700}"
   + ".sp-tree{margin:6px 0 12px 4ch;max-width:58ch;background:#ece6d6;"
   + "border:1px solid #cdc4ab;border-radius:5px;padding:8px 10px;"
-  + "font:11px/1.5 ui-monospace,Consolas,monospace,PineIcons;color:#2b2920;"
+  + "font:11px/1.5 PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#2b2920;"
   + "white-space:pre-wrap;word-break:break-word}"
   + ".sp-tree b{color:#101008}"
   + ".sp-tree .k{color:#6d6552}"
@@ -189565,11 +192166,11 @@ const SCRIPT_CSS = ""
   + "'Courier New',monospace;background:#f7f4ea;color:#14140f;"
   + "border:1px solid #c3bba4;border-radius:4px;padding:6px;box-sizing:border-box}"
   + ".sp-compose .row{display:flex;gap:6px;margin-top:6px;align-items:center;"
-  + "font:11px ui-monospace,monospace,PineIcons;color:#4a4638}"
-  + ".sp-compose select,.sp-compose input{font:11px ui-monospace,monospace,PineIcons;"
+  + "font:11px PineIcons, PineIcons, ui-monospace, monospace;color:#4a4638}"
+  + ".sp-compose select,.sp-compose input{font:11px PineIcons, PineIcons, ui-monospace, monospace;"
   + "background:#f7f4ea;color:#14140f;border:1px solid #c3bba4;"
   + "border-radius:4px;padding:3px 5px}"
-  + ".sp-compose button{font:11px ui-monospace,monospace,PineIcons;padding:3px 9px;"
+  + ".sp-compose button{font:11px PineIcons, PineIcons, ui-monospace, monospace;padding:3px 9px;"
   + "border:1px solid #c3bba4;background:#dcd4bd;color:#2c2a22;"
   + "border-radius:4px;cursor:pointer}";
 
@@ -190180,7 +192781,7 @@ async function stewardPanel() {
   box.appendChild(head);
   const term = el("div", "", "");
   term.style.cssText = "flex:1;overflow:auto;padding:12px 14px;"
-    + "font:12px/1.7 ui-monospace,Consolas,monospace,PineIcons;color:#9fd0a6;"
+    + "font:12px/1.7 PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#9fd0a6;"
     + "background:#04070b;white-space:pre-wrap;min-height:240px";
   term.textContent = "connecting to the steward…";
   box.appendChild(term);
@@ -190316,7 +192917,7 @@ async function cupboardPanel() {
   stage.appendChild(close);
   const title = el("div", "", "🗄 Cupboard View · every shelf, what is on it, and what is booked for it");
   title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;"
-    + "font:600 13px system-ui,PineIcons;color:#9fd0e3";
+    + "font:600 13px PineIcons, PineIcons, system-ui;color:#9fd0e3";
   stage.appendChild(title);
   const hint = el("div", "", "drag to turn · click a shelf to open it · click a cell for the round");
   hint.style.cssText = "position:absolute;bottom:10px;left:16px;z-index:2;"
@@ -190678,7 +193279,7 @@ async function phonePanel() {
   stage.appendChild(close);
   const title = el("div", "", "☎ Phone · a card off the deck to a call on the air");
   title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;"
-    + "font:600 13px system-ui,PineIcons;color:#9fd0e3";
+    + "font:600 13px PineIcons, PineIcons, system-ui;color:#9fd0e3";
   stage.appendChild(title);
 
   const scene = new THREE.Scene();
@@ -190803,7 +193404,7 @@ async function phonePanel() {
 
     rail.innerHTML = "";
     const h = el("div", "", "☎ The phone system");
-    h.style.cssText = "font:600 14px system-ui,PineIcons;color:#dff6ff;margin-bottom:8px";
+    h.style.cssText = "font:600 14px PineIcons, PineIcons, system-ui;color:#dff6ff;margin-bottom:8px";
     rail.appendChild(h);
     const say = el("div", "muted", String(d.say || ""));
     say.style.cssText = "font-size:11.5px;line-height:1.5;margin-bottom:12px";
@@ -190813,14 +193414,14 @@ async function phonePanel() {
       row.style.cssText = "margin:0 0 9px 0;padding-left:10px;"
         + "border-left:2px solid #22304a";
       const t = el("div", "", s.n + ". " + s.name);
-      t.style.cssText = "font:600 12px system-ui,PineIcons;color:#9fd0e3";
+      t.style.cssText = "font:600 12px PineIcons, PineIcons, system-ui;color:#9fd0e3";
       const w2 = el("div", "muted", s.what);
       w2.style.cssText = "font-size:11px;line-height:1.45";
       row.appendChild(t); row.appendChild(w2);
       rail.appendChild(row);
     });
     const dh = el("div", "", "The last cards off the deck");
-    dh.style.cssText = "font:600 12px system-ui,PineIcons;color:#dff6ff;margin:14px 0 6px";
+    dh.style.cssText = "font:600 12px PineIcons, PineIcons, system-ui;color:#dff6ff;margin:14px 0 6px";
     rail.appendChild(dh);
     (draws.slice().reverse()).forEach((row) => {
       const r2 = el("div", "", "");
@@ -191931,7 +194532,7 @@ async function orchPaint(force) {
       }
       const does = el("div", "muted", "\u2192 " + o.does);
       does.style.cssText = "font-size:9.5px;margin-top:2px;opacity:.6;"
-        + "font-family:ui-monospace,monospace,PineIcons";
+        + "font-family:PineIcons, ui-monospace, monospace, PineIcons";
       pick.appendChild(does);
       const mark = () => {
         orchPicks[String(qi)] = o.does;
@@ -192395,7 +194996,7 @@ async function sfxStatsOpen() {
       + (sample.banned ? ";opacity:.45" : "");
     const plays = el("span", "", String(sample.plays) + "×");
     plays.style.cssText = "flex:0 0 40px;color:var(--accent);"
-      + "font-family:ui-monospace,monospace,PineIcons";
+      + "font-family:PineIcons, ui-monospace, monospace, PineIcons";
     row.appendChild(plays);
     const name = el("span", "", sample.name);
     name.style.cssText = "flex:1;min-width:0;overflow:hidden;"
@@ -193212,7 +195813,7 @@ function studioConsolePaint(live) {
     html += '</div>';
   }
 
-  html += '<div style="font-family:ui-monospace,Menlo,Consolas,monospace,PineIcons;'
+  html += '<div style="font-family:PineIcons, ui-monospace, Menlo, Consolas, monospace;'
     + 'font-size:9.5px;line-height:1.5;max-height:132px;overflow:auto;'
     + 'background:#05090f;border:1px solid var(--border);border-radius:7px;'
     + 'padding:5px 7px">';
@@ -200290,8 +202891,7 @@ JOURNAL_PAGE_HTML = r"""<!doctype html>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #04060b; color: #dbe7f5;
-         font: 14px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif,
-               PineIcons; }
+         font: 14px/1.6 PineIcons, PineIcons, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   header { position: sticky; top: 0; z-index: 3; background: #0b1220;
            border-bottom: 1px solid #1e2a3a; padding: 8px 14px; display: flex;
            gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -200688,8 +203288,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   body {
     margin: 0; min-height: 100vh; display: flex; align-items: center;
     justify-content: center; background: #04060b; color: #e6edf5;
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif,
-          PineIcons;
+    font: 15px/1.5 PineIcons, PineIcons, system-ui, -apple-system, "Segoe UI", sans-serif;
     padding: 24px;
   }
   .set { width: min(560px, 100%); }
@@ -200748,6 +203347,12 @@ RADIO_PAGE_HTML = r"""<!doctype html>
     margin:0 0 14px; background:#070b12; border:1px solid #1b2735; border-radius:10px; }
   .gallery-stage.show { display:block; }
   .gallery-stage img { width:100%; height:100%; object-fit:contain; display:block; }
+  /* #1263: the set. Same frame as the artwork, on top of it while a
+     picture is playing. */
+  .gallery-stage video { width:100%; height:100%; object-fit:contain;
+    display:none; background:#000; }
+  .gallery-stage.tv video { display:block; }
+  .gallery-stage.tv img { display:none; }
   .gallery-caption { position:absolute; left:0; right:0; bottom:0; padding:9px 12px;
     background:rgba(4,6,11,.78); color:#dce8f5; font-size:12px; white-space:nowrap;
     overflow:hidden; text-overflow:ellipsis; }
@@ -200846,6 +203451,11 @@ the library files untouched">📶 quality</label>
 
   <div class="gallery-stage" id="galleryStage">
     <img id="galleryImage" alt="Pine Box gallery artwork">
+    <!-- #1263: MUTED, and not a mistake. The sound of this clip is
+         already in the broadcast the listener is hearing; an element
+         here with its own audio is the show playing twice. -->
+    <video id="galleryVideo" muted playsinline
+           preload="auto" aria-label="What the DJ is playing"></video>
     <div class="gallery-caption" id="galleryCaption"></div>
   </div>
 
@@ -200899,7 +203509,7 @@ the library files untouched">📶 quality</label>
     <button aria-label="They are being funny" onclick="shout('😂')" title="They are being funny">😂</button>
     <button aria-label="What was that" onclick="shout('😱')" title="What was that">😱</button>
     <button aria-label="They have killed it" onclick="shout('💀')" title="They have killed it">💀</button>
-    <button onclick="shout('❤️')" title="Love">❤️</button>
+    <button onclick="shout('❤')" title="Love">❤</button>
   </div>
 
   <div class="patter" id="patter"></div>
@@ -201552,7 +204162,13 @@ function renderGallery(state) {
   const image = document.getElementById("galleryImage");
   const caption = document.getElementById("galleryCaption");
   if (!stage || !image || !caption) return;
-  if (!names.length) { stage.classList.remove("show"); return; }
+  /* #1263: while the set is on, the frame belongs to it - but the
+   * artwork keeps rotating underneath so it is already right when the
+   * picture ends. */
+  if (!names.length) {
+    if (tvNow === null) stage.classList.remove("show");
+    return;
+  }
   stage.classList.add("show");
   if (galleryNames.join("|") === key) return;
   galleryNames = names; galleryIndex = 0;
@@ -201581,6 +204197,97 @@ function renderGallery(state) {
       show, (typeof streamMode !== "undefined" && streamMode)
               ? 20000 : 7000);
   }
+}
+
+/* #1263: THE SET.
+ *
+ * Polls a tiny audio-free feed - deliberately not /api/dj/voice, which
+ * announces clips the page then downloads, and which the stream road does
+ * not touch for exactly that reason. A couple of hundred bytes every few
+ * seconds is affordable in a car; megabytes of audio are not.
+ */
+let tvNow = null;            /* the clip currently on the set */
+let tvSkew = 0;              /* server clock - this clock, in ms */
+let tvSeen = 0;
+
+function tvLagSeconds() {
+  /* How far behind live this listener is.
+   *
+   * On the stream road it is not a guess: `buffered.end - currentTime` is
+   * audio that has ARRIVED and not yet been played, which is precisely
+   * the distance between what the station is doing and what this car is
+   * hearing. On the synchronised road there is no such gap. */
+  if (!streamMode || !radio) return 0;
+  try {
+    const b = radio.buffered;
+    if (!b || !b.length) return 0;
+    const ahead = b.end(b.length - 1) - Number(radio.currentTime || 0);
+    return (isFinite(ahead) && ahead > 0) ? Math.min(ahead, 120) : 0;
+  } catch (e) { return 0; }
+}
+
+async function tvPoll() {
+  if (!playing) { tvHide(); return; }
+  let data;
+  try {
+    data = await api("/api/dj/video");
+  } catch (e) { return; }
+  tvSkew = Number(data.server_ms || Date.now()) - Date.now();
+  const lagMs = tvLagSeconds() * 1000;
+  const now = Date.now();
+  let best = null;
+  (data.videos || []).forEach((v) => {
+    if (!v.url || !v.seconds) return;
+    /* The station's on-air instant, moved into THIS page's clock, then
+     * held back by this listener's own lag so the picture lands on the
+     * sound rather than half a minute ahead of it. */
+    const showAt = Number(v.broadcast_ms) - tvSkew + lagMs;
+    const into = (now - showAt) / 1000;
+    if (into >= -0.5 && into < Number(v.seconds) + 0.5) {
+      if (!best || Number(v.broadcast_ms) > Number(best.v.broadcast_ms)) {
+        best = {v: v, into: into};
+      }
+    }
+  });
+  if (!best) { tvHide(); return; }
+  tvShow(best.v, best.into);
+}
+
+function tvShow(v, into) {
+  const stage = document.getElementById("galleryStage");
+  const el = document.getElementById("galleryVideo");
+  const cap = document.getElementById("galleryCaption");
+  if (!stage || !el) return;
+  if (tvNow !== v.url) {
+    tvNow = v.url;
+    el.muted = true;                 /* belt and braces - see the markup */
+    el.src = clipUrl ? v.url : v.url;
+    el.currentTime = Math.max(0, into);
+    el.play().catch(() => {});
+    if (cap) cap.textContent = v.name || "";
+    stage.classList.add("show");
+    stage.classList.add("tv");
+  } else {
+    /* Already on: only correct the playhead if it has genuinely drifted,
+     * because a seek restarts the decoder and that is visible. */
+    try {
+      if (Math.abs(Number(el.currentTime || 0) - into) > 1.5) {
+        el.currentTime = Math.max(0, into);
+      }
+      if (el.paused) el.play().catch(() => {});
+    } catch (e) {}
+  }
+}
+
+function tvHide() {
+  const stage = document.getElementById("galleryStage");
+  const el = document.getElementById("galleryVideo");
+  if (!stage || !el || tvNow === null) return;
+  tvNow = null;
+  try { el.pause(); el.removeAttribute("src"); el.load(); } catch (e) {}
+  stage.classList.remove("tv");
+  /* The artwork gets its frame back; renderGallery decides whether the
+   * stage stays up at all. */
 }
 
 function patter(state) {
@@ -202438,6 +205145,9 @@ async function request() {
 
 initLevels();
 initMode();                     // #1253: which road this page takes
+/* #1263: the set checks often enough to catch a short sting, and cheaply
+ * enough that a car does not notice - a couple of hundred bytes. */
+setInterval(() => { try { tvPoll(); } catch (e) {} }, 2500);
 try {
   document.getElementById("build").textContent =
     "player " + BUILD.slice(-6) + " · "
@@ -202590,8 +205300,7 @@ GUIDE_HTML = r"""<!doctype html>
   body {
     margin: 0 auto; max-width: 820px; padding: 40px 28px 80px;
     background: #fff; color: #16181d;
-    font: 15px/1.62 "Segoe UI", system-ui, -apple-system, sans-serif,
-          PineIcons;
+    font: 15px/1.62 PineIcons, PineIcons, "Segoe UI", system-ui, -apple-system, sans-serif;
   }
   h1 { font-size: 27px; margin: 0 0 4px; letter-spacing: -.01em; }
   h2 {
@@ -202617,7 +205326,7 @@ GUIDE_HTML = r"""<!doctype html>
   }
   pre {
     background: #0f1115; color: #e8eaf0; padding: 12px 14px; border-radius: 7px;
-    overflow-x: auto; font: 12.5px/1.55 ui-monospace, monospace,PineIcons;
+    overflow-x: auto; font: 12.5px/1.55 PineIcons, PineIcons, ui-monospace, monospace;
   }
   .note {
     background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px;
