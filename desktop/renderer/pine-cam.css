@@ -100,8 +100,8 @@
 }
 .pine-cam-pref input { margin-top: 2px; }
 /* #1361b: the troubleshoot icon beside the Pine Cam fold. */
-#pineCamBox2 { position: relative; }
-#pineCamHeal {
+#pineCamBox2, #vitalsBox { position: relative; }   /* #1386: the tablet row too */
+#pineCamHeal, #tabletHeal {
   position: absolute;
   right: 34px;
   top: 6px;
@@ -117,7 +117,7 @@
   align-items: center;
   justify-content: center;
 }
-#pineCamHeal:hover { color: var(--ink, #e6edf5); border-color: #65c7da; }
+#pineCamHeal:hover, #tabletHeal:hover { color: var(--ink, #e6edf5); border-color: #65c7da; }
 
 /* #1358: the indicator, on a surface with no glass bar to hang one in.
 

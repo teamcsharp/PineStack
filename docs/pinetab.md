@@ -1413,6 +1413,55 @@ places that need it:
 
 ## 19. Failure modes, with their cures
 
+### 19.0 The panel's script does not parse — the one every meter misses
+
+**Symptom (2026-09-14, 52 minutes):** the station is on, a record is
+playing, the voice ring holds dozens of clips, a listener is registered and
+even *holds the air* — and `broadcast/health` says *"Nobody has heard the
+DJs say anything for N minutes. The station is on and something is sounding,
+so this is not a dead broadcast — the dialogue is not reaching the air."*
+LOOK, DEVICES and RELEASE all report nothing wrong.
+
+**Cause:** one JavaScript `SyntaxError` in the control panel's inline script
+(served line 36838 of `/`). A rewrite over `app.py` had turned eight
+`font: "…"` entries into `font: PineIcons, "…, PineIcons"` and eaten the
+trailing comma. A SyntaxError kills the **entire** script block: `pollDJ`,
+`djVoicePoll`, the music player — none of it ever existed. The heartbeat
+that kept the roster looking alive was the Electron top page's, not the
+panel's. `ast.parse` proves `app.py`; it proves nothing about the JavaScript
+inside its string templates.
+
+**Signature:**
+
+```
+webview   Runtime.exceptionThrown  SyntaxError: Unexpected identifier …
+          Object.keys(window).filter(k => /^dj|^poll/.test(k))  -> []
+          musicPlayer src=""   sayAudio src=""     (music silent too — the tell)
+station   heard_seconds_ago=null  clips_waiting=0  "0 clip(s) handed over"
+```
+
+**Check, in one line, after any template edit** (node is on the DGX host):
+
+```sh
+K=$(docker exec spark-agent printenv SPARK_AGENT_API_KEY)
+curl -s -H "Authorization: Bearer $K" http://127.0.0.1:8096/ -o /tmp/p.html
+S=$(grep -n "<script>" /tmp/p.html | head -1 | cut -d: -f1)
+E=$(grep -n "</script>" /tmp/p.html | tail -1 | cut -d: -f1)
+awk -v s=$((S+1)) -v e=$((E-1)) 'NR>=s && NR<=e' /tmp/p.html > /tmp/p.js && node --check /tmp/p.js
+```
+
+**Cure:** fix the line, restart, and then **reload the open pages** — a
+station restart does not reload a webview that is already showing the broken
+page. On the desktop, `Page.reload` over `--remote-debugging-port`; on the
+tablet, the TERMINAL rung.
+
+**And the second half:** once the panel lived again the desktop still played
+nothing, because its out-loud switch (`settings.terminals.desktop.play`) was
+OFF while the tablet's was ON and the tablet was not polling. The DEVICES
+rung refuses that case on purpose (it acts only when *every* switch is off).
+`POST /api/broadcast/fix/terminals` prints the switches; round-trip
+`GET`→`PUT /api/settings` to turn one on.
+
 ### 19.1 The WebView goes deaf — the one that will fool you
 
 **Symptom:** the panel looks completely alive — feed updating, views painting —
@@ -2170,3 +2219,39 @@ learning desks writing SQLite synchronously from inside the tint pass
 down the moment the loop is late rather than after twelve seconds of
 silence (#1372). The census carries the numbers; the note
 `docs/notes/the-bind-underneath-the-mount.md` carries the day.
+
+## 26. The SCRIPT view's two new controls, and every report's telemetry
+
+**The loop button** beside the video button (#1385) puts the SFX guy into
+endless video: clips one after another, chosen at random from the whole
+collection, until you press it again. It is a *held* setting on the station
+(`/api/sfx/video/mode`, #1366), so it survives a restart and this view
+coming and going; turning it off takes effect at the end of the clip on the
+tube rather than cutting it. Lit red while it runs. His picture dial
+(`sfx_video_share`, default 67) is what decides the mp4:mp3 mix the rest of
+the time — two mp4s for every mp3, as asked in #1100.
+
+**The search box** in the same bar (#1385, for #1110): type a word, press
+Enter, and the station answers with every time it was said on the air in
+the last two days and — the part that was actually asked for — *why*. The
+verdict is one of four shapes, each with a different cure: **REPEATS** (a
+few lines re-aired over and over; the repetition desk, not a prompt),
+**ONE ROAD** (one writing road leans on it; look at what that road is
+written from), **ONE VOICE** (a persona or a seat's prompt), or **SPREAD**
+(the word is simply common in what the station writes; the crystal's
+banned-words list is the lever). Under it: the counts by road and voice,
+the most-repeated lines with their tallies, and the airings newest first.
+`GET /api/said/search?q=` is the road; the box only draws what it says.
+
+**Every report now carries the station's own account of the moment**
+(#1379, for #1094/#1095/#1098). A request filed from the Pine Chat panel —
+on the tablet, the desktop or a phone — gets a `### Station at the time`
+block appended before its attachments: what is playing, what is being said,
+the last five lines, the script position (block/ord), the listeners and
+each device's out-loud switch, the loop's pulse, the last hour's dead air
+with its verdict, the ladder's LOOK, the tablet's state and the learning
+desk. Repeats still fold into the request they repeat, because the gist
+stops at the marker. The point is the one #1095 made: *"the station is
+playing on the tablet, yet the application is saying it's unable to locate
+the tablet"* — the report now arrives with the evidence that would have
+settled it.

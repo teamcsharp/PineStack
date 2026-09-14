@@ -702,3 +702,8 @@ attached it are not listed. The narrative that runs through it is in
 - `4158184` A script is read downwards, and an owner that takes nothing loses the air
 - `f91a38d` Sixty seconds, because at thirty the gagged light came on with the station audible
 - `c1c0129` The ladder could not reach its own rung nine, and ON AIR never touched the switch
+- `9ad5442` Pick who sees the camera, and say which microphone you are using
+- `9ce0129` A still, a clip, and the camera taking the gallery's place
+- `302c0dd` The ARP table was full, so the radio could never finish a handshake
+- `6864b50` The clip doctor, a heal button for the camera, and the orb's two broken roads
+- `8132291` The panel did not parse, so nobody heard the DJs; the loop taken off its knees

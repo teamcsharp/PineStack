@@ -41,6 +41,7 @@
        over whatever view is showing rather than living inside one. -->
   <link rel="stylesheet" href="./sfx-tv.css">
   <link rel="stylesheet" href="./pine-cam.css">
+  <link rel="stylesheet" href="./clip-doctor.css">
   <!-- The SVG sprite, for icon-only buttons that need a real <svg> with an
        aria-label rather than a bare character. -->
   <script src="./pine-icons.js"></script>
@@ -133,7 +134,16 @@
           <span>The tablet</span>
           <span id="vitalsBrief" class="vitals-brief"></span>
         </button>
+        <!-- #1386 (#1096, #1097, #1109): find the tablet and reattach this
+             app to it. The station walks its rungs (look, sweep, adopt,
+             wake); this app does the one thing the station cannot, the
+             adb connect; then the station looks again. See tablet-doctor.js. -->
+        <button id="tabletHeal" class="vitals-tool" type="button"
+                title="Find the tablet on the network and reattach this app to it: look, sweep, adopt, wake, adb connect, look again">
+          <span data-pine-icon="c:tools" aria-hidden="true"></span>
+        </button>
         <div id="vitals" class="pv"></div>
+        <pre id="tabletDoc" class="pine-cam-doc" hidden></pre>
       </div>
       <!-- #1348: the Pine Cam reads like the tablet does - what it is,
            whether it is reachable, and what it is costing. It is always
@@ -818,6 +828,9 @@
   <script src="./sfx-tv.js"></script>
   <script src="./rail.js"></script>
   <script src="./pine-cam.js"></script>
+  <script src="./tablet-doctor.js"></script>
+  <!-- #1361b: the clip doctor opens from the SCRIPT view here as it does on the tablet -->
+  <script src="./clip-doctor.js"></script>
   <!-- #1344: PUT THE RAIL UP HERE TOO.
 
        rail.js has always been device-agnostic and byte-identical to the

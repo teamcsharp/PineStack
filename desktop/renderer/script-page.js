@@ -186,9 +186,41 @@
       fireVideo(reel);
     });
 
+    /* #1385 (#1108): THE PLAY BUTTON NEXT TO THE VIDEO BUTTON.
+     *
+     * "Put a play button next to the video button that ... puts the SFX
+     *  guy into video play mode where the videos are being played one
+     *  after another chosen from random from the collection."
+     *
+     * The mode is the station's (#1366, /api/sfx/video/mode) and it is
+     * a held setting, so this button only reports and flips it; the set
+     * keeps running through a restart and this view coming and going. */
+    var loop = make('button', 'sp-btn sp-loop', '');
+    loop.title = 'Endless video: the SFX guy plays clips one after another, at random';
+    loop.setAttribute('aria-label', 'Endless video on or off');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        loop.innerHTML = root.pineIcon('c:renew', 'Endless video');
+      }
+    } catch (err) { /* the title still names it */ }
+    if (!loop.innerHTML) loop.textContent = 'loop';
+    loop.addEventListener('click', function () { loopToggle(loop); });
+    setTimeout(function () { loopRead(loop); }, 900);
+
+    /* #1385 (#1110): find a word that was said on the air. */
+    var find = make('input', 'sp-find', '');
+    find.type = 'search';
+    find.placeholder = 'find a word said on air';
+    find.title = 'Every time this word was said on the air in the last two days, and why it keeps being said';
+    find.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); findOpen(find.value); }
+    });
+
     bar.appendChild(back);
     bar.appendChild(pick);
     bar.appendChild(reel);                                   /* #1303 */
+    bar.appendChild(loop);                                   /* #1385 */
+    bar.appendChild(find);                                   /* #1385 */
     bar.appendChild(again);
     return bar;
   }
@@ -398,6 +430,103 @@
    * lands on the strip, because a button that cues the air should
    * never be silent about whether the air took it. */
   var reelTurn = 0;
+
+  /* ---- #1385: the endless set ----------------------------------- */
+  var loopOn = false;
+
+  function loopPaint(btn) {
+    if (!btn) return;
+    btn.classList.toggle('on', !!loopOn);
+    btn.title = loopOn
+      ? 'Endless video is ON - tap to stop after the clip on the tube'
+      : 'Endless video: the SFX guy plays clips one after another, at random';
+  }
+
+  function loopRead(btn) {
+    if (!api() || !api().get) return;
+    Promise.resolve(api().get('/api/sfx/video/mode')).then(function (got) {
+      loopOn = !!(got && got.on);
+      loopPaint(btn);
+    }, function () { /* asked again next time */ });
+  }
+
+  function loopToggle(btn) {
+    if (!api() || !api().post) return;
+    var want = !loopOn;
+    loopOn = want;
+    loopPaint(btn);
+    Promise.resolve(api().post('/api/sfx/video/mode', {on: want})).then(function (got) {
+      loopOn = !!(got && got.on !== undefined ? got.on : want);
+      loopPaint(btn);
+      say(loopOn ? 'endless video is on - one clip after another'
+                 : 'endless video is off - back to the dial');
+    }, function (err) {
+      loopOn = !want;
+      loopPaint(btn);
+      say('the station did not answer: ' + String((err && err.message) || err).slice(0, 60));
+    });
+  }
+
+  /* ---- #1385: the word search ------------------------------------ */
+
+  /* The station does the counting (/api/said/search, #1380); this only
+   * draws what it said. A sheet over the view, tap away to close, the
+   * same shape as the clip doctor's - the operator asked for it on the
+   * tablet, so every control is a thumb's size. */
+  function findClose() {
+    var old = el('spFindSheet');
+    if (old) old.remove();
+  }
+
+  function findOpen(q) {
+    q = String(q || '').trim();
+    if (q.length < 2 || !api() || !api().get) return;
+    findClose();
+    var back = make('div', 'sp-find-back');
+    back.id = 'spFindSheet';
+    var box = make('div', 'sp-find-box');
+    var head = make('div', 'sp-find-head');
+    head.appendChild(make('b', null, '\u201c' + q + '\u201d on the air'));
+    var x = make('button', 'sp-find-x', '\u00d7');
+    x.type = 'button';
+    x.addEventListener('click', findClose);
+    head.appendChild(x);
+    box.appendChild(head);
+    var why = make('div', 'sp-find-why', 'asking the station\u2026');
+    box.appendChild(why);
+    var facts = make('div', 'sp-find-facts');
+    box.appendChild(facts);
+    var list = make('div', 'sp-find-list');
+    box.appendChild(list);
+    back.appendChild(box);
+    back.addEventListener('click', function (ev) { if (ev.target === back) findClose(); });
+    document.body.appendChild(back);
+    Promise.resolve(api().get('/api/said/search?q=' + encodeURIComponent(q) + '&hours=48&limit=120')).then(function (d) {
+      if (!d) { why.textContent = 'the station did not answer'; return; }
+      why.textContent = d.why || d.say || '';
+      var bits = [String(d.total || 0) + ' airing(s) in ' + (d.hours || 48) + 'h, ' + String(d.distinct || 0) + ' distinct line(s)'];
+      (d.by_round || []).slice(0, 4).forEach(function (r) { bits.push(r.name + ' \u00d7' + r.n); });
+      (d.by_who || []).slice(0, 3).forEach(function (r) { bits.push(r.name + ' \u00d7' + r.n); });
+      facts.textContent = bits.join('  \u00b7  ');
+      (d.repeated || []).slice(0, 5).forEach(function (t) {
+        if (t.n < 2) return;
+        var row = make('div', 'sp-find-rep');
+        row.appendChild(make('b', null, '\u00d7' + t.n + ' '));
+        row.appendChild(make('span', null, (t.who ? t.who + ': ' : '') + t.text));
+        list.appendChild(row);
+      });
+      (d.rows || []).forEach(function (r) {
+        var row = make('div', 'sp-find-row');
+        var ago = r.ago >= 3600 ? Math.round(r.ago / 3600) + 'h ago' : Math.round(r.ago / 60) + 'm ago';
+        row.appendChild(make('span', 'sp-find-when', ago + ' \u00b7 ' + (r.who || '?') + ' \u00b7 ' + (r.round || r.kind || '')));
+        row.appendChild(make('span', 'sp-find-text', r.text || ''));
+        list.appendChild(row);
+      });
+      if (!(d.rows || []).length) list.appendChild(make('div', 'sp-find-row', 'not said on the air in the last two days'));
+    }, function (err) {
+      why.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 80);
+    });
+  }
 
   function fireVideo(btn) {
     var mine = (reelTurn += 1);

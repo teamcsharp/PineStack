@@ -6905,17 +6905,133 @@ def _pine_render(items: list[dict[str, Any]]) -> str:
 # different screenshots.
 _PINE_ATTACH_RE = re.compile(
     r"\n\nAttached (?:images|files):\n.*\Z", re.S)
+# #1379: the block pine_context_block() appends to every report. The gist
+# stops at it, so a repeat still folds into the request it repeats.
+PINE_CONTEXT_MARK = "\n\n### Station at the time"
 PINE_SAME_WINDOW = 1800.0               # half an hour
 
 
 def _pine_gist(text: str) -> str:
     body = _PINE_ATTACH_RE.sub("", str(text or "")).strip()
+    body = body.split(PINE_CONTEXT_MARK)[0]            # #1379
     return " ".join(body.lower().split())
 
 
 def _pine_attachments(text: str) -> str:
     hit = _PINE_ATTACH_RE.search(str(text or ""))
     return hit.group(0) if hit else ""
+
+
+async def pine_context_block() -> str:
+    """#1379: WHAT THE STATION WAS DOING WHEN THE REPORT WAS FILED.
+
+    "Whenever I make a Pine report, you're able to also read the adjacent
+     information ... the statistics of the station, placements in the
+     script, the current lines being spoken, the last five lines being
+     spoken, and the status of the station" (#1094), "the state of the
+     server, the state of the script, the state of the connections, the
+     state of the tablet" (#1095), "triaging all the server status
+     information about what's happening around the report" (#1098).
+
+    Every section is its own try: a report must never fail to file
+    because a reading could not be taken. Each reading is one the station
+    already keeps for itself - nothing here is measured for the occasion -
+    and the whole block is bounded, because a report is read by a person.
+    """
+    lines: list[str] = []
+
+    def add(label: str, value: Any) -> None:
+        try:
+            v = str(value or "").strip()
+        except Exception:  # noqa: BLE001
+            v = ""
+        if v:
+            lines.append("- **%s:** %s" % (label, v[:420]))
+
+    now = time.time()
+    try:
+        track = _RADIO.get("now") or {}
+        add("station", "%s%s%s" % (
+            "on" if _RADIO.get("on") else "off",
+            ", paused" if radio_paused() else "",
+            (" · playing %s - %s" % (track.get("artist") or "?",
+                                     track.get("title") or "?"))
+            if track.get("title") else ""))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sp = dict(_SPEAKING_NOW)
+        if sp.get("text"):
+            add("being said now", "%s: %s" % (sp.get("name") or sp.get("who") or "?",
+                                             str(sp.get("text"))[:220]))
+        else:
+            add("being said now", "nothing - the cast has been quiet %.0fs"
+                % float(talk_quiet_for() or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rows = [r for r in list(_RADIO.get("chat") or [])[-80:]
+                if isinstance(r, dict) and r.get("text")
+                and str(r.get("who") or "") in AIRLOG_CAST + ("drop",)][-5:]
+        if rows:
+            lines.append("- **the last five lines:**")
+            for r in rows:
+                lines.append("    - %s (%s, %s): %s" % (
+                    r.get("name") or r.get("who"), r.get("kind") or "?",
+                    r.get("round") or "?", str(r.get("text"))[:180]))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        led = script_ledger_rows()
+        if led:
+            last = led[-1]
+            add("script position", "block %s ord %s · %s/%s · %d rows in the ledger"
+                % (last.get("block"), last.get("ord"), last.get("who"),
+                   last.get("kind"), len(led)))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rows = terminal_rows()
+        add("listeners", "%d polling · the air is held by %s · switches: %s" % (
+            _radio_listeners(), audio_owner() or "nobody",
+            ", ".join("%s=%s" % (k, "on" if (v or {}).get("play") else "OFF")
+                      for k, v in rows.items()) or "none"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        add("the loop", pulse_report(600).get("reading"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        live = gap_rows(now=now)
+        got = await asyncio.to_thread(deadair_census, 1, live)
+        add("dead air, last hour", "%ds (%s) · %s" % (
+            int(got.get("dead_s") or 0), got.get("kind"),
+            str(got.get("verdict"))[:200]))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        got = await broadcast_step("look")
+        ls = [l.strip() for l in (got.get("lines") or [])
+              if l.strip() and not l.strip().startswith("$")]
+        if ls:
+            add("the ladder's look", " | ".join(ls))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        got = await asyncio.to_thread(tablet_look)
+        add("the tablet", got.get("say") or got.get("verdict")
+            or json.dumps(got, default=str)[:300])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        add("learning desk", json.dumps(learning_desk_state()))
+    except Exception:  # noqa: BLE001
+        pass
+    if not lines:
+        return ""
+    return (PINE_CONTEXT_MARK + " (" + time.strftime("%Y-%m-%d %H:%M:%S") + ")\n"
+            + "\n".join(lines))
 
 
 async def pine_append(text: str) -> dict[str, Any]:
@@ -105868,6 +105984,134 @@ def tablet_step(action: str, host: str = "") -> dict[str, Any]:
                         detail="the tablet doctor cannot " + action)
 
 
+@app.get("/api/said/search")
+async def said_search_api(
+    q: str = "",
+    hours: int = 48,
+    limit: int = 200,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """#1380: EVERY TIME A WORD WAS SAID ON AIR, AND WHY IT KEEPS BEING SAID.
+
+    "I want to be able to search for a word that was said on a broadcast
+     and I want to be able to search for why that word is so prolific ...
+     locate all the lines ... and be able to identify it down to the
+     source." (#1110)
+
+    The air log is the record of what was actually heard (two days), and
+    the chat ring covers the minutes not yet flushed to it. A single word
+    matches on word boundaries; a phrase matches anywhere. `why` is the
+    part the operator asked for: the same word is prolific for one of a
+    few reasons, and each one has a different cure - a handful of
+    distinct lines airing over and over (a repetition problem, see #1175),
+    one road or one voice leaning on it (a prompt or a document), or a
+    steady spread across everything (the word is just common).
+    """
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    needle = " ".join(str(q or "").lower().split())
+    if len(needle) < 2:
+        raise HTTPException(status_code=400, detail="give me a word")
+    hours = max(1, min(24 * 14, int(hours or 48)))
+    limit = max(1, min(1000, int(limit or 200)))
+    now = time.time()
+    since = now - hours * 3600.0
+    pat = (re.compile(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])")
+           if " " not in needle else None)
+
+    def hit(text: Any) -> bool:
+        t = str(text or "").lower()
+        return bool(pat.search(t)) if pat else (needle in t)
+
+    def _scan() -> list[dict[str, Any]]:
+        out = []
+        for r in airlog_rows(since, now, quiet=True):
+            if str(r.get("who") or "") in AIRLOG_QUIET_WHO:
+                continue
+            if str(r.get("kind") or "") in ("marker", "chat", "image_analysis",
+                                            "song_analysis", "hangup", "sfx"):
+                continue
+            if hit(r.get("text")):
+                out.append(r)
+        return out
+
+    found = await asyncio.to_thread(_scan)
+    seen = {str(r.get("id") or "") for r in found}
+    for r in list(_RADIO.get("chat") or [])[-240:]:
+        if (isinstance(r, dict) and str(r.get("id") or "") not in seen
+                and float(r.get("air_at") or r.get("ts") or 0) >= since
+                and str(r.get("who") or "") in AIRLOG_CAST + ("drop",)
+                and hit(r.get("text"))):
+            found.append(r)
+            seen.add(str(r.get("id") or ""))
+    found.sort(key=lambda r: float(r.get("air_at") or r.get("ts") or 0))
+
+    def tally(field: str) -> list[dict[str, Any]]:
+        c: dict[str, int] = {}
+        for r in found:
+            k = str(r.get(field) or "-")
+            c[k] = c.get(k, 0) + 1
+        return [{"name": k, "n": v} for k, v in
+                sorted(c.items(), key=lambda kv: -kv[1])[:8]]
+
+    texts: dict[str, dict[str, Any]] = {}
+    for r in found:
+        norm = " ".join(str(r.get("text") or "").lower().split())[:300]
+        slot = texts.setdefault(norm, {"n": 0, "text": str(r.get("text") or "")[:220],
+                                       "who": r.get("name") or r.get("who"),
+                                       "round": r.get("round"), "source": r.get("source")})
+        slot["n"] += 1
+    repeated = sorted(texts.values(), key=lambda t: -t["n"])[:8]
+    total = len(found)
+    distinct = len(texts)
+    top_share = (repeated[0]["n"] / total) if total and repeated else 0.0
+    per_hour: dict[str, int] = {}
+    for r in found:
+        h = time.strftime("%m-%d %H:00", time.localtime(float(r.get("air_at") or r.get("ts") or 0)))
+        per_hour[h] = per_hour.get(h, 0) + 1
+    rounds = tally("round")
+    whos = tally("name") or tally("who")
+    if not total:
+        why = "not said on the air in the last %dh" % hours
+    elif distinct <= 3 or top_share >= 0.4:
+        why = ("REPEATS: %d airing(s) but only %d distinct line(s) - the top one "
+               "is %d%% of them. This is a line being re-aired, not a word being "
+               "chosen; the cure is on the repetition desk (#1175), not in a prompt."
+               % (total, distinct, round(top_share * 100)))
+    elif rounds and rounds[0]["n"] >= total * 0.6:
+        why = ("ONE ROAD: %d%% of the airings come from the %s road. Look at what "
+               "that road is written from - its prompt, its documents, its seed."
+               % (round(100 * rounds[0]["n"] / total), rounds[0]["name"]))
+    elif whos and whos[0]["n"] >= total * 0.7:
+        why = ("ONE VOICE: %s says it %d%% of the time. That is a persona or a "
+               "prompt for that seat, not the station's material."
+               % (whos[0]["name"], round(100 * whos[0]["n"] / total)))
+    else:
+        why = ("SPREAD: %d airings across %d distinct lines, %d road(s) and %d "
+               "voice(s) - the word is simply common in what the station writes. "
+               "If it should not be, the crystal's banned-words list is the lever."
+               % (total, distinct, len(rounds), len(whos)))
+    rows = []
+    for r in list(reversed(found))[:limit]:
+        at = float(r.get("air_at") or r.get("ts") or 0)
+        rows.append({"id": r.get("id"), "at": at,
+                     "ago": round(now - at),
+                     "who": r.get("name") or r.get("who"), "kind": r.get("kind"),
+                     "round": r.get("round"), "aired": r.get("aired"),
+                     "source": r.get("source") or "", "voice": r.get("voice") or "",
+                     "text": str(r.get("text") or "")[:400]})
+    return {"q": needle, "hours": hours, "total": total, "distinct": distinct,
+            "first": (float(found[0].get("air_at") or found[0].get("ts") or 0) if found else 0),
+            "last": (float(found[-1].get("air_at") or found[-1].get("ts") or 0) if found else 0),
+            "why": why, "repeated": repeated, "by_round": rounds, "by_who": whos,
+            "by_kind": tally("kind"), "by_source": tally("source"),
+            "per_hour": [{"hour": k, "n": v} for k, v in sorted(per_hour.items())],
+            "rows": rows,
+            "say": ("%d airing(s) in %dh, %d distinct line(s)" % (total, hours, distinct))}
+
+
 @app.get("/api/tablet/look")
 async def tablet_look_api(
     authorization: str | None = Header(default=None),
@@ -124971,6 +125215,12 @@ async def cupboard_finish_get_api(
     require_read_auth(authorization)
     got = cupboard_finish_state()
     got["cue"] = cupboard_cue_state()
+    # #1383: every unfinished row, not only the queued ones, so the desk
+    # can grey them out (#1107) without a second walk of the shelves.
+    try:
+        got["incomplete"] = [retire_id(k, r) for k, r in cupboard_incomplete_rows()]
+    except Exception:  # noqa: BLE001
+        got["incomplete"] = []
     return got
 
 
@@ -146782,6 +147032,14 @@ async def pine_submit(
     require_auth(authorization)
     payload = await request.json()
     text = str(payload.get("text") or "").strip()
+    # #1379: the station's own account of the moment rides on every
+    # report, BEFORE the attachments, so _PINE_ATTACH_RE still finds
+    # them at the end and _pine_gist still folds a repeat.
+    if text:
+        try:
+            text = (text + await pine_context_block()).strip()
+        except Exception:  # noqa: BLE001
+            pass
     images = payload.get("images") or []
     saved = _save_pine_images(images) if isinstance(images, list) else []
     if saved:
@@ -146956,6 +147214,16 @@ RETIRE_PAGE_HTML = r"""<!doctype html>
   .chev { background: none; border: 0; color: #8fd3ff; padding: 0 4px; font-size: 12px; }
   .chev:hover { color: #d6efff; }
   tr.unheard td:first-child { box-shadow: inset 3px 0 0 #ffb347; }
+  /* #1384: a round still being recorded is not a segment; it reads as one
+     until it is, which is the whole of #1107. */
+  tr.incomplete td { opacity: .45; }
+  tr.incomplete td.text::after { content: ' — still being recorded'; color: #ffb347; opacity: 1; }
+  tr.queued td.text::after { content: ' — in the recording room'; color: #4bb3ff; opacity: 1; }
+  tr.cued td:first-child { box-shadow: inset 3px 0 0 #4bb3ff; }
+  .row-actions button.cue { border-color: #4bb3ff; color: #4bb3ff; }
+  .road-list { margin: 4px 0 2px 12px; }
+  .road-list .one { display: flex; gap: 8px; align-items: center; padding: 3px 0; border-top: 1px solid #101823; }
+  .road-list .one .t { flex: 1 1 auto; }
   tr.drawer > td { background: #080e18; border-bottom: 1px solid #1e2a3a; padding: 10px 14px; }
   .reason { margin: 0 0 7px; padding-left: 12px; border-left: 2px solid #2c3d54; }
   .reason b { color: #ffb347; font-weight: 600; }
@@ -146980,6 +147248,9 @@ RETIRE_PAGE_HTML = r"""<!doctype html>
   <button id="refresh">Refresh</button>
   <button id="removeAll" class="rm">Remove all waiting</button>
   <button id="keepAll" class="kp">Keep all waiting</button>
+  <!-- #1384 (#1107): the recording room, resumed from here. -->
+  <button id="finishAll" class="kp" title="Send every round that is written but not fully recorded back to the recording room. Greyed rows are those rounds; they are not valid segments until it finishes them.">Resume recording the incomplete ones</button>
+  <span id="finishBrief" class="meta"></span>
 </header>
 <main>
   <div class="note">Every item the station would have deleted from the cupboard waits here when its type's rule says
@@ -147064,6 +147335,11 @@ function actions(id, kind, pending) {
   const forever = raw < 0;                       /* #1157 */
   const hours = forever ? 24 : (raw || 24);
   return '<span class="row-actions">'
+    /* #1384 (#1105): force it into the queue; the orchestrator fits it into
+       the next gap, on any road, with no dial under it (#1364). */
+    + (cuedIds.has(id)
+        ? '<button class="cue" data-cact="uncue" data-id="' + esc(id) + '">Un-cue</button>'
+        : '<button class="cue" data-cact="cue" data-id="' + esc(id) + '" title="Cue it: forced into the queue, aired in the next gap">Cue</button>')
     + '<button class="rm" data-act="remove" data-id="' + esc(id) + '">Remove' + (pending ? "" : " now") + '</button>'
     + '<button class="kp" data-act="keep" data-h="24" data-id="' + esc(id) + '">Keep +24h</button>'
     + (forever
@@ -147147,8 +147423,9 @@ function render() {
   const inv = (state.inventory || []).filter((i) => (!fR || i.rhymed) && (!fP || i.pending) && (!fA || i.aired) && (!fU || !i.aired));
   document.getElementById("invCount").textContent = inv.length + " shown";
   document.getElementById("inventory").innerHTML = inv.length ? '<table><tr><th>type</th><th>round</th><th>stage</th><th>airings</th><th>age</th><th>life</th><th>decision</th><th></th></tr>'
-    + inv.map((i) => '<tr class="' + (i.pending ? 'pending' : '') + (i.rhymed ? ' rhymed' : '') + (i.aired ? '' : ' unheard') + '">' + itemCells(i, true)
-      + '<td>' + esc(i.stage) + '</td>'
+    + inv.map((i) => '<tr class="' + (i.pending ? 'pending' : '') + (i.rhymed ? ' rhymed' : '') + (i.aired ? '' : ' unheard')
+        + (queuedIds.has(i.id) ? ' queued' : incompleteIds.has(i.id) ? ' incomplete' : '') + (cuedIds.has(i.id) ? ' cued' : '') + '">' + itemCells(i, true)
+      + '<td>' + esc(i.stage) + (cuedIds.has(i.id) ? '<div class="meta">cued by hand</div>' : '') + '</td>'
       + '<td>' + (i.aired || 0) + '/' + (i.innings || 1) + (i.rest_left ? '<div class="meta">rests ' + fmt(i.rest_left) + '</div>' : '') + '</td>'
       + '<td class="meta">' + fmt(i.age || 0) + '</td>'
       + '<td>' + lifeCell(i.life_left, i.keep_until) + '</td>'
@@ -147182,12 +147459,13 @@ function renderUnheard() {
       + ((u.shut_roads || []).length ? ' ' + esc(u.shut_roads.join(", ")) + ' cannot air out of turn at all.' : '')
       + '</div></div>'
     + (roads.length ? '<table><tr><th>road</th><th>never heard</th><th>of those, airable</th><th>past the dial</th><th>oldest</th><th>airtime held</th><th>out of turn</th></tr>'
-        + roads.map((r) => '<tr><td><b>' + esc(r.label) + '</b><div class="meta">' + esc(r.kind) + '</div></td>'
+        + roads.map((r) => '<tr><td><b>' + esc(r.label) + '</b><div class="meta">' + esc(r.kind) + '</div>'
+          + '<div><button class="chev" data-road="' + esc(r.kind) + '">' + (openRoads.has(r.kind) ? 'hide them' : 'show them') + '</button></div></td>'
           + '<td>' + r.unheard + ' of ' + r.rows + '</td><td>' + r.ready + '</td>'
           + '<td>' + (r.overdue ? '<span class="why">' + r.overdue + '</span>' : '0') + '</td>'
           + '<td class="meta">' + fmt(r.oldest || 0) + '</td>'
           + '<td class="meta">' + fmt(r.seconds || 0) + '</td>'
-          + '<td class="meta">' + (r.road_open ? 'open' : '<span class="why">closed</span>') + '</td></tr>').join("")
+          + '<td class="meta">' + (r.road_open ? 'open' : '<span class="why">closed</span>') + '</td></tr>' + roadList(r)).join("")
         + '</table>' : '<div class="empty">Everything finished has been on the air.</div>')
     + '<div class="drawer-acts"><button class="go" id="airOldest">Air the longest-waiting one now</button>'
     + '<button class="go" id="judgeOldest">Ask the orchestrator about the backlog</button></div>';
@@ -147202,10 +147480,37 @@ function tick() {
 }
 setInterval(tick, 1000);
 let unheard = null;
+/* #1384: which rows are not segments yet, which are back in the recording
+   room, and which the operator has cued by hand - all from one call. */
+let finish = null;
+const incompleteIds = new Set(), queuedIds = new Set(), cuedIds = new Set(), openRoads = new Set();
+function paintFinish() {
+  incompleteIds.clear(); queuedIds.clear(); cuedIds.clear();
+  if (!finish) return;
+  (finish.incomplete || []).forEach((id) => incompleteIds.add(id));
+  (finish.rows || []).forEach((r) => { if (!r.gone) queuedIds.add(r.id); });
+  ((finish.cue || {}).rows || []).forEach((r) => cuedIds.add(r.id));
+  const b = document.getElementById("finishBrief");
+  if (b) b.textContent = (incompleteIds.size ? incompleteIds.size + ' incomplete' : 'every round is a finished recording')
+    + (queuedIds.size ? ' · ' + queuedIds.size + ' in the room, ' + (finish.lines_owed || 0) + ' line(s) owed' : '')
+    + (cuedIds.size ? ' · ' + cuedIds.size + ' cued by hand' : '');
+}
+/* #1384 (#1106): the rounds a road is holding unheard, with a Cue on each. */
+function roadList(r) {
+  if (!openRoads.has(r.kind)) return '';
+  const items = (state.inventory || []).filter((i) => i.kind === r.kind && !i.aired);
+  return '<tr><td colspan="7"><div class="road-list">' + (items.length ? items.map((i) => '<div class="one' + (incompleteIds.has(i.id) ? ' meta' : '') + '">'
+      + '<span class="t">' + esc((i.text || '').slice(0, 160)) + (incompleteIds.has(i.id) ? ' <span class="why">(still being recorded)</span>' : '') + '</span>'
+      + (cuedIds.has(i.id) ? '<button class="cue" data-cact="uncue" data-id="' + esc(i.id) + '">Un-cue</button>'
+                           : '<button class="cue" data-cact="cue" data-id="' + esc(i.id) + '" title="Put it in the next available ' + esc(r.label) + ' segment">Cue next</button>')
+      + '</div>').join('') : '<div class="meta">nothing unheard on this road</div>') + '</div></td></tr>';
+}
 async function load() {
   try {
     state = await api("/api/retire"); fetchedAt = Date.now();
     try { unheard = await api("/api/cupboard/unheard"); } catch (e) { unheard = null; }
+    try { finish = await api("/api/cupboard/finish"); } catch (e) { finish = null; }
+    paintFinish();
     render();
   }
   catch (e) { document.getElementById("pending").innerHTML = '<div class="empty">The desk could not be read: ' + esc(e.message) + (KEY ? '' : ' - open this page with ?key=YOUR_KEY') + '</div>'; }
@@ -147252,6 +147557,14 @@ document.addEventListener("click", async (ev) => {
     const id = b.dataset.why;
     if (openWhy.has(id)) { openWhy.delete(id); render(); }
     else { openWhy.add(id); render(); await loadWhy(id); }
+    return;
+  }
+  if (b.dataset.road) { const k = b.dataset.road; if (openRoads.has(k)) openRoads.delete(k); else openRoads.add(k); render(); return; }
+  if (b.id === "finishAll") {
+    if (busy) return; busy = true;
+    try { const got = await api("/api/cupboard/finish", {}); alert(got.say || 'queued'); await load(); }
+    catch (e) { alert("The room refused: " + e.message); }
+    finally { busy = false; }
     return;
   }
   if (b.dataset.cact) { await cupboardAct(b.dataset.id, b.dataset.cact); return; }
@@ -150284,6 +150597,13 @@ actually played, and anything in the way"
             title="The DJ booth — turntable, records, requests"
             onclick="boothOpen()"
             style="font-size:15px;line-height:1">🎛</button>
+    <!-- #1381 (#1091, #1092): every 3JS experience, and the station's
+         scripts, documents and media, from one popup - in this web
+         client, not only on the tablet. -->
+    <button aria-label="3JS views and the station's papers" id="threeBtn" class="pine-restart"
+            title="Every 3JS view - the Dialogue Mind, the rhetoric sphere, the vector tree, the Sim, RapAssembly - and the station's scripts, documents and media, in one popup"
+            onclick="threeSheetOpen()"
+            style="font-size:15px;line-height:1">🧊</button>
     <button aria-label="Pine Box stuck or flashing" id="pineRecover" class="pine-restart"
             title="Pine Box stuck or flashing? Stop the show, unstick the
 speaker and restart the agent."
@@ -191783,6 +192103,86 @@ function paperSnapAuto(id) {
   if (row.snapshot) { paperSnapMark(id); return; }
   if (paperSnapDone().includes(id)) return;
   setTimeout(() => { if (paperCur === id && paperBox) paperImage(true, null); }, 1800);
+}
+
+/* #1381: EVERY 3JS EXPERIENCE, AND THE STATION'S PAPERS, FROM ONE BUTTON.
+ *
+ * "Make sure that I have a three JS option in the web client, allowing me
+ *  to load up all of the experiences that we have powered by three JS and
+ *  view them in a pop up window" (#1091); "also offer a scripts option
+ *  for viewing the scripts, documentation and media generated by the
+ *  station" (#1092).
+ *
+ * Nothing new is drawn here. Every entry calls the opener that already
+ * exists for that view - the same function its own button calls - so the
+ * sheet can never show a view the panel does not have, and a view that
+ * moves takes its entry with it. The styles ride inside the function so
+ * the sheet is one self-contained thing. */
+function threeSheetClose() {
+  const s = document.getElementById("threeSheet");
+  if (s) s.remove();
+}
+function threeSheetOpen() {
+  threeSheetClose();
+  const key = (typeof SERVER_KEY === "string" && SERVER_KEY)
+    ? "?key=" + encodeURIComponent(SERVER_KEY) : "";
+  const jump = (id) => { const b = document.getElementById(id); if (b) b.scrollIntoView({block: "center"}); };
+  const groups = [
+    ["Powered by 3JS", [
+      ["🧠", "Dialogue Mind", "watch a line of banter get made, live and in 3D, with swappable themes", () => mindOpen()],
+      ["🔮", "Rhetoric sphere", "the on-air rhetoric as a sphere that undulates and reshapes to the dialogue", () => { rhetSphereToggle(); jump("rhetSphereBtn"); }],
+      ["🌳", "Vector tree", "the speakbox vector database as a 3D tree fed by your documents", () => { rhetVecToggle(); jump("rhetVecBtn"); }],
+      ["🕸", "The Sim", "the machine behind the pair, live", () => djGraphPanel()],
+      ["🎛", "RapAssembly", "the assembly line - ideation, writing, grading, air - as one live 3JS state", () => rapAssemblyPanel()],
+    ]],
+    ["Scripts, documents and media", [
+      ["📖", "Journal", "the request book: what was asked, what was written", () => journalOpen()],
+      ["📰", "Gazette", "the hourly newspaper off the station's own log", () => paperOpen()],
+      ["🗄", "Retirement desk", "every recording in the cupboard, its timer, and the recording room", () => window.open("/cupboard/retire" + key, "_blank")   /* #1381b: its real path */],
+      ["📋", "System2", "hourly plans, scripts and line diagnostics", () => system2Open()],
+      ["🧵", "Station flow", "every content step, judgment, rewrite and playback acknowledgment", () => stationFlowOpen()],
+      ["📘", "The guide", "the operator's manual, as a PDF", () => window.open("/api/pinebox/guide.pdf", "_blank")],
+      ["🖼", "Gallery", "the pictures the station has made, on the slideshow", () => window.open("/spark?pictures=1" + (key ? "&key=" + encodeURIComponent(SERVER_KEY) : ""), "_blank")],
+    ]],
+  ];
+  const back = document.createElement("div");
+  back.id = "threeSheet";
+  back.style.cssText = "position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;background:rgba(4,6,11,.62)";
+  const box = document.createElement("div");
+  box.style.cssText = "width:min(560px,94vw);max-height:86vh;overflow-y:auto;border:1px solid var(--border);border-radius:14px;background:var(--panel);color:var(--text);box-shadow:var(--shadow);font:13px/1.5 system-ui,sans-serif,PineIcons";
+  const head = document.createElement("div");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border)";
+  head.innerHTML = '<b style="font-size:15px">🧊 3JS, and the papers</b><span style="flex:1"></span>';
+  const x = document.createElement("button");
+  x.textContent = "×";
+  x.style.cssText = "background:none;border:0;color:var(--muted);font-size:22px;line-height:1;cursor:pointer;min-width:40px;min-height:40px";
+  x.onclick = threeSheetClose;
+  head.appendChild(x);
+  box.appendChild(head);
+  groups.forEach(([title, items]) => {
+    const h = document.createElement("div");
+    h.textContent = title;
+    h.style.cssText = "padding:10px 14px 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)";
+    box.appendChild(h);
+    items.forEach(([icon, name, blurb, go]) => {
+      const b = document.createElement("button");
+      b.style.cssText = "display:flex;gap:10px;align-items:center;width:100%;text-align:left;padding:9px 14px;background:none;border:0;border-top:1px solid rgba(255,255,255,.04);color:var(--text);cursor:pointer;font:inherit;min-height:44px";
+      b.innerHTML = '<span style="font-size:18px;width:26px;text-align:center">' + icon + '</span><span><b>' + name + '</b><div style="font-size:11.5px;color:var(--muted)">' + blurb + '</div></span>';
+      b.onmouseenter = () => { b.style.background = "var(--panel2)"; };
+      b.onmouseleave = () => { b.style.background = "none"; };
+      b.onclick = () => {
+        threeSheetClose();
+        try { go(); } catch (err) { alert("That view could not open: " + (err && err.message || err)); }
+      };
+      box.appendChild(b);
+    });
+  });
+  back.appendChild(box);
+  back.addEventListener("click", (ev) => { if (ev.target === back) threeSheetClose(); });
+  document.addEventListener("keydown", function esc(ev) {
+    if (ev.key === "Escape") { threeSheetClose(); document.removeEventListener("keydown", esc); }
+  });
+  document.body.appendChild(back);
 }
 
 async function paperOpen() {
