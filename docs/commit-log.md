@@ -710,3 +710,4 @@ attached it are not listed. The narrative that runs through it is in
 - `1bdafb2` Twenty inbox items closed: the buttons the agent's roads lacked, and three things nobody had built
 - `93e6a63` Profiled, not guessed: a failed import per request, a lock under the loop, and the set rung ahead
 - `b8b68f6` The station stuttered: the store's save starved the disk, and the tablet was animating under a view nobody could see
+- `e3ba6c6` The tablet's frame pipeline, the tailnet gallery's hand-back, and an SFX slider

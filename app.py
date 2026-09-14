@@ -67241,8 +67241,35 @@ _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
 # changes nothing on the screen, because the screen already has what it
 # needs. The picture door's own rule still holds - no lead, no reservation,
 # no claim on the air - so an endless set cannot mortgage the show.
-SFX_CYCLE_AHEAD = 20.0           # keep this much picture rung ahead of now
-SFX_CYCLE_QUEUE = 3              # never more than this many queued at the set
+SFX_CYCLE_AHEAD = 12.0           # keep this much picture rung ahead of now (#1417: was 20)
+SFX_CYCLE_QUEUE = 2              # the one on the tube and the next (#1417: was 3)
+
+
+def sfx_cycle_request(sample: Path, who: str = "") -> bool:
+    """#1417: the SFX guy hands the cycle a clip to ring in turn."""
+    asked = _SFX_CYCLE.setdefault("requests", [])
+    if len(asked) >= 4:
+        return False
+    asked.append((sample, str(who or "")))
+    return True
+
+
+def _sfx_cycle_note(sample: Path, seconds: float, start: float, who: str) -> None:
+    """The bookkeeping dj_sting did for a sting it rang itself."""
+    key = sfx_id(sample)
+    _RADIO["chat"].append({
+        "ts": int(time.time()), "air_at": start,
+        "who": "board", "kind": "sfx", "text": sample.stem, "sfx": key,
+        "sfx_dir": sample.parent.name or "sfx", "video": True,
+        "seconds": round(float(seconds or 0), 2),
+        "url": "/sfx/%s?t=%s" % (key, media_sign(key)), "aired": "airing",
+        "endless": True})                          # #1417: rung by the cycle, after the tube's clip
+    del _RADIO["chat"][:-240]
+    note_activity("sting", sample.stem)
+    try:
+        sfx_history_add(sample, who)
+    except Exception:  # noqa: BLE001
+        pass
 SFX_CYCLE_GAP = 0.0              # back to back; the set fades one into the next
 
 
@@ -67268,10 +67295,17 @@ async def sfx_video_cycle() -> None:
                                    "clip": plan[0]["sting"], "why": ""})
                 await asyncio.sleep(1.0)
                 continue
-            # The book first - instant, and full the moment the process is up.
-            got = await sfx_db_pick_row_async(True)
-            pick = got[0] if got else None
-            seconds = float(got[1]) if got else 0.0
+            # #1417: the SFX guy's own clip first, if he has handed one in.
+            asked = _SFX_CYCLE.setdefault("requests", [])
+            asked_who = ""
+            if asked:
+                pick, asked_who = asked.pop(0)
+                seconds = await asyncio.to_thread(sfx_seconds, pick)
+            else:
+                # The book first - instant, and full the moment the process is up.
+                got = await sfx_db_pick_row_async(True)
+                pick = got[0] if got else None
+                seconds = float(got[1]) if got else 0.0
             if pick is None:
                 # The old road, for the minutes after a fresh install only.
                 pick = sfx_deck_take()
@@ -67292,6 +67326,8 @@ async def sfx_video_cycle() -> None:
                 at_ms=int(start * 1000))
             plan.append({"sting": pick.stem, "start": start,
                          "end": start + seconds})
+            if asked_who:
+                _sfx_cycle_note(pick, seconds, start, asked_who)      # #1417
             _SFX_CYCLE.update({"at": now, "until": plan[-1]["end"],
                                "rung": int(_SFX_CYCLE.get("rung") or 0) + 1,
                                "clip": plan[0]["sting"], "queued": len(plan),
@@ -67312,6 +67348,7 @@ def sfx_video_mode_state() -> dict[str, Any]:
             # #1395: the book is what the set is fed from now.
             "book": sfx_db_counts().get("video_playable", 0),
             "queued": int(cycle.get("queued") or 0),
+            "asked": len(cycle.get("requests") or []),        # #1417: the SFX guy's clips waiting their turn
             "ahead_s": max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1)),
             "say": ("the endless set is on - %d clip(s) rung, %s is on the "
                     "tube with %.0fs left"
@@ -68522,6 +68559,20 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     is_video = sfx_is_video(sample)
     if is_video:
         to_box = False
+    # #1417: IN ENDLESS MODE THE TUBE BELONGS TO THE CYCLE. "Whenever endless
+    # video mode is active, don't have the SFX guy play a clip during a clip
+    # he is already playing. Have him do it after." A video sting rung here
+    # went down the voice feed to the page's own tube (djVideoTv) while the
+    # set played the cycle's clip - two pictures, two sounds, at once. Now he
+    # hands the clip to the cycle, which rings it in turn after the one on
+    # the tube (the cycle keeps one clip rung ahead); an audio-only sting
+    # waits for the tube to be free, which in endless mode is his next
+    # cadence after the set has nothing planned.
+    if sfx_video_mode_on():
+        if is_video:
+            return "queued" if sfx_cycle_request(sample, who) else ""
+        if time.time() < float(_SFX_CYCLE.get("until") or 0):
+            return ""
     # On the record like any spoken line (#269): which sample, from which
     # folder, with enough identity for the panel to vote it off the air.
     # #903 (#848): this row was written BEFORE any attempt to play, and

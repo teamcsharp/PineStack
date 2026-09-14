@@ -2402,3 +2402,18 @@ dropped at the prototype, where every writer meets them. Measured after the
 whole series (#1413a–g): the WebView process 289% → 157%, the kiosk 255% →
 132%, the audio render thread with a third of a core to spare, main-thread
 task time 98% → 84%.
+
+**In endless mode the tube belongs to the cycle (#1417).** "Whenever endless
+video mode is active, don't have the SFX guy play a clip during a clip he is
+already playing. Have him do it after." A video sting went down the voice
+feed to the page's *own* little tube (`djVideoTv`, with its own queue) while
+the set played the cycle's clip — two pictures, two sounds, at once. Now,
+while the loop button is lit, the SFX guy hands his clip to the cycle
+(`sfx_cycle_request`), which rings it in turn, after the one on the tube; the
+cycle keeps one clip rung ahead instead of three (`SFX_CYCLE_QUEUE` 2,
+`SFX_CYCLE_AHEAD` 12 s) so "after" means the next slot, not a minute later,
+and the warm slot (#1411) still has a clip's length to fetch it. His clip
+gets the same feed row and history entry it always did, marked `endless`. An
+audio-only sting waits for the tube to be free — in endless mode that is his
+next cadence after the set has nothing planned. `/api/sfx/video/mode` shows
+`asked`: his clips waiting their turn.
