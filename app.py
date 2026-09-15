@@ -109462,7 +109462,10 @@ def segment_inspect(block: int) -> dict[str, Any]:
     out: dict[str, Any] = {"schema": 1, "block": int(block), "available": True,
                            "round": None, "lines": [], "seats": [],
                            "transaction": [], "brief": None, "timing": None,
-                           "holes": [], "prompt_kind": "", "why": ""}
+                           "holes": [], "prompt_kind": "", "why": "",
+                           # 2026-09-15 (#1168), the three the inspector
+                           # asked for and this route could not answer.
+                           "hour": "", "slot": None, "admission": None}
     try:
         led = [r for r in script_ledger_rows() if int(r.get("block") or -1) == int(block)]
     except Exception as exc:  # noqa: BLE001
@@ -109591,6 +109594,96 @@ def segment_inspect(block: int) -> dict[str, Any]:
         out["timing"] = None
         out["why"] = ("not one line of this segment was ever heard - it was "
                       "written and, if it has states, refused at hand-over")
+    # THE HOUR this segment belongs to, from the round's own commit time.
+    try:
+        out["hour"] = time.strftime("%Y-%m-%dT%H", time.localtime(
+            float(first.get("at") or 0) or time.time()))
+    except Exception:  # noqa: BLE001
+        out["hour"] = ""
+    # WHICH ENTRY ON THE SHEET. The honest answer is usually "one of
+    # these": the ledger records the ROAD a round was written for and its
+    # commit time, but not the slot id it was reserved against - only the
+    # live `_ready_slot` window knows that, and it is gone by the time
+    # anyone inspects. So this names every entry of that road in the
+    # running order, and says plainly that the station does not record
+    # which one a finished round was written for. A prompt saved "for this
+    # segment" therefore reaches the ROAD, not one entry, and the pop-up
+    # must say so rather than implying a precision that is not there.
+    try:
+        sheet = schedule_public() or {}
+        rows = [r for r in (sheet.get("slots") or []) if isinstance(r, dict)]
+        mine = [r for r in rows
+                if str(SCHED_PREP_KIND.get(str(r.get("kind") or ""))
+                       or r.get("kind") or "") == road]
+        now_id = str((_RADIO.get("sched_pos") or {}).get("slot_id") or "")
+        out["slot"] = {
+            "preset": str(sheet.get("active") or ""),
+            "candidates": [{"id": str(r.get("id") or ""),
+                            "kind": str(r.get("kind") or ""),
+                            "label": str(r.get("label") or "")[:80],
+                            "minutes": float(r.get("minutes") or 0),
+                            "on_air_now": str(r.get("id") or "") == now_id}
+                           for r in mine][:12],
+            "slot_id": (str(mine[0].get("id") or "") if len(mine) == 1 else ""),
+            "say": ("one entry on the sheet runs this road, so it is that one"
+                    if len(mine) == 1 else
+                    "%d entries on the sheet run this road; the ledger does not "
+                    "record which one a finished round was written for, so a "
+                    "prompt saved for this segment reaches the road rather than "
+                    "one entry" % len(mine)) if mine else
+                   "no entry on the sheet runs this road right now",
+        }
+    except Exception as exc:  # noqa: BLE001
+        out["slot"] = {"preset": "", "candidates": [], "slot_id": "",
+                       "say": "the sheet could not be read: %r" % (exc,)}
+    # THE ADMITTED PLAYBACK OCCURRENCE, when the gate saw this segment go
+    # out. The gate keeps its cues, so a block is linked to an occurrence
+    # by the line ids it admitted - and, for a welded round whose cue
+    # carries no row id, by the words. An occurrence this block cannot be
+    # linked to is not claimed.
+    try:
+        want_ids = {str(l.get("line_id") or "") for l in out["lines"] if l.get("line_id")}
+        want_text = {" ".join(str(l.get("text") or "").lower().split())[:60]
+                     for l in out["lines"] if l.get("text")}
+        found: list[dict[str, Any]] = []
+        census = admission_state(64) if "admission_state" in globals() else {}
+        for occ in (census.get("occurrences") or []):
+            if not isinstance(occ, dict):
+                continue
+            hit = 0
+            for cue in (occ.get("cues") or []):
+                if not isinstance(cue, dict):
+                    continue
+                if str(cue.get("line_id") or "") in want_ids:
+                    hit += 1
+                elif " ".join(str(cue.get("text") or "").lower().split())[:60] in want_text:
+                    hit += 1
+            if not hit:
+                continue
+            found.append({"occurrence_id": str(occ.get("occurrence_id") or ""),
+                          "position": occ.get("position"),
+                          "state": str(occ.get("state") or ""),
+                          "outcome": str(occ.get("outcome") or ""),
+                          "lane": str(occ.get("lane") or ""),
+                          "producer": str(occ.get("producer") or ""),
+                          "origin": str(occ.get("origin") or ""),
+                          "admitted_at": occ.get("admitted_at"),
+                          "lines_matched": hit,
+                          "audio": {k: (occ.get("audio") or {}).get(k)
+                                    for k in ("media", "seconds", "bytes", "hash_method")},
+                          "script_revision": str(occ.get("script_revision") or ""),
+                          "performer_session": str(occ.get("performer_session") or "")})
+        out["admission"] = {
+            "occurrences": found[:8],
+            "say": ("%d admitted occurrence(s) carry lines of this segment"
+                    % len(found)) if found else
+                   ("the gate holds no occurrence carrying a line of this "
+                    "segment - it keeps a bounded window, so a segment older "
+                    "than that window is simply out of its reach"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        out["admission"] = {"occurrences": [],
+                            "say": "the gate could not be read: %r" % (exc,)}
     return out
 
 

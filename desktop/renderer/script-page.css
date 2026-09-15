@@ -1251,3 +1251,238 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
   flex: 1 1 auto; min-height: 44px; border: 1px solid #65c7da; border-radius: 9px;
   background: #10202a; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
 }
+
+/* ---- #1168: the menu on a segment's header -------------------------
+ *
+ * "whenever i tap and hold on a segment's header, I want a right click
+ *  menu ... I also want a sidebar showing a vertical infographic
+ *  showing guided arrows going from path to path, from person to
+ *  person ... going down the screen in a sidebar to the right of the
+ *  pop-up."
+ *
+ * THE GLASS IS 1154x690 CSS px on the tablet, so nothing here may be
+ * taller than that: every box is a flex column with ONE scrolling child,
+ * capped at min(86vh, 640px), which leaves the header and the buttons
+ * pinned where a thumb expects them however long the segment ran. The
+ * sheets are the ones sheetShell() builds, so PineDrag already moves
+ * them by their header (.sp-find-box / .sp-find-head).
+ */
+
+/* The heading is now a held control as well as the fold's handle, so
+   the WebView's own selection callout must not race the hold - the same
+   rule the script's name (#1164) and the caution button already wear. */
+.sp-scene {
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  touch-action: manipulation;
+}
+/* The two marks reportFire paints on whatever it was given, so a report
+   filed from a heading answers the way the caution button does. */
+.sp-scene.sp-firing { opacity: .55; }
+.sp-scene.sp-fired-bad { color: #ff5d5d; }
+
+.sp-segmenu {
+  position: fixed; z-index: 2147483007;
+  width: min(320px, 88vw); max-height: min(72vh, 480px);
+  display: flex; flex-direction: column; overflow-y: auto;
+  border: 1px solid #35414c; border-radius: 10px;
+  background: #0b1116; color: #dfe7ee;
+  font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .55);
+}
+.sp-segmenu-where {
+  padding: 8px 14px; font-size: 11px; color: #8ea0ad;
+  border-bottom: 1px solid #24323a;
+}
+.sp-segmenu-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 0 14px;
+  border: 0; border-bottom: 1px solid #101823; background: none; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-segmenu-mark { display: inline-flex; flex: 0 0 auto; color: #8ea0ad; }
+.sp-segmenu-mark .pi-icon { width: 20px; height: 20px; }
+.sp-segmenu-text { flex: 1 1 auto; min-width: 0; }
+/* Cancel is the way out, not a fourth choice: quieter, and last. */
+.sp-segmenu-cancel { color: #8ea0ad; border-bottom: 0; }
+
+/* ---- the facts, shared by all three windows ---------------------- */
+.sp-segsec { padding: 8px 14px; border-bottom: 1px solid #101823; }
+.sp-segsec-h {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 6px; font-size: 11px; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; color: #65c7da;
+}
+.sp-segrow { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 2px 0; }
+.sp-segrow-k { flex: 0 0 auto; min-width: 116px; font-size: 11px; color: #8ea0ad; }
+.sp-segrow-v { flex: 1 1 160px; min-width: 0; color: #dfe7ee; word-break: break-word; }
+/* A field the station does not have must not read like one it does. */
+.sp-segrow-none { color: #6f8291; font-style: italic; }
+.sp-segrow-why { flex: 1 1 100%; font-size: 10.5px; line-height: 1.5; color: #7f8f9c; }
+.sp-seghole .sp-segrow-v, .sp-seghole .sp-segrow-k { color: #e3be63; }
+
+.sp-segseat { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; padding: 3px 0; }
+.sp-segseat-name { color: #dfe7ee; }
+.sp-segseat-seat { font-size: 10.5px; color: #8ea0ad; }
+.sp-segseat-n { margin-left: auto; font-size: 11px; color: #8ea0ad; font-variant-numeric: tabular-nums; }
+
+.sp-segline {
+  margin: 6px 0; padding: 5px 0 5px 9px;
+  border-left: 3px solid #35414c; background: #080d11; border-radius: 0 6px 6px 0;
+}
+.sp-segline-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.sp-segline-who { color: #dfe7ee; }
+.sp-segline-tag { font-size: 10.5px; color: #8ea0ad; font-variant-numeric: tabular-nums; }
+.sp-segline-text { color: #cfe0e6; word-break: break-word; }
+.sp-segline-made { font-size: 10.5px; color: #7f8f9c; word-break: break-word; }
+.sp-segline-why { font-size: 11px; color: #ff9d6b; }
+/* Written and never heard: the one thing this pop-up is opened to see,
+   so it is dimmed and marked rather than hidden. */
+.sp-segline.sp-unheard { opacity: .72; }
+.sp-segline.sp-unheard .sp-segline-text { text-decoration: line-through; text-decoration-color: #6f8291; }
+.sp-segline.sp-withdrawn { background: #140d0d; }
+
+/* ---- inspect: the body and the sidebar beside it ----------------- */
+.sp-segins-box {
+  width: min(980px, 96vw); max-height: min(86vh, 640px);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: #0b1116; color: #dfe7ee;
+}
+.sp-segins-split { flex: 1 1 auto; min-height: 0; display: flex; }
+.sp-segins-body { flex: 1 1 auto; min-width: 0; overflow-y: auto; }
+/* "a sidebar to the right of the pop-up" - inside its own scroller, so
+   it scrolls with the window and never lengthens it. */
+.sp-segins-side {
+  flex: 0 0 236px; min-width: 0; overflow-y: auto;
+  padding: 8px 12px; border-left: 1px solid #24323a; background: #080d11;
+}
+.sp-segins-wait { padding: 10px 14px; color: #65c7da; font-weight: 600; }
+/* A narrow surface puts the flow under the facts rather than squeezing
+   both: the operator still gets the whole drawing, in one column. */
+@media (max-width: 720px) {
+  .sp-segins-split { flex-direction: column; }
+  .sp-segins-side { flex: 0 0 auto; border-left: 0; border-top: 1px solid #24323a; }
+}
+
+/* ---- the vertical infographic ------------------------------------ */
+.sp-segflow-h {
+  margin-bottom: 6px; font-size: 11px; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; color: #65c7da;
+}
+.sp-segflow-note { font-size: 10.5px; line-height: 1.5; color: #7f8f9c; padding: 4px 0; }
+.sp-segflow-legend {
+  display: flex; flex-wrap: wrap; gap: 4px 10px;
+  padding: 4px 0 8px; margin-bottom: 6px; border-bottom: 1px solid #101823;
+}
+.sp-segflow-key { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: #8ea0ad; }
+.sp-segflow-dot { display: inline-block; flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: #6f8291; }
+.sp-segflow-name { min-width: 0; }
+.sp-segflow-n { color: #6f8291; font-variant-numeric: tabular-nums; }
+.sp-segflow-node {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 9px; border: 1px solid #35414c; border-radius: 8px;
+  background: #0b1116; font-size: 11.5px; color: #dfe7ee;
+}
+/* The arrow: a stem in the speaker's colour, a head in the answerer's,
+   and what passed between them written beside it. Two elements and a
+   border triangle - no canvas, no animation, nothing per frame. */
+.sp-segflow-arrow { position: relative; display: flex; align-items: center; gap: 8px; padding: 2px 0 2px 11px; }
+.sp-segflow-stem { flex: 0 0 auto; width: 2px; height: 30px; background: #6f8291; border-radius: 1px; }
+.sp-segflow-head {
+  position: absolute; left: 7px; bottom: 0;
+  width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent;
+  border-top: 7px solid #6f8291;
+}
+.sp-segflow-label { flex: 1 1 auto; min-width: 0; font-size: 10.5px; line-height: 1.4; color: #8ea0ad; word-break: break-word; }
+.sp-segflow-unheard .sp-segflow-stem { opacity: .45; }
+.sp-segflow-unheard .sp-segflow-label { color: #ff9d6b; }
+.sp-segflow-gap { padding: 4px 0 4px 11px; font-size: 10.5px; color: #e3be63; }
+
+/* ---- report segment ---------------------------------------------- */
+.sp-segrep-box {
+  width: min(620px, 96vw); max-height: min(86vh, 640px);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: #0b1116; color: #dfe7ee;
+}
+.sp-segrep-who { flex: 0 0 auto; padding: 8px 14px; border-bottom: 1px solid #101823; }
+.sp-segrep-extract { flex: 1 1 auto; min-height: 60px; overflow-y: auto; padding: 8px 14px; background: #080d11; }
+.sp-segrep-ta {
+  flex: 0 0 auto; margin: 8px 14px 0; box-sizing: border-box; min-height: 72px; padding: 8px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee;
+  font: inherit; resize: vertical;
+}
+.sp-segrep-ta::placeholder { color: #6f8291; }
+.sp-segrep-row { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 14px 0; }
+.sp-segrep-dictate {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 0 12px;
+  border: 1px solid #35414c; border-radius: 9px; background: #0b1116; color: #dfe7ee;
+  font: inherit; cursor: pointer;
+}
+.sp-segrep-dictate .pi-icon { width: 16px; height: 16px; }
+.sp-segrep-file {
+  flex: 1 1 auto; min-height: 44px; border: 1px solid #65c7da; border-radius: 9px;
+  background: #10202a; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-segrep-box > .sp-segrow-why { flex: 0 0 auto; padding: 6px 14px 12px; }
+
+/* ---- examine system prompt --------------------------------------- */
+.sp-segpr-box {
+  width: min(720px, 96vw); max-height: min(86vh, 640px);
+  display: flex; flex-direction: column; overflow-y: auto;
+  background: #0b1116; color: #dfe7ee;
+}
+.sp-segpr-facts { flex: 0 0 auto; padding: 8px 14px; border-bottom: 1px solid #101823; }
+.sp-segpr-ta {
+  flex: 0 0 auto; margin: 8px 14px 0; box-sizing: border-box; min-height: 150px; padding: 8px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; resize: vertical;
+}
+.sp-segpr-ta::placeholder { color: #6f8291; }
+.sp-segpr-row { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px 0; }
+.sp-segpr-in {
+  flex: 1 1 180px; min-width: 0; min-height: 40px; box-sizing: border-box; padding: 6px 9px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee; font: inherit;
+}
+.sp-segpr-in::placeholder { color: #6f8291; }
+.sp-segpr-tick {
+  display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 4px;
+  border: 0; background: none; color: #8ea0ad; font: inherit; font-size: 11.5px;
+  text-align: left; cursor: pointer;
+}
+.sp-segpr-tick.on { color: #e3be63; }
+.sp-segpr-tickmark { display: inline-flex; flex: 0 0 auto; }
+.sp-segpr-tickmark .pi-icon { width: 18px; height: 18px; }
+.sp-segpr-scope {
+  flex: 1 1 200px; min-width: 0; min-height: 40px; padding: 6px 9px;
+  border: 1px solid #35414c; border-radius: 8px; background: #0b1116; color: #dfe7ee; font: inherit;
+}
+/* Two acts, two buttons, and they must not look like one another: the
+   book is quiet, the air is lit. The station keeps them apart and so
+   does this - "Never apply silently on a save." */
+.sp-segpr-save {
+  flex: 1 1 200px; min-height: 44px; border: 1px solid #35414c; border-radius: 9px;
+  background: #0b1116; color: #dfe7ee; font: inherit; cursor: pointer;
+}
+.sp-segpr-apply {
+  flex: 1 1 200px; min-height: 44px; border: 1px solid #e3be63; border-radius: 9px;
+  background: #211a0c; color: #e3be63; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-segpr-book { flex: 0 0 auto; padding: 10px 14px 14px; }
+.sp-segpr-again {
+  margin-left: auto; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 34px; min-height: 34px; border: 0; border-radius: 8px;
+  background: none; color: #8ea0ad; font: inherit; cursor: pointer;
+}
+.sp-segpr-again .pi-icon { width: 16px; height: 16px; }
+.sp-segpr-preset {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  width: 100%; min-height: 44px; padding: 6px 10px; margin-bottom: 6px;
+  border: 1px solid #24323a; border-radius: 8px; background: #080d11; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer;
+}
+.sp-segpr-presetwhy { font-size: 10.5px; color: #8ea0ad; }
+.sp-segpr-clause { margin-top: 8px; font-size: 11px; color: #8ea0ad; }
+.sp-segpr-pre {
+  margin: 6px 0 0; padding: 8px; max-height: 180px; overflow: auto;
+  border: 1px solid #24323a; border-radius: 8px; background: #06090c;
+  color: #cfe0e6; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-word;
+}

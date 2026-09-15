@@ -1824,6 +1824,1227 @@
     return menu;
   }
 
+  /* ---- #1168: the menu on a segment's header ---------------------- */
+
+  /* D. HOLD A SEGMENT'S HEADER.
+   *
+   * Inbox #1168, in the operator's own words:
+   *
+   *   "whenever i tap and hold on a segment's header, I want a right
+   *    click menu offering:
+   *    - inspect segment (view popup going over every aspect of how the
+   *      segment was composed)
+   *    - report segment (pop up report window for reporting segment,
+   *      extracts script and playback records for report and allows me
+   *      to dictate / type a report to file)
+   *    - examine system prompt (show system prompt in pop up window
+   *      allowing for edit and saving as default or new preset for
+   *      segment prompt. Allow me to modify system prompts for
+   *      segments)
+   *
+   *    Whenever I'm looking at a segment, I also want a sidebar showing
+   *    a vertical infographic showing guided arrows going from path to
+   *    path, from person to person representing the conversation
+   *    transaction taking place and how everyone participated and
+   *    coalesced in the making of the conversation going down the
+   *    screen in a sidebar to the right of the pop-up."
+   *
+   * THE GESTURE IS ALREADY IN THIS FILE. holdOpen() - half a second,
+   * eight pixels of travel cancels it, the trailing synthetic click is
+   * swallowed by `pineHeld`, and the desk's right-click and the
+   * WebView's own long-press are both turned into the same answer. The
+   * SFX button, the caution button, the report icon and the script's
+   * name (#1164) are on it; the scene heading is the fifth. The heading
+   * already has a click of its own - it is the fold's handle (#1285) -
+   * so that click asks `pineHeld` first, exactly the way the caution
+   * button does, and a hold therefore never also folds the segment away
+   * underneath its own menu.
+   *
+   * HOW A SEGMENT IS NAMED. By its BLOCK, which is the station's own
+   * name for one conversation (#1330). The heading itself does not
+   * carry one: the screenplay pushes a scene with a round and a seg id
+   * and keeps `scene_block` to itself, and #1330 stamps data-block on
+   * the LINES. So the block is read off the first line under the
+   * heading, walked in DOM order - which the reconciler (#1273) keeps
+   * as script order. A heading with no numbered line under it has no
+   * block, and that is said rather than guessed.
+   *
+   * WHERE THE MENU GOES. Fixed, at the heading's own measured corner
+   * and clamped to the glass, rather than absolute inside #spScript:
+   * that pane scrolls and clips, and a drop-down that can be scrolled
+   * half out of its own parent is worse than one that simply stays put
+   * until it is answered. PineDismiss closes it on a tap away or
+   * Escape, the one rule every pop-up on this page is on.
+   */
+  var SEG_MENU_ID = 'spSegMenu';
+  var segMenuUnwatch = null;
+  var segAsked = Object.create(null);   /* block -> {at, data}, briefly held */
+
+  /* The seats the station has, each with a stable colour, so the same
+     person is the same colour in the legend, in the arrows and in the
+     line list - and on the next segment, and tomorrow. `board` and
+     `drop` are not people but they take part, so they are drawn.
+     Measured over 24 hours of air (2026-09-15): dj 5,038, cohost 3,707,
+     board 3,166, drop 1,367, caller 695, host 89, third 3, manager 0 -
+     so `host` is a real ninth seat and belongs in the table rather than
+     falling through to "someone else", and `manager` is here waiting
+     for its road to be switched on. */
+  var SEG_SEATS = [
+    {seat: 'dj', label: 'DJ', colour: '#65c7da'},
+    {seat: 'cohost', label: 'Co-host', colour: '#54d18b'},
+    {seat: 'host', label: 'Host', colour: '#4fb0a6'},
+    {seat: 'third', label: 'Third seat', colour: '#b98cf0'},
+    {seat: 'caller', label: 'Caller', colour: '#e3be63'},
+    {seat: 'caller2', label: 'Second caller', colour: '#ef8f5e'},
+    {seat: 'board', label: 'The board', colour: '#8fa0ad'},
+    {seat: 'drop', label: 'Drop', colour: '#e06c9f'},
+    {seat: 'manager', label: 'The manager', colour: '#e05c5c'}
+  ];
+  var SEG_SEAT_ELSE = {seat: '', label: 'someone else', colour: '#6f8291'};
+  /* The tablet's frame pipeline is sensitive (2026-09-14): a segment of
+     a few hundred hand-offs must not put a few hundred more nodes on
+     the glass. Beyond this the sidebar says how many it did not draw. */
+  var SEG_FLOW_MOST = 60;
+
+  function segSeatLook(seat) {
+    var want = String(seat || '').toLowerCase();
+    for (var i = 0; i < SEG_SEATS.length; i += 1) {
+      if (SEG_SEATS[i].seat === want) return SEG_SEATS[i];
+    }
+    return {seat: want, label: want || SEG_SEAT_ELSE.label,
+      colour: SEG_SEAT_ELSE.colour};
+  }
+
+  /* "a field the station does not have is null with a sentence beside
+     it, never invented" - so this page has to be able to tell nothing
+     from zero, and print the difference. */
+  function segHas(v) {
+    return v !== undefined && v !== null && v !== '';
+  }
+
+  function segWord(v, missing) {
+    return segHas(v) ? String(v) : String(missing || 'the station did not say');
+  }
+
+  /* One decimal, always - a hole of 16.7 s and one of 17 s are the same
+     hole, but the station measured the first and this page must not
+     print the second as though it had. The trailing .0 goes. */
+  function segSecs(v) {
+    if (!segHas(v) || !isFinite(Number(v))) return '';
+    var n = Math.round(Number(v) * 10) / 10;
+    return n + 's';
+  }
+
+  /* One fact, as a row: what it is, what the station said, and - when
+     the station said nothing - the sentence it sent instead. */
+  function segRow(into, key, value, why) {
+    var row = make('div', 'sp-segrow');
+    row.appendChild(make('span', 'sp-segrow-k', String(key)));
+    var v = make('span', 'sp-segrow-v', segHas(value) ? String(value) : '—');
+    if (!segHas(value)) v.classList.add('sp-segrow-none');
+    row.appendChild(v);
+    if (why) row.appendChild(make('span', 'sp-segrow-why', String(why)));
+    into.appendChild(row);
+    return row;
+  }
+
+  function segSection(into, title) {
+    var box = make('div', 'sp-segsec');
+    box.appendChild(make('div', 'sp-segsec-h', String(title)));
+    into.appendChild(box);
+    return box;
+  }
+
+  /* WHICH SEGMENT THIS HEADING IS. Everything the three pop-ups need,
+     read off the DOM before anything is opened over it. */
+  function segIdentity(node) {
+    var out = {node: node, heading: '', seg: '', block: '', round: '',
+      hour: hourKey, at: ''};
+    if (!node || !node.getAttribute) return out;
+    out.heading = headerText(node);
+    out.seg = String(node.getAttribute('data-seg') || '');
+    /* #1303b keeps the current item on the node, so the round the
+       screenplay wrote this scene for is here without asking. */
+    var item = node.pineItem || null;
+    if (item) {
+      out.round = String(item.round || '');
+      if (item.hour) out.hour = String(item.hour);
+      if (segHas(item.at)) out.at = String(item.at);
+    }
+    var walk = node.nextSibling;
+    while (walk) {
+      if (walk.className !== undefined
+          && /(^|\s)sp-el(\s|$)/.test(String(walk.className || ''))) {
+        if (/(^|\s)sp-scene(\s|$)/.test(String(walk.className || ''))) break;
+        var mark = walk.getAttribute ? String(walk.getAttribute('data-seg') || '') : '';
+        if (out.seg && mark && mark !== out.seg) break;
+        var blk = walk.getAttribute ? String(walk.getAttribute('data-block') || '') : '';
+        if (blk) { out.block = blk; break; }
+      }
+      walk = walk.nextSibling;
+    }
+    return out;
+  }
+
+  /* THE STATION'S RECORD OF ONE SEGMENT.
+   *
+   * GET /api/segment/inspect?block=<n> answers with the round, every
+   * line in ledger order, who took part, the brief against what was
+   * actually said, the timing with its holes, and the `transaction`
+   * array the sidebar draws.
+   *
+   * Never rejects. A 404 is a real answer here - the route may still be
+   * deploying, and the pop-up says so rather than failing - and so is
+   * `available: false`, which is what a block older than the ledger's
+   * forty-eight hours gets. Both come back in the same shape as a good
+   * answer so nothing downstream has to ask which kind it got.
+   *
+   * AND IT IS ASKED ONCE. Inspecting a segment and then reporting it is
+   * the same block twice inside a few seconds, and this file's traffic
+   * rule is not decorative - 38 concurrent requests were measured
+   * starving this tablet's audio for 46 seconds. A good answer is held
+   * for the screenplay's own rest (twenty seconds); a refusal is never
+   * held, because the route may be deploying as he reads. */
+  function segInspect(block) {
+    block = String(block || '');
+    var held = segAsked[block];
+    if (held && (Date.now() - held.at) < SCREENPLAY_REST_MS) {
+      return Promise.resolve(held.data);
+    }
+    if (!block) {
+      return Promise.resolve({available: false, block: '', why: 'No line under'
+        + ' this heading carries a block number, so there is nothing for the'
+        + ' station to look up. A segment is named by its block (#1330).'});
+    }
+    if (!api() || !api().get) {
+      return Promise.resolve({available: false, block: block,
+        why: 'There is no bridge to the station from this surface.'});
+    }
+    return Promise.resolve(api().get('/api/segment/inspect?block='
+        + encodeURIComponent(block))).then(function (d) {
+      if (!d || typeof d !== 'object') {
+        return {available: false, block: block,
+          why: 'The station answered, but with nothing in it.'};
+      }
+      segAsked[block] = {at: Date.now(), data: d};
+      return d;
+    }, function (err) {
+      var msg = String((err && err.message) || err);
+      var missing = /\b404\b|not\s*found/i.test(msg);
+      return {available: false, block: block, unreachable: true,
+        why: missing
+          ? 'This station has no /api/segment/inspect yet - it may still be'
+            + ' deploying. Nothing else on this menu depends on it.'
+          : 'The station did not answer: ' + msg.slice(0, 140)};
+    });
+  }
+
+  /* ---- #1168-1: inspect segment ----------------------------------- */
+
+  /* "a view popup going over every aspect of how the segment was
+   * composed" - the round and when it was committed, every line in
+   * ledger order with its seat, voice, engine, model, length, air time
+   * and aired state, who took part and for how long, the brief this
+   * road was supposed to fill against what it actually contained, the
+   * timing with any hole inside it, and the hand-offs.
+   *
+   * `heard` is the truthful one and `aired` is the raw state, so they
+   * are shown as two different things: a line can be `published`
+   * (handed over) and never acknowledged, or `withdrawn` (refused at
+   * hand-over, with the check that refused it beside it), and a written
+   * line that was never heard is common enough tonight that hiding it
+   * would make this pop-up lie. */
+  function segInspectClose() { var n = el('spSegInspect'); if (n) n.remove(); }
+
+  function segInspectOpen(ident) {
+    var sheet = sheetShell('spSegInspect', 'sp-segins',
+      'Segment ' + (ident.block ? ident.block : '(unnumbered)'));
+    /* A diagnostic surface: the broadcast ducks while it is open and
+       lets go by itself when the sheet leaves the page. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-spSegInspect', root.PineDuck.REPORT, sheet.back);
+    }
+    var split = make('div', 'sp-segins-split');
+    var body = make('div', 'sp-segins-body');
+    var side = make('div', 'sp-segins-side');
+    split.appendChild(body);
+    split.appendChild(side);
+    sheet.box.appendChild(split);
+
+    var head = segSection(body, 'The heading');
+    segRow(head, 'scene', ident.heading);
+    segRow(head, 'block', ident.block, ident.block ? '' : 'no numbered line under it');
+    segRow(head, 'hour', ident.hour);
+    segRow(head, 'segment id', ident.seg);
+
+    body.appendChild(make('div', 'sp-segins-wait', 'asking the station…'));
+    side.appendChild(make('div', 'sp-segflow-note', 'the hand-offs will be drawn here'));
+
+    segInspect(ident.block).then(function (d) {
+      if (!el('spSegInspect')) return;          /* closed while asking */
+      var wait = body.querySelector('.sp-segins-wait');
+      if (wait) wait.remove();
+      segFactsPaint(body, d, ident);
+      side.textContent = '';
+      segFlowPaint(side, d);
+      if (d && d.available === false) {
+        sheet.say(String(d.why || 'the station has no record of this segment'), true);
+      }
+    });
+    return sheet;
+  }
+
+  /* Everything but the sidebar. Every field may be absent; absent is
+     printed as absent, with the station's own sentence where it sent
+     one. */
+  function segFactsPaint(body, d, ident) {
+    d = d || {};
+    if (d.available === false) {
+      var gone = segSection(body, 'The station has no record');
+      gone.appendChild(make('div', 'sp-segrow-why', String(d.why
+        || 'the ledger holds forty-eight hours, and this segment is older than that')));
+      return;
+    }
+
+    var rnd = d.round || null;
+    var round = segSection(body, 'The round');
+    if (rnd) {
+      segRow(round, 'road', segWord(rnd.road, ident.round || ''));
+      segRow(round, 'conversation', rnd.sid);
+      segRow(round, 'committed', rnd.committed);
+      segRow(round, 'lines', segHas(rnd.lines) ? rnd.lines : null);
+      segRow(round, 'scripted', segHas(rnd.scripted) ? rnd.scripted : null,
+        'written into the running order before it was said');
+      segRow(round, 'welded', segHas(rnd.welded) ? rnd.welded : null,
+        'joined on afterwards, not scripted');
+    } else {
+      round.appendChild(make('div', 'sp-segrow-why',
+        'The station carries no round record for this block.'));
+    }
+
+    var brief = d.brief || null;
+    var bs = segSection(body, 'What this road was supposed to contain');
+    if (brief) {
+      segRow(bs, 'road', brief.road);
+      segRow(bs, 'wants', brief.wants);
+      segRow(bs, 'looked for', (brief.looked_for || []).join(', '));
+      segRow(bs, 'found', (brief.found || []).join(', '));
+      /* met is null when the road has no brief at all; false means the
+         station looked for its own words and found none. Those are two
+         different answers and must not print the same. */
+      segRow(bs, 'met', brief.met === true ? 'yes'
+        : (brief.met === false ? 'no' : null),
+        (brief.met === null || brief.met === undefined)
+          ? 'this road has no brief to meet'
+          : (brief.met === false
+            ? 'the station looked for its own words and found none'
+            : ''));
+      if (brief.say) bs.appendChild(make('div', 'sp-segrow-why', String(brief.say)));
+    } else {
+      bs.appendChild(make('div', 'sp-segrow-why',
+        'The station sent no brief for this road.'));
+    }
+
+    var t = d.timing || null;
+    var ts = segSection(body, 'The timing');
+    if (t) {
+      segRow(ts, 'first heard', t.first_heard || t.from);
+      segRow(ts, 'last heard', t.last_heard || t.to);
+      segRow(ts, 'span', segSecs(t.span_s));
+      segRow(ts, 'heard', (segHas(t.heard) && segHas(t.of))
+        ? (t.heard + ' of ' + t.of) : null);
+    } else {
+      ts.appendChild(make('div', 'sp-segrow-why', String(d.why
+        || 'Not one line of this segment was ever heard, so there is no timing.')));
+    }
+    var holes = d.holes || [];
+    if (holes.length) {
+      for (var h = 0; h < holes.length; h += 1) {
+        var hole = holes[h] || {};
+        var hr = segRow(ts, 'hole', segWord(hole.from, '?') + ' → '
+          + segWord(hole.to, '?'), segSecs(hole.seconds));
+        hr.classList.add('sp-seghole');
+      }
+    } else if (t) {
+      ts.appendChild(make('div', 'sp-segrow-why',
+        'No gap over twelve seconds between consecutive heard lines inside it.'));
+    }
+
+    /* The admitted playback occurrence, when the station carries one.
+       It does not today: the answer measured on air holds the per-line
+       air times and the timing block and nothing named for the
+       occurrence, so this says that rather than dressing the line
+       stamps up as one. */
+    var play = d.playback || d.occurrence || d.admitted || null;
+    var ps = segSection(body, 'The admitted playback occurrence');
+    if (play && typeof play === 'object') {
+      for (var pk in play) {
+        if (!Object.prototype.hasOwnProperty.call(play, pk)) continue;
+        if (play[pk] && typeof play[pk] === 'object') continue;
+        segRow(ps, pk.replace(/_/g, ' '), play[pk]);
+      }
+    } else {
+      ps.appendChild(make('div', 'sp-segrow-why', 'The station did not send'
+        + ' one. The per-line air times below are what it does hold.'));
+    }
+
+    var seats = d.seats || [];
+    var ss = segSection(body, 'Who took part');
+    if (seats.length) {
+      for (var i = 0; i < seats.length; i += 1) {
+        var s = seats[i] || {};
+        var look = segSeatLook(s.seat);
+        var row = make('div', 'sp-segseat');
+        var dot = make('span', 'sp-segflow-dot', '');
+        dot.style.background = look.colour;
+        row.appendChild(dot);
+        row.appendChild(make('b', 'sp-segseat-name', segWord(s.name, look.label)));
+        row.appendChild(make('span', 'sp-segseat-seat', look.label));
+        row.appendChild(make('span', 'sp-segseat-n',
+          (segHas(s.lines)
+            ? s.lines + ' line' + (Number(s.lines) === 1 ? '' : 's')
+            : 'lines unsaid')
+          + (segHas(s.seconds) ? '  ·  ' + segSecs(s.seconds) : '')
+          + (segHas(s.heard) ? '  ·  ' + s.heard + ' heard' : '')));
+        ss.appendChild(row);
+      }
+    } else {
+      ss.appendChild(make('div', 'sp-segrow-why',
+        'The station recorded nobody taking part in this block.'));
+    }
+
+    var lines = d.lines || [];
+    var ls = segSection(body, 'Every line, in ledger order');
+    if (!lines.length) {
+      ls.appendChild(make('div', 'sp-segrow-why', 'The station sent no lines.'));
+      return;
+    }
+    for (var j = 0; j < lines.length; j += 1) {
+      ls.appendChild(segLineCard(lines[j] || {}));
+    }
+  }
+
+  /* One line as the station holds it. A line that was written and never
+     heard is drawn differently rather than hidden - that is the whole
+     reason to be reading this pop-up. */
+  function segLineCard(l) {
+    var look = segSeatLook(l.who);
+    var card = make('div', 'sp-segline');
+    if (l.heard === false) card.classList.add('sp-unheard');
+    if (String(l.aired || '') === 'withdrawn') card.classList.add('sp-withdrawn');
+    card.style.borderLeftColor = look.colour;
+    var top = make('div', 'sp-segline-top');
+    top.appendChild(make('b', 'sp-segline-who', segWord(l.name, look.label)));
+    var tags = [];
+    if (segHas(l.ord)) tags.push('#' + l.ord);
+    if (segHas(l.kind)) tags.push(String(l.kind));
+    if (segHas(l.at)) tags.push(String(l.at));
+    if (segHas(l.seconds)) tags.push(segSecs(l.seconds));
+    tags.push(l.heard === true ? 'heard'
+      : (l.heard === false ? 'never heard' : 'heard: not said'));
+    tags.push('aired: ' + segWord(l.aired, 'nothing'));
+    if (l.scripted === false) tags.push('not scripted');
+    top.appendChild(make('span', 'sp-segline-tag', tags.join('  ·  ')));
+    card.appendChild(top);
+    card.appendChild(make('div', 'sp-segline-text', segWord(l.text, '(no text)')));
+    var made = [];
+    if (segHas(l.voice)) made.push('voice ' + l.voice);
+    if (segHas(l.engine)) made.push('engine ' + l.engine);
+    if (segHas(l.model)) made.push('model ' + l.model);
+    if (segHas(l.source)) made.push('source ' + l.source);
+    if (segHas(l.air_at)) made.push('air_at ' + l.air_at);
+    if (segHas(l.line_id)) made.push('line ' + l.line_id);
+    card.appendChild(make('div', 'sp-segline-made',
+      made.length ? made.join('  ·  ')
+        : 'the station recorded nothing about how this line was made'));
+    if (segHas(l.withdrawn_why)) {
+      card.appendChild(make('div', 'sp-segline-why',
+        'refused at hand-over: ' + String(l.withdrawn_why)));
+    }
+    return card;
+  }
+
+  /* ---- #1168: the sidebar infographic ----------------------------- */
+
+  /* "a vertical infographic showing guided arrows going from path to
+   * path, from person to person representing the conversation
+   * transaction taking place and how everyone participated and
+   * coalesced ... going down the screen in a sidebar to the right of
+   * the pop-up".
+   *
+   * Drawn with plain elements and no canvas, no animation and no rAF:
+   * the tablet's frame pipeline is sensitive (2026-09-14 measured a
+   * re-dressed list holding BeginMainFrame at every vsync), and a
+   * column of divs costs one layout and then nothing at all. It lives
+   * inside the pop-up's own scroller, so it scrolls with it and cannot
+   * make the window taller than the glass.
+   *
+   * `transaction` is the station's ordered hand-offs. The chain is
+   * WALKED rather than assumed: where one hand-off's `to` is not the
+   * next one's `from`, the break is drawn as a break instead of being
+   * quietly stitched over.
+   *
+   * AND A SEGMENT WITH ONE SPEAKER DRAWS HONESTLY. An empty
+   * `transaction` is a real answer - nobody answered anybody - so the
+   * sidebar says that and shows who was there, rather than inventing an
+   * exchange out of one voice. */
+  function segFlowSteps(rows) {
+    var steps = [], last = '', i;
+    for (i = 0; i < rows.length; i += 1) {
+      var from = String((rows[i] && rows[i].from) || '');
+      var to = String((rows[i] && rows[i].to) || '');
+      if (last === '') steps.push({node: from});
+      else if (last !== from) { steps.push({gap: true}); steps.push({node: from}); }
+      steps.push({arrow: rows[i] || {}});
+      steps.push({node: to});
+      last = to;
+    }
+    return steps;
+  }
+
+  function segFlowChip(seat) {
+    var look = segSeatLook(seat);
+    var chip = make('div', 'sp-segflow-node', '');
+    var dot = make('span', 'sp-segflow-dot', '');
+    dot.style.background = look.colour;
+    chip.appendChild(dot);
+    chip.appendChild(make('span', 'sp-segflow-name', look.label));
+    chip.style.borderColor = look.colour;
+    return chip;
+  }
+
+  function segFlowArrow(t) {
+    var wrap = make('div', 'sp-segflow-arrow');
+    if (t && t.heard === false) wrap.classList.add('sp-segflow-unheard');
+    var stem = make('div', 'sp-segflow-stem', '');
+    stem.style.background = segSeatLook(t && t.from).colour;
+    wrap.appendChild(stem);
+    var head = make('div', 'sp-segflow-head', '');
+    head.style.borderTopColor = segSeatLook(t && t.to).colour;
+    wrap.appendChild(head);
+    var bits = [];
+    if (segHas(t && t.kind)) bits.push(String(t.kind));
+    if (segHas(t && t.seconds)) bits.push(segSecs(t.seconds));
+    if (segHas(t && t.at)) bits.push(String(t.at));
+    if (t && t.heard === false) bits.push('never heard');
+    var label = make('div', 'sp-segflow-label', bits.join('  ·  ')
+      || 'the station said nothing about what passed');
+    if (segHas(t && t.text)) label.title = String(t.text).slice(0, 300);
+    wrap.appendChild(label);
+    return wrap;
+  }
+
+  function segFlowPaint(side, d) {
+    d = d || {};
+    side.appendChild(make('div', 'sp-segflow-h', 'How it was passed around'));
+    if (d.available === false) {
+      side.appendChild(make('div', 'sp-segflow-note', String(d.why
+        || 'the station has no record of this segment, so there is nothing to draw')));
+      return;
+    }
+    var rows = d.transaction || [];
+    var seats = d.seats || [];
+
+    /* The legend, from whoever the station says was actually there -
+       not from the eight seats in the abstract. */
+    var legend = make('div', 'sp-segflow-legend');
+    var shown = Object.create(null), k;
+    for (k = 0; k < seats.length; k += 1) {
+      var look = segSeatLook(seats[k] && seats[k].seat);
+      if (shown[look.label]) continue;
+      shown[look.label] = 1;
+      var key = make('div', 'sp-segflow-key', '');
+      var dot = make('span', 'sp-segflow-dot', '');
+      dot.style.background = look.colour;
+      key.appendChild(dot);
+      key.appendChild(make('span', 'sp-segflow-name', look.label));
+      if (segHas(seats[k] && seats[k].lines)) {
+        key.appendChild(make('span', 'sp-segflow-n', '×' + seats[k].lines));
+      }
+      legend.appendChild(key);
+    }
+    if (legend.children.length) side.appendChild(legend);
+
+    if (!rows.length) {
+      /* One speaker, or none. Said plainly. */
+      if (seats.length === 1) {
+        side.appendChild(segFlowChip(seats[0] && seats[0].seat));
+        side.appendChild(make('div', 'sp-segflow-note', 'One voice and no'
+          + ' hand-off: nobody answered inside this segment, so there is no'
+          + ' exchange to draw.'));
+      } else if (seats.length > 1) {
+        for (var s = 0; s < seats.length && s < SEG_FLOW_MOST; s += 1) {
+          side.appendChild(segFlowChip(seats[s] && seats[s].seat));
+        }
+        side.appendChild(make('div', 'sp-segflow-note', 'The station recorded'
+          + ' these seats but no hand-off between them.'));
+      } else {
+        side.appendChild(make('div', 'sp-segflow-note',
+          'The station recorded no hand-offs and nobody taking part.'));
+      }
+      return;
+    }
+
+    var drawn = rows.length > SEG_FLOW_MOST ? rows.slice(0, SEG_FLOW_MOST) : rows;
+    var steps = segFlowSteps(drawn);
+    for (var i = 0; i < steps.length; i += 1) {
+      if (steps[i].node !== undefined) side.appendChild(segFlowChip(steps[i].node));
+      else if (steps[i].arrow) side.appendChild(segFlowArrow(steps[i].arrow));
+      else if (steps[i].gap) {
+        side.appendChild(make('div', 'sp-segflow-gap',
+          'nothing was recorded between these two'));
+      }
+    }
+    if (rows.length > drawn.length) {
+      side.appendChild(make('div', 'sp-segflow-note',
+        (rows.length - drawn.length) + ' more hand-off(s) are not drawn:'
+        + ' this tablet is kept cheap on purpose.'));
+    }
+  }
+
+  /* ---- #1168-2: report segment ------------------------------------ */
+
+  /* "pop up report window for reporting segment, extracts script and
+   * playback records for report and allows me to dictate / type a
+   * report to file".
+   *
+   * It files down the road the caution button and the #1164 menu
+   * already use and no other: reportFire() -> reportGather() for the
+   * window, the motion ring and the view snapshot, then POST
+   * /api/script/report, then the ten-second post-capture and the
+   * picture. So the evidence the caution road gathers rides along
+   * without this sheet gathering any of it a second time.
+   *
+   * THE EXTRACT RIDES IN `reason`, AND ONLY IN `reason`. #1164 wrote
+   * down why and it has not changed: normalize_view() excludes unknown
+   * fields by schema, so a new key stamped on the view never reaches
+   * the .json or the .md, while `reason` is what app.py leads the inbox
+   * item with. The station caps it at 1200 characters, so the identity
+   * and the operator's own words are written FIRST and the line-by-line
+   * digest is appended only while there is room - the part that gets
+   * cut is the part he can still read in full in the inspect pop-up. */
+  function segReportClose() { var n = el('spSegReport'); if (n) n.remove(); }
+
+  function segReportReason(ident, d, own) {
+    d = d || {};
+    var parts = ['report segment'];
+    if (own) parts.push('what he says: ' + String(own).slice(0, 400));
+    if (ident.heading) parts.push('scene: ' + ident.heading);
+    parts.push('block: ' + (ident.block || 'none under this heading'));
+    var rnd = d.round || null;
+    if (rnd) {
+      parts.push('round: ' + segWord(rnd.road, ident.round || '?')
+        + (segHas(rnd.sid) ? ' (' + rnd.sid + ')' : '')
+        + (segHas(rnd.committed) ? ', committed ' + rnd.committed : ''));
+    } else {
+      parts.push('round: ' + (ident.round || 'unknown')
+        + ' (the station sent no round record)');
+    }
+    parts.push('hour: ' + (ident.hour || 'unknown'));
+    if (d.available === false) {
+      parts.push('the station has no record of this block: '
+        + String(d.why || '').slice(0, 160));
+    }
+    var t = d.timing || null;
+    if (t) {
+      parts.push('timing: ' + segWord(t.first_heard || t.from, '?') + ' to '
+        + segWord(t.last_heard || t.to, '?') + ', ' + segSecs(t.span_s)
+        + ', heard ' + segWord(t.heard, '?') + ' of ' + segWord(t.of, '?'));
+    } else if (d.available !== false) {
+      parts.push('timing: none - not one line of this segment was heard');
+    }
+    var holes = d.holes || [];
+    if (holes.length) {
+      var hs = [];
+      for (var h = 0; h < holes.length && h < 6; h += 1) {
+        hs.push(segWord(holes[h].from, '?') + '-' + segWord(holes[h].to, '?')
+          + ' ' + segSecs(holes[h].seconds));
+      }
+      parts.push('holes: ' + hs.join(', '));
+    }
+    /* The script and playback extract, appended line by line only while
+       it still fits under the station's own cap. */
+    var out = parts.join('; ');
+    var lines = d.lines || [];
+    for (var i = 0; i < lines.length; i += 1) {
+      var l = lines[i] || {};
+      var sep = (i === 0 ? '; script and playback: ' : ' | ');
+      var one = '#' + segWord(l.ord, '?') + ' ' + segWord(l.who, '?')
+        + ' ' + segWord(l.kind, '?') + ' ' + segSecs(l.seconds)
+        + ' ' + segWord(l.at, 'no air time')
+        + ' ' + (l.heard === true ? 'heard'
+          : (l.heard === false ? 'NOT heard' : 'heard?'))
+        + (segHas(l.withdrawn_why) ? ' withdrawn:' + l.withdrawn_why : '')
+        + ' "' + String(l.text || '').replace(/\s+/g, ' ').slice(0, 60) + '"';
+      if ((out + sep + one).length > 1180) {
+        out += ' | (' + (lines.length - i) + ' more line(s): read them in the'
+          + ' inspect pop-up)';
+        break;
+      }
+      out += sep + one;
+    }
+    return out;
+  }
+
+  function segReportOpen(ident) {
+    var sheet = sheetShell('spSegReport', 'sp-segrep', 'Report this segment');
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-spSegReport', root.PineDuck.REPORT, sheet.back);
+    }
+    var who = make('div', 'sp-segrep-who');
+    segRow(who, 'scene', ident.heading);
+    segRow(who, 'block', ident.block, ident.block ? '' : 'no numbered line under it');
+    segRow(who, 'hour', ident.hour);
+    sheet.box.appendChild(who);
+
+    var extract = make('div', 'sp-segrep-extract');
+    extract.appendChild(make('div', 'sp-segrow-why', 'reading the script and'
+      + ' playback records for this segment…'));
+    sheet.box.appendChild(extract);
+
+    var ta = make('textarea', 'sp-segrep-ta', '');
+    ta.placeholder = 'what is wrong with this segment?';
+    ta.rows = 3;
+    ta.setAttribute('aria-label', 'Your report about this segment');
+    sheet.box.appendChild(ta);
+
+    var tools = make('div', 'sp-segrep-row');
+    var dictate = make('button', 'sp-segrep-dictate', '');
+    dictate.type = 'button';
+    dictate.innerHTML = folderIcon('c:microphone', '');
+    dictate.appendChild(document.createTextNode('Dictate'));
+    dictate.title = 'Say it: the dot lends its ear and the words land in the box';
+    /* The dot's ear, exactly as the reason sheet borrows it - and a
+       surface with no microphone says so rather than pretending. */
+    dictate.addEventListener('click', function () {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') {
+        sheet.say('no microphone on this surface');
+        return;
+      }
+      try {
+        dot.captureNext(function (words) {
+          words = String(words || '').trim();
+          if (!words) { sheet.say('nothing was heard'); return; }
+          ta.value = (ta.value ? String(ta.value).replace(/\s+$/, '') + ' ' : '') + words;
+          sheet.say('heard: ' + words.slice(0, 80));
+        });
+        sheet.say('listening…', true);
+      } catch (err) {
+        sheet.say('the dot could not listen: '
+          + String((err && err.message) || err).slice(0, 80));
+      }
+    });
+    var file = make('button', 'sp-segrep-file', 'File the report');
+    file.type = 'button';
+    tools.appendChild(dictate);
+    tools.appendChild(file);
+    sheet.box.appendChild(tools);
+    sheet.box.appendChild(make('div', 'sp-segrow-why', 'The window, the motion'
+      + ' ring, the view snapshot and the picture the caution button already'
+      + ' gathers ride along with it.'));
+
+    var held = null;                    /* the station's record, once read */
+    segInspect(ident.block).then(function (d) {
+      held = d;
+      if (!el('spSegReport')) return;
+      extract.textContent = '';
+      var lines = (d && d.lines) || [];
+      if (d && d.available === false) {
+        extract.appendChild(make('div', 'sp-segrow-why', String(d.why
+          || 'the station has no record of this segment')));
+      } else if (!lines.length) {
+        extract.appendChild(make('div', 'sp-segrow-why',
+          'The station sent no lines for this block.'));
+      } else {
+        extract.appendChild(make('div', 'sp-segsec-h', lines.length
+          + ' line(s) will be extracted into the report'));
+        for (var i = 0; i < lines.length; i += 1) {
+          extract.appendChild(segLineCard(lines[i] || {}));
+        }
+      }
+    });
+
+    file.addEventListener('click', function () {
+      var own = String(ta.value || '').replace(/\s+/g, ' ').trim();
+      if (!own) { sheet.say('say what is wrong, or dictate it'); return; }
+      var reason = segReportReason(ident, held, own);
+      sheet.close();
+      /* The caution road, and the kind the station files it under. */
+      reportKind = 'caution';
+      try { reportFire(ident.node || el('spScriptName') || document.body, reason); }
+      finally { setTimeout(function () { reportKind = 'report'; }, 100); }
+    });
+    return sheet;
+  }
+
+  /* ---- #1168-3: examine system prompt ----------------------------- */
+
+  /* "show system prompt in pop up window allowing for edit and saving
+   * as default or new preset for segment prompt. Allow me to modify
+   * system prompts for segments."
+   *
+   * THE STATION ALREADY HAS ALL OF THIS AND NONE OF IT IS REBUILT HERE:
+   *
+   *   GET  /api/schedule/segment/prompt?hour=&slot=&kind=   what this
+   *        entry actually writes with, where those words came from, the
+   *        variant shelf, the book that suits it and the dressed clause
+   *   GET  /api/schedule/promptbook?kind=                   the book,
+   *        newest first
+   *   POST /api/schedule/promptbook                         save one
+   *        under a name; send an `id` to rewrite one, leave it out to
+   *        mint a new one. SAVING CHANGES NOTHING ON AIR.
+   *   POST /api/schedule/promptbook/apply                   put one to
+   *        work. Its contract, read out of app.py rather than assumed:
+   *        {text | id, scope, hour, slot, kind, minutes, name}, scope
+   *        one of default | next_segment | next_30 | next_hour.
+   *        `default` writes the words onto the kind as a named variant
+   *        and pins the entry in the RUNNING ORDER to it - a permanent
+   *        change to the plan; name no entry and it arms the variant
+   *        for every entry of that kind instead. The three timed scopes
+   *        change nothing in the running order at all: they are a note
+   *        held beside it, so there is never anything to undo.
+   *
+   * WHICH IS WHY THERE ARE TWO BUTTONS AND NOT ONE. The station itself
+   * keeps saving and applying apart, and the operator has to be able to
+   * tell which he is doing: "Save as a new preset" writes to the book
+   * and stops - nothing on air moves - and "Save and use for this
+   * segment" saves and THEN applies, at a scope he picks, printed in
+   * the station's own words for what that scope means. Nothing here
+   * ever applies silently on a save.
+   *
+   * The scene view knows no slot id - it is reading the air log, not
+   * the running order - so the entry is named by its KIND, which is
+   * what `prompt_kind` off the inspect route is for, and the route
+   * answers for that kind in general when no entry is named. The hour
+   * is sent only when it really looks like an hour key; anything else
+   * and the station's own default (the hour on air) is the right answer
+   * rather than a guess of ours. */
+  var SEG_HOUR_RE = /^\d{4}-\d{2}-\d{2}T\d{2}$/;
+  var SEG_SCOPE_WHY = {
+    'default': 'from now on - it goes into the running order itself and'
+      + ' survives a restart',
+    'next_segment': 'the next segment of this kind, then it lets go',
+    'next_30': 'the next thirty minutes',
+    'next_hour': 'the next hour - both thirty-minute halves'
+  };
+
+  function segPromptClose() { var n = el('spSegPrompt'); if (n) n.remove(); }
+
+  function segPromptOpen(ident) {
+    var sheet = sheetShell('spSegPrompt', 'sp-segpr',
+      'The system prompt behind this segment');
+    /* NOT ducked. The reason sheet and the inbox duck the broadcast
+       because they are diagnostics; this is a preference, the way the
+       SFX folder sheet is, and the operator is usually listening to the
+       very segment he is rewriting the instruction for. */
+    var kind = String(ident.round || '');
+    var hour = SEG_HOUR_RE.test(String(ident.hour || '')) ? String(ident.hour) : '';
+    var picked = null;                   /* the preset loaded into the box */
+
+    var facts = make('div', 'sp-segpr-facts');
+    sheet.box.appendChild(facts);
+    var ta = make('textarea', 'sp-segpr-ta', '');
+    ta.rows = 10;
+    ta.placeholder = 'the system prompt this kind of segment writes with';
+    ta.setAttribute('aria-label', 'The system prompt for this segment');
+    sheet.box.appendChild(ta);
+
+    var namely = make('div', 'sp-segpr-row');
+    var nameIn = make('input', 'sp-segpr-in', '');
+    nameIn.type = 'text';
+    nameIn.placeholder = 'a name for this preset';
+    nameIn.setAttribute('aria-label', 'The preset name');
+    var scenIn = make('input', 'sp-segpr-in', '');
+    scenIn.type = 'text';
+    scenIn.placeholder = 'when to use it';
+    scenIn.setAttribute('aria-label', 'When to use this preset');
+    namely.appendChild(nameIn);
+    namely.appendChild(scenIn);
+    sheet.box.appendChild(namely);
+
+    /* Rewriting the preset he opened is a different act from minting a
+       new one, and the route draws that line with `id`. So does this,
+       and it is off until he says otherwise. */
+    var overRow = make('div', 'sp-segpr-row sp-segpr-over');
+    overRow.hidden = true;
+    var over = make('button', 'sp-segpr-tick', '');
+    over.type = 'button';
+    over.setAttribute('aria-pressed', 'false');
+    var overMark = make('span', 'sp-segpr-tickmark', '');
+    over.appendChild(overMark);
+    over.appendChild(make('span', 'sp-segpr-tickt',
+      'rewrite the preset I opened instead of minting a new one'));
+    overRow.appendChild(over);
+    sheet.box.appendChild(overRow);
+    function overPaint() {
+      var on = over.getAttribute('aria-pressed') === 'true';
+      overMark.innerHTML = folderIcon(on ? 'c:checkbox--checked' : 'c:checkbox', '');
+      if (!overMark.innerHTML) overMark.textContent = on ? '[x]' : '[ ]';
+      over.classList.toggle('on', on);
+    }
+    over.addEventListener('click', function () {
+      over.setAttribute('aria-pressed',
+        over.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+      overPaint();
+    });
+    overPaint();
+
+    var scopeRow = make('div', 'sp-segpr-row');
+    scopeRow.appendChild(make('span', 'sp-segrow-k', 'and use it for'));
+    var scope = make('select', 'sp-segpr-scope');
+    scope.setAttribute('aria-label', 'How long the applied prompt holds');
+    scopeRow.appendChild(scope);
+    sheet.box.appendChild(scopeRow);
+    var scopeWhy = make('div', 'sp-segrow-why', '');
+    sheet.box.appendChild(scopeWhy);
+
+    var buttons = make('div', 'sp-segpr-row');
+    var save = make('button', 'sp-segpr-save', 'Save as a new preset');
+    save.type = 'button';
+    save.title = 'Writes it into the prompt book. Nothing on air changes.';
+    var apply = make('button', 'sp-segpr-apply', 'Save and use for this segment');
+    apply.type = 'button';
+    apply.title = 'Saves it AND puts it to work, at the scope chosen above';
+    buttons.appendChild(save);
+    buttons.appendChild(apply);
+    sheet.box.appendChild(buttons);
+
+    var book = make('div', 'sp-segpr-book');
+    sheet.box.appendChild(book);
+
+    function scopeSay() {
+      var opt = scope.options[scope.selectedIndex];
+      scopeWhy.textContent = (opt && opt.pineWhy)
+        || SEG_SCOPE_WHY[scope.value] || '';
+    }
+    function scopePaint(scopes) {
+      scope.textContent = '';
+      var order = ['next_segment', 'next_30', 'next_hour', 'default'], i;
+      for (i = 0; i < order.length; i += 1) {
+        var id = order[i];
+        var said = (scopes && scopes[id]) || SEG_SCOPE_WHY[id] || id;
+        var opt = make('option', '',
+          id === 'default' ? 'the standing instruction' : said);
+        opt.value = id;
+        opt.pineWhy = said;
+        scope.appendChild(opt);
+      }
+      scope.value = 'next_segment';
+      scopeSay();
+    }
+    scope.addEventListener('change', scopeSay);
+    scopePaint(null);
+
+    function bookPaint(rows) {
+      book.textContent = '';
+      var h = make('div', 'sp-segsec-h', 'The prompt book'
+        + (kind ? ', for ' + kind : '') + ' — newest first');
+      var again = make('button', 'sp-segpr-again', '');
+      again.type = 'button';
+      again.innerHTML = folderIcon('c:renew', 'Read the book again');
+      if (!again.innerHTML) again.textContent = 'refresh';
+      again.title = 'Read the prompt book again';
+      again.addEventListener('click', bookLoad);
+      h.appendChild(again);
+      book.appendChild(h);
+      if (!rows || !rows.length) {
+        book.appendChild(make('div', 'sp-segrow-why',
+          'Nothing saved for this kind yet.'));
+        return;
+      }
+      for (var i = 0; i < rows.length && i < 40; i += 1) {
+        (function (row) {
+          var b = make('button', 'sp-segpr-preset', '');
+          b.type = 'button';
+          b.appendChild(make('b', '', String(row.name || row.id || 'unnamed')));
+          b.appendChild(make('span', 'sp-segpr-presetwhy',
+            (row.kind ? String(row.kind) : 'suits anything')
+            + (row.scenario ? '  ·  ' + String(row.scenario) : '')));
+          b.addEventListener('click', function () {
+            ta.value = String(row.text || '');
+            nameIn.value = String(row.name || '');
+            scenIn.value = String(row.scenario || '');
+            picked = row;
+            overRow.hidden = false;
+            sheet.say('opened “' + String(row.name || row.id) + '”'
+              + ' — nothing has been saved or applied');
+          });
+          book.appendChild(b);
+        })(rows[i] || {});
+      }
+    }
+
+    function bookLoad() {
+      if (!api() || !api().get) { sheet.say('no bridge to the station'); return; }
+      Promise.resolve(api().get('/api/schedule/promptbook'
+          + (kind ? '?kind=' + encodeURIComponent(kind) : ''))).then(function (d) {
+        if (!el('spSegPrompt')) return;
+        bookPaint((d && d.prompts) || []);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        book.textContent = '';
+        book.appendChild(make('div', 'sp-segrow-why', 'the book could not be'
+          + ' read: ' + String((err && err.message) || err).slice(0, 90)));
+      });
+    }
+
+    function promptLoad() {
+      if (!api() || !api().get) {
+        facts.textContent = '';
+        facts.appendChild(make('div', 'sp-segrow-why',
+          'There is no bridge to the station from this surface.'));
+        return;
+      }
+      facts.textContent = '';
+      facts.appendChild(make('div', 'sp-segrow-why', 'asking the station…'));
+      var q = '/api/schedule/segment/prompt?kind=' + encodeURIComponent(kind);
+      if (hour) q += '&hour=' + encodeURIComponent(hour);
+      Promise.resolve(api().get(q)).then(function (d) {
+        if (!el('spSegPrompt')) return;
+        d = d || {};
+        facts.textContent = '';
+        segRow(facts, 'segment', segWord(d.label, kind || ident.heading));
+        segRow(facts, 'kind', segWord(d.kind, kind));
+        segRow(facts, 'hour', segWord(d.hour, hour || 'the hour on air'));
+        segRow(facts, 'these words came from', d.source);
+        if (d.variant) segRow(facts, 'variant', d.variant.name || d.variant.id);
+        if (d.window) {
+          var w = segRow(facts, 'a timed prompt owns this kind',
+            String(d.window.name || ''), String(d.window.says || ''));
+          w.classList.add('sp-seghole');
+        }
+        if (d.why) facts.appendChild(make('div', 'sp-segrow-why', String(d.why)));
+        if (d.blurb) facts.appendChild(make('div', 'sp-segrow-why', String(d.blurb)));
+        ta.value = String(d.text || '');
+        if (!String(d.text || '').trim() && d.seed) {
+          ta.value = String(d.seed);
+          sheet.say('there is nothing on the shelf for this kind; the'
+            + ' station’s own seed is in the box', true);
+        }
+        if (!nameIn.value) {
+          nameIn.value = String(d.label || d.kind || kind || 'segment')
+            + (ident.block ? ' · block ' + ident.block : '');
+        }
+        if (d.scopes) scopePaint(d.scopes);
+        if (d.clause) {
+          var cl = make('details', 'sp-segpr-clause');
+          cl.appendChild(make('summary', '',
+            'the dressed clause, as the writing room receives it'));
+          cl.appendChild(make('pre', 'sp-segpr-pre', String(d.clause)));
+          facts.appendChild(cl);
+        }
+        bookPaint(d.book || []);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        facts.textContent = '';
+        facts.appendChild(make('div', 'sp-segrow-why', 'the station did not'
+          + ' answer: ' + String((err && err.message) || err).slice(0, 110)));
+      });
+    }
+
+    /* SAVE. The book, and only the book. */
+    function saveIt() {
+      var text = String(ta.value || '');
+      if (!text.trim()) { sheet.say('there is nothing in the box to save'); return null; }
+      if (!api() || !api().post) { sheet.say('no bridge to the station'); return null; }
+      var body = {name: String(nameIn.value || '').slice(0, 80), kind: kind,
+        scenario: String(scenIn.value || '').slice(0, 200), text: text};
+      /* An `id` rewrites that one; without it the station mints a new
+         one. The tick above is the only thing that sends an id. */
+      if (picked && picked.id && over.getAttribute('aria-pressed') === 'true') {
+        body.id = String(picked.id);
+      }
+      return Promise.resolve(api().post('/api/schedule/promptbook', body));
+    }
+
+    save.addEventListener('click', function () {
+      var ask = saveIt();
+      if (!ask) return;
+      sheet.say('saving…', true);
+      ask.then(function (got) {
+        if (!el('spSegPrompt')) return;
+        var row = (got && got.prompt) || {};
+        if (row.id) { picked = row; overRow.hidden = false; }
+        bookPaint((got && got.book && got.book.prompts) || []);
+        sheet.say('saved to the book as “'
+          + String(row.name || nameIn.value || 'it')
+          + '”. Nothing on air has changed.', true);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        sheet.say('the station refused the save: '
+          + String((err && err.message) || err).slice(0, 90));
+      });
+    });
+
+    /* SAVE AND USE. Two acts, in that order, and the second one is
+       named out loud in the station's own words when it lands. */
+    apply.addEventListener('click', function () {
+      var ask = saveIt();
+      if (!ask) return;
+      var want = String(scope.value || 'next_segment');
+      sheet.say('saving, then applying…', true);
+      ask.then(function (got) {
+        var row = (got && got.prompt) || {};
+        if (el('spSegPrompt')) {
+          if (row.id) { picked = row; overRow.hidden = false; }
+          bookPaint((got && got.book && got.book.prompts) || []);
+        }
+        var body = {scope: want, kind: kind, text: String(ta.value || ''),
+          name: String(nameIn.value || '').slice(0, 80)};
+        /* The id makes `default` rewrite this preset's own variant
+           rather than piling up a new one every time it is applied. */
+        if (row.id) body.id = String(row.id);
+        if (hour) body.hour = hour;
+        if (want === 'next_30') body.minutes = 30;
+        if (want === 'next_hour') body.minutes = 60;
+        return Promise.resolve(api().post('/api/schedule/promptbook/apply', body));
+      }).then(function (got) {
+        if (!el('spSegPrompt')) return;
+        if (!got || got.ok === false) {
+          sheet.say('saved, but not applied: '
+            + String((got && got.say) || 'the station refused it'), true);
+          return;
+        }
+        sheet.say('saved, and now in force: ' + String(got.says || want)
+          + (segHas(got.entries) ? ' (' + got.entries + ' entry/entries)' : ''), true);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        sheet.say('the station refused it: '
+          + String((err && err.message) || err).slice(0, 110));
+      });
+    });
+
+    promptLoad();
+
+    /* The road the prompt routes want is the segment's KIND. The
+       inspect route names it (`prompt_kind`) and is the only thing that
+       knows it for certain, so when the scene gave us nothing we ask,
+       and read again once the answer arrives. */
+    if (!kind) {
+      segInspect(ident.block).then(function (d) {
+        if (!el('spSegPrompt')) return;
+        var got = String((d && d.prompt_kind) || '');
+        if (!got || got === kind) return;
+        kind = got;
+        promptLoad();
+      });
+    }
+    return sheet;
+  }
+
+  /* ---- #1168: the menu itself ------------------------------------- */
+
+  var SEG_CHOICES = [
+    {id: 'inspect', label: 'Inspect segment', icon: 'c:microscope',
+     why: 'Every aspect of how this segment was composed, with the'
+        + ' conversation drawn down the side'},
+    {id: 'report', label: 'Report segment', icon: 'c:receipt',
+     why: 'File a report about this segment - its script and playback'
+        + ' records ride along'},
+    {id: 'prompt', label: 'Examine system prompt', icon: 'c:book',
+     why: 'The system prompt this kind of segment writes with: read it,'
+        + ' edit it, save it, or put it to work'}
+  ];
+
+  function segMenuClose() {
+    var menu = el(SEG_MENU_ID);
+    if (menu) menu.remove();
+    if (segMenuUnwatch) {
+      try { segMenuUnwatch(); } catch (err) { /* already gone */ }
+      segMenuUnwatch = null;
+    }
+  }
+
+  function segMenuOpen(node) {
+    if (!node) return null;
+    segMenuClose();
+    var ident = segIdentity(node);
+
+    var menu = make('div', 'sp-segmenu');
+    menu.id = SEG_MENU_ID;
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', 'This segment');
+
+    /* No say line of its own: this menu says nothing, it only opens
+       three windows that each have one. A message that could never
+       appear is a message the reader has to work out is dead. */
+    menu.appendChild(make('div', 'sp-segmenu-where',
+      (ident.block ? 'block ' + ident.block : 'no block number under this heading')
+      + (ident.round ? '  ·  ' + ident.round : '')));
+
+    function row(choice) {
+      var b = make('button', 'sp-segmenu-item', '');
+      b.type = 'button';
+      b.setAttribute('role', 'menuitem');
+      b.dataset.seg = choice.id;
+      var mark = make('span', 'sp-segmenu-mark', '');
+      mark.innerHTML = folderIcon(choice.icon, '');
+      if (!mark.innerHTML) mark.textContent = '·';
+      b.appendChild(mark);
+      b.appendChild(make('span', 'sp-segmenu-text', choice.label));
+      b.title = choice.why;
+      b.addEventListener('click', function () {
+        segMenuClose();
+        try {
+          if (choice.id === 'inspect') segInspectOpen(ident);
+          else if (choice.id === 'report') segReportOpen(ident);
+          else segPromptOpen(ident);
+        } catch (err) {
+          caughtNote('seg:' + choice.id, err);
+          say('that window could not be opened: '
+            + String((err && err.message) || err).slice(0, 80));
+        }
+      });
+      return b;
+    }
+    for (var i = 0; i < SEG_CHOICES.length; i += 1) menu.appendChild(row(SEG_CHOICES[i]));
+
+    var cancel = make('button', 'sp-segmenu-item sp-segmenu-cancel', '');
+    cancel.type = 'button';
+    cancel.setAttribute('role', 'menuitem');
+    var cmark = make('span', 'sp-segmenu-mark', '');
+    cmark.innerHTML = folderIcon('c:close--filled', '');
+    if (!cmark.innerHTML) cmark.textContent = '·';
+    cancel.appendChild(cmark);
+    cancel.appendChild(make('span', 'sp-segmenu-text', 'Cancel'));
+    cancel.title = 'Close this menu and do nothing';
+    cancel.addEventListener('click', segMenuClose);
+    menu.appendChild(cancel);
+
+    document.body.appendChild(menu);
+    /* Fixed, at the heading's own corner, clamped inside the glass -
+       the tablet's is 1154x690 CSS px, and a menu hanging off the
+       bottom of it is a menu with an item the thumb cannot reach. */
+    try {
+      var seat = headerSeat(node);
+      var gw = (root.innerWidth || 1154), gh = (root.innerHeight || 690);
+      var mw = menu.offsetWidth || 300, mh = menu.offsetHeight || 220;
+      var left = Math.max(6, Math.min(gw - mw - 6, (seat.left || 0)));
+      var top = (seat.bottom || 0) + 4;
+      if (top + mh > gh - 6) top = Math.max(6, (seat.top || 0) - mh - 4);
+      if (top + mh > gh - 6) top = Math.max(6, gh - mh - 6);
+      menu.style.left = Math.round(left) + 'px';
+      menu.style.top = Math.round(top) + 'px';
+    } catch (err) { /* no geometry on this surface; the CSS stands */ }
+
+    /* It opens two diagnostics and files reports, so it ducks - and the
+       hold is tied to the menu, so PineDuck gives the radio back by
+       itself the moment the menu leaves the page. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-' + SEG_MENU_ID, root.PineDuck.REPORT, menu);
+    }
+    /* Tap away and Escape, through the one rule every other pop-up on
+       this page is on. The heading is spared so its own hold re-opens
+       rather than close-then-open. */
+    if (root.PineDismiss && typeof root.PineDismiss.watch === 'function') {
+      segMenuUnwatch = root.PineDismiss.watch(menu, segMenuClose, [node], function () {
+        return !!el(SEG_MENU_ID);
+      });
+    }
+    return menu;
+  }
+
   /* ---- #1385: the word search ------------------------------------ */
 
   /* The station does the counting (/api/said/search, #1380); this only
@@ -3647,8 +4868,25 @@
       node.classList.add('sp-fold');
       node.addEventListener('click', function (ev) {
         ev.stopPropagation();        /* not a pane gesture (#1272) */
+        /* #1168: "whenever i tap and hold on a segment's header, I want
+           a right click menu". The hold has already answered, so this
+           click is the synthetic one the platform fires after it -
+           swallowing it is what stops a hold also folding the segment
+           away underneath its own menu. The same question the caution
+           button asks of its own hold. */
+        if (node.pineHeld) return;
         segToggle(String(item.seg || item.id || ''));
       });
+      /* #1168: the fifth thing in this file on holdOpen() - half a
+         second, eight pixels of travel cancels it, and the desk's
+         right-click and the WebView's own long-press are both turned
+         into the same answer. Nodes are KEPT and re-dressed across a
+         repaint (#1273), so this is attached once per heading and never
+         stacked up by a poll. */
+      node.setAttribute('aria-haspopup', 'menu');
+      node.title = 'Hold this heading (or right-click it): inspect the'
+        + ' segment, report it, or examine its system prompt';
+      holdOpen(node, function () { segMenuOpen(node); });
     }
     /* A line that has not aired yet is the interesting one - it can still
      * be changed before the room hears it. ONLY 'prepared' is that line;
@@ -5131,12 +6369,33 @@
        tests/test_script_admission_view_2026_09_15.cjs. It is pure, so the
        test holds the real code rather than a copy of it. */
     cues: PineScriptCues,
+    /* #1168: the segment menu's own roads, exported the same way and
+       for the same reason - a stub-DOM smoke test can then hold the
+       REAL hold, the real three windows and the real sidebar rather
+       than a copy of them that drifts. */
+    segments: {
+      identity: segIdentity,
+      open: segMenuOpen,
+      close: segMenuClose,
+      inspect: segInspectOpen,
+      report: segReportOpen,
+      prompt: segPromptOpen,
+      reason: segReportReason,
+      steps: segFlowSteps,
+      flow: segFlowPaint,
+      seat: segSeatLook,
+      block: scriptBlock
+    },
     isMounted: function () { return mounted; },
     close: function () {
       folderClose();                                  /* 2026-09-14 */
       reasonClose();
       inboxClose();
       headerClose();                                  /* #1164 */
+      segMenuClose();                                 /* #1168 */
+      segInspectClose();
+      segReportClose();
+      segPromptClose();
       if (stop) stop();
       stop = null;
       if (beat) clearInterval(beat);
