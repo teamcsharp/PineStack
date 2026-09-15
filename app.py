@@ -1540,6 +1540,15 @@ DEFAULT_DJ = {
     # The drop guy (#282): the voice that occasionally shouts a liner
     # where a sample sting would have gone. Empty voice = never happens.
     "drop_voice": "",
+    # #1164: THE MANAGER SEAT. booth_actor_name has known how to
+    # name this seat since #749 and cast_signature has read its
+    # voice since #1057 - but neither key survived a save, because
+    # the dj settings dict is a wholesale rebuild (see the notes on
+    # manager_name below). Empty name = "the manager upstairs";
+    # empty voice = one is drawn for him the way a caller's is, and
+    # the booth says so in the log rather than lending him a host's.
+    "manager_name": "",
+    "manager_voice": "",
     # Folders that never enter the radio shuffle (#332) — the audiobooks
     # are shelf stock for the voice lab, not airplay.
     "radio_skip_folders": ["audiobook", "audio book", "audiobooks"],
@@ -2575,6 +2584,13 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "dice_callers": bool(raw_dj.get("dice_callers")),      # #676
         "guest_id": str(raw_dj.get("guest_id") or "")[:40],
         "drop_voice": str(raw_dj.get("drop_voice") or "")[:100],
+        # #1164: this dict is a WHOLESALE REBUILD, so a key that is
+        # not written here is silently dropped on every save - which
+        # is why manager_name has been a dead key with a panel field
+        # in front of it, and why dj.manager_voice could be read by
+        # cast_signature and never once be set.
+        "manager_name": str(raw_dj.get("manager_name") or "")[:40],
+        "manager_voice": str(raw_dj.get("manager_voice") or "")[:100],
         "talk_radio": max(0, min(100, int(
             raw_dj.get("talk_radio", DEFAULT_DJ["talk_radio"]) or 0))),
         "talk_radio_mode": bool(raw_dj.get("talk_radio_mode", False)),
@@ -17281,11 +17297,30 @@ def shelf_full(kind: str) -> bool:
 # alarm is arguable rather than mysterious.
 SEGMENT_BRIEF: dict[str, dict[str, Any]] = {
     "manager": {
-        "want": "a memo from upstairs, read out and reacted to",
+        # #1164: the segment is a memo from upstairs, and it now
+        # arrives one of two ways - slid down to be read out in the
+        # booth, or phoned down by the man who wrote it (the
+        # manager_calls_in switch). Both are the same segment and
+        # both are checked by the same words. Every entry below is
+        # a word one of the two roads really produces: the call's
+        # own brief asks for the phone to be named out loud and for
+        # him to put it down at the end, and the memo material is
+        # the same material either way.
+        #
+        # No "marker" on purpose. The memo road can never have a
+        # 'C:' turn, and claiming one here would make its failure
+        # line say "nobody speaks on the phone line" about a
+        # segment that has no phone in it.
+        "want": ("a memo from upstairs - read out and reacted to, "
+                 "or phoned down by the manager himself"),
         "any": ("upstairs", "management", "memo", "head office",
                 "the office", "the boss", "the brass", "came down",
                 "a note from", "the suits", "corporate", "the front office",
-                "downstairs", "higher up"),
+                "downstairs", "higher up",
+                # #1164: the call road's own words.
+                "on the line", "the phone", "the line", "hangs up",
+                "hung up", "put the phone down", "calling down",
+                "rang down", "on the other end"),
     },
     "caller": {
         "want": "somebody on the phone line",
@@ -83474,6 +83509,13 @@ async def speak_turns(turns: list[tuple[str, str]],
                       caller_name: str = "",
                       caller_voice: str = "",
                       caller_fx: dict[str, Any] | None = None,
+                      # #1164: WHICH SEAT the 'C:' marker belongs
+                      # to. The phone line, the drawn voice and the
+                      # vocoder are the caller's machinery; who is
+                      # holding the handset is not always a caller.
+                      # "caller" is the default, so every road that
+                      # does not pass this behaves as it always has.
+                      caller_seat: str = "caller",
                       source_text: str = "",
                       caller2_name: str = "",
                       caller2_voice: str = "",
@@ -83497,6 +83539,7 @@ async def speak_turns(turns: list[tuple[str, str]],
             turns, track, limit, vouched=vouched, source=source,
             by_hand=by_hand, whole=whole, caller_name=caller_name,
             caller_voice=caller_voice, caller_fx=caller_fx,
+            caller_seat=caller_seat,                       # #1164
             source_text=source_text, caller2_name=caller2_name,
             caller2_voice=caller2_voice, render_stream=render_stream,
             feel=feel, allow_repeat=allow_repeat, recorded=recorded,
@@ -83509,6 +83552,7 @@ async def speak_turns(turns: list[tuple[str, str]],
             turns, track, limit, vouched=vouched, source=source,
             by_hand=by_hand, whole=whole, caller_name=caller_name,
             caller_voice=caller_voice, caller_fx=caller_fx,
+            caller_seat=caller_seat,                       # #1164
             source_text=source_text, caller2_name=caller2_name,
             caller2_voice=caller2_voice, render_stream=render_stream,
             feel=feel, allow_repeat=allow_repeat, recorded=recorded,
@@ -83612,6 +83656,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                       caller_name: str = "",
                       caller_voice: str = "",
                       caller_fx: dict[str, Any] | None = None,
+                      # #1164: WHICH SEAT the 'C:' marker belongs
+                      # to. The phone line, the drawn voice and the
+                      # vocoder are the caller's machinery; who is
+                      # holding the handset is not always a caller.
+                      # "caller" is the default, so every road that
+                      # does not pass this behaves as it always has.
+                      caller_seat: str = "caller",
                       source_text: str = "",
                       caller2_name: str = "",
                       caller2_voice: str = "",
@@ -83776,7 +83827,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         in turns` — binding the raw MARKER as the speaker. Those turns aired
         in the default voice and were labelled "A:" in the booth, which is
         one of the ways the booth showed a speaker the stream was not."""
-        return ("caller" if marker == "C"
+        return (caller_seat if marker == "C"         # #1164: usually "caller"
                 else "caller2" if marker == "E"     # second person on the line
                 else "dj" if marker == "A"
                 else "third" if marker == "D" else "cohost")
@@ -83936,7 +83987,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # nervous for the rest of the night is a real bug.
                 _RADIO.setdefault("macro_auto", {})[who] = True
         vec = performance_vector(
-            who, (caller_voice if who == "caller"
+            who, (caller_voice if who == caller_seat      # #1164
                   else caller2_voice if who == "caller2"
                   else voices.get(who)) or "")
         first_at = len(playlist)
@@ -84038,7 +84089,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             if not text:
                 continue
             vec = performance_vector(
-                who, (caller_voice if who == "caller"
+                who, (caller_voice if who == caller_seat  # #1164
                       else caller2_voice if who == "caller2"
                       else voices.get(who)) or "")
             playlist.append({
@@ -84072,14 +84123,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     def _turn_voice(item: dict[str, Any]) -> str | None:
         if ready_takes is not None:
             return str(item.get("voice") or "")
-        return ((caller_voice or None) if item["who"] == "caller"
+        return ((caller_voice or None) if item["who"] == caller_seat
                 else (caller2_voice or caller_voice or None)
                 if item["who"] == "caller2"
                 else (voices.get(item["who"]) or None))
 
     def _turn_fx(item: dict[str, Any]) -> dict[str, Any]:
         # Both people on the line share the same crackling phone channel.
-        fx = dict(phone_fx) if item["who"] in ("caller", "caller2") \
+        fx = dict(phone_fx) if item["who"] in (caller_seat, "caller2") \
             else voice_effect_pick()
         if item.get("vec"):
             fx["perf"] = item["vec"]
@@ -84171,7 +84222,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             _call_archive_transcript.append({
                 "who": who,
                 "name": booth_actor_name(
-                    who, caller_name if who == "caller"
+                    who, caller_name if who == caller_seat   # #1164
                     else caller2_name if who == "caller2" else ""),
                 "text": text,
             })
@@ -84837,7 +84888,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         "ts": int(time.time()), "who": who, "kind": _kind,
                         # #1023 (G1): which ROAD this row belongs to -
                         # kind above is "call" for every burst row.
-                        "round": airlog_round_now(who, _kind, caller_name),
+                        # #1164: a manager on the line is not a
+                        # caller ROUND - the memo entry is still
+                        # the memo entry. Only a caller's seat
+                        # makes airlog_round_now say "caller".
+                        "round": airlog_round_now(
+                            who, _kind,
+                            caller_name if caller_seat == "caller" else ""),
                         **({"sfx": chunk, "sfx_dir": "the stream",
                             "seconds": round(float(secs or 0), 2)}
                            if who == "board" else {}),
@@ -84851,7 +84908,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                            and (_pics := gallery_pending_pick(chunk))
                            else {}),
                         "name": booth_actor_name(
-                            who, caller_name if who == "caller"
+                            who, caller_name if who == caller_seat  # #1164
                             else caller2_name if who == "caller2" else ""),
                         # #770: when this turn will actually be AUDIBLE, not
                         # when the batch was written. Every turn of a burst
@@ -84866,7 +84923,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         # is how you see the report a caller is citing.
                         **({"source": source} if source else {}),
                         "voice": (_turn_voice(aired_items[_ti]) if ready_takes is not None
-                                  and 0 <= _ti < len(aired_items) else caller_voice if who == "caller"
+                                  and 0 <= _ti < len(aired_items) else caller_voice if who == caller_seat
                                   else caller2_voice if who == "caller2"
                                   else voices.get(who, "")) or "",
                         # #782: the dossier, on the coalesced road too —
@@ -84908,7 +84965,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                  # consumes it later; preparation does not.
                                  "remember_text": _turn,
                                  "name": booth_actor_name(
-                                     who, caller_name if who == "caller"
+                                     who, caller_name if who == caller_seat  # #1164
                                      else caller2_name if who == "caller2" else ""),
                                  "from": offset, "until": offset + _real,
                                  # --- script production (2026-09-15) ---
@@ -85190,7 +85247,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                     _live["box_delivery"] = ("muted" if _box_receipt.get("intentional_mute") else "unconfirmed")
                             _memory = str(_row_ack.get("remember_text") or "")
                             if (_box_audible and _rid_ack not in _PAGE_ACKED_LINES
-                                    and _row_ack.get("who") in ("dj", "cohost", "third", "caller", "caller2", "drop")):
+                                    and _row_ack.get("who") in ("dj", "cohost", "third", "caller", "caller2", "drop", caller_seat)):   # #1164
                                 _system2_acknowledge_row({"ready_round": ready_meta}, _row_ack, "box:" + _rid_ack)
                                 if _memory:
                                     air_remember(_memory,
@@ -85328,7 +85385,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         _turn = str(item.get("turn_text") or "")
         backlog_before = {id(row) for row in _RENDER_BACKLOG}
         out = await dj_speak(
-            "call" if who == "caller" else "interject", track,
+            # #1164: a manager on the line is on a call, not
+            # interjecting - and the seat is what says so.
+            "call" if who == caller_seat else "interject", track,
             line=item["chunk"],
             who=who, voice=_turn_voice(item),
             source=source, by_hand=by_hand,
@@ -85337,8 +85396,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # sentence-capped slice with disfluencies in it never
             # matches a ledger of whole turns.
             checked=True,
-            fx=phone_fx if who == "caller" else None,
-            name=caller_name if who == "caller" else "",
+            fx=phone_fx if who == caller_seat else None,        # #1164
+            name=caller_name if who == caller_seat else "",     # #1164
             source_text=source_text,
             clip=ready,
             sting=bool(item["turn_end"]), remember_text=_turn)
@@ -85613,6 +85672,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     caller_name: str = "",
                     caller_voice: str = "", source: str = "",
                     caller_fx: dict[str, Any] | None = None,
+                    # #1164: whose seat the person on the line sits
+                    # in. "caller" is every existing road.
+                    caller_seat: str = "caller",
                     bank: bool = False,
                     caller2_name: str = "",
                     caller2_voice: str = "",
@@ -87114,7 +87176,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # outer prep_round used to stamp `caller` only after dj_banter
         # returned, which meant every call was actually tinted and audited as
         # generic banter; phone-specific fidelity instructions were dead code.
-        "prep_kind": "caller" if caller_name else "banter",
+        # #1164: a call from a seat of its own is THAT seat's
+        # round. The memo entry stays the memo entry when the
+        # manager is the one ringing it in.
+        "prep_kind": (caller_seat if caller_name and caller_seat != "caller"
+                      else "caller" if caller_name else "banter"),
         "source": source or seed.get("file", ""),
         "seed_text": seed.get("text", ""),
         # #838: the passages the rewrite may not touch, carried with the
@@ -87127,7 +87193,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         "swaths": [s for s in (seed, comeback, jab, tail) if s],
         "seek_verdict": seek_verdict,
         "caller_name": caller_name, "caller_voice": caller_voice,
-        "caller_fx": caller_fx, "at": time.time(),
+        "caller_fx": caller_fx, "caller_seat": caller_seat,   # #1164
+        "at": time.time(),
         "caller2_name": caller2_name, "caller2_voice": caller2_voice,
         "call": dict(call_meta or {}),
         "render_stream": render_stream,
@@ -87825,7 +87892,15 @@ async def _banter_air(entry: dict[str, Any],
                             "silent and the cupboard was full, and a "
                             "repeat outranks dead air")
     airlog_round_hint(str(entry.get("prep_kind") or ""),
-                      caller=str(entry.get("caller_name") or ""))  # #1023 (G1)
+                      # #1164: a caller name beats everything in
+                      # airlog_round_hint - so only a CALLER may
+                      # send one. The manager rings in on the
+                      # caller's machinery from a seat of his own,
+                      # and the round he rings into is the memo.
+                      caller=(str(entry.get("caller_name") or "")
+                              if str(entry.get("caller_seat")
+                                     or "caller") == "caller"
+                              else ""))                    # #1023 (G1)
     # #1050 (P1): which lines were already in the ring, so the stamp at the
     # bottom of this function can name the ones this round became.
     _sp_mark = screenplay_round_open(entry)
@@ -87986,6 +88061,9 @@ async def _banter_air(entry: dict[str, Any],
                                caller_name=entry.get("caller_name", ""),
                                caller_voice=entry.get("caller_voice", ""),
                                caller_fx=entry.get("caller_fx"),
+                               # #1164: and whose seat they sit in.
+                               caller_seat=str(
+                                   entry.get("caller_seat") or "caller"),
                                source_text=entry.get("seed_text", ""),
                                caller2_name=entry.get("caller2_name", ""),
                                caller2_voice=entry.get("caller2_voice", ""),
@@ -88142,6 +88220,366 @@ async def dj_open_show() -> list[str]:
            else "")
         + ". Finish by handing over to the first record of the session."
     ))
+
+
+# --- #1164: THE MANAGER RINGS THE BOOTH -------------------------------------
+#
+# "I am noticing some of the scripts missing entire segments, for example
+#  the manager is supposed to call during the manager's segment."
+#
+# He is right, and the measurement is blunt: 1,176 rows of manager
+# segment on the air in twenty-four hours, spoken by dj (5,048) and
+# cohost (3,714), and ZERO rows whose speaker is `manager`.  The man the
+# segment is named after has a seat booth_actor_name has known how to
+# name since #749 and has never once been heard.
+#
+# So he rings in.  Not a second call road - the CALLER's road with a
+# different seat in it.  dj_banter already carries a person on the line:
+# banter_turns folds their name to the 'C:' marker, caller_line_voice
+# draws them a voice that is never one of the pair's, and speak_turns
+# puts the phone rack over it.  All of that is exactly what a memo
+# phoned down from upstairs needs.  `caller_seat` says whose seat the
+# handset is in, and it is the only thing that road was missing.
+#
+# The ring and the hang-up are FREE.  Neither is spoken: the screenplay
+# writes "The phone rings. X is on the line" and "X hangs up after ..."
+# out of the call ledger (_screenplay_actions reads d["calls"], which is
+# call_log_read()), so call_ended() buys both action lines without
+# spending a second of the entry's clock.  The round pays only for the
+# turns it actually says, and manager_call_turns_for_slot decides how
+# many of those the entry can hold.
+
+# The switch.  A file under the data directory, re-read every few
+# seconds, so the manager can be put on the phone and taken off it again
+# while the operator is listening - no restart, no deploy.  "on" puts
+# him on the line; "off", a missing file, an empty one, or anything else
+# leaves the memo road exactly as it was.
+#
+# Deliberately NOT a dj setting.  That dict is a wholesale rebuild on
+# every save (see the notes on manager_name, which has been a dead key
+# for exactly that reason), and a switch the operator has to be able to
+# flick mid-segment must not depend on a settings round trip.
+MANAGER_CALL_SWITCH_PATH = data_path("manager_calls_in")
+MANAGER_CALL_SWITCH_EVERY = 5.0
+_MANAGER_CALL_SWITCH: dict[str, Any] = {"at": 0.0, "on": False, "said": None}
+
+# The line he rings down, named because the screenplay prints it:
+# "The phone rings. <name> is on the internal line from upstairs."
+MANAGER_CALL_LINE = "the internal line from upstairs"
+# What the call costs before anybody has said anything - the ring, the
+# pickup, the goodbye.  Smaller than a request-line call's
+# CALL_TOP_AND_TAIL (#960): upstairs does not introduce itself.
+MANAGER_CALL_TOP_AND_TAIL = 18.0
+# The shortest thing that is a CALL rather than a memo read aloud: he
+# says it, one of them answers, he does not take the answer well, they
+# are left holding it.  Under four turns there is no call to hear, and
+# the road would rather not run than run as something else.
+MANAGER_CALL_TURNS_MIN = 4
+# ...and the longest.  A memo is a message, not a phone-in: the manager
+# segment must not quietly become a second caller segment.
+MANAGER_CALL_TURNS_MAX = 6
+
+
+def manager_calls_in() -> bool:
+    """#1164: is the manager ringing the booth himself tonight?
+
+    Read off <data>/manager_calls_in every MANAGER_CALL_SWITCH_EVERY
+    seconds and memoised in between, because this is asked once per
+    manager round and a share read per round is a share read per round.
+    Never raises: an unreadable switch is an off switch, and the memo
+    road is what off means.
+
+    Says so in the log when it CHANGES, and only then - a line every
+    five seconds saying the switch is still off is not a log."""
+    now = time.time()
+    if now - float(_MANAGER_CALL_SWITCH["at"]) < MANAGER_CALL_SWITCH_EVERY:
+        return bool(_MANAGER_CALL_SWITCH["on"])
+    on = False
+    try:
+        on = MANAGER_CALL_SWITCH_PATH.read_text(
+            errors="replace").strip().lower() == "on"
+    except Exception:  # noqa: BLE001
+        on = False                      # missing, unreadable, mid-write
+    was = _MANAGER_CALL_SWITCH["said"]
+    _MANAGER_CALL_SWITCH.update({"at": now, "on": on, "said": on})
+    if was is not None and bool(was) != on:
+        try:
+            pipeline_log("air", "#1164: %s (%s says %s)"
+                         % ("the manager rings the booth himself now"
+                            if on else
+                            "the manager is back to sending memos down",
+                            MANAGER_CALL_SWITCH_PATH.name,
+                            "on" if on else "off"))
+        except Exception:  # noqa: BLE001
+            pass
+    return on
+
+
+def manager_call_name() -> str:
+    """Who is on the line.  The same draw dj_manager_call (#636) makes,
+    so the man who phones during the segment and the man who phones
+    between records are one person."""
+    try:
+        return (str(dj_settings().get("manager_name") or "").strip()
+                or "the manager upstairs")
+    except Exception:  # noqa: BLE001
+        return "the manager upstairs"
+
+
+async def manager_call_voice() -> tuple[str, bool]:
+    """The manager seat's voice, and whether it is the PINNED one.
+
+    #1164 (3): the seat's configured voice through the normal render
+    road - dj.manager_voice, which cast_signature has consulted since
+    #1057 and which nothing has ever been able to spend.  When nothing
+    is pinned the station falls back the way it falls back everywhere
+    else a stranger needs a voice, through caller_line_voice: a voice
+    out of the catalogue that is guaranteed never to be the host's or
+    the co-host's (#559).  The caller SAYS SO in the log - a manager who
+    silently sounds like the DJ is the bug this whole patch is about."""
+    try:
+        pinned = str(dj_settings().get("manager_voice") or "").strip()
+    except Exception:  # noqa: BLE001
+        pinned = ""
+    if pinned:
+        return pinned, True
+    try:
+        drawn = await caller_line_voice(manager_call_name())
+    except Exception:  # noqa: BLE001
+        drawn = ""
+    return str(drawn or ""), False
+
+
+def manager_call_turns_for_slot() -> int:
+    """#1164 (6): how many turns the call may run to, so the round LANDS
+    inside the memo entry instead of being refused for length.
+
+    This is call_turns_for_slot()'s arithmetic (#960/#961) aimed at the
+    manager entry rather than the phone-call entry, and it uses the same
+    measured call_turn_seconds() - what a turn of dialogue actually runs
+    on THIS box, from the task ledger, not a character count.
+
+    Returns 0 to mean "this entry cannot hold a call", which is not a
+    failure: the memo road runs instead and the segment is the segment
+    it has always been.  That is the honest answer to tonight's refusals
+    ("the gallery round runs 196s and its entry has 92s left") - a round
+    that will not fit is not written, rather than written and thrown
+    away after the model has been paid for it.
+
+    No sheet running (owns <= 0) is UNRESTRICTED, exactly as the caller
+    road treats it, and takes the floor."""
+    try:
+        owns = 0.0
+        # Already inside the memo entry: fill what is left of it.
+        try:
+            _slot = _RADIO.get("sched_slot") or {}
+            if (str(SCHED_PREP_KIND.get(str(_slot.get("kind") or "")) or "")
+                    == "manager"):
+                owns = sched_entry_left()
+        except Exception:  # noqa: BLE001
+            owns = 0.0
+        if owns <= 0:
+            try:
+                for ent in coord_upcoming(1800.0):
+                    if str(ent.get("road") or "") == "manager":
+                        owns = float(ent.get("owns_seconds") or 0)
+                        break
+            except Exception:  # noqa: BLE001
+                owns = 0.0
+        if owns <= 0:
+            return MANAGER_CALL_TURNS_MIN
+        fits = int((owns - MANAGER_CALL_TOP_AND_TAIL)
+                   / max(1.0, call_turn_seconds()))
+        if fits < MANAGER_CALL_TURNS_MIN:
+            return 0                    # no room for a call; send the memo
+        return min(MANAGER_CALL_TURNS_MAX, fits)
+    except Exception:  # noqa: BLE001
+        return MANAGER_CALL_TURNS_MIN
+
+
+# What he is like on the phone.  Not a script - the register, the way
+# UPSTAIRS_GRIPES is the register for the intercom pages.  Rolled per
+# call so the same man is not the same scene twice.
+MANAGER_CALL_MANNER: tuple[str, ...] = (
+    "He is not angry. He is worse than angry: calm, and in no hurry.",
+    "He is reading it off the page and will not be interrupted until he "
+    "has finished the page.",
+    "He is pretending this is a friendly call and nobody in the booth "
+    "believes him for a second.",
+    "He has clearly been holding this in since this morning and it comes "
+    "out faster than he meant it to.",
+    "He is bored by his own memo and resents having to read it at all, "
+    "which somehow makes it worse.",
+)
+
+
+async def _manager_rings_booth(track: dict[str, Any] | None,
+                               memo: str, flavour: str = "",
+                               topic: str = "") -> list[str]:
+    """#1164: upstairs on the booth phone, saying the memo himself.
+
+    Returns the aired lines, or [] - and [] is never a silence: every
+    door out of here falls through to the memo road in dj_manager_note,
+    which is the road that ran before this existed.  The refusals are
+    deliberate and all four are logged:
+
+      * the entry has no room for a call (manager_call_turns_for_slot);
+      * the manager seat has no voice at all to ring in with;
+      * somebody is already on the line - the phone is one phone;
+      * the round simply did not air, which is dj_banter's business.
+
+    The memo's identity is kept whole: one manager_memo_save per round,
+    the same de-duplicating print, and stamped at the round's AIR time
+    (#1162) so the screenplay puts "a memo comes down from upstairs" at
+    the head of the segment rather than after the last line of it."""
+    memo = " ".join(str(memo or "").split())
+    if not memo:
+        return []
+    turns = manager_call_turns_for_slot()
+    if turns <= 0:
+        try:
+            pipeline_log("air", "#1164: the memo entry has %ds left, which "
+                                "is under the %d turns a call needs - "
+                                "upstairs sends the memo down instead"
+                         % (int(max(0.0, sched_entry_left())),
+                            MANAGER_CALL_TURNS_MIN))
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+    boss = manager_call_name()
+    voice, pinned = await manager_call_voice()
+    if not pinned:
+        try:
+            pipeline_log("air", "#1164: NO VOICE IS PINNED FOR THE MANAGER "
+                                "SEAT (dj.manager_voice is empty) - he is "
+                                "ringing in on %s, drawn the way a caller's "
+                                "voice is drawn and guaranteed not to be "
+                                "either host's. Pin one and he keeps it."
+                         % (voice_friendly(voice) if voice
+                            else "no voice at all"))
+        except Exception:  # noqa: BLE001
+            pass
+    if not voice:
+        try:
+            pipeline_log("air", "#1164: the manager seat has no voice to "
+                                "ring in with and he is NOT going out in a "
+                                "host's - the memo is read out from the "
+                                "booth instead")
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+    if not call_line_take(boss, {"line": MANAGER_CALL_LINE,
+                                 "topic": "a memo from upstairs",
+                                 "upstairs": True}):
+        try:
+            pipeline_log("air", "#1164: %s is on the line already - the "
+                                "phone is one phone, so upstairs sends the "
+                                "memo down instead" % (call_line_busy()
+                                                       or "somebody"))
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+    started = time.time()
+    # The ending, stated up front the way #879 states a caller's, so the
+    # round is written TOWARDS a hang-up rather than merely stopping.
+    rule = {"id": "manager_hangs_up",
+            "text": ("the manager says his piece, does not wait to be "
+                     "argued with, and puts the phone down")}
+    said: list[str] = []
+    try:
+        said = await dj_banter(
+            track, lines=turns, own_material=True,
+            caller_name=boss, caller_voice=voice,
+            # #1164: HIS seat, not the caller's. This is the whole patch.
+            caller_seat="manager",
+            # One floor up, down an internal line: a little phone crush
+            # and no character at all - the calm is the threat. The same
+            # rack dj_manager_call (#636) gives him.
+            caller_fx={"vocode": "plain", "pitch": -2},
+            render_stream=bool(dj_settings().get("call_stream", True)),
+            angle=(
+                f"The BOOTH PHONE goes - the internal line, not the "
+                f"request line. It is {boss}, from the office UPSTAIRS. "
+                "The round OPENS with the phone ringing and one of the "
+                "hosts hearing it, saying out loud who is on the line, "
+                "and answering it.\n"
+                f"{boss} has a MEMO in front of him and he reads it down "
+                "the phone himself rather than sending it down. What the "
+                "memo says, in management's own words, is:\n"
+                f"\"{memo}\"\n"
+                + (("He also brings up something he has heard the two of "
+                    "you going on about, and he raises it the way a "
+                    "manager does - as one more thing he is not "
+                    f"impressed by:\n\"{topic}\"\n")
+                   if topic else "")
+                + "Do not read it back word for word: say it the way a "
+                "man says a memo he wrote himself, and let the pair deal "
+                "with it WHILE HE IS STILL ON THE LINE. They talk TO "
+                f"him, not about him - no describing {boss} to each "
+                "other in the third person while he can hear it. He "
+                "answers back, holds his ground, and about half the "
+                "turns in this call are his.\n"
+                + random.choice(MANAGER_CALL_MANNER) + "\n"
+                + "The call must END this way, arrived at over the last "
+                f"turn or two: {str(rule.get('text') or '')}. The last "
+                "thing the listener hears is one of the hosts left "
+                "holding whatever that was, and then back to the "
+                "record.\n"
+                f"Format his lines as 'C: ...' - C is {boss}, who speaks "
+                "in full sentences and is not in the room."
+                + flavour)) or []
+    except Exception as exc:  # noqa: BLE001
+        # #1219's lesson, applied on the way in rather than after two
+        # days of chasing it: this is a NEW road in front of a road that
+        # works, so a throw here must not take the manager segment off
+        # the air - and it must not be swallowed either. The memo road
+        # below runs, and the fault is named with its type, because a
+        # fallback that hides an exception hides it until somebody
+        # happens to look.
+        said = []
+        try:
+            pipeline_log("air", "#1164: THE CALL FROM UPSTAIRS THREW and "
+                                "the memo road is taking the segment - "
+                                "%s: %s" % (type(exc).__name__, exc))
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        # The ledger row, whatever happened - and it is this row the
+        # screenplay turns into the ring and the hang-up. call_ended
+        # also frees the line on every path, which is why it is in a
+        # finally: a manager road that threw used to be able to leave
+        # the phone showing busy until CALL_LINE_STALE (#977).
+        try:
+            call_ended(boss, MANAGER_CALL_LINE, started, rule,
+                       len(said or []))
+        except Exception:  # noqa: BLE001
+            call_line_free()
+    if not said:
+        try:
+            pipeline_log("air", "#1164: the call from upstairs did not "
+                                "reach the air - the memo road takes it")
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+    quota_stamp("manager")              # #841: the hour counts it, as ever
+    try:                                # #1146: the book keeps it, as ever
+        # #1162: stamped where the round BEGAN, so the screenplay puts
+        # "a memo comes down from upstairs" at the head of the segment
+        # instead of after the last line that deals with it.
+        await asyncio.to_thread(
+            manager_memo_save, "\n".join(said), "call", True, "", started)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pipeline_log("air", "#1164: UPSTAIRS RANG THE BOOTH - %s read the "
+                            "memo down %s himself in %s, %d line(s), and "
+                            "hung up"
+                     % (boss, MANAGER_CALL_LINE,
+                        voice_friendly(voice) if voice else "his own voice",
+                        len(said)))
+    except Exception:  # noqa: BLE001
+        pass
+    return said
 
 
 async def dj_manager_note(track: dict[str, Any] | None = None,
@@ -88353,6 +88791,23 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
             "Do not read that back word for word. Say what it means for the "
             "show tonight, and mention any product or sponsorship it asks "
             "you to push." + flavour)
+    # #1164: ...OR HE RINGS THE BOOTH AND SAYS IT HIMSELF.
+    #
+    # Behind the manager_calls_in switch, which defaults OFF, and
+    # only on the LIVE road - `bank_to is None` keeps preparation,
+    # the shelf and _ready_shelf_air out of this entirely. The memo
+    # he reads down the phone is the memo this round already has,
+    # gripe or instruction, so the segment is the same segment.
+    #
+    # Every refusal inside falls through to the memo road below -
+    # no room in the entry, no voice for the seat, the line already
+    # busy, the round not airing - so this can never be the reason
+    # a manager segment goes quiet.
+    if bank_to is None and manager_calls_in():
+        _rang = await _manager_rings_booth(track, _gripe or note,
+                                          flavour, topic=_topic)
+        if _rang:
+            return _rang
     _said = await dj_banter(track, lines=3, whole=True,           # #859
                             bank=bank_to is not None,
                             bank_to=bank_to, own_material=True,
@@ -108987,6 +109442,158 @@ def hour_contract_delivered(since: float, until: float) -> dict[str, Any]:
     return out
 
 
+def segment_inspect(block: int) -> dict[str, Any]:
+    """2026-09-15 (#1168): EVERY ASPECT OF HOW ONE SEGMENT WAS COMPOSED.
+
+    "inspect segment (view popup going over every aspect of how the segment
+    was composed)" and "a vertical infographic ... from person to person
+    representing the conversation transaction taking place and how everyone
+    participated and coalesced in the making of the conversation".
+
+    A segment is a BLOCK in the script ledger, which is the authority on
+    what was written and in what order (#1330). This gathers, for one
+    block: the round that wrote it, every line in ledger order with what
+    the air log knows about it, who took part, the hand-offs between them
+    in order - which is the infographic - the segment's own brief against
+    what it actually contained, and the holes inside it.
+
+    Every field is present. A thing this station cannot answer is None
+    with a sentence, never a plausible guess."""
+    out: dict[str, Any] = {"schema": 1, "block": int(block), "available": True,
+                           "round": None, "lines": [], "seats": [],
+                           "transaction": [], "brief": None, "timing": None,
+                           "holes": [], "prompt_kind": "", "why": ""}
+    try:
+        led = [r for r in script_ledger_rows() if int(r.get("block") or -1) == int(block)]
+    except Exception as exc:  # noqa: BLE001
+        out["available"] = False
+        out["why"] = "the ledger could not be read: %r" % (exc,)
+        return out
+    if not led:
+        out["available"] = False
+        out["why"] = ("no block %d is in the script ledger - it holds the last "
+                      "48 hours, so an older segment is gone" % int(block))
+        return out
+    led.sort(key=lambda r: int(r.get("ord") or 0))
+    first = led[0]
+    road = str(first.get("round") or "")
+    out["prompt_kind"] = road
+    out["round"] = {"sid": str(first.get("sid") or ""), "road": road,
+                    "committed_at": float(first.get("at") or 0),
+                    "committed": time.strftime("%H:%M:%S", time.localtime(float(first.get("at") or 0))),
+                    "lines": len(led),
+                    "scripted": sum(1 for r in led if r.get("scripted", True)),
+                    "welded": sum(1 for r in led if not r.get("scripted", True))}
+    # What the air log knows about each of those lines. One read, memoised
+    # by the log's own reader; never a scan per line.
+    air: dict[str, dict[str, Any]] = {}
+    try:
+        _at = float(first.get("at") or 0) or time.time()
+        for row in airlog_rows(_at - 1800.0, _at + 7200.0, quiet=True):
+            rid = str(row.get("id") or "")
+            if rid:
+                air[rid] = row
+    except Exception:  # noqa: BLE001
+        air = {}
+    heard_at: list[float] = []
+    for r in led:
+        lid = str(r.get("line_id") or "")
+        got = air.get(lid) or {}
+        # A welded sting airs under the SAMPLE's id, not the ledger's
+        # (#1133) - the pair share the round and the text.
+        if not got and str(r.get("kind") or "") == "sfx":
+            key = " ".join(str(r.get("text") or "").lower().split())
+            for _row in air.values():
+                if (str(_row.get("sid") or "") == str(r.get("sid") or "")
+                        and " ".join(str(_row.get("text") or "").lower().split()) == key):
+                    got = _row
+                    break
+        aired = str(got.get("aired") or "")
+        at = float(got.get("air_at") or 0)
+        if aired in AIR_AT_HEARD and at:
+            heard_at.append(at)
+        trace = got.get("trace") if isinstance(got.get("trace"), dict) else {}
+        render = trace.get("render") if isinstance(trace.get("render"), dict) else {}
+        out["lines"].append({
+            "line_id": lid, "ord": int(r.get("ord") or 0),
+            "who": str(r.get("who") or ""), "name": str(got.get("name") or ""),
+            "kind": str(r.get("kind") or ""),
+            "text": " ".join(str(r.get("text") or "").split())[:400],
+            "seconds": float(r.get("seconds") or got.get("seconds") or 0),
+            "scripted": bool(r.get("scripted", True)),
+            "aired": aired or None,
+            "air_at": at or None,
+            "at": time.strftime("%H:%M:%S", time.localtime(at)) if at else None,
+            "heard": aired in AIR_AT_HEARD,
+            "withdrawn_why": str(got.get("withdrawn_why") or "") or None,
+            "voice": str(got.get("voice") or "") or None,
+            "engine": str(render.get("engine") or got.get("engine") or "") or None,
+            "model": str((trace.get("written") or {}).get("model") or "") or None,
+            "source": str(got.get("source") or "") or None,
+        })
+    # Who took part, and for how long.
+    seats: dict[str, dict[str, Any]] = {}
+    for line in out["lines"]:
+        who = str(line.get("who") or "")
+        if not who:
+            continue
+        got = seats.setdefault(who, {"seat": who, "name": line.get("name") or "",
+                                     "lines": 0, "seconds": 0.0, "heard": 0})
+        got["lines"] += 1
+        got["seconds"] = round(float(got["seconds"]) + float(line.get("seconds") or 0), 1)
+        got["heard"] += 1 if line.get("heard") else 0
+    out["seats"] = sorted(seats.values(), key=lambda r: -float(r.get("seconds") or 0))
+    # THE TRANSACTION: each hand-off from the seat that spoke to the seat
+    # that answered, in the ledger's order. This is the infographic.
+    prev = None
+    for line in out["lines"]:
+        who = str(line.get("who") or "")
+        if not who:
+            continue
+        if prev is not None and prev != who:
+            out["transaction"].append({
+                "from": prev, "to": who, "ord": line.get("ord"),
+                "kind": line.get("kind"), "seconds": line.get("seconds"),
+                "at": line.get("at"), "heard": line.get("heard"),
+                "line_id": line.get("line_id"),
+                "text": str(line.get("text") or "")[:120]})
+        prev = who
+    # The brief, against what the segment actually contained.
+    brief = SEGMENT_BRIEF.get(road) or {}
+    if brief:
+        words = tuple(brief.get("any") or ())
+        blob = " ".join(str(l.get("text") or "") for l in out["lines"]).lower()
+        found = [w for w in words if w in blob]
+        out["brief"] = {"road": road, "wants": str(brief.get("want") or ""),
+                        "looked_for": list(words)[:24], "found": found[:12],
+                        "met": bool(found),
+                        "say": ("the segment contains %s" % ", ".join(found[:4]))
+                        if found else ("nothing in this segment reads like %s"
+                                       % (brief.get("want") or road))}
+    else:
+        out["brief"] = {"road": road, "wants": "", "looked_for": [], "found": [],
+                        "met": None,
+                        "say": "this road has no brief - the station does not "
+                               "say what a %s segment must contain" % (road or "?")}
+    if heard_at:
+        heard_at.sort()
+        out["timing"] = {"first_heard": heard_at[0], "last_heard": heard_at[-1],
+                         "from": time.strftime("%H:%M:%S", time.localtime(heard_at[0])),
+                         "to": time.strftime("%H:%M:%S", time.localtime(heard_at[-1])),
+                         "span_s": round(heard_at[-1] - heard_at[0], 1),
+                         "heard": len(heard_at), "of": len(out["lines"])}
+        for a, b in zip(heard_at, heard_at[1:]):
+            if b - a > 12.0:
+                out["holes"].append({"from": time.strftime("%H:%M:%S", time.localtime(a)),
+                                     "to": time.strftime("%H:%M:%S", time.localtime(b)),
+                                     "seconds": round(b - a, 1)})
+    else:
+        out["timing"] = None
+        out["why"] = ("not one line of this segment was ever heard - it was "
+                      "written and, if it has states, refused at hand-over")
+    return out
+
+
 def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict[str, Any]:
     """Passive incident context from bounded in-memory records, never a repair.
 
@@ -109123,6 +109730,19 @@ def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict
 
 
 # --- broadcast admission (2026-09-15) ---
+@app.get("/api/segment/inspect")
+async def segment_inspect_api(
+    block: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-15 (#1168): how one segment was composed, who took part, and
+    what passed between them."""
+    require_read_auth(authorization)
+    if not block:
+        raise HTTPException(status_code=400, detail="name a block")
+    return await asyncio.to_thread(segment_inspect, int(block))
+
+
 @app.get("/api/hour/contract")
 async def hour_contract_api(
     hours: float = 1.0,

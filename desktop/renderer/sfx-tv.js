@@ -1385,6 +1385,15 @@
 
   function next() {
     if (showing || !mounted) return;
+    /* #1167: nothing new comes out of the tube while a report is up. The
+     * clip stays in the queue; whether it is still worth playing when he
+     * is finished is decided by the LATE test two lines down, which is the
+     * right answer either way - a sting that was meant to punctuate a line
+     * spoken four minutes ago should not fire now.
+     *
+     * The live read rather than the flag, so this holds even in the case
+     * where the watch never attached. */
+    if (reportUp || reportNow()) return;
     var clip = queue.shift();
     while (clip && (now() - Number(clip.at || now())) / 1000 > LATE) {
       clip = queue.shift();
@@ -1464,6 +1473,7 @@
   }
 
   async function poll() {
+    wireDuck();                                            /* #1167 */
     if (busy || !api() || !api().get) return;
     busy = true;
     try {
@@ -1495,6 +1505,82 @@
    * sidebar and an ENDLESS tab on the tablet's rail, each a toggle. */
   var endlessOn = null;
   var veiled = false;
+  /* #1167 - "Don't have the audio playing and don't have videos popping up
+   * during the process of filing tickets. Resume everything after the
+   * ticket following screen has been closed or sent."
+   *
+   * THIS SET IS THE ONE THAT MAKES THE NOISE. The LISTEN view's backdrop
+   * is muted wallpaper; the sound of a sting is this window's <video>.
+   * And this is also the thing that literally pops up: the set opens
+   * itself whenever the station rings one through, which during a report
+   * is a picture and a noise arriving in the middle of a sentence.
+   *
+   * IT IS ALREADY COVERED, AND THAT IS NOT ENOUGH. The report pad is at
+   * z-index 2147483040 and this set at 2147483020, so the pad is over it
+   * and nothing here needs to move a layer. A covered set is still an
+   * audible set, still runs its cycle, still tears down and starts the
+   * next one. So its visibility is deliberately left alone - the pad
+   * already handles that - and what changes is that it goes silent, stops,
+   * and takes nothing new out of the queue until he is done.
+   *
+   * THE MUTE IS RECORDED, NOT ASSUMED. `level()` will clear muted on its
+   * own when the master volume is up, so this element's mute is somebody
+   * else's state as often as it is nobody's; what was found is what goes
+   * back. Keyed to the ELEMENT, because a set that tore down and built
+   * another while a report was up must not have the old one's mute
+   * written onto the new one. */
+  var reportUp = false;
+  var reportWas = null;
+  var unduck = null;
+
+  function reportNow() {
+    var d = root.PineDuck;
+    return !!(d && typeof d.reporting === 'function' && d.reporting());
+  }
+
+  function reportQuiet(on) {
+    if (on) {
+      if (!reportWas && video) {
+        reportWas = {el: video, muted: !!video.muted, playing: !video.paused};
+      }
+      if (video) {
+        try { video.muted = true; } catch (err) { /* gone */ }
+        try { video.pause(); } catch (err) { /* already still */ }
+      }
+      return;
+    }
+    var was = reportWas;
+    reportWas = null;
+    if (video && was && was.el === video) {
+      try { if (video.muted !== was.muted) video.muted = was.muted; }
+      catch (err) { /* gone */ }
+      /* Only resume what was actually running. A clip that was already
+       * paused - on its last frame under a hold sheet, say - stays where
+       * the operator left it. */
+      if (was.playing) {
+        try { video.play().catch(function () { /* the frame is a picture */ }); }
+        catch (err) { /* gone */ }
+      }
+    }
+    /* And the queue starts moving again. */
+    next();
+  }
+
+  /* Wired lazily and idempotently: pine-duck.js is loaded before this file
+   * on the desk, but the kiosk injects these in its own order and a set
+   * that silently never subscribed would be a set that talks over every
+   * report. poll() calls this again every 2.5s until it takes. */
+  function wireDuck() {
+    if (unduck) return;
+    var d = root.PineDuck;
+    if (!d || typeof d.watch !== 'function') return;
+    unduck = d.watch(function (on) {
+      var was = reportUp;
+      reportUp = !!on;
+      if (was === reportUp) return;
+      reportQuiet(reportUp);
+    });
+  }
 
   function endlessPaint(on) {
     on = !!on;
@@ -1626,6 +1712,7 @@
       if (mounted) return;
       mounted = true;
       base = String((opts && opts.baseUrl) || '');
+      wireDuck();                                          /* #1167 */
       poll();
       timer = setInterval(poll, POLL_MS);
       /* A window that shrank under a set left near the edge would strand

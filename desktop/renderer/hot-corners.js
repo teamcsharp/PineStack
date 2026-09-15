@@ -65,6 +65,27 @@
   var COMMIT_DEG = 35;      /* within this many degrees of the diagonal */
   var JUDGE_PX = 40;        /* past this the direction is judged; short of it a
                                wobble is still a wobble */
+
+  /* #1166: "Make sure I can also activate hot corners by tapping on the
+   * corners. or clicking."
+   *
+   * A TAP IS A SWIPE THAT NEVER WENT ANYWHERE. Both begin with exactly the
+   * same pointerdown - same corner square, same gates, same glow - and the
+   * two are told apart only at the up. These are the numbers that do it.
+   *
+   * TAP_PX is deliberately UNDER JUDGE_PX. Short of JUDGE_PX the judge
+   * returns 'going' and never rules on direction, so a press that stayed
+   * inside TAP_PX cannot have been thrown out as "not toward the centre"
+   * along the way - a tap and a failed swipe can therefore never be
+   * confused for one another. Past it the press was travelling somewhere
+   * and belongs to the swipe, committed or abandoned; it is not a tap.
+   *
+   * TAP_MS leaves the long press alone. Half a second is far longer than a
+   * tap on glass and far shorter than a deliberate hold, so anything that
+   * wants press-and-hold in a corner later still has it to claim. */
+  var TAP_PX = 24;
+  var TAP_MS = 500;
+
   var STORE = 'pineHotCorners';
   var STEPS = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1200];
 
@@ -326,12 +347,91 @@
     return {state: 'commit', progress: 1};
   }
 
+  /* #1166: IS THIS PRESS SOMEBODY ELSE'S?
+   *
+   * "Make sure I can also activate hot corners by tapping on the corners.
+   *  or clicking."
+   *
+   * A tap is a far more dangerous gesture than a swipe, because a tap is
+   * what everything else on the screen is listening for too. The corner
+   * squares are not empty: the TOP RIGHT sits under the view rail, whose
+   * tabs are the only way between views on the tablet, and the TOP LEFT
+   * sits under the panel's own controls on the desk. A corner that ate
+   * those would be far worse than no corner at all.
+   *
+   * So the tap is taken ONLY off the page's own background. Two families
+   * are refused, and a press that lands on either is left entirely alone -
+   * it is not swallowed, not acted on, and reaches whatever it was going
+   * to reach:
+   *
+   *   THINGS THAT ARE OPERATED. button, a, input, select, textarea,
+   *   label, summary, and anything wearing role=button/link/tab/checkbox/
+   *   slider/menuitem or contenteditable. That one list covers the rail's
+   *   tabs (they are <button class="pine-view-tab">), every sheet button,
+   *   the clock's GRAB button and the search box.
+   *
+   *   SURFACES THAT OWN THEIR OWN GESTURES. The SFX set (#sfxTv, which
+   *   takes a tap to open its menu and a double tap to replay), the talk
+   *   dot, the report pad, the camera, the rail's own body between its
+   *   tabs, and this file's own furniture. These are floating things that
+   *   can sit anywhere, including squarely in a corner.
+   *
+   * THE ANSWER IS DECIDED AT POINTERDOWN, not at the up, because that is
+   * where the operator's finger actually landed - by the up the element
+   * under it may have moved or gone. And it governs the TAP ONLY: the
+   * swipe is untouched, so a swipe that begins on a rail tab still works
+   * exactly as it did before this change.
+   *
+   * WHEN IN DOUBT, DO NOT TAKE IT. A throw anywhere in this walk answers
+   * "yes, somebody else's" - the corner losing a tap is a small thing
+   * beside the corner eating a press that was not its own. */
+  function overControl(node) {
+    var TAGS = {button: 1, a: 1, input: 1, select: 1, textarea: 1,
+                label: 1, summary: 1, option: 1};
+    var ROLES = {button: 1, link: 1, tab: 1, checkbox: 1, radio: 1,
+                 slider: 1, menuitem: 1, switch: 1, textbox: 1};
+    /* Floating surfaces with gestures of their own, by id or by class. */
+    var OWNED = /(^|\s)(pine-view-tab|pineViewRail|sfx-tv|pine-cam|hc-btn|hc-pick|hc-x|hc-glow|hc-strip|hc-toast)(\s|$)/;
+    var OWNED_ID = {sfxTv: 1, pineViewRail: 1, pineTalkDot: 1, pineTalkSay: 1,
+                    pineReportPad: 1, pineTip: 1};
+    try {
+      var el = node;
+      if (el && el.nodeType === 3) el = el.parentNode;   /* a text node */
+      var hops = 0;
+      while (el && el.nodeType === 1 && hops < 60) {
+        if (el === doc.body || el === doc.documentElement) return false;
+        var tag = String(el.tagName || '').toLowerCase();
+        if (TAGS[tag] === 1) return true;
+        if (el.getAttribute) {
+          var role = el.getAttribute('role');
+          if (role && ROLES[String(role).toLowerCase()] === 1) return true;
+          if (el.getAttribute('contenteditable') === 'true') return true;
+        }
+        if (el.id && OWNED_ID[el.id] === 1) return true;
+        /* className is an SVGAnimatedString on an SVG node, not a string. */
+        var cls = el.className;
+        if (typeof cls !== 'string') cls = (cls && cls.baseVal) || '';
+        if (cls && OWNED.test(cls)) return true;
+        el = el.parentNode;
+        hops += 1;
+      }
+    } catch (err) {
+      return true;                      /* unreadable: leave the press alone */
+    }
+    return false;
+  }
+
   /* --------------------------------------------------------- the glow */
 
   var glow = null;
 
+  var pulseTimer = 0;
+
   function glowShow(corner, progress) {
     if (!doc || !doc.body) return;
+    /* #1166: a swipe starting during a tap's pulse owns the glow from
+     * here; the pulse must not hide it out from under the drag. */
+    if (pulseTimer) { clearTimeout(pulseTimer); pulseTimer = 0; }
     if (!glow) {
       glow = make('div', 'hc-glow');
       doc.body.appendChild(glow);
@@ -343,9 +443,26 @@
   }
 
   function glowHide() {
+    if (pulseTimer) { clearTimeout(pulseTimer); pulseTimer = 0; }
     if (!glow) return;
     glow.className = 'hc-glow';
     glow.style.opacity = '0';
+  }
+
+  /* #1166: THE TAP'S OWN FLASH. A swipe grows the glow under the finger,
+   * so a tap - which has no travel to grow with - would otherwise fire
+   * with a glow that barely appeared. This puts it up at full and lets it
+   * go: dropping the `on` class hands it back to the stylesheet's
+   * .18s opacity fade, so the corner that fired is unmistakably the one
+   * that lights, and it is gone before the action's own sheet arrives. */
+  function glowPulse(corner) {
+    glowShow(corner, 1);
+    pulseTimer = setTimeout(function () {
+      pulseTimer = 0;
+      if (!glow) return;
+      glow.className = 'hc-glow';
+      glow.style.opacity = '0';
+    }, 150);
   }
 
   /* ---------------------------------------------------------- the gesture */
@@ -381,7 +498,11 @@
     var corner = cornerAt(ev.clientX, ev.clientY, w, h);
     if (!corner) return;
     if ((cfg[corner] || 'off') === 'off') return;
-    live = {id: ev.pointerId, corner: corner, x: ev.clientX, y: ev.clientY, t: now()};
+    /* #1166: `onControl` is decided HERE, where the finger actually
+     * landed, and is read only by the tap at the up - see onUp and
+     * overControl. The swipe does not consult it and is unchanged. */
+    live = {id: ev.pointerId, corner: corner, x: ev.clientX, y: ev.clientY,
+            t: now(), onControl: overControl(ev.target)};
     glowShow(corner, 0);
   }
 
@@ -401,8 +522,50 @@
     act(cfg[corner]);
   }
 
+  /* #1166: THE TAP, TAKEN HERE OR NOT AT ALL.
+   *
+   * "Make sure I can also activate hot corners by tapping on the corners.
+   *  or clicking."
+   *
+   * Everything that had to be true for a swipe to be possible was already
+   * checked at the down - the corners are on, this corner is not `off`, no
+   * sheet is up, it was the primary pointer, the left button, and the
+   * press landed inside the corner's square. If `live` is still here at
+   * the up, all of that held and the only questions left are whether the
+   * press stayed still, whether it was brief, and whose it was.
+   *
+   * The gates are re-checked rather than assumed: a sheet can have opened
+   * under the finger, and the preferences drawer can have turned the
+   * corner off, between the down and the up.
+   *
+   * ON FIRING, THE PRESS BECOMES OURS, exactly as a committed swipe does:
+   * the click the platform synthesises afterwards is swallowed by
+   * onClick. Without that a corner tap on the LISTEN view's backdrop
+   * would also be counted by that view's own double-tap-to-full-screen,
+   * and the operator would get two things for one finger. */
   function onUp(ev) {
-    if (live && ev.pointerId === live.id) { abandon(); return; }
+    if (live && ev.pointerId === live.id) {
+      var was = live;
+      live = null;
+      var dx = ev.clientX - was.x, dy = ev.clientY - was.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var ms = now() - was.t;
+      var what = cfg[was.corner] || 'off';
+      if (was.onControl                      /* somebody else's press */
+          || dist > TAP_PX                   /* it was going somewhere */
+          || ms > TAP_MS                     /* a press, not a tap */
+          || sheets.length                   /* a sheet owns the screen now */
+          || !cfg.enabled
+          || what === 'off') {
+        glowHide();
+        return;
+      }
+      swallowClickUntil = now() + 700;
+      glowPulse(was.corner);
+      eat(ev);
+      act(what);
+      return;
+    }
     if (swallowId !== null && ev.pointerId === swallowId) {
       swallowId = null;
       eat(ev);
@@ -1762,6 +1925,9 @@
     /* The pure parts, for a harness. */
     _cornerAt: cornerAt,
     _judge: judge,
+    /* #1166: whose press is this? Exported so the rail exemption can be
+     * checked against the real page rather than argued about. */
+    _overControl: overControl,
     _stepTable: stepTable,
     _heardRow: heardRow,
     _lastSfx: lastSfx,

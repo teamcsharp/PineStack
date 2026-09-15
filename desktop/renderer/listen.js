@@ -125,6 +125,45 @@
   const ENDLESS_CHECK_MS = 1000;
   let endlessBackdrop = false;
   let endlessAt = 0;
+  /* #1167 - "If I'm in endless video mode and I bring up the file report
+   * screen or any report screen, remove the video from displaying and mute
+   * the audio for a moment while I narrate to the dictation system. Don't
+   * have the audio playing and don't have videos popping up during the
+   * process of filing tickets. Resume everything after the ticket
+   * following screen has been closed or sent."
+   *
+   * DUCKING THE LEVEL WAS ONLY HALF OF IT, and the half that does not
+   * matter here. A clip behind a report pad is still MOVING - it is still
+   * running its cycle, still tearing down and starting the next one, and
+   * still asking for the eye of a man who is trying to describe a fault
+   * out loud. He said "remove the video from displaying", and that is the
+   * literal instruction: off the glass, not dimmed behind a sheet.
+   *
+   * PAUSED AND HIDDEN, NOT COVERED. A <video> that is merely painted over
+   * goes on decoding, goes on reaching its end, and goes on handing the
+   * wall to the clip after it. The existing hand-back road in
+   * paintEndless already does the right thing - pause, hide, drop the src,
+   * load() to let the frames go - so this does not invent a second way to
+   * put a clip down; it makes the set look OFF for as long as a report is
+   * up, and lets the road that already exists carry it.
+   *
+   * WHAT THE STILLS DO. "The backdrop falls back to whatever the view
+   * shows when there is no clip" - which is the gallery, and the gallery
+   * stays. He objected to VIDEO popping up, not to a photograph fading
+   * gently behind him, and a screen that goes black while he talks is a
+   * screen that looks like it crashed at the worst possible moment.
+   *
+   * THE SIGNAL IS PineDuck's. pine-duck.js knows about every report and
+   * diagnostic surface on both machines - the report pad, the inbox, the
+   * reason sheet, the ink overlay, a hot-corner sheet, the line inspector,
+   * the tablet doctor, the script-name menu and dictation itself - and its
+   * own sweep drops a hold whose element has left the page, so a sheet
+   * torn out without closing still ends the quiet. Reproducing any part of
+   * that list here would be a second answer to one question. */
+  let reporting = false;
+  let reportWas = null;         /* the mute state found when quiet began */
+  let unwatchDuck = null;
+
   /* #1147: true while a clip has been asked for and has no frame yet -
    * the window in which the WebView would otherwise paint its own play
    * badge, and the window the plexus covers. */
@@ -374,8 +413,13 @@
     const still = el("plBack");
     const vid = el("plBackVid");
 
-    /* Occasionally, a moving one. */
-    if (clips.length && vid && backdropTurn % CLIP_EVERY === 0) {
+    /* Occasionally, a moving one - but never while a report is up.
+     * #1167: "don't have videos popping up during the process of filing
+     * tickets" is not only about the endless set. The gallery road puts a
+     * clip on this same element every fifth turn, and one of those
+     * arriving mid-sentence is the same interruption by another door. The
+     * stills go on cycling; only the moving ones wait. */
+    if (!reporting && clips.length && vid && backdropTurn % CLIP_EVERY === 0) {
       const pick = clips[Math.floor(Math.random() * clips.length)];
       vid.src = genUrl(pick);   /* 2026-09-15 (#1151) */
       /* HIDDEN UNTIL IT HAS A FRAME. The plexus covers the download, which
@@ -538,7 +582,14 @@
     const tv = root.PineSfxTv;
     const vid = el("plBackVid");
     const still = el("plBack");
-    const on = !!(tv && typeof tv.endless === "function" && tv.endless()
+    /* #1167: a report is up, so the set is OFF as far as this wall is
+     * concerned. Folding it into `on` rather than adding a branch means
+     * the hand-back below - pause, hide, drop the src, let the frames go,
+     * give the wall back to the gallery - is the same road a set being
+     * switched off takes, and there is only ever one way a clip comes
+     * down off this screen. */
+    const on = !reporting
+      && !!(tv && typeof tv.endless === "function" && tv.endless()
       && typeof tv.playing === "function" && onScreen());
     const clip = on ? tv.playing() : null;
     const want = clip && clip.url ? absolute(String(clip.url)) : "";
@@ -743,6 +794,45 @@
     } catch (err) { /* a locked store must not stop the radio */ }
   }
 
+  /* #1167: go quiet, and come back exactly as found.
+   *
+   * THE MUTE IS RECORDED RATHER THAN ASSUMED. In endless mode paintEndless
+   * sets this element muted every time, because it is wallpaper and a
+   * backdrop that made noise would be a second voice over the station - so
+   * nine times in ten writing `true` here changes nothing and writing
+   * `true` back afterwards would be right by luck. It is not written back
+   * by luck. What was found is what is restored, so an element some other
+   * road deliberately left UNMUTED is handed back unmuted, and this
+   * function cannot be the reason a picture goes silent for good.
+   *
+   * Only the mute is carried across. Paused and hidden are not restored
+   * from here because they are not this function's to restore: when the
+   * report closes, paintEndless is asked to decide the wall again from
+   * scratch and puts a fresh clip up through the road that always builds
+   * one. Recording a `paused` this file would never write back would be a
+   * comment pretending to be code. */
+  function reportQuiet(on) {
+    const vid = el("plBackVid");
+    if (on) {
+      if (!reportWas && vid) reportWas = {el: vid, muted: !!vid.muted};
+      if (vid) {
+        if (!vid.muted) vid.muted = true;
+        try { vid.pause(); } catch (err) { /* it was not going anyway */ }
+        vid.hidden = true;
+      }
+      /* #1147's stand-in is a requestAnimationFrame loop and a picture in
+       * its own right. Neither belongs on the glass while he is talking. */
+      endlessWaiting = false;
+      showPlexus(false);
+      return;
+    }
+    const was = reportWas;
+    reportWas = null;
+    if (vid && was && was.el === vid && vid.muted !== was.muted) {
+      vid.muted = was.muted;
+    }
+  }
+
   /* Is this view the one on the glass? Either host class missing means the
    * operator has gone somewhere else and the chrome must come back. */
   function viewOpen() {
@@ -913,6 +1003,29 @@
     /* #1163: whatever he left it at. Pending until a clip is on the wall -
      * see paintBare. */
     barePending = readBare();
+
+    /* #1167: told the moment a report opens or closes, rather than found
+     * out a second later on the endless check's own rest. A second is a
+     * long time to have a clip moving behind a man who has started
+     * talking, and the resume has to be just as prompt or the picture he
+     * was promised back does not come back until he wonders whether it
+     * will. The dot is never touched - it is the thing he is dictating
+     * into. */
+    const duck = root.PineDuck;
+    if (!unwatchDuck && duck && typeof duck.watch === "function") {
+      unwatchDuck = duck.watch(function (on) {
+        const was = reporting;
+        reporting = !!on;
+        if (was === reporting) return;
+        reportQuiet(reporting);
+        /* Decide the wall again at once. On the way in this takes the clip
+         * down; on the way out it puts a fresh one up, with the plexus
+         * covering the load exactly as #1147 asks. Bare mode is not
+         * touched by any of it, so a screen he left full screen comes back
+         * full screen (#1163). */
+        if (mounted) paintEndless(Date.now(), true);
+      });
+    }
 
     /* THE DOUBLE TAP IS COUNTED HERE RATHER THAN LEFT TO `dblclick`.
      * A WebView synthesises dblclick from two taps only when it feels like
