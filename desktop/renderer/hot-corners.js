@@ -1466,6 +1466,22 @@
     box.appendChild(bar);
     box.appendChild(frame);
     doc.body.appendChild(box);
+    /* 2026-09-15 (#1172): "Whenever I'm in the process of editing a screen
+     * recording or editing a screenshot or filing a report, stop playing
+     * video and audio until I close the window. Also stop playing videos
+     * and spawning videos whenever I have a pop-up up dealing with
+     * diagnostic screen capture or video editing."
+     *
+     * The report pad, the ink overlay and every corner sheet already tell
+     * PineDuck they are open, and the listen and SFX roads stand their
+     * clips down on that signal (#1167). This editor was the one surface
+     * that did not - so a clip could play, and start the next one, behind
+     * the very window he is editing a clip in. The hold is tied to the
+     * element, so a road that tears the editor out without calling close()
+     * still ends the quiet. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('hc-video-editor', root.PineDuck.REPORT, box);
+    }
     var entry = {box: box, close: close};
     function close() {
       root.removeEventListener('message', receive);

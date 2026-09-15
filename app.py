@@ -156798,9 +156798,16 @@ border-radius:4px;background:var(--panel2)"></canvas>
           placeholder="Ask the Borg to do something…"></textarea>
         <!-- 2026-09-14: whether the station's own account of the moment
              (#1379) rides on this report. Asked every time, answered by
-             the tick; on by default. -->
+             the tick; on by default.
+             2026-09-15 (#1171): "Remember if I have this toggled off and
+             retain that setting so that way it's not enabled accidentally
+             for things that it's not needed for." It came back ticked
+             every time, so a deliberate no lasted exactly one report. The
+             tick is now remembered per glass - see pineDebugRemember
+             below - and on by default only until he says otherwise. -->
         <label class="toggle" style="margin-top:6px" title="Attach the station's state at the time - what is playing, what is being said, the last five lines, the script position, the loop, the dead air, the tablet">
-          <input id="pineDebug" type="checkbox" checked>
+          <input id="pineDebug" type="checkbox" checked
+                 onchange="pineDebugRemember(this)">
           Attach the station's debug information to this report
         </label>
         <button class="primary" style="margin-top:10px"
@@ -204831,6 +204838,39 @@ setTimeout(endlessRead, 2500);
 setInterval(endlessRead, 15000);
 
 let pineSending = false;
+
+
+      /* 2026-09-15 (#1171): THE TICK REMEMBERS BEING TURNED OFF.
+       *
+       * "Remember if I have this toggled off and retain that setting so
+       *  that way it's not enabled accidentally for things that it's not
+       *  needed for."
+       *
+       * localStorage rather than a station setting, deliberately: this is
+       * a per-glass preference like the rail's memory, and the operator
+       * filing from the desk has not decided anything about the tablet.
+       * Every read and write is wrapped - the accessor itself throws in
+       * some contexts on this stack, and a preference is never worth an
+       * exception. */
+      function pineDebugRemember(box) {
+        try { localStorage.setItem("pineDebugAttach", box.checked ? "1" : "0"); }
+        catch (err) { /* a glass that cannot remember still works */ }
+      }
+      (function () {
+        function restore() {
+          var box = document.getElementById("pineDebug");
+          if (!box) return;
+          try {
+            var saved = localStorage.getItem("pineDebugAttach");
+            if (saved !== null) box.checked = saved === "1";
+          } catch (err) { /* the default stands */ }
+        }
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", restore);
+        } else {
+          restore();
+        }
+      })();
 
 async function submitPine() {
   const ta = document.getElementById("pineInput");

@@ -771,7 +771,24 @@
     debugRow.setAttribute('style', 'display:flex;align-items:center;gap:8px;font-size:12px;color:#9fb3c0');
     var debug = document.createElement('input');
     debug.type = 'checkbox';
+    /* 2026-09-15 (#1171): "Remember if I have this toggled off and retain
+       that setting so that way it's not enabled accidentally for things
+       that it's not needed for." It was rebuilt ticked every time the pad
+       opened, so a deliberate no lasted exactly one report. Remembered per
+       glass in localStorage - the same key the panel's Pine Chat uses, so
+       one answer covers both places he files from on this screen - and on
+       by default only until he says otherwise. Every access is wrapped:
+       the accessor itself throws in some contexts on this stack, and a
+       preference is never worth an exception. */
     debug.checked = true;
+    try {
+      var savedDebug = localStorage.getItem('pineDebugAttach');
+      if (savedDebug !== null) debug.checked = savedDebug === '1';
+    } catch (err) { /* the default stands */ }
+    debug.addEventListener('change', function () {
+      try { localStorage.setItem('pineDebugAttach', debug.checked ? '1' : '0'); }
+      catch (err) { /* a glass that cannot remember still works */ }
+    });
     debugRow.appendChild(debug);
     debugRow.appendChild(document.createTextNode("Attach the station's debug information to this report"));
     var row = document.createElement('div');
