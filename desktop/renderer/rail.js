@@ -326,6 +326,35 @@
 
     document.body.appendChild(rail);
 
+    /* 2026-09-15: THE DESK'S OWN TABS MUST BE ABLE TO COME BACK.
+     *
+     * "whenever I click the main tab, it doesn't take me back to the main
+     *  tab anymore. It just stays where I am."
+     *
+     * On the desktop this rail ADOPTS the shell's own <section class="view">
+     * elements (#1344) and shows one by adding `.open` - which is
+     * position:fixed;inset:0 at z-index 2147483000, the whole glass. The
+     * shell's own nav (renderer.js selectView) only toggles `.active` on
+     * those same sections; it has never heard of `.open`, so a view opened
+     * from the rail stayed over the deck and the Agent tab looked dead.
+     *
+     * Bound in the CAPTURE phase on the document so it runs before the
+     * shell's own handler, and it only ever CLOSES - whatever the shell
+     * then decides to show is its business. The rail's own tabs carry
+     * `pine-view-tab`, so they are not this. */
+    document.addEventListener('click', function (ev) {
+      var node = ev.target;
+      while (node && node !== document) {
+        if (node.classList && node.classList.contains('pine-view-tab')) return;
+        if (node.classList && node.classList.contains('tab')
+            && node.getAttribute && node.getAttribute('data-view')) {
+          closeAll();
+          return;
+        }
+        node = node.parentNode;
+      }
+    }, true);
+
     /* THE STARTUP ASSEMBLY. Shown once, over whatever the panel is doing,
      * and it removes itself - the station is already on air behind it, so
      * nothing waits on this. The mark is a data URI (pine-logo.js) because
