@@ -82,7 +82,21 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   onReplayFlush: (callback) => ipcRenderer.on("replay-flush", () => callback()),
   /* #1205: replayBegin also carries {audio:{source, present, state, detail,
    * supported}} - the recorder telling the ring what its capture holds, since
-   * the renderer is the only side that can see the stream's track list. */
+   * the renderer is the only side that can see the stream's track list.
+   *
+   * #1207: and {streams:{picture, sound}}, because there are two recorders
+   * now and only one of them can fail at a time. The desk films the window
+   * with one capture and takes the broadcast off the panel's own frame with a
+   * second, audio-only one; the ring keeps their pieces apart and the cut
+   * lays the sound under the picture. main.js writes both into
+   * pinebox-ring-sound.log at every start, which is the only place a person
+   * outside the app can read which ring did not come up.
+   *
+   * replayPush's meta carries `kind`: 'a' for a piece of sound, anything else
+   * (or nothing) for a piece of picture. `at` is when the piece STARTED,
+   * taken in the renderer immediately before MediaRecorder.start() - the trip
+   * through this bridge is short but it is not zero, and every bit of the
+   * alignment arithmetic is done on those two stamps. */
   replayBegin: (opts) => ipcRenderer.invoke("replay:begin", opts),
   replayStop: (why) => ipcRenderer.invoke("replay:stop", why),
   replayPush: (buffer, meta) => ipcRenderer.invoke("replay:push", buffer, meta),

@@ -97,6 +97,83 @@
  * already reads (state / complete / coverage_ratio / video_only_explicit).
  */
 
+/* ---------------------------------------------------------------------------
+ * TWO RINGS, ONE CUT (2026-09-15, #1207).
+ *
+ *   "Similar to the tablet, I always want to capture the broadcast audio of
+ *    the recording. So any time that I go into the video editor, I need the
+ *    audio of the broadcast."
+ *
+ * #1205 above says the pieces "now arrive WITH an audio track". They never
+ * did. Every pairing that would have put the sound in the same capture as the
+ * picture was measured and refused by this Electron (37.10.3):
+ *
+ *   { video: win, audio: 'loopback' }     -> "Error starting capture".
+ *   { video: win, audio: <panel frame> }  -> the same, with the frame found
+ *                                            and correct in the log.
+ *   { video: <panel frame>, audio: same } -> ACCEPTED, and the piece did
+ *       carry 48 kHz opus - but the picture became the panel's own control
+ *       page: no rail, no menu, not the Listen view he was watching. A
+ *       recording of the wrong screen is worse than a silent one.
+ *
+ * What IS accepted is a SECOND capture, audio-only: the renderer asks
+ * getDisplayMedia({ video: false, audio: true }) and main.js answers
+ * { audio: <panel frame>, enableLocalEcho: true }. Measured: one audio track
+ * labelled "Tab audio", no video track, and two such captures of the same
+ * frame may be live at once - which is what makes this possible at all,
+ * because the window capture is already running beside it.
+ *
+ * So there are two rings. The picture ring is untouched. The sound ring holds
+ * its own pieces, and the cut lays them under the picture.
+ *
+ * -------------------------------------------------------------------------
+ * ALIGNMENT, WHICH IS THE WHOLE DIFFICULTY, AND WHAT WAS MEASURED.
+ *
+ * The naive scheme - concatenate each ring and shift the sound by the gap
+ * between the two first stamps - is wrong, and wrong by SECONDS. Measured
+ * over a real 70-second two-lane recording (35 pieces in each ring):
+ *
+ *     wall clock spanned            70.014 s
+ *     sound concat                  68.880 s   (-1.1 s)
+ *     picture concat                43.260 s   (-26.8 s)
+ *
+ * Desktop capture is CHANGE-DRIVEN. A screen that is not moving emits no
+ * frames, so a two-second piece of a still screen ends at its last frame and
+ * carries perhaps 1.2 s of timeline. The concat demuxer lays pieces end to
+ * end by their container durations, so every still moment pulls everything
+ * after it earlier - against a sound ring that is locked to real time. Over
+ * a ten-minute cut that is minutes of divergence, not milliseconds.
+ *
+ * THE CURE IS TO STOP LETTING THE CONTAINER DECIDE. Each list now carries an
+ * explicit `duration` directive per piece, and the duration is the interval
+ * to the NEXT piece's stamp - not the piece's own measured length, because
+ * that would leave the stop-and-start seam (about 32 ms on the sound ring,
+ * more on the picture ring) to accumulate. So piece k begins at exactly
+ * (at_k - at_0) in its ring's timeline: every piece re-anchors to the wall
+ * clock it was stamped with, and error cannot accumulate across a cut of any
+ * length. `-r 25` on the output fills a still stretch by holding the frame,
+ * which is the truthful picture of a screen that was not moving.
+ *
+ * Measured again with the directives in place, same recording:
+ *
+ *     picture concat 69.750 s, sound concat 69.940 s
+ *
+ * and, with a time code - the panel flashing white and clicking at 3 kHz in
+ * the same task, so the mark is in both media with no cross-process skew -
+ * read back out of a finished 20-second cut taken with a non-zero seek:
+ *
+ *     first mark +60 ms, last mark +60 ms  ->  drift across the cut +1 ms
+ *
+ * The residual is the sound landing 60-120 ms after the picture, and it does
+ * not grow. Most of that is where it has to be: a piece is stamped with
+ * Date.now() immediately before MediaRecorder.start(), and the picture's
+ * first frame arrives up to one capture interval later (83 ms at 12 fps)
+ * while the sound's first samples arrive within about 20 ms. Sound LATE
+ * against picture is the forgiving direction, and 60-120 ms is inside what
+ * broadcast practice allows (ITU-R BT.1359-1: up to 125 ms behind). A
+ * measured correction, if one is ever wanted, goes in ALIGN_NUDGE_MS.
+ */
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -119,8 +196,52 @@ const HOLD_MAX_S = 600;           /* ten minutes */
 const HOLD_MAX_BYTES = 900 * 1024 * 1024;
 
 /* #1205: the name the provenance carries, said the way the tablet says
- * "android-playback-mix" - what it IS, not which API produced it. */
-const AUDIO_SOURCE = 'desk-loopback-mix';
+ * "android-playback-mix" - what it IS, not which API produced it.
+ *
+ * #1207 renamed it. It said 'desk-loopback-mix' through a fortnight in which
+ * nothing was ever captured, and the name was doubly false once something
+ * was: this is not the machine's loopback and it is not a mix. It is the
+ * station panel's own audio - the broadcast, and only the broadcast, which is
+ * better than a loopback would have been, because it cannot pick up a
+ * notification or whatever else the desktop is doing. Nothing outside this
+ * file reads the string. */
+const AUDIO_SOURCE = 'desk-broadcast-frame';
+
+/* #1207: A SHIFT THIS LARGE MEANS A STAMP IS NOT BELIEVABLE.
+ *
+ * NOT a tolerance on how far out of step the sound may be. The shift is
+ * measured from the two rings' own stamps and compensated EXACTLY, whatever
+ * its size, so a large one is usually not an error at all: a sound ring that
+ * only came up twenty seconds into a thirty-second window is twenty seconds
+ * "out", and delaying it by twenty seconds puts it exactly where it belongs.
+ * Refusing that would throw away ten seconds of real broadcast to avoid a
+ * problem that does not exist. An earlier draft of this did precisely that.
+ *
+ * What cannot happen is a shift larger than the ring can hold. Both rings are
+ * asked for the same absolute window and pruned to the same wall clock, so
+ * the gap between their first pieces is bounded by the hold. Anything past
+ * that means a stamp is wrong - the system clock moved under the recorder -
+ * and then the operator's own rule applies: an audio track a second out of
+ * step is more distracting than none. The cut goes out silent and says why.
+ *
+ * The floor keeps it sane for very short holds; the real ceiling is the hold
+ * itself, computed at the cut. */
+const ALIGN_MAX_MS = 10000;
+
+/* A measured correction to put the sound ahead of where its stamps say, in
+ * milliseconds. Zero, deliberately: the time-code run put the sound 60-120 ms
+ * after the picture, but part of that is the probe's own paint-against-
+ * schedule skew and the rest is inside broadcast tolerance, so nothing is
+ * applied on a model rather than a measurement. This is where a correction
+ * goes if the operator ever actually hears one. */
+const ALIGN_NUDGE_MS = 0;
+
+/* A hole in the sound shorter than this is the recorder's stop-and-start
+ * seam, not a stretch of missing broadcast. Measured at about 32 ms per seam
+ * on the sound ring; a quarter second is a wide margin around that. Without
+ * it a thirty-second cut would report fifteen "gaps" and frighten somebody
+ * about a recording that is whole. */
+const GAP_MIN_MS = 250;
 
 function nowMs() { return Date.now(); }
 
@@ -128,11 +249,17 @@ class ScreenRing {
   constructor() {
     this.dir = null;
     this.pieces = [];             /* {file, at, ms, bytes, w, h, a} oldest first */
+    /* #1207: THE SECOND RING. The same shape, from the second recorder - the
+     * audio-only capture of the panel frame. Kept apart from the picture
+     * rather than merged, because the two recorders stop and start on their
+     * own clocks and a merged list could not say which ring a hole was in. */
+    this.sound = [];
     this.holdSeconds = HOLD_DEFAULT_S;
     this.running = false;
     this.detail = 'not started';
     this.startedAt = 0;
     this.dropped = 0;             /* pieces aged out, for the record */
+    this.soundDropped = 0;
     /* #1182d: bumped on every piece that lands, so a cut can wait for the
      * one it just asked for rather than sleeping a guessed interval. */
     this.taken = 0;
@@ -232,8 +359,13 @@ class ScreenRing {
     const m = meta || {};
     const ms = Math.max(1, Math.round(Number(m.ms) || SEGMENT_MS));
     const at = Math.round(Number(m.at) || (nowMs() - ms));
+    /* #1207: which ring this piece belongs to. Absent means the picture, so
+     * a renderer that has not been updated still fills the ring it always
+     * filled rather than dropping its pieces on the floor. */
+    const isSound = String(m.kind || '') === 'a';
     this.ensureDir();
-    const file = path.join(this.dir, 'p' + String(at) + '.webm');
+    const file = path.join(this.dir,
+      (isSound ? 'a' : 'p') + String(at) + '.webm');
     try {
       fs.writeFileSync(file, Buffer.from(buffer));
     } catch (error) {
@@ -243,18 +375,29 @@ class ScreenRing {
     this.taken += 1;
     /* #1205: `a` is the renderer's answer to "did THIS piece carry a live
      * audio track", asked of the stream at the moment the piece closed. A
-     * piece from a recorder that lost its loopback halfway through says
-     * false, and the cut's coverage says so rather than the file quietly
-     * going quiet in the middle. */
-    this.pieces.push({ file, at, ms, bytes: buffer.length,
+     * piece from a recorder that lost its capture halfway through says false,
+     * and the cut's coverage says so rather than the file quietly going quiet
+     * in the middle. On a picture piece it is always false now (#1207): the
+     * picture ring carries no sound and never claims to. */
+    const piece = { file, at, ms, bytes: buffer.length,
       w: Math.round(Number(m.w) || 0), h: Math.round(Number(m.h) || 0),
-      a: !!m.a });
-    this.pieces.sort((a, b) => a.at - b.at);
-    this.running = true;
-    this.detail = 'recording';
-    this.startedAt = this.startedAt || at;
+      a: !!m.a };
+    if (isSound) {
+      this.sound.push(piece);
+      this.sound.sort((a, b) => a.at - b.at);
+    } else {
+      this.pieces.push(piece);
+      this.pieces.sort((a, b) => a.at - b.at);
+      /* Only the picture decides that the ring is running and when it began.
+       * A sound ring that outlived the picture must not hold the recorder
+       * open on its own - there would be nothing to cut. */
+      this.running = true;
+      this.detail = 'recording';
+      this.startedAt = this.startedAt || at;
+    }
     this.prune();
-    return { ok: true, held: this.heldSeconds(), pieces: this.pieces.length };
+    return { ok: true, held: this.heldSeconds(),
+      pieces: this.pieces.length, sound: this.sound.length };
   }
 
   /* Old pieces go, by time first and by weight second. */
@@ -268,6 +411,15 @@ class ScreenRing {
     while (this.pieces.length > 1 && this.bytes() > HOLD_MAX_BYTES) {
       this.drop(this.pieces[0]);
     }
+    /* #1207: the sound ring is pruned to the same wall clock, on its own, so
+     * neither ring can hold the other's pieces alive. It is not weighed: a
+     * second of opus is about 16 kB against a second of picture at 200 kB,
+     * so the byte ceiling that matters is the picture's. */
+    while (this.sound.length > 1) {
+      const first = this.sound[0];
+      if (first.at + first.ms >= keepFrom) break;
+      this.dropSound(first);
+    }
   }
 
   drop(piece) {
@@ -276,10 +428,18 @@ class ScreenRing {
     try { fs.unlinkSync(piece.file); } catch (e) { /* already gone */ }
   }
 
+  dropSound(piece) {
+    this.sound.shift();
+    this.soundDropped += 1;
+    try { fs.unlinkSync(piece.file); } catch (e) { /* already gone */ }
+  }
+
   forget() {
     this.running = false;
     for (const p of this.pieces) { try { fs.unlinkSync(p.file); } catch (e) {} }
+    for (const p of this.sound) { try { fs.unlinkSync(p.file); } catch (e) {} }
     this.pieces = [];
+    this.sound = [];
     if (this.dir) { try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch (e) {} }
     this.dir = null;
   }
@@ -323,48 +483,96 @@ class ScreenRing {
     return { ok: true, running: !!this.running, seconds: Math.round(held * 10) / 10,
       holds: this.holdSeconds, bytes: this.bytes(), pieces: this.pieces.length,
       dropped: this.dropped, era: this.era(), where: this.dir || '',
+      /* #1207: HOW MANY RINGS THIS BUILD KEEPS, and it is a handshake, not a
+       * statistic.
+       *
+       * The renderer is reloaded whenever a file on the share changes; the
+       * main process is not, and only comes up again when Pine Box is
+       * restarted. So a new renderer routinely runs against an old main
+       * process, and this is the pairing that goes wrong: a renderer that
+       * sends sound pieces tagged `kind: 'a'` to a ring that has never heard
+       * of `kind` gets every one of them filed in with the picture. That
+       * happened on the live desk while this was being written - opus pieces
+       * sitting in the picture list, where a cut would concat them together
+       * with the video and ffmpeg would refuse the lot.
+       *
+       * So the renderer asks before it opens the second capture, and a build
+       * that cannot answer (older main.js: `rings` is undefined) is told no.
+       * The desk then films the window silently, exactly as it did before,
+       * until it is restarted - which is the honest outcome and not a broken
+       * ring. */
+      rings: 2,
       /* #1205: the sheet asks this BEFORE it cuts, so the checkbox about
        * allowing video without complete audio is a decision made with the
        * answer in hand rather than a guess. `held_ratio` is measured over
        * the pieces on disk, not claimed by the recorder. */
-      audio: { ...this.audioSaid, held_ratio: this.heldAudioRatio() },
+      audio: { ...this.audioSaid, held_ratio: this.heldAudioRatio(),
+        /* #1207: the sound ring's own count, so the sheet can tell a ring
+         * that never started from one that started and went quiet. */
+        pieces: this.sound.length, dropped: this.soundDropped },
       detail };
   }
 
   /* How much of what is HELD carries sound, 0..1. 0 with nothing held, so a
-   * fresh ring reads as "no sound yet" rather than "complete". */
+   * fresh ring reads as "no sound yet" rather than "complete".
+   *
+   * #1207: measured by laying the SOUND ring over the span the PICTURE ring
+   * holds, because that span is what a cut can be taken out of. A sound ring
+   * running beside no picture is 0, not 1: there is nothing to put it under. */
   heldAudioRatio() {
+    if (!this.pieces.length) return 0;
+    const last = this.pieces[this.pieces.length - 1];
+    const from = this.pieces[0].at;
+    const to = last.at + last.ms;
+    const total = to - from;
+    if (total <= 0) return 0;
     let heard = 0;
-    let total = 0;
-    for (const p of this.pieces) { total += p.ms; if (p.a) heard += p.ms; }
-    if (!total) return 0;
-    return Math.round((heard / total) * 1000) / 1000;
+    for (const p of this.sound) {
+      if (!p.a) continue;
+      const start = Math.max(p.at, from);
+      const end = Math.min(p.at + p.ms, to);
+      if (end > start) heard += (end - start);
+    }
+    return Math.round(Math.min(1, heard / total) * 1000) / 1000;
   }
 
   /* The pieces covering `seconds` of video ending `back` seconds ago, newest
    * era only. Returns what it could actually reach, never a promise it
    * cannot keep. */
-  window(seconds, back) {
+  /* #1207: `which` picks the ring - 'sound' for the second recorder's
+   * pieces, anything else for the picture. Both are asked for the SAME
+   * absolute window, which is what lets the cut put them on one timeline:
+   * `start` and `end` come back so the caller can do that arithmetic without
+   * recomputing nowMs() and getting a different answer a millisecond later. */
+  window(seconds, back, which) {
     const want = Math.max(0.2, Number(seconds) || 0);
     const behind = Math.max(0, Number(back) || 0);
+    const sound = which === 'sound';
+    const list = sound ? this.sound : this.pieces;
     const held = this.heldSeconds();
-    if (!this.pieces.length) {
-      return { ok: false, held: 0, detail: 'the ring is empty' };
+    if (!list.length) {
+      return { ok: false, held: sound ? held : 0, start: 0, end: 0,
+        detail: sound ? 'the sound ring is empty' : 'the ring is empty' };
     }
     const end = nowMs() - (behind * 1000);
     const start = end - (want * 1000);
-    const era = this.era();
+    /* The era is the picture's problem alone: it exists because the concat
+     * demuxer refuses pieces whose codec parameters disagree and the window
+     * is resizable. Opus at 48 kHz does not change shape when a window is
+     * dragged, so the sound ring has no eras to keep apart. */
+    const era = sound ? { w: 0, h: 0 } : this.era();
     const used = [];
     let clamped = false;
-    for (const p of this.pieces) {
+    for (const p of list) {
       if (p.at + p.ms <= start) continue;
       if (p.at >= end) continue;
       if (era.w && p.w && (p.w !== era.w || p.h !== era.h)) { clamped = true; continue; }
       used.push(p);
     }
     if (!used.length) {
-      return { ok: false, held, clamped,
-        detail: 'nothing in the ring covers that window' };
+      return { ok: false, held, clamped, start, end,
+        detail: sound ? 'nothing in the sound ring covers that window'
+          : 'nothing in the ring covers that window' };
     }
     const first = used[0];
     const last = used[used.length - 1];
@@ -375,7 +583,7 @@ class ScreenRing {
     const to = Math.max(0, (nowMs() - (last.at + last.ms)) / 1000);
     /* How far into the first piece the wanted window begins. */
     const offset = Math.max(0, (start - first.at) / 1000);
-    return { ok: true, pieces: used, held, clamped,
+    return { ok: true, pieces: used, held, clamped, start, end,
       from: Math.round(from * 10) / 10, to: Math.round(to * 10) / 10,
       offset, seconds: Math.min(want, ((last.at + last.ms) - Math.max(start, first.at)) / 1000),
       w: era.w, h: era.h };
@@ -402,56 +610,137 @@ class ScreenRing {
    *   unavailable  none did, and `detail` says why in plain words.
    *
    * There is deliberately no state that means "probably". */
-  soundFor(window, videoOnly) {
-    const pieces = (window && window.pieces) || [];
+  /* #1207: MEASURED OVER THE SOUND RING, AGAINST THE PICTURE'S OWN WINDOW.
+   *
+   * `shot` is the picture window the cut is really using and `heard` is the
+   * sound window for the same absolute seconds. Coverage is the fraction of
+   * the picture's span that the sound ring actually holds - overlap by the
+   * clock, not a count of pieces, because the two rings' pieces do not share
+   * boundaries and never will.
+   *
+   * `shift` is how far the sound has to be moved to sit under the picture,
+   * and it is REPORTED rather than hidden: an operator who hears something
+   * odd should be able to read what was done to the sound. */
+  soundFor(shot, videoOnly, heard, shift) {
     const said = this.audioSaid || {};
+    const holds = (heard && heard.ok && heard.pieces) ? heard.pieces : [];
     const audio = { source: AUDIO_SOURCE, present: false, complete: false,
       state: 'unavailable', detail: '', coverage_ratio: 0,
       covered_seconds: 0, window_seconds: 0, gaps: 0, gap_seconds: 0,
-      pieces: pieces.length, pieces_with_audio: 0,
+      pieces: holds.length, pieces_with_audio: 0,
       video_only_explicit: !!videoOnly, platform: process.platform,
-      supported: said.supported === undefined ? null : said.supported };
+      supported: said.supported === undefined ? null : said.supported,
+      align_shift_ms: null, align_bound_ms: null };
     if (videoOnly) {
       audio.detail = 'video only, as asked';
       return audio;
     }
-    let heard = 0;
-    let missed = 0;
-    let gaps = 0;
-    let inGap = false;
-    for (const p of pieces) {
-      if (p.a) { heard += p.ms; inGap = false; audio.pieces_with_audio += 1; }
-      else { missed += p.ms; if (!inGap) { gaps += 1; inGap = true; } }
+    /* The span the cut will really cover, in absolute ms: where the picture
+     * begins and how long of it there is. */
+    const shotPieces = (shot && shot.pieces) || [];
+    if (!shotPieces.length) {
+      audio.detail = 'there is no picture to put sound under';
+      return audio;
     }
-    const total = heard + missed;
-    audio.window_seconds = Math.round((total / 1000) * 10) / 10;
-    audio.covered_seconds = Math.round((heard / 1000) * 10) / 10;
+    const from = Math.max(shot.start, shotPieces[0].at);
+    const to = from + (shot.seconds * 1000);
+    audio.window_seconds = Math.round(((to - from) / 1000) * 10) / 10;
+    if (!holds.length) {
+      audio.detail = said.detail || (said.supported === false
+        ? 'the panel has no sound to capture on this surface, so the '
+          + 'recording is silent'
+        : 'the sound ring held nothing for that window');
+      return audio;
+    }
+    /* #1207: a shift larger than the ring can hold is not a late start, it is
+     * a broken stamp. Better a silent cut that says so than a track laid down
+     * on a timeline that cannot be true. Anything short of that is
+     * compensated exactly, however large it looks. */
+    const ceiling = Math.max(ALIGN_MAX_MS, (this.holdSeconds * 1000) + SEGMENT_MS);
+    if (shift === null || !Number.isFinite(shift) || Math.abs(shift) > ceiling) {
+      audio.detail = 'the two rings are ' + Math.round(Math.abs(Number(shift) || 0))
+        + ' ms apart, which is further than the ring can hold, so a stamp is '
+        + 'wrong and the sound was left out rather than laid down out of step';
+      return audio;
+    }
+    audio.align_shift_ms = Math.round(shift);
+    /* What is left after the shift: the two recorders are stamped on the same
+     * clock in the same thread, so what remains is the difference between how
+     * long each one takes to produce its first sample - bounded by one
+     * capture interval of the picture. */
+    audio.align_bound_ms = Math.round(1000 / 12);
+    /* Overlap by the clock. Only pieces the recorder said carried a live
+     * track count; one that was recorded off a dead capture is a hole. */
+    const spans = [];
+    for (const p of holds) {
+      if (!p.a) continue;
+      const start = Math.max(p.at, from);
+      const end = Math.min(p.at + p.ms, to);
+      if (end > start) { spans.push([start, end]); audio.pieces_with_audio += 1; }
+    }
+    spans.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const span of spans) {
+      const last = merged[merged.length - 1];
+      if (last && span[0] <= last[1] + GAP_MIN_MS) {
+        last[1] = Math.max(last[1], span[1]);
+      } else { merged.push([span[0], span[1]]); }
+    }
+    let covered = 0;
+    for (const span of merged) covered += (span[1] - span[0]);
+    /* Holes worth naming: the head, the tail, and anything between the merged
+     * runs. The merge above has already swallowed the recorder's own seams. */
+    let gaps = 0;
+    let missed = 0;
+    let edge = from;
+    for (const span of merged) {
+      if (span[0] - edge >= GAP_MIN_MS) { gaps += 1; missed += (span[0] - edge); }
+      edge = Math.max(edge, span[1]);
+    }
+    if (to - edge >= GAP_MIN_MS) { gaps += 1; missed += (to - edge); }
+    const total = Math.max(1, to - from);
+    audio.covered_seconds = Math.round((covered / 1000) * 10) / 10;
     audio.gap_seconds = Math.round((missed / 1000) * 10) / 10;
     audio.gaps = gaps;
-    audio.coverage_ratio = total ? Math.round((heard / total) * 1000) / 1000 : 0;
-    if (!heard) {
-      audio.detail = said.detail
-        || (said.supported === false
-          ? 'this platform has no loopback capture, so the recording is silent'
-          : 'the recorder captured no audio track');
+    audio.coverage_ratio = Math.round(Math.min(1, covered / total) * 1000) / 1000;
+    if (!covered) {
+      audio.detail = said.detail || 'the sound ring held nothing for that window';
       return audio;
     }
     audio.present = true;
-    audio.complete = !missed;
-    audio.state = missed ? 'partial' : 'captured';
-    audio.detail = missed
-      ? ('the desk mix, with ' + gaps + (gaps === 1 ? ' gap' : ' gaps')
+    audio.complete = !gaps;
+    audio.state = gaps ? 'partial' : 'captured';
+    audio.detail = gaps
+      ? ('the broadcast, with ' + gaps + (gaps === 1 ? ' gap' : ' gaps')
          + ' totalling ' + audio.gap_seconds.toFixed(1) + 's')
-      : 'the desk mix, captured with the picture';
+      : 'the broadcast, from the panel, laid under the picture';
     return audio;
   }
 
   /* --------------------------------------------------------------- cuts */
 
-  listFile(dir, pieces) {
-    const lines = pieces.map(
-      (p) => "file '" + p.file.replace(/\\/g, '/').replace(/'/g, "'\\''") + "'");
-    const list = path.join(dir, 'pieces.txt');
+  /* #1207: EVERY PIECE CARRIES THE WALL CLOCK IT WAS STAMPED WITH.
+   *
+   * Without the `duration` directives the concat demuxer lays pieces end to
+   * end by their container lengths, and a picture piece of a still screen is
+   * shorter than the time it covers - measured at 43.26 s of timeline for
+   * 70.01 s of recording, because desktop capture emits no frames while
+   * nothing moves. Sound cannot be laid under a timeline like that.
+   *
+   * The duration written is the interval to the NEXT piece's stamp, not the
+   * piece's own measured length: that puts piece k at exactly (at_k - at_0)
+   * and leaves the stop-and-start seam out of the arithmetic entirely, so it
+   * cannot accumulate over a ten-minute cut. The last piece has no next, so
+   * it declares what it measured. */
+  listFile(dir, pieces, name) {
+    const lines = [];
+    for (let i = 0; i < pieces.length; i += 1) {
+      const p = pieces[i];
+      lines.push("file '" + p.file.replace(/\\/g, '/').replace(/'/g, "'\\''") + "'");
+      const next = (i + 1 < pieces.length) ? (pieces[i + 1].at - p.at) : p.ms;
+      lines.push('duration ' + (Math.max(1, next) / 1000).toFixed(3));
+    }
+    const list = path.join(dir, name || 'pieces.txt');
     fs.writeFileSync(list, lines.join('\n') + '\n', 'utf8');
     return list;
   }
@@ -474,21 +763,71 @@ class ScreenRing {
    * is retried with `-an` and the provenance is DOWNGRADED to unavailable
    * with the encoder's own words in it. A cut that says "captured" must never
    * be a cut that is silent. */
+  /* #1207: HOW THE SOUND IS PUT ON THE PICTURE'S TIMELINE.
+   *
+   * Both lists are already anchored to the wall clock by their `duration`
+   * directives, so input 0 at time t is absolute (vfirst.at + t) and input 1
+   * at time t is absolute (afirst.at + t). One shift puts them together:
+   *
+   *   shift = vfirst.at - afirst.at
+   *
+   *   shift > 0  the sound ring began first, so drop `shift` off its front.
+   *              atrim leaves the original timestamps behind it, which is why
+   *              asetpts follows and not the other way round.
+   *   shift < 0  the sound ring began later, so hold it back by that much.
+   *              Here asetpts must come FIRST: asetpts=PTS-STARTPTS after an
+   *              adelay would reset the delay it had just applied, silently,
+   *              and the sound would be early by exactly the amount it was
+   *              supposed to be late.
+   *
+   * aresample=async=1:first_pts=0 closes the arithmetic: it pads the front
+   * with real silence so the stream begins at zero, and it fills the seams
+   * between pieces rather than pulling everything after a seam earlier. */
+  soundFilter(shift) {
+    const bits = [];
+    const ms = Math.round(shift) - ALIGN_NUDGE_MS;
+    if (ms > 0) {
+      bits.push('atrim=start=' + (ms / 1000).toFixed(3));
+      bits.push('asetpts=PTS-STARTPTS');
+    } else if (ms < 0) {
+      bits.push('asetpts=PTS-STARTPTS');
+      bits.push('adelay=' + Math.abs(ms) + ':all=1');
+    } else {
+      bits.push('asetpts=PTS-STARTPTS');
+    }
+    bits.push('aresample=async=1:first_pts=0');
+    return '[1:a]' + bits.join(',') + '[pinesound]';
+  }
+
   async cut(want, options) {
     const opts = options || {};
     const got = this.window(want.seconds, want.back);
+    /* THE PICTURE DECIDES WHETHER THERE IS A CUT AT ALL. A sound ring with no
+     * picture behind it produces nothing - a black rectangle with a broadcast
+     * on it is not a screen recording, and nobody asked for one. */
     if (!got.ok) return { ok: false, detail: got.detail, held: got.held };
+    /* And the sound is entirely optional: every road below this line still
+     * lands a silent recording if the second ring is empty, dead, or was
+     * never started. */
+    const heard = want.video_only ? null : this.window(want.seconds, want.back, 'sound');
+    const shift = (heard && heard.ok && heard.pieces.length && got.pieces.length)
+      ? (got.pieces[0].at - heard.pieces[0].at) : null;
     const dir = clipMux.stash();
-    const audio = this.soundFor(got, want.video_only);
+    const audio = this.soundFor(got, want.video_only, heard, shift);
     try {
       const list = this.listFile(dir, got.pieces);
+      const soundList = audio.present ? this.listFile(dir, heard.pieces, 'sound.txt') : '';
       const out = want.out || path.join(dir, 'screen.mp4');
       const build = (withSound) => ['-hide_banner', '-nostdin', '-y',
         '-f', 'concat', '-safe', '0', '-i', list,
+        ...(withSound ? ['-f', 'concat', '-safe', '0', '-i', soundList] : []),
+        ...(withSound
+          ? ['-filter_complex', this.soundFilter(audio.align_shift_ms),
+             '-map', '0:v:0', '-map', '[pinesound]']
+          : []),
         '-ss', got.offset.toFixed(3), '-t', got.seconds.toFixed(3),
         ...(withSound
-          ? ['-map', '0:v:0', '-map', '0:a:0',
-             '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2']
+          ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2']
           : ['-an']),
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
         '-pix_fmt', 'yuv420p', '-r', '25',
@@ -543,9 +882,10 @@ class ScreenRing {
         '-ss', (got.offset + (0.5 / Math.max(fps, 0.01))).toFixed(3),
         '-t', span.toFixed(3),
         '-vf', 'fps=' + fps.toFixed(5) + ',scale=' + edge + ':-2:flags=bicubic',
-        /* #1205: the pieces carry sound now and the scrub strip is stills.
-         * Said out loud so no decoder time is spent on a track that cannot
-         * reach a JPEG. */
+        /* #1205: said out loud so no decoder time is spent on a track that
+         * cannot reach a JPEG. #1207: the picture ring has no audio track at
+         * all now - the sound is a second ring and this never opens it - so
+         * this is belt and braces rather than the thing that strips it. */
         '-an',
         '-frames:v', String(count), '-q:v', '4',
         path.join(dir, 'f%03d.jpg')];
@@ -578,4 +918,4 @@ class ScreenRing {
 }
 
 module.exports = { ScreenRing, SEGMENT_MS, HOLD_DEFAULT_S, HOLD_MIN_S, HOLD_MAX_S,
-  HOLD_MAX_BYTES, AUDIO_SOURCE };
+  HOLD_MAX_BYTES, AUDIO_SOURCE, ALIGN_MAX_MS, ALIGN_NUDGE_MS, GAP_MIN_MS };

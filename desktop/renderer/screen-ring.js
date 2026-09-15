@@ -71,6 +71,56 @@
  * and the desk's clip window still only offers a mic channel for recordings
  * that arrived from the tablet with one. Recording the room because somebody
  * asked for the broadcast would be a different feature and a worse one.
+ *
+ * ---------------------------------------------------------------------------
+ * AND #1205 WAS WRONG ABOUT HOW (2026-09-15, #1207).
+ *
+ * The comment above says the handler answers `{ video: win, audio: 'loopback' }`
+ * and that the sound comes with the picture. It never did - every capture
+ * fell straight through to the legacy road and every recording was silent.
+ * The diagnostic in the temp folder is what finally said so, in one line:
+ *
+ *     the window would not give up its sound: Error starting capture
+ *
+ * Measured against Electron 37.10.3: `{ video: win, audio: 'loopback' }` is
+ * refused, and so is `{ video: win, audio: <panel frame> }`. System loopback
+ * is offered for a SCREEN and not beside one window; and a BrowserWindow is
+ * not a thing this Electron will take as `video` at all ("video must be a
+ * WebFrameMain or DesktopCapturerSource"). So getDisplayMedia has always
+ * failed here and the picture has always come from the getUserMedia road
+ * below - which is exactly why the picture is right and the file is silent.
+ *
+ * Pointing the capture at the panel frame for BOTH streams was accepted and
+ * did carry 48 kHz opus, but then the picture is the panel's own control
+ * page: no rail, no menu, not the view he was watching.
+ *
+ * WHAT IS ACCEPTED IS A SECOND CAPTURE WITH NO PICTURE IN IT AT ALL:
+ *
+ *     getDisplayMedia({ video: false, audio: true })
+ *       answered with { audio: <panel frame>, enableLocalEcho: true }
+ *
+ * Measured: one audio track, labelled "Tab audio", no video track; it may run
+ * beside the window capture; and asking with `video: true` instead fails the
+ * whole request, because the handler must then produce a picture it has not
+ * got. So the constraint below says `video: false` and that is load-bearing.
+ *
+ * enableLocalEcho IS NOT OPTIONAL, AND IT WAS MEASURED BY LISTENING. With a
+ * tone playing in the panel and the machine's own speaker mix read back
+ * through a screen-loopback capture, one FFT bin, tone on minus tone off:
+ *
+ *     nothing capturing the frame        -28.1 dB
+ *     capturing it, enableLocalEcho true -28.0 dB   (the speakers keep it)
+ *     capturing it, flag left off        -85.4 dB   (the speakers lose it)
+ *
+ * That is the worst outcome available here - the operator listening to his
+ * own station and the recorder silencing it - and it is one missing property
+ * away at all times.
+ *
+ * THE PICTURE RECORDER BELOW IS UNCHANGED except that it now asks for
+ * `audio: false`. It never got sound and cannot; saying so makes the request
+ * honest, lets main.js tell the two captures apart by what they asked for,
+ * and removes the reason the old code had to reopen the window capture on a
+ * gesture - so the picture is now opened once and never disturbed again.
  */
 (function (root) {
   'use strict';
@@ -95,6 +145,25 @@
   var parts = [];
   var failures = 0;
   var said = '';
+  /* #1207: THE SECOND RECORDER. Its own capture, its own MediaRecorder, its
+   * own two-second loop. Deliberately not coupled to the picture's: they
+   * cannot be made to start on the same millisecond, so the cut is built to
+   * measure the difference instead - and keeping them independent means
+   * either one can die without stopping the other. */
+  var sndStream = null;
+  var sndRec = null;
+  var sndRunning = false;
+  var sndStopping = false;
+  var sndStartedAt = 0;
+  var sndParts = [];
+  var sndPieces = 0;
+  /* #1207: the open that is already in flight. start() asks for the sound and
+   * main.js asks again a moment later with its own user activation, so two
+   * calls can be in the air before either has resolved. Without this they
+   * would both open a capture of the panel and the second would overwrite the
+   * first - two encoders on one frame, one of them orphaned and never
+   * stopped. Callers share the one promise instead. */
+  var sndOpening = null;
   /* #1205: what this capture carries, as a thing that can be ASKED rather
    * than assumed. `state` is one of capturing / unavailable, `detail` is the
    * plain reason the editor and the export sheet print. */
@@ -127,6 +196,16 @@
     var want = withAudio
       ? ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm']
       : ['video/webm;codecs=vp8', 'video/webm;codecs=vp9', 'video/webm'];
+    return firstSupported(want);
+  }
+
+  /* #1207: the sound ring's own container. Opus in WebM, which is what the
+   * capture hands over anyway, so nothing is transcoded until the cut. */
+  function pickSoundType() {
+    return firstSupported(['audio/webm;codecs=opus', 'audio/webm']);
+  }
+
+  function firstSupported(want) {
     for (var i = 0; i < want.length; i += 1) {
       try {
         if (root.MediaRecorder && root.MediaRecorder.isTypeSupported(want[i])) return want[i];
@@ -135,13 +214,16 @@
     return '';
   }
 
-  /* Is there a live audio track on the capture RIGHT NOW? Asked per piece,
-   * because a loopback that ends underneath the recorder - a device changed,
-   * an output switched - must show up as a gap in the ring's coverage rather
-   * than as a file that is quietly silent halfway through. */
+  /* Is there a live audio track on the SOUND capture right now? Asked per
+   * piece, because a capture that ends underneath the recorder - the panel
+   * reloaded, an output switched - must show up as a gap in the ring's
+   * coverage rather than as a file that is quietly silent halfway through.
+   *
+   * #1207: it asks the sound capture, not the picture's. The picture capture
+   * has no audio track and asking it would report silence forever. */
   function audioLive() {
     var tracks = [];
-    try { tracks = (stream && stream.getAudioTracks && stream.getAudioTracks()) || []; }
+    try { tracks = (sndStream && sndStream.getAudioTracks && sndStream.getAudioTracks()) || []; }
     catch (err) { return false; }
     for (var i = 0; i < tracks.length; i += 1) {
       if (tracks[i] && tracks[i].readyState === 'live' && !tracks[i].muted) return true;
@@ -154,16 +236,25 @@
    * never inferred down there. */
   function tellSound() {
     if (!has('replayBegin')) return;
-    try { desk().replayBegin({ audio: { source: 'desk-loopback-mix',
+    try { desk().replayBegin({ audio: { source: 'desk-broadcast-frame',
       present: !!sound.present, state: sound.state, detail: sound.detail,
-      supported: sound.supported } }); }
+      supported: sound.supported, road: sound.road },
+      /* #1207: both streams named on the one road that writes the
+       * diagnostic, because a fault in either is read out of that file. */
+      streams: { picture: { open: !!stream, running: !!running },
+                 sound: { open: !!sndStream, running: !!sndRunning,
+                          pieces: sndPieces } } }); }
     catch (err) { /* a bridge that will not take it is not a failed capture */ }
   }
 
   /* One piece, start to finish. Resolves when the piece is on its way down. */
   function recordOne() {
     if (!running || !stream) return;
-    var withAudio = audioLive();
+    /* #1207: false, always. The picture capture is opened with `audio: false`
+     * and this Electron has no road that would put sound on it; the sound is
+     * the second ring below. Kept as a variable rather than folded away so
+     * the shape of this function still matches recordSound(). */
+    var withAudio = false;
     var type = pickType(withAudio);
     var options = { videoBitsPerSecond: BITS };
     if (withAudio) options.audioBitsPerSecond = AUDIO_BITS;
@@ -209,8 +300,10 @@
         catch (err) { size = {}; }
         /* #1205: `a` is this piece's own answer about sound - the state the
          * recorder was STARTED with, so a track that died mid-piece is not
-         * claimed by the piece it died in. */
+         * claimed by the piece it died in. #1207: on a picture piece that is
+         * always false, and the ring reads coverage off the sound ring. */
         return desk().replayPush(buf, { at: at, ms: ms, a: !!withAudio,
+          kind: 'v',
           w: Math.round(size.width || WIDTH), h: Math.round(size.height || HEIGHT) });
       }).then(null, function (err) {
         failures += 1;
@@ -231,7 +324,7 @@
     }, SEG_MS);
   }
 
-  /* THE CAPTURE, AND THE ONE ROAD THAT CARRIES SOUND (#1182c, #1205).
+  /* THE PICTURE CAPTURE, AND ONLY THE PICTURE (#1182c, #1205, #1207).
    *
    * #1182c measured this and the measurement still stands: getDisplayMedia
    * requires TRANSIENT USER ACTIVATION - something pressed within the last
@@ -241,18 +334,20 @@
    * carries no such requirement, which is why the ring has been opened that
    * way.
    *
-   * #1205 is why the ORDER is now the other way round. The application's own
-   * audio is offered through the display-media handler and nowhere else:
-   * main.js answers it with `audio: 'loopback'`. The legacy constraints road
-   * has no equivalent that this Electron will honour, so a ring opened that
-   * way can only ever be silent - and silent was the whole complaint.
+   * #1205 turned the order round in the belief that getDisplayMedia was the
+   * only road that could carry the desk's sound. #1207 measured what actually
+   * happened when it did: the handler answers `{ video: win, ... }`, this
+   * Electron refuses a BrowserWindow as `video` outright, and EVERY capture
+   * has fallen through to the legacy road below. That is not a fault to fix
+   * here - the legacy road is the one producing the correct picture, window
+   * frame, rail, menu bar and all - so the order is left exactly as it is and
+   * the sound is taken by a second capture instead.
    *
-   * So: getDisplayMedia FIRST, called synchronously so that a supplied
-   * activation is spent on the capture rather than on an IPC round trip;
-   * the legacy road second, for when there is no activation to spend, and
-   * with an honest note that the recording will have no sound until a gesture
-   * upgrades it. Never the reverse - a video-only capture that succeeded
-   * first would keep the ring silent for the whole session. */
+   * What changed: this function no longer says anything about sound. It has
+   * none and never had; the sound ring reports itself. A picture road that
+   * wrote its own reasons into the sound's state is how "no loopback on this
+   * platform" came to be printed on a Windows desk that had simply been
+   * refused for a different reason entirely. */
   function openCapture(gesture) {
     var media = root.navigator && root.navigator.mediaDevices;
     if (!media) return Promise.reject(new Error('no media devices here'));
@@ -260,25 +355,24 @@
     if (typeof media.getDisplayMedia === 'function') {
       try {
         first = media.getDisplayMedia({
+          /* #1207: `audio: false`, and it is load-bearing. This capture has
+           * never been given sound and cannot be - measured, twice. Saying so
+           * is what lets main.js tell this request from the sound ring's by
+           * what each one asked for, rather than guessing. */
           video: { width: { ideal: WIDTH }, height: { ideal: HEIGHT },
                    frameRate: { ideal: FPS, max: FPS } },
-          /* Asked for explicitly: Electron ignores an audio answer for a
-           * request that did not want audio, so `audio: true` here is what
-           * makes the handler's loopback reachable at all. */
-          audio: true
+          audio: false
         }).then(function (got) { return { stream: got, road: 'display-media' }; },
           function (err) {
-            withoutSound('the window would not give up its sound: '
-              + String((err && err.message) || err));
+            note('display capture would not film the window ('
+              + String((err && err.message) || err)
+              + '), so the window is filmed the legacy way');
             return null;
           });
       } catch (err) {
-        withoutSound('display capture refused the ask: '
-          + String((err && err.message) || err));
+        note('display capture refused the ask: ' + String((err && err.message) || err));
         first = Promise.resolve(null);
       }
-    } else {
-      withoutSound('this surface has no display capture, so it has no loopback');
     }
     return first.then(function (got) {
       if (got) return got;
@@ -289,14 +383,6 @@
         if (!source || !source.ok || !source.id) {
           throw new Error((source && source.detail) || 'no source to record');
         }
-        /* The main process knows what this platform can do - loopback is
-         * Windows-only in this Electron - so a silent recording says which
-         * of the two reasons it is: a limit, or a gesture that never came. */
-        if (source.loopback === false) {
-          sound = { present: false, state: 'unavailable', supported: false,
-            road: '', detail: source.detail
-              || 'this platform has no loopback capture, so the recording is silent' };
-        }
         return media.getUserMedia({
           audio: false,
           video: { mandatory: { chromeMediaSource: 'desktop',
@@ -306,50 +392,282 @@
         }).then(function (opened) { return { stream: opened, road: 'window-only' }; });
       });
     });
-    function withoutSound(why) {
-      if (!gesture) {
-        sound = { present: false, state: 'unavailable', supported: sound.supported,
-          detail: 'the recorder had no user gesture to open the sound with; '
-            + 'the next click or key press will add it', road: '' };
-        return;
-      }
-      sound = { present: false, state: 'unavailable', supported: sound.supported,
-        detail: why, road: '' };
-    }
   }
 
   /* #1205: WHY THE CAPTURE IS SAID TO HAVE SOUND, OR NOT.
    *
    * Asked of the stream rather than of the request: a handler that answered
-   * `audio: false` - which is what an unsupported platform gets - produces a
-   * perfectly good video stream with no audio track on it, and no error
-   * anywhere. The only honest test is to count the tracks. */
-  function settleSound(opened) {
-    var road = (opened && opened.road) || '';
+   * without audio produces a perfectly good stream with no audio track on it
+   * and no error anywhere. The only honest test is to count the tracks.
+   *
+   * #1207: it is the SOUND capture that is asked now. */
+  function settleSound() {
     if (audioLive()) {
-      sound = { present: true, state: 'capturing', supported: true, road: road,
-        detail: 'the desk mix, captured with the picture' };
+      sound = { present: true, state: 'capturing', supported: true,
+        road: 'panel-frame',
+        detail: 'the broadcast, captured from the panel' };
       return;
     }
-    var why = sound.detail;
-    if (road === 'display-media') {
-      /* The handler answered, and it answered without audio: the capture
-       * this machine gave back has no audio track on it. That is not a
-       * missing gesture - the gesture worked - so it is reported as the
-       * machine's answer, with the known limit named beside it. `supported`
-       * here means "loopback worked on this machine"; main.js reports the
-       * platform's own answer separately as loopback_supported. */
-      sound = { present: false, state: 'unavailable', supported: false, road: road,
-        detail: 'the capture came back with no audio track, so the recording '
-          + 'is silent (Electron captures application audio on Windows only)' };
+    /* The capture resolved and has no audio track on it. That is this
+     * machine's answer, not a missing gesture and not a stale reason from
+     * some earlier attempt, so it is stated outright rather than deferring to
+     * whatever `detail` happened to be holding. */
+    sound = { present: false, state: 'unavailable', supported: false,
+      road: 'panel-frame',
+      detail: 'the sound capture came back with no audio track' };
+  }
+
+  /* #1207: THE SECOND CAPTURE. NO PICTURE IN IT, AND THAT IS THE POINT.
+   *
+   * `video: false` is what makes this work at all. Asking with `video: true`
+   * and letting main.js answer with audio alone fails the whole request -
+   * measured: the handler throws "Video was requested, but no video stream
+   * was provided" and the page is given AbortError "Error starting capture".
+   *
+   * Nothing here names a device. main.js chooses the panel frame and the page
+   * is given no say in it, for the same reason it is given no say in which
+   * window is filmed: the wrong choice would put somebody else's sound into a
+   * ring that gets exported. No microphone is opened on this road or any
+   * other - `audio: true` on getDisplayMedia means "the thing being captured",
+   * never an input device, and that is the whole of what is asked for here. */
+  function openSound() {
+    var media = root.navigator && root.navigator.mediaDevices;
+    if (!media || typeof media.getDisplayMedia !== 'function') {
+      return Promise.reject(new Error('this surface has no display capture, '
+        + 'so it has no road to the broadcast'));
+    }
+    /* getDisplayMedia can throw where it stands rather than rejecting - no
+     * transient activation is one way. A synchronous throw here would come up
+     * through start(), and start() is what is filming the window: the sound
+     * is never allowed to cost the picture, so it is turned into a rejection
+     * before it can leave this function. */
+    try {
+      return media.getDisplayMedia({ video: false, audio: true });
+    } catch (err) {
+      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /* One piece of sound, start to finish. The same shape as recordOne() on
+   * purpose: the two recorders stamp their pieces the same way, at the same
+   * point in the same kind of function, so whatever delay there is between
+   * Date.now() and the encoder actually latching is the SAME delay in both
+   * rings and cancels out of the shift the cut computes. */
+  function recordSound() {
+    if (!sndRunning || !sndStream) return;
+    var live = audioLive();
+    var type = pickSoundType();
+    var options = { audioBitsPerSecond: AUDIO_BITS };
+    if (type) options.mimeType = type;
+    try {
+      sndRec = new root.MediaRecorder(sndStream, options);
+    } catch (err) {
+      failures += 1;
+      note('the sound recorder would not start: ' + String((err && err.message) || err));
+      sndRunning = false;
       return;
     }
-    sound = { present: false, state: 'unavailable', supported: sound.supported,
-      road: road, detail: why || 'the capture came back with no audio track' };
+    sndParts = [];
+    sndStartedAt = Date.now();
+    sndRec.ondataavailable = function (ev) {
+      if (ev && ev.data && ev.data.size) sndParts.push(ev.data);
+    };
+    sndRec.onerror = function (ev) {
+      failures += 1;
+      note('the sound recorder complained: '
+        + String((ev && ev.error && ev.error.message) || 'no reason given'));
+    };
+    sndRec.onstop = function () {
+      var at = sndStartedAt;
+      var ms = Date.now() - at;
+      var blob = null;
+      try { blob = new root.Blob(sndParts, { type: type || 'audio/webm' }); }
+      catch (err) { blob = null; }
+      sndParts = [];
+      if (sndRunning && !sndStopping) {
+        try { recordSound(); }
+        catch (err) { note('could not restart the sound: ' + err.message); }
+      }
+      if (!blob || !blob.size) return;
+      blob.arrayBuffer().then(function (buf) {
+        if (!has('replayPush')) return;
+        sndPieces += 1;
+        return desk().replayPush(buf, { at: at, ms: ms, a: !!live, kind: 'a' });
+      }).then(null, function (err) {
+        failures += 1;
+        note('a piece of sound did not reach the ring: '
+          + String((err && err.message) || err));
+      });
+    };
+    try {
+      sndRec.start();
+    } catch (err) {
+      failures += 1;
+      note('the sound recorder refused to run: ' + String((err && err.message) || err));
+      sndRunning = false;
+      return;
+    }
+    root.setTimeout(function () {
+      try { if (sndRec && sndRec.state === 'recording') sndRec.stop(); }
+      catch (err) { /* onstop will not come; the next tick starts a new one */ }
+    }, SEG_MS);
+  }
+
+  /* Open the sound ring and keep it. Returns a promise that never rejects:
+   * a desk that cannot capture the broadcast must still film the window, and
+   * every road out of here leaves `sound` saying plainly which it was. */
+  /* #1207: ASK THE RING WHETHER IT CAN KEEP THE TWO APART, BEFORE CAPTURING.
+   *
+   * This file is re-evaluated whenever the share changes; main.js and
+   * screen-ring.cjs are only reloaded when Pine Box is restarted. So a new
+   * renderer against an old main process is the normal state of affairs for
+   * minutes at a time, and it is the one pairing that does real damage: an
+   * older ring has never heard of `kind`, files every piece of sound in with
+   * the picture, and a cut then concatenates opus pieces with video ones and
+   * is refused outright. Measured on the live desk while this was written.
+   *
+   * `rings` is the handshake. An older build does not answer it, and gets no
+   * second capture - the window is filmed silently, exactly as before, and
+   * the reason says what to do about it. */
+  function ringKeepsSound() {
+    if (!has('replayBegin')) return Promise.resolve(false);
+    try {
+      return Promise.resolve(desk().replayBegin({
+        audio: { source: 'desk-broadcast-frame', present: false,
+          state: sound.state, detail: sound.detail, supported: sound.supported },
+        streams: { picture: { open: !!stream, running: !!running },
+                   sound: { open: false, running: false, pieces: sndPieces } }
+      })).then(function (got) {
+        return !!(got && Number(got.rings) >= 2);
+      }, function () { return false; });
+    } catch (err) { return Promise.resolve(false); }
+  }
+
+  function startSound() {
+    if (sndRunning) return Promise.resolve(true);
+    if (sndOpening) return sndOpening;
+    if (!root.MediaRecorder) return Promise.resolve(false);
+    sndOpening = ringKeepsSound().then(function (keeps) {
+      if (!keeps) {
+        sound = { present: false, state: 'unavailable', supported: sound.supported,
+          road: 'panel-frame',
+          detail: 'this Pine Box is still running an older recorder in its main '
+            + 'process, which would file the broadcast in with the picture and '
+            + 'spoil the cut; restart Pine Box and the sound comes with it' };
+        note(sound.detail);
+        tellSound();
+        /* Rejected rather than resolved false, so the branch below that
+         * tears a half-open capture down is not run against a capture that
+         * was never opened. `quiet` tells the rejection handler that the
+         * reason has already been set and said, and must not be overwritten
+         * with the generic one. */
+        var stop = new Error('the ring in this build keeps one lane only');
+        stop.quiet = true;
+        throw stop;
+      }
+      return openSound();
+    }).then(function (got) {
+      sndStream = got;
+      sndRunning = true;
+      sndStopping = false;
+      settleSound();
+      if (!sound.present) {
+        /* A capture with no track on it is not a capture. Let it go rather
+         * than leaving a dead recorder running for the rest of the evening. */
+        try { got.getTracks().forEach(function (t) { t.stop(); }); } catch (err) {}
+        sndStream = null;
+        sndRunning = false;
+        /* Said out loud, because this is the shape the export sheet reads and
+         * the diagnostic writes: a capture that opened and carried nothing is
+         * a different fault from one that was refused, and the two have to be
+         * told apart from outside the app. */
+        tellSound();
+        note(sound.detail);
+        return false;
+      }
+      try {
+        var track = sndStream.getAudioTracks()[0];
+        if (track) {
+          track.addEventListener('ended', function () {
+            note('the broadcast capture ended');
+            stopSound('the capture ended');
+          });
+        }
+      } catch (err) { /* not fatal */ }
+      tellSound();
+      recordSound();
+      note('recording the broadcast from the panel');
+      return true;
+    }, function (err) {
+      /* The handshake above has already set a better reason and said it out
+       * loud; the generic one would bury it. */
+      if (err && err.quiet) return false;
+      sound = { present: false, state: 'unavailable', supported: sound.supported,
+        road: 'panel-frame',
+        detail: 'the panel would not give up its sound: '
+          + String((err && err.message) || err) };
+      tellSound();
+      note(sound.detail);
+      return false;
+    });
+    /* Cleared whichever way it went, so a later gesture can try again. */
+    sndOpening = sndOpening.then(function (got) {
+      sndOpening = null;
+      return got;
+    }, function () {
+      sndOpening = null;
+      return false;
+    });
+    return sndOpening;
+  }
+
+  /* The sound ring stops on its own, and the picture carries on without it.
+   * The ring keeps whatever sound it already has; the cut will report the
+   * coverage it really found and the recording stays a recording. */
+  function stopSound(why) {
+    sndStopping = true;
+    sndRunning = false;
+    try { if (sndRec && sndRec.state === 'recording') sndRec.stop(); } catch (err) {}
+    try {
+      if (sndStream) {
+        var tracks = sndStream.getTracks();
+        for (var i = 0; i < tracks.length; i += 1) { try { tracks[i].stop(); } catch (e) {} }
+      }
+    } catch (err) {}
+    sndStream = null;
+    sndRec = null;
+    if (sound.present) {
+      sound = { present: false, state: 'unavailable', supported: sound.supported,
+        road: 'panel-frame', detail: String(why || 'the sound capture stopped') };
+      tellSound();
+    }
+    if (running) watchForGesture();
+  }
+
+  /* #1207: the sound ring can be opened on its own, and is - main.js spends
+   * a second user activation on it so that neither capture has to share one
+   * gesture with the other. Safe to call twice: startSound() returns early
+   * when it is already running. */
+  function startTheSound(opts) {
+    if (!has('replayPush')) return Promise.resolve({ ok: false, audio: sound });
+    try {
+      return startSound().then(function (got) {
+        if (!got && running) watchForGesture();
+        return { ok: !!got, audio: sound };
+      }, function () { return { ok: false, audio: sound }; });
+    } catch (err) {
+      note('the sound could not be started: ' + String((err && err.message) || err));
+      return Promise.resolve({ ok: false, audio: sound });
+    }
   }
 
   function start(opts) {
-    if (running) return Promise.resolve({ ok: true, already: true, audio: sound });
+    if (running) {
+      /* The picture is already up; the sound may still be missing, and this
+       * is the one road that gets a fresh gesture from main.js. */
+      try { startTheSound(opts); } catch (err) { /* said by startTheSound */ }
+      return Promise.resolve({ ok: true, already: true, audio: sound });
+    }
     if (!root.MediaRecorder) {
       note('this surface has no MediaRecorder');
       return Promise.resolve({ ok: false, detail: 'no MediaRecorder here' });
@@ -359,7 +677,6 @@
       stream = opened.stream;
       running = true;
       stopping = false;
-      settleSound(opened);
       /* The capture ending underneath us - a window closed, a device
        * changed - must not leave a recorder pointed at nothing. */
       try {
@@ -379,9 +696,12 @@
         try { desk().onReplayFlush(flush); } catch (err) { /* not fatal */ }
       }
       recordOne();
-      note('recording this window' + (sound.present ? ' with the desk mix'
-        : ' without sound: ' + sound.detail));
-      if (!sound.present) watchForGesture();
+      note('recording this window');
+      /* #1207: THE PICTURE IS UP BEFORE THE SOUND IS ASKED FOR, AND THE
+       * SOUND IS NEVER ALLOWED TO COST IT. Everything below this line is
+       * already recording; a throw from the sound road reaching here would
+       * turn a running capture into a rejected start() and lose the window. */
+      try { startTheSound(opts); } catch (err) { /* said by startTheSound */ }
       return { ok: true, audio: sound };
     }, function (err) {
       note('the window would not be captured: ' + String((err && err.message) || err));
@@ -389,63 +709,40 @@
     });
   }
 
-  /* #1205: THE FIRST GESTURE UPGRADES A SILENT RING.
+  /* #1205, rebuilt for #1207: THE FIRST GESTURE RETRIES THE SOUND RING.
    *
-   * A capture opened without an activation has no sound and can never grow
-   * one: the track list on a live MediaStream is fixed. So the first real
-   * press anywhere in the shell reopens it - one stop-and-start, the seam of
-   * a single piece - and from then on the pieces carry the broadcast. Three
-   * tries, ten seconds apart, because a platform with no loopback at all must
-   * not reopen its capture on every click for the rest of the evening.
+   * It used to reopen the WINDOW capture to try to grow an audio track on it,
+   * and swap the recorder onto the new one mid-flight. None of that is needed
+   * now and all of it was risk to the picture: the sound is a separate
+   * capture, so a retry opens that capture and nothing else. The window is
+   * opened once at startup and is never touched again.
    *
-   * A press inside the panel webview is a different document and never
-   * reaches this listener; that is why main.js supplies the activation up
-   * front and this is only the backstop. */
+   * Three tries, ten seconds apart, so a desk where the panel simply has no
+   * sound to give does not reopen a capture on every click all evening. A
+   * press inside the panel webview is a different document and never reaches
+   * this listener; that is why main.js supplies the activation up front and
+   * this is only the backstop. */
   var watching = false;
   function watchForGesture() {
     if (watching || !doc || !doc.addEventListener) return;
-    if (sound.supported === false) return;
+    if (sndRunning) return;
     watching = true;
     var kinds = ['pointerdown', 'keydown'];
     var take = function () {
-      if (sound.present || !running) return unwatch();
-      if (sound.supported === false) return unwatch();
+      if (sndRunning || !running) return unwatch();
       if (upgrades >= 3) return unwatch();
       var now = Date.now();
       if (now - lastUpgrade < 10000) return;
       lastUpgrade = now;
       upgrades += 1;
       /* Opened INSIDE the event, so the activation is still transient. */
-      var media = root.navigator && root.navigator.mediaDevices;
-      if (!media || typeof media.getDisplayMedia !== 'function') return unwatch();
-      var asking;
-      try {
-        asking = media.getDisplayMedia({
-          video: { width: { ideal: WIDTH }, height: { ideal: HEIGHT },
-                   frameRate: { ideal: FPS, max: FPS } },
-          audio: true
-        });
-      } catch (err) { return; }
-      asking.then(function (got) {
-        var tracks = [];
-        try { tracks = (got.getAudioTracks && got.getAudioTracks()) || []; }
-        catch (e) { tracks = []; }
-        if (!tracks.length) {
-          /* No sound on this platform either way; stop the capture we just
-           * opened rather than leaving two running. */
-          try { got.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-          sound = { present: false, state: 'unavailable', supported: false,
-            road: 'display-media', detail: 'this platform has no loopback '
-              + 'capture, so the recording is silent (Electron offers it on '
-              + 'Windows only)' };
-          tellSound();
+      startSound().then(function (got) {
+        if (got) {
+          note('the broadcast was added to the recording');
           return unwatch();
         }
-        swapTo(got);
-      }, function (err) {
-        note('the sound could not be added on that press: '
-          + String((err && err.message) || err));
-      });
+        if (upgrades >= 3) unwatch();
+      }, function () { /* startSound() never rejects */ });
     };
     var unwatch = function () {
       watching = false;
@@ -458,43 +755,13 @@
     }
   }
 
-  /* Move the recorder onto a new capture without losing the ring. The old
-   * piece is closed first so nothing half-recorded reaches the disk, and the
-   * old tracks are stopped so two captures of the same window are never live
-   * together - two encoders on one screen is the thing that makes a desk
-   * stutter. */
-  function swapTo(got) {
-    var old = stream;
-    /* THE NEW CAPTURE IS INSTALLED FIRST, AND THAT ORDER IS THE WHOLE TRICK.
-     * Stopping the running recorder restarts it from inside its own onstop,
-     * and onstop starts the next piece from `stream` - so `stream` has to be
-     * the new one BEFORE the stop, or the very next piece is recorded off
-     * the capture that is about to be thrown away and lands marked as having
-     * sound it does not have. Whether onstop is coming also decides who
-     * starts that piece: calling recordOne() here as well would leave two
-     * encoders on one window. */
-    stream = got;
-    settleSound({ road: 'display-media' });
-    var willRestart = !!(rec && rec.state === 'recording');
-    try { if (willRestart) rec.stop(); } catch (err) { willRestart = false; }
-    try {
-      var track = stream.getVideoTracks()[0];
-      if (track) { track.addEventListener('ended', function () { note('the capture ended'); stop(); }); }
-    } catch (err) {}
-    try {
-      if (old) {
-        var tracks = old.getTracks();
-        for (var i = 0; i < tracks.length; i += 1) { try { tracks[i].stop(); } catch (e) {} }
-      }
-    } catch (err) {}
-    tellSound();
-    note('the desk mix was added to the recording');
-    if (running && !willRestart) recordOne();
-  }
-
   function stop() {
     stopping = true;
     running = false;
+    /* #1207: the sound goes with it. A sound ring left running under a
+     * stopped picture would hold a capture open on the panel - and keep
+     * enableLocalEcho's promise alive - for no recording at all. */
+    stopSound('the page stopped it');
     try { if (rec && rec.state === 'recording') rec.stop(); } catch (err) {}
     try {
       if (stream) {
@@ -510,9 +777,16 @@
 
   function state() {
     return { running: running, failures: failures, said: said, segment_ms: SEG_MS,
+             /* #1207: both rings, named, because "is it recording" now has
+              * two answers and a person reading this has to see which one
+              * went wrong. */
+             streams: { picture: { open: !!stream, running: !!running },
+                        sound: { open: !!sndStream, running: !!sndRunning,
+                                 pieces: sndPieces } },
              audio: { present: !!sound.present, state: sound.state,
                       detail: sound.detail, supported: sound.supported,
-                      road: sound.road, live: audioLive(), upgrades: upgrades } };
+                      road: sound.road, live: audioLive(), upgrades: upgrades,
+                      running: !!sndRunning, pieces: sndPieces } };
   }
 
   /* #1182d: CLOSE THE PIECE YOU ARE ON.
@@ -523,10 +797,19 @@
    * those are the seconds the operator actually wanted, because a rolling
    * recorder is asked for the thing that just happened. */
   function flush() {
+    var closed = false;
+    /* #1207: BOTH rings are closed, and the sound first. The cut asks for
+     * this just before it runs, and a sound ring still holding the last two
+     * seconds while the picture has already handed them down would make the
+     * newest stretch of the cut silent - the exact stretch the operator
+     * reached for. */
     try {
-      if (rec && rec.state === 'recording') { rec.stop(); return true; }
+      if (sndRec && sndRec.state === 'recording') { sndRec.stop(); closed = true; }
     } catch (err) { /* the timer will close it soon enough */ }
-    return false;
+    try {
+      if (rec && rec.state === 'recording') { rec.stop(); closed = true; }
+    } catch (err) { /* likewise */ }
+    return closed;
   }
 
   /* Only on the desk. The tablet has its own recorder in Kotlin and must not
@@ -556,6 +839,10 @@
   }
 
   root.PineScreenRing = { start: start, stop: stop, state: state, flush: flush,
+                          /* #1207: main.js spends a second user activation on
+                           * this one, so the two captures never have to share
+                           * a gesture. */
+                          startSound: startTheSound,
                           sound: function () { return state().audio; },
                           SEG_MS: SEG_MS, WIDTH: WIDTH, HEIGHT: HEIGHT, FPS: FPS };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -42,6 +42,27 @@ const LOOPBACK_HERE = process.platform === "win32";
  * runs inside a capture negotiation and must not go searching. */
 let panelFrame = null;
 
+/* #1205c / #1207: THE LINE THAT CAUGHT THIS.
+ *
+ * A silent recording has a REASON and until #1205c it lived only in the
+ * renderer's console, which nobody can read from outside the app. This
+ * appends one line per capture negotiation and one per recorder start to a
+ * file a person can open in a text editor. It is what finally showed that
+ * getDisplayMedia was being refused outright -
+ *
+ *     the window would not give up its sound: Error starting capture
+ *
+ * - after every meter in the app had said the sound was fine. It names BOTH
+ * streams now (#1207), because with two rings "the recording is silent" has
+ * two possible causes, and the next fault will be found the way this one
+ * was: by reading which of them did not start. */
+function ringSound(line) {
+  try {
+    fs.appendFileSync(path.join(os.tmpdir(), "pinebox-ring-sound.log"),
+      new Date().toISOString() + " " + String(line) + String.fromCharCode(10));
+  } catch (error) { /* a diagnostic may never stop a recording */ }
+}
+
 function panelFrameNow() {
   try {
     if (panelFrame && !panelFrame.isDestroyed() && panelFrame.mainFrame) {
@@ -787,103 +808,97 @@ function createWindow() {
    * the recorder starts itself a couple of seconds after the app opens, and
    * a picker nobody is sitting in front of is a feature that never runs; and
    * the wrong choice in that picker would quietly record somebody's email
-   * into a ring that gets exported. The answer is this window, always, and
+   * into a ring that gets exported. The answer is decided here, always, and
    * the renderer is given no say in it.
    *
-   * `video: win` hands Electron the BrowserWindow itself rather than a
-   * desktopCapturer source id, so the capture follows the window rather
-   * than a screen region.
-   *
-   * #1205: AND THE SOUND COMES WITH IT NOW. The comment that used to stand
-   * here said audio was refused deliberately, because "the broadcast is
-   * pulled from PineAir's own ring when a clip is cut... and capturing it
-   * twice would put it in the file twice". The first half of that was
-   * measured and found to be false on this desk: PineAir.start() has exactly
-   * one caller in the whole renderer (sampler.js:3247), so on a desk where
-   * the sampler is never opened there is no ring at all; and PineAir taps
-   * media elements in the document it RUNS in, which is the shell, while the
-   * broadcast plays in the panel - `<webview id="controlFrame">` - a separate
-   * document in a separate process. Every recording was silent, and the
-   * editor said so: "No audio was captured in this recording."
+   * ---------------------------------------------------------------------
+   * #1207: TWO CAPTURES, TOLD APART BY WHAT EACH ONE ASKED FOR.
    *
    *   "Similar to the tablet, I always want to capture the broadcast audio
    *    of the recording. So any time that I go into the video editor, I need
    *    the audio of the broadcast."
    *
-   * So the sound is captured WITH the picture, the way the tablet does it,
-   * and the second half of the old comment becomes the thing to handle: the
-   * after-the-fact PineAir road is now a fallback that runs only when the
-   * ring carried no sound, so nothing is ever muxed twice. See
-   * replayWithSound().
+   * #1205 claimed the sound now travelled with the picture. It never did.
+   * Measured against this Electron (37.10.3), every pairing that would have
+   * put both in one capture is refused:
    *
-   * WHAT 'loopback' IS, AND WHAT IT IS NOT (read off this Electron's own
-   * electron.d.ts, 37.10.3, interface Streams):
+   *   { video: win, audio: 'loopback' }     -> "Error starting capture".
+   *       System loopback is offered for a SCREEN; asked for beside one
+   *       window it fails the whole request.
+   *   { video: win, audio: <panel frame> }  -> the same refusal. A
+   *       diagnostic proved the frame was found and correct (it logged
+   *       frame=yes with the station url), so it is the PAIRING that is not
+   *       allowed.
+   *   { video: <panel frame>, audio: same } -> ACCEPTED, and the piece did
+   *       carry a 48 kHz opus track - but the picture becomes the panel's
+   *       own control page, with no rail, no menu and not the Listen view he
+   *       was watching. A recording of the wrong screen is worse than a
+   *       silent recording of the right one.
    *
-   *   "If a string is specified, can be `loopback` or `loopbackWithMute`.
-   *    Specifying a loopback device will capture system audio, and is
-   *    currently only supported on Windows."
+   * And one more thing was measured, which explains the rest: `video: win`
+   * is not a legal answer here at all. Handed a BrowserWindow this Electron
+   * throws "video must be a WebFrameMain or DesktopCapturerSource", the
+   * whole request fails, and the renderer falls through to its legacy
+   * getUserMedia road - which is where the correct picture has been coming
+   * from all along. The video branch below is therefore dead wiring that
+   * fails safe, and it is left exactly as it is: the picture is right, and
+   * the operator's first rule is that it stays right.
    *
-   * So: Windows only, and this desk is Windows. Elsewhere the handler answers
-   * `audio: false`, the capture comes back with no audio track, and the
-   * renderer reports honest silence with a reason rather than a claim.
+   * What IS accepted is a second capture with no picture in it:
    *
-   * 'loopback' AND NOT 'loopbackWithMute', AND NOT A WebFrameMain, and that
-   * choice is the station's sound. loopbackWithMute mutes local playback
-   * while it captures - it would silence the speakers for as long as the ring
-   * runs, which is every minute the app is open. Handing the panel's frame
-   * instead (`audio: <WebFrameMain>`) would reroute the panel's real playback
-   * through the capture path and, per the same typings, mutes it unless
-   * enableLocalEcho is set - a live broadcast is not the place to test that.
-   * Plain loopback is a passive read of what the machine is already playing:
-   * it opens no input device, it takes no microphone, and it changes nothing
-   * about the path the sound already travels to the speakers. */
+   *   { video: false, audio: true } asked for, answered with
+   *   { audio: <panel frame>, enableLocalEcho: true }
+   *
+   * Measured: one audio track labelled "Tab audio", no video track, no
+   * gesture needed, and two of them may be live on the same frame at once -
+   * which matters, because the window capture is running beside it.
+   *
+   * enableLocalEcho IS NOT OPTIONAL. Capturing a frame MUTES that frame's
+   * local playback unless it is set, and the panel is where the broadcast
+   * plays - so without it the recorder silences the station while the
+   * operator is listening to it. Verified by listening rather than by
+   * reading the flag: with a tone in the panel and the machine's speaker mix
+   * read back through a screen-loopback capture, one FFT bin, tone on minus
+   * tone off -
+   *
+   *     nothing capturing the frame          -28.1 dB
+   *     capturing it, enableLocalEcho true   -28.0 dB   speakers keep it
+   *     capturing it, flag left off          -85.4 dB   speakers lose it
+   *
+   * The two requests are told apart by `videoRequested` / `audioRequested`,
+   * which Electron puts on the request itself. Nothing is passed out of band
+   * and the page cannot lie its way into the other answer: a request with no
+   * video gets the panel's sound and nothing else, and a request with video
+   * gets the window and no sound, whatever else it asks for. */
   try {
     session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
       if (!win || win.isDestroyed()) return callback({});
-      /* Only when the page asked for it. Electron ignores an audio answer to
-       * a request that wanted none, and saying it anyway would make the log
-       * read as though every capture had sound. */
-      const wantsAudio = request && request.audioRequested !== false;
-      /* #1205c: THE PANEL'S FRAME, NOT THE MACHINE'S LOOPBACK.
-       *
-       * Measured: answering `audio: 'loopback'` alongside `video: win` makes
-       * getDisplayMedia fail outright - "Error starting capture" - because
-       * system loopback is offered for a SCREEN, not for one window. The
-       * whole request is refused, the recorder falls back to its silent
-       * road, and every piece carries one video stream and no audio.
-       *
-       * The frame road is better than loopback anyway. The broadcast plays
-       * in the panel, so this records exactly that and nothing else - not
-       * the whole machine, not a notification, not whatever else the desktop
-       * is doing. enableLocalEcho is what keeps it coming out of the
-       * speakers while it is recorded; without it, capturing the frame
-       * MUTES the broadcast, which is the one outcome worse than silence. */
-      /* #1205d: MEASURED, BOTH WAYS, AND BOTH REFUSED.
-       *
-       *   { video: win, audio: 'loopback' }  -> "Error starting capture".
-       *       System loopback is offered for a SCREEN; asked for beside one
-       *       window it fails the whole request.
-       *   { video: win, audio: <panel frame> } -> the same refusal. The
-       *       frame was found and named in the log; the pairing is not
-       *       allowed.
-       *   { video: <panel frame>, audio: <panel frame> } -> ACCEPTED, and
-       *       the piece carried a 48 kHz opus track. But the picture is then
-       *       the panel's own document - the control page - and not the
-       *       window: no rail, no menu, and not the Listen view he was
-       *       actually looking at. A recording of the wrong screen is worse
-       *       than a silent recording of the right one.
-       *
-       * So the picture is the window and this request carries no audio. The
-       * sound is being taken through a second, audio-only capture; until
-       * that lands the recording is honestly silent rather than wrong. */
-      const frame = null;
-      const _panelFrame = wantsAudio ? panelFrameNow() : null;
-      if (frame) {
-        callback({ video: win, audio: frame, enableLocalEcho: true });
-        return;
+      const wantsVideo = !!(request && request.videoRequested);
+      const wantsAudio = !!(request && request.audioRequested);
+      /* THE SOUND RING. No picture asked for, so this is the second capture,
+       * and the answer is the panel's frame with its local playback left
+       * alone. */
+      if (!wantsVideo && wantsAudio) {
+        const frame = panelFrameNow();
+        ringSound("HANDLER sound wantsVideo=false wantsAudio=true frame="
+          + (frame ? "yes" : "no")
+          + " panel=" + (frame ? String(frame.url || "") : "(none)"));
+        if (!frame) {
+          /* Refused, and the renderer says so in words the export sheet
+           * prints. Better than answering with a frame that is not the
+           * station's and recording the wrong room. */
+          return callback({});
+        }
+        return callback({ audio: frame, enableLocalEcho: true });
       }
-      callback({ video: win,
-        audio: (LOOPBACK_HERE && wantsAudio) ? "loopback" : false });
+      /* THE PICTURE RING. Left as #1182 wrote it, including the fact that
+       * this Electron will refuse it: the renderer's fallback is what films
+       * the window, and it films it correctly. `audio: false` is said out
+       * loud so nothing can ever attach sound to this capture behind the
+       * sound ring's back and put the broadcast in the file twice. */
+      ringSound("HANDLER picture wantsVideo=" + wantsVideo
+        + " wantsAudio=" + wantsAudio);
+      callback({ video: win, audio: false });
     }, { useSystemPicker: false });
   } catch (err) { /* older Electron: getDisplayMedia simply will not start */ }
 
@@ -957,6 +972,33 @@ function createWindow() {
           "(function(){try{return window.PineScreenRing"
           + "?window.PineScreenRing.start({gesture:true})&&1:0}catch(e){return -1}})()",
           true);
+        /* #1207: A SECOND ACTIVATION, FOR THE SECOND CAPTURE.
+         *
+         * getDisplayMedia CONSUMES transient activation, so one gesture
+         * cannot be relied on to open two captures - and each
+         * executeJavaScript(code, true) mints a fresh one, so the sound ring
+         * is given its own rather than made to share. It is spent a moment
+         * later, not in the same task, because the picture is what must not
+         * be put at risk: if the sound's request were to fail in a way that
+         * took the activation with it, the window capture has already been
+         * opened and is already recording.
+         *
+         * (Measured: an audio-only display-media request is in fact accepted
+         * here with no activation at all. The gesture is spent anyway, since
+         * that is not a rule this app gets to depend on staying true, and
+         * startSound() returns early when the ring is already running, so the
+         * two roads cannot both open a capture.) */
+        setTimeout(() => {
+          try {
+            if (!win || win.isDestroyed()) return;
+            win.webContents.executeJavaScript(
+              "(function(){try{return window.PineScreenRing"
+              + "&&window.PineScreenRing.startSound"
+              + "?window.PineScreenRing.startSound({gesture:true})&&1:0}"
+              + "catch(e){return -1}})()",
+              true);
+          } catch (error) { /* the gesture backstop in the page still has it */ }
+        }, 900);
       } catch (error) { /* a page that will not take it still films silently */ }
     }, 2500);
   });
@@ -3077,10 +3119,15 @@ ipcMain.handle("replay:begin", (_event, opts) => {
    * writes that one line where it can be read with a text editor. It is a
    * single small append on a road that fires once per capture, not per
    * piece. */
+  /* #1207: BOTH STREAMS NAMED, not just the sound's verdict. With two rings
+   * a silent recording can mean the panel had no frame, the sound capture
+   * was refused, or the sound recorder died while the picture carried on -
+   * and one line that says only "present: false" cannot tell them apart. */
   try {
     const a = (opts && opts.audio) || null;
-    fs.appendFileSync(path.join(os.tmpdir(), "pinebox-ring-sound.log"),
-      new Date().toISOString() + " " + JSON.stringify(a) + String.fromCharCode(10));
+    const streams = (opts && opts.streams) || null;
+    ringSound("BEGIN audio=" + JSON.stringify(a)
+      + " streams=" + JSON.stringify(streams));
   } catch (error) { /* a diagnostic may never stop a recording */ }
   try {
     const cfg = readConfig() || {};
@@ -3113,6 +3160,11 @@ ipcMain.handle("replay:state", () => {
      * the operator decides whether to tick "Allow video without complete
      * audio". That line has to be true BEFORE the cut, not only after it. */
     return { ...got, atLeast: got.holds,
+      /* #1207: `loopback_supported` is kept for the sheet that reads it, but
+       * it no longer decides anything: the sound is the panel's own frame,
+       * not the machine's loopback, and it is captured on every platform
+       * this app runs on. The honest answer about whether THIS desk is
+       * recording sound is got.audio.state, which the recorder reports. */
       audio: { ...(got.audio || {}), loopback_supported: LOOPBACK_HERE },
       min: HOLD_MIN_S, max: HOLD_MAX_S, fallback: HOLD_DEFAULT_S };
   } catch (error) { return { ok: false, running: false, seconds: 0, holds: 0,
