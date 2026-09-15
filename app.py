@@ -60,6 +60,7 @@ from crystal_prompts import (turn_prompt as crystal_prompt_turn,
 from crystal_source import clean_repair_prompt_echo, strip_repair_prompt_echo
 from segment_contract import ad_sale_evidence
 from store_retention import retention_sweep, store_sizes
+import station_modifiers                 # #1169/#1170: the modifier desk
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
                       director_lessons_clause, director_notes, director_path,
@@ -26553,6 +26554,16 @@ def radio_prompt_instruction(slot: str) -> str:
             lead += plot_clause()
         except Exception:  # noqa: BLE001
             pass            # a broken plotline never silences the booth
+        # #1169: and what is STANDING - the guest in the room, the
+        # topic on the table, the event going on, the story running.
+        # Here for the reason above: a modifier that only reached
+        # dj_banter would be a modifier the calls, the memos, the ad
+        # reads and the gallery never heard of, which is exactly the
+        # complaint. Behind <data>/modifiers/mode, default off.
+        try:
+            lead += modifiers_clause()
+        except Exception:  # noqa: BLE001
+            pass            # colour never silences the booth either
         # #1162: and, one round in five, the manager cutting into it. On
         # this layer for the reason above - "every round the station
         # writes assembles that one" - so a memo may land in the booth
@@ -27483,7 +27494,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
                    checked: bool = False, remember_text: str = "",
-                   round_as: str = "") -> str:
+                   round_as: str = "", sid: str = "") -> str:
     """#1146: the floor door for single lines. A cover, a news line or an
     interjection waits for the round that has the air instead of landing
     in the middle of it. Re-entrant: the recovery road inside a round is
@@ -27495,14 +27506,16 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             kind, track, extra=extra, line=line, who=who, voice=voice,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
-            checked=checked, remember_text=remember_text, round_as=round_as)
+            checked=checked, remember_text=remember_text, round_as=round_as,
+            sid=sid)
     _owned = await _floor_take(f"a {kind} line from {who}")
     try:
         return await _dj_speak_floorless(
             kind, track, extra=extra, line=line, who=who, voice=voice,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
-            checked=checked, remember_text=remember_text, round_as=round_as)
+            checked=checked, remember_text=remember_text, round_as=round_as,
+            sid=sid)
     finally:
         _floor_drop(_owned)
 
@@ -27516,7 +27529,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
                    checked: bool = False, remember_text: str = "",
-                   round_as: str = "") -> str:
+                   round_as: str = "", sid: str = "") -> str:
     """Say it, log it to the chat channel so the panel can show the patter.
     `who` is "dj" or "cohost" — the co-host has his own voice so the two are
     told apart by ear, not only by the transcript. `source` is the speakbox
@@ -28240,6 +28253,13 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         "voice": forced or "",
         "engine": engine,
         "model": str(load_settings().get("model") or ""),
+        # #1170: a single line may name the segment it belongs to.
+        # Only the gap fills pass one today - they have never had a
+        # sid, so airlog_row_from writes "" and script_ledger_catch_up
+        # commits them as an unscripted block belonging to nothing.
+        # Absent by default: an entry without a sid is what every
+        # other caller of this road has always produced.
+        **({"sid": str(sid)} if sid else {}),
     }
     # #696: the rest of the provenance, on the line rather than scattered
     # across three feeds that only ever describe the LAST render. Hovering
@@ -56027,6 +56047,296 @@ async def schedule_prompts_save_api(
     return prompts
 
 
+# --- #1169/#1170: the modifier desk ---------------------------------------
+# The operator, inbox #1169: "give IDs and identifiers to these things and
+# make sure that they are traceable throughout segments and through
+# dialogue in order to make sure that these systems are taking place
+# whenever they're activated ... I want to be able to trace these things
+# across the segments happening to the segments as modifiers for their
+# events when they are occurring."  And #1170: "whenever there's dead air
+# ... these are things that are said on the station that also get codes and
+# IDs and are followed throughout the system."
+#
+# MEASURED FIRST, 2026-09-15.  A guest (data/guests.json), a topic
+# (data/banter_topics.json) and a plotline (data/plotlines.json) already
+# HAD an id.  An event did not exist at all - the nearest thing, a theme in
+# data/caller_themes.json, is a bare name with no id, so renaming one
+# orphans every record that pointed at it.  And not one of the four was
+# ever recorded against a segment: data/plot_beats.jsonl carried the plot
+# id on 2475 beats in twenty-four hours and a segment id on NONE of them,
+# while air_log.jsonl and script_ledger.jsonl carried the sid on every line
+# and named no modifier at all.  The two halves of the answer were both on
+# disk and shared no join key.
+#
+# So this is a JOIN and a SWITCH, not a fifth book.  guests.json,
+# banter_topics.json, plotlines.json and caller_themes.json stay the truth
+# and keep their own ids; station_modifiers holds only what is standing,
+# which segment each standing thing rode, and the logic - all of it pure,
+# all of it unit-tested off a temp directory.  This block is the station's
+# side: where the stores are, when the clock ticks, and what airs.
+MODIFIERS_DIR = data_path("modifiers")
+MODIFIERS_SWITCH = station_modifiers.ModifierSwitch(MODIFIERS_DIR)
+_MODIFIER_BOOK = station_modifiers.ModifierBook(DATA_DIR)
+_MODIFIER_LOCK = RLock()
+_MODIFIER_FOLLOW: dict[str, Any] = {"at": 0.0, "said": None}
+# How often the desk re-reads the station's own stores.  A guest sent home
+# must stop riding within a tick, or the next hour of segments is traced to
+# somebody who is not in the building.
+MODIFIER_FOLLOW_EVERY = 10.0
+
+
+def modifiers_mode() -> str:
+    """off | trace | ride.  Never raises; an unreadable switch is off."""
+    try:
+        return MODIFIERS_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return station_modifiers.MODE_OFF
+
+
+def modifiers_trace_on() -> bool:
+    """Are ids being recorded against segments?  Changes nothing that airs."""
+    return modifiers_mode() in (station_modifiers.MODE_TRACE,
+                                station_modifiers.MODE_RIDE)
+
+
+def modifiers_air_on() -> bool:
+    """Do the standing modifiers reach the prompt and the gap fillers?"""
+    return modifiers_mode() == station_modifiers.MODE_RIDE
+
+
+def modifiers_follow(force: bool = False) -> dict[str, Any]:
+    """Put up what the station's own stores say is up, take down what they
+    no longer say.
+
+    Called off the round path rather than off a scheduler, throttled to
+    MODIFIER_FOLLOW_EVERY: a desk that needs its own loop is a desk that
+    can starve one, and this station has paid for that twice (#1142,
+    #1146).  Never raises - colour may not take the station off the air."""
+    now = time.time()
+    if not force and now - float(_MODIFIER_FOLLOW["at"]) < MODIFIER_FOLLOW_EVERY:
+        return {}
+    _MODIFIER_FOLLOW["at"] = now
+    try:
+        with _MODIFIER_LOCK:
+            _MODIFIER_BOOK.reload()
+            raises = station_modifiers.from_stores(
+                guests=read_guests(), dj=dj_settings(),
+                topics=read_bombshells(), plotlines=plot_read(),
+                themes=themes_read(), now=now)
+            out = station_modifiers.follow_stores(_MODIFIER_BOOK, raises,
+                                                  now=now)
+    except Exception:  # noqa: BLE001
+        return {}
+    said = ",".join(out.get("standing") or [])
+    if said != _MODIFIER_FOLLOW["said"]:
+        _MODIFIER_FOLLOW["said"] = said
+        try:
+            pipeline_log("model", "#1169: standing now - "
+                         + (said or "nothing"))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def modifiers_standing() -> list[dict[str, Any]]:
+    """What is up.  [] when the switch is off, so nothing downstream has to
+    ask twice."""
+    if not modifiers_trace_on():
+        return []
+    try:
+        modifiers_follow()
+        with _MODIFIER_LOCK:
+            return _MODIFIER_BOOK.standing()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def modifiers_ride_round(sid: str, round_kind: str = "",
+                         source: str = "") -> list[str]:
+    """Record that whatever is standing shaped the round called `sid`.
+
+    One call, where the sid is minted - BEFORE the round is written, so a
+    round that is written and never heard is still traceable.  "Written and
+    never aired" is an answer #1169 asks for and #1239 is why it has to be
+    a different answer from "heard"."""
+    if not sid or not modifiers_trace_on():
+        return []
+    try:
+        modifiers_follow()
+        with _MODIFIER_LOCK:
+            return _MODIFIER_BOOK.ride(str(sid), None, round_kind=round_kind,
+                                       source=source)
+    except Exception:  # noqa: BLE001
+        return []           # a failed trace never stops a round going out
+
+
+def modifiers_for_sid(sid: str) -> list[str]:
+    """The modifiers that shaped this segment.  A dict lookup: this is asked
+    once per ledger row and once per air-log row, and a share read per line
+    would be a share read per line."""
+    if not sid or not modifiers_trace_on():
+        return []
+    try:
+        with _MODIFIER_LOCK:
+            return _MODIFIER_BOOK.ids_for(str(sid))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def modifiers_named(ids: list[str]) -> list[dict[str, Any]]:
+    """Ids to {id, kind, name} - what the inspector shows.  An id whose
+    record has aged out of the book still comes back, named for what it is,
+    because a trace that silently drops a row is worse than one that says
+    "this rode here and the book no longer remembers it"."""
+    out: list[dict[str, Any]] = []
+    for one in ids or []:
+        row = {}
+        try:
+            with _MODIFIER_LOCK:
+                row = _MODIFIER_BOOK.get(str(one))
+        except Exception:  # noqa: BLE001
+            row = {}
+        kind, key = station_modifiers.split_id(one)
+        out.append({"id": str(one), "kind": row.get("kind") or kind,
+                    "key": row.get("key") or key,
+                    "name": row.get("name") or "",
+                    "raised": row.get("raised") or 0,
+                    "until": row.get("until") or 0,
+                    "known": bool(row)})
+    return out
+
+
+def modifiers_clause() -> str:
+    """What the writing prompt hears.  "" unless the switch is at `ride`.
+
+    Hung on the same layer as plot_clause() and for the reason its comment
+    gives - "every round the station writes assembles that one" - so a
+    standing guest, topic, event or plotline reaches the booth talk, the
+    calls, the memos, the ad reads and the gallery without being wired into
+    each of them separately."""
+    if not modifiers_air_on():
+        return ""
+    try:
+        rows = modifiers_standing()
+        return station_modifiers.standing_clause(
+            rows[:station_modifiers.CLAUSE_CAP])
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def modifiers_gap_context() -> str:
+    """#1170: what the SFX guy should be thinking about while he fills a
+    hole.
+
+    His bank is already picked by CONTEXT, not by text - pick() ranks a
+    prepared line by how many terms it shares with whatever it is handed -
+    so handing it what is standing is the whole of the change.  Nothing
+    renders, nothing new is written, and a station with nothing standing
+    gets exactly the topic line it got before."""
+    if not modifiers_air_on():
+        return ""
+    try:
+        rows = modifiers_standing()
+        said = [station_modifiers.record_says(r) for r in rows[:3]]
+        return " ".join(s for s in said if s).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def modifiers_gap_sid() -> str:
+    """A sid for a line said into dead air, with the standing modifiers
+    ridden onto it.
+
+    The gap fills have never had one: sfxguy_gap_talk goes out through
+    dj_speak, whose ring entry has no `sid` key, so airlog_row_from writes
+    "" and script_ledger_catch_up (#1339) commits it as an unscripted
+    one-row block belonging to nothing.  #1170 asks for the opposite - what
+    is said into a gap is "followed throughout the system" - and a segment
+    id is what following means here."""
+    if not modifiers_trace_on():
+        return ""
+    try:
+        rows = modifiers_standing()
+        if not rows:
+            return ""
+        sid = uuid.uuid4().hex[:12]
+        modifiers_ride_round(sid, round_kind="sfxguy", source="dead air")
+        return sid
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def modifiers_seat_guest(mid: str) -> bool:
+    """Put the raised guest in the third chair.
+
+    THE MEASURED REASON THE THIRD SEAT SPOKE THREE TIMES IN A DAY.  Every
+    door into that seat is behind `if dj["third_name"]` - the voice draw
+    (session_voices), the macro rotation, the persona clause, and above all
+    the ONE string in the whole file that tells the model the letter D
+    exists:  ", 'D: ...' for {third_name}".  With third_name empty the
+    writer is told "strictly alternating" between A and B and nothing
+    anywhere asks for a D, so the three lines a day are the noise floor of
+    a model emitting a stray D: that banter_turns then maps to the seat.
+    third_name has exactly two writers - an operator typing it into the
+    panel, and set_guest() - and nothing in the running station calls
+    set_guest by itself.  Raising a guest here calls it, which is the
+    difference between a guest who is on the books and a guest who is in
+    the room.
+
+    Behind the switch: this changes what airs."""
+    if not modifiers_air_on():
+        return False
+    kind, key = station_modifiers.split_id(mid)
+    if kind != station_modifiers.KIND_GUEST or not key:
+        return False
+    try:
+        guest = next((g for g in read_guests()
+                      if str(g.get("id") or "") == key), None)
+        if not guest:
+            return False
+        if str(dj_settings().get("guest_id") or "") == key \
+                and dj_settings().get("guest_mode"):
+            return False                # already in the chair
+        set_guest(guest)
+        pipeline_log("air", "#1169: %s takes the third chair (%s)"
+                     % (str(guest.get("name") or "the guest"), mid))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def modifier_trace(mid: str, hours: float = 24.0) -> dict[str, Any]:
+    """Every segment this modifier touched, with times and whether those
+    segments were actually HEARD."""
+    now = time.time()
+    span = max(0.1, min(48.0, float(hours or 24.0))) * 3600.0
+    try:
+        with _MODIFIER_LOCK:
+            record = _MODIFIER_BOOK.get(str(mid))
+            rides = _MODIFIER_BOOK.rides_for(str(mid))
+    except Exception as exc:  # noqa: BLE001
+        return {"schema": 1, "id": str(mid), "available": False,
+                "why": "the modifier book could not be read: %r" % (exc,),
+                "modifier": None, "segments": [], "summary": None}
+    rides = [r for r in rides if float(r.get("at") or 0) >= now - span]
+    rows: list[dict[str, Any]] = []
+    if rides:
+        first = min(float(r.get("at") or now) for r in rides)
+        try:
+            rows = airlog_rows(first - 60.0, now + 7200.0, quiet=True)
+        except Exception:  # noqa: BLE001
+            rows = []
+    segments = station_modifiers.trace_segments(rides, rows)
+    return {"schema": 1, "id": str(mid), "available": True, "why": "",
+            "mode": modifiers_mode(),
+            "modifier": (record or None),
+            "standing": station_modifiers.record_standing(record, now)
+                        if record else False,
+            "segments": segments,
+            "summary": station_modifiers.trace_summary(record or {"name": mid},
+                                                       segments)}
+
+
 # --- The plotline desk: hand-written storylines the pair play out on air ---
 # You structure a plot in acts; while it is ACTIVE the booth weaves the
 # current act into its rounds — in character, never announced as a script —
@@ -69262,7 +69572,13 @@ async def sfxguy_gap_talk(why: str = "", floorless: bool = False) -> str:
         voice = str(dj_settings().get("drop_voice") or "")
         if not voice:
             return _no("no SFX speaker voice is configured (drop_voice)")
-        take = sfxguy_ready_pick(sfx_topic_line(), voice)
+        # #1170: "whenever there's dead air ... these are things that
+        # are said on the station". The topic is the PICK CONTEXT, not
+        # the words - so handing him what is STANDING is the whole of
+        # the change, and a station with nothing standing gets exactly
+        # the topic line it got before.
+        _mod_ctx = modifiers_gap_context()
+        take = sfxguy_ready_pick(_mod_ctx or sfx_topic_line(), voice)
         if not take:
             return _no("nothing in his bank is recorded, rested and free")
         token = str(take.get("id") or "")
@@ -69276,11 +69592,15 @@ async def sfxguy_gap_talk(why: str = "", floorless: bool = False) -> str:
         clip = {"path": "/media/" + name, "sig": media_sign(name),
                 "seconds": float(take.get("seconds") or 0)}
         door = _dj_speak_floorless if floorless else dj_speak
+        # #1170: and what he says into the hole is recorded against the
+        # modifier's id like anything else - which needs a segment id,
+        # which this road has never had.
+        _mod_sid = modifiers_gap_sid()
         try:
             out = await door("interject", None, line=text, who="drop",
                              voice=voice, name="The SFX Guy",
                              checked=True, sting=False, clip=clip,
-                             round_as="sfxguy")          # #1237
+                             round_as="sfxguy", sid=_mod_sid)  # #1237/#1170
         except Exception as exc:  # noqa: BLE001
             pipeline_log("air", "the SFX Guy could not fill the air: "
                          + f"{type(exc).__name__}: {exc}"[:140])
@@ -83692,6 +84012,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     # It cost two days of chasing the page, the loop and the wire, all of
     # which had real faults - and none of which was this one.
     _round_sid = uuid.uuid4().hex[:12]
+    # #1169: whatever is standing rides this round. Here and not at
+    # commit time, because a round that is written and never heard is
+    # still a round a modifier shaped, and "written and never aired"
+    # is an answer the trace has to be able to give (#1239).
+    try:
+        modifiers_ride_round(_round_sid)
+    except Exception:  # noqa: BLE001
+        pass
     dj = dj_settings()
     voices = ({str(t["who"]): str(t["voice"]) for t in ready_takes}
               if ready_takes is not None else await session_voices())
@@ -109465,7 +109793,10 @@ def segment_inspect(block: int) -> dict[str, Any]:
                            "holes": [], "prompt_kind": "", "why": "",
                            # 2026-09-15 (#1168), the three the inspector
                            # asked for and this route could not answer.
-                           "hour": "", "slot": None, "admission": None}
+                           "hour": "", "slot": None, "admission": None,
+                           # #1169: the guest, topic, event and
+                           # plotline that shaped THIS segment.
+                           "modifiers": []}
     try:
         led = [r for r in script_ledger_rows() if int(r.get("block") or -1) == int(block)]
     except Exception as exc:  # noqa: BLE001
@@ -109684,6 +110015,14 @@ def segment_inspect(block: int) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         out["admission"] = {"occurrences": [],
                             "say": "the gate could not be read: %r" % (exc,)}
+    # #1169, the reverse of /api/modifier/trace: the guest, topic,
+    # event and plotline that were standing when this round was
+    # written. [] when nothing was, and [] when the switch is off.
+    try:
+        out["modifiers"] = modifiers_named(
+            modifiers_for_sid(str((out.get("round") or {}).get("sid") or "")))
+    except Exception:  # noqa: BLE001
+        out["modifiers"] = []
     return out
 
 
@@ -109823,6 +110162,136 @@ def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict
 
 
 # --- broadcast admission (2026-09-15) ---
+# --- #1169/#1170: the modifier desk, both directions ----------------------
+@app.get("/api/modifiers")
+async def modifiers_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-15 (#1169): every modifier on the book, and which of them are
+    standing right now."""
+    require_read_auth(authorization)
+
+    def _read() -> dict[str, Any]:
+        modifiers_follow(force=True)
+        now = time.time()
+        with _MODIFIER_LOCK:
+            rows = _MODIFIER_BOOK.all()
+        standing = [r for r in rows
+                    if station_modifiers.record_standing(r, now)]
+        return {"schema": 1, "at": now, "mode": modifiers_mode(),
+                "switch": str(MODIFIERS_SWITCH.path),
+                "traces": modifiers_trace_on(), "airs": modifiers_air_on(),
+                "standing": standing, "all": rows,
+                "clause": modifiers_clause(),
+                "say": ("%d standing of %d on the book; the switch says %s"
+                        % (len(standing), len(rows), modifiers_mode()))}
+
+    return await asyncio.to_thread(_read)
+
+
+@app.get("/api/modifier/trace")
+async def modifier_trace_api(
+    id: str = "",
+    hours: float = Query(default=24.0, ge=0.1, le=48.0),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-15 (#1169): every segment this modifier touched, when, and
+    whether it was heard."""
+    require_read_auth(authorization)
+    if not station_modifiers.is_modifier_id(id):
+        raise HTTPException(status_code=400,
+                            detail="name a modifier id, like guest:4f959ea0")
+    return await asyncio.to_thread(modifier_trace, str(id), float(hours))
+
+
+@app.post("/api/modifier/raise")
+async def modifier_raise_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-15 (#1169): put a modifier up by hand.
+
+    `kind` is guest, topic, event or plot.  `key` is the id it already has
+    in its own store - a guest id out of guests.json, a topic id out of
+    banter_topics.json, a plot id out of plotlines.json - because this desk
+    does not mint a second identity for anything that has one.  An EVENT is
+    the exception and the only one: the station holds those as bare names,
+    so `key` may be left out and one is derived from the name.
+
+    Raising a GUEST also seats them, which is the whole of #1169's second
+    half - but only when the switch is at `ride`, because that changes what
+    airs."""
+    require_auth(authorization)
+    payload = await request.json()
+    kind = str(payload.get("kind") or "").strip().lower()
+    if kind not in station_modifiers.KINDS:
+        raise HTTPException(status_code=400,
+                            detail="kind must be one of %s"
+                                   % (", ".join(station_modifiers.KINDS),))
+    name = str(payload.get("name") or "").strip()
+    key = str(payload.get("key") or payload.get("id") or "").strip()
+    if not key and kind == station_modifiers.KIND_EVENT:
+        key = station_modifiers.name_key(name)
+    if not key:
+        raise HTTPException(status_code=400,
+                            detail="name the key this thing already has in "
+                                   "its own store")
+    stands = payload.get("stands_s")
+
+    def _raise() -> dict[str, Any]:
+        with _MODIFIER_LOCK:
+            _MODIFIER_BOOK.reload()
+            return _MODIFIER_BOOK.raise_(
+                kind, key, name or key,
+                stands_s=(None if stands is None else float(stands)),
+                note=str(payload.get("note") or ""), source="by hand")
+
+    row = await asyncio.to_thread(_raise)
+    if not row:
+        raise HTTPException(status_code=400, detail="that is not a modifier")
+    seated = await asyncio.to_thread(modifiers_seat_guest, str(row.get("id")))
+    return {"ok": True, "modifier": row, "seated": bool(seated),
+            "mode": modifiers_mode(),
+            "say": ("the switch is off - this is on the book and will not "
+                    "ride anything until <data>/modifiers/mode says trace "
+                    "or ride" if not modifiers_trace_on() else
+                    "standing, and riding every round written from now")}
+
+
+@app.post("/api/modifier/drop")
+async def modifier_drop_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-15 (#1169): take a modifier down.
+
+    The record stays.  A trace of a guest who has left is still a trace,
+    and #1169 asks for the segments the guest touched, not for the guest to
+    be forgotten the moment they go home."""
+    require_auth(authorization)
+    payload = await request.json()
+    mid = str(payload.get("id") or "").strip()
+    if not station_modifiers.is_modifier_id(mid):
+        raise HTTPException(status_code=400, detail="name a modifier id")
+
+    def _drop() -> bool:
+        with _MODIFIER_LOCK:
+            _MODIFIER_BOOK.reload()
+            return _MODIFIER_BOOK.drop(mid)
+
+    ok = await asyncio.to_thread(_drop)
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such modifier")
+    kind, _key = station_modifiers.split_id(mid)
+    if kind == station_modifiers.KIND_GUEST and modifiers_air_on():
+        try:
+            if str(dj_settings().get("guest_id") or "") == _key:
+                await asyncio.to_thread(set_guest, None)
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": True, "id": mid, "mode": modifiers_mode()}
+
+
 @app.get("/api/segment/inspect")
 async def segment_inspect_api(
     block: int = 0,
@@ -123936,9 +124405,33 @@ async def dj_caller_to_guest(
              "who": str(row.get("persona") or "")[:600],
              "why": str(row.get("goal") or "")[:600],
              "voice": str(row.get("voice_id") or "")[:100]}
+    # #1169: dedupe by ID, not by name. Promoting the same caller
+    # twice minted a fresh id and orphaned the old one, and
+    # active_guest()'s `g.get("id") == gid` lookup then silently
+    # returned {} - a guest on the books and nobody in the chair.
+    _old = next((g for g in read_guests()
+                 if str(g.get("name") or "") == guest["name"]), None)
+    if _old and _old.get("id"):
+        guest["id"] = str(_old["id"])
     write_guests([g for g in read_guests()
-                  if g.get("name") != guest["name"]] + [guest])
-    return {"ok": True, "guest": guest, "guests": read_guests()}
+                  if g.get("id") != guest["id"]
+                  and g.get("name") != guest["name"]] + [guest])
+    # #1169: and SEAT them. This route's own docstring says "same
+    # person, now in the room being interviewed instead of on the
+    # phone" - and it wrote the row and never called set_guest, so the
+    # one workflow that would put somebody in the third chair during a
+    # show was a no-op for the seat. Behind the switch: it changes
+    # what airs.
+    _seated = False
+    if modifiers_air_on():
+        try:
+            set_guest(guest)
+            modifiers_follow(force=True)
+            _seated = True
+        except Exception:  # noqa: BLE001
+            _seated = False
+    return {"ok": True, "guest": guest, "guests": read_guests(),
+            "seated": _seated}
 
 
 @app.get("/api/dj/callers")
@@ -134504,6 +134997,16 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
         "clip_tail": round(float(entry.get("clip_tail") or 0), 3),
         "seconds": round(seconds, 2),
     }
+    # #1169: the modifiers that shaped the segment this line belongs
+    # to, so a heard line can name what was going on when it went out.
+    # Absent when nothing was standing, which is the normal state and
+    # must cost the row nothing.
+    try:
+        _mods = modifiers_for_sid(str(row.get("sid") or ""))
+        if _mods:
+            row["mods"] = _mods
+    except Exception:  # noqa: BLE001
+        pass
     if entry.get("ad_audio"):
         row["ad_audio"] = str(entry.get("ad_audio"))
     if entry.get("images"):
@@ -135450,6 +135953,10 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
         return 0
     block = _script_block_next()
     at = time.time()
+    try:
+        _mods = modifiers_for_sid(str(sid or ""))
+    except Exception:  # noqa: BLE001
+        _mods = []
     out: list[str] = []
     for ord_, row in enumerate(rows):
         out.append(json.dumps({
@@ -135467,6 +135974,10 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
             # could have been read in advance.
             "cue": str(row.get("cue") or ""),
             "scripted": bool(row.get("scripted", True)),
+            # #1169: the modifiers that shaped this round. An id list,
+            # never a copy of the thing - guests.json, banter_topics.json,
+            # plotlines.json and caller_themes.json stay the truth.
+            **({"mods": _mods} if _mods else {}),
         }))
     try:
         with _SCRIPT_LEDGER_LOCK:
