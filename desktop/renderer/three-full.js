@@ -1071,6 +1071,126 @@
     return !!believeOpen;
   }
 
+  /* ================================================================ #1202
+
+     THE ORCHESTRATOR PAGE IN THIS CHOOSER - AND WHY IT IS NOT A TILE.
+
+     "I want the orchestrator page able to be opened in the 3JS tab."
+
+     WHAT IT IS, WHICH IS WHAT DECIDES WHERE IT GOES. Every other thing in
+     this sheet is an entry in PINE_3JS: it has an open() and a frame, the
+     station panel builds it, and on the desk it lives in a DIFFERENT
+     DOCUMENT from this file and can only be driven by name across a bridge
+     with JSON in between. The orchestrator page (orchestrator-glass.js,
+     #1191) is none of those things. It is a pop-up this module can simply
+     CALL - window.PineOrchGlass.open() - and it is reachable that way on
+     BOTH surfaces, for two different reasons that happen to agree:
+
+       - on the DESK, index.html loads orchestrator-glass.js into the shell,
+         which is the same document this file is loaded into. Same window.
+       - on the TABLET, ViewAssets.kt injects the whole bundle into the
+         panel's WebView, and both files are in that bundle. Same window
+         again.
+
+     So it crosses no boundary, it is never promoted, it has no frame and it
+     is not in the register. It is the one entry in this sheet that does not
+     need the thing the rest of this file exists to reach.
+
+     THEREFORE IT IS NOT A NINETEENTH TILE. Mixing it into the grid would
+     break three true things at once:
+
+       - the count line under the title counts REGISTER scenes, and the
+         operator was sent here in the first place by that line telling him
+         "0 on this station" when there were thirty-two. Adding a non-scene
+         to the number it reports would make it wrong again, in the other
+         direction, on the one surface whose whole job tonight was to stop
+         lying about a count;
+       - the one-at-a-time guard in show() governs opens INSIDE the panel and
+         governs nothing at all about a pop-up in this window;
+       - isFull(), lift(), drop() and watch() would each have to learn about
+         an object none of them owns.
+
+     So it sits in its own strip ABOVE the grid, under a heading that says
+     plainly what kind of thing it is - "not a scene: a pop-up in this
+     window" - carrying the same Carbon bot the glass wears in its own
+     header, so a person recognises it as the same object rather than reading
+     it as a nineteenth experience. Above rather than below because it is the
+     door to the account he called nightmarish, and burying that under
+     eighteen scene tiles is the same fault at a smaller scale.
+
+     WHAT HAPPENS IF HE PICKS IT WHILE A SCENE IS UP: THE SCENE IS CLOSED
+     FIRST, and the next sheet says so.
+
+     That was measured, not preferred. A promoted scene is
+     position:fixed; inset:0; z-index:2147483030 - the core's own CSS, up at
+     the top of this file. The glass is z-index 2147483005
+     (orchestrator-glass.css). On the TABLET both live in one document, so
+     opening the glass under a live scene puts it three million behind: he
+     presses a button and nothing appears. On the DESK the scene is inside
+     the webview and the glass is in the shell, so it WOULD appear - floating
+     over a full-bleed black carrier with a scene running invisibly behind
+     it. One press producing two different outcomes on two surfaces is
+     exactly the inconsistency that makes an operator stop trusting a
+     control.
+
+     Raising the glass above the scene was considered and rejected. The
+     scene's only way out on the tablet is .p3-exit at 2147483035, and a
+     pop-up parked over the top of it is "a way out the scene can delete"
+     wearing a different coat - the lesson the lock screen taught when it
+     covered the keyguard's own unlock gesture.
+
+     So: shutScene() first, which is the ONE existing road. It already drops
+     the lift, clears believeOpen and stops the watcher, so none of tonight's
+     three close paths is duplicated, bypassed or re-implemented here. If
+     nothing is up, shutScene() is not called at all and the glass opens
+     straight away.
+     ==================================================================== */
+
+  function glass() {
+    try {
+      if (root.PineOrchGlass && typeof root.PineOrchGlass.open === 'function') {
+        return root.PineOrchGlass;
+      }
+    } catch (err) { /* not in this bundle */ }
+    return null;
+  }
+
+  /* ALWAYS RESOLVES, ALWAYS WITH A STRING - the same contract show() carries,
+   * so the sheet can print whatever comes back without knowing which road
+   * ran. 'orchestrator' means it is up; anything else is a sentence to show
+   * him. */
+  function openGlass() {
+    var g = glass();
+    if (!g) {
+      lastNote = 'the orchestrator page is not loaded in this window - '
+        + 'orchestrator-glass.js is not in this bundle, so there is nothing '
+        + 'to open. Every scene above is unaffected.';
+      return Promise.resolve(lastNote);
+    }
+    var wasUp = isFull();
+    var raise = function () {
+      try { g.open(); } catch (err) {
+        lastNote = 'the orchestrator page would not open: '
+          + String((err && err.message) || err);
+        return lastNote;
+      }
+      /* The sheet closes on success, taking any note with it, so the reason
+       * the scene went away is left for the NEXT sheet rather than flashed
+       * at a surface that is about to be removed. */
+      lastNote = wasUp
+        ? 'the scene that was up was closed first - the orchestrator page '
+          + 'draws in this window and a full screen scene sits over it'
+        : '';
+      return 'orchestrator';
+    };
+    if (!wasUp) return Promise.resolve(raise());
+    /* Both settlements raise it. A panel that has stopped answering must not
+     * also cost him the pop-up: shutScene() has already put the stacking
+     * back before it asked anything, so the glass is safe to show either
+     * way. */
+    return shutScene().then(raise, raise);
+  }
+
   /* ====================================================================
      THE CHOOSER - the only part that stays in this document on the desk.
      ==================================================================== */
@@ -1132,6 +1252,65 @@
     var note = make('p', 'p3-note', lastNote || '');
     var grid = make('div', 'p3-grid');
     var tiles = [];
+
+    /* #1202 - THE ORCHESTRATOR PAGE, IN ITS OWN STRIP, ABOVE THE SCENES.
+     * See the long block above this function for why it is apart from them
+     * and what happens when it is picked while a scene is up.
+     *
+     * IT IS BUILT EVEN WHEN got.ok IS FALSE, and that is a real property
+     * rather than an oversight: the glass asks the station directly on
+     * /api/orchestrator/glass, so a panel that cannot be reached - the very
+     * failure that empties the grid above - costs him the scenes and not the
+     * account. The sheet that says "the station panel did not answer in
+     * time" still has a working door to the waste ledger in it. */
+    var apart = make('div', 'p3-apart');
+    var apartHead = make('div', 'p3-apart-h');
+    var bot = glyph('c:bot');
+    if (bot) {
+      var botHolder = make('span', 'p3-mark');
+      botHolder.innerHTML = bot;
+      apartHead.appendChild(botHolder);
+    }
+    apartHead.appendChild(make('span', '',
+      'not a scene - a pop-up in this window'));
+    apart.appendChild(apartHead);
+
+    var orch = make('button', 'p3-pick p3-orch');
+    orch.type = 'button';
+    orch.appendChild(make('b', '', 'The orchestrator'));
+    orch.appendChild(make('i', '',
+      'what he is doing, the four rooms, and what was made and never heard'));
+    /* NOT DISABLED WHEN IT IS MISSING. A dead button tells him nothing; a
+     * live one that answers with a sentence tells him which file is not in
+     * this bundle. openGlass() already returns exactly that sentence, so the
+     * honest path and the ordinary path are the same code. */
+    if (!glass()) {
+      orch.appendChild(make('i', '',
+        'not loaded in this window - press to see why'));
+    }
+    orch.addEventListener('click', function (event) {
+      event.stopPropagation();
+      var i;
+      for (i = 0; i < tiles.length; i += 1) tiles[i].disabled = true;
+      note.textContent = 'opening the orchestrator page...';
+      openGlass().then(function (said) {
+        var j;
+        for (j = 0; j < tiles.length; j += 1) tiles[j].disabled = false;
+        if (String(said) === 'orchestrator') {
+          if (sheet === into) { into.remove(); sheet = null; }
+          return;
+        }
+        note.textContent = String(said);
+      });
+    });
+    /* IT JOINS THE SAME DISABLE SWEEP AS THE TILES, and that is not
+     * cosmetic: a press here calls shutScene(), and shutScene() landing in
+     * the middle of a scene that show() is still retrying to promote is the
+     * exact race the one-at-a-time guard was written for. One press at a
+     * time across the whole sheet, both kinds of thing included. */
+    tiles.push(orch);
+    apart.appendChild(orch);
+    into.appendChild(apart);
 
     var pick = function (row) {
       var b = make('button', 'p3-pick');
@@ -1241,6 +1420,13 @@
     chooser: chooser,
     isFull: isFull,
     HOST_ID: HOST_ID,
+    /* #1202: the orchestrator page, openable from anywhere that can already
+       reach this module - the rail and the hot corners included - and not
+       only from the sheet. Closes a live scene first; see the block above
+       openGlass() for why that is the only outcome that is the same on both
+       surfaces. */
+    openOrchestrator: openGlass,
+    _glass: glass,
     /* For the tests and for a console: the core itself, and the exact
      * source that is evaluated inside the panel. */
     _core: pineThreeCore,

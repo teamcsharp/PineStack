@@ -1479,9 +1479,22 @@
      * the very window he is editing a clip in. The hold is tied to the
      * element, so a road that tears the editor out without calling close()
      * still ends the quiet. */
-    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
-      root.PineDuck.hold('hc-video-editor', root.PineDuck.REPORT, box);
-    }
+    /* 2026-09-15 (#1210): AND THE QUIET MAY NEVER COST HIM THE CLOSE BUTTON.
+     *
+     * This call was unguarded, and the iframe is appended ABOVE it. A throw
+     * out of hold() therefore left the editor on screen with every one of
+     * its exits still unbuilt - close(), the back-click that calls it, the
+     * listener that hears the editor's own close and export, and the entry
+     * in `sheets`. The window opened and no road could shut it.
+     *
+     * hold() walks the document's media nodes and fans out to every
+     * watcher, so it has real ways to fail. Ducking the room is a courtesy.
+     * Being able to close the window is not. */
+    try {
+      if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+        root.PineDuck.hold('hc-video-editor', root.PineDuck.REPORT, box);
+      }
+    } catch (err) { /* the show keeps playing; the editor still closes */ }
     var entry = {box: box, close: close};
     function close() {
       root.removeEventListener('message', receive);

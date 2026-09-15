@@ -67,6 +67,35 @@
 .p3-mark { display: inline-flex; width: 14px; height: 14px; }
 .p3-mark svg { width: 100%; height: 100%; fill: currentColor; }
 .p3-head i { font-style: normal; font-size: 11px; color: var(--muted, #8fa0ad); }
+/* #1202: THE ORCHESTRATOR PAGE, APART FROM THE SCENES.
+
+   A ruled-off strip above the grid rather than a tile in it, because it is a
+   different kind of thing: a pop-up in THIS document, not a scene the panel
+   builds in another one. The rule and the caption are the whole design - a
+   person should be able to tell at a glance that the button below the line
+   and the buttons below the grid are not the same sort of object, without
+   reading either.
+
+   It is full width on purpose. The grid is auto-fill at 150px, so a tile
+   here would land beside three scenes and read as a fourth. */
+.p3-apart {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line, #35414c);
+}
+.p3-apart-h {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--muted, #8fa0ad);
+  margin-bottom: 7px;
+}
+.p3-orch { width: 100%; }
+.p3-orch b { font-size: 13px; }
+
 .p3-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));

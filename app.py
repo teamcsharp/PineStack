@@ -52575,8 +52575,17 @@ async def dead_air_watch() -> None:
             # seconds of nobody saying a word, gap filler never called.
             # The operator's dead air is the PAIR being silent, not the
             # room, and #1231 built the clock that tells them apart.
+            # 2026-09-15 (#1208): AIR1208_NAMED_PARK. Bounded, and it says
+            # where it is. This is the very next await below the two #1186
+            # bounded, so a pass that survives both of those parks HERE -
+            # which is what the ledger showed: passes stuck at 2 with both
+            # bounds already fired, 26 minutes without reaching the top.
+            _dead_air_pass("the SFX guy over music")
             try:
-                await sfx_fill_over_music()
+                await asyncio.wait_for(
+                    sfx_fill_over_music(), AIR1186_PARK_S)
+            except asyncio.TimeoutError:
+                _dead_air_late("the SFX guy over music")
             except Exception:  # noqa: BLE001
                 pass        # the watchdog never dies of its own cure
             if ((now_really_playing() and (_room_gets_music
@@ -52615,11 +52624,21 @@ async def dead_air_watch() -> None:
             # dead_air_rescue. Strictly additive: when the cupboard has
             # nothing the sting below still happens.
             if quiet > DEAD_AIR_RESCUE_AFTER:
+                # 2026-09-15 (#1208): bounded on the playout budget, not
+                # the filler one - dead_air_rescue ends in _ready_shelf_air,
+                # which waits for a render and then for the page to play it.
+                # A timeout here reads as "the cupboard did not answer in
+                # time", so the pass falls through to the rungs below
+                # exactly as it would if the cupboard were empty.
+                _dead_air_pass("the cupboard (rescue)")
                 try:
-                    if await dead_air_rescue(quiet):
+                    if await asyncio.wait_for(
+                            dead_air_rescue(quiet), AIR1186_PARK_AIR_S):
                         heard = time.time()
                         strikes = 0
                         continue
+                except asyncio.TimeoutError:
+                    _dead_air_late("the cupboard's rescue")
                 except Exception:  # noqa: BLE001
                     pass        # the watchdog never dies of its own cure
             # 2026-09-08: silence is PUNCTUATED long before it is a strike
@@ -52628,9 +52647,16 @@ async def dead_air_watch() -> None:
             # not a hard twelve seconds. This was the shortest hole the
             # SFX Guy could ever hear.
             if quiet > sfx_gap_notice(limit):
+                # 2026-09-15 (#1208): the same function is already bounded
+                # at the #1313 call site forty lines above. One call site
+                # bounded and the other not is how a cure hides a fault.
+                _dead_air_pass("the gap filler (silence)")
                 try:
-                    await sfx_fill_gap(f"the room has been silent {int(quiet)}s",
-                                       under_floor=True)
+                    await asyncio.wait_for(sfx_fill_gap(
+                        f"the room has been silent {int(quiet)}s",
+                        under_floor=True), AIR1186_PARK_S)
+                except asyncio.TimeoutError:
+                    _dead_air_late("the gap filler (silence)")
                 except Exception:  # noqa: BLE001
                     pass
             if quiet <= limit or _rendering:
