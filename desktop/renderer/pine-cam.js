@@ -158,25 +158,43 @@
     } catch (e) { /* a forgotten position is not worth an error */ }
   }
 
-  function drag(el, handle, key) {
+  /* 2026-09-14: "tap the window and drag it around to reposition it."
+   * This listened for mouse events only, so on the tablet a finger on
+   * the box scrolled the page instead. Pointer events with capture cover
+   * a finger and a mouse alike; presses on buttons are left to the
+   * buttons; and a press that never moved more than eight pixels is
+   * reported as a TAP through `onTap`, which is how the collapsed circle
+   * opens back up. */
+  function drag(el, handle, key, onTap) {
     var from = null;
-    handle.addEventListener('mousedown', function (ev) {
-      if (ev.button !== 0) return;
-      from = {x: ev.clientX, y: ev.clientY,
+    var moved = false;
+    handle.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+      if (ev.target && ev.target.closest && ev.target.closest('button, input, select, textarea, a')) return;
+      from = {x: ev.clientX, y: ev.clientY, id: ev.pointerId,
         left: parseInt(el.style.left, 10) || 0,
         top: parseInt(el.style.top, 10) || 0};
+      moved = false;
+      try { handle.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
       ev.preventDefault();
     });
-    document.addEventListener('mousemove', function (ev) {
-      if (!from) return;
-      el.style.left = Math.max(0, Math.min(window.innerWidth - 80,
-        from.left + (ev.clientX - from.x))) + 'px';
-      el.style.top = Math.max(0, Math.min(window.innerHeight - 60,
-        from.top + (ev.clientY - from.y))) + 'px';
+    handle.addEventListener('pointermove', function (ev) {
+      if (!from || ev.pointerId !== from.id) return;
+      var dx = ev.clientX - from.x, dy = ev.clientY - from.y;
+      if (!moved && Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      moved = true;
+      el.style.left = Math.max(0, Math.min(window.innerWidth - 60, from.left + dx)) + 'px';
+      el.style.top = Math.max(0, Math.min(window.innerHeight - 40, from.top + dy)) + 'px';
     });
-    document.addEventListener('mouseup', function () {
-      if (from) { remember(el, key); from = null; }
-    });
+    var drop = function (ev) {
+      if (!from || (ev && ev.pointerId !== from.id)) return;
+      try { handle.releasePointerCapture(from.id); } catch (e) { /* not held */ }
+      if (moved) remember(el, key);
+      else if (onTap) { try { onTap(ev); } catch (e) { /* a tap is a courtesy */ } }
+      from = null;
+    };
+    handle.addEventListener('pointerup', drop);
+    handle.addEventListener('pointercancel', drop);
   }
 
   function build() {
@@ -188,15 +206,87 @@
       '<div class="pine-cam-bar">'
       + '<b>PINE CAM</b>'
       + '<i id="pineCamWhy"></i>'
+      /* 2026-09-14: record from the box itself, into the record location;
+       * fold the box to a live circle; close. Carbon through pineIcon with
+       * a word behind each, never an emoji. */
+      + '<button type="button" class="pine-cam-rec" id="pineCamBoxRec" '
+      + 'aria-label="Record" title="Record: mark the start, press again to end the clip and keep it in the record location">'
+      + icon('c:recording--filled', 'Record', 'REC') + '</button>'
+      + '<button type="button" class="pine-cam-fold" id="pineCamFold" '
+      + 'aria-label="Collapse to a circle" title="Collapse the picture to a small live circle - tap the circle to open it again">'
+      + icon('c:circle--filled', 'Collapse', 'o') + '</button>'
       + '<button type="button" class="pine-cam-x" '
       + 'aria-label="Close the camera view" title="Close the camera view">×</button>'
       + '</div>'
       + '<img id="pineCamImg" alt="The Pine Cam, live">';
     document.body.appendChild(box);
     place(box);
-    drag(box, box.querySelector('.pine-cam-bar'));
-    box.querySelector('.pine-cam-x').addEventListener('click', close);
+    /* The whole box is the handle; a tap on the folded circle unfolds it. */
+    drag(box, box, null, function () { if (box.classList.contains('pine-cam-round')) setRound(false); });
+    box.querySelector('.pine-cam-x').addEventListener('click', function (ev) { ev.stopPropagation(); close(); });
+    box.querySelector('#pineCamFold').addEventListener('click', function (ev) { ev.stopPropagation(); setRound(true); });
+    box.querySelector('#pineCamBoxRec').addEventListener('click', function (ev) { ev.stopPropagation(); boxRecord(); });
+    try { if (localStorage.getItem(ROUND_KEY) === '1') setRound(true); } catch (e) { /* stays open */ }
     return box;
+  }
+
+  /* 2026-09-14: "collapse the camera picture in picture into an icon that's
+   * also able to be dragged around inside of a circle ... I want the stream
+   * of the camera to still be showing across the circle." The same <img>
+   * keeps painting at four a second; the CSS makes it a round 84px window
+   * with the picture covering it. The choice is remembered. */
+  var ROUND_KEY = 'pineCamRound';
+  function setRound(on) {
+    if (!box) return;
+    box.classList.toggle('pine-cam-round', !!on);
+    try { localStorage.setItem(ROUND_KEY, on ? '1' : '0'); } catch (e) { /* forgotten */ }
+    if (!on) place(box);                   /* back to the remembered size */
+  }
+
+  /* 2026-09-14: THE RECORD BUTTON ON THE BOX. "offer a recording button
+   * that records footage ... and save it to the record location." The
+   * link records continuously (#1356), so this marks a start, marks an
+   * end, asks the station to cut that span, and then asks it to KEEP the
+   * cut in the record location - the clips folder the folder icon opens,
+   * which the desk carries to the export folder when that is switched
+   * on. No Save As: the tablet has none, and the record location is the
+   * point. */
+  var boxRecFrom = 0;
+  var boxRecTick = 0;
+  function boxRecPaint() {
+    var b = document.getElementById('pineCamBoxRec');
+    if (!b) return;
+    var why = document.getElementById('pineCamWhy');
+    if (!boxRecFrom) { b.classList.remove('on'); return; }
+    var sec = Math.max(0, Math.round(Date.now() / 1000 - boxRecFrom));
+    b.classList.add('on');
+    if (why) why.textContent = 'recording ' + Math.floor(sec / 60) + ':' + (sec % 60 < 10 ? '0' : '') + (sec % 60);
+  }
+  function boxRecord() {
+    var why = document.getElementById('pineCamWhy');
+    var tell = function (t) { if (why) why.textContent = String(t || ''); };
+    if (!boxRecFrom) {
+      boxRecFrom = Date.now() / 1000;
+      boxRecPaint();
+      if (!boxRecTick) boxRecTick = setInterval(boxRecPaint, 500);
+      return;
+    }
+    var from = boxRecFrom, to = Date.now() / 1000;
+    boxRecFrom = 0;
+    if (boxRecTick) { clearInterval(boxRecTick); boxRecTick = 0; }
+    boxRecPaint();
+    if (to - from < 1) { tell('too short to cut'); return; }
+    tell('cutting ' + Math.round(to - from) + 's...');
+    Promise.resolve(post('/api/pinelink/cut', {from: from, to: to})).then(function (r) {
+      if (!r || !r.ok) { tell((r && r.say) || 'the cut did not come back'); return; }
+      tell('keeping it...');
+      return Promise.resolve(post('/api/pinelink/keep', {name: r.name})).then(function (k) {
+        if (!k || !k.ok) { tell((k && k.say) || 'the station kept only the cut'); return; }
+        tell('kept: ' + (k.name || 'the clip'));
+        readPrefs();
+        setTimeout(function () { if (why && why.textContent.indexOf('kept:') === 0) why.textContent = live ? 'live' : ''; }, 8000);
+      });
+    }).catch(function () { tell('the station did not answer'); });
   }
 
   /* 2026-09-14: THE CACHE-BUSTER WORE THE TOKEN'S NAME. `?t=` is the
@@ -285,6 +375,7 @@
           : (got.state === 'live' && !got.fresh) ? 'stale' : String(got.state || '');   /* #1387 */
       }
       paintRow(got, live);
+      railTabs();                          /* 2026-09-14: the rail entries */
       /* If it goes while the view is open, say so rather than freezing on
        * the last frame - a still picture of a camera that has gone is the
        * worst of both. */
@@ -1436,6 +1527,41 @@
   }
 
   /* The radio icon: tell the tablet, open the sheet, climb. */
+  /* 2026-09-14: THE TABLET'S SIDE RAIL. "an option in the sidebar on the
+   * pine tab to view the pine cam whenever it is present ... and a button
+   * in the sidebar to scan for, locate, and connect to the pine cam and
+   * go through troubleshooting." The rail (#pineViewRail, rail.js) is
+   * built at boot from VIEWS[]; these are not views, so they are appended
+   * as two more tabs in the rail's own class. CAM is shown only while the
+   * link is live and opens the picture; FIND CAM runs the ladder with its
+   * console, whatever the state. The rail scrolls, so a tenth tab is
+   * reachable. Re-tried from look() until the rail exists. */
+  function railTabs() {
+    var rail = document.getElementById('pineViewRail');
+    if (!rail) return;
+    var cam = document.getElementById('pineViewTab-cam');
+    if (!cam) {
+      cam = document.createElement('button');
+      cam.id = 'pineViewTab-cam';
+      cam.type = 'button';
+      cam.className = 'pine-view-tab pine-view-tab-cam';
+      cam.textContent = 'CAM';
+      cam.title = 'The Pine Cam is here - tap for the picture';
+      cam.addEventListener('click', function (ev) { ev.stopPropagation(); toggle(); });
+      rail.appendChild(cam);
+      var find = document.createElement('button');
+      find.id = 'pineViewTab-camfind';
+      find.type = 'button';
+      find.className = 'pine-view-tab pine-view-tab-camfind';
+      find.textContent = 'FIND CAM';
+      find.title = 'Scan for the Pine Cam, connect to it, and put its picture up - step by step';
+      find.addEventListener('click', function (ev) { ev.stopPropagation(); radio(); });
+      rail.appendChild(find);
+    }
+    cam.style.display = live ? '' : 'none';
+    cam.classList.toggle('on', !!shown);
+  }
+
   function radio() {
     openLadder();
     con('radio', 'the radio icon was pressed - telling the tablet the camera is being switched on');
@@ -1524,6 +1650,7 @@
   }
 
   function start() {
+    try { railTabs(); } catch (e) { /* no rail on this surface */ }
     try { folded = localStorage.getItem(FOLD_KEY) === '1'; }
     catch (e) { folded = false; }
     /* #1118: the three icons beside the wrench, and the export folder

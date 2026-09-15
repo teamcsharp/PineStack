@@ -626,3 +626,41 @@
   0%, 100% { background: #35414c; }
   50% { background: #65c7da; }
 }
+
+/* 2026-09-14: the box is dragged by a finger anywhere on it (touch-action
+   none, or the page scrolls instead), records from its own bar, and folds
+   to a live circle that keeps painting the stream. */
+.pine-cam-box { touch-action: none; user-select: none; }
+.pine-cam-rec, .pine-cam-fold {
+  background: none;
+  border: 1px solid #24323a;
+  border-radius: 6px;
+  color: #9fb4bd;
+  width: 26px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  font-size: 10px;
+}
+.pine-cam-rec svg, .pine-cam-fold svg, .pine-cam-rec .pi-icon, .pine-cam-fold .pi-icon { width: 13px; height: 13px; }
+.pine-cam-rec.on { color: #ff5d5d; border-color: #ff5d5d; animation: pine-cam-rec-beat 1.2s ease-in-out infinite; }
+@keyframes pine-cam-rec-beat { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+.pine-cam-box.pine-cam-round {
+  width: 84px !important;
+  height: 84px;
+  border-radius: 50%;
+  overflow: hidden;
+  border: 2px solid #65c7da;
+  box-shadow: 0 6px 22px rgba(0,0,0,.55);
+  cursor: pointer;
+}
+.pine-cam-box.pine-cam-round .pine-cam-bar { display: none; }
+.pine-cam-box.pine-cam-round img {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  object-fit: cover;
+}

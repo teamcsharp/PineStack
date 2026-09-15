@@ -107861,6 +107861,46 @@ async def pinelink_cut_api(
     return got
 
 
+@app.post("/api/pinelink/keep")
+async def pinelink_keep_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-14: "a recording button that records footage ... and save it
+    to the record location." A cut lives in data/pinelink/cuts, which
+    nothing lists; this copies it into the clips folder - the record
+    location the folder icon opens and the desk carries from - under a
+    name that says it was pressed for, not rolled."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    name = str((body or {}).get("name") or "")
+    if not PINELINK_NAME.match(name):
+        raise HTTPException(status_code=400, detail="bad name")
+    src = PINELINK_CUTS / name
+    if not src.is_file():
+        raise HTTPException(status_code=404, detail="no such cut")
+
+    def _keep() -> dict[str, Any]:
+        folder = pinelink_clips_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / ("rec_" + time.strftime("%Y-%m-%d_%H-%M-%S") + ".mp4")
+        shutil.copy2(src, dest)
+        return {"ok": True, "name": dest.name, "path": str(dest),
+                "host_path": share_path_of(dest), "bytes": dest.stat().st_size,
+                "say": "kept as %s in %s" % (dest.name, share_path_of(folder) or str(folder))}
+
+    try:
+        got = await asyncio.to_thread(_keep)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "say": "could not keep it: %s" % str(exc)[:160]}
+    _PINELINK_CENSUS["at"] = 0.0           # the next look counts it
+    pipeline_log("air", "pine cam: %s (from the box's record button)" % got["say"])
+    return got
+
+
 @app.get("/api/pinelink/cut/{filename}")
 async def pinelink_cut_file_api(
     filename: str,
