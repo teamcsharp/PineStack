@@ -17312,8 +17312,15 @@ SEGMENT_BRIEF: dict[str, dict[str, Any]] = {
         # 'C:' turn, and claiming one here would make its failure
         # line say "nobody speaks on the phone line" about a
         # segment that has no phone in it.
-        "want": ("a memo from upstairs - read out and reacted to, "
-                 "or phoned down by the manager himself"),
+        # 2026-09-15 (#1176): and the operator has now said, in a report
+        # filed against a real one, what the segment IS - "the DJs get an
+        # angry message from the manager and discuss / sulk over it for
+        # the segment. They can take a caller but he also has to be
+        # discussing the manager's message." The brief is what the
+        # checker measures a segment against, so it says that.
+        "want": ("an angry message from upstairs - read out, reacted to and "
+                 "sulked over for the segment, or phoned down by the manager "
+                 "himself; a caller in this segment is on about it too"),
         "any": ("upstairs", "management", "memo", "head office",
                 "the office", "the boss", "the brass", "came down",
                 "a note from", "the suits", "corporate", "the front office",
@@ -89106,8 +89113,19 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
             "the way a memo says it, and then deal with it on air. Take it "
             "personally, because it is personal: defend yourself, blame each "
             "other, agree with it in a way that is worse than arguing, or "
-            "quietly do what it says while complaining. The manager is never "
-            "in the room and never speaks in his own voice." + flavour)
+            "quietly do what it says while complaining."
+            # 2026-09-15 (#1176), the operator's own words about what this
+            # segment IS: "This is a memo from upstairs segment. That means
+            # the DJs get an angry message from the manager and discuss /
+            # sulk over it for the segment. They can take a caller but he
+            # also has to be discussing the manager's message."
+            "\nHe is ANGRY. It is not a note, it is a telling-off, and it "
+            "is the whole of this segment: keep coming back to it, sulk "
+            "about it, bring it up again after you think you have moved "
+            "on. Do not finish with it in two lines and change the "
+            "subject. If somebody is on the line during this segment, they "
+            "are on about the memo as well - the caller heard it too and "
+            "has an opinion about it." + flavour)
     else:
         _angle = (
             "a memo has just come down from the manager upstairs. One of you "
@@ -89118,7 +89136,13 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
             f"\"{note}\"\n"
             "Do not read that back word for word. Say what it means for the "
             "show tonight, and mention any product or sponsorship it asks "
-            "you to push." + flavour)
+            "you to push."
+            # 2026-09-15 (#1176): the same segment, the same rules.
+            "\nHe is not asking nicely - it lands as a telling-off, and it "
+            "is the whole of this segment: keep returning to it, sulk about "
+            "it, bring it up again after you think you have moved on. If "
+            "somebody is on the line during this segment they are on about "
+            "the memo too." + flavour)
     # #1164: ...OR HE RINGS THE BOOTH AND SAYS IT HIMSELF.
     #
     # Behind the manager_calls_in switch, which defaults OFF, and
@@ -89136,7 +89160,23 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
                                           flavour, topic=_topic)
         if _rang:
             return _rang
-    _said = await dj_banter(track, lines=3, whole=True,           # #859
+    # 2026-09-15 (#1176): WRITTEN TO LAST THE SEGMENT.
+    #
+    # The operator filed a report on a manager segment that ran 46.6
+    # seconds of a four-minute entry - 11 lines, and by line four they
+    # were somewhere else entirely. `lines=3` is why: it asks for three
+    # and the round is over. He asked for the pair to "discuss / sulk over
+    # it for the segment", so it asks for ten.
+    #
+    # Ten rather than the twenty-odd that would fill 240 seconds exactly,
+    # because tonight's other measurement is that a round longer than the
+    # room left in its entry is REFUSED at hand-over and thrown away
+    # whole - "the gallery round runs 196s and its entry has 92s left".
+    # At the 4.2 s a line this segment actually measured, ten lines is
+    # about 42 seconds of talk plus its stings, which fits an entry that
+    # has already been part spent. Better a segment that lasts and airs
+    # than one that fills the sheet and is never heard.
+    _said = await dj_banter(track, lines=10, whole=True,          # #859
                             bank=bank_to is not None,
                             bank_to=bank_to, own_material=True,
                             angle=_angle)
