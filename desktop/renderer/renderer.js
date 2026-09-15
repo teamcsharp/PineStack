@@ -1400,6 +1400,11 @@ for (const [id, muted] of [["nabuMuteBtn", true], ["nabuUnmuteBtn", false]]) {
 function createDesktopRejectionNotices({request, openReview, storage = localStorage, key = '', interval = 4000}) {
   let stopped = false, timer = null, running = null, cursor = 0, initialized = false;
   let bootstrapHead = 0, count = 0, fresh = 0, newest = null;
+  // #1192: the queue's SHAPE, off the same payload the count comes
+  // from. Null until the station answers with it, and every reader
+  // below falls back to exactly today's wording when it is null, so
+  // an older station serves an unchanged banner.
+  let shape = null;
   const storageKey = 'pine-desktop-rejection-cursor:' + key;
   try { cursor = Number(storage.getItem(storageKey)) || 0; } catch (_) { /* storage unavailable */ }
   const root = document.createElement('div'); root.dataset.rejectionReview = 'desktop'; root.id = 'desktopRejectionNotices';
@@ -1438,8 +1443,40 @@ function createDesktopRejectionNotices({request, openReview, storage = localStor
       // the station later repaired, superseded or re-graded leaves the queue
       // and was still being counted here. The headline is the queue.
       const waiting = count || fresh;
-      title.textContent = waiting === 1 ? 'A cut line waits for your decision' : waiting + ' cut lines wait for your decision';
-      text.textContent = 'Each one was refused after its asks and cut before the studio. Allow it, keep the cut, or discuss the failed checks with the orchestrator.';
+      // #1192: TWO DIFFERENT THINGS, COUNTED AS ONE, NAMED AFTER THE
+      // SMALLER. Measured on the live store the night this was
+      // written: of 581 pending rows, 142 were CUTS (a line taken out
+      // of a round - gate call_contract or tint) and 439 were HOLDS (a
+      // whole round stopped before the booth for missing its brief -
+      // gate segment_brief, disposition held_before_recording). This
+      // banner read `unreviewed`, which is all 581, and called every
+      // one of them a cut line. He was being asked to make a decision
+      // about 580 things when roughly 128 were the kind of thing the
+      // sentence described. The station now says which is which on the
+      // same payload; when it does not, the old sentence stands.
+      const cuts = shape ? Number(shape.cuts) || 0 : 0;
+      const holds = shape ? Number(shape.holds) || 0 : 0;
+      const others = shape ? Number(shape.other) || 0 : 0;
+      const gone = shape && shape.undecidable != null ? Number(shape.undecidable) || 0 : 0;
+      const named = [];
+      if (cuts) named.push(cuts === 1 ? '1 cut line' : cuts + ' cut lines');
+      if (holds) named.push(holds === 1 ? '1 held round' : holds + ' held rounds');
+      if (others) named.push(others === 1 ? '1 other refusal' : others + ' other refusals');
+      if (named.length) {
+        let said = named.join(' and ') + (cuts + holds + others === 1 ? ' waits' : ' wait')
+          + ' for your decision';
+        // A row whose round has aired, expired or been replaced cannot
+        // be decided at all: there is no line to restore and nothing to
+        // restore it into. Saying so is the difference between a queue
+        // and a backlog.
+        if (gone) said += ' - ' + gone + ' of them can no longer be decided: the round is gone';
+        title.textContent = said;
+      } else {
+        title.textContent = waiting === 1 ? 'A cut line waits for your decision' : waiting + ' cut lines wait for your decision';
+      }
+      text.textContent = holds
+        ? 'A cut line was refused after its asks and taken out of its round; a held round was stopped before the studio for missing what its entry is for. Allow it, keep the decision, or discuss the failed checks with the orchestrator.'
+        : 'Each one was refused after its asks and cut before the studio. Allow it, keep the cut, or discuss the failed checks with the orchestrator.';
       text.classList.remove('error'); card.hidden = false;
     }
   }
@@ -1457,6 +1494,7 @@ function createDesktopRejectionNotices({request, openReview, storage = localStor
           const next = snapshot ? Number(data.latest_cursor) || 0 : data.next_after != null ? Number(data.next_after) : events.length ? Math.max(...events.map(row => Number(row.seq) || 0)) : data.events_has_more ? previous : Number(data.latest_cursor) || 0;
           cursor = Math.max(previous, Number.isFinite(next) ? next : previous);
           count = Number(data.unreviewed) || 0;
+          shape = data.queue && typeof data.queue === 'object' ? data.queue : null;
           if (!initialized && !previous) {
             fresh = count; bootstrapHead = Number(data.latest_cursor) || 0;
             const latest = data.items?.[0] || events.at(-1);

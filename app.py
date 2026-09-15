@@ -18650,7 +18650,8 @@ _BRIEF_TITLE_STOP = frozenset(
     "story three today world years after says said".split())
 
 
-def segment_audit(kind: str, script: str, *, product: str = "", titles: str = "") -> dict[str, Any]:
+def segment_audit(kind: str, script: str, *, product: str = "", titles: str = "",
+                  capture: bool = True) -> dict[str, Any]:
     """#968: does this script do the thing its entry is for?
 
     2026-09-08 (evening): `titles` are the wire headlines a bulletin was
@@ -18740,7 +18741,20 @@ def segment_audit(kind: str, script: str, *, product: str = "", titles: str = ""
     if out.get("checked") and not out.get("ok"):
         out["machine_ok"] = False
         out["machine_faults"] = [out.get("why") or "off brief"]
-        if line_review_permits("segment_brief", script, reasons=out["machine_faults"],
+        # #1192: `capture=False` IS THE RE-READ, and it exists for one
+        # caller: review_queue_regrade, asking whether a row that has
+        # been sitting in the operator's queue for a week would still
+        # be refused today.  line_review_permits below captures on a
+        # refusal, and the row it would capture is the very row being
+        # examined: re-auditing it would bump its occurrence count,
+        # move its last_at so a seven-day-old row looked new, and pay
+        # an fsync-bearing INSERT for the privilege - on the table
+        # whose capture cost this station 6,189 seconds of event-loop
+        # stall in a day (#1398, #1190).  `and` short-circuits, so
+        # with capture=False the audit still reports machine_ok and
+        # machine_faults exactly as before and simply does not write.
+        # Every existing caller keeps today's behaviour by default.
+        if capture and line_review_permits("segment_brief", script, reasons=out["machine_faults"],
                                context={"kind": str(kind or ""), "who": "", "product": product}):
             out.update(ok=True, operator_accepted=True)
     return out
@@ -121842,6 +121856,826 @@ def line_review_regrade_pending(limit: int = 400, gone_after: float = 1800.0) ->
     return out
 
 
+# =====================================================================
+# #1192: THE QUEUE HAD NO CONSUMER, AND THE BANNER NAMED THE WRONG THING.
+#
+# THE OPERATOR, photographing a banner reading "580 cut lines wait for
+# your decision":
+#
+#     "adjust the system to make it more acceptable in the future whenever
+#     it comes to working and preventing us from having wasted work...
+#     ensure that the station is more fluidly able to pursue its goals."
+#
+# WHAT WAS MEASURED, on the live store, before a line of this was written.
+# 30,127 rows in line_reviews.  581 pending.  29,528 noted.  EIGHTEEN
+# human decisions, ever.  The 581 pending are:
+#
+#     segment_brief / held_before_recording   439    a HOLD
+#     call_contract / cut                     126    a CUT
+#     tint          / cut                      16    a CUT
+#
+# and the only automatic consumer the queue has ever had,
+# line_review_regrade_pending, iterates exactly
+#
+#     for gate in ("tint", "recording_tint"):
+#
+# recording_tint is in INFORMATIONAL_GATES, so its rows are never pending
+# and that arm is always empty.  That leaves tint: 16 rows of 581, 2.8 per
+# cent.  The other 97.2 per cent is read by nothing at all.  Arrivals run
+# 45-127 a day (38, 127, 91, 58, 74, 72, 76, 45 across the last eight
+# days); departures are about zero; the oldest pending row is seven days
+# old and 500 of the 581 are over twenty-four hours old.  A queue only a
+# human can drain, which a human has drained eighteen times in 30,127
+# rows, is not a queue.  It is a leak, and it leaks the operator's
+# attention.
+#
+# A HOLD AND A CUT ARE NOT THE SAME QUESTION, and this is the whole of
+# the design.
+#
+#   A CUT (call_contract, tint) took a line OUT of a round that may still
+#   exist.  The operator's decision is live for as long as the round is:
+#   allow, and the words go back through the writing and recording rooms.
+#
+#   A HOLD (segment_brief / held_before_recording) stopped a whole round
+#   before the booth because the script never got to what its entry was
+#   for.  The hold has already done its work.  If the round it held back
+#   is gone, nothing at all is owed: there is no line to restore and no
+#   round to restore it into.
+#
+# In BOTH cases the row becomes undecidable the moment its subject stops
+# existing, and the retirement road is deleting those subjects underneath
+# these rows - live retirement reasons cite "it failed its segment brief
+# when it was shelved" in as many words.  A news round's subject is dead
+# three hours after it was prepped (NEWS_PREP_LIFE = 10800.0) and 378 of
+# the 439 holds are news.  So a row can decay into a question nobody can
+# answer, and then sit in the operator's count for a week.
+#
+# line_review_matching() is the join that answers "does the subject still
+# exist", the tint arm has used it since 2026-09-08, and `round_gone` has
+# closed 441 rows that way.  Nothing ever ran it for the other 97 per
+# cent.  That is the single largest recoverable piece of this queue and
+# it needs no new mechanism, only a second arm on the same thread.
+#
+# WHAT THIS DESK REFUSES TO DO.  It never calls _LINE_REVIEW.decide.  It
+# never writes an "allow" or a "keep", never touches the approved
+# fingerprint set, never sets operator_accepted, never deletes a row and
+# never puts a word on the air.  A machine may re-examine, it may re-grade
+# and it may expire a row whose subject is gone; it must never quietly
+# allow something a checker refused.  A row today's checker still refuses
+# STAYS PENDING, with its stored verdict brought up to date so the reason
+# the operator reads is today's reason.
+#
+# THE CONTRACT CHECK AND THE RENDER, since the question was asked.  All
+# 126 pending call_contract rows were read: not one carries a take, a
+# clip key, a seconds count or a made count, in the context or in the
+# retained entry.  Their three stages are row_retired (69, called from the
+# top of larder_prepare, before _round_chunks exists), recording_room_
+# rejected (43, logged as "was not sent to the recording room") and
+# live_call_rejected (14, logged as "refused before recording or live
+# synthesis").  call_flow_report is pure text and reads nothing a take
+# provides.  The check is already ahead of the engine; there is nothing
+# to move.  What those rows cost is the TINT round before them (mean
+# 81.3 s), and a tint's failure cannot be known before the tint.
+#
+# OFF THE EVENT LOOP.  rejection_lab_runtime's #1398 comment and tonight's
+# #1190 guard measured this very table's capture doing an fsync-bearing
+# insert from the loop - 6,189 s of stall out of 21,162 in a day, the
+# largest named source of dead air on the station.  Every read below goes
+# through our OWN READ-ONLY connection, which never takes
+# LineReviewStore._lock (18.5 s in one measured frame while a writer held
+# it against a 3.0 GB file); every walk runs inside asyncio.to_thread;
+# and the only two calls that take the store lock are the writes, once per
+# closed row, only in `sweep`.
+#
+# THE SWITCH.  data/review_queue/mode, one word, re-read every three
+# seconds, no restart - the shape of data/record_talk/mode (#1179)
+# including its strict one-token parse, and its OWN environment variable
+# so no other switch on the station can throw it.  `off` (the default,
+# and what a missing, empty, unreadable or unrecognised file reads as) is
+# the station exactly as it runs tonight.  `trace` runs the whole scan and
+# says in the log precisely what it WOULD close, changing nothing.
+# `sweep` closes them.
+#
+# WHAT IS NOT BEHIND THE SWITCH, and why.  The queue's SHAPE and the
+# MEASUREMENT of which rows have no subject left change only what is
+# REPORTED - no row moves, no grade changes, nothing airs differently -
+# so they ship unconditionally.  That is deliberate: it is what lets the
+# banner say "N of them can no longer be decided" on the first night with
+# the switch still off, which is the evidence the operator needs before
+# he throws it.
+# =====================================================================
+REVIEW_QUEUE_DIR = data_path("review_queue")
+REVIEW_QUEUE_ENV = "PINE_REVIEW_QUEUE_MODE"
+REVIEW_QUEUE_OFF = "off"
+REVIEW_QUEUE_TRACE = "trace"
+REVIEW_QUEUE_SWEEP = "sweep"
+REVIEW_QUEUE_MODES = (REVIEW_QUEUE_OFF, REVIEW_QUEUE_TRACE, REVIEW_QUEUE_SWEEP)
+# The gates this desk reads.  NOT tint: line_review_regrade_pending owns
+# that one and has since 2026-09-08, and two arms grading the same row
+# would fight over its verdict.  These two are the 565 of 581 nothing
+# reads.
+REVIEW_QUEUE_SCAN_GATES = ("segment_brief", "call_contract")
+# A row must be BOTH unmatched AND this old before its subject is called
+# gone.  The tint arm uses 1800 s; this is deliberately six times that,
+# because the grace exists only to protect a round that has been written
+# but not yet shelved, and 500 of the 581 rows are over a day old, so
+# being six times more patient costs essentially nothing and cannot be
+# accused of haste.  It is also exactly NEWS_PREP_LIFE, the longest a
+# news round - 378 of the 439 holds - can possibly still exist.
+REVIEW_QUEUE_GONE_AFTER = float(os.getenv("PINE_REVIEW_QUEUE_GONE_AFTER", "10800"))
+# How many pending rows one pass reads.  The whole pending queue is 581,
+# so 600 reads all of it in one pass and the ceiling is a bound against a
+# future in which it is not 581.
+REVIEW_QUEUE_MOST = int(os.getenv("PINE_REVIEW_QUEUE_MOST", "600"))
+# How many rows one pass may RE-GRADE.  Re-grading a call walks the shelf
+# for novelty, which is the expensive leg; the subject-gone arm is the
+# one that clears the backlog and it is not bounded by this.
+REVIEW_QUEUE_REGRADE_MOST = int(os.getenv("PINE_REVIEW_QUEUE_REGRADE_MOST", "24"))
+# How long an answer about the queue's shape stands before it is asked
+# again.  The desktop notices poll the rejections route every four
+# seconds; a count that is not cached costs more than it reports.
+REVIEW_QUEUE_SHAPE_TTL = float(os.getenv("PINE_REVIEW_QUEUE_SHAPE_TTL", "20"))
+REVIEW_QUEUE_CENSUS_TTL = float(os.getenv("PINE_REVIEW_QUEUE_CENSUS_TTL", "300"))
+
+
+def review_queue_parse_mode(text: Any) -> str:
+    """One word into a mode.  Anything else at all is `off`.
+
+    Copied from track_talk_segment.parse_mode (#1179) on purpose, strict
+    arm included: ONE WORD MEANS ONE WORD, so a switch file holding a
+    sentence is off however promising a word inside it looks.  An
+    operator's note to himself must never read as permission, and this
+    switch lets a machine close rows out of his queue.  "on" is read as
+    `sweep` because that is plainly what somebody typing it meant, and
+    because the two switches beside this one spell it that way."""
+    words = str(text or "").replace(",", " ").split()
+    if len(words) != 1:
+        return REVIEW_QUEUE_OFF
+    low = words[0].strip().lower()
+    if low in REVIEW_QUEUE_MODES:
+        return low
+    return REVIEW_QUEUE_SWEEP if low in ("on", "true", "yes") else REVIEW_QUEUE_OFF
+
+
+class _ReviewQueueSwitch:
+    """`<data>/review_queue/mode`, re-read at most every `ttl` seconds.
+
+    DEFAULTS OFF.  Missing file, empty file, unreadable file, a word this
+    does not know, a file being rewritten underneath us: off, every time.
+    Its own environment variable, so no other switch on the station can
+    throw it by accident."""
+
+    def __init__(self, root: Any, env: Any = None, ttl: float = 3.0,
+                 clock: Any = time.time):
+        self.root = Path(root)
+        self.path = self.root / "mode"
+        self.ttl = float(ttl)
+        self.clock = clock
+        self._env = dict(os.environ if env is None else env)
+        self._read_at = 0.0
+        self._cached = REVIEW_QUEUE_OFF
+
+    def _text(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, ValueError):
+            return ""
+
+    def mode(self) -> str:
+        now = float(self.clock())
+        if self._read_at and (now - self._read_at) < self.ttl:
+            return self._cached
+        text = self._text()
+        if not text:
+            text = str(self._env.get(REVIEW_QUEUE_ENV, "")).strip()
+        self._read_at = now
+        self._cached = review_queue_parse_mode(text)
+        return self._cached
+
+    def write(self, text: str) -> None:
+        """Tests and operator tools only; never the station itself."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + "." + uuid.uuid4().hex + ".tmp")
+        tmp.write_text(str(text).strip() + "\n", encoding="utf-8")
+        os.replace(tmp, self.path)
+        self._read_at = 0.0
+
+
+REVIEW_QUEUE_SWITCH = _ReviewQueueSwitch(REVIEW_QUEUE_DIR, clock=time.time)
+_REVIEW_QUEUE_SAID: dict[str, Any] = {"mode": None}
+# The last shape, the last scan, and a ledger of what this station's own
+# sweeps have closed since boot.  All three are REPORTS; nothing reads
+# them to make a decision.
+_REVIEW_QUEUE_SEEN: dict[str, Any] = {"shape": {}, "census": {}, "scan": {},
+                                      "closed": []}
+
+
+def review_queue_mode() -> str:
+    """off | trace | sweep.  Never raises; an unreadable switch is off.
+
+    Says so in the log when it CHANGES and only then - a line every three
+    seconds saying the switch is still off is not a log (#1179)."""
+    mode = REVIEW_QUEUE_OFF
+    try:
+        mode = REVIEW_QUEUE_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return REVIEW_QUEUE_OFF
+    was = _REVIEW_QUEUE_SAID.get("mode")
+    if mode != was:
+        _REVIEW_QUEUE_SAID["mode"] = mode
+        if was is not None:
+            try:
+                pipeline_log("crystal", "#1192: the review-queue sweep is now "
+                             + mode + " - " + review_queue_board_say(mode))
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def review_queue_sweeps() -> bool:
+    """May the desk actually close a row out of the operator's queue?"""
+    return review_queue_mode() == REVIEW_QUEUE_SWEEP
+
+
+def review_queue_board_say(mode: str) -> str:
+    """One sentence for the road report, so the operator can read the
+    state of this from the same panel he photographed."""
+    if mode == REVIEW_QUEUE_SWEEP:
+        return ("the queue's holds and cuts are re-read every ten minutes: a "
+                "row whose round no longer exists, a row a newer refusal "
+                "replaces, and a row today's checker now passes leave as "
+                "notes that say which; anything still refused stays pending "
+                "with its verdict brought up to date, and nothing is ever "
+                "allowed by machine")
+    if mode == REVIEW_QUEUE_TRACE:
+        return ("the queue is being READ and counted but not changed: the "
+                "report says exactly how many rows would leave and why, and "
+                "not one row moves")
+    return ("the queue is counted but never drained: only the 16 tint rows "
+            "of 581 have an automatic reader, and the 565 holds and call "
+            "cuts wait for a human who has decided eighteen times in 30,127 "
+            "rows (#1192 is off)")
+
+
+def review_queue_kind(gate: Any, disposition: Any, technical: Any = 0) -> str:
+    """cut | hold | other - the distinction the banner was missing.
+
+    A CUT took a line out of a round.  A HOLD stopped a whole round before
+    the booth.  Anything technical is neither: it is a failure of the box,
+    which _initial_status already keeps out of the pending queue, and it
+    is counted apart here so that if one ever appears it cannot be read as
+    an editorial question."""
+    if technical:
+        return "other"
+    word = str(disposition or "").strip().lower()
+    if word.startswith("held") or word == "hold":
+        return "hold"
+    if word == "cut":
+        return "cut"
+    return "other"
+
+
+def _review_queue_db() -> Any:
+    """OUR OWN READ-ONLY DOOR onto the review store.
+
+    Not LineReviewStore.summaries and not .get: both take the store's
+    RLock, and a worker thread holds that lock while it commits to a
+    3.0 GB SQLite file - 18.5 seconds of event-loop stall in the frame
+    preference_examples measured (#1070).  Reporting must never wait on a
+    writer.  WAL is on (the store sets journal_mode=WAL at open), so a
+    second read-only connection sees a consistent snapshot without
+    blocking and without being blocked."""
+    import sqlite3
+    db = sqlite3.connect("file:" + Path(_LINE_REVIEW.path).as_posix()
+                         + "?mode=ro", uri=True, timeout=20.0)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def _review_queue_json(text: Any, fallback: Any = None) -> Any:
+    try:
+        got = json.loads(text or "null")
+    except (TypeError, ValueError):
+        return fallback if fallback is not None else {}
+    if got is None:
+        return fallback if fallback is not None else {}
+    return got
+
+
+def review_queue_pending_rows(limit: int = 0,
+                              gates: Any = None) -> list[dict[str, Any]]:
+    """The pending rows of the named gates, oldest first, read read-only.
+
+    Shaped like a LineReviewStore row so line_review_matching can be
+    handed one unchanged - it reads id, context, decision and last_at and
+    nothing else."""
+    want = tuple(gates or REVIEW_QUEUE_SCAN_GATES)
+    most = int(limit) if int(limit or 0) > 0 else REVIEW_QUEUE_MOST
+    rows: list[dict[str, Any]] = []
+    db = _review_queue_db()
+    try:
+        marks = ",".join("?" for _ in want)
+        cursor = db.execute(
+            "SELECT id,gate,disposition,technical,source,candidate,context,"
+            "evaluation,decision,reasons,first_at,last_at,latest_seq,revision "
+            "FROM line_reviews WHERE review_status='pending' "
+            "AND gate IN (" + marks + ") ORDER BY first_at LIMIT ?",
+            tuple(str(g) for g in want) + (max(1, most),))
+        for raw in cursor:
+            rows.append({
+                "id": str(raw["id"]),
+                "gate": str(raw["gate"] or ""),
+                "disposition": str(raw["disposition"] or ""),
+                "technical": int(raw["technical"] or 0),
+                "source": str(raw["source"] or ""),
+                "candidate": str(raw["candidate"] or ""),
+                "context": _review_queue_json(raw["context"]),
+                "evaluation": _review_queue_json(raw["evaluation"]),
+                "decision": _review_queue_json(raw["decision"]),
+                "reasons": _review_queue_json(raw["reasons"], []),
+                "first_at": float(raw["first_at"] or 0),
+                "last_at": float(raw["last_at"] or 0),
+                "latest_seq": int(raw["latest_seq"] or 0),
+                "revision": int(raw["revision"] or 0),
+                "review_status": "pending"})
+    finally:
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return rows
+
+
+def _review_queue_since(db: Any, table: str, when: float) -> int:
+    """How many rows of an append-only, seq-ordered table were written at
+    or after `when` - found by BINARY SEARCH on the primary key.
+
+    review_events is 30,000-plus fat rows carrying whole scripts, and
+    `at` has no index, so `WHERE at>=?` is a full table scan of a 3.0 GB
+    file to answer "what came in today".  seq is INTEGER PRIMARY KEY
+    AUTOINCREMENT, which is the rowid, and both these tables are
+    append-only and strictly increasing in time, so the boundary can be
+    found in about seventeen rowid lookups instead.  Only ever used for a
+    report, and it says so: a table that was ever deleted from would make
+    this an estimate rather than a count."""
+    if table not in ("review_events", "review_decisions"):
+        return 0
+    edge = db.execute("SELECT MIN(seq),MAX(seq) FROM " + table).fetchone()
+    low = int((edge[0] if edge else 0) or 0)
+    high = int((edge[1] if edge else 0) or 0)
+    if not high or not low:
+        return 0
+    answer = high + 1
+    first, last = low, high
+    while first <= last:
+        middle = (first + last) // 2
+        got = db.execute("SELECT at FROM " + table + " WHERE seq=?",
+                         (middle,)).fetchone()
+        if got is None:
+            first = middle + 1
+            continue
+        if float(got[0] or 0) >= float(when):
+            answer = middle
+            last = middle - 1
+        else:
+            first = middle + 1
+    return max(0, high - answer + 1) if answer <= high else 0
+
+
+def _review_queue_day_start(now: float) -> float:
+    """Midnight local, the way the operator means "today"."""
+    try:
+        parts = time.localtime(float(now))
+        return float(time.mktime((parts.tm_year, parts.tm_mon, parts.tm_mday,
+                                  0, 0, 0, 0, 0, -1)))
+    except Exception:  # noqa: BLE001
+        return float(now) - 86400.0
+
+
+def review_queue_closed_today(now: float) -> int:
+    """How many rows this station's own sweeps have closed since boot,
+    today.  Kept in memory on purpose: note_stale writes an effect with
+    an `at` in it, but counting those means a scan of 29,528 noted rows
+    with a json_extract on each, which is the very cost this desk exists
+    to avoid paying on a report."""
+    day = _review_queue_day_start(now)
+    ledger = [pair for pair in (_REVIEW_QUEUE_SEEN.get("closed") or [])
+              if float(pair[0]) >= now - 172800.0]
+    _REVIEW_QUEUE_SEEN["closed"] = ledger
+    return sum(int(pair[1]) for pair in ledger if float(pair[0]) >= day)
+
+
+def review_queue_census(now: float = 0.0, force: bool = False) -> dict[str, Any]:
+    """Arrivals and departures for today.  Its own, slower clock.
+
+    The binary search below is cheap, but it is still three connections'
+    worth of work for a number that moves a few times an hour, and the
+    shape above it is asked every twenty seconds by a panel poll."""
+    stamp = float(now or time.time())
+    got = _REVIEW_QUEUE_SEEN.get("census") or {}
+    if not force and got and (stamp - float(got.get("at") or 0)) < REVIEW_QUEUE_CENSUS_TTL:
+        return dict(got)
+    day = _review_queue_day_start(stamp)
+    out: dict[str, Any] = {"at": stamp, "day_start": day, "arrived_today": 0,
+                           "decided_today": 0, "errors": 0}
+    try:
+        db = _review_queue_db()
+        try:
+            out["arrived_today"] = _review_queue_since(db, "review_events", day)
+            out["decided_today"] = _review_queue_since(db, "review_decisions", day)
+        finally:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        out["errors"] = 1
+    _REVIEW_QUEUE_SEEN["census"] = dict(out)
+    return dict(out)
+
+
+def review_queue_shape(force: bool = False) -> dict[str, Any]:
+    """WHAT THE QUEUE ACTUALLY IS - cuts, holds, undecidable, today's
+    arrivals against today's departures, and what the oldest row is
+    waiting for.
+
+    Reporting only.  Nothing here writes, decides, grades or airs, which
+    is why it ships with no switch in front of it: fault four's number is
+    the one thing the operator sees, and a count that names 439 holds as
+    cuts is wrong whether or not anybody is sweeping.
+
+    Must be called from a worker thread.  It opens SQLite."""
+    now = time.time()
+    held = _REVIEW_QUEUE_SEEN.get("shape") or {}
+    if not force and held and (now - float(held.get("at") or 0)) < REVIEW_QUEUE_SHAPE_TTL:
+        return copy.deepcopy(held)
+    shape: dict[str, Any] = {
+        "at": now, "mode": review_queue_mode(), "pending": 0,
+        "cuts": 0, "holds": 0, "other": 0, "by_gate": {},
+        "undecidable": None, "scanned_at": 0.0, "scanned_gates": list(REVIEW_QUEUE_SCAN_GATES),
+        "arrived_today": 0, "left_today": 0, "oldest": None, "errors": 0,
+        "say": ""}
+    try:
+        db = _review_queue_db()
+        try:
+            for raw in db.execute(
+                    "SELECT gate,disposition,technical,count(*) AS n "
+                    "FROM line_reviews WHERE review_status='pending' "
+                    "GROUP BY gate,disposition,technical"):
+                many = int(raw["n"] or 0)
+                kind = review_queue_kind(raw["gate"], raw["disposition"],
+                                         raw["technical"])
+                # The count is plural, the classification is singular, and
+                # a typo between the two is how a banner comes to read zero
+                # while 581 rows wait - which is the fault this is fixing.
+                shape[{"cut": "cuts", "hold": "holds"}.get(kind, "other")] += many
+                shape["pending"] += many
+                slot = shape["by_gate"].setdefault(
+                    str(raw["gate"] or ""), {"cut": 0, "hold": 0, "other": 0})
+                slot[kind] += many
+        finally:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        shape["errors"] += 1
+    try:
+        census = review_queue_census(now)
+        shape["arrived_today"] = int(census.get("arrived_today") or 0)
+        shape["left_today"] = (int(census.get("decided_today") or 0)
+                               + review_queue_closed_today(now))
+        shape["left_today_means"] = ("decisions the operator made today plus "
+                                     "rows this station's own sweeps have "
+                                     "closed since it booted")
+    except Exception:  # noqa: BLE001
+        shape["errors"] += 1
+    scan = _REVIEW_QUEUE_SEEN.get("scan") or {}
+    if scan:
+        shape["scanned_at"] = float(scan.get("at") or 0)
+        shape["undecidable"] = int(scan.get("subject_gone") or 0)
+        shape["oldest"] = copy.deepcopy(scan.get("oldest"))
+        shape["would_close"] = int(scan.get("would_close") or 0)
+    shape["say"] = review_queue_say_shape(shape)
+    _REVIEW_QUEUE_SEEN["shape"] = copy.deepcopy(shape)
+    return copy.deepcopy(shape)
+
+
+def review_queue_say_shape(shape: dict[str, Any]) -> str:
+    """The sentence the banner was getting wrong, said properly.
+
+    "580 cut lines wait for your decision" counted 439 HOLDS as cuts and
+    named the whole pile after the smaller half.  Two different things
+    get two different words here, and if the machine knows some of them
+    can no longer be decided at all it says so in the same breath."""
+    cuts = int(shape.get("cuts") or 0)
+    holds = int(shape.get("holds") or 0)
+    other = int(shape.get("other") or 0)
+    parts = []
+    if cuts:
+        parts.append("%d cut line%s" % (cuts, "" if cuts == 1 else "s"))
+    if holds:
+        parts.append("%d held round%s" % (holds, "" if holds == 1 else "s"))
+    if other:
+        parts.append("%d other refusal%s" % (other, "" if other == 1 else "s"))
+    if not parts:
+        return "nothing is waiting for your decision"
+    said = " and ".join(parts) + (" waits" if cuts + holds + other == 1 else " wait")
+    said += " for your decision"
+    gone = shape.get("undecidable")
+    if gone:
+        said += (" - %d of them can no longer be decided: the round each one "
+                 "belonged to has aired, expired or been replaced" % int(gone))
+    return said
+
+
+def _review_queue_close(sweeping: bool, out: dict[str, Any], review_id: str,
+                        status: str, say: str) -> bool:
+    """Close one row, or - in off and trace - only count that it would be.
+
+    note_stale is the ONLY write this desk performs besides
+    refresh_verdict, and both are refused to it unless the switch says
+    sweep.  Neither can allow anything: note_stale moves a row to `noted`
+    with an effect saying why, which is where 29,528 rows already live
+    and where the operator can still read every one of them."""
+    if not sweeping:
+        out["would_close"] = int(out.get("would_close") or 0) + 1
+        out.setdefault("would", {})
+        out["would"][status] = int(out["would"].get(status) or 0) + 1
+        return False
+    try:
+        if _LINE_REVIEW.note_stale(review_id, status, say):
+            out["closed"] = int(out.get("closed") or 0) + 1
+            return True
+    except Exception:  # noqa: BLE001
+        out["errors"] = int(out.get("errors") or 0) + 1
+    return False
+
+
+def review_queue_regrade(row: dict[str, Any], match: Any = None) -> Any:
+    """Re-read ONE pending row against today's own checker.
+
+    Deterministic, no model, and - this is the load-bearing part -
+    NO CAPTURE.  segment_audit's tail calls line_review_permits, which
+    captures a fresh occurrence of exactly the row we are examining: it
+    would bump its occurrence count, move its last_at, make a week-old
+    row look like it arrived this minute, and pay an fsync-bearing insert
+    for the privilege.  capture=False is that tail turned off, and it
+    exists for this caller alone.  call_flow_report has no capture in it
+    at all; the capture on that road lives in call_entry_regrade, one
+    level up, and is not called here.
+
+    Returns the report, or None when this gate has no re-read a machine
+    may run."""
+    gate = str(row.get("gate") or "")
+    ctx = row.get("context") if isinstance(row.get("context"), dict) else {}
+    if gate == "segment_brief":
+        script = str(ctx.get("script") or row.get("source") or "")
+        if not script.strip():
+            return None
+        got = segment_audit(str(ctx.get("kind") or ""), script,
+                            product=str(ctx.get("product") or ""),
+                            capture=False)
+        # An unchecked verdict is not a pass.  segment_audit returns
+        # ok=True with checked=False for a kind whose brief cannot be read
+        # off the words - and reading that as "it passes now" would empty
+        # the queue by pretending the question was never asked.
+        if not got.get("checked"):
+            return None
+        return got
+    if gate == "call_contract":
+        active = str(ctx.get("script") or row.get("candidate")
+                     or row.get("source") or "")
+        if not active.strip():
+            return None
+        meta = ctx.get("call") if isinstance(ctx.get("call"), dict) else {}
+        tinted = str(ctx.get("script_tinted") or "").strip()
+        is_tinted = bool(tinted and tinted == active.strip())
+        entry = None
+        if isinstance(match, tuple) and len(match) > 2:
+            entry = match[2]
+        return call_flow_report(
+            active, str(ctx.get("caller_name") or ""),
+            str(ctx.get("caller2_name") or ""),
+            include_shelf=True,
+            topic=str(meta.get("topic") or ""),
+            # The tint-fidelity leg only binds when the words that would
+            # air ARE the tinted ones; otherwise there is no rewrite to be
+            # faithful to, exactly as call_entry_regrade decides it.
+            source_script=(str(ctx.get("script_plain") or "") if is_tinted else ""),
+            speakerbox_text=str(meta.get("speakerbox_text") or ""),
+            # Its own round must not count as its own novelty collision.
+            exclude_entry=entry,
+            story=(meta.get("story") if isinstance(meta.get("story"), dict)
+                   else ctx.get("story")),
+            plot=(meta.get("plot") if isinstance(meta.get("plot"), dict)
+                  else ctx.get("plot")),
+            soft_quality=is_tinted)
+    return None
+
+
+def review_queue_scan(limit: int = 0, gone_after: Any = None,
+                      sweep: Any = None) -> dict[str, Any]:
+    """THE CONSUMER THE 97 PER CENT NEVER HAD.  Run in a thread.
+
+    Three things, and only these three, may happen to a row:
+
+      superseded    a NEWER pending refusal of the same line at the same
+                    gate exists, so the older one is moot.  The tint arm
+                    has done this since 2026-09-08 (22 of 199 rows were
+                    older duplicates); 499 rows have left that way.
+
+      round_gone    line_review_matching finds no round for it and the row
+                    is older than the grace.  This is the undecidable one:
+                    there is no line to restore and nothing to restore it
+                    into, and allowing it would rebuild a whole round from
+                    the capture.  441 rows have left this way from the
+                    tint arm alone.
+
+      stale_grader  today's own deterministic checker passes the stored
+                    words.  A verdict the machine itself no longer holds
+                    is not a decision to put to a person.
+
+    and one thing may happen to a row that stays:
+
+      refreshed     it is STILL refused, it stays PENDING, and the reason
+                    the operator will read is replaced with today's.
+
+    WHAT IT REFUSES.  No decide().  No allow.  No keep.  No
+    operator_accepted.  No touch of the approved-fingerprint set.  No
+    delete.  Nothing reaches the air.  A machine may re-examine, re-grade
+    and expire; it may never quietly allow what a checker refused."""
+    now = time.time()
+    mode = review_queue_mode()
+    doing = bool(mode == REVIEW_QUEUE_SWEEP) if sweep is None else bool(sweep)
+    grace = REVIEW_QUEUE_GONE_AFTER if gone_after is None else float(gone_after)
+    out: dict[str, Any] = {
+        "at": now, "mode": mode, "sweeping": doing, "grace": grace,
+        "seen": 0, "cuts": 0, "holds": 0, "other": 0,
+        "subject_gone": 0, "superseded": 0, "passes_now": 0,
+        "refreshed": 0, "kept": 0, "regraded": 0, "closed": 0,
+        "would_close": 0, "errors": 0, "oldest": None}
+    try:
+        rows = review_queue_pending_rows(limit)
+    except Exception:  # noqa: BLE001
+        out["errors"] += 1
+        _REVIEW_QUEUE_SEEN["scan"] = copy.deepcopy(out)
+        return out
+    out["seen"] = len(rows)
+    # One pending row per line, per gate: the NEWEST refusal of a line is
+    # the one worth a decision.
+    newest: dict[tuple[str, str], tuple[float, str]] = {}
+    for row in rows:
+        key = (row["gate"], " ".join(str(row.get("source") or "").split()).lower())
+        stamp = float(row.get("last_at") or 0)
+        if key[1] and (key not in newest or stamp > newest[key][0]):
+            newest[key] = (stamp, row["id"])
+    regraded = 0
+    for row in rows:
+        # A thread, but a thread sharing this interpreter with the loop:
+        # hand the GIL back between rows exactly as the tint arm does.
+        time.sleep(0.003)
+        review_id = row["id"]
+        try:
+            kind = review_queue_kind(row["gate"], row["disposition"],
+                                     row["technical"])
+            out[{"cut": "cuts", "hold": "holds"}.get(kind, "other")] += 1
+            if out["oldest"] is None:
+                out["oldest"] = {
+                    "id": review_id, "gate": row["gate"], "kind": kind,
+                    "disposition": row["disposition"],
+                    "first_at": row["first_at"],
+                    "age_seconds": round(max(0.0, now - row["first_at"]), 1),
+                    "waiting_for": (list(row.get("reasons") or [])[:1]
+                                    or ["no reason was stored"])[0],
+                    "say": ""}
+            key = (row["gate"], " ".join(str(row.get("source") or "").split()).lower())
+            if key[1] and newest.get(key, (0.0, review_id))[1] != review_id:
+                out["superseded"] += 1
+                _review_queue_close(
+                    doing, out, review_id, "superseded",
+                    "a newer refusal of the same line at the same gate "
+                    "replaces it")
+                continue
+            try:
+                match = line_review_matching(row)
+            except Exception:  # noqa: BLE001
+                out["errors"] += 1
+                match = None
+            if not match:
+                if (now - float(row.get("first_at") or now)) >= grace:
+                    out["subject_gone"] += 1
+                    _review_queue_close(
+                        doing, out, review_id, "round_gone",
+                        ("the round this hold stopped has aired, expired or "
+                         "been replaced; the hold did its work and there is "
+                         "no round left to release"
+                         if kind == "hold" else
+                         "the round this line belonged to has aired, expired "
+                         "or been replaced; allowing it now would rebuild "
+                         "the whole round from the capture"))
+                    if out["oldest"] and out["oldest"]["id"] == review_id:
+                        out["oldest"]["say"] = "its round no longer exists"
+                else:
+                    out["kept"] += 1
+                continue
+            if regraded < REVIEW_QUEUE_REGRADE_MOST:
+                report = None
+                try:
+                    report = review_queue_regrade(row, match)
+                except Exception:  # noqa: BLE001
+                    out["errors"] += 1
+                    report = None
+                if isinstance(report, dict):
+                    regraded += 1
+                    out["regraded"] += 1
+                    if report.get("ok"):
+                        out["passes_now"] += 1
+                        _review_queue_close(
+                            doing, out, review_id, "stale_grader",
+                            ("the round passes today's segment brief"
+                             if row["gate"] == "segment_brief" else
+                             "the stored words pass today's phone contract"))
+                        continue
+                    if doing:
+                        try:
+                            if _LINE_REVIEW.refresh_verdict(
+                                    review_id,
+                                    list(report.get("faults")
+                                         or report.get("machine_faults") or []),
+                                    report):
+                                out["refreshed"] += 1
+                        except Exception:  # noqa: BLE001
+                            out["errors"] += 1
+            out["kept"] += 1
+        except Exception:  # noqa: BLE001
+            out["errors"] += 1
+    if doing and out["closed"]:
+        _REVIEW_QUEUE_SEEN.setdefault("closed", [])
+        _REVIEW_QUEUE_SEEN["closed"].append((now, int(out["closed"])))
+    _REVIEW_QUEUE_SEEN["scan"] = copy.deepcopy(out)
+    # The shape is now stale by construction, and the banner is the one
+    # thing the operator sees.
+    _REVIEW_QUEUE_SEEN["shape"] = {}
+    return out
+
+
+def review_queue_say(got: dict[str, Any]) -> None:
+    """Say it once a pass, and only when there is something to say."""
+    try:
+        if not isinstance(got, dict) or not got.get("seen"):
+            return
+        moved = (int(got.get("closed") or 0) + int(got.get("refreshed") or 0)
+                 + int(got.get("would_close") or 0))
+        if not moved:
+            return
+        if got.get("sweeping"):
+            pipeline_log("crystal", "#1192: the operator's queue was read and "
+                         "drained - %d row(s) closed of %d read (%d whose round "
+                         "is gone, %d superseded, %d that pass today's checker), "
+                         "%d verdict(s) brought up to date, %d still waiting "
+                         "(%d cut(s), %d hold(s))"
+                         % (int(got.get("closed") or 0), int(got.get("seen") or 0),
+                            int(got.get("subject_gone") or 0),
+                            int(got.get("superseded") or 0),
+                            int(got.get("passes_now") or 0),
+                            int(got.get("refreshed") or 0),
+                            int(got.get("kept") or 0),
+                            int(got.get("cuts") or 0), int(got.get("holds") or 0)))
+        else:
+            pipeline_log("crystal", "#1192: the operator's queue was read and "
+                         "NOT changed (the sweep switch is %s) - %d of %d row(s) "
+                         "would leave: %d whose round is gone, %d superseded, "
+                         "%d that pass today's checker. %d cut(s) and %d hold(s) "
+                         "are being counted as one thing on his banner."
+                         % (str(got.get("mode") or "off"),
+                            int(got.get("would_close") or 0),
+                            int(got.get("seen") or 0),
+                            int(got.get("subject_gone") or 0),
+                            int(got.get("superseded") or 0),
+                            int(got.get("passes_now") or 0),
+                            int(got.get("cuts") or 0), int(got.get("holds") or 0)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _line_reviews_page(after: int, before: int, limit: int,
+                       status: str, gate: str) -> dict[str, Any]:
+    """The page the panel already asks for, with the queue's SHAPE on it.
+
+    One thread hop, not two: the route paid for a worker already and the
+    shape is cached for twenty seconds behind it.  Extending the payload
+    the banner ALREADY READS is the whole of fault four's plumbing - there
+    is no new route, and a client that does not know about `queue` is
+    unaffected."""
+    page = _LINE_REVIEW.summaries(after, before, limit, status, gate)
+    try:
+        page["queue"] = review_queue_shape()
+    except Exception:  # noqa: BLE001
+        pass
+    return page
+
+
 def call_entry_recheck(most: int = 6) -> dict[str, Any]:
     """2026-09-08 (the scan): re-read a RAPPED call against today's phone
     contract. A call's verdict is stored in its own meta, and nothing
@@ -121922,6 +122756,21 @@ async def regrade_once() -> None:
             except Exception:  # noqa: BLE001
                 pass
             try:
+                # #1192: AND THE OTHER 97 PER CENT.  The arm above
+                # reads gates ("tint", "recording_tint"); recording_tint
+                # is informational so its rows are never pending, which
+                # leaves 16 rows of 581.  This one reads the 439 holds
+                # and the 126 call cuts that nothing has ever read.
+                # Same thread, same ten minutes, and with the switch
+                # off it only COUNTS - the count is what the banner
+                # needs to stop calling 439 held rounds "cut lines".
+                swept = await asyncio.to_thread(review_queue_scan)
+                review_queue_say(swept)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 # 2026-09-08: and the rapped calls held behind a stored
                 # verdict older than today's contract.
                 calls = call_entry_recheck()
@@ -121949,6 +122798,16 @@ async def api_line_reviews_regrade(authorization: str | None = Header(default=No
         got["calls"] = call_entry_recheck(most=16)      # 2026-09-08: the rapped calls too
     except Exception:  # noqa: BLE001
         pass
+    try:
+        # #1192: by hand, the holds and the call cuts as well - and
+        # the shape, forced, so the answer in the response is the
+        # queue as it stands after this pass rather than one cached
+        # twenty seconds before it.
+        got["queue_sweep"] = await asyncio.to_thread(review_queue_scan)
+        review_queue_say(got["queue_sweep"])
+        got["queue"] = await asyncio.to_thread(review_queue_shape, True)
+    except Exception:  # noqa: BLE001
+        pass
     return got
 
 
@@ -121962,7 +122821,14 @@ async def api_line_reviews(
     try:
         # #1070: a page of the queue is megabytes of SQLite rows and the
         # panel and the LCD both poll it - read it off the loop.
-        return await asyncio.to_thread(_LINE_REVIEW.summaries, after, before, limit, status, gate)
+        # #1192: and the queue's SHAPE rides on the same payload -
+        # how many cuts, how many holds, how many are undecidable,
+        # what came in today against what left, and what the oldest
+        # row is waiting for.  The banner already reads this route;
+        # extending it is cheaper than a route nobody polls, and it
+        # means the corrected count reaches the one surface the
+        # operator actually looks at.
+        return await asyncio.to_thread(_line_reviews_page, after, before, limit, status, gate)
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
