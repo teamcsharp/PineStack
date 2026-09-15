@@ -39223,8 +39223,8 @@ def slot_stock() -> dict[str, int]:
             for k, v in (slot_supply() or {}).items()}
 
 
-def slot_read(idx: int, stock: dict[str, int] | None = None
-              ) -> dict[str, Any]:
+def slot_read(idx: int, stock: dict[str, int] | None = None,
+              spent: float = 0.0) -> dict[str, Any]:
     """ONE slot, fully reasoned: what it owes, what it has, what is
     missing, whether that can still be made, and what gives if not.
 
@@ -39251,6 +39251,34 @@ def slot_read(idx: int, stock: dict[str, int] | None = None
         # "without anything ever falling behind".
         out["lead"] = max(0.0, (end if out["current"] else start) - now)
         out["room"] = round(out["lead"] * SLOT_DUTY, 1)
+        # 2026-09-15 (#1188): STOCK WAS SPENT FORWARD BUT ROOM WAS NOT.
+        #
+        # `room` above is this slot's whole runway from NOW at the duty
+        # cycle, computed independently for every slot - so each future
+        # slot was told it had the entire runway to itself while the
+        # slots in front of it were being told the same thing about the
+        # same seconds. There is one preparing station, not eight.
+        #
+        # MEASURED on /api/slots?ahead=7 covering 08:30 to 12:30:
+        # per-slot costs of 0, 2001, 2001, 2001, 2353.2, 2353.2, 2353.2,
+        # 2353.2 - 15,415.8 seconds of work against a runway to the last
+        # slot of 8,154.5 seconds, 189 PER CENT OVER. The board reported
+        # 1 of 8 half-hours at risk. Spent forward, the same board
+        # reports most of the afternoon at risk, which is the truth.
+        #
+        # `spent` is what the slots ahead of this one have already
+        # booked out of the shared runway; slot_board keeps the running
+        # total. Off, it is 0.0 and nothing moves at all; in `trace` the
+        # forward figures ride alongside and decide nothing; only in
+        # `air` does the verdict below negotiate against the real room.
+        #   (HZ1188ROOMQX)
+        out["spent_before"] = round(max(0.0, float(spent or 0)), 1)
+        out["room_forward"] = horizon_room(out["lead"], out["spent_before"])
+        try:
+            if horizon_live():
+                out["room"] = out["room_forward"]
+        except Exception:  # noqa: BLE001
+            pass
         want: dict[str, int] = {}
         for row in manifest:
             if row["live_only"]:
@@ -39358,8 +39386,31 @@ def slot_board(ahead: int = 3) -> dict[str, Any]:
         out["ready_now"] = {k: sum(1 for w in v if w <= 0)
                             for k, v in have.items()}
         first = slot_index()
+        # 2026-09-15 (#1188): the same forward spend the stock allocation
+        # above has always done - "stock is allocated as the board walks
+        # forward, so a later slot is told what is genuinely left for it
+        # rather than what exists" - applied to the ROOM, which is the
+        # other shared thing and was never spent at all.  `cost` is the
+        # seconds of work a slot needs; they come out of the one runway.
+        #   (HZ1188BOARDQX)
+        _hz_spent = 0.0
         for step in range(max(1, min(8, int(ahead) + 1))):
-            out["slots"].append(slot_read(first + step, have))
+            _hz_one = slot_read(first + step, have, _hz_spent)
+            _hz_one["verdict_forward"] = horizon_verdict(
+                _hz_one.get("cost"), _hz_one.get("room_forward"))
+            out["slots"].append(_hz_one)
+            try:
+                _hz_spent += max(0.0, float(_hz_one.get("cost") or 0))
+            except (TypeError, ValueError):
+                pass
+        out["spent_forward"] = round(_hz_spent, 1)
+        try:
+            out["forward_room"] = bool(horizon_live())
+            out["at_risk_forward"] = sum(
+                1 for r in out["slots"]
+                if str(r.get("verdict_forward") or "") in ("tight", "cannot"))
+        except Exception:  # noqa: BLE001
+            pass
         try:
             out["hour"] = hour_ballast()               # #1054
         except Exception:  # noqa: BLE001
@@ -45145,6 +45196,838 @@ def coord_ahead_seconds() -> float:
 _BARE_ARRIVALS: dict[str, int] = {}     # road -> times it arrived empty
 
 
+# --- #1188: THE HORIZON DESK (HZ1188DESKQX) --------------------------
+#
+# "make sure that the orchestrator has the means at his disposal to
+#  manage the pantry and understand what is needed for each segment
+#  that's coming up in every hourly block and to plan things out up to
+#  six hours in advance."
+#
+# The planning layer was raised from a two-hour to a six-hour horizon
+# separately.  This is the arithmetic underneath it.  FOUR THINGS WERE
+# MEASURED ON THE LIVE STATION, 2026-09-15, and every one of them made
+# the station look better covered than it was.
+#
+# 1. THE FORWARD WALK COULD NOT SEE A FUTURE SHEET.  coord_upcoming() is
+#    the only forward walk on this station.  It resolved the sheet ONCE,
+#    for the hour it was standing in - schedule_preset_now(store) with no
+#    moment, schedule_hour_slots(store, hour_key) with the key of NOW -
+#    and then cycled that one list round and round with
+#    `idx = (idx + 1) % len(slots)`.  Both of those functions take a
+#    moment and it passed neither; of eighteen schedule_preset_now call
+#    sites exactly ONE passed a `when`.  So a six-hour plan priced the
+#    CURRENT hour's sheet six times over.  It could not see a different
+#    preset assigned to a future hour through store["day"], a future date
+#    through store["month"], or a per-hour override in store["hours"].
+#    All three maps are empty today, so the error is invisible today and
+#    appears the first time the operator schedules a different hour -
+#    which is precisely the thing he is asking to be able to do.
+#
+#    horizon_sheet_at() resolves the sheet AT THE MOMENT BEING WALKED TO,
+#    and the walk adopts it the way schedule_take() does: schedule_take's
+#    `fresh` test is (preset name changed) or (override stamp changed),
+#    and on either it re-seats at entry one.  So the identity here is
+#    exactly (name, stamp) and a change re-seats the walk at index 0.
+#    That also answers "what if the future hour's preset has a different
+#    number of entries" - the cycling index never survives the change.
+#
+#    horizon_clip() answers the other half.  A preset that does not total
+#    sixty minutes drifts against the wall clock; today both presets on
+#    this station total exactly 60.0 so the drift is zero and invisible,
+#    and it will not stay that way.  An entry running across an hour
+#    boundary into a DIFFERENT sheet is cut at the boundary, because that
+#    is what schedule_take does to it - `fresh` is tested before the hold
+#    is, so crossing the boundary re-seats immediately and truncates the
+#    entry that was running.
+#
+# 2. STOCK WAS CREDITED THAT WILL HAVE EXPIRED.  dialogue_stock_items()
+#    filters with `if _expiry and _expiry < now` - expiry tested against
+#    PLAN TIME rather than against the moment the entry it is covering
+#    actually starts.  stock_expires_at() gives news
+#    prep_news_at + NEWS_PREP_LIFE, three hours.  The four live bulletins
+#    had a MEDIAN AGE OF 1.5 HOURS, so they were credited with covering
+#    all twelve news entries across six hours when at most the next hour
+#    and a half of them was real.  MEASURED OVER-CREDIT: about 1,620
+#    seconds of phantom news cover, and news consequently reported 100
+#    PER CENT COVERAGE OVER SIX HOURS.  Every road's rest and keep window
+#    has the same evaluate-at-now bug; news is where it bites because
+#    news is the only road with a short life.
+#
+#    horizon_spend() spends a road's shelf as a FIFO of (expires, seconds)
+#    and DROPS anything that will have died by the moment the entry it
+#    would cover actually starts.
+#
+#    SAY THIS LOUDLY: THIS MAKES COVERAGE FIGURES DROP.  That is the fix
+#    working, not a regression.  A road that read 100% over six hours and
+#    now reads 25% did not lose any stock - it never had that cover, and
+#    the plan that said it did was the thing that was broken.  Every
+#    surface below therefore carries `held_seconds_plan_time` and
+#    `overcredit_seconds` beside the new figure, so a panel can SHOW the
+#    change rather than quietly displaying a worse number.
+#
+#    The ledger is deliberately scaled so its total per road is EXACTLY
+#    what hour_needs() is already crediting at plan time (horizon_ledger).
+#    At t=0 the numbers are byte-identical to today's; the only thing
+#    that differs is what falls off as the walk moves forward.  Nothing
+#    else about the held figure changes, which keeps this fault's fix
+#    from carrying anything else in with it.
+#
+# 3. STOCK WAS SPENT FORWARD BUT ROOM WAS NOT.  slot_read() computed
+#    `room = lead x SLOT_DUTY` from NOW for every slot independently, so
+#    each future slot was told it had the whole runway to itself.
+#    MEASURED on /api/slots?ahead=7 covering 08:30 to 12:30: per-slot
+#    costs of 0, 2001, 2001, 2001, 2353.2, 2353.2, 2353.2, 2353.2 - a
+#    total of 15,415.8 seconds of work against a runway to the last slot
+#    of 8,154.5 seconds, 189 PER CENT OVER.  The board reported 1 of 8
+#    half-hours at risk.  Spend room forward the way stock already is and
+#    the same board reports most of the afternoon at risk, which is the
+#    truth.  horizon_room()/horizon_verdict() do that arithmetic.
+#
+# 4. NO FUTURE HOUR CARRIED A DEMAND FIGURE.  GET /api/schedule/hours
+#    returned 8 hours of 18 slots each with correct preset resolution,
+#    and only the CURRENT hour's 18 slots carried a demand-versus-stock
+#    block.  126 FUTURE SLOTS CARRIED NONE.  Worse, every future slot's
+#    prep block was byte-identical to the current hour's for the same
+#    kind - news read `written 4, ready 4, seconds 212.9` at 15:00
+#    exactly as at 08:00.  ONE SHELF COUNTED EIGHT TIMES WITH NO
+#    SPEND-DOWN.  This was fixed once inside coord_upcoming as #957 and
+#    never fixed here.  horizon_plan_index() keys the one corrected walk
+#    by (hour key, index) so every hour in the view is priced off the
+#    same spend-down, and horizon_hour_demand() answers for ANY named
+#    hour - the thing the audit found nothing anywhere could do.
+#
+# AND WHAT IS UNCERTAIN, SAID OUT LOUD RATHER THAN IMPLIED AWAY.  A
+# six-hour plan is void the moment the sheet is edited: POST
+# /api/schedule/slots replaces a preset wholesale and
+# /api/schedule/activate restarts the clock.  horizon_stamp() stamps a
+# plan with the sheet revision it was computed against - the same
+# (mtime_ns, size) key _schedule_raw() already caches on, so it costs a
+# stat and no read - and horizon_stamp_stale() lets a plan say it is
+# stale instead of lying.  And the quota fires independently of the
+# sheet and OUTRANKS it: MEASURED INTRUSION IS 31.5 PER CENT of every
+# entry's seconds filled by a road other than the one that asked.  Any
+# forward promise carries that, so every surface here carries it too.
+#
+# BEHIND A SWITCH, DEFAULTING OFF, in the shape of data/record_talk/mode
+# (#1179) down to its strict one-token parse - a file holding a sentence
+# is off, however promising a word inside it looks:
+#
+#   <data>/horizon/mode, one word, re-read every few seconds, no restart
+#   and no settings round trip.
+#     off   - the station exactly as it runs today.  The default.
+#     trace - the honest figures are computed and published BESIDE the
+#             old ones, and future hours grow the demand block they never
+#             had.  Nothing that decides anything changes.
+#     air   - trace, and the honest figures are the ones that decide.
+#
+# Everything in here that walks the sheet or the shelf is BLOCKING and
+# says so.  /api/rooms/call-sheet already calls commitment_inventory_plan
+# straight on the event loop; that is the thing not to copy, and the
+# routes below go through asyncio.to_thread.
+HORIZON_DIR = data_path("horizon")
+# The env fallback is rewired rather than inherited: TalkSwitch reads
+# track_talk_segment.ENV_NAME, and #1179's record-talk switch must never
+# turn this one on by accident.
+HORIZON_SWITCH = track_talk_segment.TalkSwitch(
+    HORIZON_DIR,
+    env={track_talk_segment.ENV_NAME:
+         str(os.environ.get("SPARK_AGENT_HORIZON", ""))},
+    clock=time.time)
+_HORIZON_SAID: dict[str, Any] = {"mode": None}
+
+# 2026-09-15: 31.5% of every entry's seconds are filled by a road other
+# than the one that asked for them. The quota fires independently of the
+# sheet and outranks it. Any forward promise carries this.
+HORIZON_INTRUSION = 0.315
+HORIZON_INTRUSION_SAYS = (
+    "the quota fires independently of the running order and outranks it - "
+    "measured intrusion is 31.5% of every entry's seconds filled by a road "
+    "other than the one that asked, so read this plan as a shape and not "
+    "as a promise")
+HORIZON_DROP_SAYS = (
+    "coverage READS LOWER here than on the old figures and that is the "
+    "repair, not a regression: stock is now tested against the moment the "
+    "entry it covers actually starts instead of against plan time, so "
+    "material that will have expired before it could be used stopped being "
+    "counted (#1188)")
+HORIZON_ROW_SAYS = (
+    "held at the moment this entry starts, not at plan time (#1188)")
+HORIZON_MOST_STEPS = 2000          # spin guard: 6h of 15s entries is 1,440
+HORIZON_LEDGER_TTL = 5.0           # the same rest HOUR_NEEDS_TTL keeps
+_HORIZON_LEDGER: dict[str, Any] = {"at": 0.0, "rows": {}}
+
+
+def horizon_mode() -> str:
+    """off | trace | air.  Never raises; an unreadable switch is off.
+
+    Says so in the log when it CHANGES and only then - a line every few
+    seconds saying the switch is still off is not a log."""
+    mode = track_talk_segment.MODE_OFF
+    try:
+        mode = HORIZON_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return track_talk_segment.MODE_OFF
+    was = _HORIZON_SAID["mode"]
+    if mode != was:
+        _HORIZON_SAID["mode"] = mode
+        if was is not None:
+            try:
+                pipeline_log("lookahead", "#1188: the horizon desk is "
+                             + str(mode))
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def horizon_on() -> bool:
+    """Are the honest figures being computed and published at all?"""
+    return horizon_mode() != track_talk_segment.MODE_OFF
+
+
+def horizon_live() -> bool:
+    """Do the honest figures get to DECIDE, or only to be read?"""
+    return horizon_mode() == track_talk_segment.MODE_AIR
+
+
+def horizon_hour_top(when: Any) -> float:
+    """The top of the hour holding `when`, as local time.
+
+    Back out through localtime rather than arithmetic on the epoch, for
+    the reason _sched_hour_shift already gives: the clocks changing must
+    not hand anybody an hour that does not exist."""
+    try:
+        got = time.localtime(float(when))
+        return time.mktime((got.tm_year, got.tm_mon, got.tm_mday,
+                            got.tm_hour, 0, 0, 0, 1, -1))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def horizon_sheet_at(store: Any, when: Any,
+                     memo: Any = None) -> tuple:
+    """(identity, the enabled entries) for the hour holding `when`.
+
+    THE WHOLE OF FAULT ONE.  schedule_hour_slots() has always taken an
+    hour key and resolved month, then day, then the active preset, then
+    any per-hour override, AT THAT HOUR - `schedule_preset_now(store, at)`
+    with the moment inside it.  It works for any hour up to 24 out and
+    always has.  The forward walk simply never asked it about any hour
+    but the one it was standing in.
+
+    The IDENTITY is (preset name, override stamp) and nothing else,
+    because that is exactly schedule_take()'s `fresh` test - "crossing
+    INTO or OUT OF an overridden hour re-seats the walk at the top of the
+    list it is now running, which is what the top of an hour means".  Put
+    the row ids in it and the walk would re-seat on an edit the booth
+    would not have re-seated on.
+
+    `memo` is an ordinary dict the caller owns for the life of ONE walk:
+    a six-hour walk asks about at most seven hours and this keeps it to
+    seven resolutions rather than one per entry."""
+    key = ""
+    try:
+        key = _sched_hour_key(float(when))
+    except Exception:  # noqa: BLE001
+        key = ""
+    if isinstance(memo, dict) and key in memo:
+        return memo[key]
+    name, rows, overridden = "", [], False
+    try:
+        name, rows, overridden = schedule_hour_slots(store, key, float(when))
+    except Exception:  # noqa: BLE001
+        name, rows, overridden = "", [], False
+    live = [dict(r) for r in (rows or [])
+            if isinstance(r, dict) and r.get("enabled", True)]
+    got = ((str(name or ""), key if overridden else ""), live)
+    if isinstance(memo, dict):
+        memo[key] = got
+    return got
+
+
+def horizon_clip(store: Any, at: Any, seconds: Any,
+                 ident: Any, memo: Any = None) -> tuple:
+    """(seconds this entry actually gets, seconds cut off it).
+
+    A preset that does not total sixty minutes drifts against the wall
+    clock.  Today both presets on this station total exactly 60.0, the
+    drift is zero, and the fault is invisible; it will not stay that way,
+    and the first sheet that does not total an hour would otherwise have
+    the walk quietly running the wrong entries at the wrong times for the
+    rest of the horizon.
+
+    An entry running across an hour boundary into a DIFFERENT sheet is
+    cut at the boundary, because that is what happens to it: schedule_take
+    tests `fresh` before it tests the hold, so crossing into an hour with
+    a different preset or a different override re-seats at entry one
+    immediately and truncates whatever was running.  Crossing into an
+    hour running the SAME sheet cuts nothing - the entry runs on through
+    the boundary exactly as it does today."""
+    try:
+        seconds = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    try:
+        at = float(at)
+        edge = horizon_hour_top(at + 3600.0)
+        if edge <= at:
+            edge = at + 3600.0
+        if edge >= at + seconds:
+            return round(seconds, 3), 0.0
+        nxt, rows = horizon_sheet_at(store, edge + 60.0, memo)
+        if nxt == ident or not rows:
+            return round(seconds, 3), 0.0
+        kept = max(1.0, edge - at)
+        return round(kept, 3), round(max(0.0, seconds - kept), 3)
+    except Exception:  # noqa: BLE001
+        return round(seconds, 3), 0.0
+
+
+def horizon_stock(road: Any) -> list:
+    """One road's READY shelf as (expires_at, seconds), soonest to die
+    first, memoised for HORIZON_LEDGER_TTL.
+
+    dialogue_stock_items() is the common inventory - its own docstring:
+    "none of those systems may count or work a different pile any more" -
+    and stock_expires_at() is the one clock over it.  Nothing here stats a
+    file: dialogue_stock_items is the planner-fast predicate that reads
+    the already validated pantry, which is why this is affordable on a
+    walk that visits a hundred entries.
+
+    SOONEST TO DIE FIRST is the spending order on purpose.  A bulletin
+    with twenty minutes left must be spent before one with three hours
+    left or it is simply lost, and that ordering is also the one most
+    generous to the coverage figure - so a road that still reads short
+    after this is genuinely short."""
+    now = time.time()
+    memo = _HORIZON_LEDGER
+    if now - float(memo.get("at") or 0) > HORIZON_LEDGER_TTL:
+        memo["at"], memo["rows"] = now, {}
+    rows = memo.get("rows")
+    if not isinstance(rows, dict):
+        rows = {}
+        memo["rows"] = rows
+    road = str(road or "")
+    if road in rows:
+        return list(rows[road])
+    got: list = []
+    try:
+        for item in dialogue_stock_items(road, include_unready=False):
+            try:
+                secs = float(item.get("audio_seconds")
+                             or item.get("seconds") or 0)
+            except (TypeError, ValueError):
+                secs = 0.0
+            if secs <= 0:
+                continue
+            exp = 0.0
+            try:
+                exp = float(stock_expires_at(
+                    road, item.get("row") or item) or 0)
+            except Exception:  # noqa: BLE001
+                exp = 0.0
+            got.append((exp, secs))
+    except Exception:  # noqa: BLE001
+        got = []
+    got.sort(key=lambda r: (r[0] if r[0] else 1.0e18))
+    rows[road] = got
+    return list(got)
+
+
+def horizon_ledger(held: Any) -> dict:
+    """Every road's shelf as a spendable FIFO of (expires_at, seconds),
+    TOTALLING EXACTLY WHAT IS ALREADY BEING CREDITED.
+
+    This is the one deliberate restraint in the whole of fault two.  The
+    aggregate `held` per road comes from hour_needs(), which has its own
+    long history of corrections (#977, #1091, #1125, #1132) about WHICH
+    rows count.  The shelf walk here knows a different thing - WHEN each
+    row dies - and if it were allowed to supply the total as well it
+    would drag every one of those corrections into this change and nobody
+    would be able to tell which number moved for which reason.
+
+    So the per-row expiry distribution is taken from the shelf and then
+    scaled to the total hour_needs already publishes.  At plan time the
+    figures come out byte-identical to today's.  The only thing that
+    differs is what falls off as the walk moves forward, which is exactly
+    and only the fault being fixed.  A road with a total but no readable
+    shelf gets one never-expiring row, which is today's behaviour."""
+    out: dict = {}
+    try:
+        source = dict(held or {})
+    except Exception:  # noqa: BLE001
+        source = {}
+    for road, total in source.items():
+        road = str(road)
+        try:
+            total = max(0.0, float(total or 0))
+        except (TypeError, ValueError):
+            total = 0.0
+        rows: list = []
+        if total > 0:
+            src = horizon_stock(road)
+            have = 0.0
+            for _exp, _secs in src:
+                have += max(0.0, float(_secs))
+            if src and have > 0:
+                grow = total / have
+                rows = [(exp, max(0.0, float(secs)) * grow)
+                        for exp, secs in src]
+            else:
+                rows = [(0.0, total)]
+        out[road] = rows
+    return out
+
+
+def horizon_spend(ledger: Any, road: Any, want: Any, when: Any) -> tuple:
+    """Take `want` seconds off a road's FIFO at the moment `when`, and
+    say how much of the shelf had to be thrown away to get there.
+
+    Returns (seconds taken, seconds dropped as expired).  A row whose
+    expiry has passed `when` is not stock for an entry starting at
+    `when` - it is stock the desk will have to write a replacement for -
+    so it is dropped rather than counted.  Expiry 0 means "no clock on
+    it" (stock_expires_at returns 0 for anything never heard) and such a
+    row never dies.
+
+    THE LEDGER IS MUTATED IN PLACE.  That is how the walk spends forward:
+    the first news entry eats the freshest bulletin, the second eats the
+    next, and the fifth - three hours out, with every bulletin on the
+    shelf dead by then - eats nothing and says so."""
+    try:
+        rows = ledger.get(str(road)) if isinstance(ledger, dict) else None
+    except Exception:  # noqa: BLE001
+        rows = None
+    if not isinstance(rows, list):
+        return 0.0, 0.0
+    try:
+        want = max(0.0, float(want))
+        when = float(when)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    got = 0.0
+    gone = 0.0
+    guard = 0
+    while rows and got < want - 0.001 and guard < 5000:
+        guard += 1
+        exp, secs = rows[0]
+        try:
+            exp = float(exp or 0)
+            secs = max(0.0, float(secs or 0))
+        except (TypeError, ValueError):
+            rows.pop(0)
+            continue
+        if exp and exp <= when:
+            rows.pop(0)
+            gone += secs
+            continue
+        if secs <= 0.001:
+            rows.pop(0)
+            continue
+        take = min(secs, want - got)
+        got += take
+        if take >= secs - 0.001:
+            rows.pop(0)
+        else:
+            rows[0] = (exp, secs - take)
+    return round(got, 3), round(gone, 3)
+
+
+def horizon_room(lead: Any, spent: Any, duty: Any = None) -> float:
+    """The room a slot ACTUALLY has: its own runway at the duty cycle,
+    less every second of work the slots in front of it have already
+    booked out of the same runway.
+
+    Fault three in one line.  There is one preparing station, not eight."""
+    try:
+        if duty is None:
+            duty = SLOT_DUTY
+        room = max(0.0, float(lead)) * float(duty)
+        return round(max(0.0, room - max(0.0, float(spent or 0))), 1)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def horizon_verdict(cost: Any, room: Any) -> str:
+    """covered | tight | cannot, on the same two thresholds slot_read has
+    always negotiated on - 0.6 of the room is comfortable, all of it
+    fits with nothing to spare.  No give-up list: this is the plain
+    arithmetic answer, for a surface that wants to show what the forward
+    figure WOULD say without the negotiation running twice."""
+    try:
+        cost = max(0.0, float(cost or 0))
+        room = max(0.0, float(room or 0))
+    except (TypeError, ValueError):
+        return "unknown"
+    if cost <= room * 0.6:
+        return "covered"
+    if cost <= room:
+        return "tight"
+    return "cannot"
+
+
+def horizon_dress(row: Any, held_due: Any, expired: Any, owns: Any,
+                  cannot: Any, clipped: Any, live: Any) -> None:
+    """Write the honest figures onto one walked entry.
+
+    In `trace` they sit BESIDE the old ones and decide nothing.  In `air`
+    they replace them.  Either way `held_seconds_plan_time` and
+    `overcredit_seconds` ride along, so a surface can SAY that the number
+    moved and why instead of quietly showing a worse one - which is the
+    whole reason the drop is safe to ship."""
+    try:
+        held_due = max(0.0, float(held_due or 0))
+        owns = max(0.0, float(owns or 0))
+        was = float(row.get("held_seconds") or 0)
+        row["expiry_honest"] = True
+        row["held_at_start"] = round(held_due, 1)
+        row["expired_seconds"] = round(max(0.0, float(expired or 0)), 1)
+        row["clipped_seconds"] = round(max(0.0, float(clipped or 0)), 1)
+        row["held_seconds_plan_time"] = round(was, 1)
+        row["overcredit_seconds"] = round(max(0.0, was - held_due), 1)
+        row["plan_says"] = HORIZON_ROW_SAYS
+        row["intrusion"] = HORIZON_INTRUSION
+        if not live:
+            return
+        held = min(held_due, owns)
+        row["owns_seconds"] = round(owns, 1)
+        row["held_seconds"] = round(held, 1)
+        row["short_seconds"] = (0.0 if cannot
+                                else round(max(0.0, owns - held), 1))
+        row["covered"] = bool(cannot) or held >= owns - 1.0
+        if not cannot and held <= 0:
+            row["bare"] = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def horizon_sequence(store: Any, window: Any = 0.0, idx: Any = 0,
+                     started: Any = None, when: Any = None,
+                     clock: Any = None) -> list:
+    """THE SHEET, WALKED FORWARD, RESOLVED AT EVERY HOUR IT REACHES.
+
+    The pure half of fault one: a store in, a list of (hour, index, kind,
+    when, how long) out, no shelf and no booth.  coord_upcoming() makes
+    the same two decisions through the same two helpers, so the two can
+    never disagree about WHICH entry runs WHEN; this exists because
+    horizon_hour_demand() has to answer about an hour further out than
+    the coordinator's dial reaches, and because an arithmetic this easy
+    to get wrong belongs somewhere a test can drive it against a
+    made-up schedule.
+
+    BLOCKING: schedule_hour_slots reads the (memoised) sheet.  Not on the
+    event loop."""
+    clock = clock if callable(clock) else time.time
+    out: list = []
+    try:
+        now = float(when if when is not None else clock())
+        window = max(0.0, float(window or 0))
+        memo: dict = {}
+        ident, slots = horizon_sheet_at(store, now, memo)
+        if not slots:
+            return out
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            idx = 0
+        if not 0 <= idx < len(slots):
+            idx = 0
+        begin = float(started if started is not None else now)
+        at = begin + max(0.25, float(slots[idx].get("minutes") or 3)) * 60.0
+        step = 0
+        while at - now <= window and step < HORIZON_MOST_STEPS:
+            step += 1
+            nid, nrows = horizon_sheet_at(store, at, memo)
+            if nid != ident and nrows:
+                ident, slots, idx = nid, nrows, -1
+            idx = (idx + 1) % len(slots)
+            slot = slots[idx]
+            secs = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            secs, clipped = horizon_clip(store, at, secs, ident, memo)
+            out.append({
+                "hour": _sched_hour_key(at),
+                "index": idx,
+                "sequence": step - 1,
+                "kind": str(slot.get("kind") or ""),
+                "slot_id": str(slot.get("id") or ("index-%d" % idx)),
+                "label": str(slot.get("label") or slot.get("kind") or ""),
+                "preset": ident[0],
+                "overridden": bool(ident[1]),
+                "due_at": round(at, 3),
+                "starts_in": round(at - now, 1),
+                "owns_seconds": round(secs, 1),
+                "clipped_seconds": round(clipped, 1),
+            })
+            at += secs
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def horizon_stamp(store: Any = None, hours: Any = 0) -> dict:
+    """WHAT THIS PLAN WAS COMPUTED AGAINST, so a stale plan can say it is
+    stale instead of lying.
+
+    A six-hour plan is void the moment the sheet is edited - POST
+    /api/schedule/slots replaces a preset wholesale and
+    /api/schedule/activate restarts the clock, and neither of them tells
+    anybody holding a plan.  `sheet` is the (mtime_ns, size) key
+    _schedule_raw() already caches on, so this costs a stat and no read;
+    hand it back with horizon_stamp_stale() and the holder finds out.
+
+    `intrusion` is the other uncertainty and it is not a rounding error:
+    31.5% of every entry's seconds are filled by a road other than the
+    one that asked, because the quota fires independently of the sheet
+    and outranks it.  A plan that did not say so would be implying a
+    precision it does not have."""
+    out: dict = {
+        "at": round(time.time(), 3),
+        "sheet": "",
+        "active": "",
+        "enabled": True,
+        "hours": 0.0,
+        "mode": track_talk_segment.MODE_OFF,
+        "intrusion": HORIZON_INTRUSION,
+        "intrusion_says": HORIZON_INTRUSION_SAYS,
+        "expiry_says": HORIZON_DROP_SAYS,
+    }
+    try:
+        out["mode"] = horizon_mode()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        stat = SCHEDULE_PATH.stat()
+        out["sheet"] = "%d:%d" % (stat.st_mtime_ns, stat.st_size)
+    except Exception:  # noqa: BLE001
+        out["sheet"] = ""
+    try:
+        store = store if isinstance(store, dict) else schedule_read()
+        out["active"] = str(store.get("active") or "")
+        out["enabled"] = bool(store.get("enabled", True))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out["hours"] = round(max(0.0, float(hours or 0)), 2)
+    except (TypeError, ValueError):
+        out["hours"] = 0.0
+    return out
+
+
+def horizon_stamp_stale(stamp: Any) -> bool:
+    """Has the sheet been edited since that plan was computed?
+
+    Unknown counts as STALE.  A plan that cannot prove it is current is
+    not a plan anybody should act on six hours out."""
+    try:
+        was = str((stamp or {}).get("sheet") or "")
+        if not was:
+            return True
+        stat = SCHEDULE_PATH.stat()
+        return was != "%d:%d" % (stat.st_mtime_ns, stat.st_size)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def horizon_plan_index(hours: Any = 6.0) -> dict:
+    """The corrected forward walk, keyed {hour key: {index: entry}}.
+
+    FAULT FOUR.  There is one walk and every hour in the view is priced
+    off it, so the shelf is SPENT DOWN as the walk proceeds instead of
+    being counted once per hour for eight hours.  The first occurrence in
+    an hour wins, which is the rule schedule_hours_view already used for
+    the current hour.
+
+    BLOCKING: this is coord_upcoming over the whole horizon.  Not on the
+    event loop."""
+    out: dict = {}
+    try:
+        window = max(600.0, min(24.0, float(hours or 6)) * 3600.0)
+        for row in coord_upcoming(window):
+            try:
+                key = _sched_hour_key(float(row.get("due_at") or 0))
+            except Exception:  # noqa: BLE001
+                continue
+            at = row.get("index")
+            if not key or not isinstance(at, int):
+                continue
+            out.setdefault(key, {}).setdefault(at, dict(row))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
+    """WHAT ONE NAMED HOUR NEEDS, AND WHAT IS STANDING BEHIND IT.
+
+    The audit's finding, in as many words: nothing anywhere took an hour
+    key and returned demand-and-stock; every deep surface was now-plus-N.
+    The sheet resolution already worked for any hour up to 24 out
+    (schedule_hour_slots) - the missing half was PRICING it.
+
+    Entry by entry: what it owes, what is actually held at the moment it
+    starts, what expired before it could be used, what that leaves short,
+    and whether the road can be prepared at all.  An hour beyond the
+    walk's reach still gets its demand - the sheet resolves for any hour -
+    and says plainly that the stock figure is not available that far out
+    rather than inventing one.
+
+    BLOCKING.  Not on the event loop."""
+    out: dict = {
+        "key": str(key or ""),
+        "ok": False,
+        "say": "",
+        "preset": "",
+        "overridden": False,
+        "priced": False,
+        "entries": [],
+        "owed_seconds": 0.0,
+        "held_seconds": 0.0,
+        "short_seconds": 0.0,
+        "expired_seconds": 0.0,
+        "covered": 0,
+        "bare": 0,
+        "roads": {},
+    }
+    try:
+        want = str(key or "").strip()
+        if not _sched_is_hour_key(want):
+            want = _sched_hour_key()
+        out["key"] = want
+        store = schedule_read()
+        out["stamp"] = horizon_stamp(store)
+        at = _sched_hour_epoch(want)
+        if at < 0:
+            out["say"] = "that is not an hour this station can resolve"
+            return out
+        name, slots, overridden = schedule_hour_slots(store, want, at + 60.0)
+        out["preset"] = str(name or "")
+        out["overridden"] = bool(overridden)
+        live = [dict(r) for r in (slots or [])
+                if isinstance(r, dict) and r.get("enabled", True)]
+        if not live:
+            out["ok"] = True
+            out["say"] = "that hour runs nothing at all"
+            return out
+        now = time.time()
+        reach = 0.0
+        try:
+            reach = float(hours or 0) or max(
+                1.0, min(24.0, (at + 3600.0 - now) / 3600.0 + 1.0))
+        except (TypeError, ValueError):
+            reach = 6.0
+        plan = horizon_plan_index(reach).get(want) or {}
+        out["priced"] = bool(plan)
+        out["stamp"]["hours"] = round(reach, 2)
+        for i, row in enumerate(live):
+            kind = str(row.get("kind") or "")
+            road = str(SCHED_PREP_KIND.get(kind) or kind)
+            cannot = CANNOT_PREPARE.get(kind) or ""
+            road, cannot = record_talk_entry(kind, road, cannot)
+            owns = max(0.25, float(row.get("minutes") or 3)) * 60.0
+            one: dict = {
+                "index": i,
+                "kind": kind,
+                "road": road,
+                "label": str(row.get("label") or kind),
+                "slot_id": str(row.get("id") or ("index-%d" % i)),
+                "owns_seconds": round(owns, 1),
+                "cannot": cannot,
+                "priced": False,
+                "held_seconds": 0.0,
+                "short_seconds": 0.0 if cannot else round(owns, 1),
+                "expired_seconds": 0.0,
+                "covered": bool(cannot),
+                "bare": (not cannot),
+            }
+            walked = plan.get(i)
+            if isinstance(walked, dict):
+                one["priced"] = True
+                for field in ("owns_seconds", "held_seconds", "short_seconds",
+                              "covered", "bare", "starts_in", "due_at",
+                              "held_at_start", "expired_seconds",
+                              "held_seconds_plan_time", "overcredit_seconds",
+                              "clipped_seconds", "rows", "commit_id"):
+                    if field in walked:
+                        one[field] = walked[field]
+            out["entries"].append(one)
+            out["owed_seconds"] += owns
+            out["held_seconds"] += float(one.get("held_seconds") or 0)
+            out["short_seconds"] += float(one.get("short_seconds") or 0)
+            out["expired_seconds"] += float(one.get("expired_seconds") or 0)
+            if one.get("covered"):
+                out["covered"] += 1
+            if one.get("bare"):
+                out["bare"] += 1
+            if not cannot:
+                seat = out["roads"].setdefault(
+                    road, {"owed": 0.0, "held": 0.0, "short": 0.0,
+                           "entries": 0, "bare": 0})
+                seat["owed"] += owns
+                seat["held"] += float(one.get("held_seconds") or 0)
+                seat["short"] += float(one.get("short_seconds") or 0)
+                seat["entries"] += 1
+                if one.get("bare"):
+                    seat["bare"] += 1
+        for field in ("owed_seconds", "held_seconds", "short_seconds",
+                      "expired_seconds"):
+            out[field] = round(float(out[field]), 1)
+        for seat in out["roads"].values():
+            for field in ("owed", "held", "short"):
+                seat[field] = round(float(seat[field]), 1)
+        out["ok"] = True
+        out["say"] = (
+            "%s runs %s: %d entries, %ds owed, %ds held, %ds short, "
+            "%d bare" % (want, out["preset"] or "the plan", len(out["entries"]),
+                         int(out["owed_seconds"]), int(out["held_seconds"]),
+                         int(out["short_seconds"]), out["bare"]))
+        if not out["priced"]:
+            out["say"] += (" - demand only: that hour is beyond the walk, so "
+                           "the stock figures are what the sheet owes and not "
+                           "what is behind it")
+    except Exception:  # noqa: BLE001
+        out["say"] = "the horizon desk could not read that hour"
+    return out
+
+
+def horizon_plan(hours: Any = 6.0) -> dict:
+    """THE WHOLE HORIZON IN ONE ANSWER: every hour in the window, priced,
+    with the shelf spent down across all of them and the sheet resolved
+    at each one - and stamped with what it was computed against.
+
+    BLOCKING.  Not on the event loop."""
+    out: dict = {"hours": [], "ok": False, "say": "", "mode": "off"}
+    try:
+        span = max(1.0, min(24.0, float(hours or 6)))
+        out["mode"] = horizon_mode()
+        store = schedule_read()
+        out["stamp"] = horizon_stamp(store, span)
+        first = _sched_hour_key()
+        owed = held = short = expired = 0.0
+        bare = 0
+        for step in range(int(span)):
+            got = horizon_hour_demand(_sched_hour_shift(first, step), span)
+            out["hours"].append(got)
+            owed += float(got.get("owed_seconds") or 0)
+            held += float(got.get("held_seconds") or 0)
+            short += float(got.get("short_seconds") or 0)
+            expired += float(got.get("expired_seconds") or 0)
+            bare += int(got.get("bare") or 0)
+        out["owed_seconds"] = round(owed, 1)
+        out["held_seconds"] = round(held, 1)
+        out["short_seconds"] = round(short, 1)
+        out["expired_seconds"] = round(expired, 1)
+        out["bare"] = bare
+        out["cover"] = round(held / owed, 3) if owed > 0 else 0.0
+        out["ok"] = True
+        out["say"] = (
+            "%d hours ahead: %ds owed, %ds held (%d%%), %ds short, %d bare "
+            "entries" % (len(out["hours"]), int(owed), int(held),
+                         int(100 * (held / owed if owed > 0 else 0)),
+                         int(short), bare))
+    except Exception:  # noqa: BLE001
+        out["say"] = "the horizon desk could not build a plan"
+    return out
+
+
 def coord_upcoming(window: float = 0.0,
                    measure: bool = True) -> list[dict[str, Any]]:
     """#911: the entries about to take the air, and whether anything is
@@ -45165,12 +46048,20 @@ def coord_upcoming(window: float = 0.0,
         store = schedule_read()
         if not store.get("enabled", True):
             return out
-        name = schedule_preset_now(store)
+        # 2026-09-15 (#1188): the moment is passed explicitly. This
+        # line was never wrong - schedule_preset_now with no `when` means
+        # now - but it is the head of a walk that is about to resolve six
+        # further hours, and of eighteen schedule_preset_now call sites
+        # on this station exactly ONE passed a moment. Leaving the first
+        # hour of a six-hour plan to a default is how the other five came
+        # to be priced off it.  (HZ1188NOWQX)
+        _hz_now = time.time()
+        name = schedule_preset_now(store, _hz_now)
         rows = list((store.get("presets") or {}).get(name) or [])
         try:
-            hour_key = _sched_hour_key()
+            hour_key = _sched_hour_key(_hz_now)
             picked, hour_rows, overridden = schedule_hour_slots(
-                store, hour_key)
+                store, hour_key, _hz_now)
             if overridden and hour_rows:
                 name, rows = picked, hour_rows
         except Exception:  # noqa: BLE001
@@ -45212,12 +46103,87 @@ def coord_upcoming(window: float = 0.0,
         # Derive the bound from the requested wall-time horizon; the time
         # condition remains authoritative and this is only the spin guard.
         most_steps = len(slots) * max(2, int((window + 3599.0) // 3600.0) + 1)
+        # 2026-09-15 (#1188): THE SHEET IS RESOLVED AT THE MOMENT THE
+        # WALK REACHES, NOT AT THE MOMENT IT LEFT.
+        #
+        # What this loop did: resolved one sheet for the hour it was
+        # standing in and then cycled that one list for the whole
+        # horizon - `idx = (idx + 1) % len(slots)`, round and round. A
+        # six-hour plan therefore priced the CURRENT hour's sheet six
+        # times. It could not see a different preset assigned to a
+        # future hour through store["day"], a future date through
+        # store["month"], or a per-hour override in store["hours"]. All
+        # three maps are empty today, so the fault is invisible today
+        # and appears the first time the operator schedules a different
+        # hour - which is exactly what he has asked to be able to do.
+        #
+        # horizon_sheet_at() asks schedule_hour_slots about the hour the
+        # walk has reached, which has always taken a moment and always
+        # resolved month-then-day-then-active-then-override at it. When
+        # the identity changes the walk re-seats at entry one, which is
+        # precisely what schedule_take does on the same test - so a
+        # future hour with a different NUMBER of entries can never be
+        # indexed by the old hour's cycling index.
+        #
+        # horizon_clip() handles the other drift: a preset that does not
+        # total sixty minutes. Both presets on this station total exactly
+        # 60.0 today so the drift is zero and invisible, and it will not
+        # stay that way.
+        #
+        # Off, `_hz` is False and every line below runs exactly as it
+        # ran before this shipped.  (HZ1188WALKQX)
+        _hz = False
+        _hz_live = False
+        try:
+            _hz = horizon_on()
+            _hz_live = horizon_live()
+        except Exception:  # noqa: BLE001
+            _hz = _hz_live = False
+        _hz_memo: dict[str, Any] = {}
+        _hz_ident: Any = None
+        _hz_left: dict[str, Any] = {}
+        if _hz:
+            try:
+                _hz_ident = horizon_sheet_at(store, time.time(), _hz_memo)[0]
+                if measure:
+                    _hz_left = horizon_ledger(left)
+            except Exception:  # noqa: BLE001
+                _hz_ident, _hz_left = None, {}
         while at - time.time() <= window and step < most_steps:
             step += 1
+            if _hz:
+                try:
+                    _hz_id, _hz_rows = horizon_sheet_at(store, at, _hz_memo)
+                    if _hz_id != _hz_ident and _hz_rows:
+                        _hz_ident, slots, idx = _hz_id, _hz_rows, -1
+                        # The spin guard was derived from the length of
+                        # the ONE list this walk used to have. A shorter
+                        # future sheet would otherwise cut the horizon
+                        # off early and a longer one would be truncated.
+                        most_steps = max(most_steps, step + len(slots) * (
+                            2 + int((window + 3599.0) // 3600.0)))
+                except Exception:  # noqa: BLE001
+                    pass
             idx = (idx + 1) % len(slots)
             slot = slots[idx]
             kind = str(slot.get("kind") or "")
             mins = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            # 2026-09-15 (#1188): a preset that does not total sixty
+            # minutes drifts against the wall clock, and an entry running
+            # across an hour boundary into a DIFFERENT sheet is cut at
+            # the boundary - schedule_take tests `fresh` before it tests
+            # the hold, so crossing re-seats at entry one immediately and
+            # truncates whatever was running. Both presets on this
+            # station total exactly 60.0 today, so the drift is zero,
+            # `_hz_clipped` is always 0.0, and nothing below sees any
+            # difference. It will not stay that way.  (HZ1188CLIPQX)
+            _hz_clipped = 0.0
+            if _hz:
+                try:
+                    mins, _hz_clipped = horizon_clip(
+                        store, at, mins, _hz_ident, _hz_memo)
+                except Exception:  # noqa: BLE001
+                    _hz_clipped = 0.0
             road = str(SCHED_PREP_KIND.get(kind) or kind)
             cannot = CANNOT_PREPARE.get(kind) or ""
             # #1179: A RECORD ENTRY OWES ITS BOOKENDS.  This is the
@@ -45245,6 +46211,43 @@ def coord_upcoming(window: float = 0.0,
                 left[road] = held - mins    # this entry eats its share
                 held = min(held, mins)      # ...and only its share counts
                 rows_held = int((needs.get(road) or {}).get("rows") or 0)
+            # 2026-09-15 (#1188): STOCK IS CREDITED AT THE MOMENT THE
+            # ENTRY IT COVERS ACTUALLY STARTS.
+            #
+            # dialogue_stock_items filters with `if _expiry and _expiry
+            # < now` - expiry against PLAN TIME, not against the moment
+            # the entry being covered begins. stock_expires_at gives
+            # news prep_news_at + NEWS_PREP_LIFE, three hours. The four
+            # live bulletins had a MEDIAN AGE OF 1.5 HOURS, so they were
+            # credited with covering all twelve news entries across six
+            # hours when at most the next hour and a half of them was
+            # real. MEASURED OVER-CREDIT: about 1,620 seconds of phantom
+            # news cover, and news reporting 100 PER CENT COVERAGE OVER
+            # SIX HOURS. Every road's rest and keep window carries the
+            # same evaluate-at-now bug; news is where it bites because
+            # news is the only road with a short life.
+            #
+            # THIS MAKES COVERAGE FIGURES DROP, AND THAT IS THE REPAIR.
+            # A road that read 100% over six hours and now reads a
+            # quarter of that did not lose any stock - it never had that
+            # cover. horizon_dress leaves `held_seconds_plan_time` and
+            # `overcredit_seconds` on the row so every surface can SAY
+            # the number moved and why, rather than quietly showing a
+            # worse one.
+            #
+            # `at` is this entry's own start moment (the walk sets
+            # at = started + owns and then at += mins at the foot of the
+            # loop), so it is the moment to test against, and the ledger
+            # is spent in place so the first news entry eats the
+            # freshest bulletin and the fifth, three hours out with the
+            # whole shelf dead by then, eats nothing.  (HZ1188DUEQX)
+            _hz_held, _hz_gone = held, 0.0
+            if _hz and measure and road != "track_talk" and not cannot:
+                try:
+                    _hz_held, _hz_gone = horizon_spend(
+                        _hz_left, road, mins, at)
+                except Exception:  # noqa: BLE001
+                    _hz_held, _hz_gone = held, 0.0
             due_at = float(at)
             slot_id = str(slot.get("id") or f"index-{idx}")
             out.append({
@@ -45276,6 +46279,9 @@ def coord_upcoming(window: float = 0.0,
                 "covered": bool(cannot) or held >= mins - 1.0,
                 "cannot": cannot,
             })
+            if _hz:                                  # 2026-09-15 (#1188)
+                horizon_dress(out[-1], _hz_held, _hz_gone, mins,
+                              cannot, _hz_clipped, _hz_live)
             at += mins
     except Exception:  # noqa: BLE001
         pass
@@ -54721,6 +55727,30 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
         started = float(pos.get("started") or 0) or None
     except (TypeError, ValueError):
         started = None
+    # 2026-09-15 (#1188): ONE SHELF WAS COUNTED ONCE PER HOUR.
+    #
+    # MEASURED: this view returned 8 hours of 18 slots each with correct
+    # preset resolution, and only the CURRENT hour's 18 slots carried a
+    # demand-versus-stock block - 126 FUTURE SLOTS CARRIED NONE. Worse,
+    # every future slot's per-kind `prep` block was byte-identical to
+    # the current hour's for the same kind: news read `written 4, ready
+    # 4, seconds 212.9` at 15:00 exactly as it did at 08:00. One shelf
+    # counted eight times with no spend-down. #957 fixed exactly this
+    # inside coord_upcoming and it was never fixed here.
+    #
+    # The walk is now run ONCE for the whole window and keyed by (hour,
+    # index), so the stock is spent down across every hour in the view
+    # the way #957 spends it down across the entries of one. The first
+    # occurrence in an hour wins, which is the rule the current hour has
+    # always used.  (HZ1188VIEWQX)
+    _hz_plan: dict[str, Any] = {}
+    _hz_on = False
+    try:
+        _hz_on = horizon_on()
+        if _hz_on:
+            _hz_plan = horizon_plan_index(count)
+    except Exception:  # noqa: BLE001
+        _hz_plan, _hz_on = {}, False
     rows: list[dict[str, Any]] = []
     for step in range(count):
         key = _sched_hour_shift(first, step)
@@ -54749,7 +55779,18 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
         # It was simply never wired to the sheet. Keyed by the slot index
         # it already reports, so the two cannot drift apart.
         _per_entry: dict[int, dict[str, Any]] = {}
-        if is_now:
+        if _hz_on:
+            # 2026-09-15 (#1188): every hour, off the one walk above -
+            # and the current hour too, because that walk is the same
+            # coord_upcoming, now resolving each hour's own sheet and
+            # spending the shelf down across all of them rather than
+            # cycling this hour's list for the whole horizon.
+            #   (HZ1188PERQX)
+            try:
+                _per_entry = dict(_hz_plan.get(key) or {})
+            except Exception:  # noqa: BLE001
+                _per_entry = {}
+        elif is_now:
             try:
                 for _up in coord_upcoming(3600.0):
                     _at = _up.get("index")
@@ -54846,6 +55887,16 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
                     "cannot": str(_mine.get("cannot") or ""),
                     "share": round(_held / _owns, 3) if _owns > 0 else 0.0,
                     "starts_in": float(_mine.get("starts_in") or 0),
+                    # 2026-09-15 (#1188): and what the old figure was, so
+                    # a panel drawing a LOWER bar than yesterday can say
+                    # which of the two numbers changed and why instead of
+                    # quietly showing a worse one.  (HZ1188BARQX)
+                    "was_held": float(_mine.get("held_seconds_plan_time")
+                                      or _held),
+                    "overcredit": float(_mine.get("overcredit_seconds") or 0),
+                    "expired": float(_mine.get("expired_seconds") or 0),
+                    "clipped": float(_mine.get("clipped_seconds") or 0),
+                    "honest": bool(_mine.get("expiry_honest")),
                 }
             out.append(row)
         rows.append({
@@ -54867,9 +55918,21 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
                     "slot_id": (live_id or None) if is_now else None,
                     "started": started if is_now else None},
         })
-    return {"hours": rows,
-            "kinds": [dict(k) for k in SCHEDULE_KINDS],
-            "presets": sorted(store.get("presets") or {})}
+    # 2026-09-15 (#1188): and what the whole answer was computed
+    # against. A six-hour plan is void the moment the sheet is edited -
+    # POST /api/schedule/slots replaces a preset wholesale and
+    # /api/schedule/activate restarts the clock, and neither of them
+    # tells anybody holding a plan. Stamped, a stale plan can say it is
+    # stale; unstamped it can only lie.  (HZ1188STAMPQX)
+    _hz_out = {"hours": rows,
+               "kinds": [dict(k) for k in SCHEDULE_KINDS],
+               "presets": sorted(store.get("presets") or {})}
+    try:
+        _hz_out["stamp"] = horizon_stamp(store, float(count))
+        _hz_out["priced_ahead"] = bool(_hz_on)
+    except Exception:  # noqa: BLE001
+        pass
+    return _hz_out
 
 
 def _sched_hours_put(store: dict[str, Any], key: str,
@@ -54895,9 +55958,99 @@ async def schedule_hours_api(
     air) &count=1..24 (default 6). Scroll it forward to see, and set up,
     the hours that have not happened yet."""
     require_read_auth(authorization)
-    return schedule_hours_view(
+    # 2026-09-15 (#1188): OFF THE EVENT LOOP. This walked the sheet,
+    # read the prep snapshot and ran coord_upcoming on the loop, and it
+    # is about to price every hour in the window rather than only the
+    # one on air. This station has been starved by less - see #1142,
+    # #1149 and the profile in #1153 - and /api/rooms/call-sheet calling
+    # commitment_inventory_plan directly on the loop is the thing this
+    # is deliberately not copying.  (HZ1188THREADQX)
+    return await asyncio.to_thread(
+        schedule_hours_view,
         str(request.query_params.get("from") or ""),
         request.query_params.get("count") or 6)
+
+
+@app.get("/api/schedule/hour-demand")
+async def api_hour_demand(
+    key: str = "",
+    hours: float = 0.0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1188: WHAT ONE NAMED HOUR NEEDS, AND WHAT IS BEHIND IT.
+
+    "understand what is needed for each segment that's coming up in
+    every hourly block".
+
+    The audit's finding was that nothing anywhere took an hour key and
+    returned demand-and-stock - every deep surface was now-plus-N. The
+    sheet resolution has always worked for any hour up to 24 out; what
+    was missing was PRICING it. ?key=YYYY-MM-DDTHH, empty for the hour
+    on air.
+
+    Entry by entry: what it owes, what is held AT THE MOMENT IT STARTS,
+    what expired before it could be used, what that leaves short, and
+    whether the road can be prepared at all - plus the sheet revision
+    the answer was computed against and the 31.5% quota intrusion that
+    no forward promise can price."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(
+        horizon_hour_demand, str(key or ""), float(hours or 0))
+
+
+@app.get("/api/schedule/horizon")
+async def api_horizon_plan(
+    hours: float = 6.0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1188: THE WHOLE HORIZON, UP TO SIX HOURS AND OUT TO TWENTY-FOUR.
+
+    "plan things out up to six hours in advance."
+
+    Every hour in the window, priced off ONE forward walk that resolves
+    each hour's own sheet and spends the shelf down as it goes - so the
+    cupboard is counted once across the horizon rather than once per
+    hour. Stamped with the sheet revision and carrying, out loud, the
+    two things it cannot promise: an edit to the running order voids it,
+    and 31.5% of every entry's seconds are filled by a road other than
+    the one that asked."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(horizon_plan, float(hours or 6))
+
+
+@app.get("/api/schedule/horizon/switch")
+async def api_horizon_switch(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1188: which way the horizon desk is set, and where the switch is.
+
+    Read-only on purpose, in the shape of #1179's record-talk switch: it
+    is a file an operator writes, `<data>/horizon/mode`, one word,
+    re-read every few seconds with no restart and no settings round
+    trip. off | trace | air, and a file holding a sentence is off."""
+    require_read_auth(authorization)
+    mode = "off"
+    try:
+        mode = horizon_mode()
+    except Exception:  # noqa: BLE001
+        mode = "off"
+    return {
+        "mode": mode,
+        "path": str(HORIZON_DIR / "mode"),
+        "modes": list(track_talk_segment.MODES),
+        "default": track_talk_segment.MODE_OFF,
+        "says": {
+            "off": "the station exactly as it runs today",
+            "trace": ("the honest figures are computed and published "
+                      "beside the old ones, and future hours grow the "
+                      "demand block they never had - nothing decides "
+                      "differently"),
+            "air": "trace, and the honest figures are the ones that decide",
+        },
+        "expiry_says": HORIZON_DROP_SAYS,
+        "intrusion_says": HORIZON_INTRUSION_SAYS,
+        "stamp": horizon_stamp(),
+    }
 
 
 # --- #920: THE HOUR ARCHIVE ------------------------------------------
