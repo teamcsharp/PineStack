@@ -1272,6 +1272,7 @@
     if (!clip || !clip.url || !clip.endless) return;
     var id = clipId(clip);
     var row = {id: id, url: String(clip.url),
+               video: !!clip.video,                          /* #1199 */
                sting: String(clip.sting || clip.text || ''),
                seconds: Number(clip.seconds) || 0};
     /* The same clip round again is the newest entry, not a second one. */
@@ -1300,6 +1301,7 @@
       if (String(coming[i].id || coming[i].url) === key) coming.splice(i, 1);
     }
     coming.push({id: clipId(clip), url: String(clip.url),
+                 video: !!clip.video,                        /* #1199 */
                  sting: String(clip.sting || clip.text || ''),
                  seconds: Number(clip.seconds) || 0,
                  at: Number(clip.at) || 0});
@@ -1341,10 +1343,12 @@
     var back = heard.slice(-STRIP_EACH);
     for (i = 0; i < back.length; i += 1) {
       rows.push({id: back[i].id, url: back[i].url, sting: back[i].sting,
+                 video: !!back[i].video,                     /* #1199 */
                  seconds: back[i].seconds, when: 'played'});
     }
     if (playing && playing.url) {
       rows.push({id: clipId(playing), url: String(playing.url),
+                 video: !!playing.video,                     /* #1199 */
                  sting: String(playing.sting || playing.text || ''),
                  seconds: Number(playing.seconds) || 0, when: 'now'});
       comingDrop(clipId(playing));                           /* #1195 */
@@ -1360,6 +1364,7 @@
       for (i = 0; i < queue.length; i += 1) {
         if (!queue[i] || !queue[i].url) continue;
         ahead.push({id: clipId(queue[i]), url: String(queue[i].url),
+                    video: !!queue[i].video,                 /* #1199 */
                     sting: String(queue[i].sting || queue[i].text || ''),
                     seconds: Number(queue[i].seconds) || 0,
                     at: Number(queue[i].at) || 0});
@@ -1369,6 +1374,7 @@
     for (i = 0; i < ahead.length && rows.length < (STRIP_EACH * 2) + 1; i += 1) {
       if (mine && String(ahead[i].id) === mine) continue;
       rows.push({id: ahead[i].id, url: ahead[i].url, sting: ahead[i].sting,
+                 video: !!ahead[i].video,                    /* #1199 */
                  seconds: ahead[i].seconds, at: ahead[i].at, when: 'next'});
       if (rows.length >= STRIP_EACH + 1 + STRIP_EACH) break;
     }
@@ -1835,7 +1841,22 @@
        asked for a second time. */
     var m = /[?&]t=([^&#]+)/.exec(url);
     var sign = m ? m[1] : '';
-    var looksVideo = /\.(mp4|m4v|webm|mov|mkv|ogv)(\?|#|$)/i.test(url);
+    /* #1199: THE URL CANNOT ANSWER THIS, and it never could.
+     *
+     * This used to sniff a file extension. An sfx url has none - the
+     * station builds them as /sfx/<hex>?t=<signature> in eight places -
+     * so the test answered false for every clip in the cycle, every tile
+     * took the spectrogram road, and a spectrogram of an mp4 draws its
+     * SOUNDTRACK. The waveform-looking thumbnails the operator was shown
+     * were pictures of the audio, not frames of the film.
+     *
+     * The clip has always known. /api/dj/video carries "video": true on
+     * every cycle clip. The flag rides on the row now; the sniff stays
+     * underneath as a fallback, so a clip handed in from somewhere that
+     * sets no flag behaves exactly as it does today. */
+    var looksVideo = (row && typeof row.video === 'boolean')
+      ? row.video
+      : /\.(mp4|m4v|webm|mov|mkv|ogv)(\?|#|$)/i.test(url);
     var road = looksVideo ? '/api/sfx/poster/' : '/api/sfx/spec/';
     return road + encodeURIComponent(id) + (sign ? '?t=' + sign : '');
   }

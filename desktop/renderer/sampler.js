@@ -52,7 +52,26 @@
      *            behaviour and stays the default
      *   progress a root movement applied every four pads, so the grid can
      *            walk a progression rather than one scale */
-    octave: 0, chord: 'chromatic', progress: 'none'
+    octave: 0, chord: 'chromatic', progress: 'none',
+    /* #1198: HOW STRONGLY A VIDEO PAD SHOWS ITS PICTURE, 0..100.
+     *
+     * "Have the video on the sampler pad faded to 30% or whatever I said it
+     *  to in the preferences."
+     *
+     * Thirty is his number and it is the default here. It sits in `modes`
+     * rather than in a cupboard of its own because that is where everything
+     * else this page remembers already lives - "remember what settings I
+     * have on on this page and have them on by default when I go back to
+     * this page" - and he said "in the preferences", meaning the ones he
+     * already has, not a new set.
+     *
+     * ONE NUMBER FOR BOTH PICTURES: the still on the pad and the video
+     * while he is holding it. Two dials for one look would be two things to
+     * keep in agreement, and the reason for the fade is identical in both
+     * cases - the pad's label and number have to stay readable over the top
+     * of it. The dial's own label says exactly that, so the control and
+     * this comment cannot drift apart. */
+    padVideo: 30
   };
 
   /* WHAT THIS PAGE WAS LEFT SET TO.
@@ -75,6 +94,7 @@
         sixteen: modes.sixteen, repeat: modes.repeat,
         division: modes.division, bpm: modes.bpm,
         octave: modes.octave, chord: modes.chord, progress: modes.progress,
+        padVideo: modes.padVideo,                              /* #1198 */
         feedShown: feedShown
       }));
     } catch (err) { /* a preference is not worth an exception */ }
@@ -99,6 +119,14 @@
     if ([4, 6, 8, 12, 16, 24, 32].indexOf(division) >= 0) modes.division = division;
     const bpm = Number(saved.bpm);
     if (isFinite(bpm) && bpm >= 20 && bpm <= 300) modes.bpm = bpm;
+    /* #1198: the pad-picture fade. Bounded and only taken when it IS a
+     * number - `Number(undefined)` is NaN and would otherwise have written
+     * NaN over the 30 the moment an older stored preference was read, which
+     * is how a default silently becomes "invisible". */
+    const shade = Number(saved.padVideo);
+    if (isFinite(shade) && shade >= 0 && shade <= 100) {
+      modes.padVideo = Math.round(shade);
+    }
     /* How far back the feed was left open. Bounded by the station's own ring
      * so a corrupt or ancient value cannot ask for a list that never ends. */
     const shown = Number(saved.feedShown);
@@ -404,6 +432,16 @@
       await engine().load(key, got.bytes);
       meta.seconds = engine().seconds(key);
       layout[targetBank][targetPad] = meta;
+      /* #1198: a pad that has just been overwritten keeps neither of the
+       * old clip's pictures. The peaks were already stale here before
+       * tonight - a re-import drew the previous clip's waveform until the
+       * page was reloaded - and the poster would have joined it. */
+      const faceHere = root.PineSamplerFace;
+      if (faceHere && typeof faceHere.forgetPad === "function") {
+        faceHere.forgetPad(key);
+      } else if (faceHere) {
+        faceHere.forgetPeaks(key);
+      }
       saveLayout();
       paintPads();
       note(meta.exact
@@ -776,6 +814,7 @@
      * audio interference." On by default - see sampler-air.js. */
     duckForPads();
     padPicture(layout[bank][sourceIndex]);                    /* #1310 */
+    padFilmOn(sourceIndex);                                   /* #1198 */
 
     const pitch = modes.sixteen ? sixteenPitch(index) : undefined;
     const fire = () => audio.fire(key, options);
@@ -783,7 +822,12 @@
     began(voiceId, sourceIndex, key,
       pitch === undefined ? padPitch(sourceIndex) : pitch,
       modes.gate || (layout[bank][sourceIndex] || {}).loop);
-    const record = { voiceId, repeatTimer: null };
+    /* #1198: `filmPad` is which pad's PICTURE this press put up, which is
+     * not always the pad under the finger: in 16 LEVEL every tile plays the
+     * SELECTED pad's clip, so the picture belongs to the pad that holds it.
+     * lift() has to stop the same one it started, and asking `modes.sixteen`
+     * again on release would answer with whatever the toggle says THEN. */
+    const record = { voiceId, repeatTimer: null, filmPad: sourceIndex };
     if (modes.repeat) {
       record.repeatTimer = setInterval(() => {
         const previous = held.get(index);
@@ -841,6 +885,69 @@
     catch (err) { /* the pad still sounds */ }
   }
 
+  /* #1198: HOLD THE PAD AND THE VIDEO RUNS ON THE PAD, ON THE PAD ITSELF.
+   *
+   * "If I put the video on a sampler pad, I want the video on the sampler
+   *  pad so I see the thumbnail of it and then whenever I tap and hold it I
+   *  want the video to play until I let go of it on the sampler pad."
+   *
+   * WHY ON THE PAD AND NOT ON THE SET, which was the real question here.
+   * sfx-tv.js owns the station's one video pipeline - a warmed element, a
+   * cycle, a duck, a ring every surface polls - and a second pipeline
+   * beside it would be the mistake. It is not what this is. Three things
+   * decided it:
+   *
+   *   1. THE SET HAS NO RELEASE. Its doors are cut() - "not that one, this
+   *      one" - and stop(), which UNMOUNTS it: clears the poll timer, drops
+   *      the warm element, sets mounted false. A pad release that called
+   *      stop() would take the station's set off the air until something
+   *      mounted it again, sixteen times a minute. There is no "end this
+   *      clip now, leave the set standing" road, and sfx-tv.js is not ours
+   *      to add one to tonight.
+   *   2. THE SET IS A BROADCAST, THE PAD IS AN AUDITION. cut({ring: true})
+   *      publishes into the ring so the tablet's set pops the same picture
+   *      - correct when a pad press is meant as a picture going out, which
+   *      is what #1310 does and still does. A hold-and-release is a finger
+   *      checking which clip this is; ringing the other surfaces on every
+   *      one of those would make the tablet flash all evening.
+   *   3. HE SAID "ON THE SAMPLER PAD" THREE TIMES IN ONE SENTENCE.
+   *
+   * A PAD IS SMALL AND THAT IS THE POINT. At about 110 px on the desk and
+   * 92 px on the tablet, and at 30% behind a label, this is not a picture
+   * you read - it is a picture you RECOGNISE. Sixteen tiles of text look
+   * the same at arm's length; sixteen waveforms do not, which is the note
+   * at the top of sampler-face.js, and a moving frame does the same job one
+   * step further. It also answers the only question a hold asks - "is this
+   * doing anything" - under the thumb rather than in the corner of the
+   * screen where the set floats.
+   *
+   * NO SECOND AUDIO ROAD. The film is MUTED, always. An mp4's audio track
+   * decodes onto the pad like any other sample and the engine is already
+   * playing it, in the mix, at the pad's own gain, pitch, pan and trim. A
+   * film with sound would be the same clip twice, a few milliseconds apart.
+   *
+   * Everything below is a thin call into sampler-face.js, which owns the
+   * pad's face; this file owns the instrument and only says WHEN. */
+  function padFilmOn(padIndex) {
+    const face = root.PineSamplerFace;
+    if (!face || typeof face.filmStart !== "function") return;
+    try { face.filmStart(bank, padIndex, layout[bank][padIndex]); }
+    catch (err) { /* the pad still sounds */ }
+  }
+
+  function padFilmOff(padIndex) {
+    const face = root.PineSamplerFace;
+    if (!face || typeof face.filmStop !== "function") return;
+    try { face.filmStop(bank, padIndex); }
+    catch (err) { /* nothing was running */ }
+  }
+
+  function padFilmOffAll() {
+    const face = root.PineSamplerFace;
+    if (!face || typeof face.filmStopAll !== "function") return;
+    try { face.filmStopAll(); } catch (err) { /* nothing was running */ }
+  }
+
   /* THE BROADCAST COMES BACK WHEN THE LAST VOICE DIES, not when the finger
    * lifts: a one-shot outlives the press that started it, so counting
    * presses would unduck over the top of a pad still sounding. The engine
@@ -864,12 +971,67 @@
     held.delete(index);
     const element = el("pad-" + index);
     if (element) element.classList.remove("lit");
+    /* #1198: THE RELEASE, AND IT IS BEFORE THE EARLY RETURN ON PURPOSE.
+     *
+     * "I want the video to play until I let go of it."
+     *
+     * lift() is the ONE funnel every ending goes through - pointerup,
+     * pointercancel, pointerleave, a gesture that turned out to be a carry
+     * to the bin, a gesture whose pad no longer matches. That is why the
+     * film hangs off this rather than off a listener of its own: a second
+     * gesture road would be a second chance to miss the release, and a
+     * missed release here is a video that plays for ever.
+     *
+     * It runs even when there is no `record`, because that early return is
+     * exactly the case a doubled release lands in - the first one deleted
+     * the record, the second still has to be able to say "stop". */
+    padFilmOff(record && record.filmPad !== undefined ? record.filmPad : index);
     if (!record) return;
     if (record.repeatTimer) clearInterval(record.repeatTimer);
     if (modes.gate && record.voiceId) {
       engine().release(record.voiceId);
       ended(record.voiceId);
     }
+  }
+
+  /* #1198: AND THE PATHS A FINGER NEVER TAKES.
+   *
+   * A pointer capture guarantees the pointerup comes back to the pad even
+   * if the finger slides off it - that is why press() takes one, and it is
+   * the road the sampler already used. What a capture does NOT survive:
+   *
+   *   - the window losing focus mid-press (alt-tab, a native dialog, the
+   *     shell putting another window in front). Chromium fires no
+   *     pointerup at all in that case; it was measured firing pointercancel
+   *     on the tablet and nothing whatsoever on the desk.
+   *   - the tab or the view going hidden under a held pad.
+   *   - the app being closed and the view unmounted.
+   *
+   * Each of those leaves a held pad with no release. For a gated voice that
+   * is a stuck note; for a film it is a picture that never stops. So every
+   * one of them is swept here, by the same funnel: lift every pad that is
+   * still down, then stop any film that somehow outlived its pad. */
+  function releaseEverything() {
+    for (const index of [...held.keys()]) {
+      try { lift(index); } catch (err) { /* one bad pad, not all */ }
+    }
+    padFilmOffAll();
+  }
+
+  /* Wired once, at mount, and never unwired: the sampler is mounted at most
+   * once per page and a listener that sweeps nothing costs nothing. */
+  let netsWired = false;
+  function wireReleaseNets() {
+    if (netsWired) return;
+    netsWired = true;
+    try {
+      root.addEventListener("blur", releaseEverything);
+      if (root.document && root.document.addEventListener) {
+        root.document.addEventListener("visibilitychange", () => {
+          if (root.document.hidden) releaseEverything();
+        });
+      }
+    } catch (err) { /* not a browser; nothing can be held either */ }
   }
 
   /* WHO WANTS TO KNOW WHEN THE PAD OR THE BANK CHANGES.
@@ -2105,7 +2267,14 @@
     }, extra || {});
     meta.seconds = engine().seconds(key);
     layout[bank][index] = meta;
-    if (root.PineSamplerFace) root.PineSamplerFace.forgetPeaks(key);
+    /* #1198: forgetPad drops the pad's POSTER as well as its peaks, because
+     * a pad overwritten with new bytes must not keep the old clip's frame.
+     * Guarded on the name rather than assumed: a face from before tonight
+     * has only forgetPeaks, and an air take onto a pad must not throw
+     * because the picture road is missing. */
+    const face = root.PineSamplerFace;
+    if (face && typeof face.forgetPad === "function") face.forgetPad(key);
+    else if (face) face.forgetPeaks(key);
     saveLayout();
     paintPads();
     return meta;
@@ -2585,6 +2754,11 @@
       button.className = "pb-bank";
       button.textContent = String(b + 1);
       button.addEventListener("click", async () => {
+        /* #1198: the bank goes, so the picture goes with it. A film is
+         * layered into a CELL - #pad-3 - and the cells are reused by every
+         * bank, so a film left running while the bank turns over would be
+         * bank 1's video sitting on bank 2's clip. */
+        releaseEverything();
         bank = b;
         paintPads();
         /* A chop can be undone only on the bank it happened to, so the
@@ -2821,6 +2995,10 @@
     stop.title = "Silence every pad at once";
     stop.addEventListener("click", () => {
       engine().stopAll();
+      /* #1198: "Silence every pad at once" has to mean the picture too - a
+       * film still running over a grid the operator has just silenced reads
+       * as a STOP that did not work. */
+      releaseEverything();
       /* The ledger is the view's own record and nothing tells it the engine
        * went quiet, so STOP has to say so - otherwise the timeline keeps
        * drawing lanes for voices that were cut a moment ago. */
@@ -2876,6 +3054,55 @@
     rptWrap.appendChild(rptSlider);
     rptWrap.appendChild(rptSaid);
     dials.appendChild(rptWrap);
+
+    /* #1198: HOW STRONGLY A VIDEO PAD SHOWS ITS PICTURE.
+     *
+     * "Have the video on the sampler pad faded to 30% or whatever I said it
+     *  to in the preferences."
+     *
+     * It sits in the dial row rather than the toggle row because it is a
+     * number, not a light - the note above the dials says why the two kinds
+     * are kept apart, and it is the same reason CHOP once read as a mode.
+     *
+     * THE LABEL SAYS EXACTLY WHAT IT FADES, both halves of it, because the
+     * one thing that would make this preference useless is the operator
+     * setting it for the still and being surprised by the video. Fives
+     * rather than ones: nobody can aim at 37% behind a label, and a slider
+     * that pretends to is a control lying about what it can do. */
+    const vidWrap = document.createElement("label");
+    vidWrap.className = "pb-dial";
+    vidWrap.id = "pbPadVidDial";
+    vidWrap.title = "How strongly a video pad shows its picture - the "
+      + "thumbnail on the pad and the video while you hold it. The rest is "
+      + "the pad's own tile, so the label stays readable over the top.";
+    const vidName = document.createElement("span");
+    vidName.className = "pb-dial-name";
+    vidName.textContent = "PAD VIDEO";
+    const vidSlider = document.createElement("input");
+    vidSlider.id = "pbPadVid";
+    vidSlider.type = "range";
+    vidSlider.min = "0";
+    vidSlider.max = "100";
+    vidSlider.step = "5";
+    vidSlider.value = String(modes.padVideo);
+    const vidSaid = document.createElement("b");
+    vidSaid.className = "pb-dial-said";
+    vidSaid.textContent = modes.padVideo + "%";
+    vidSlider.addEventListener("input", () => {
+      modes.padVideo = Math.max(0, Math.min(100, Number(vidSlider.value) || 0));
+      vidSaid.textContent = modes.padVideo + "%";
+      rememberModes();
+      /* Repainted on the spot, and the film too if one is running: a fade
+       * you cannot see moving is a fade you cannot set. */
+      const face = root.PineSamplerFace;
+      if (face && typeof face.paintPadFaces === "function") {
+        try { face.paintPadFaces(); } catch (err) { /* the dial still moved */ }
+      }
+    });
+    vidWrap.appendChild(vidName);
+    vidWrap.appendChild(vidSlider);
+    vidWrap.appendChild(vidSaid);
+    dials.appendChild(vidWrap);
 
     const menu = (id, name, options, get, set) => {
       const wrap = document.createElement("label");
@@ -3022,6 +3249,7 @@
      * the edit sheet. It hangs off the seams this file publishes rather than
      * reaching inside, so it can be absent without anything here noticing. */
     if (root.PineSamplerFace) root.PineSamplerFace.start();
+    wireReleaseNets();                                        /* #1198 */
     paintDials();
     engine().setPolyphonic(modes.poly);
     paintPads();
@@ -3099,6 +3327,11 @@
     /* The kit loader writes whole banks back; it needs the same door the
      * sampler's own imports use rather than a second store of its own. */
     put: dbPut,
+    /* #1198: the pad-picture fade, 0..1, for the face to paint with. Handed
+     * over as a fraction rather than the operator's percentage because that
+     * is what a CSS opacity wants, and a conversion done in two places is a
+     * conversion that will eventually be done two ways. */
+    padVideoFade: () => Math.max(0, Math.min(1, Number(modes.padVideo) / 100)),
     /* Told on every selection and every repaint, so the face follows without
      * a timer of its own. */
     onPad: (fn) => { if (typeof fn === "function") watchers.push(fn); },
