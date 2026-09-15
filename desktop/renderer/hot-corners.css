@@ -179,6 +179,19 @@
 .hc-toast.up { opacity: 1; transform: translate(-50%, 0); }
 .hc-toast.bad { border-color: #a8563f; color: #ffcdbc; }
 
+/* A separate frame leaves the station player and script view mounted. */
+.hc-video-editor {
+  position: fixed; inset: 0; z-index: 2147483035;
+  display: flex; flex-direction: column; background: #111820;
+  color: #edf3f5; font: 14px/1.4 Inter, "Segoe UI", system-ui, sans-serif;
+}
+.hc-video-editor-bar {
+  flex: 0 0 auto; display: flex; align-items: center;
+  justify-content: space-between; gap: 12px; padding: 6px 12px;
+  border-bottom: 1px solid #35414c;
+}
+.hc-video-editor-frame { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; }
+
 @media (max-width: 520px) {
   .hc-ticks span:nth-child(even) { visibility: hidden; }
   .hc-ink-note { display: none; }

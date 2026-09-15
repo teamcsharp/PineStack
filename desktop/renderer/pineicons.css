@@ -16,7 +16,7 @@
    Icons inherit currentColor and font-size like any other character. */
 
 @font-face {
-  font-family: 'PineIcons';
+  font-family: PineIcons, 'PineIcons';
   font-style: normal;
   font-weight: 400;
   font-display: block;           /* never flash the colour emoji first */

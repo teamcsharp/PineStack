@@ -712,3 +712,4 @@ attached it are not listed. The narrative that runs through it is in
 - `b8b68f6` The station stuttered: the store's save starved the disk, and the tablet was animating under a view nobody could see
 - `e3ba6c6` The tablet's frame pipeline, the tailnet gallery's hand-back, and an SFX slider
 - `624ab0b` In endless mode the tube belongs to the cycle: the SFX guy's clip plays after, never over
+- `9e5e3ee` The audio graph that grew a node per clip, a mixer dot on the player card, and the heap frozen every quarter hour

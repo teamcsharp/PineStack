@@ -46,9 +46,11 @@ station off the air.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -127,6 +129,19 @@ CLIP_GRACE_SECONDS = float(os.getenv("STREAM_CLIP_GRACE", "45"))
 # is what keeps the average at 1x through a stall.
 CATCHUP_LIMIT = float(os.getenv("STREAM_CATCHUP_LIMIT", "60"))
 
+# How long the mixer will wait for a starved decoder before giving up
+# and emitting a hole. The sources read from local disk, so a wait
+# this long is only ever the GIL, and the burst covers the lateness.
+STARVE_WAIT_MAX = float(os.getenv("STREAM_STARVE_WAIT", "0.25"))
+
+# HLS. Four-second segments with eight in the playlist gives a player about
+# half a minute of runway - the same read-ahead the mp3 burst buys, but
+# handed over as separate short requests, so a dropped connection costs one
+# segment rather than the broadcast.
+HLS_SEGMENT_SECONDS = float(os.getenv("STREAM_HLS_SEGMENT", "4"))
+HLS_LIST_SIZE = int(os.getenv("STREAM_HLS_LIST", "8"))
+HLS_ROOT = os.getenv("STREAM_HLS_DIR", "")
+
 
 def _ffmpeg_exe() -> str:
     """The one ffmpeg this box has. imageio's binary first, PATH second."""
@@ -161,6 +176,7 @@ class _Decoder:
         self._started = False
         self._offset = max(0.0, float(offset))
         self._pump: threading.Thread | None = None
+        self.padded = 0                 # frames we had to zero-fill
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> bool:
@@ -241,6 +257,16 @@ class _Decoder:
         with self._lock:
             return self._held
 
+    def has_frame(self) -> bool:
+        """A COMPLETE frame, right now, without padding.
+
+        The mixer asks this before it consumes. Without it, a short read
+        is silently zero-filled and the hole never appears in any
+        counter - which is how 687 ms of digital silence got onto the
+        air with `underruns` reading zero."""
+        with self._lock:
+            return self._held >= FRAME_BYTES or self._eof
+
     def read_frame(self) -> tuple[bytes, bool]:
         """One frame of PCM, and whether it is real audio.
 
@@ -267,9 +293,14 @@ class _Decoder:
             eof = self._eof
             self._room.notify_all()
         if not out:
+            if not eof:
+                self.padded += 1
             return SILENCE, (not eof)
         if want:
-            # The tail of a file, or a starved decoder: pad the frame.
+            # The tail of a file (legitimate), or a starved decoder (a
+            # hole). Only the second is a fault, so only it is counted.
+            if not eof:
+                self.padded += 1
             out += b"\0" * want
         return bytes(out), True
 
@@ -302,8 +333,12 @@ class _Encoder:
     certainly not a second set of DJ clips.
     """
 
-    def __init__(self, bitrate: int) -> None:
+    def __init__(self, bitrate: int, split: bool = False) -> None:
         self.bitrate = int(bitrate)
+        # #1265: L=record, R=DJs, for a listener who wants to balance the
+        # two for themselves. See the module note on why this cannot be
+        # done in the mixer.
+        self.split = bool(split)
         self.proc: subprocess.Popen | None = None
         self.sinks: dict[int, "_Sink"] = {}
         self.burst: deque[bytes] = deque()
@@ -406,6 +441,103 @@ class _Encoder:
             pass
 
 
+class _HlsEncoder:
+    """One AAC/HLS encoder at one bitrate, writing segments to a folder.
+
+    ffmpeg owns the segmenting and the playlist rolling; this class only
+    feeds it PCM and remembers when somebody last asked for the playlist,
+    so an abandoned one can be reaped.
+    """
+
+    def __init__(self, bitrate: int, root: Path,
+                 split: bool = False) -> None:
+        self.bitrate = int(bitrate)
+        self.split = bool(split)
+        self.dir = root / (f"hls{self.bitrate}"
+                           + ("s" if self.split else ""))
+        self.playlist = self.dir / "live.m3u8"
+        self.proc: subprocess.Popen | None = None
+        self.prime: list[bytes] = []
+        self.asked_at = time.time()
+        self.restarts = 0
+
+    def start(self) -> bool:
+        try:
+            # A fresh folder: a stale playlist from a previous run would
+            # name segments that no longer exist, and a player reads that
+            # as a broken stream rather than an old one.
+            if self.dir.exists():
+                for old in self.dir.iterdir():
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        cmd = [_ffmpeg_exe(), "-nostdin", "-hide_banner", "-loglevel", "error",
+               "-analyzeduration", "0", "-probesize", "32",
+               "-fflags", "+nobuffer",
+               "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS),
+               "-i", "pipe:0",
+               "-c:a", "aac", "-b:a", f"{self.bitrate}k",
+               "-f", "hls",
+               "-hls_time", str(HLS_SEGMENT_SECONDS),
+               "-hls_list_size", str(HLS_LIST_SIZE),
+               # delete_segments keeps the folder bounded; omit_endlist
+               # keeps the playlist LIVE, so a player never decides the
+               # broadcast has finished and stops asking.
+               "-hls_flags", "delete_segments+omit_endlist+independent_segments",
+               "-hls_segment_type", "mpegts",
+               "-hls_allow_cache", "0",
+               "-hls_segment_filename", str(self.dir / "seg%05d.ts"),
+               str(self.playlist)]
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, bufsize=0)
+        except Exception:  # noqa: BLE001
+            self.proc = None
+            return False
+        return True
+
+    def feed(self, frame: bytes) -> bool:
+        proc = self.proc
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            self.restarts += 1
+            self.stop()
+            if not self.start():
+                return False
+            proc = self.proc
+        try:
+            if proc is not None and proc.stdin is not None:
+                proc.stdin.write(frame)
+            return True
+        except Exception:  # noqa: BLE001
+            self.stop()
+            return False
+
+    def ready(self) -> bool:
+        try:
+            return self.playlist.is_file() and self.playlist.stat().st_size > 0
+        except OSError:
+            return False
+
+    def stop(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class StationStream:
     """The mixer, the encoder and the fan-out, behind one URL.
 
@@ -430,6 +562,9 @@ class StationStream:
 
         self._lock = threading.Lock()
         self._encoders: dict[int, _Encoder] = {}
+        self._hls: dict[int, _HlsEncoder] = {}
+        self._hls_root = Path(HLS_ROOT) if HLS_ROOT else Path(
+            tempfile.mkdtemp(prefix="pinebox-hls-"))
         self._next_id = 1
 
         self._run = False
@@ -439,6 +574,12 @@ class StationStream:
         # The last JOIN_BURST_SECONDS of the mix, as PCM. Rate-independent,
         # so ONE copy primes an encoder at any bitrate. At 44.1k stereo
         # this is about 5 MB for thirty seconds.
+        # #1253: the last few sessions, so a RECONNECT LOOP is visible.
+        # A car that reconnects every twenty seconds and one that holds a
+        # single socket for an hour look identical in a live snapshot and
+        # completely different here.
+        self.sessions: deque = deque(maxlen=40)
+
         self._pcm_burst: deque[bytes] = deque(
             maxlen=max(1, int(JOIN_BURST_SECONDS * 1000 / FRAME_MS)))
 
@@ -452,6 +593,9 @@ class StationStream:
             "voice_airing": "", "clips_aired": 0, "underruns": 0,
             "encoder_restarts": 0, "last_error": "",
             "reanchors": 0, "behind_worst": 0.0, "primed": 0,
+            "starve_waits": 0, "starve_wait_ms": 0, "holes": 0,
+            "swaps": 0,
+            "padded_music": 0, "padded_voice": 0,
         }
         self._aired: "deque[str]" = deque(maxlen=512)
         self._aired_set: set[str] = set()
@@ -464,16 +608,37 @@ class StationStream:
 
     def rates(self) -> dict[int, int]:
         with self._lock:
-            return {r: len(e.sinks) for r, e in self._encoders.items()}
+            return {(f"{r}k split" if sp else f"{r}k"): len(e.sinks)
+                    for (r, sp), e in self._encoders.items()}
 
-    def attach(self, bitrate: Any = None) -> "_Sink":
+    def listener_rows(self) -> list[dict[str, Any]]:
+        """What each listener is ACTUALLY receiving.
+
+        `delivered_x` is the number that matters: 1.0 means this socket
+        is keeping up with real time. Below 1.0 for any length of time
+        and that listener is draining their buffer toward a stutter,
+        whatever the mixer thinks it is producing."""
+        with self._lock:
+            sinks = [sk for e in self._encoders.values()
+                     for sk in e.sinks.values()]
+        return [sk.row() for sk in sinks]
+
+    def attach(self, bitrate: Any = None, split: bool = False) -> "_Sink":
         """A listener at one quality. The mix is shared; the encode is not."""
         rate = snap_rate(bitrate if bitrate is not None else self.bitrate)
-        sink = _Sink(rate)
+        key = (rate, bool(split))
+        sink = _Sink(rate, bool(split))
+        # Bind first: offer() is a no-op until the sink knows which loop
+        # to hand chunks to, and the burst is offered a few lines below.
+        try:
+            sink.bind(asyncio.get_running_loop())
+        except RuntimeError:
+            pass                    # not on a loop - a test harness
+
         with self._lock:
-            enc = self._encoders.get(rate)
+            enc = self._encoders.get(key)
             if enc is None:
-                enc = _Encoder(rate)
+                enc = _Encoder(rate, bool(split))
                 if not enc.start():
                     self.stats["last_error"] = f"encoder {rate}k would not start"
                 # The burst this rate has never had. The mixer writes it
@@ -481,7 +646,7 @@ class StationStream:
                 # listener attached below receives a full read-ahead
                 # instead of the nothing a cold encoder would give them.
                 enc.prime = list(self._pcm_burst)
-                self._encoders[rate] = enc
+                self._encoders[key] = enc
             sink.ident = self._next_id
             self._next_id += 1
             with enc.lock:
@@ -496,9 +661,56 @@ class StationStream:
         self.ensure_running()
         return sink
 
-    def detach(self, sink: "_Sink") -> None:
+    def hls(self, bitrate: Any = None,
+            split: bool = False) -> "_HlsEncoder":
+        """The HLS encoder at this rate, started and primed if it is new.
+
+        Unlike an mp3 listener there is no socket to hold: a player just
+        keeps asking for the playlist. `asked_at` is that heartbeat, and
+        the mixer reaps an encoder nobody has asked about.
+        """
+        rate = snap_rate(bitrate if bitrate is not None else self.bitrate)
+        key = (rate, bool(split))
         with self._lock:
-            enc = self._encoders.get(getattr(sink, "bitrate", 0))
+            enc = self._hls.get(key)
+            if enc is None:
+                enc = _HlsEncoder(rate, self._hls_root, bool(split))
+                if not enc.start():
+                    self.stats["last_error"] = f"hls {rate}k would not start"
+                # The same backlog the mp3 encoders get, so the very first
+                # playlist already lists several seconds of segments
+                # instead of making the player wait for them in real time.
+                enc.prime = list(self._pcm_burst)
+                self._hls[key] = enc
+            enc.asked_at = time.time()
+            self._last_listener_at = time.time()
+        self.ensure_running()
+        return enc
+
+    def hls_existing(self, bitrate: int,
+                     split: bool = False) -> "_HlsEncoder | None":
+        """The HLS encoder at this rate if one is already running.
+
+        Segment requests must never be able to SPAWN an encoder: a player
+        asking for a segment of a stream nobody is listening to is a stale
+        playlist, and answering it by starting a lame process is how one
+        abandoned tab keeps the box busy for ever."""
+        with self._lock:
+            enc = self._hls.get((int(bitrate), bool(split)))
+            if enc is not None:
+                enc.asked_at = time.time()
+            return enc
+
+    def detach(self, sink: "_Sink") -> None:
+        try:
+            row = sink.row()
+            row["ended"] = time.strftime("%H:%M:%S")
+            self.sessions.append(row)
+        except Exception:  # noqa: BLE001
+            pass
+        with self._lock:
+            enc = self._encoders.get((getattr(sink, "bitrate", 0),
+                                      bool(getattr(sink, "split", False))))
             if enc is not None:
                 with enc.lock:
                     enc.sinks.pop(getattr(sink, "ident", -1), None)
@@ -548,11 +760,15 @@ class StationStream:
                 # nothing. It keeps its burst ring for the linger so that
                 # coming back at the same quality is still instant.
                 with self._lock:
-                    for rate, enc in list(self._encoders.items()):
+                    for ekey, enc in list(self._encoders.items()):
                         if (enc.idle_since
                                 and now - enc.idle_since > LINGER_SECONDS):
                             enc.stop()
-                            self._encoders.pop(rate, None)
+                            self._encoders.pop(ekey, None)
+                    for hkey, hls in list(self._hls.items()):
+                        if now - hls.asked_at > LINGER_SECONDS:
+                            hls.stop()
+                            self._hls.pop(hkey, None)
 
                 # Station state, four times a second. Cheap on the host
                 # side by contract, and never on the event loop.
@@ -568,22 +784,53 @@ class StationStream:
                     tid = str(track.get("id") or "")
                     self.now_title = str(track.get("title") or "")
                     self.now_artist = str(track.get("artist") or "")
-                    if tid != music_id:
-                        if music is not None:
-                            music.close()
-                        music, music_id = None, tid
+                    # #1253: DOUBLE-BUFFERED SWAP.
+                    #
+                    # This used to close the playing decoder BEFORE
+                    # building its replacement, so every record change
+                    # aired the gap between them. And an empty `tid` -
+                    # the station mid-turnover, a blip in _RADIO - tore
+                    # down a working decoder to replace it with nothing,
+                    # which is a far longer hole for no reason at all.
+                    #
+                    # So: an empty tid means "not said yet", and keeps
+                    # what is playing. A real change builds the new
+                    # decoder, waits for it to genuinely have audio, and
+                    # only then retires the old one.
+                    if not tid:
+                        pass                    # keep the current record
+                    elif tid != music_id:
                         path = str(track.get("path") or "")
+                        cand = None
                         if path:
                             offset = max(0.0, now - float(
                                 track.get("started") or now))
                             cand = _Decoder(path, offset)
                             if cand.start():
-                                music = cand
+                                # Give it a moment to fill. It reads off
+                                # the local shelf, where first frame was
+                                # measured at 21-41 ms.
+                                _spin = 0.0
+                                while (_spin < 0.5 and not cand.has_frame()
+                                       and not cand.finished):
+                                    time.sleep(0.005)
+                                    _spin += 0.005
                             else:
                                 self.stats["last_error"] = (
                                     f"record would not open: {path}")
-                        self.stats["music_id"] = music_id
-                        self._meta_seq += 1
+                                cand = None
+                        if cand is not None:
+                            if music is not None:
+                                music.close()
+                            music = cand
+                            music_id = tid
+                            self.stats["music_id"] = music_id
+                            self.stats["swaps"] = int(
+                                self.stats.get("swaps") or 0) + 1
+                            self._meta_seq += 1
+                        # A replacement that would not open leaves the
+                        # current record playing rather than cutting to
+                        # silence; the next poll tries again.
 
                     # New clips: take them at announce time, which is the
                     # whole point of the seven-second lead - the decode
@@ -612,6 +859,39 @@ class StationStream:
 
                 paused = bool(state.get("paused"))
                 on_air = bool(state.get("on", True)) and not paused
+                with self._lock:
+                    want_split = (any(e.split for e in self._encoders.values())
+                                  or any(h.split for h in self._hls.values()))
+
+                # #1253: DO NOT OUTRUN THE DECODERS.
+                #
+                # Catch-up after a stall is only free when the audio is
+                # already in RAM. When it is not - because the pump
+                # thread is fighting the same GIL that caused the stall -
+                # racing ahead turns one stall into a burst of zero-
+                # padded frames, which is a hole in the broadcast. Wait
+                # for the bytes instead. Being a few milliseconds later
+                # is what the burst is for; a hole is not recoverable.
+                if on_air:
+                    _waited = 0.0
+                    while _waited < STARVE_WAIT_MAX:
+                        _short = False
+                        if (music is not None and not music.finished
+                                and not music.has_frame()):
+                            _short = True
+                        _vd = airing.decoder if airing is not None else None
+                        if (_vd is not None and not _vd.finished
+                                and not _vd.has_frame()):
+                            _short = True
+                        if not _short:
+                            break
+                        time.sleep(0.004)
+                        _waited += 0.004
+                    if _waited:
+                        self.stats["starve_waits"] += 1
+                        self.stats["starve_wait_ms"] += int(_waited * 1000)
+                        if _waited >= STARVE_WAIT_MAX:
+                            self.stats["holes"] += 1
 
                 # -- pick the voice for this frame -------------------------
                 if airing is not None and airing.decoder is not None:
@@ -636,6 +916,8 @@ class StationStream:
                                or not self._forget(v)]
 
                 # -- assemble ----------------------------------------------
+                made_sound = False
+                split_frame = SILENCE
                 if not on_air:
                     # Off air, or paused: the socket is HELD OPEN and fed
                     # silence. Persistence is the point - a car must not
@@ -675,11 +957,13 @@ class StationStream:
                         else:
                             if not live:
                                 self.stats["underruns"] += 1
+                            self.stats["padded_music"] = music.padded
                             bed = _pcm(raw)
                     else:
                         bed = np.zeros(FRAME_SAMPLES * CHANNELS,
                                        dtype=np.int32)
 
+                    made_sound = (music is not None) or (voice_pcm is not None)
                     mixed = bed * bed_gain
                     if voice_pcm is not None:
                         n = min(mixed.size, voice_pcm.size)
@@ -687,29 +971,72 @@ class StationStream:
                     np.clip(mixed, -32768, 32767, out=mixed)
                     frame = mixed.astype("<i2").tobytes()
 
+                    # #1265: the same instant, UNMIXED - record left, DJs
+                    # right - for listeners doing their own balance. Only
+                    # built when somebody is actually on that road, and
+                    # deliberately NOT ducked: ducking is a mixing
+                    # decision, and on this road the listener is the one
+                    # doing the mixing.
+                    if want_split:
+                        m = bed.reshape(-1, CHANNELS).mean(axis=1)
+                        if voice_pcm is not None:
+                            v = voice_pcm.reshape(-1, CHANNELS).mean(axis=1)
+                            n = min(m.size, v.size)
+                            if n < m.size:
+                                v = np.concatenate(
+                                    [v, np.zeros(m.size - n, dtype=v.dtype)])
+                            v = v[:m.size]
+                        else:
+                            v = np.zeros(m.size, dtype=m.dtype)
+                        pair = np.empty(m.size * 2, dtype=np.int32)
+                        pair[0::2] = m
+                        pair[1::2] = v
+                        np.clip(pair, -32768, 32767, out=pair)
+                        split_frame = pair.astype("<i2").tobytes()
+
                 # -- hand it to every encoder ------------------------------
                 # One mix, several rates. A listener on 48k and one on
                 # 128k share this frame and everything that made it.
-                self._pcm_burst.append(frame)
+                # #1253: BANK ONLY REAL PROGRAMME. The backlog is what a
+                # joining listener is handed as their read-ahead, and the
+                # mixer is kept warm from boot - so without this test the
+                # first half-minute after a restart banks pure silence and
+                # the next person to tune in is handed thirty seconds of
+                # nothing, which reads as broken. Off air, or on air with
+                # no record open yet, simply does not go in the bank.
+                if made_sound:
+                    self._pcm_burst.append(frame)
                 with self._lock:
                     encoders = list(self._encoders.values())
+                    hlses = list(self._hls.values())
                 if not encoders:
                     # Nobody yet, but the linger has not run out. Keep the
                     # mixer turning so the first listener starts instantly.
                     pass
                 for enc in encoders:
                     before = enc.restarts
+                    shaped = split_frame if enc.split else frame
                     if enc.prime:
                         backlog, enc.prime = enc.prime, []
                         for past in backlog:
                             if not enc.feed(past):
                                 break
                         self.stats["primed"] += 1
-                    if not enc.feed(frame):
+                    if not enc.feed(shaped):
                         self.stats["last_error"] = (
                             f"encoder {enc.bitrate}k stopped")
                     if enc.restarts != before:
                         self.stats["encoder_restarts"] += 1
+                for hls in hlses:
+                    hshaped = split_frame if hls.split else frame
+                    if hls.prime:
+                        backlog, hls.prime = hls.prime, []
+                        for past in backlog:
+                            if not hls.feed(past):
+                                break
+                    if not hls.feed(hshaped):
+                        self.stats["last_error"] = (
+                            f"hls {hls.bitrate}k stopped")
 
                 self.stats["frames"] += 1
 
@@ -751,6 +1078,9 @@ class StationStream:
                 for enc in self._encoders.values():
                     enc.stop()
                 self._encoders.clear()
+                for hls in self._hls.values():
+                    hls.stop()
+                self._hls.clear()
 
     def _remember(self, key: str) -> None:
         if len(self._aired) == self._aired.maxlen and self._aired:
@@ -778,6 +1108,10 @@ class StationStream:
             "listeners": self.listeners,
             "bitrate": self.bitrate,
             "rates": self.rates(),
+            "hls_rates": [f"{r}k split" if sp else f"{r}k"
+                          for (r, sp) in sorted(self._hls)],
+            "listener_rows": self.listener_rows(),
+            "recent_sessions": list(self.sessions)[-12:],
             "join_burst_s": JOIN_BURST_SECONDS,
             "title": self.now_title,
             "artist": self.now_artist,
@@ -789,56 +1123,116 @@ class StationStream:
 
 
 class _Sink:
-    """One listener's socket, and the backlog it is allowed to hold.
+    """One listener socket, fed by the event loop rather than by a pool.
 
-    A listener that cannot keep up is dropped back to the live edge
-    rather than allowed to grow without bound - a stalled car radio must
+    THE POINT OF THIS CLASS IS WHAT IT DOES NOT DO. It does not park a
+    thread. The encoder thread calls offer() and returns immediately;
+    the chunk is handed to the event loop, and the route awaits a plain
+    asyncio.Queue. Nothing here touches the default ThreadPoolExecutor,
+    which app.py shares across 407 to_thread call sites - the pool whose
+    saturation used to stop delivery dead while the loop itself was fine.
+
+    A listener that cannot keep up is dropped back toward the live edge
+    rather than allowed to grow without bound: a car in a dead zone must
     not be able to cost the box memory, and when it comes back it wants
     NOW, not the minute it missed.
     """
 
-    def __init__(self, bitrate: int) -> None:
+    def __init__(self, bitrate: int, split: bool = False) -> None:
         self.ident = 0
         self.bitrate = int(bitrate)
-        self._q: deque[bytes] = deque()
+        self.split = bool(split)
+        self._max_bytes = int(bitrate * 1000 / 8 * LISTENER_QUEUE_SECONDS)
+        self._loop: Any = None
+        self._q: Any = None
         self._held = 0
-        self._max = int(bitrate * 1000 / 8 * LISTENER_QUEUE_SECONDS)
-        self._cv = threading.Condition()
         self._open = True
         self.dropped = 0
+        self.sent = 0
+        self.stalls = 0
+        self.started = time.time()
 
+    def bind(self, loop: Any) -> None:
+        """Attach to the loop that will do the writing. Called from the
+        route, before any chunk is offered."""
+        self._loop = loop
+        self._q = asyncio.Queue()
+
+    # -- producer side (encoder thread) --------------------------------
     def offer(self, chunk: bytes) -> None:
-        with self._cv:
-            if not self._open:
-                return
-            self._q.append(chunk)
-            self._held += len(chunk)
-            while self._held > self._max and self._q:
-                self._held -= len(self._q.popleft())
-                self.dropped += 1
-            self._cv.notify()
+        if not self._open:
+            return
+        loop, queue = self._loop, self._q
+        if loop is None or queue is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._push, chunk)
+        except RuntimeError:
+            # The loop is gone; so is this listener.
+            self._open = False
 
-    def take(self, timeout: float = 1.0) -> bytes:
-        """Whatever has piled up, as one write. Returns b"" on a timeout,
-        which the route turns into a keep-alive tick rather than a close."""
-        with self._cv:
-            if not self._q and self._open:
-                self._cv.wait(timeout)
-            if not self._q:
-                return b""
-            out = b"".join(self._q)
-            self._q.clear()
-            self._held = 0
-            return out
+    def _push(self, chunk: bytes) -> None:
+        """Runs ON the loop, so the deque below needs no lock."""
+        if not self._open or self._q is None:
+            return
+        self._q.put_nowait(chunk)
+        self._held += len(chunk)
+        # Too far behind: shed from the OLDEST end, toward the live edge.
+        while self._held > self._max_bytes:
+            try:
+                old = self._q.get_nowait()
+            except Exception:  # noqa: BLE001
+                break
+            self._held -= len(old)
+            self.dropped += len(old)
+
+    # -- consumer side (the route) -------------------------------------
+    async def aget(self, timeout: float = 1.0) -> bytes:
+        """Everything waiting, as one write. b"" on a timeout, which the
+        route treats as a keep-alive tick rather than a close."""
+        if self._q is None:
+            return b""
+        try:
+            first = await asyncio.wait_for(self._q.get(), timeout)
+        except asyncio.TimeoutError:
+            self.stalls += 1
+            return b""
+        except Exception:  # noqa: BLE001
+            return b""
+        parts = [first]
+        self._held -= len(first)
+        while True:
+            try:
+                more = self._q.get_nowait()
+            except Exception:  # noqa: BLE001
+                break
+            self._held -= len(more)
+            parts.append(more)
+        out = b"".join(parts)
+        self.sent += len(out)
+        return out
 
     def close(self) -> None:
-        with self._cv:
-            self._open = False
-            self._cv.notify_all()
+        self._open = False
 
     @property
     def open(self) -> bool:
         return self._open
+
+    def row(self) -> dict[str, Any]:
+        up = max(0.001, time.time() - self.started)
+        return {
+            "id": self.ident,
+            "bitrate": self.bitrate,
+            "seconds": round(up, 1),
+            "sent_kb": round(self.sent / 1024, 1),
+            # The honest pace check for ONE listener: what they actually
+            # received, against what the stream produced in that time.
+            "delivered_x": round((self.sent * 8 / (self.bitrate * 1000)) / up, 3),
+            "behind_kb": round(self._held / 1024, 1),
+            "dropped_kb": round(self.dropped / 1024, 1),
+            "quiet_ticks": self.stalls,
+        }
 
 
 def icy_block(title: str) -> bytes:

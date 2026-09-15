@@ -9,6 +9,8 @@ dist-desktop/
 # Patch scripts used to drop a timestamped copy of app.py here before
 # editing. Git already keeps every version; backups now go to /tmp.
 *.backup.*
+app.py.bak-*
+/typescript
 h1.json
 
 # Audit evidence written beside the docs by the resolver sessions: replay

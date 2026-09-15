@@ -1409,7 +1409,7 @@
       Promise.resolve(api().get('/api/script-reports/' + encodeURIComponent(name))).then(function (got) {
         d.pineAsking = false;
         var t = String((got && got.text) || (got && got.say) || '(empty)');
-        card.pineReports[name] = t;
+        if (!got || got.status !== 'awaiting_post') card.pineReports[name] = t;
         pre.textContent = t;
       }, function (err) {
         d.pineAsking = false;             /* asked again on the next open */
@@ -1746,131 +1746,100 @@
     catch (err) { return {error: String((err && err.message) || err).slice(0, 200)}; }
   }
 
-  function reportNode(n, paneRect, chars) {
-    var r = n.getBoundingClientRect();
-    return {
-      el: n.getAttribute('data-el') || '',
-      line: n.getAttribute('data-line') || '',
-      seg: n.getAttribute('data-seg') || '',
-      cls: String(n.className || ''),
-      text: String(n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, chars),
-      top: Math.round(r.top - paneRect.top),
-      bottom: Math.round(r.bottom - paneRect.top),
-      inView: r.height > 0 && r.bottom > paneRect.top && r.top < paneRect.bottom
-    };
-  }
-
-  /* 2026-09-14: THE CAUTION BUTTON AND THE ROLLING RECORD.
-   *
-   * "a caution button in the script view that when clicked / tapped files
-   *  a script analysis report ... along with a rolling report of the last
-   *  5 seconds of script viewer motion with the actively selected element
-   *  in an information dense SHA style format separated by | symbols ...
-   *  the script entries up and down the page for the last 20 entries up
-   *  and the last 10 entries down ... scripts not having their lines
-   *  inserted sequentially ... it's jumping up and down pages."
-   *
-   * So the view keeps a RING of its own motion, sampled four times a
-   * second while mounted: which element is lit, where it sits in page
-   * order, its block.ord from the ledger (#1330), the pane's scroll
-   * position and what the playhead reads. The report carries the last
-   * fifteen seconds of that (more than asked - the moment before the
-   * jump is the one worth having), plus the twenty elements above and
-   * ten below the lit one at the moment of the tap. Both are pipe rows
-   * with a legend, and the station's side of the report (app.py
-   * script_report_reading) reads them back: backward jumps, page-sized
-   * jumps, and rows whose block.ord runs against page order. */
-  var motion = [];
+  /* Passive rolling diagnostics: the previous minute of observed changes,
+   * full line identities and audio coordinates. The tap submits immediately;
+   * a screenshot and ten seconds of subsequent evidence finish the report.
+   * Recording never scrolls the view or changes playback. */
   var MOTION_MS = 250;
-  var MOTION_KEEP = 60;
   var motionTimer = 0;
-  var lastMotionIndex = -1;
-  var offScreenFor = 0;
+  var diagnosticRecorder = null;
+  var diagnosticNodes = [];
+  var diagnosticIndices = new Map();
+  var diagnosticLines = Object.create(null);
+  var diagnosticRevision = '';
+  var diagnosticSnapshot = null;
+  function recorder() {
+    if (!diagnosticRecorder && root.PineScriptDiagnostics) diagnosticRecorder = root.PineScriptDiagnostics.createRecorder();
+    return diagnosticRecorder;
+  }
+  function diagnosticDocument(box) {
+    diagnosticNodes = Array.prototype.slice.call(box.querySelectorAll('.sp-el'));
+    diagnosticIndices = new Map();
+    diagnosticLines = Object.create(null);
+    diagnosticNodes.forEach(function (n, i) {
+      diagnosticIndices.set(n, i);
+      if (n.pineItem && n.pineItem.line) diagnosticLines[String(n.pineItem.line)] = {item: n.pineItem, index: i};
+    });
+    if (root.PineScriptDiagnostics) diagnosticRevision = root.PineScriptDiagnostics.revision(elements);
+  }
 
-  function elOrder(node) {
-    var b = node && node.dataset ? node.dataset.block : '';
-    var o = node && node.dataset ? node.dataset.ord : '';
-    return (b || o) ? (String(b || '-') + '.' + String(o || '-')) : '-';
-  }
-  function elWho(all, i) {
-    /* the nearest character heading above, as the screenplay says it */
-    for (var k = i; k >= 0 && k > i - 40; k -= 1) {
-      if (all[k].classList.contains('sp-character')) return String(all[k].textContent || '').trim().slice(0, 12);
-    }
-    return '';
-  }
-  function elKind(node) {
-    var m = /\bsp-([a-z_-]+)/.exec(String(node.className || '').replace('sp-el', '').replace('sp-now', ''));
-    return m ? m[1] : '';
-  }
-  function short(t, n) {
-    return String(t || '').replace(/\s+/g, ' ').replace(/\|/g, '/').trim().slice(0, n);
-  }
   function sampleMotion() {
     var pane = el('spScript');
-    if (!pane) return;
-    var all = pane.querySelectorAll('.sp-el');
+    var rec = recorder();
+    if (!pane || !rec) return;
     var lit = pane.querySelector('.sp-el.sp-now');
-    var idx = -1;
-    if (lit) { for (var i = 0; i < all.length; i += 1) { if (all[i] === lit) { idx = i; break; } } }
-    var head = null;
-    try { head = bridgeHead(); } catch (e) { head = null; }
-    var pos = head && typeof head.position === 'number' ? head.position.toFixed(1)
-      : head && typeof head.at === 'number' ? head.at.toFixed(1) : '';
-    var row = [
-      new Date().toISOString().slice(11, 23),
-      idx,
-      idx >= 0 && lastMotionIndex >= 0 ? (idx - lastMotionIndex) : '',
-      lit && lit.dataset ? String(lit.dataset.line || '').slice(0, 8) : '',
-      lit ? elOrder(lit) : '',
-      Math.round(pane.scrollTop),
-      lit ? Math.round(lit.getBoundingClientRect().top - pane.getBoundingClientRect().top) : '',
-      pos ? 'r' + pos : 'e',
-      lit ? short(lit.textContent, 28) : ''
-    ].join('|');
-    lastMotionIndex = idx;
-    motion.push(row);
-    /* 2026-09-14: THE LIT LINE, OFF SCREEN, WITH FOLLOW ON (report #1131:
-     * lit_top -3965 px for fifteen seconds). markNow only scrolls when
-     * the id CHANGES, so a re-fit, a fold or a long record line could
-     * leave the mark out of view for as long as the line lasted. If the
-     * mark has been off the pane for two seconds while following and no
-     * scroll of ours is in flight, bring it back the gentle way. */
-    try {
-      if (lit && follow && Date.now() >= selfScrollUntil) {
-        var pr = pane.getBoundingClientRect(), lr = lit.getBoundingClientRect();
-        var onScreen = lr.bottom > pr.top && lr.top < pr.bottom;
-        offScreenFor = onScreen ? 0 : offScreenFor + 1;
-        if (offScreenFor >= 8) {
-          offScreenFor = 0;
-          selfScrollUntil = Date.now() + 1200;
-          lit.scrollIntoView({block: 'nearest', behavior: 'smooth'});
-        }
-      } else { offScreenFor = 0; }
-    } catch (e) { offScreenFor = 0; }
-    if (motion.length > MOTION_KEEP) motion.splice(0, motion.length - MOTION_KEEP);
-    ensureCaution();
-  }
-  var MOTION_LEGEND = 'time|lit_index|delta_index|line8|block.ord|scrollTop|lit_top_px|head(r=read secs,e=estimated)|text28';
-  var WINDOW_LEGEND = 'index|delta|line8|el8|block.ord|kind|who|secs|text64';
-
-  function reportWindow(all, litIndex) {
-    var rows = [];
-    if (!all.length) return rows;
-    var from = litIndex >= 0 ? Math.max(0, litIndex - 20) : 0;
-    var to = litIndex >= 0 ? Math.min(all.length - 1, litIndex + 10) : Math.min(all.length - 1, 30);
-    for (var i = from; i <= to; i += 1) {
-      var n = all[i];
-      rows.push([
-        i, litIndex >= 0 ? (i - litIndex) : '',
-        String(n.dataset.line || '').slice(0, 8), String(n.dataset.el || '').slice(0, 8),
-        elOrder(n), elKind(n), elWho(all, i), n.dataset.secs || '',
-        short(n.textContent, 64)
-      ].join('|'));
+    var idx = diagnosticIndices.has(lit) ? diagnosticIndices.get(lit) : -1;
+    var audio = root.PineScriptDiagnostics.readAudio(bridgeHead(), soundingPlayer(), streamAt());
+    var active = attempt(activeRow) || {};
+    var feed = [];
+    try { feed = root.PineStationFeed.rows() || []; } catch (e) { /* no feed */ }
+    var records = [], nearby = [], mapping = [], byId = Object.create(null);
+    feed.forEach(function (r) { if (r.id) byId[String(r.id)] = r; });
+    var rect = pane.getBoundingClientRect(), visible = -1;
+    var knownActive = diagnosticLines[String(active.id || '')];
+    if (idx < 0 && !knownActive) {
+      for (var v = 0; v < diagnosticNodes.length; v += 1) {
+        var box = diagnosticNodes[v].getBoundingClientRect();
+        if (box.height > 0 && box.bottom > rect.top && box.top < rect.bottom) { visible = v; break; }
+      }
     }
-    return rows;
+    var contextAt = root.PineScriptDiagnostics.contextIndex(idx, knownActive ? knownActive.index : -1, visible, diagnosticNodes.length);
+    var from = contextAt < 0 ? 0 : Math.max(0, contextAt - 20);
+    var to = contextAt < 0 ? -1 : Math.min(diagnosticNodes.length - 1, contextAt + 10);
+    for (var i = from; i <= to; i += 1) {
+      var n = diagnosticNodes[i], item = n.pineItem || {};
+      var id = String(item.line || (item.id ? 'element:' + item.id : ''));
+      nearby.push({id: id, element_id: String(item.id || ''), index: i, block: item.block, ord: item.ord});
+      if (id) {
+        var source = byId[id] || {};
+        records.push({id: id, element_id: item.id, block: item.block, ord: item.ord,
+          kind: item.type, who: source.who || source.name || '', text: item.text,
+          media: rowFile(source), from_s: rowFrom(source), until_s: rowUntil(source), document_index: i});
+      }
+    }
+    // Keep a small cue neighborhood and both claimed identities. Copying the
+    // whole file can evict the very rows needed to explain a long burst.
+    var candidates = root.PineScriptDiagnostics.selectMappings(feed, audio, String(active.id || ''), lit ? String(lit.dataset.line || '') : '');
+    candidates.rows.forEach(function (r) {
+        mapping.push(String(r.id || ''));
+        if (!records.some(function (held) { return held.id === String(r.id || ''); })) {
+          var known = diagnosticLines[String(r.id || '')] || {}, item = known.item || {};
+          records.push({id: r.id, kind: r.kind, who: r.who || r.name, text: r.text,
+            media: rowFile(r), from_s: rowFrom(r), until_s: rowUntil(r),
+            element_id: item.id, block: item.block, ord: item.ord, document_index: known.index});
+        }
+    });
+    var top = lit ? Math.round(lit.getBoundingClientRect().top - rect.top) : null;
+    diagnosticSnapshot = {
+      recorder_version: 2, capture_source: 'script-page',
+      highlight_id: lit ? String(lit.dataset.line || '') : '', active_id: String(active.id || ''),
+      document_revision: diagnosticRevision, script_age_ms: fetchedAt ? Date.now() - fetchedAt : null,
+      speaking_id: String((speakingNow && speakingNow.id) || ''), audio: audio,
+      nearby: nearby, context_index: contextAt,
+      context_source: idx >= 0 ? 'highlight' : knownActive ? 'active' : visible >= 0 ? 'viewport' : 'unavailable',
+      mapping_rows: mapping, mapping_rows_total: candidates.total,
+      mapping_rows_omitted: candidates.omitted, matching_file_rows_total: candidates.matching_file_total,
+      stream: liveStream ? {at: liveStream.at, length: liveStream.length, row_count: (liveStream.rows || []).length,
+        rows: (liveStream.rows || []).filter(function (r) { return String(r.id || '') === String(active.id || '') || String(r.id || '') === nowLineId; }).map(function (r) { return {id: r.id, from: r.from, until: r.until}; })} : null,
+      viewport: {scroll_top_px: Math.round(pane.scrollTop), height_px: pane.clientHeight, width_px: pane.clientWidth, content_height_px: pane.scrollHeight, lit_top_px: top},
+      paused: stationPaused, follow: follow, visibility: String(document.visibilityState || ''),
+      errors: caught.slice(-6)
+    };
+    rec.observe({at_ms: Date.now(), highlight_id: diagnosticSnapshot.highlight_id, active_id: diagnosticSnapshot.active_id,
+      document_revision: diagnosticRevision, element_index: idx, block: lit && lit.dataset.block,
+      ord: lit && lit.dataset.ord, scroll_top_px: Math.round(pane.scrollTop), lit_top_px: top,
+      audio: audio, follow: follow, paused: stationPaused, snapshot: diagnosticSnapshot}, records);
   }
-
   var reportKind = 'report';
   function ensureCaution() {
     var pane = el('spScript');
@@ -1882,7 +1851,7 @@
       wrap.id = 'spCautionWrap';
       var b = make('button', 'sp-caution', '');
       b.type = 'button';
-      b.title = 'The script is erratic, out of order or jumping? Tap: the last fifteen seconds of this view\'s motion and the lines around the mark go to the Pine inbox for analysis';
+      b.title = 'Report a script jump: keep the previous minute, this moment, and the next 10 seconds in the Pine inbox';
       b.setAttribute('aria-label', 'Report the script as erratic');
       try { if (typeof root.pineIcon === 'function') b.innerHTML = root.pineIcon('c:warning--alt', 'Report the script as erratic'); } catch (e) { /* text */ }
       if (!b.innerHTML) b.textContent = '!';
@@ -1902,132 +1871,11 @@
     pane.insertBefore(wrap, pane.firstChild);
   }
 
-  function reportGather() {
-    var pane = el('spScript');
-    var paneRect = pane ? pane.getBoundingClientRect()
-      : {top: 0, bottom: 0, left: 0, right: 0, height: 0};
-    var all = pane ? pane.querySelectorAll('.sp-el') : [];
-    var litList = document.querySelectorAll('.sp-el.sp-now');
-    var lit = [];
-    var litIndex = -1;
-    var i;
-    for (i = 0; i < litList.length; i += 1) lit.push(reportNode(litList[i], paneRect, 160));
-    if (litList.length) {
-      for (i = 0; i < all.length; i += 1) { if (all[i] === litList[0]) { litIndex = i; break; } }
-    }
-    var around = [];
-    if (litIndex >= 0) {
-      for (i = Math.max(0, litIndex - 3); i <= Math.min(all.length - 1, litIndex + 3); i += 1) {
-        if (i === litIndex) continue;
-        var near = reportNode(all[i], paneRect, 80);
-        near.offset = i - litIndex;
-        around.push(near);
-      }
-    }
-    var litLine = lit.length ? lit[0].line : '';
-    /* 2026-09-14: WHERE THE LIT LINE IS, IN THE OPERATOR'S WORDS. The
-       lit line's top against the pane's top (negative: above), and one
-       short sentence the inbox can lead with instead of a geometry. */
-    var litOffsetPx = null;
-    var whyNotShown = 'no line is lit';
-    if (litList.length && pane) {
-      var litRect = litList[0].getBoundingClientRect();
-      litOffsetPx = Math.round(litRect.top - paneRect.top);
-      if (litRect.bottom <= paneRect.top) whyNotShown = 'above the view by ' + Math.round(paneRect.top - litRect.bottom) + ' px';
-      else if (litRect.top >= paneRect.bottom) whyNotShown = 'below the view by ' + Math.round(litRect.top - paneRect.bottom) + ' px';
-      else whyNotShown = 'on screen';
-    } else if (nowLineId && !document.querySelector('.sp-el[data-line="' + nowLineId + '"]')) {
-      whyNotShown = 'the lit line is not on the page';
-    }
-    var stream = liveStream ? jsonSafe(liveStream) : null;
-    if (stream && stream.rows && stream.rows.length) {
-      stream.rowCount = stream.rows.length;
-      stream.rows = stream.rows.slice(0, 40);        /* the head is enough */
-    }
-    return {
-      request: 1115,
-      kind: reportKind,
-      at: Date.now(),
-      motionLegend: MOTION_LEGEND,
-      motion: motion.slice(),
-      windowLegend: WINDOW_LEGEND,
-      window: reportWindow(all, litIndex),
-      hourKey: hourKey,
-      beforeKey: beforeKey,
-      fetchedAgeMs: fetchedAt ? Date.now() - fetchedAt : null,
-      fetching: !!fetching,
-      chasedAgoMs: chasedAt ? Date.now() - chasedAt : null,
-      nowLineId: nowLineId,
-      nowLineOnPage: nowLineId
-        ? !!document.querySelector('.sp-el[data-line="' + nowLineId + '"]') : null,
-      lit: lit,
-      litCount: litList.length,
-      litIndex: litIndex,
-      litLineOnPage: litLine
-        ? !!document.querySelector('.sp-el[data-line="' + litLine + '"]') : null,
-      litOffsetPx: litOffsetPx,                       /* 2026-09-14 */
-      whyNotShown: whyNotShown,                       /* 2026-09-14 */
-      around: around,
-      activeRow: attempt(activeRow),
-      bridgeHead: attempt(bridgeHead),
-      headIsRead: attempt(headIsRead),
-      follow: !!follow,
-      stick: !!stick,
-      adrift: adrift,
-      selfScrollMsLeft: selfScrollUntil ? selfScrollUntil - Date.now() : 0,
-      liveSeg: liveSeg,
-      stationPaused: !!stationPaused,
-      skewMs: skewMs,
-      lastOffMs: lastOffMs,
-      liveStream: stream,
-      speakingNow: jsonSafe(speakingNow),
-      flow: jsonSafe(flow),
-      pane: pane ? {
-        scrollTop: pane.scrollTop,
-        scrollHeight: pane.scrollHeight,
-        clientHeight: pane.clientHeight,
-        top: Math.round(paneRect.top),
-        bottom: Math.round(paneRect.bottom),
-        atEnd: pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 40
-      } : null,
-      counts: {
-        el: all.length,
-        withLine: pane ? pane.querySelectorAll('.sp-el[data-line]').length : 0,
-        elements: elements.length,
-        keyed: scriptNodes.size
-      },
-      page: {
-        userAgent: String(navigator.userAgent || ''),
-        href: String(location.href || ''),
-        innerWidth: root.innerWidth || 0,
-        innerHeight: root.innerHeight || 0,
-        visibility: String(document.visibilityState || ''),
-        mounted: !!mounted
-      },
-      caught: caught.slice()
-    };
-  }
-
-  /* The visible slice of the script as plain text - the picture that
-     cannot fail. One line per element in the pane's viewport, the lit
-     one marked, bounded so a folded-open hour cannot flood the file. */
-  function reportText() {
-    var pane = el('spScript');
-    if (!pane) return '(no script pane on this surface)';
-    var box = pane.getBoundingClientRect();
-    var all = pane.querySelectorAll('.sp-el');
-    var out = [];
-    for (var i = 0; i < all.length; i += 1) {
-      var r = all[i].getBoundingClientRect();
-      if (r.height <= 0 || r.bottom <= box.top || r.top >= box.bottom) continue;
-      var t = String(all[i].textContent || '').replace(/\s+/g, ' ').trim();
-      var id = all[i].getAttribute('data-line') || '';
-      out.push((all[i].classList.contains('sp-now') ? '>>> ' : '    ')
-        + (id ? '[' + id + '] ' : '') + t);
-      if (out.length >= 120) { out.push('    ... (cut at 120 lines)'); break; }
-    }
-    if (!out.length) out.push('(no script element is in the pane’s viewport)');
-    return out.join('\n');
+  function reportGather(phase, incident, since) {
+    sampleMotion();
+    var rec = recorder();
+    if (!rec) throw new Error('script diagnostics did not load');
+    return rec.capture(Date.now(), phase || 'tap', incident || '', since, diagnosticSnapshot);
   }
 
   /* The picture. On the desktop the chrome can take one
@@ -2035,34 +1883,29 @@
      screenshot(); either may be missing, slow or broken, and none of
      that may hold the report - five seconds and it goes without. */
   function reportImage() {
-    var bridge = api();
-    var ask = null;
+    var bridge = api(), ask = null, source = 'unavailable', requested = Date.now();
     try {
-      if (bridge && typeof bridge.shotView === 'function') ask = bridge.shotView();
-      else if (bridge && typeof bridge.screenshot === 'function') ask = bridge.screenshot();
-    } catch (err) { ask = null; }
-    if (!ask) return Promise.resolve(null);
+      if (bridge && typeof bridge.shotView === 'function') { source = 'shotView'; ask = bridge.shotView(); }
+      else if (bridge && typeof bridge.screenshot === 'function') { source = 'screenshot'; ask = bridge.screenshot(); }
+    } catch (err) { return Promise.resolve({image: null, screenshot_source: source, screenshot_at_ms: requested, screenshot_error: String(err.message || err).slice(0, 160)}); }
+    if (!ask) return Promise.resolve({image: null, screenshot_source: source, screenshot_at_ms: requested, screenshot_error: 'screenshot unavailable'});
     return new Promise(function (resolve) {
       var settled = false;
-      var late = setTimeout(function () {
-        if (!settled) { settled = true; resolve(null); }
-      }, 5000);
-      Promise.resolve(ask).then(function (got) {
+      function finish(image, error) {
         if (settled) return;
         settled = true; clearTimeout(late);
-        var url = (got && typeof got === 'object')
-          ? (got.dataUrl || got.data_url || got.image || got.png || '') : got;
-        if (typeof url !== 'string' || !url) { resolve(null); return; }
-        if (/^data:image\//.test(url)) { resolve(url); return; }
-        /* a bare base64 body is a picture too */
-        if (/^[A-Za-z0-9+\/=\s]+$/.test(url) && url.length > 64) {
-          resolve('data:image/png;base64,' + url.replace(/\s+/g, ''));
-          return;
+        resolve({image: image, screenshot_source: source, screenshot_at_ms: Date.now(),
+          screenshot_requested_at_ms: requested, screenshot_error: error || null});
+      }
+      var late = setTimeout(function () { finish(null, 'screenshot timed out after 5 seconds'); }, 5000);
+      Promise.resolve(ask).then(function (got) {
+        var url = (got && typeof got === 'object') ? (got.dataUrl || got.data_url || got.image || got.png || '') : got;
+        if (typeof url === 'string' && /^data:image\//.test(url)) { finish(url); return; }
+        if (typeof url === 'string' && /^[A-Za-z0-9+\/=\s]+$/.test(url) && url.length > 64) {
+          finish('data:image/png;base64,' + url.replace(/\s+/g, '')); return;
         }
-        resolve(null);
-      }, function () {
-        if (!settled) { settled = true; clearTimeout(late); resolve(null); }
-      });
+        finish(null, 'screenshot returned no image');
+      }, function (err) { finish(null, String((err && err.message) || err).slice(0, 160)); });
     });
   }
 
@@ -2082,48 +1925,80 @@
   /* 2026-09-14: `reason` is the operator's own why, from the reason
      sheet (a hold on the caution button); a plain tap files without
      one. The station stores it and leads the inbox summary with it. */
+  var REPORT_PENDING_KEY = 'pine-script-report-finishes-v2';
+  function pendingReports() {
+    try { return JSON.parse(root.localStorage.getItem(REPORT_PENDING_KEY) || '[]').slice(-3); }
+    catch (e) { return []; }
+  }
+  function keepPending(name, body) {
+    try {
+      var saved = pendingReports().filter(function (r) { return r.name !== name; });
+      if (body) {
+        var small = Object.assign({}, body, {image: null});
+        if (body.image) small.screenshot_error = 'image was not retained for retry; original upload failed';
+        saved.push({name: name, body: small});
+      }
+      root.localStorage.setItem(REPORT_PENDING_KEY, JSON.stringify(saved.slice(-3)));
+    } catch (e) { caughtNote('report-persistence', e); }
+  }
+  function finishReport(name, body) {
+    keepPending(name, body);
+    return Promise.resolve(api().post('/api/script/report/' + encodeURIComponent(name) + '/finish', body)).then(function (got) {
+      if (got && got.ok === false) throw new Error(got.say || 'the station refused the attachment');
+      keepPending(name, null);
+      return got;
+    });
+  }
+  function retryReports() {
+    pendingReports().forEach(function (held) {
+      if (!/^script_[A-Za-z0-9_-]+\.md$/.test(held.name || '')) return;
+      finishReport(held.name, held.body).catch(function (err) { caughtNote('report-retry', err); });
+    });
+  }
   function reportFire(btn, reason) {
-    var mine = (reportTurn += 1);
+    var mine = (reportTurn += 1), tapped = Date.now();
     if (!api() || !api().post) { say('no bridge to file the report through'); return; }
     btn.classList.add('sp-firing');
     function done(text, bad) {
-      if (mine !== reportTurn) return;  /* a newer tap owns the strip */
-      btn.classList.remove('sp-firing');
-      btn.classList.toggle('sp-fired-bad', !!bad);
-      say(text);
+      if (mine !== reportTurn) return;
+      btn.classList.remove('sp-firing'); btn.classList.toggle('sp-fired-bad', !!bad); say(text);
       setTimeout(function () { btn.classList.remove('sp-fired-bad'); }, 2600);
     }
-    var view, text;
-    try { view = reportGather(); }
-    catch (err) {
-      view = {request: 1115, at: Date.now(),
-        gatherError: String((err && err.message) || err).slice(0, 200),
-        nowLineId: nowLineId, caught: caught.slice()};
-    }
-    try { text = reportText(); }
-    catch (err) { text = '(the visible script could not be read: ' + String((err && err.message) || err) + ')'; }
-    var flashed = false;
-    function flash() {
-      if (flashed) return;
-      flashed = true;
-      reportShutter();
-      say('captured');
-    }
-    var shot = reportImage();
-    setTimeout(flash, 400);
-    shot.then(flash, flash);
-    shot.then(function (image) {
-      return api().post('/api/script/report', {view: view, image: image || null, text: text,
-        reason: reason ? String(reason).slice(0, 2000) : null});
-    }).then(function (got) {
-      if (got && got.ok === false) {
-        done(String(got.say || 'the station refused the report').slice(0, 100), true);
-        return;
-      }
-      done(String((got && got.say) || (got && got.id ? 'filed as #' + got.id : 'filed')).slice(0, 100));
-    }, function (err) {
-      done('not filed: ' + String((err && err.message) || err).slice(0, 80), true);
+    var incident = (root.crypto && root.crypto.randomUUID) ? root.crypto.randomUUID()
+      : ('script-' + tapped + '-' + Math.random().toString(16).slice(2));
+    var view;
+    try { view = reportGather('tap', incident); }
+    catch (err) { done('not filed: ' + String(err.message || err).slice(0, 80), true); return; }
+    tapped = view.captured_at_ms;
+    // Submit the tap immediately. Screenshot latency cannot move the server's
+    // initial observation or erase the evidence already collected.
+    var initial;
+    try { initial = Promise.resolve(api().post('/api/script/report', {view: view,
+      reason: reason ? String(reason).slice(0, 1200) : null, incident_id: incident})); }
+    catch (err) { done('not filed: ' + String(err.message || err).slice(0, 80), true); return; }
+    var shot = reportImage(), flashed = false;
+    function flash() { if (flashed) return; flashed = true; reportShutter(); }
+    setTimeout(flash, 400); shot.then(flash, flash);
+    var after = new Promise(function (resolve) {
+      setTimeout(function () {
+        try { resolve(reportGather('post', incident, tapped + 1)); }
+        catch (err) { resolve({schema_version: 2, phase: 'post', incident_id: incident,
+          captured_at_ms: Date.now(), events: [], rows: {}, snapshot: {errors: [{at: Date.now(),
+            kind: 'post-capture', msg: String(err.message || err).slice(0, 200)}]}}); }
+      }, 10000);
     });
+    initial = initial.then(function (got) {
+      if (!got || got.ok === false || !got.file) throw new Error((got && got.say) || 'the report was not acknowledged');
+      if (mine === reportTurn) say('filed as #' + got.id + ' - capturing 10 seconds after the tap');
+      return got;
+    });
+    Promise.all([initial, after, shot]).then(function (all) {
+      var got = all[0], name = String(got.file).split('/').pop();
+      var body = Object.assign({view: all[1], incident_id: incident}, all[2]);
+      return finishReport(name, body).then(function () {
+        done('filed as #' + got.id + ' - capture complete' + (body.screenshot_error ? ' (without a picture)' : ''));
+      }, function (err) { done('report #' + got.id + ' kept; attachment pending: ' + String(err.message || err).slice(0, 65), true); });
+    }).catch(function (err) { done('not filed: ' + String((err && err.message) || err).slice(0, 80), true); });
   }
 
   function fireVideo(btn) {
@@ -2808,6 +2683,11 @@
          reading the node later - the strip's hold, for one - should get
          what this line says now. */
       node.pineItem = item;
+      // Keep evidence attributes in step with a keyed node's current item.
+      ['line', 'seg', 'block', 'ord'].forEach(function (field) {
+        if (item[field] !== undefined && item[field] !== null) node.dataset[field] = String(item[field]);
+        else delete node.dataset[field];
+      });
       order.push(node);
     }
     scriptNodes.forEach(function (held, key) {
@@ -2817,6 +2697,8 @@
     });
     stitchScript(box, order);
     scriptRestore(box, anchor);
+    diagnosticDocument(box);
+    ensureCaution();
     /* FOLLOWING BEATS STICKING TO THE END.
      * The live line sits wherever the conversation has got to, and the end
      * of the hour is usually well past it; scrolling to the bottom after
@@ -2852,7 +2734,9 @@
     if (!box || box.scrollTop <= 4) return {pinned: true};
     var lip = box.getBoundingClientRect();
     for (var i = 0; i < box.children.length; i += 1) {
+      if (!box.children[i].classList.contains('sp-el')) continue;
       var seat = box.children[i].getBoundingClientRect();
+      if (seat.height <= 0) continue;
       if (seat.bottom <= lip.top + 1) continue;      /* scrolled off the top */
       return {node: box.children[i], was: seat.top};
     }
@@ -2876,6 +2760,7 @@
      else is one insertBefore. */
   function stitchScript(box, order) {
     var cursor = box.firstChild;
+    if (cursor && cursor.id === 'spCautionWrap') cursor = cursor.nextSibling;
     for (var i = 0; i < order.length; i += 1) {
       if (order[i] === cursor) { cursor = cursor.nextSibling; continue; }
       box.insertBefore(order[i], cursor);
@@ -2886,6 +2771,7 @@
     while (cursor) {
       var next = cursor.nextSibling;
       if (cursor.id === 'spPlan') { plan = cursor; }
+      else if (cursor.id === 'spCautionWrap') { /* retained control */ }
       else { cursor.remove(); }
       cursor = next;
     }
@@ -4301,6 +4187,7 @@
     if (!motionTimer) motionTimer = setInterval(function () { try { sampleMotion(); } catch (e) { /* the ring is a courtesy */ } }, MOTION_MS);   /* 2026-09-14 */
     if (mounted) return Promise.resolve(true);
     build(node);
+    retryReports();
     wirePlayer();
     mounted = true;
     foldLoad();                                              /* #1294 */

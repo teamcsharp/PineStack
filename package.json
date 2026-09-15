@@ -31,6 +31,13 @@
         "from": "app.py",
         "to": "agent/app.py"
       },
+      { "from": "script_diagnostics.py", "to": "agent/script_diagnostics.py" },
+      { "from": "script_report_store.py", "to": "agent/script_report_store.py" },
+      { "from": "video_editor.py", "to": "agent/video_editor.py" },
+      { "from": "desktop/renderer/video-editor.html", "to": "agent/desktop/renderer/video-editor.html" },
+      { "from": "desktop/renderer/video-editor.js", "to": "agent/desktop/renderer/video-editor.js" },
+      { "from": "desktop/renderer/video-editor.css", "to": "agent/desktop/renderer/video-editor.css" },
+      { "from": "desktop/renderer/video-edit-model.js", "to": "agent/desktop/renderer/video-edit-model.js" },
       {
         "from": "station_flow.py",
         "to": "agent/station_flow.py"

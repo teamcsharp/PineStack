@@ -1,20 +1,1254 @@
 # PineTab — the Lenovo Tab M9 as a Pine Box terminal
 
-A record of turning a stock Lenovo Tab M9 into a dedicated Pine Box kiosk: what
-the device is, what was found on it, what was built to manage it, and what has
-deliberately not been done yet. Written as the work happened, on 2026-09-10.
+This document has three parts.
 
-The aim is a tablet that boots straight into Pine Box and is a limb of the
-station — listen, work the deck, open every console, and play the air back
-through a sampler — with no Google account, no Lenovo shell, and no home screen.
+**Part 0 (§0.1–0.12)** is the field guide: everything a project that has never
+seen this tablet needs in order to reach it, read it, put its own software on
+it, talk to the station from it, and stay out of the kiosk's way. It was
+written on 2026-09-14 from the source of the kiosk, the station and the desk,
+and from readings taken off the live tablet that evening. Where the two
+disagree, the live reading is given and the source is named. Start here.
 
-
-**Part I (§1-14)** is how a stock Lenovo Tab M9 was made ours. **Part II
-(§15-22)** is the software that runs on it, how to build for it, and every
-way it has been seen to fail. If you are picking this up cold and something
-is broken, read §19 first.
+**Part I (§1–14)** is how a stock Lenovo Tab M9 was made ours — the unlock,
+the GSI, the jack, the tailnet. **Part II (§15–29)** is the software that runs
+on it as it was built, and every way it has been seen to fail. Both are the
+record; Part 0 is the map of it. If something is broken, §19 is still the
+place to read first.
 
 ---
+
+# Part 0 — the field guide
+
+## 0.1 The one-page version
+
+| | |
+|---|---|
+| The tablet | Lenovo Tab M9 (TB310FU), MediaTek MT6768, arm64-v8a, 4 GB RAM, 64 GB. 9-inch, **800×1340 physical, used landscape as 1340×800**, density 200 |
+| What it runs | **TrebleDroid vanilla GSI** `21.0-20260614-UNOFFICIAL-arm64_bvN` — LineageOS 21, Android 14, SDK 34, **userdebug**, bootloader unlocked (`verifiedbootstate=orange`), **no Google Play Services**, no speech recognizer, WebView 149.0.7827.114 |
+| Address | `10.89.1.154` on the house Wi-Fi (`wlan0`). Tailscale node `trebledroid-vanilla` = `100.95.199.28` (installed, signed in, **offline** at the time of writing) |
+| adb | `adb connect 10.89.1.154:5555` — wireless adb is **persistent across reboots** (`persist.adb.tcp.port=5555`). No pairing, no cable. The shell is `uid 2000 (shell)`; `adb root` is available on a userdebug build but restarts adbd |
+| The station | `http://10.89.1.246:8096` (host `lilspark`, a DGX Spark; tailnet `100.74.95.59` / `lilspark.tail1fec29.ts.net`). Public listener door `:8097`. SSH `ehm_eckx@10.89.1.246` |
+| What is on it (third-party) | `com.pinebox.kiosk` (ours: the terminal, three launcher entries), `fm.pinebox.jackfix` (ours: a platform-signed overlay on `android`, inert), `com.tailscale.ipn` |
+| What the kiosk is | One Android WebView showing the station's own control panel, with the station's view code **injected from the APK's assets**, a JS bridge (`window.pineDesktop`) into native Kotlin, a native Oboe sampler, and a handful of background services |
+| Ports the kiosk opens on the tablet | **TCP `127.0.0.1:8096`** (a loopback byte relay to the station, WebView-only) and the abstract unix socket **`pine_camera`**. Nothing on `0.0.0.0`; adbd on `*:5555` is the system's |
+| Is it locked down? | **Not today.** No device owner is set, lock task is `NONE`, the HOME resolver is `com.android.launcher3` (the stock launcher). The kiosk *declares* HOME and *would* pin itself if it were device owner; it is not. A person can leave it with the Home button and open Settings — and was doing exactly that while this was written |
+| Deploying to the kiosk | `C:\_tools\pinebox-android\PineBoxKiosk\deploy.sh` — **only** that. It platform-signs. A plain `gradle assembleDebug` + `adb install` silently kills the headphone jack (§0.8) |
+| Deploying your own app | `adb -s 10.89.1.154:5555 install -r your.apk` — any signature. Nothing the kiosk does stops you (§0.6) |
+| Talking to the station | Plain HTTP, poll-only, no WebSockets, no CORS. Reads need no key on the LAN today; writes need `Authorization: Bearer <key>`, and the key is printed in the page served at `/` (§0.9) |
+
+## 0.2 Reaching the tablet
+
+### 0.2.1 adb
+
+There is **no `adb` on `PATH`** in the tool shells on the Windows box. Two
+copies exist and both are 37.0.1:
+
+```
+C:\_tools\platform-tools\adb.exe               <- the one the desktop app resolves to
+C:\_tools\android-sdk\platform-tools\adb.exe   <- the one deploy.sh and the toolchain manifest use
+```
+
+Either works. Every command below assumes:
+
+```sh
+ADB=/c/_tools/platform-tools/adb.exe          # Git Bash
+D="-s 10.89.1.154:5555"                       # ALWAYS pass -s
+$ADB connect 10.89.1.154:5555                 # "already connected" is fine
+$ADB devices -l
+#   10.89.1.154:5555  device product:lineage_arm64_bvN model:TrebleDroid_vanilla device:tdgsi_arm64_ab
+```
+
+`-s` is not optional. Once the tablet is on both USB and Wi-Fi adb has two
+transports for one device and refuses every untargeted command with
+*"more than one device/emulator"*.
+
+Wireless adb survives a reboot because `persist.adb.tcp.port=5555` was set
+(§8). If it ever does not answer: a USB cable and `adb tcpip 5555`, or
+Android's own Wireless debugging pairing (`adb mdns services` lists the
+pairing port; the six-digit code comes off the tablet's screen). `adb root`
+restarts adbd and, on the TLS road, changes the port — reconnect afterwards.
+
+The station can also find it without adb: `GET /api/tablet/look` on the
+station answers whether the tablet has fetched the show lately, whether its
+address is in the ARP table, and whether port 5555 answers, and
+`POST /api/tablet/doctor/sweep` walks the /24 for a tablet whose lease moved
+(§0.9.6). The desktop's tablet doctor (§0.10) walks those rungs and then
+does the one thing the station cannot — `adb connect`.
+
+### 0.2.2 The pid trap, and the devtools socket
+
+```sh
+$ADB $D shell pidof com.pinebox.kiosk          # INTERMITTENTLY EMPTY while the app is running
+```
+
+`pidof` and `ps -A | grep pinebox` both return nothing at random on this
+device (it happened again on 2026-09-14 while writing this, twice in a row,
+against a kiosk that was on screen). Never trust one attempt; loop, or take
+the pid from somewhere else:
+
+```sh
+# the WebView's DevTools socket names the pid, and it is reliable:
+SOCK=$($ADB $D shell "cat /proc/net/unix" | tr -d '\r' | grep -o "webview_devtools_remote_[0-9]*" | head -1)
+P=${SOCK#webview_devtools_remote_}
+# or the app's own boot line:
+$ADB $D logcat -d | grep "panel up in" | tail -1     # field 3 is the pid
+```
+
+Note the `tr -d '\r'` — adb's shell output arrives with CRLF on Windows and
+a `\r` inside a grep pattern silently matches nothing.
+
+### 0.2.3 Seeing and touching the screen
+
+```sh
+$ADB $D exec-out screencap -p > now.png            # 1340x800, ~100 KB, does not disturb anything
+$ADB $D shell "dumpsys window | grep mCurrentFocus" # who actually has the screen
+$ADB $D shell "cmd statusbar collapse"             # a pulled-down shade looks exactly like a hang
+$ADB $D shell input tap 670 400                    # display coordinates, landscape, integers only
+$ADB $D shell input swipe 100 400 1200 400 250     # x1 y1 x2 y2 ms
+$ADB $D shell input swipe 670 400 670 400 600      # a same-point swipe held 600 ms is a long press
+$ADB $D shell input keyevent KEYCODE_WAKEUP        # the WebView cannot wake the tablet; the framework can
+$ADB $D shell input keyevent KEYCODE_SLEEP
+$ADB $D shell input text 'hello%sworld'            # %s is input's space escape
+```
+
+Coordinates are the display's, in the orientation you are looking at
+(1340×800). `input` accepts **integers only** — a decimal fails with a usage
+message that goes nowhere, which looks like a dead spot on the screen. The
+raw touch panel reports its axes in **portrait** (0–799 by 0–1339);
+`sendevent` would need the rotation undone by hand and is also the slowest
+road (measured: a held `adb shell` writing `input` lines is 42 ms per tap,
+a fresh `adb shell input tap` is 127 ms, raw `sendevent` is 161 ms). Keep a
+shell open and write lines to it — that is what `desktop/tablet-input.cjs`
+does.
+
+Video of the screen: `screenrecord` works, and the kiosk itself already
+holds a rolling 20-minute H.264 ring of the whole screen (§0.5.9), so for
+"what just happened" ask the kiosk rather than starting a second encoder.
+
+```sh
+# a live MJPEG mirror, exactly the pipe the desktop uses (needs ffmpeg on the PC):
+$ADB $D exec-out "screenrecord --output-format=h264 --size 670x400 --bit-rate 2948000 -" \
+  | ffmpeg -hide_banner -loglevel error -f h264 -r 30 -i pipe:0 -r 15 -q:v 6 -f mjpeg pipe:1 > live.mjpg
+```
+
+The `-r 30` *before* `-i` is load-bearing: the usual low-latency flags
+(`-probesize 32 -analyzeduration 0 -fflags nobuffer`) produce **zero frames**
+against screenrecord's raw H.264. Sizes must be even; the encoder refuses
+an odd width and blames nothing in particular. Do not pass `--time-limit` —
+the cap has moved between Android versions; rebuild the pipe when it ends.
+
+### 0.2.4 Inside the WebView — Chrome DevTools over adb
+
+The kiosk is a debug build and `PineApp` turns on
+`WebView.setWebContentsDebuggingEnabled(true)`, so the Chrome DevTools
+Protocol is reachable over an adb forward. This is the single most useful
+tool for the tablet, far better than screenshots for "why is it blank".
+
+```sh
+SOCK=$($ADB $D shell "cat /proc/net/unix" | tr -d '\r' | grep -o "webview_devtools_remote_[0-9]*" | head -1)
+$ADB $D forward tcp:9222 localabstract:$SOCK
+curl -s http://127.0.0.1:9222/json           # -> [{type:"page", url:"http://127.0.0.1:8096/", webSocketDebuggerUrl:...}]
+```
+
+Node 22+ has a built-in `WebSocket`, so no package is needed. This script
+was run against the live tablet on 2026-09-14 and is the whole client:
+
+```js
+// cdp-ask.mjs — evaluate one JS expression in the kiosk's WebView.
+//   node cdp-ask.mjs 9222 'document.title'
+const [port, expr] = process.argv.slice(2);
+const pages = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+const page = pages.find(p => p.type === 'page' && /127\.0\.0\.1:8096|10\.89\.1\.246/.test(p.url)) || pages[0];
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+await new Promise(r => ws.onopen = r);
+ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate',
+  params: { expression: expr, awaitPromise: true, returnByValue: true, userGesture: true } }));
+const msg = await new Promise(r => ws.onmessage = e => r(JSON.parse(e.data)));
+console.log(JSON.stringify(msg.result?.result?.value ?? msg.result?.exceptionDetails ?? msg, null, 1));
+ws.close();
+```
+
+`userGesture: true` matters: without it `play()` on an audio or video
+element is refused. `awaitPromise: true` lets you evaluate `await
+pineDesktop.get('/api/dj')` directly.
+
+What that call returned on 2026-09-14, and what each line tells you:
+
+```
+href          http://127.0.0.1:8096/          <- the panel is loaded through the loopback door, NOT from 10.89.1.246 (§0.5.5)
+isSecureContext  true                         <- which is the whole reason for the door
+userAgent     Mozilla/5.0 (Linux; X11; TrebleDroid vanilla Build/UQ1A.240205.004) ... Chrome/149.0.7827.114 Safari/537.36 PineBoxKiosk/1.0.0
+              ^ NOT "Android" - the kiosk rewrites its UA. Key a tablet check on "PineBoxKiosk" or "!Electron && Linux", never on /Android/
+innerWidth x innerHeight   1154 x 690   devicePixelRatio 1.25   (TARGET_CSS_WIDTH 1150 + minimumFontSize 12, §9)
+pineSampler.backend        "oboe"       <- the NATIVE sampler, not Web Audio (§0.5.8)
+localStorage.pineLastView  "script"     <- the rail reopens the last view at boot
+rail tabs (right edge, top to bottom)   TECH SAMPLER SCRIPT LISTEN MUSIC PRESENT SLIDES 3JS SC CORNERS CAM FIND-CAM ENDLESS
+```
+
+Three rules for CDP on this tablet, each learned the hard way (§15, §19):
+
+- **Injected JS never enters the DOM.** The kiosk hands each asset to
+  `evaluateJavascript`, so grepping `document.documentElement.innerHTML`
+  for a function you just shipped finds nothing and proves nothing. CSS
+  *does* land (a `<style>` tag), and so do the globals — test `typeof
+  window.PineYourThing`, or call it.
+- **A container restart reloads the page and changes the CDP target id.**
+  A watcher holding the old `ws://…/page/<id>` goes silently blank. Re-read
+  `/json` after any restart.
+- **The rail tab toggles.** Clicking a tab whose view is open closes it. A
+  view is built lazily on first press, so `getElementById` for its content
+  is `null` until then; open it by clicking the rail child whose
+  `textContent` matches, not by calling `mount()` without a host.
+
+The desktop app keeps its own DevTools door on **port 9333** (`terminal-glass.cjs`),
+deliberately not 9222, "the port a person debugging by hand will already have
+taken". Forward whichever you like; they do not conflict.
+
+### 0.2.5 Logs
+
+```sh
+$ADB $D logcat -d -s PineKioskActivity PineBridge PinePanel PineKiosk PineAudio PineBoot \
+    PineLoopDoor PineJack PineNet PineReplay PineRecorder PineCameraSvc PineWallpaper \
+    PineMic PineAirTap PineMediaFocus PineRevive PineSpark DgxTerminal
+$ADB $D logcat -d | grep -E "relaunch: com.pinebox.kiosk|ANR in"     # the two lines that explain a lost view
+```
+
+`/data/anr` keeps **old** traces; check the date before blaming one.
+
+## 0.3 What is on the tablet, and what is running
+
+Read off the live device on 2026-09-14 21:40.
+
+### 0.3.1 Packages, components, launcher entries
+
+```
+pm list packages -3
+  com.tailscale.ipn        1.102.4     the tailnet client (VPN consent + sign-in were done by hand; always_on_vpn_app=com.tailscale.ipn, lockdown OFF)
+  fm.pinebox.jackfix       1.0         a platform-signed RRO overlay targeting `android` ([x] enabled) - one of the five dead roads to the jack (§8); harmless, inert, could be removed
+  com.pinebox.kiosk        1.0.0       the terminal. versionCode 1, minSdk 30, targetSdk 34, DEBUGGABLE, LARGE_HEAP, signed b4addb29 (the platform key)
+```
+
+The kiosk's components (`dumpsys package com.pinebox.kiosk`):
+
+| component | exported | what it is |
+|---|---|---|
+| `.MainActivity` | yes — MAIN/LAUNCHER **and** MAIN/HOME/DEFAULT | the terminal. `singleTask`, `showWhenLocked`, `turnScreenOn`, `fullSensor` |
+| `.SparkActivity` | yes — MAIN/LAUNCHER, its own `taskAffinity` | "SC Stack": loads `/spark?pictures=1` in a plain WebView with the same bridge. Not a kiosk, Back leaves it |
+| `.terminal.DgxTerminalActivity` | yes — MAIN/LAUNCHER, its own `taskAffinity` | "DGX Terminal": an SSH shell to `ehm_eckx@100.74.95.59` over Tailscale SSH. No keys stored (§12) |
+| `.camera.PineCameraActivity` | **no** | full-screen camera preview on the tablet's own glass |
+| `.camera.PineCameraService` | **no** | foreground service (`camera`); listens on abstract socket `pine_camera`; opens the lens **only while a client is connected** |
+| `.replay.PineAppRecorder` | **no** | foreground service (`specialUse`): the rolling screen recording (§0.5.9) |
+| `.kiosk.BootReceiver` | yes | `BOOT_COMPLETED`, `QUICKBOOT_POWERON`, `com.htc.intent.action.QUICKBOOT_POWERON` → applies owner policies, starts the recorder and camera service, launches MainActivity |
+| `.kiosk.PineDeviceAdminReceiver` | yes, `BIND_DEVICE_ADMIN` | the device-owner hook. **Not currently the owner** |
+| `androidx.core.content.FileProvider` `com.pinebox.kiosk.clipboard` | no | `cache/clipboard/` — how `copyImage` puts a PNG on the clipboard |
+
+Launcher activities on the tablet (`query-activities … LAUNCHER`): Settings,
+Jelly (`org.lineageos.jelly`, the browser), the three kiosk entries above,
+Tailscale. There is also `org.lineageos.glimpse` (gallery), `documentsui`,
+and the AOSP camera extensions — no Google camera, no Play Store.
+
+### 0.3.2 The kiosk's grants
+
+`deploy.sh` prints these after every install; they are what a platform
+signature buys:
+
+```
+android.permission.MODIFY_AUDIO_ROUTING   granted=true   signature|privileged - the jack (§8)
+android.permission.DUMP                   granted=true   signature|privileged - reads `dumpsys input` for the cable
+android.permission.CAPTURE_AUDIO_OUTPUT   granted=true   signature - AirTap (REMOTE_SUBMIX), OFF unless asked
+android.permission.CAPTURE_VIDEO_OUTPUT   granted=true   signature - a VirtualDisplay mirror of the WHOLE screen, no projection dialog
+android.permission.CAPTURE_SECURE_VIDEO_OUTPUT granted=true  (this display carries FLAG_SECURE)
+android.permission.RECORD_AUDIO           granted=true   runtime - the talk dot; re-granted by deploy.sh after an uninstall
+android.permission.CAMERA                 granted=true   runtime - same
+android.permission.POST_NOTIFICATIONS     granted=false  (never asked; the two foreground services run at IMPORTANCE_MIN)
+plus: INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE, RECEIVE_BOOT_COMPLETED, SET_WALLPAPER, WAKE_LOCK,
+      MODIFY_AUDIO_SETTINGS, FOREGROUND_SERVICE, FOREGROUND_SERVICE_CAMERA, FOREGROUND_SERVICE_SPECIAL_USE
+```
+
+If `MODIFY_AUDIO_ROUTING` or `DUMP` ever read `granted=false`, somebody
+installed a debug-signed build over the top. The app looks completely
+normal; only the jack is dead. `./deploy.sh` cures it.
+
+### 0.3.3 Kiosk state — what "kiosk" currently means
+
+Measured, not read from the manifest:
+
+```
+dumpsys device_policy      Enabled Device Admins (User 0): <empty>    -> NO device owner
+dumpsys activity           mLockTaskModeState=NONE, mLockTaskPackages=<empty>
+cmd package resolve-activity HOME   com.android.launcher3/.uioverrides.QuickstepLauncher   -> the stock launcher owns Home
+pm list users              UserInfo{0:Owner}
+settings screen_off_timeout 60000 ; stay_on_while_plugged_in 0
+```
+
+So today the kiosk is an ordinary foreground app that:
+
+- holds `FLAG_KEEP_SCREEN_ON` / `FLAG_TURN_SCREEN_ON` / `FLAG_SHOW_WHEN_LOCKED`
+  on its window (**not** a wake lock — `dumpsys power` shows the
+  WindowManager's `SCREEN_BRIGHT_WAKE_LOCK` charged to uid 10212, plus
+  `AudioMix` partial locks while sound plays; the kiosk itself acquires none);
+- goes immersive and re-asserts it on every focus change;
+- calls `startLockTask()` on every `onResume` — which without device owner
+  is only *screen pinning*, and the measured state is `NONE`, so it is not
+  even pinned;
+- declares HOME, so the **first press of Home shows the chooser**; the
+  operator has evidently chosen launcher3, or dismissed it. The Home button
+  leaves the kiosk, Recents works, Settings opens;
+- **would**, if made device owner (`dpm set-device-owner
+  com.pinebox.kiosk/.kiosk.PineDeviceAdminReceiver`), pin HOME with
+  `addPersistentPreferredActivity`, restrict lock task to its own package,
+  **disable the status bar**, set `STAY_ON_WHILE_PLUGGED_IN=7`, and refuse
+  every outbound link. `dpm set-device-owner` fails while any account exists
+  on the device — and Tailscale's sign-in may count. Nobody has done it.
+
+**Consequence for a second project:** nothing stops your app being launched,
+foregrounded, or set as the default Home. Whether that stays true depends on
+whether someone later provisions the device owner; check `dumpsys
+device_policy` before assuming either way. If the kiosk *is* made owner,
+your package must be added to `KioskController.applyOwnerPolicies`'s
+`setLockTaskPackages` list or it will be blocked while the kiosk is
+lock-tasked.
+
+### 0.3.4 What runs in the background, always
+
+| thing | started by | what it costs / does |
+|---|---|---|
+| `StationFeed` (Kotlin, OkHttp) | `PineApp` | **the one poller** of `/api/dj` every 4 s, playhead interpolated at 250 ms. Every native consumer reads its snapshot |
+| `WallpaperWatch` | `PineApp` | every 5 min chooses the piece the station is selling (`selling_now`, else newest still in `/api/generations`) and hangs it on home + lock — but only when no view is on the glass (#1296, §19.2), because hanging it relaunches the Activity |
+| `PineAppRecorder` + `ScreenReplay` | boot, and every `onResume` | a `VirtualDisplay` mirror of the **whole screen** into an H.264 ring: 0.5 scale, 12 fps, 600 kbps, **1200 s held in RAM**. Sleeps on `SCREEN_OFF`. No consent dialog (signature permission). **Your app's UI is in this ring while it is on screen** |
+| `PineCameraService` | boot, and every `onResume` | the `pine_camera` socket. The lens is closed until a reader connects |
+| `JackWatch` | `onResume` | every 2 s runs `dumpsys input`, reads `SwitchValues`, and *announces* the cable to the framework via reflection (`AudioManager.setWiredDeviceConnectionState`) because this GSI never notices it. The announcement lives in the framework and outlives the app (§8) |
+| `LockWatch` | `onResume` | draws the kiosk's own lock screen (`lock.js`) over the keyguard on `SCREEN_OFF/ON/USER_PRESENT`. Not a keyguard replacement |
+| `MediaFocus` | `onResume` | holds **`AUDIOFOCUS_GAIN`** (USAGE_MEDIA) while in front. Your app taking focus in the foreground works normally; the kiosk re-takes it on its next resume |
+| `keepTimersAlive` | `onResume` | `webView.resumeTimers()` every 20 s from the main-thread Handler, because Android suspends the WebView's JS timers while rAF keeps firing (§19.3) |
+| `Revive` + `deaf-watch.js` | the view | every 30 s compares "the bridge answers" against "a plain fetch does not"; two strikes → the app ends its own process and an `AlarmManager` relaunch fires ~2.5 s later. Five-minute rest, gives up after three in thirty minutes (§19.1) |
+| `LoopDoor` | `MainActivity.load()` | the `127.0.0.1:8096` relay (§0.5.5) |
+| `Reach` | `load()` | probes `/healthz` on the LAN, then the tailnet address, then the MagicDNS name; keeps the first that answers |
+
+Memory at the time of the reading: 3,863 MB total, **353 MB free**. The
+kiosk process, its WebView sandbox and `webview_zygote` are the three
+processes that matter; load average has been measured at 25–27. Anything
+you add runs beside that.
+
+## 0.4 The network, from the tablet's side
+
+| road | address | when |
+|---|---|---|
+| the LAN | `http://10.89.1.246:8096` | at home; tried first because Tailscale would route two machines on one switch through a userspace TUN |
+| the tailnet | `http://100.74.95.59:8096` | from anywhere, once Tailscale is up on the tablet |
+| MagicDNS | `http://lilspark.tail1fec29.ts.net:8096` | same, needs the tablet to accept Tailscale DNS |
+| the public door | `http://<any of the above>:8097` | a second uvicorn in the same station process, allowlisted routes only, `Authorization` stripped, `?t=<share token>` is the only credential (§0.9.2) |
+| SSH to the box | `100.74.95.59:22` (`SSH-2.0-Tailscale`) | the DGX Terminal app. The LAN's `10.89.1.246:22` is real OpenSSH and would want a password, so it is deliberately **not** offered |
+| the Pine Cam | `192.168.1.254` (its own access point `H88_…`) | held by the DGX's spare USB radio, never by the tablet. The tablet only ever sees `/api/pinelink/frame.jpg` |
+
+The kiosk's `network_security_config.xml` permits cleartext for exactly
+`10.89.1.246`, `100.74.95.59`, `lilspark.tail1fec29.ts.net` (with
+subdomains), `127.0.0.1` and `localhost`. **That policy is the kiosk's, not
+the device's.** Your app ships its own; a plain `http://` to the station from
+a targetSdk 34 app needs `android:usesCleartextTraffic="true"` or its own
+domain-config, or the request is refused before a packet leaves and nothing
+in the failure says so.
+
+Everything the panel needs resolves **relative** to whatever origin it was
+loaded from — the served page contains no absolute `http://10.89.1.246:`
+references and media arrives as `/sfx/<id>?t=…`, `/music/<id>?t=…` — so the
+same page works over any road with no station change.
+
+## 0.5 Anatomy of the kiosk
+
+Source: `C:\_tools\pinebox-android\PineBoxKiosk` on the Windows box — a git
+repository on branch `main` (an older note in this project's memory said it
+was not; it is). It is on local disk on purpose: gradle refuses a UNC
+working directory outright. Two source roots:
+`app/src/main/java/com/pinebox/kiosk/` (the app) and
+`app/src/main/kotlin/fm/pinebox/kiosk/audio/` (the sampler's JNI class —
+its package must match what `cpp/android/jni_bridge.cpp` exports,
+`Java_fm_pinebox_kiosk_audio_PineSampler_*`, and JNI resolves by class
+package, which need not match the application id).
+
+### 0.5.1 One Activity, one WebView, and four document-start injections
+
+`MainActivity.load()` runs, in order: show "Reaching the station…" → read
+the config → `Reach` probes the roads → `Readiness.take()` records what the
+terminal confirmed about itself → `LoopDoor.open(base)` → `webView.loadUrl("$load/")`
+where `load` is the door's origin (`http://127.0.0.1:8096`) or the station's
+if the door would not open.
+
+Before the page runs, `WebViewCompat.addDocumentStartJavaScript` registers,
+in this order (registration order is evaluation order):
+
+1. `assets/pine-bridge.js` — builds `window.pineDesktop` over `window.__pineNative`
+2. `assets/pine-touch.js` — `touch-action` fixes so three.js canvases get their drags and taps lose the 300 ms delay
+3. `assets/tablet.css` (as a style injector, id `pine-tablet-css`) — the 9-inch layout; its `@media (max-width: 1250px)` **must stay above `TARGET_CSS_WIDTH` (1150)** or every rule silently switches off
+4. `assets/pine-media-origin.js` — measured 38 in-flight requests producing a 46 s media stall; records the lesson and does not move media to `:8097` (cross-origin media produced no audio track in this WebView)
+5. `PineSamplerBridge.SHIM_JS` — `window.pineSampler` over the native engine (only if the `.so` loaded)
+6. `BootAssets` — the logo, the splash, `pine-boot/boot-sequence.js`, and `vendor/three.min.js` handed over as a string
+
+Then, at `onPageFinished`, `ViewAssets` and `SamplerAssets` are evaluated:
+every file in `SCRIPTS` concatenated and handed to `evaluateJavascript`,
+every file in `STYLES` concatenated into one `<style>`. A file that fails to
+parse throws the whole bundle — the guard logs `[pine] views failed` and
+**nothing is injected**.
+
+`ViewAssets.SCRIPTS`, in evaluation order (models before the views that read them, `rail.js` near the end because it looks for the globals the others define):
+
+```
+pine-logo.js  boot-splash.js  pine-dismiss.js  view-chrome.js  console-line.js  console-trace.js
+audio-law.js  talk-dot.js  vote-arrows.js  listen-model.js  pine-meters.js  script-lineage.js
+script-stage.js  script.js  script-page.js  listen.js  music.js  wall-transition.js  video-wall.js
+presentation-source.js  presentation.js  busy.js  three-full.js  line-deep.js  line-actions.js
+sfx-tv.js  clip-doctor.js  pine-cam.js  lock.js  spark-overlays.js  slideshow-source.js
+slideshow.js  deaf-watch.js  rail.js  hot-corners.js
+```
+
+`ViewAssets.STYLES`: `view-chrome boot-splash console-trace script script-page listen-music presentation lock vote-arrows line-actions sfx-tv clip-doctor pine-cam three-full busy slideshow spark-overlays hot-corners` (all `.css`).
+
+`SamplerAssets.SCRIPTS` (a separate bundle with its **own copies** of shared files): `lcd-dialogue sampler-engine sampler-feed sampler-air sampler sampler-trim sampler-face sampler-grab sampler-kits sfx-tv deaf-watch` (+ `boot.js`, `sampler.css`, `sfx-tv.css`). Also in `pine-sampler/` but not in that list: `pinetab-route.js` and `terminal-audio.js`, which are `desktop/pinetab-route.cjs` and `desktop/terminal-audio.cjs` self-publishing as `window.PineBroadcastTo` / the routing-table client, and `terminal-audio-client.js`, `view-chrome.js/.css`.
+
+**Why two copies of every view exist.** The page is `http://127.0.0.1:8096`
+and the assets are `file:///android_asset/`; the WebView refuses that
+crossing, so the files cannot be referenced, only read and evaluated. The
+same files also live in `spark-agent/desktop/renderer/` for the Electron
+desk and are served from there at `/spark/asset/<name>` for `SparkActivity`.
+A renderer edit on the share changes the desk within seconds (its hot
+watcher) and **changes the tablet not at all** until copied into
+`app/src/main/assets/` and shipped with `deploy.sh` (§0.8).
+
+### 0.5.2 The rail (what the tabs are)
+
+`rail.js` builds a fixed strip on the **right** edge (`#pineViewRail`,
+z-index 2147483001; the left edge belongs to the app's native drawer). Each
+view is a `position:fixed; inset:0` host, built lazily on first press, one
+open at a time; TECH is the panel itself and closes whatever is open. Live
+on 2026-09-14, top to bottom:
+
+| tab | what opens | source |
+|---|---|---|
+| TECH | the station's panel, nothing over it | — |
+| SAMPLER | the sampler page (16 pads × 5 banks, native oboe engine) | `pine-sampler/` |
+| SCRIPT | the screenplay view: the running order, the player card, the mixer dot, the loop and search controls (§26–29) | `script-page.js` |
+| LISTEN | lean-back radio | `listen.js` |
+| MUSIC | the same feed from the record library's side | `music.js` |
+| PRESENT | six panes off one poll | `presentation.js` |
+| SLIDES | the ComfyUI output folder as a slideshow with the SC overlays (`docs/slideshow-tablet.md`) | `slideshow.js` |
+| 3JS | every three.js experience full-screen | `three-full.js` |
+| SC | the SC stack overlays as a floating pop-up | `spark-overlays.js` |
+| CORNERS | hot-corner preferences (§0.5.11) | `hot-corners.js` |
+| CAM / FIND CAM | the Pine Cam picture-in-picture, and its troubleshooter | `pine-cam.js` |
+| ENDLESS | the SFX guy's endless video mode (§27) | `script-page.js` / `sfx-tv.js` |
+
+`console-line.js` owns the bottom ~26 px of every screen; measure
+`#pineConsoleLine` rather than drawing at `bottom:0`. The lock screen
+(`lock.js`, `#pineLock`, z-index 2147483050) is drawn over the keyguard by the
+kiosk itself; tap the X top-right (about 1274, 43) to reach the panel.
+
+### 0.5.3 The bridge — `window.pineDesktop`
+
+`bridge/PineDesktopBridge.kt` is `window.__pineNative` (five raw
+`@JavascriptInterface` methods: `invoke(id, method, argsJson)` returning a
+sync ack and settling later through `window.__pineBridgeSettle`, plus the
+synchronous `micLevel()`, `copyText()`, `copyImage()`, `clipboardReady()`).
+`assets/pine-bridge.js` hangs one function per method off
+`window.pineDesktop`, mirroring `desktop/preload.js` name for name so the
+same view code runs on both surfaces. Every method is a Promise except the
+four synchronous ones and `micNative()` (returns `true`). Read off the live
+page:
+
+```
+config      readConfig writeConfig
+station     discoverKey get post put del          <- HTTP to the station through the APP's OkHttp client, not the WebView
+shell       openExternal buildInfo
+backend     startBackend stopBackend setupBackend reconstituteDesktop   -> resolve {ok:false, unsupported:true}
+            backendLog (returns "") onBackendLog onSupportProgress
+lcd*        15 names                                -> unsupported ("the LCD is wired to the box, not to this terminal")
+terminal*   12 names                                -> unsupported ("this device is the terminal; it cannot provision itself")
+readiness   readyReport
+mic         micTake micChunk micStart micStop micCancel micState micLevel micNative
+air tap     airStart airStop airState airSlice     <- REMOTE_SUBMIX capture of the system mix, 120 s ring; OFF unless asked
+camera      cameraOpen cameraClose cameraTune cameraRange cameraShow cameraHide
+replay      replayState replaySave replayChunk screenShot replayExport
+corners     hotCorners hotCornersSet
+files       keepClip saveText saveBytes
+hardware    jack wallpaper
+recovery    revive
+usb / MPC   usbState usbPick usbSend usbList usbRead
+clipboard   copyText copyImage clipboardReady     (synchronous booleans)
+```
+
+Refusals *resolve* with `{ok:false, unsupported:true}` — a rejection would
+show as a crashed handler; a resolved refusal shows as "not available here".
+Envelopes: ack `{"accepted":true,"id":"r1-…"}`; settle `{"id":…,"ok":true,"value":…}`
+or `{"ok":false,"error":"401 from the station"}`.
+
+**The bridge does not use the WebView's network.** `get/post/put/del` go
+through OkHttp (connect 3 s, read/write 20 s, call 30 s; a slow client with
+150 s read for the long roads; 600 s for uploads). This is why the feed keeps
+painting when Chromium's own network stack is dead (§19.1), and why anything
+that must not fail goes on the bridge. It is also why *"the tablet's bridge
+gives up at 20 s"* is a number the station's routes are designed around.
+
+**Adding a bridge method is three edits** and missing the third is the usual
+bug: the name in `ASYNC_METHODS` in `PineDesktopBridge.kt` (dispatch), a
+`"name" -> { … }` branch in the `when` (behaviour), and `name:
+promised("name")` in `assets/pine-bridge.js` (exposure). Skip the shim line
+and `pineDesktop.name` is `undefined` with no error anywhere.
+
+The panel's own inline script calls only two bridge methods
+(`clipboardReady`, `copyImage`) and reads one property
+(`window.__pineDesktopVolume`). Everything else on the bridge is for the
+injected views.
+
+### 0.5.4 `PineNet` — two URL prefixes served by OkHttp, everything else by Chromium
+
+`shouldInterceptRequest` handles **GET** on `/vendor/*` (three.js from the
+APK, `X-Pine-Source: apk`) and `/api/generations/image/*` (fetched by OkHttp,
+re-encoded to WebP ≤768 px, 256 MB disk cache, 4 lanes). Everything else —
+media Range requests, POSTs, the API polls — returns `null` and goes through
+the WebView. Consequence: **images keep loading while the WebView's network
+is dead**, which is the diagnostic for §19.1.
+
+### 0.5.5 `LoopDoor` — why `location.origin` is `http://127.0.0.1:8096`
+
+A raw TCP byte relay bound to **`127.0.0.1:8096` on the tablet** (ephemeral
+loopback port if 8096 is taken), aimed at whichever road `Reach` chose. It
+parses nothing. It exists because `BaseAudioContext.audioWorklet` is gated on
+`isSecureContext`, the panel is plain http, no certificate is obtainable for
+a LAN address that is also reached over a tailnet, and the WebView's
+`--unsafely-treat-insecure-origin-as-secure` flag never reached the renderer
+(the command-line file *is* honoured on this `ro.debuggable=1` build; that
+switch just does not work). Loopback is potentially trustworthy by spec.
+Result: the sampler's air tap runs its AudioWorklet instead of a
+main-thread ScriptProcessor that lost 17–23 % of its buffers.
+
+It is **WebView-only**. The kiosk's OkHttp talks to the station directly.
+Do not "improve" it into an HTTP proxy, and **do not bind `127.0.0.1:8096`
+from your own app** — the door will fall back to a random port and keep
+working, but you will have made the panel's origin unpredictable for
+everyone debugging it.
+
+### 0.5.6 Provisioning itself, and the station's key
+
+`KeyDiscovery` does one unauthenticated `GET /` and lifts
+`const SERVER_KEY = "…";` out of the page (same regex as Electron's
+`discoverAgentKey`). The kiosk then sends `Authorization: Bearer <key>` on
+every request. `ConfigStore` is a Preferences DataStore named
+`pinebox-desktop` with keys `baseUrl apiKey mode port dataDir python
+tailnetUrl tailnetName recordingFolder hotCornersOn hotCornerTl hotCornerTr
+hotCornerBl hotCornerBr`; `writeConfig` writes exactly that list (a key not
+on it appears to save and reads back the default — `tailnetUrl` and
+`recordingFolder` were lost that way once). `BuildConfig` carries the three
+default roads.
+
+### 0.5.7 Audio: focus, the jack, the mic, the graph
+
+- **Focus.** `MediaFocus` requests `AUDIOFOCUS_GAIN`; `DuckController`
+  takes `AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK` while a pad rings.
+  `OutputRoute` only *listens* to route changes (to reopen the oboe stream);
+  it never forces a route.
+- **The jack** is announced by the app, not the framework (§8). Audio on
+  `headset(4)` with no cable is a stale announcement, and audio on
+  `headset(4)` *is* usually correct here because a cable runs to a bigger
+  system — ask before "restoring" the speaker. On 2026-09-14 the route read
+  `speaker(2)`.
+- **The mic** is `AudioRecord` at 16 kHz on `MIC` (`VOICE_RECOGNITION` is
+  dead on this device: 0.0004 against 0.63). There is no speech recognizer on
+  the GSI, so the clip goes to the station's `POST /api/listen/transcribe`
+  (wyoming-whisper). `onPermissionRequest` grants the page **audio capture
+  only**; the camera is never granted to the page.
+- **The Web Audio graph** belongs to the panel: `window.pineAudioCtx`,
+  `audioScope(el)` (one analyser per element, memoised; a second
+  `createMediaElementSource` on the same element **throws**), `gainFor()`,
+  ducking `music × (1 − duck)` while `djSpeaking`. Anything wanting levels
+  borrows the analyser. Players are built with `new Audio(url)` and never
+  enter the DOM. The `<audio>` volume setter is clamped page-wide because
+  the desk's 160 % voice slider threw `IndexSizeError` on the tablet and
+  silenced the DJs (§8).
+
+### 0.5.8 The native sampler (oboe)
+
+`app/src/main/cpp/` builds `libpinebox_sampler.so` (core: `engine mixer pad
+voice duck analysis window sample_buffer audio_format`; android: `jni_bridge
+media_decode oboe_output`; Oboe 1.9.0 via FetchContent or vendored at
+`cpp/third_party/oboe`; NDK 26.1.10909125, CMake 3.22.1, `-std=c++17
+-fno-finite-math-only`, `c++_shared`, arm64-v8a only). `PineSampler.kt`
+declares the `external fun`s (the README's "the JNI binding is still
+missing" is stale — it exists), `PineSamplerBridge` is `window.PineSamplerNative`
+(all synchronous: `beginLoad/pushChunk/finishLoad`, `fire/release/stopPad/stopAll`,
+`peaks/zeroCross/levels/footprint`, `setFastPads/claimFire/fastState`, …),
+and the shim publishes `window.pineSampler` with `backend === "oboe"`.
+`sampler-engine.js` (Web Audio) still loads as `window.PineSamplerEngine` —
+it is what the *desktop* uses and what provides an `AudioContext` here; its
+pads are unused on the tablet. Two features once shipped broken by being
+added to the Web Audio engine only; keep per-voice bookkeeping in the view.
+
+The oboe stream asks for `SharingMode::Exclusive` + `LowLatency`; `onPause`
+calls `PineSampler.sleep()` to hand the exclusive AAudio port back, which is
+what lets **another app in front open a low-latency stream**.
+
+### 0.5.9 The screen recorder and the camera
+
+`ScreenReplay` mirrors the real display into an encoder through a
+`VirtualDisplay` with `VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR | FLAG_SECURE` — no
+`MediaProjection`, no consent dialog, because `CAPTURE_VIDEO_OUTPUT` is
+signature-granted. `PineAppRecorder` keeps it alive as a foreground service
+(notification 4301, `pine-recorder`, `IMPORTANCE_MIN`), started at boot and
+at every `onResume`, resting on `SCREEN_OFF`. The hot corners (§0.5.11) and
+the desk's "reach backwards" clip both read this ring
+(`pineDesktop.replayState/replayExport/replayChunk`).
+
+`PineCameraService` (notification 4302, `pine-camera`) listens on the
+abstract unix socket **`pine_camera`** from boot. A connection opens the
+lens; the last disconnect closes it. Wire format is **4-byte big-endian
+length + JPEG**, not marker-scanned, because an ImageReader's JPEG carries an
+EXIF thumbnail that is itself a JPEG and a marker scan stops at its end.
+From a PC:
+
+```sh
+$ADB $D forward tcp:9999 localabstract:pine_camera
+# connect to 127.0.0.1:9999, read [u32be len][jpeg] frames; the lens is on while you are connected
+```
+
+If the desktop app has its camera window open, the same frames are already
+on **`http://127.0.0.1:8791/camera.mjpg`** and **`/camera.jpg`** on the PC
+(loopback only, fixed port so OBS / ComfyUI / a browser can be pointed at
+it). The desk's *screen* mirror, by contrast, listens on an OS-assigned
+loopback port that must be read out of `pineDesktop.mirrorHow()`.
+
+### 0.5.10 Wallpaper, lock screen, USB, DGX terminal, Spark
+
+- `WallpaperWatch` — every 5 min, `selling_now` from the feed else the newest
+  still in `/api/generations?limit=N` (newest-first; filter `.mp4/.webm`
+  out), centre-cropped, onto `FLAG_SYSTEM` and `FLAG_LOCK` in two calls.
+  Hanging it raises `CONFIG_ASSETS_PATHS` (0x80000000), which has no name in
+  `configChanges` and relaunches the Activity — so it is held until
+  `onPause` (§19.2).
+- `LockWatch` + `lock.js` — the station on the lock screen: clock, now
+  playing, the screenplay (45 s rest), the slideshow (30 s rest), the request
+  box, the talk dot. Zero extra polls of `/api/dj`.
+- `UsbBrowse` / `UsbTarget` — browse and write a USB stick (an MPC) through
+  the Storage Access Framework (`ACTION_OPEN_DOCUMENT_TREE`). MediaStore
+  renames a file whose extension disagrees with its MIME; use
+  `application/octet-stream` when the extension matters.
+- `DgxSsh` — `com.github.mwiede:jsch 0.2.18`, `PreferredAuthentications
+  none,publickey`, no key on the tablet: Tailscale SSH authorises on tailnet
+  identity. Reads the banner first and refuses anything that is not
+  `SSH-2.0-Tailscale`. Writes on one thread (`dgx-ssh-write`), because a
+  socket write from the key callback is `NetworkOnMainThreadException` and
+  the failed write left JSch closed for good (§12).
+- `SparkActivity` — loads `/spark?pictures=1`; everything it shows is served
+  from `desktop/renderer/` on the station, so an overlay edit reaches it on
+  its next launch with **no APK in the loop**. It pads for the system bars
+  instead of hiding them: an app you are meant to leave should not hide the
+  button you leave with.
+
+### 0.5.11 Hot corners
+
+`hot-corners.js` (in `ViewAssets` last; `CORNERS` rail tab; 40 KB — an
+earlier reading of this file as a 129-byte stub was a parallel session
+mid-copy). A primary pointer down inside a 110 px corner square, ≥150 px
+toward the centre within 35° of the diagonal, inside 1.5 s, one finger;
+only a committed swipe is swallowed. Defaults (`HotCornerPrefs`): top-left
+**shot** (screenshot → red-ink markup → the Pine inbox), top-right
+**export** (the last 5 s … 20 min of the screen ring to the recording
+folder), bottom-left **inspect** (the line on air and how it came to be),
+bottom-right **sfx** (replay the last sting); `off` and `report` are the
+other actions. Bridge: `screenShot`, `replayState`, `replayExport({seconds,
+upload})`, `hotCorners`, `hotCornersSet`; the Kotlin side calls
+`window.PineHotCorners.configure(cfg)` on load and on every change.
+
+### 0.5.12 Numbers the kiosk is tuned to
+
+```
+StationFeed.POLL_MS 4000   TICK_MS 250           "Do not shorten POLL_MS."
+TARGET_CSS_WIDTH 1150 -> initial scale = widthPx*100/1150, clamped 75..400  (134% here); minimumFontSize 12
+tablet.css breakpoint max-width:1250px         must stay above TARGET_CSS_WIDTH
+TIMER_GUARD_MS 20000       RETRY_MS 4000 (main-frame load failure)
+Revive: REST_MS 5 min, GIVE_UP_AFTER 3 in RUN_WINDOW_MS 30 min, relaunch delay ~2.5 s (900 ms lands inside the dying process)
+deaf-watch EVERY_MS 30000, two strikes
+JackWatch POLL_MS 2000, SW_HEADPHONE_INSERT bit 2 (SwitchValues 4 = in)
+ScreenReplay: SCALE 0.5, FPS 12, BITRATE 600000, HOLD_SECONDS 1200
+AirTap HOLD_SECONDS 120     MicCapture RATE 16000
+PineNet: MAX_EDGE 768, WEBP_QUALITY 80, LANES 4, cache 256 MB; OkHttp 16 per host
+WallpaperWatch EVERY_MS 5 min
+z-index bands: views 2147483000, rail 2147483001, trace console ...004, SC pop-up ...010, PiP ...020, sampler overlays ...030+, hold sheets ...046, lock ...050, view-chrome ...200
+```
+
+## 0.6 Putting your own app on the tablet
+
+### 0.6.1 Install
+
+```sh
+$ADB $D install -r path/to/your.apk      # any signature; -r keeps data on a reinstall
+$ADB $D shell am start -n your.package/.YourActivity
+$ADB $D shell pm grant your.package android.permission.RECORD_AUDIO   # runtime grants, no prompt needed on a kiosk
+```
+
+Build for **arm64-v8a** (`abilist arm64-v8a,armeabi-v7a,armeabi` — 32-bit
+runs too). `minSdk` up to 34 is fine. **Nothing may depend on
+`play-services-*` or Firebase** — there are none, and a Play-dependent app
+fails at first use, not at install. There is no `RecognitionService`, so
+speech has to go to the station's whisper (§0.9.5). The device is
+`userdebug`, so `adb shell` can `run-as` any debuggable package and
+`adb root` is available if you need more.
+
+You do **not** need the platform key unless you want signature-level
+permissions (the jack, `DUMP`, screen capture without a projection). If you
+do, the key is `PineBoxKiosk/keys/platform.pk8` + `platform.x509.pem` — the
+AOSP test platform key this GSI's framework is signed with (`b4addb29`,
+SHA-256 `c8a2e9bc…92ab8`), and you sign with `apksigner` after building
+exactly as `deploy.sh` does. A platform-signed app is a system-trusted app;
+`sharedUserId` is not needed and the kiosk does not declare one.
+
+### 0.6.2 Coexisting with the kiosk
+
+What the kiosk will and will not do to you, from its source and the live state:
+
+| concern | today | if it is ever made device owner |
+|---|---|---|
+| Launching you | `am start`, the launcher, or a HOME chooser all work | lock task allows only `com.pinebox.kiosk`; add your package to `setLockTaskPackages` in `KioskController.applyOwnerPolicies` |
+| Being Home | launcher3 is Home; you can be | the kiosk pins itself with `addPersistentPreferredActivity` |
+| Status bar / Quick Settings | normal | disabled by policy |
+| Audio focus | the kiosk holds `AUDIOFOCUS_GAIN` while in front; you take it normally when you are in front; it re-takes it on resume | same |
+| Low-latency audio | the kiosk sleeps its exclusive oboe stream in `onPause`; yours can open one | same |
+| Camera | the lens is **free** unless someone is connected to `pine_camera` or `PineCameraActivity` is up | same |
+| Microphone | free unless a talk-dot take is in progress (`AudioRecord` on `MIC`) or the air tap is on | same |
+| Screen recording | `ScreenReplay` is recording the **whole screen** at 12 fps whenever the display is on — including your app. It is RAM-only and rolls over after 20 min, but it is there | same |
+| Ports | `127.0.0.1:8096` is the door — avoid it. `pine_camera` abstract socket — avoid the name | same |
+| Network policy | yours is yours (`network_security_config` is per-app) | same |
+| Wake / screen | the kiosk keeps the screen on only while its window is in front; behind you the 60 s timeout applies | `STAY_ON_WHILE_PLUGGED_IN` |
+| Wallpaper | the kiosk repaints home + lock every 5 min while it is *not* on screen — i.e. while you are. Expect `CONFIG_ASSETS_PATHS` relaunches of *your* Activity too if you do not handle configuration changes; that flag cannot be declared away | same |
+| Boot | `BootReceiver` launches the kiosk at boot. Yours can declare its own; whichever `HOME` wins decides what is on screen | the kiosk |
+| Intents you can send it | `am start -n com.pinebox.kiosk/.MainActivity` (and `.SparkActivity`, `.terminal.DgxTerminalActivity`). `com.htc.intent.action.QUICKBOOT_POWERON` is an unprotected broadcast `BootReceiver` accepts — it would start the recorder and camera service and launch the kiosk; do not | same |
+| Intents it can send you | **none**. There is no configurable intent, no bridge method that starts an arbitrary component. `openExternal(url)` is `ACTION_VIEW` on a URL (refused when device owner). The only other `startActivity` is the battery-saver settings page | same |
+| Content you can read from it | nothing — the FileProvider is not exported; the DataStore is private | same |
+
+**Ways to be reached *from* the kiosk**, in order of cost: (1) an `ACTION_VIEW`
+intent filter on a custom scheme or an http host — the panel or a view can
+call `pineDesktop.openExternal('yourscheme://…')` and, absent device owner,
+`shouldOverrideUrlLoading` sends any non-station host out to the system
+chooser (Jelly today; yours if you claim the host); (2) a new `ViewAssets`
+entry and rail tab whose "view" is a button that calls a new bridge method
+that does `startActivity(...)` — a kiosk change, §0.8; (3) `adb` from the
+desk, which the desktop app already does for the kiosk kick. There is no
+road that does not involve either the URL chooser or editing the kiosk.
+
+**The cheapest correct shape for your own Activity** is the one
+`SparkActivity` and `DgxTerminalActivity` already use: `MAIN`+`LAUNCHER`
+only, your own `android:taskAffinity`, `launchMode="singleTop"` or
+`singleTask`, `resizeableActivity="true"`, `screenOrientation="fullSensor"`,
+the long `configChanges` list, **no HOME filter, no lock task**, and pad for
+the system bars rather than going immersive. The station's panel is a
+12,000-node document on a tablet measured at 148 MB free under a load of 25;
+budget your own memory and CPU against that, and do not run a second
+`/api/dj` poller at 4 s if you can read what the kiosk already fetched
+(§0.7.3).
+
+### 0.6.3 A WebView of your own
+
+If your app is also a WebView on the station, three things measured here
+will bite you within a day:
+
+- **Chromium's per-origin socket pool is six.** The panel runs ~35 network
+  pollers and was measured with 274 requests queued on `127.0.0.1:8096`,
+  oldest 74 s. The station now shares identical in-flight GETs and aborts at
+  8 s (`API_TIMEOUT_MS`) in the panel's own `api()`. Use a native HTTP
+  client (OkHttp) for anything that must arrive; it never touches that pool
+  — measured 15 native requests completing at 0 s during a fault where the
+  WebView completed 21 in 75 s.
+- **The WebView's JS timers freeze** while `requestAnimationFrame` keeps
+  firing; the kiosk pokes `resumeTimers()` every 20 s from a Handler. Ride
+  rAF for anything that must keep moving, and expect no web-side cure to
+  reach a frozen timer.
+- **The WebView's network stack wedges** (§19.1): the process keeps running,
+  images through your own client keep loading, and every `fetch` and
+  `<audio>` fails in 40–100 ms. A page reload hands the new page the same
+  dead stack; only `am force-stop` cures it. The kiosk's `deaf-watch` +
+  `Revive` is the shape of the cure: compare a native road against a
+  WebView road, and end your own process.
+- `isSecureContext` is false on `http://10.89.1.246`; AudioWorklet,
+  `getUserMedia` and the clipboard API are gone with it. The loopback door
+  is the only road that worked (§0.5.5).
+- Key a tablet check on the UA string `PineBoxKiosk/…` or `!Electron &&
+  Linux`, never on `/Android/` — the kiosk's WebView calls itself `Linux;
+  X11; TrebleDroid`.
+
+## 0.7 Talking to the station from the tablet
+
+The station is `app.py` on the DGX (FastAPI, ~211,000 lines, 715 routes, one
+process that is also recording a live radio show). It is **poll-only**:
+there are no WebSocket routes, no `EventSource` in any page, and one SSE
+route (`POST /v1/chat/completions` with `stream:true`). There is **no CORS
+middleware**, so a browser page on another origin cannot XHR it; a native
+client is unaffected. Responses are not gzipped; `/api/dj` is ~120 KB a
+poll. §0.9 has the route inventory; this section is the contract for a
+device that wants to *listen*.
+
+### 0.7.1 Identity: the listener id, the roster, the `terminals` row
+
+1. **Mint one id and keep it in persistent storage.** The panel mints
+   `pb<8 base-36>` in `sessionStorage`, the Electron shell mints
+   `desktop-<rand>`, the tune page mints a bare base-36 string. A fresh id
+   per launch is why the air keeps changing hands (`AUDIO_OWNER_QUICK`
+   exists to hand it back within 12 s). Prefix yours distinctly.
+2. **Send it as `?listener=<id>`** on `GET /api/radio/clock` (every 1.5 s)
+   and `GET /api/dj` (every 4 s, `&lean=1`). That is the whole registration —
+   there is no join route; the roster entry is created by the poll and
+   pruned after 30 s without one. `POST /api/dj/join {listener, name}` is
+   the *social* hello (the DJs welcome you); it is optional.
+3. **Ask the operator for a row** in `settings.terminals`, or write it
+   yourself with the key. `GET /api/settings`, add
+   `"yourdev": {"name":"…","play":true,"listener":"<your id>","addr":"10.89.1.154","fallback":false,"music":1.0,"voice":1.0,"reply":1.0}`,
+   `PUT /api/settings` **the whole document back** — PUT replaces, and the
+   validator rebuilds from a whitelist, so a partial PUT resets everything
+   you omitted. A row that names a `listener` is matched by id first and is
+   DHCP-proof; `addr` is the fallback. Sixteen rows max, key `[a-z0-9_.-]`,
+   levels clamped 0–1, `play` defaults **false**. Every client reads the
+   table and obeys its own row — that is how the tablet's volume is set
+   from the desk. The live table on 2026-09-14:
+
+   ```
+   pinetab  play=true  addr 10.89.1.154  music .8 voice 1.0 reply 1.0  fallback=false
+   desktop  play=true  addr 10.89.1.13   music .6 voice .6  reply .6   fallback=true
+   ```
+
+4. **Read the roster** at `GET /api/radio/listeners`:
+   `{listeners:[{listener, seen, since, addr, what:"the desktop app"|"a browser tab", owns_air}], audio_owner, say}`.
+   `what` is derived from `"Electron" in User-Agent` and nothing else — a
+   native client, the kiosk, and a phone all read "a browser tab"; tell them
+   apart by `addr` and by your id's prefix.
+
+### 0.7.2 Who plays out loud — the air owner, and acking honestly
+
+Only one player in the house may sound at once, or "the DJs overlap each
+other" (one show three times, a few hundred milliseconds apart). The rule
+is enforced by the **air owner**: `GET /api/radio/clock` carries
+`audio_owner`; if it is non-empty and not your id, **mute**. `music_here ===
+false` means the box has the record and you must not play a second copy.
+`paused` means go quiet. Remote listeners through `:8097` are exempt (a car
+is not in the room).
+
+`POST /api/radio/solo {"listener":"<id>"}` (key required) hands one
+listener the air and gags every other page; `{"clear":true}` releases it.
+It refuses (HTTP 200 with `refused`/`why`) a device whose row says
+`play=false`, and a device the station has judged **deaf**. Resolution
+order in `audio_owner()` (app.py ~27782): a quiet owner (>12 s) whose
+device is back under a new id hands over at once; a live owner is refused if
+its row says `play=false` or if it has held the air 75 s having acknowledged
+nothing audible (`OWNER_DEAF_SECONDS`, then refused for `OWNER_DEAF_REST` =
+300 s); nobody → the first `play=true` row with a live listener,
+non-fallback rows first.
+
+**Acking is what "heard" means.** `POST /api/dj/voice/ack`:
+
+```json
+{"event":"received|canplay|playing|ended|error", "delivery_id":"<from the clip>",
+ "listener_id":"<your id>", "sequence":3, "current_time":4.21,
+ "volume":1.0, "audible_volume":1.0, "muted":false, "error":""}
+```
+
+`audible_volume > 0` on `playing`/`ended` is what sets the station's "the
+dialogue was heard" mark. If you hold the air and ack silently (or never),
+you lose it after 75 s and are refused for 300 s; if *nobody* acks audibly,
+the unattended `AIR_LADDER` runs — relieve at 90 s, flush at 120 s, release
+at 180 s, reload every page at 240 s, **restart the station process at 360
+s**. A polite listener acks with the truth.
+
+### 0.7.3 What to poll, how often, and what comes back
+
+| route | cadence | bytes | what |
+|---|---|---|---|
+| `GET /api/radio/clock?listener=<id>` | **1.5 s** | ~0.5 KB | `server_ms started_ms on playing paused id music_here title seconds url art listeners audio_owner` — the record and the gate |
+| `GET /api/dj?listener=<id>&lean=1` | **4 s** | ~120 KB full / less lean | everything: `station playing paused dj now elapsed queued build reload_at kiosk_kick coming on steward station_name dj_names remaining upcoming requests music_to voice_to output listeners history played last_said speaking speaking_now talk_next_in dialogue_flow chat stream_now selling_now gallery_now ad_now box pulse library activity activity_log airtime playback …`. `lean=1` drops `dialogue_flow last_said upcoming activity_log vector_access repair_log stream_now airtime playback history pipeline` and truncates `chat` to 20 |
+| `GET /api/dj/voice?since=<ms>` | 4 s | small | `{server_ms, cut_ms, clips:[{broadcast_ms, delivery_id, delivery_state, engine, kind, speech, stream, text, ts, url, voice, who, …}], reservation_updates}`. Clips with `ts > cut_ms` are playable; a line is offered for `broadcast_ms − 7 s` lead and not past 45 s late |
+| `GET /api/dj/video` | 2.5 s | small | `{clips, server_ms, cut_ms, endless}` — the SFX guy's picture. (Two handlers share this path; the first registered, `dj_video_api`, is live — parse `clips`, not `videos`) |
+| `GET /api/pulse` | on demand | small | the event loop's stalls, worst, and the named blocking frame. **Read this before blaming your own client** |
+| `GET /api/broadcast/health` / `/console` | on demand | | is anyone hearing it; the whole repair-step table and log |
+| `GET /api/tablet/look` | on demand | | the tablet as the station sees it (§0.9.6) |
+
+The panel itself runs the clock at 1.5 s, the DJ poll at 4 s, the voice
+poll at 4 s, the video poll at 2.5 s, and ~35 other timers; the tune page
+slows to 3 s / 8 s in stream mode. **Do not go faster.** One request in
+flight per endpoint, with an 8–20 s deadline, and a single-flight latch that
+only its owner clears (a latch cleared by a successor put the overlap back).
+
+Rather than a second poller, a companion app on the same tablet can read
+the kiosk's `StationFeed` snapshot only by living inside the kiosk (there is
+no content provider). From outside, poll — at the cadences above.
+
+### 0.7.4 Playing sound
+
+- **Clip road (what the panel does):** poll `/api/dj/voice`, fetch each
+  clip's `url` exactly as given (it carries `?t=<HMAC sig>`; you cannot mint
+  it without the key), start it at `broadcast_ms`, ack. Music is
+  `/music/<id>?t=…` from the clock, with `/music/<id>/art`. Optional
+  `&br=32|48|64|96|128` picks a lower-rate derivative — a whitelist, not a
+  clamp, and a `(key, rate)` that once served the original keeps serving it
+  for 900 s.
+- **Stream road (simpler, ~30 s behind live):** `GET /stream.mp3?t=<share token>`
+  — endless mp3, 32–192 kbps via `?br=`, ICY metadata on `Icy-MetaData: 1`,
+  30 s join burst so the first packet has audio, never closes (a paused
+  station is fed silence). `/stream.m3u8` + `/hls/<rate>/segNNN.ts` for HLS
+  (4 s segments, 8 in the list; iOS wants this). `?split=1` sends the
+  record on the left and the DJs on the right so a client can balance them
+  instantly with its own gains — opt in only if you will un-split it.
+  `GET /api/stream/state` reports `listeners bitrate rates hls_rates
+  up_seconds produced_seconds underruns holes …`. The mixer's format is
+  s16le stereo 44.1 kHz in 100 ms frames.
+- The share token: `POST /api/share {"hours":168,"label":"…","scope":"listen"}`
+  (key required) → `{token, url, expires}`; the URL is `/tune/<token>` and the
+  token is what `?t=` wants on every `require_listen_auth` route. A `full`
+  scope token opens the real panel and is accepted as a bearer.
+
+### 0.7.5 Sending things in
+
+| what | route | gate | body |
+|---|---|---|---|
+| a song request | `POST /api/dj/request` | listen token or key | `{q, now?}` — 400 "Name a song", 404 no match |
+| a shout or a react | `POST /api/dj/shout` | listen | `{who≤32, text≤280}` or `{react≤8}`; text spawns a banter round so the DJs answer on air |
+| a vote | `POST /api/music/vote` | listen | |
+| wake a paused station | `POST /api/radio/unpause` | listen | one-way: a guest may only wake it |
+| speech to text | `POST /api/listen/transcribe` | **key** | raw WAV/PCM bytes, 2 kB–12 MB → `{text, heard}` (+`detail, bytes` when empty) |
+| a spoken call-in | `POST /api/dj/callin/voice?rate=16000` | key | raw 16-bit mono PCM ≥3,200 bytes → a request or a call-in |
+| a request to the operator | `POST /api/pine-requests` | key | `{text, debug:true, images:[dataurl…], files:[…]}` → the inbox (`data/pine_requests.md`). Identical text within 30 min folds into the open request; `debug` (absent = true) appends a "Station at the time" block. Read it back with `GET /api/pine-requests`; `POST …/{id}/resolve {reply}` closes it |
+| a report from a view with a picture | `POST /api/script/report` | key | `{view, text≤20000, image, reason≤1200}` |
+| a line to the LLM / the inbox by dictation | `POST /v1/chat/completions` | key | OpenAI-shaped; inbox dictation outranks the model and answers as `"model":"pine-inbox"` |
+| a broadcast recording | `PUT /api/export/upload?name=&what=&seconds=` | key | bytes; how the kiosk's air tap hands a slice to the station |
+
+## 0.8 Contributing to the kiosk itself
+
+### 0.8.1 The toolchain
+
+```
+C:\_tools\jdk17                 Temurin 17.0.20.1
+C:\_tools\android-sdk           platforms/android-34, build-tools/34.0.0, ndk/26.1.10909125, cmake/3.22.1, platform-tools 37.0.1
+C:\_tools\gradle                gradle 8.14.5  (the project pins AGP 8.5.2, Kotlin 1.9.24; there is NO gradle wrapper JAR checked in)
+C:\_tools\_gradlehome           GRADLE_USER_HOME - without it AGP re-downloads from scratch and the build "hangs" for minutes
+C:\_tools\pinebox-toolchain.json   the manifest desktop/android-build.cjs reads; written by PowerShell WITH A UTF-8 BOM that JSON.parse refuses unless stripped
+C:\_tools\pinebox-android\PineBoxKiosk   the project, git branch main
+C:\_tools\pinebox-jackfix       the dead RRO road (§8), source of fm.pinebox.jackfix
+C:\_tools\pinebox-gsi           GSI images
+```
+
+Dependencies: AndroidX core/appcompat/activity/lifecycle/datastore/webkit/drawerlayout/documentfile,
+coroutines 1.8.1, OkHttp 4.12.0, jsch 0.2.18 (mwiede), junit + mockwebserver + org.json for JVM tests.
+`FAIL_ON_PROJECT_REPOS`; R8 off in both build types; `lint.abortOnError=false`
+("a kiosk that stops building because a lint rule turned into an error is a
+kiosk nobody can patch at 3am").
+
+### 0.8.2 The build-and-deploy loop
+
+```sh
+cd /c/_tools/pinebox-android/PineBoxKiosk          # LOCAL cwd - gradle refuses a UNC one
+./deploy.sh                                          # build -> zipalign -> platform-sign -> verify -> install
+./deploy.sh --no-build                               # re-sign and install what is already built
+$ADB $D shell am start -n com.pinebox.kiosk/.MainActivity   # deploy.sh leaves the app STOPPED
+```
+
+`deploy.sh` pins `JAVA_HOME=/c/_tools/jdk17`, `ANDROID_HOME=/c/_tools/android-sdk`,
+`GRADLE_USER_HOME=/c/_tools/_gradlehome`, device `PINE_TAB=10.89.1.154:5555`,
+runs `gradle.bat --console=plain assembleDebug`, then `zipalign -p -f 4`,
+`apksigner sign --key keys/platform.pk8 --cert keys/platform.x509.pem`, and
+**two** checks before it will install: the APK's signer must be the platform
+key by full SHA-256, and the tablet's framework must still be `b4addb29`.
+Either failing is a refusal, not a warning. On a signature clash it
+uninstalls first and re-grants `RECORD_AUDIO` and `CAMERA`. Its own header
+says the plain two-command install has killed the jack "twice"; the memory
+notes say three. If it says *"could not read the tablet's framework key"*,
+adb has dropped the tablet — reconnect, it is not a signing fault.
+
+**`desktop/android-build.cjs` does not do this.** The desktop's
+`terminalBuildApk` / `terminalInstallApk` run `gradle assembleDebug
+--no-daemon` and `adb install -r` — debug-signed, no platform key, no
+`deploy.sh`. Using them on the kiosk reverts the signature. (Its default
+project path is also written as a single-quoted JS string whose backslashes
+collapse, so it needs `cfg.androidProject` set to work at all.) They are
+fine for building *your* app, which does not need the platform key.
+
+Build time is ~20 s warm. Verify the install by **size and timestamp** of
+`pm path com.pinebox.kiosk` against your own APK — a second session installs
+to this tablet too, and on 2026-09-14 the kiosk project's assets were being
+rewritten at 21:41 while this guide was written. Then verify by calling
+your code over CDP (§0.2.4), never by grepping the DOM.
+
+### 0.8.3 Adding a view, a style, a bridge method
+
+A view is a plain IIFE hanging one global off `window`
+(`window.PineYourThing = {mount, close, …}`); no modules, no bundler.
+Three registration points, and missing each fails differently:
+
+| file | what it does | if you forget it |
+|---|---|---|
+| `desktop/renderer/rail.js` `VIEWS[]` (`{id, cls, label, mount:[globals…]}`) | the tab and its host | no tab at all |
+| `PineBoxKiosk/…/bridge/ViewAssets.kt` `SCRIPTS` / `STYLES` | bundles + evaluates the file | tab opens to "has not been loaded on this terminal" |
+| `desktop/renderer/index.html` | the Electron half | works on the tablet, not on the desk |
+
+Order in `SCRIPTS` matters; `rail.js` goes after the views. The `cls` in a
+`VIEWS` row is the **host's** class, not your view's — give the host its own
+(`sl-host`, not `sl`), or your stylesheet lands on the element that reserves
+the rail's strip. If the view must also exist on the sampler page, repeat
+for `pine-sampler/` and `SamplerAssets`. Copy the file into **both**
+`desktop/renderer/` and `app/src/main/assets/pine-views/` — there is no sync
+script; compare by size before building (`view-chrome.css` genuinely
+differs between the two asset dirs; a basename diff cries wolf on it).
+
+Rules that came from measurements on this glass: talk to the station
+through `pineDesktop`, not `fetch`; ride rAF, not `setInterval`, for
+anything that must keep moving; float at body level in the z-index bands
+(§0.5.12); borrow the panel's analyser, never build a second source on an
+element; `padding-right` on the host does **not** inset an absolutely
+positioned child (the containing block is the padding box) — measure
+`#pineViewRail` and inset with a CSS variable, and re-measure after ~1.4 s
+and with a `ResizeObserver` because the rail can be 0 px wide at mount;
+`offsetParent` is always `null` for `position:fixed`; tear down floating
+`<video>`s by class over the document, clearing `src` and calling `load()`
+before removing (a leaked loading video eats one of the six sockets for
+good); the panel's `[hidden]` is a UA type-level rule, so any class-level
+`display` outranks it; icons are Carbon through `pineIcon('c:name')`, never
+emoji; ES5 only in anything the WebView evaluates. `tests/` holds the
+node and python tests that pin the shared files (`test_slideshow_*`,
+`test_sfx_tv_*`, `test_pinetab_route_*`, `test_terminal_*`, …).
+
+A new native capability is the three edits in §0.5.3, and every
+`@JavascriptInterface` method runs on the WebView's JavaBridge thread — not
+the UI thread, not a thread with a Looper.
+
+### 0.8.4 The parallel-session rule
+
+More than one agent session edits this project and `app.py` at once, and a
+read-modify-write over the other's changes has clobbered whole patches
+three times in a day. Re-read before every patch, patch with anchors that
+must match exactly once, write atomically, and verify the **served** page
+(`node --check` the extracted `<script>`) rather than the file — a single
+`SyntaxError` in the panel's inline script kills `pollDJ`, the voice poll
+and the music player together while every server meter stays green (§19.0).
+
+## 0.9 The station's API, for a device
+
+### 0.9.1 Auth in one table
+
+| gate | what it checks | where it applies |
+|---|---|---|
+| `require_read_auth` | **nothing** unless `SPARK_AGENT_LOCK_READS=true` (it is `false`) | ~330 read routes: `/api/dj`, `/api/radio/clock`, `/api/radio/listeners`, `/api/settings` GET, `/api/pulse`, `/api/generations`, … — all answered on the LAN with no header today |
+| `require_auth` | `Authorization: Bearer <SPARK_AGENT_API_KEY>` (64 hex) **or** a full-scope share token | every write: `/api/radio/solo`, `/api/dj/output`, `PUT /api/settings`, `/api/service/restart`, `/api/pine-requests` POST, `/api/listen/transcribe`, `/api/share`, `/api/tablet/doctor/*`, … |
+| `require_listen_auth` | `?t=<share token>` **or** the bearer | the guest surface: `/stream.*`, `/hls/*`, `/api/dj/join|request|shout`, `/api/music/vote`, `/api/radio/unpause`, `/api/generations/image/*`, `/api/pinelink/mine|frame.jpg` |
+| `media_sign` | `?t=<32 hex HMAC(key, name)>` **or** the bearer | `/media/<key>`, `/music/<id>`, `/sfx/<id>`, `/tape/<key>`, `/nabu-audio`, … — the sig arrives *inside* the JSON that named the file |
+| `?key=` fallback | the bearer in the query string | a dozen page-opening routes (`/api/tablet/look`, `/api/said/search`, `/api/pine-journal`, `/api/cupboard/*`, …) |
+| none | | `/`, `/healthz`, `/health`, `/radio`, `/spark`, `/spark/asset/*`, `/api/slideshow`, `/tune/<token>` (the token gates it), `/vendor/*`, `/icons/*`, the `/api/director/*` family, and ~60 more |
+
+Where the key comes from: `GET /` embeds `const SERVER_KEY = "…";`
+(`SPARK_AGENT_AUTOFILL_KEY=true`), which is how both the kiosk and the
+desktop provision themselves. Over SSH:
+`docker exec spark-agent printenv SPARK_AGENT_API_KEY`. It is **not** in
+`data/settings.json`.
+
+### 0.9.2 The public door, `:8097`
+
+A second uvicorn in the same process, wrapped by `PublicListenerGate`: any
+path not on the allowlist is 404 before a handler runs; **`Authorization` is
+stripped** and `x-pinebox-public: 1` is added; WebSocket scopes are dropped.
+Allowed GETs: `/healthz /api/dj /api/dj/voice /api/dj/reacts /api/dj/video
+/manifest.webmanifest /api/radio/clock /stream.mp3 /stream.m3u /stream.m3u8
+/api/stream/state /spark/asset/{sfx-tv.js,sfx-tv.css,slideshow.css}
+/api/pinelink/mine /api/pinelink/frame.jpg` plus prefixes `/app-icon-
+/tune/ /media/ /music/ /data/vendor/ /icons/ /api/generations/image/ /hls/
+/sfx/`. Allowed POSTs: `/api/dj/join /api/dj/request /api/dj/shout
+/api/music/vote /api/radio/unpause`. So through the public door `?t=` is the
+only credential that works, and `/tune/<full token>` is downgraded to the
+radio page. `GET /` on 8097 is a 404 by design.
+
+### 0.9.3 Reads
+
+`/api/dj`, `/api/radio/clock`, `/api/dj/voice`, `/api/dj/video` — §0.7.3.
+Also: `GET /api/dj/state` (`dj_state()` + `died`), `GET /api/radio` (the 11
+transport keys), `GET /api/radio/pause`, `GET /api/radio/next` (signed
+`url`/`art`), `GET /api/dj/flow`, `GET /api/airlog?since&until&who&kinds&most`
+(≤5000 rows of everything that aired), `GET /api/said/search?q=`, `GET
+/api/perf` (RAM/CPU/GPU/temps of the DGX), `GET /api/health/details`
+(20 s memo; 5–32 s uncached — do not poll it), `GET /api/library`, `GET
+/api/sfx/stats` (every sting with a signed `url`), `GET /api/generations?limit=`
+(newest-first, includes `.mp4/.webm`), `GET /api/slideshow/playlist?limit&offset&kind&favorites&order=shuffle&seed&since`
+and `GET /api/slideshow/media/<file>?w=` (**Range and thumbnails** — use
+this, not `/api/generations/image`, for anything that seeks or lists),
+`GET /api/slideshow/stack` (the eleven desktop tailers in one 10 s-cached
+answer), `GET /api/broadcast/{health,console,watch}`, `GET /api/routing/moves`,
+`GET /api/export/courier`, `GET /api/pinelink/{look,state,doctor,ladder,clips}`,
+`GET /api/manuals*`, `GET /api/system2/{status,hours,hour,script,binding,line,download}`.
+
+### 0.9.4 Writes that move the broadcast
+
+- `POST /api/dj/output` — `{music|voice|reply: "box"|"here"|"both"|"off"|"nabu", voice_device:"pine"|"nabu", music_level|voice_level|reply_level: 0..1, music_control, box_talk, system:true}`.
+  One destination is enforced (music is dragged to where the voice points;
+  `off` is a mute, not a place); moving the voice to `box`/`off` clears the
+  voice clip ring at once. Returns `dj_state()`.
+- `POST /api/radio/solo` — §0.7.2. **Order for "make X the only sound":
+  solo first, then output, then `PUT /api/settings`** — the other way round
+  has a window where the show is routed to a page and no page believes it
+  is the sink.
+- `PUT /api/settings` — replaces; read-modify-write the whole document.
+  `model` is ignored here (use `POST /api/model`); a blank `ha_token` is
+  restored from disk.
+- `POST /api/radio/pause {paused}` / `POST /api/dj/{start,stop,next,prev,say,interject,replay,announce,drain}`.
+- `POST /api/broadcast/fix/<step>` — the reinitialise ladder one rung at a
+  time (§23): `look speed triangulate` change nothing; `onair relieve
+  ungag floor flush drain stock terminals release reload_pages kiosk stream
+  engines deep steward disk restart`. `kiosk` stamps `kiosk_kick` on
+  `/api/dj`; the **desktop** sees it and runs `am force-stop` + `am start`
+  on the tablet — the station has no adb.
+- `POST /api/broadcast/reload-pages` — stamps `reload_at`; every open page
+  whose start predates it reloads 0.8–4.8 s later, the caller's included.
+- `POST /api/service/restart {"name":"spark-agent"}` — the process
+  `os._exit(3)`s half a second later and docker brings it back (~20 s of
+  silence). Any other container name goes to the restarts-only docker
+  proxy. **The body is required**; without it the route 500s.
+
+### 0.9.5 The tablet's services on the station
+
+- `POST /api/listen/transcribe` — raw audio → text (§0.7.5). The reason: no
+  `RecognitionService` on the GSI.
+- `GET /api/slideshow/*` — the lock screen's and SLIDES tab's material
+  (§0.9.3), `favorites.md` and `screensaver_state.json` shared with the
+  desktop slideshow (`source: host|station` says whether `~/bin` is mounted).
+- `GET /spark`, `/spark/asset/<name>` — `SparkActivity`'s page and its
+  seven allowlisted renderer files, served from `/app/desktop/renderer`.
+- `GET /api/pinelink/frame.jpg?t=` — the Pine Cam picture at 4 fps (refuses a
+  half-written JPEG; on the public door a token with the camera tick is
+  mandatory), `POST /api/pinelink/announce` (stamps `announce_at` so the
+  tablet puts a notice mid-screen), `/api/pinelink/{cut,keep,prefs,on-air,public,viewers,mine}`.
+- `GET /api/sfx/video/neighbour?id&dir=next|prev` — answered from the clip
+  book (`data/sfx_clips.db`), never by walking the 18,570-file CIFS folder,
+  because "the tablet's bridge gives up at 20 s".
+- `PUT /api/export/upload` — where the air tap's slices go.
+
+### 0.9.6 The tablet as the station sees it
+
+`GET /api/tablet/look` (read; `?key=` accepted) →
+`{at, host, configured, port, arp{ip,flags,mac,device}, adb{open,ms}, seen{first,hits,at,what,agent}, seen_ago, fetching, on_network, adb_port_open, kiosk_kick, steps[], verdict, cure, say, steps_available[]}`.
+On 2026-09-14 it read: *"the tablet is here and ready — it is playing the
+station and its debugging port is open"*, seen 0.4 s ago via `okhttp/4.12.0`
+(the kiosk's client, not its WebView), MAC `36:63:f9:5d:06:32` on the box's
+`wlP9s9`.
+
+`POST /api/tablet/doctor/{look|ping|arp|sweep|adopt|wake}` (key) — every
+rung but `adopt` (writes the swept address to `data/tablet_link.json`) and
+`wake` (stamps `kiosk_kick`) is a question. `sweep` connects to port 5555 on
+all 254 hosts of the /24 in 0.35 s each. `GET /api/tablet/seen` lists every
+address that has fetched the show. Constants: `PINE_TABLET_HOST=10.89.1.154`,
+`PINE_TABLET_ADB_PORT=5555`. There is **no** `/api/terminals` — the device
+table lives in `settings.json` only.
+
+### 0.9.7 Rules the station is built around
+
+- `/api/dj` at 4 s, the clock at 1.5 s, nothing faster; `lean=1` when you
+  do not need the big keys.
+- 38 concurrent requests from the tablet produced a 46 s media stall; every
+  tablet-facing road since is one request or a cached one.
+- The event loop stalls are the baseline (121 of 144 dead-air gaps in one
+  window were loop stalls; some endpoints answer in 10–15 s). A slow answer
+  is not your fault and not the tablet's; `GET /api/pulse` names the frame.
+- Caches you are reading through: settings 1 s, terminals 5 s, health
+  details 20 s, slideshow stack 10 s, storage 30 s.
+- Two routes on one path: the first registered wins, silently.
+- `VOICE_BROADCAST_LEAD_MS 7000`, `VOICE_LATE_OFFER_MS 45000`,
+  `AUDIO_OWNER_LIFE 90`, `AUDIO_OWNER_QUICK 12`, `OWNER_DEAF_SECONDS 75`,
+  `OWNER_DEAF_REST 300`, roster window 30 s.
+
+## 0.10 The desk's side (Electron, on the Windows PC)
+
+`spark-agent/desktop/` is the Pine Box Desktop, launched via `pine_box.exe`
+into a runner mirror at `%LOCALAPPDATA%\PineBoxDesktop\runner` (the share is
+too slow to run from), hot-reloading `desktop/renderer/` every 1.5 s. Its
+tablet modules, all driven from `window.pineDesktop` in the renderer:
+
+| module | what it does | reach it from another program |
+|---|---|---|
+| `terminal-host.cjs` / `terminal.cjs` / `terminal-net.cjs` | finds adb (`C:\_tools\platform-tools`, `C:\platform-tools`, `%LOCALAPPDATA%\Android\Sdk\platform-tools`), discovers the tablet by mDNS then a bounded private-subnet sweep, `adb tcpip`/`connect`, the provisioner (survey, snapshot, bootloader, unlock behind the string `ERASE THIS TABLET`) | — |
+| `tablet-vitals.cjs` | **one** adb shell: `dumpsys battery; current_now; /proc/loadavg; /proc/meminfo; dumpsys gfxinfo com.pinebox.kiosk`, split on `---pine---` → `{battery{percent,status,volts,tempC,chargeMah,drawMa,watts,hoursLeft}, load, memory, graphics{frames,janky,p50,p90,p95,p99,missedVsync}, rttMs}`. Polled at 4 s when present, 20 s when absent, coalesced (2.5 s hold) so the sidebar and the mirror window share one sweep | copy the shell line |
+| `tablet-mirror.cjs` `Mirror` | the screen: `screenrecord … -` piped through ffmpeg to MJPEG, sizes `quarter/third/half/full` of the measured `deviceWidth×deviceHeight`, bitrate `w×h×11` (floor 800 kbps), 15 fps, rebuilt whenever screenrecord ends. Served on **an OS-assigned loopback port**: `/live.mjpg`, `/frame.jpg` | read the port from `mirrorHow()`; or run the pipe yourself (§0.2.3) |
+| `tablet-mirror.cjs` `CameraGlass` | the tablet's camera via `adb forward tcp:<9230–9629> localabstract:pine_camera`, re-served on **`127.0.0.1:8791`** as `/camera.mjpg` and `/camera.jpg` (falls back to a random port if 8791 is taken; `where().known` says which) | `http://127.0.0.1:8791/camera.jpg` while the camera window is open |
+| `tablet-input.cjs` | one held `adb shell`; `input tap/swipe/keyevent/text` lines, integers, display coordinates | copy the recipe |
+| `pinetab-route.cjs` | the six destinations (`pinetab app web box nabu off` — `both` deliberately absent); resolves the tablet in the roster by `addr` against `settings.terminals.pinetab.addr`, freshness `seen ≤ 30`; sends solo → output → settings; refuses a page that is not looking at the station. Same file ships in the APK as `pine-sampler/pinetab-route.js` | `pineDesktop.pinetabWhere()/pinetabSend(key)` |
+| `terminal-audio.cjs` + `renderer/terminal-audio-client.js` | the `terminals` table client, shared by the desk and the tablet page | |
+| `terminal-glass.cjs` | stills (`exec-out screencap -p`, fallback pull), clips (`screenrecord --time-limit N --bit-rate 6000000 /sdcard/pinebox-glass.mp4` + pull), wake/sleep by keyevent, a DevTools door on **port 9333**, a written report | |
+| `renderer/tablet-doctor.js` | the ladder: station `look` → `sweep`/`adopt`/`wake` → `adb connect` → `look` again; "attached" is measured. Desktop-only by design | the wrench beside *The tablet* in the sidebar |
+| `android-build.cjs` | `gradle assembleDebug` + `adb install -r` from the toolchain manifest — **debug-signed, not for the kiosk** (§0.8.2) | fine for your own APK |
+| `gsi.cjs` / `firmware.cjs` | the GSI matcher (`ro.*` props vs the image's bytes) and the stock-firmware verifier; the flash plan as data with `where: bootloader|fastbootd` per step and the wipe **last and in the bootloader** (fastbootd's `-w` wiped nothing in 4 ms and said it had) | |
+
+The desk also watches `/api/dj` for `kiosk_kick` (new stamp → `am
+force-stop` + `am start` on the kiosk) and `reload_at`. It, not the station,
+is the thing with adb.
+
+## 0.11 When it does not work — the short table
+
+Full detail in §19; this is the order to look.
+
+| you see | it is probably | check | cure |
+|---|---|---|---|
+| panel alive, feed moving, **no sound at all**, images still load | the WebView's network stack wedged (§19.1) | CDP: `fetch('/api/dj')` → `TypeError` in 40–100 ms; `musicPlayer.networkState 2 readyState 0` | `am force-stop com.pinebox.kiosk; am start …` — a reload will **not** do it; `deaf-watch` should have done this itself |
+| nothing on screen responds | the notification shade, or the lock screen's X | `dumpsys window | grep mCurrentFocus`; screenshot | `cmd statusbar collapse`; tap (1274, 43) |
+| view lost its scroll / folds every ~5 min | the wallpaper relaunching the Activity (§19.2) | `logcat | grep "relaunch: com.pinebox.kiosk"` | fixed by #1296; if it recurs, `WallpaperWatch.reading` is not being set |
+| meters/marks frozen, music playing | JS timers suspended (§19.3) | CDP: a fresh `setTimeout` never fires; rAF does | `keepTimersAlive` should cover it; force-stop if not |
+| audio on `headset(4)` with nothing plugged in | a stale jack announcement (§19.4) | `dumpsys audio | grep Devices`; `dumpsys input | grep SwitchValues` | `await pineDesktop.jack({on:false})` — but ask first; a cable usually *is* in |
+| the jack ignores the cable after a deploy | a debug-signed build over the platform one | `dumpsys package com.pinebox.kiosk | grep -E "MODIFY_AUDIO_ROUTING|DUMP"` → `granted=false` | `./deploy.sh` |
+| the mic "hears nothing" | `RECORD_AUDIO` lost in an uninstall | same dumpsys | `pm grant com.pinebox.kiosk android.permission.RECORD_AUDIO` |
+| your new view: tab present, "has not been loaded on this terminal" | not in `ViewAssets.SCRIPTS`, or the bundle threw | `logcat -s PineKioskActivity | grep "views failed"` | fix the parse error; every file in the bundle must parse |
+| your new bridge method is `undefined` | the shim line in `pine-bridge.js` | `typeof pineDesktop.yourMethod` | the third edit |
+| "your fix isn't running" but the CSS class is there | you grepped the DOM for injected JS | `typeof window.PineYourThing` | it *is* running |
+| the tablet holds the air and the house is silent | its row `play=false`, or it is deaf (never acks) | `/api/radio/listeners`, `/api/broadcast/console` | `POST /api/broadcast/fix/terminals`, `/release`; the DEVICES rung acts only when every switch is off |
+| everything looks fine, the DJs are not heard, for an hour | a `SyntaxError` in the served panel (§19.0) | `node --check` the extracted `<script>` from `GET /` | fix the template, restart, **reload the pages** |
+| 87 fetches outstanding, nothing completes | a leaked loading `<video>` holding a socket (§19.5) | CDP: `performance.getEntriesByType('resource')` | clear `src`, `load()`, remove; force-stop |
+| everything is slow, stutters | the tablet's main thread or audio thread saturated (§28) | `cat /proc/<pid>/task/*/stat` twice; CDP `Performance.getMetrics` | it is what #1413a–g and #1420 fixed; a stutter that *returns* after a reload is something growing |
+| `deploy.sh`: "could not read the tablet's framework key" | adb dropped the tablet | `adb devices` | `adb connect` first |
+| `adb` says "more than one device" | USB and Wi-Fi both attached | | `-s 10.89.1.154:5555` |
+
+## 0.12 Quick reference
+
+```sh
+ADB=/c/_tools/platform-tools/adb.exe; D="-s 10.89.1.154:5555"; B=http://10.89.1.246:8096
+K=$(curl -s $B/ | grep -o 'SERVER_KEY = "[^"]*"' | cut -d'"' -f2)
+
+$ADB connect 10.89.1.154:5555
+$ADB $D exec-out screencap -p > now.png
+$ADB $D shell "dumpsys window | grep mCurrentFocus"
+$ADB $D shell "am force-stop com.pinebox.kiosk"; sleep 4; $ADB $D shell "am start -n com.pinebox.kiosk/.MainActivity"
+$ADB $D shell "am start -n com.pinebox.kiosk/.SparkActivity"          # the SC stack app
+$ADB $D shell "am start -n com.pinebox.kiosk/.terminal.DgxTerminalActivity"
+$ADB $D shell "dumpsys audio | grep -iE 'Devices:'"
+$ADB $D shell "dumpsys package com.pinebox.kiosk | grep -E 'MODIFY_AUDIO_ROUTING|DUMP|RECORD_AUDIO|signatures'"
+$ADB $D shell "dumpsys device_policy | grep -A2 'Enabled Device Admins'"
+$ADB $D shell "cmd package resolve-activity -a android.intent.action.MAIN -c android.intent.category.HOME | grep packageName"
+$ADB $D shell "ss -ltnp"                                              # 127.0.0.1:8096 and *:5555, nothing else
+SOCK=$($ADB $D shell "cat /proc/net/unix" | tr -d '\r' | grep -o "webview_devtools_remote_[0-9]*" | head -1)
+$ADB $D forward tcp:9222 localabstract:$SOCK; curl -s http://127.0.0.1:9222/json
+$ADB $D forward tcp:9999 localabstract:pine_camera                    # [u32be len][jpeg] frames while connected
+$ADB $D install -r your.apk
+
+curl -s $B/healthz
+curl -s "$B/api/radio/clock?listener=<id>"
+curl -s "$B/api/dj?lean=1&listener=<id>" | python -c "import sys,json;d=json.load(sys.stdin);print(d['listeners'],d['audio_owner'] if 'audio_owner' in d else '',d['on'],d['paused'])"
+curl -s $B/api/radio/listeners
+curl -s -H "Authorization: Bearer $K" $B/api/tablet/look
+curl -s -H "Authorization: Bearer $K" $B/api/settings | python -c "import sys,json;print(json.load(sys.stdin)['terminals'])"
+curl -s -XPOST -H "Authorization: Bearer $K" -H "Content-Type: application/json" -d '{"listener":"<id>"}' $B/api/radio/solo
+curl -s -XPOST -H "Authorization: Bearer $K" -H "Content-Type: application/json" -d '{"text":"…","debug":true}' $B/api/pine-requests
+curl -s -XPOST -H "Authorization: Bearer $K" -H "Content-Type: application/json" -d '{"name":"spark-agent"}' $B/api/service/restart
+curl -s $B/api/pulse | python -c "import sys,json;d=json.load(sys.stdin);print(d['stalls'],d['worst_s'],[r['top'] for r in d['recent'][:3]])"
+
+cd /c/_tools/pinebox-android/PineBoxKiosk && ./deploy.sh && $ADB $D shell "am start -n com.pinebox.kiosk/.MainActivity"
+```
+
+### Known discrepancies between this document's older sections, the READMEs, and the device (as of 2026-09-14)
+
+- `PineBoxKiosk/README.md` says the JNI binding "has not been written yet" and that call-in/microphone is "left for later" — both exist (`fm.pinebox.kiosk.audio.PineSampler`, `MicCapture`). It also gives `initialScalePercent` as `/1000`; the code is `/1150`. And it shows the raw `adb install -r app-debug.apk` — do not; see §0.8.2.
+- §15 says `adb shell id` returns uid 0. It returns `uid=2000(shell)`; root is `adb root` away on this userdebug build.
+- §16.6 and §0.3.3: the kiosk is written as a HOME app with lock task; on the device, launcher3 holds HOME, no device owner is set, lock task is `NONE`.
+- The project memory said the kiosk project "is NOT a git repo"; it is (`main`, with uncommitted asset edits from a parallel session).
+- `desktop/android-build.cjs` cannot deploy the kiosk correctly (debug key); `deploy.sh` is the only road.
+- `app.py` registers `/api/dj/video` twice; the first (`dj_video_api`, `{clips}`) is live and, being `require_read_auth`, is open on the public door without a token.
+- Two `adb.exe` copies at `C:\_tools\platform-tools` and `C:\_tools\android-sdk\platform-tools`; same version, either works.
+
+---
+
+# Part I — how a stock Lenovo Tab M9 was made ours
 
 ## 1. The device
 

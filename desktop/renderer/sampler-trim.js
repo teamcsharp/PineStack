@@ -105,7 +105,7 @@
     overlay.innerHTML =
       '<div class="pb-trim-box">'
       + '<div class="pb-trim-head"><b id="pbTrimTitle">Pad</b>'
-      + '<button id="pbTrimClose" title="Close">✕</button></div>'
+      + '<button id="pbTrimClose" title="Close" aria-label="Close">✕</button></div>'
       + '<p id="pbTrimCut" class="pb-trim-cut"></p>'
       + '<canvas id="pbTrimCanvas" class="pb-trim-canvas"></canvas>'
       + '<p id="pbTrimReadout" class="pb-trim-readout"></p>'

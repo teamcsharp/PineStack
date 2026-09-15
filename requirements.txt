@@ -13,6 +13,7 @@ pyserial==3.5
 # meme sting lands several times louder than the DJ who set it up. No apt, no
 # root, no system package — it ships the binary and pip already runs here.
 imageio-ffmpeg==0.6.0
+av==18.1.0            # precise captured-video stream metadata; bundled FFmpeg has no ffprobe
 numpy
 # The Gazette's unattended front-page card (#1020). When no panel is open the
 # press has nothing to photograph, so paper_snapshot_pillow draws the card

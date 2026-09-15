@@ -37,6 +37,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 from station_flow import FlowJournal
+from script_report_store import ScriptReportStore, REPORT_NAME as SCRIPT_REPORT_NAME
 from line_review import LineReviewStore, ReviewConflictError
 from rejection_lab import RejectionLabStore
 from rejection_lab_runtime import LabRuntime
@@ -107871,6 +107872,101 @@ async def said_prompt_api(
 
 
 SCRIPT_REPORTS_DIR = data_path("script_reports")
+_SCRIPT_REPORT_STORE = ScriptReportStore(SCRIPT_REPORTS_DIR)
+
+
+def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict[str, Any]:
+    """Passive incident context from bounded in-memory records, never a repair.
+
+    These are server observations/receipts, not a claim about what a speaker
+    sounded at the client's earlier tap. No air-log scan or model call belongs
+    on this diagnostic path.
+    """
+    now = time.time()
+    out: dict[str, Any] = {"observed_at_ms": int(now * 1000),
+                           "build_ms": _BUILD_MS, "errors": []}
+
+    def pick(row: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+        if not isinstance(row, dict):
+            return {}
+        return {k: (v[:240] if isinstance(v, str) else v)
+                for k in keys if (v := row.get(k)) is not None
+                and isinstance(v, (str, int, float, bool))}
+
+    rows = view.get("rows") if isinstance(view.get("rows"), dict) else {}
+    wanted = set(list(rows)[:160])
+    snapshot = view.get("snapshot") if isinstance(view.get("snapshot"), dict) else {}
+    wanted.update(str(snapshot.get(k) or "") for k in ("highlight_id", "active_id", "speaking_id"))
+    wanted.discard("")
+    out["speaking"] = pick(_SPEAKING_NOW, ("id", "who", "kind", "at", "aired"))
+    out["air"] = {"owner": str(_AUDIO_OWNER.get("who") or ""),
+                  "owner_since": _AUDIO_OWNER.get("at"),
+                  "on": bool(_RADIO.get("on")), "paused": bool(radio_paused()),
+                  "voice_route": _RADIO.get("voice_to"),
+                  "box_talk": _RADIO.get("box_talk"),
+                  "listeners": sum(1 for at in list(_LISTENERS.values()) if now - float(at or 0) < 30)}
+    stream = dict(_STREAM_NOW)
+    stream_rows = list(stream.get("rows") or [])
+    off = now - float(stream.get("at") or now)
+    nearby = [r for r in stream_rows if isinstance(r, dict) and
+              (str(r.get("id") or "") in wanted or
+               float(r.get("from") or 0) - 10 <= off <= float(r.get("until") or 0) + 10)]
+    out["stream"] = dict(pick(stream, ("at", "length", "file")),
+                         offset_estimate_s=round(off, 3), row_count=len(stream_rows),
+                         rows=[pick(r, ("id", "from", "until", "media", "clip_media")) for r in nearby[:32]],
+                         omitted_rows=max(0, len(nearby) - 32))
+    feed = list(_RADIO.get("chat") or [])
+    relevant = [r for r in feed if isinstance(r, dict) and str(r.get("id") or "") in wanted]
+    out["feed"] = {"total": len(feed), "matched": len(relevant),
+                   "omitted_rows": max(0, len(relevant) - 80),
+                   "rows": [pick(r, ("id", "sid", "kind", "aired", "air_at", "ts", "media",
+                                     "clip_media", "clip_from", "clip_until", "delivery_id", "withdrawn_why"))
+                            for r in relevant[-80:]]}
+    clips = list(_RADIO.get("voice_clips") or [])
+    pending = []
+    for clip in clips:
+        if not isinstance(clip, dict):
+            continue
+        delivery = _PAGE_DELIVERIES.get(str(clip.get("delivery_id") or "")) or {}
+        state = str(delivery.get("state") or clip.get("delivery_state") or "unknown")
+        if state == "ended":
+            continue
+        row = pick(clip, ("id", "delivery_id", "broadcast_ms", "ts", "kind", "media", "seconds"))
+        row["delivery_state"] = state
+        pending.append(row)
+    out["queue"] = {"total": len(pending), "feed_total": len(clips),
+                    "omitted_rows": max(0, len(pending) - 12), "rows": pending[:12]}
+    # Collapse progress acknowledgments for the same listener/delivery/state;
+    # retain their time span, sample count and both positions. A seek creates
+    # a new record. Interleaved listeners each keep their own progress span.
+    events: list[dict[str, Any]] = []
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in list(_PAGE_ACK_EVENTS):
+        if float(event.get("at") or 0) < max(now - 75, since_ms / 1000):
+            continue
+        row = pick(event, ("at", "listener_id", "delivery_id", "event", "muted", "volume",
+                           "audible_volume", "error", "current_time", "sequence"))
+        key = (str(row.get("listener_id") or ""), str(row.get("delivery_id") or ""))
+        prev = latest.get(key)
+        if prev and all(prev.get(k) == row.get(k) for k in ("event", "muted", "volume", "audible_volume", "error")) \
+                and 0 <= float(row.get("current_time") or 0) - float(prev.get("position_end_s") or 0) \
+                <= max(2.0, float(row.get("at") or 0) - float(prev.get("last_at") or 0) + 1):
+            prev.update(last_at=row.get("at"), position_end_s=row.get("current_time"),
+                        sequence_end=row.get("sequence"), samples=int(prev["samples"]) + 1)
+        else:
+            row.update(last_at=row.get("at"), position_end_s=row.get("current_time"), samples=1)
+            events.append(row)
+            latest[key] = row
+    out["playback"] = {"source": "browser receipts; not acoustic verification",
+                       "events": events[-100:], "omitted_events": max(0, len(events) - 100),
+                       "last_speech_receipt": pick(_TALK_ACK, ("at", "listener", "delivery_id", "audible_volume"))}
+    stalls = [r for r in list(_PULSE.get("stalls") or []) if isinstance(r, dict)
+              and float(r.get("at") or 0) >= max(now - 75, since_ms / 1000)]
+    out["loop"] = {"last_beat_at": _PULSE.get("at"),
+                   "open": pick(_PULSE.get("open"), ("at", "seconds", "frame")),
+                   "stalls": [pick(r, ("at", "seconds", "frame")) for r in stalls[-12:]],
+                   "omitted_stalls": max(0, len(stalls) - 12)}
+    return out
 
 
 def _view_num(view: dict[str, Any], *keys: str) -> float:
@@ -108305,112 +108401,146 @@ def script_report_reading(view: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-@app.get("/api/script-reports/{name}")
-async def script_report_file_api(
-    name: str,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """2026-09-14: "I wanna see every markdown file listed next to it with
-    ticks to expand it and show the contents" - the inbox card folds the
-    report open from here."""
+@app.get("/api/script/report/status")
+async def script_report_status_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_read_auth(authorization)
-    if not re.fullmatch(r"script_[0-9_-]{8,40}\.md", name or ""):
+    return {"schema_version": 2, "before_ms": 60000, "after_ms": 10000,
+            "two_phase": True, "build_ms": _BUILD_MS}
+
+
+@app.get("/api/script-reports/{name}")
+async def script_report_file_api(name: str, authorization: str | None = Header(default=None)) -> Any:
+    require_read_auth(authorization)
+    if not SCRIPT_REPORT_NAME.fullmatch(name or ""):
         raise HTTPException(status_code=400, detail="bad name")
     path = SCRIPT_REPORTS_DIR / name
-    if not path.is_file():
+    try:
+        text = await asyncio.to_thread(path.read_text, "utf-8")
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="no such report")
-    text = await asyncio.to_thread(path.read_text, "utf-8")
-    return {"name": name, "bytes": len(text), "text": text[:400000]}
+    if name.endswith(".json"):
+        return Response(content=text, media_type="application/json",
+                        headers={"Cache-Control": "no-store"})
+    status = "complete"
+    try:
+        metadata = await asyncio.to_thread(_SCRIPT_REPORT_STORE.read, name)
+        status = str(metadata.get("status") or "complete")
+    except (FileNotFoundError, ValueError):
+        pass  # old reports have no sidecar
+    return {"name": name, "bytes": len(text.encode("utf-8")), "text": text, "status": status}
+
+
+async def _script_report_payload(request: Request) -> dict[str, Any]:
+    body = await request.body()
+    if len(body) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="report exceeds 8 MiB")
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="report must be JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="report must be an object")
+    return payload
+
+
+def _script_report_observe(view: dict[str, Any], since_ms: float = 0) -> dict[str, Any]:
+    try:
+        return script_diagnostic_context(view, since_ms=since_ms)
+    except Exception as exc:  # evidence failure must be visible, never a guessed diagnosis
+        return {"observed_at_ms": int(time.time() * 1000),
+                "errors": [str(exc)[:240]]}
+
+
+def _script_report_answer(report: dict[str, Any]) -> dict[str, Any]:
+    findings = (report.get("analysis") or {}).get("findings") or []
+    messages = [str(f.get("message") or "") for f in findings if isinstance(f, dict)]
+    return {"ok": True, "id": report.get("inbox_id"),
+            "incident_id": report.get("incident_id"), "file": report.get("file"),
+            "status": report.get("status"), "verdict": messages,
+            "say": "filed as #%s - diagnostic capture saved" % report.get("inbox_id")}
+
+
+async def _script_report_attach_inbox(report: dict[str, Any]) -> None:
+    """Keep the existing screenshot/annotation UI attached to this incident.
+
+    Append references only; no second upload, new request or replacement of
+    operator edits. After linking once, retries cannot restore a photo the
+    operator subsequently annotated or removed.
+    """
+    images = report.get("images") or []
+    if not images or report.get("inbox_images_linked") or not report.get("inbox_id"):
+        return
+    async with _pine_lock:
+        items = await asyncio.to_thread(pine_read)
+        item = next((r for r in items if r.get("id") == report["inbox_id"]), None)
+        if item is not None:
+            text = str(item.get("text") or "")
+            missing = [n for n in images if "[img:%s]" % n not in text]
+            if missing:
+                item["text"] = text.rstrip() + "\n\nAttached images:\n" + "\n".join(
+                    "![captured script](data/pine_uploads/%s) [img:%s]" % (n, n) for n in missing)
+                await asyncio.to_thread(PINE_REQUESTS_PATH.write_text, _pine_render(items), encoding="utf-8")
+    await asyncio.to_thread(_SCRIPT_REPORT_STORE.mark_images_linked, Path(report["file"]).name)
+    report["inbox_images_linked"] = True
 
 
 @app.post("/api/script/report")
-async def script_report_api(
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """#1115: the script view's own report - what the page saw, what the
-    station was doing, a picture - into a markdown file and the inbox."""
+async def script_report_api(request: Request,
+                            authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_auth(authorization)
-    payload = await request.json()
-    payload = payload if isinstance(payload, dict) else {}
+    payload = await _script_report_payload(request)
     view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
-    text = str(payload.get("text") or "")[:20000]
-    image = str(payload.get("image") or "")
-    # 2026-09-14: "specify a reason for the report ... so that way you know
-    # what it is that I'm actually having an issue with"
-    reason = str(payload.get("reason") or "").strip()[:1200]
-    reading = await asyncio.to_thread(script_report_reading, view)
-    try:
-        reading["explain"] = await asyncio.to_thread(script_explain, view, reading)
-    except Exception as exc:  # noqa: BLE001
-        reading["explain"] = ["the explanation road failed: %s" % str(exc)[:100]]
-    stamp = time.strftime("%Y-%m-%d_%H%M%S")
-    SCRIPT_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    saved = _save_pine_images([image]) if image else []
-    md = ["# Script view report - %s" % time.strftime("%Y-%m-%d %H:%M:%S"), "",
-          *(["## Why the operator filed it", reason, ""] if reason else []),
-          "## Verdict",
-          *("- " + v for v in (reading.get("verdict") or [])), "",
-          "## What the page saw", "```json",
-          json.dumps(view, indent=1, default=str)[:30000], "```", "",
-          "## Motion of the view (last %d samples, 4/s; newest last)" % len(view.get("motion") or []),
-          "```", str(view.get("motionLegend") or ""),
-          *(str(r) for r in (view.get("motion") or [])), "```", "",
-          "## The window: 20 above the mark, 10 below (page order)",
-          "```", str(view.get("windowLegend") or ""),
-          *(str(r) for r in (view.get("window") or [])), "```", "",
-          "## What the station says happened",
-          *("- " + w for w in (reading.get("explain") or [])), "",
-          "## Sequence check", "```json",
-          json.dumps(reading.get("sequence") or {}, indent=1, default=str)[:12000], "```", "",
-          "## The screen, as text", "```",
-          text or "(no text rendering)", "```", "",
-          "## What the station was doing", "```json",
-          json.dumps(reading, indent=1, default=str)[:30000], "```"]
-    if saved:
-        md += ["", "## The picture",
-               *("![the view](data/pine_uploads/%s)" % n for n in saved)]
-    path = SCRIPT_REPORTS_DIR / ("script_%s.md" % stamp)
-    try:
-        path.write_text("\n".join(md), encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500,
-                            detail="could not write the report: %s"
-                                   % str(exc)[:120])
-    lit = str(view.get("nowLineId") or view.get("now_line_id") or "-")
-    said = (reading.get("speaking") or {}).get("id") or "-"
-    head = "read" if (view.get("headIsRead") or view.get("head_is_read")) \
-        else "estimated"
-    age = int(_view_num(view, "fetchedAgeMs", "fetched_age_ms",
-                        "fetchedAge") / 1000)
-    kind = "CAUTION" if str(view.get("kind") or "") == "caution" else "view"
-    summary = ("#1115 script %s report: %s\n\nthe page marks `%s`; the "
-               "station is saying `%s`; playhead %s; the script on the page "
-               "is %ss old.\n\nfull report: data/script_reports/%s"
-               % (kind, "; ".join(reading.get("verdict") or []), lit, said, head,
-                  age, path.name))
-    if reason:
-        summary = "%s\n\n%s" % (reason, summary)
-    if reading.get("explain"):
-        summary += "\n\nwhat the station says happened:\n" + "\n".join(
-            "- " + w for w in reading["explain"][:4])
-    try:
-        summary = (summary + await pine_context_block()).strip()
-    except Exception:  # noqa: BLE001
-        pass
-    if saved:
-        summary += "\n\nAttached images:\n" + "\n".join(
-            "![pasted image](data/pine_uploads/%s) [img:%s]" % (n, n)
-            for n in saved)
+    # The timestamp belongs to receipt of the initial tap, before any image
+    # upload, disk scans, or report writing. Each observation keeps its clock.
+    server = _script_report_observe(view)
+    report = await asyncio.to_thread(_SCRIPT_REPORT_STORE.create, view, server,
+                incident_id=str(payload.get("incident_id") or view.get("incident_id") or ""),
+                reason=str(payload.get("reason") or ""),
+                image=str(payload.get("image") or ""), save_images=_save_pine_images)
+    messages = [str(f.get("message") or "") for f in
+                (report.get("analysis") or {}).get("findings", []) if isinstance(f, dict)]
+    summary = "Script diagnostic capture" + (": " + report["reason"] if report.get("reason") else "")
+    if messages:
+        summary += "\n\n" + "\n".join("- " + m for m in messages[:3])
+    summary += "\n\nFull evidence and available follow-up: " + report["file"]
+    # Generic station context used to duplicate large, unrelated snapshots.
+    # This incident already holds selected playback receipts and row states.
     item = await pine_append(summary)
-    pipeline_log("air", "script view report filed as #%s -> %s (#1115)"
-                 % (item.get("id"), path.name))
-    return {"ok": True, "id": item.get("id"),
-            "file": "data/script_reports/" + path.name,
-            "verdict": reading.get("verdict"),
-            "say": "filed as #%s - %s"
-                   % (item.get("id"),
-                      (reading.get("verdict") or [""])[0][:90])}
+    report["inbox_id"] = item.get("id")
+    await asyncio.to_thread(_SCRIPT_REPORT_STORE.set_inbox, Path(report["file"]).name, item.get("id"))
+    await _script_report_attach_inbox(report)
+    pipeline_log("air", "script diagnostic capture #%s -> %s" % (item.get("id"), report["file"]))
+    return _script_report_answer(report)
+
+
+@app.post("/api/script/report/{name}/finish")
+async def script_report_finish_api(name: str, request: Request,
+                                   authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    if not SCRIPT_REPORT_NAME.fullmatch(name or "") or not name.endswith(".md"):
+        raise HTTPException(status_code=400, detail="bad name")
+    payload = await _script_report_payload(request)
+    view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
+    try:
+        old = await asyncio.to_thread(_SCRIPT_REPORT_STORE.read, name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="no such incident")
+    incident_id = str(payload.get("incident_id") or view.get("incident_id") or "")
+    if incident_id != str(old.get("incident_id") or ""):
+        raise HTTPException(status_code=409, detail="incident identity does not match")
+    server = _script_report_observe(view, since_ms=float(old.get("server_observed_at_ms") or 0))
+    screenshot = payload.get("screenshot")
+    if not isinstance(screenshot, dict):
+        screenshot = {key: payload.get(source) for key, source in
+                      (("captured_at_ms", "screenshot_at_ms"),
+                       ("requested_at_ms", "screenshot_requested_at_ms"),
+                       ("source", "screenshot_source"), ("error", "screenshot_error"))
+                      if payload.get(source) is not None}
+    report = await asyncio.to_thread(_SCRIPT_REPORT_STORE.finish, name, incident_id, view, server,
+                image=str(payload.get("image") or ""), screenshot=screenshot,
+                save_images=_save_pine_images)
+    await _script_report_attach_inbox(report)
+    return _script_report_answer(report)
 
 
 @app.get("/api/tablet/look")
@@ -110536,6 +110666,13 @@ async def slideshow_backend_api(
 # ---------------------------------------------------------------------------
 
 _SPARK_ASSET_DIR = Path("/app/desktop/renderer")
+# Captures are edited on a bounded background worker; the station's audio
+# players and scheduler are never involved in a video edit.
+from video_editor import create_video_editor_router
+app.include_router(create_video_editor_router(
+    data_path("video_edits"), Path(__file__).resolve().parent / "desktop" / "renderer",
+    require_auth, require_read_auth))
+
 _SPARK_ASSETS = {
     "spark-overlays.js": "application/javascript; charset=utf-8",
     "spark-overlays.css": "text/css; charset=utf-8",

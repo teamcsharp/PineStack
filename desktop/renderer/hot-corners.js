@@ -455,7 +455,7 @@
    * (data-pine-drag / data-pine-drag-handle - pine-dismiss.js's delegated
    * drag), a close glyph, and tap-away / Escape through PineDismiss.watch
    * like every other panel on the page. */
-  function sheet(title, cls) {
+  function sheet(title, cls, opts) {
     var box = make('div', 'hc-sheet' + (cls ? ' ' + cls : ''));
     box.setAttribute('data-pine-drag', '');
     var head = make('div', 'hc-head');
@@ -471,7 +471,7 @@
     doc.body.appendChild(box);
     /* 2026-09-14: a diagnostic sheet ducks the broadcast to 10%; the
        preferences sheet is not one. The hold follows the element. */
-    if (root.PineDuck && String(cls || '').indexOf('prefs') < 0) {
+    if (root.PineDuck && String(cls || '').indexOf('prefs') < 0 && !(opts && opts.duck === false)) {
       root.PineDuck.hold('hc-' + (cls || 'sheet'), root.PineDuck.REPORT, box);
     }
 
@@ -755,8 +755,66 @@
     return out;
   }
 
+  var videoEditor = null;
+  var captureBusy = false;
+
+  function editorPath(sourceId) {
+    sourceId = String(sourceId || '');
+    if (!/^[0-9a-f]{32}$/.test(sourceId)) throw new Error('invalid video source identity');
+    return '/video-editor/?source=' + sourceId;
+  }
+
+  function editorMessage(event, frameWindow, origin) {
+    if (!event || event.source !== frameWindow || event.origin !== origin) return '';
+    var kind = event.data && event.data.type;
+    return kind === 'pine-video-editor-close' || kind === 'pine-video-editor-export' ? kind : '';
+  }
+
+  /* Keep the station document and its player alive underneath the editor.
+   * The source is an opaque station identity; returned URLs cannot navigate
+   * the native bridge to another host. Export notifications never save files. */
+  function openVideoEditor(sourceId) {
+    var url = stationUrl(editorPath(sourceId));
+    var origin = new root.URL(url, root.location.href).origin;
+    if (videoEditor) videoEditor.close();
+    var box = make('section', 'hc-video-editor');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Screen recording editor');
+    var bar = make('div', 'hc-video-editor-bar');
+    bar.appendChild(make('span', '', 'Screen recording'));
+    var back = button('hc-btn', 'Close editor');
+    bar.appendChild(back);
+    var frame = make('iframe', 'hc-video-editor-frame');
+    frame.title = 'Edit screen recording';
+    frame.setAttribute('allow', 'autoplay; fullscreen');
+    frame.src = url;
+    box.appendChild(bar);
+    box.appendChild(frame);
+    doc.body.appendChild(box);
+    var entry = {box: box, close: close};
+    function close() {
+      root.removeEventListener('message', receive);
+      var at = sheets.indexOf(entry);
+      if (at >= 0) sheets.splice(at, 1);
+      if (box.parentNode) box.parentNode.removeChild(box);
+      if (videoEditor === entry) videoEditor = null;
+    }
+    function receive(event) {
+      var kind = editorMessage(event, frame.contentWindow, origin);
+      if (kind === 'pine-video-editor-close') close();
+      else if (kind === 'pine-video-editor-export') toast('Edited video is ready');
+    }
+    back.addEventListener('click', close);
+    root.addEventListener('message', receive);
+    sheets.push(entry);
+    videoEditor = entry;
+    return entry;
+  }
+
   function exportSheet() {
-    var s = sheet('Save the last …', 'hc-export');
+    if (captureBusy) { toast('Preparing the captured video\u2026'); return; }
+    var canEdit = has('replayEdit');
+    var s = sheet(canEdit ? 'Edit the last recorded moment' : 'Save the last …', 'hc-export', {duck: false});
     var body = s.body;
     var big = make('div', 'hc-big', '');
     var range = make('input', 'hc-range');
@@ -768,11 +826,21 @@
     range.setAttribute('aria-label', 'how much of the screen recording to save');
     var ticks = make('div', 'hc-ticks');
     var holds = make('p', 'hc-dim', 'reading the ring…');
-    var save = button('hc-btn hc-primary hc-wide', 'Save to recordings', 'c:save');
+    var save = button('hc-btn hc-primary hc-wide', canEdit ? 'Open video editor' : 'Save to recordings', 'c:save');
+    var audioNote = make('p', 'hc-dim', canEdit ? 'Reading captured audio status\u2026' : '');
+    var videoOnly = make('input', '');
+    videoOnly.type = 'checkbox';
+    var videoOnlyRow = make('label', 'hc-row hc-master');
+    videoOnlyRow.appendChild(videoOnly);
+    videoOnlyRow.appendChild(make('span', '', 'Allow video without complete audio if unavailable'));
     body.appendChild(big);
     body.appendChild(range);
     body.appendChild(ticks);
     body.appendChild(holds);
+    if (canEdit) {
+      body.appendChild(audioNote);
+      body.appendChild(videoOnlyRow);
+    }
     body.appendChild(save);
 
     var table = stepTable(0);
@@ -791,6 +859,10 @@
 
     if (has('replayState')) {
       Promise.resolve(bridge().replayState()).then(function (got) {
+        var audio = got && got.audio;
+        if (canEdit) audioNote.textContent = audio ?
+          'Audio: ' + String(audio.state || 'unknown').replace(/_/g, ' ') +
+          (audio.detail ? ' - ' + audio.detail : '') : 'Captured audio status is unavailable.';
         var held = Number(got && got.seconds) || 0;
         table = stepTable(held);
         var last = -1;
@@ -810,6 +882,7 @@
         paintTicks();
       }, function (err) {
         holds.textContent = 'the ring could not be read: ' + String((err && err.message) || err);
+        if (canEdit) audioNote.textContent = 'Captured audio status is unavailable.';
       });
     } else {
       holds.textContent = 'the ring cannot be read on this surface (no replayState)';
@@ -817,11 +890,41 @@
 
     save.addEventListener('click', function () {
       var seconds = STEPS[Number(range.value)] || STEPS[0];
-      if (!has('replayExport')) {
+      if (!canEdit && !has('replayExport')) {
         toast('no screen recording road on this surface', true);
         return;
       }
       save.disabled = true;
+      if (canEdit) {
+        captureBusy = true;
+        range.disabled = true;
+        videoOnly.disabled = true;
+        toast('Preparing the last ' + fmtSeconds(seconds) + ' for editing\u2026');
+        Promise.resolve(bridge().replayEdit({seconds: seconds, video_only: videoOnly.checked})).then(function (got) {
+          captureBusy = false;
+          save.disabled = range.disabled = videoOnly.disabled = false;
+          if (!got || !got.ok) {
+            var detail = String((got && got.detail) || 'The captured video could not be opened');
+            if (got && got.original_saved) detail += ' - original saved to ' + String(got.where || 'recordings');
+            audioNote.textContent = detail;
+            toast(detail, true);
+            return;
+          }
+          try {
+            openVideoEditor(got.source_id || got.id);
+            s.close();
+            toast('');
+          } catch (err) {
+            toast(String((err && err.message) || err), true);
+          }
+        }, function (err) {
+          captureBusy = false;
+          save.disabled = range.disabled = videoOnly.disabled = false;
+          audioNote.textContent = String((err && err.message) || err);
+          toast(audioNote.textContent, true);
+        });
+        return;
+      }
       toast('saving the last ' + fmtSeconds(seconds) + '…');
       Promise.resolve(bridge().replayExport({seconds: seconds, upload: true})).then(function (got) {
         save.disabled = false;
@@ -1150,7 +1253,9 @@
     _stepTable: stepTable,
     _heardRow: heardRow,
     _lastSfx: lastSfx,
-    _stationUrl: stationUrl
+    _stationUrl: stationUrl,
+    _editorPath: editorPath,
+    _editorMessage: editorMessage
   };
   root.PineHotCorners = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

@@ -3699,7 +3699,7 @@ function initWakeWords() {
         + "<span class='wake-phrase'>“" + esc(w.phrase) + "”</span>"
         + "<span class='wake-route'>→ " + (w.route === "dj" ? "the DJs" : "the LLM")
         + "</span>"
-        + "<button class='wake-x' title='remove this wake word'>✕</button>";
+        + "<button class='wake-x' title='remove this wake word' aria-label='remove this wake word'>✕</button>";
       row.querySelector("input").addEventListener("change", async (ev) => {
         wake.words[i].on = ev.target.checked;
         s.wake = wake; await api.put("/api/settings", s); draw();
@@ -10860,7 +10860,7 @@ function initSamplePopup() {
     urlRow.className = "sp-row";
     urlRow.innerHTML = "<input type='text' id='spUrl' placeholder='paste a "
       + "YouTube / any video link…'><button id='spFetch'>Fetch</button>"
-      + "<button id='spClose'>✕</button>";
+      + "<button id='spClose' title='Close' aria-label='Close'>✕</button>";
     pop.appendChild(urlRow);
     if (note && stage !== "fetching") {
       const st = document.createElement("div");
@@ -11000,7 +11000,7 @@ function initSamplePopup() {
       + "root:</span> <input type='text' id='spFolder' "
       + "style='flex:1;min-width:120px'>"
       + "<button id='spBack'>‹ back</button>"
-      + "<button id='spClose'>✕</button>";
+      + "<button id='spClose' title='Close' aria-label='Close'>✕</button>";
     pop.appendChild(folderRow);
     const fInp = folderRow.querySelector("#spFolder");
     fInp.value = localStorage.getItem("pineSampleFolder") || "Samples";
@@ -11469,7 +11469,7 @@ function initCrystalBtn() {
     head.className = "cp-head";
     head.innerHTML = "<b>" + (kind === "doc" ? "📄 " : "📜 ")
       + esc(file) + "</b><span class='muted cp-count'></span>"
-      + "<button class='cp-x'>✕</button>";
+      + "<button class='cp-x' title='Close' aria-label='Close'>✕</button>";
     win.appendChild(head);
     head.addEventListener("mousedown", (ev) => {
       if (ev.target.closest("button,input")) return;
@@ -11629,7 +11629,7 @@ function initCrystalBtn() {
     head.className = "cp-head";
     head.innerHTML = "<button class='cp-back'>‹ back</button><b>📜 "
       + esc(title) + "</b><span class='muted cp-count'></span>"
-      + "<button class='cp-x'>✕</button>";
+      + "<button class='cp-x' title='Close' aria-label='Close'>✕</button>";
     pop.appendChild(head);
     dragBy(head);
     head.querySelector(".cp-back").onclick = () => draw();
@@ -11875,7 +11875,7 @@ function initCrystalBtn() {
     head.innerHTML = "<button class='cp-back'>‹ cabinet</button>"
       + "<b>🌆 the influence observatory</b>"
       + "<span class='muted cp-count'></span>"
-      + "<button class='cp-x'>✕</button>";
+      + "<button class='cp-x' title='Close' aria-label='Close'>✕</button>";
     pop.appendChild(head);
     dragBy(head);
     head.querySelector(".cp-back").onclick = () => { obsStop(); draw(); };
@@ -12153,7 +12153,7 @@ function initCrystalBtn() {
       + "<span class='muted'>drag me · corner resizes</span>"
       + "<button class='cp-obs' title='the influence observatory — "
       + "watch the active crystal seed the cast (#822)'>🌆</button>"
-      + "<button class='cp-x'>✕</button>";
+      + "<button class='cp-x' title='Close' aria-label='Close'>✕</button>";
     pop.appendChild(head);
     dragBy(head);
     head.querySelector(".cp-obs").onclick = () => openObservatory();
@@ -12225,8 +12225,8 @@ function initCrystalBtn() {
       hd.className = "cp-mindrow cp-mindhead";
       hd.innerHTML = "<span>in</span><span>mind</span>"
         + "<span class='cp-md-n'>chunks</span><span class='cp-md-all'>"
-        + "<button class='cp-exall' title='expand every mind'>⊞</button>"
-        + "<button class='cp-coall' title='collapse everything'>⊟"
+        + "<button class='cp-exall' title='expand every mind' aria-label='expand every mind'>⊞</button>"
+        + "<button class='cp-coall' title='collapse everything' aria-label='collapse everything'>⊟"
         + "</button></span>";
       r3.appendChild(hd);
       hd.querySelector(".cp-exall").onclick = () =>
