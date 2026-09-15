@@ -19021,6 +19021,135 @@ _SLOT_STARVED = [0]
 SLOT_STARVED_MOST = 3
 
 
+# --- #1177: THE TWO ROADS THE RUNNING ORDER CANNOT ASK FOR ------------
+#
+# The operator, at the production board: "I want a deep agentic
+# investigation into why these do not have their lines for straight or
+# never how they they never make it to the segments or into the script."
+#
+# "These" are station IDs and record intros and send-offs: 0 written,
+# 0 recorded, 0 ready, 0s standing by, on every counter prep_board()
+# keeps, beside six roads that are all producing.
+#
+# MEASURED, NOT INFERRED.  Both roads AIR - 30 station IDs and 92 record
+# intros and send-offs in twenty-four hours of air_log.  Neither is in
+# CANNOT_PREPARE.  Neither is in PREP_SHORT_HORIZON.  Both have a working
+# writer - prep_station_id, prep_track_talk - the drop voice is set, and
+# track_talk_on() is on.  So the zeroes are a statement about
+# PREPARATION, not about existence.
+#
+# THE BREAK.  Wanting is expressed in exactly one currency.
+# schedule_demand_entries() walks the running order;
+# commitment_inventory_plan() binds stock to those entries;
+# commitment_write_needed() asks that plan whether a road still owes
+# seconds.  Every other road on the board is NAMED BY THE SHEET, so every
+# other road can want something.  These two are fired by EVENTS instead -
+# a station ID by the SFX guy cycle, a record talk by the needle going
+# down - and the sheet has no entry for either.  Measured on the live
+# sheet: the next four hours owe gallery, banter_caller, news, banter,
+# caller, manager and ad, and name neither of these two even as
+# live-only.  The sheet own `record` rows, four an hour, are in
+# CANNOT_PREPARE and skipped before a road is derived from them, so not
+# even the record a track talk rides expresses demand for it.
+#
+# So commitment_write_needed() is False for both on every pass, for ever.
+# prep_plan drops them off the board with "every second owed in the next
+# four hours is already assigned to FIFO stock", and _prep_one_work would
+# refuse them at the same door if anything ever reached it.  Neither
+# writer has been called: data/track_talk_queue.json, which
+# prep_track_talk rewrites after every write, is two bytes and three days
+# old, the persisted shelf holds 0 rows on both roads against 144 calls
+# and 116 gallery rounds, and the lookahead log carries not one line
+# about either road while naming all six of the others.
+#
+# WHAT IT COSTS, off gap_log over the same twenty-four hours.  A road
+# that banks runs about one second of dead air per airing: banter 1.1,
+# gallery 1.1, memos 1.3, calls 1.7.  Record talk runs 77.8 seconds a
+# turn - 4,748 seconds of silence in a day, the third-heaviest road on
+# the station - and station IDs 59.7.  Every one of those is the writing
+# desk and the engine being asked for a record introduction while the
+# record is already over.  The coordinator counts 434 arrivals with
+# nothing prepared on track talk this session alone.
+#
+# THE CURE IS NOT A NEW ROAD.  It is to let these two say they want
+# something in the currency they already have.  Track talk knows its
+# lookahead through track_talk_full(); a station ID shelf knows its own
+# depth through shelf_full().  Both predicates are already consulted two
+# lines below the door that refuses them - so nothing is stocked past the
+# ceilings that stand today.  The roads simply stop being refused before
+# they reach them.
+#
+# Behind a switch that DEFAULTS OFF, in the shape of manager_calls_in: a
+# file under data/, re-read every few seconds, no restart and no settings
+# round trip.  Off, this is the station exactly as it runs tonight.
+EVENT_ROADS_SWITCH_PATH = data_path("event_roads_prepare")
+EVENT_ROADS_SWITCH_EVERY = 5.0
+_EVENT_ROADS_SWITCH: dict[str, Any] = {"at": 0.0, "on": False, "said": None}
+# Deliberately not "every road with an empty shelf".  These are the two
+# the sheet has no entry for AT ALL, and the two the air log shows going
+# out live every single time.
+EVENT_DRIVEN_ROADS = ("station_id", "track_talk")    # EVT_ROADS_MARK_A
+
+
+def event_roads_prepare() -> bool:
+    """#1177: may the two event-driven roads ask for work themselves?
+
+    Read off <data>/event_roads_prepare every EVENT_ROADS_SWITCH_EVERY
+    seconds and memoised in between - this is asked once per road per
+    planning pass, and a share read per road per pass is a share read per
+    road per pass.  Never raises: an unreadable switch is an off switch,
+    and off is the station exactly as it runs now.
+
+    Says so in the log when it CHANGES, and only then - a line every five
+    seconds saying the switch is still off is not a log."""
+    now = time.time()
+    if now - float(_EVENT_ROADS_SWITCH["at"]) < EVENT_ROADS_SWITCH_EVERY:
+        return bool(_EVENT_ROADS_SWITCH["on"])
+    on = False
+    try:
+        on = EVENT_ROADS_SWITCH_PATH.read_text(
+            errors="replace").strip().lower() == "on"
+    except Exception:  # noqa: BLE001
+        on = False                      # missing, unreadable, mid-write
+    was = _EVENT_ROADS_SWITCH["said"]
+    _EVENT_ROADS_SWITCH.update({"at": now, "on": on, "said": on})
+    if was is not None and bool(was) != on:
+        try:
+            pipeline_log("lookahead", "#1177: %s (%s says %s)"
+                         % ("station IDs and record talk may be stacked "
+                            "ahead now - their own shelves say when"
+                            if on else
+                            "station IDs and record talk are live-only "
+                            "again - only the running order may ask",
+                            EVENT_ROADS_SWITCH_PATH.name,
+                            "on" if on else "off"))
+        except Exception:  # noqa: BLE001
+            pass
+    return on
+
+
+def event_road_wants(kind: str) -> bool:
+    """#1177: has this event-driven road room for one more, in its OWN
+    terms?
+
+    The very predicates prep_plan tests two lines below the door, asked
+    two lines early so the road is not refused before it reaches them.
+    That is the whole of the change: no new ceiling, no new shelf, and no
+    road stocked past what shelf_full() and track_talk_full() already
+    allow.
+
+    Anything going wrong reads as NO, which builds nothing - the safe
+    direction, and the one shelf_full() itself takes."""
+    try:
+        if str(kind) == "track_talk":
+            return not track_talk_full()
+        if str(kind) == "station_id":
+            return not shelf_full("station_id")
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 def prep_plan(skip: Any = None) -> dict[str, Any]:
     """WHAT to prepare next and WHY - the whole decision, in one place,
     written down so the operator can read the reasoning.
@@ -19161,6 +19290,15 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                     _needs_script = True        # #1131: the hour says so
                 if kind == "caller" and story_bank_short():
                     _needs_script = True        # #1033: the caller floor
+                # #1177: ...and the two roads the sheet cannot name.
+                # The commitment ledger can never owe them a second,
+                # so without this they are dropped off the board on
+                # every pass for ever.  Their own shelves are the
+                # demand, because nothing else is.
+                if (not _needs_script and event_roads_prepare()
+                        and kind in EVENT_DRIVEN_ROADS):
+                    # EVT_ROADS_MARK_B
+                    _needs_script = event_road_wants(kind)
                 if not _needs_script and not _can_finish_here:
                     _off[kind] = ("every second owed in the next four hours "
                                   "is already assigned to FIFO stock")
@@ -35970,6 +36108,13 @@ async def _prep_one_work(kind: str) -> bool:
         if (not _new_script and str(kind) == "caller"
                 and story_bank_short()):
             _new_script = True
+        # #1177: the same door, and the same two roads.  The planner
+        # above may now choose them; without this they would still be
+        # refused here, on the very pass that chose them.
+        if (not _new_script and event_roads_prepare()
+                and str(kind) in EVENT_DRIVEN_ROADS):
+            # EVT_ROADS_MARK_C
+            _new_script = event_road_wants(str(kind))
         if (not _new_script
                 and not (str(kind) == "track_talk" and _assigned_unready)):
             prep_note(str(kind), "four-hour obligations assigned")
