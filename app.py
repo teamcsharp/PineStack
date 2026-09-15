@@ -106118,6 +106118,41 @@ _PINELINK_LAST: dict[str, Any] = {"bytes": b"", "at": 0.0}
 PINELINK_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
+_PINELINK_CENSUS: dict[str, Any] = {"at": 0.0, "busy": False,
+                                    "clips": 0, "kept_bytes": 0, "newest": ""}
+PINELINK_CENSUS_TTL = 10.0
+
+
+def _pinelink_census_refresh() -> None:
+    try:
+        clips = sorted(pinelink_clips_dir().glob("*.mp4"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        _PINELINK_CENSUS.update({
+            "clips": len(clips),
+            "kept_bytes": sum(p.stat().st_size for p in clips),
+            "newest": clips[0].name if clips else ""})
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _PINELINK_CENSUS["at"] = time.time()
+        _PINELINK_CENSUS["busy"] = False
+
+
+def pinelink_census() -> dict[str, Any]:
+    """How many clips are kept, how big, which is newest - answered from a
+    memo and refreshed on a daemon thread when it is older than ten
+    seconds. The first caller after a restart sees zeros for a moment,
+    which is a truthful 'not counted yet' and costs the loop nothing."""
+    from threading import Thread
+    now = time.time()
+    if (now - float(_PINELINK_CENSUS.get("at") or 0) > PINELINK_CENSUS_TTL
+            and not _PINELINK_CENSUS.get("busy")):
+        _PINELINK_CENSUS["busy"] = True
+        Thread(target=_pinelink_census_refresh, name="pinelink-census",
+               daemon=True).start()
+    return {k: _PINELINK_CENSUS.get(k) for k in ("clips", "kept_bytes", "newest")}
+
+
 def pinelink_state() -> dict[str, Any]:
     """What the link says about itself, plus what is actually on disk.
 
@@ -106136,14 +106171,14 @@ def pinelink_state() -> dict[str, Any]:
         got["fresh"] = bool(time.time() - float(got.get("at") or 0) < 30.0)
     except Exception:  # noqa: BLE001
         got["fresh"] = False
-    try:
-        clips = sorted(pinelink_clips_dir().glob("*.mp4"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        got["clips"] = len(clips)
-        got["kept_bytes"] = sum(p.stat().st_size for p in clips)
-        got["newest"] = clips[0].name if clips else ""
-    except Exception:  # noqa: BLE001
-        got["clips"] = 0
+    # 2026-09-14: THE CENSUS IS NOT TAKEN ON THE LOOP. This globbed and
+    # stat()ed the clips folder on every call - and every frame the
+    # tune page pulls (four a second per viewer) calls it through
+    # pinelink_viewer_ok, every panel every five seconds through
+    # /api/pinelink/state. The gap log named it a top blocker in the
+    # 17:00 hour (1.5-2.7 s stalls on a disk the store's save was
+    # starving). Stale-while-refreshing on a thread, ten seconds.
+    got.update(pinelink_census())
     # #1118: the operator pressed the camera on from a desk - the tablet
     # watches this stamp and puts its notice in the middle of the screen.
     got["announce_at"] = float(_PINELINK_ANNOUNCE.get("at") or 0)
@@ -108014,12 +108049,22 @@ def share_path_of(path: Path | str) -> str:
     return ""
 
 
+_PINELINK_PREFS_MEMO: dict[str, Any] = {"at": 0.0, "got": {}}
+
+
 def pinelink_prefs_read() -> dict[str, Any]:
+    """Five-second memo: the gap log caught even this one-kilobyte read
+    blocking the loop on a starved disk (pinelink_prefs_read, 18:00)."""
+    now = time.time()
+    if now - float(_PINELINK_PREFS_MEMO.get("at") or 0) < 5.0:
+        return dict(_PINELINK_PREFS_MEMO.get("got") or {})
     try:
         got = json.loads(PINELINK_PREF.read_text())
-        return got if isinstance(got, dict) else {}
+        got = got if isinstance(got, dict) else {}
     except Exception:  # noqa: BLE001
-        return {}
+        got = {}
+    _PINELINK_PREFS_MEMO.update({"at": now, "got": dict(got)})
+    return dict(got)
 
 
 def pinelink_prefs_write(patch: dict[str, Any]) -> dict[str, Any]:
@@ -108028,6 +108073,7 @@ def pinelink_prefs_write(patch: dict[str, Any]) -> dict[str, Any]:
     got.update(patch)
     PINELINK_PREF.parent.mkdir(parents=True, exist_ok=True)
     PINELINK_PREF.write_text(json.dumps(got))
+    _PINELINK_PREFS_MEMO.update({"at": time.time(), "got": dict(got)})
     return got
 
 
@@ -208366,22 +208412,55 @@ setTimeout(clockLoop, 1500);
     bar.appendChild(fold);
     shot = document.createElement("img");
     shot.alt = "the Pine Cam";
-    /* A frame that fails to load must not leave the browser's broken-image
-     * glyph sitting over the show; the next tick replaces it anyway. */
-    shot.addEventListener("error", function () { shot.removeAttribute("src"); });
+    /* 2026-09-14: the visible <img> is only ever handed a frame that has
+     * ALREADY decoded (see draw), so a failure never reaches it and the
+     * last good picture stays up instead of a blank or a broken glyph. */
     box.appendChild(bar);
     box.appendChild(shot);
     document.body.appendChild(box);
   }
 
+  /* 2026-09-14: WHY IT FLASHED, AND WHY THE CAR CHOKED WITH IT.
+   *
+   * This set a new src on the visible <img> every 250 ms whatever the
+   * link was doing, and cleared it on any failure. Over a phone in a
+   * car that is four 40 kB fetches a second (1.3 Mbit/s) queued behind
+   * each other on the same funnel as the audio; each one that timed
+   * out blanked the picture, each one that arrived repainted it from
+   * black - the "flashing" - and every one of them made the station
+   * count its clips folder on the event loop (pinelink_state, measured
+   * 1.5-2.7 s stalls in the gap log), which is the loop the mp3 mixer
+   * rides. So: ONE frame in flight at a time, fetched into an offscreen
+   * Image and handed to the visible <img> only once decoded, and the
+   * pace follows the link - four a second on the LAN, one every few
+   * seconds on a slow tower, never a queue. */
+  var pending = false;
+  var paceMs = 250;
   function draw() {
     if (!mayShow || !frameUrl || folded) return;
     /* A hidden tab is a tab nobody is watching, and a phone throttles
      * these timers anyway - so stop asking rather than queue up a burst
      * of stale frames to be fetched the moment it wakes. */
     if (document.hidden) return;
-    if (!shot) return;
-    shot.src = stamp(frameUrl);
+    if (!shot || pending) return;
+    pending = true;
+    var t0 = Date.now();
+    var img = new Image();
+    img.onload = function () {
+      pending = false;
+      var took = Date.now() - t0;
+      paceMs = Math.max(250, Math.min(4000, Math.round(paceMs * 0.5 + took * 0.8)));
+      if (shot && mayShow && !folded) shot.src = img.src;
+    };
+    img.onerror = function () {
+      pending = false;
+      paceMs = Math.min(4000, paceMs * 2);   /* back off; the last frame stays */
+    };
+    img.src = stamp(frameUrl);
+  }
+  function drawLoop() {
+    try { draw(); } catch (e) { pending = false; }
+    setTimeout(drawLoop, paceMs);
   }
 
   async function ask() {
@@ -208408,7 +208487,7 @@ setTimeout(clockLoop, 1500);
     try { ask(); } catch (e) {}
     setTimeout(loop, 15000);
   }
-  timer = setInterval(draw, 250);
+  drawLoop();                              /* 2026-09-14: paced, not fixed */
   setTimeout(loop, 1200);
 })();
 </script>
