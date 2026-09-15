@@ -69269,7 +69269,17 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
 
     if sfx_due_after(completed, int(settings.get("sfx_every_units") or 0)):
         _SFX_CADENCE_STATUS["sample_due"] += 1
-        sample = await asyncio.to_thread(_sfx_cadence_pick)
+        # #1185: the cadence is the OTHER road that welds a sound effect
+        # into the round's own wav, and #1263 made it audio-only on
+        # purpose - which is exactly what makes it a second track under
+        # the endless set. While the video is the singular SFX track it
+        # is not picked at all; `sample_omitted` below counts it as the
+        # omission it is, and _SFX_SOUNDBOARD counts WHY. The SFX guy's
+        # own half of this function - his voice, his take, his quip - is
+        # three lines down and is deliberately not touched: "Continue to
+        # have the SFX guy do dialogue."
+        sample = (None if sfx_soundboard_hold_cadence()
+                  else await asyncio.to_thread(_sfx_cadence_pick))
         duration = sfx_seconds(sample) if sample else 0.0
         if sample and fits(duration):
             additions.append({"path": str(sample), "who": "board", "text": "🔊 " + sample.stem,
@@ -69663,6 +69673,7 @@ def sfx_video_mode_state() -> dict[str, Any]:
             "book": sfx_db_counts().get("video_playable", 0),
             "queued": int(cycle.get("queued") or 0),
             "asked": len(cycle.get("requests") or []),        # #1417: the SFX guy's clips waiting their turn
+            "soundboard": sfx_soundboard_state(),          # #1185: the singular-track rule
             "ahead_s": max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1)),
             # 2026-09-15 (#1184): AND WHAT SEAMLESS IS DOING, in the same
             # voice, on the same line - because a switch whose effect the
@@ -69689,6 +69700,363 @@ def sfx_video_mode_state() -> dict[str, Any]:
                                    (" - seamless is armed and will take "
                                     "effect when the set is on")
                                    if sfx_video_seam_on() else ""))}
+
+
+# --- #1185: THE ENDLESS SET IS THE SFX GUY'S SOUNDBOARD --------------------
+#
+# "when the endless video is enabled, have that take over for the SFX guy
+#  using SFX effects. Have the video be the singular SFX track when
+#  enabled. Continue to have the SFX guy do dialogue. But have him use the
+#  endless video as his soundboard when its active."
+#
+# WHAT WAS MEASURED.  With the endless set lit there were THREE roads that
+# could put a sound effect on the air, not one:
+#
+#   1. dj_sting - already closed.  #1417 hands a video sting to the cycle
+#      and refuses an audio one while the cycle has something planned.
+#   2. the round assembler - NOT closed.  It read
+#          _sting = "" if _keep_mic else sting_due()
+#      and appended the chosen file straight into `seg`, the list the
+#      concat graph welds into the round's own wav.  It never asked
+#      sfx_video_mode_on() at all.  Every sting heard DURING a round came
+#      through here, not through dj_sting, so #1417 never saw them: the
+#      operator heard a picture with its own soundtrack on the tube and an
+#      unrelated clip welded into the speech underneath it.
+#   3. the cadence - NOT closed.  _sfx_cadence_additions_inner drops a
+#      sample into the same `seg` every sfx_every_units turns, drawn from
+#      the drop folders.  #1263 made that road AUDIO ONLY on purpose, which
+#      is exactly what makes it the second track the operator is hearing.
+#
+# WHAT THIS DOES.  When the rule is in force, a sting the round chose is not
+# appended to the segment.  It is handed to the cycle the way #1417 hands
+# one, so the video that appears IS the sting - "have him use the endless
+# video as his soundboard".  A sting with no picture is handed nowhere: it
+# is withheld while the cycle has something planned, which is the same
+# refusal #1417 already makes on the other road, and it is the whole of
+# "the video be the singular SFX track".  The cadence sample is held for
+# the same reason and counted, so the holding is visible rather than felt.
+#
+# WHAT THIS DOES NOT TOUCH: HIS MOUTH.  sfxguy_gap_talk, sfxguy_line, the
+# quips, sfxguy_ready_pick, the drop voice's liners and the SFX guy's own
+# half of _sfx_cadence_additions all run exactly as they run tonight.
+# "Continue to have the SFX guy do dialogue" is the one thing this must not
+# cost him, and nothing in this block reads or writes any of those roads.
+#
+# THE SWITCH, in the shape of <data>/modifiers/mode and
+# <data>/record_talk/mode: <data>/sfx_soundboard/mode, ONE word, re-read at
+# most every SOUNDBOARD_TTL seconds, no restart and no settings round trip.
+#
+#   off        the station exactly as it runs tonight.  The default, and
+#              what a missing, empty, unreadable or wordy file reads as.
+#   trace      counts what the rule WOULD have diverted and changes nothing
+#              that airs - the honest way to find out how loud the second
+#              source really is before silencing it.
+#   singular   the rule in force.
+#
+# The parse is track_talk_segment's STRICTER one, not station_modifiers':
+# ONE TOKEN OR NOTHING.  A switch file holding "singular after the news" is
+# OFF, because an operator must not be able to hand the station's whole
+# sound over to a new road by leaving himself a note in the same file.
+# "on" is read as `singular`, because that is plainly what somebody typing
+# it meant and because the two switches beside this one read it that way.
+#
+# The rule also needs the endless set ITSELF to be on.  With the set off
+# there is no tube for anything to be singular on, and every question below
+# answers exactly as it did before this block existed.
+SOUNDBOARD_DIR = data_path("sfx_soundboard")
+SOUNDBOARD_MODE_OFF = "off"
+SOUNDBOARD_MODE_TRACE = "trace"
+SOUNDBOARD_MODE_SINGULAR = "singular"
+SOUNDBOARD_MODES = (SOUNDBOARD_MODE_OFF, SOUNDBOARD_MODE_TRACE,
+                    SOUNDBOARD_MODE_SINGULAR)
+SOUNDBOARD_TTL = 3.0
+SOUNDBOARD_ENV = "SPARK_AGENT_SFX_SOUNDBOARD"
+_SFX_SOUNDBOARD_SWITCH = {"at": 0.0, "mode": SOUNDBOARD_MODE_OFF,
+                          "said": None}
+# The accounting the operator asked to be able to read back: how many of his
+# stings rang on the tube instead of in the segment, how many hand-offs the
+# cycle refused because four were already waiting, how many audio stings and
+# cadence samples were withheld, and - in `trace` - how many WOULD have been.
+_SFX_SOUNDBOARD = {"to_cycle": 0, "refused": 0, "withheld": 0,
+                   "cadence_held": 0, "would": 0, "would_cadence": 0,
+                   "last": "", "at": 0.0}
+
+
+def sfx_soundboard_parse(text: Any) -> str:
+    """One word into a mode.  Anything else at all is OFF.
+
+    ONE WORD MEANS ONE WORD: a file holding a sentence is off, however
+    promising a word inside it looks.  station_modifiers.parse_mode scans
+    for a word it knows anywhere in the text; under that rule a file
+    reading "SINGULAR PLEASE" would turn the station's sound over, which is
+    a switch an operator can throw by leaving himself a note."""
+    words = str(text or "").replace(",", " ").split()
+    if len(words) != 1:
+        return SOUNDBOARD_MODE_OFF
+    low = words[0].strip().lower()
+    if low in SOUNDBOARD_MODES:
+        return low
+    return SOUNDBOARD_MODE_SINGULAR if low == "on" else SOUNDBOARD_MODE_OFF
+
+
+def sfx_soundboard_say(mode: str = "") -> str:
+    """One plain sentence for whichever surface is asking."""
+    mode = str(mode or "")
+    if mode == SOUNDBOARD_MODE_SINGULAR:
+        return ("the endless set is the SFX guy's soundboard - his stings "
+                "ring on the tube, and nothing else punctuates")
+    if mode == SOUNDBOARD_MODE_TRACE:
+        return ("counting only - his stings still splice into the round "
+                "and the tube still plays its own clips as well")
+    return ("off - the round splices its own stings under the set, as the "
+            "station has always run")
+
+
+def sfx_soundboard_mode() -> str:
+    """off | trace | singular.  Never raises; an unreadable switch is off.
+
+    Says so in the log when it CHANGES and only then: a line every few
+    seconds saying the switch is still off is not a log."""
+    now = time.time()
+    try:
+        last = float(_SFX_SOUNDBOARD_SWITCH.get("at") or 0.0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if last and 0.0 <= now - last < SOUNDBOARD_TTL:
+        return str(_SFX_SOUNDBOARD_SWITCH.get("mode") or SOUNDBOARD_MODE_OFF)
+    text = ""
+    try:
+        text = (SOUNDBOARD_DIR / "mode").read_text(
+            encoding="utf-8", errors="replace").strip()
+    except (OSError, ValueError):
+        text = ""
+    except Exception:  # noqa: BLE001
+        text = ""
+    if not text:
+        try:
+            text = str(os.environ.get(SOUNDBOARD_ENV, "") or "").strip()
+        except Exception:  # noqa: BLE001
+            text = ""
+    mode = sfx_soundboard_parse(text)
+    was = _SFX_SOUNDBOARD_SWITCH.get("said")
+    _SFX_SOUNDBOARD_SWITCH["at"] = now
+    _SFX_SOUNDBOARD_SWITCH["mode"] = mode
+    if mode != was:
+        _SFX_SOUNDBOARD_SWITCH["said"] = mode
+        if was is not None:
+            try:
+                pipeline_log("air", "#1185: the soundboard switch reads %s - %s"
+                             % (mode, sfx_soundboard_say(mode)))
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def sfx_soundboard_singular() -> bool:
+    """Is the singular-track rule in force RIGHT NOW?
+
+    Both halves, every time: the switch AND the endless set.  With the set
+    off there is no tube to be singular on and nothing below may change."""
+    try:
+        return (sfx_soundboard_mode() == SOUNDBOARD_MODE_SINGULAR
+                and sfx_video_mode_on())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def sfx_soundboard_hand_off(sample: Any, who: str = "round") -> str:
+    """The round asks: does this sting still belong in the segment?
+
+    An EMPTY string means "yours - splice it exactly as you always have".
+    Anything else is the reason it is not yours, and the caller must not
+    append it to the segment:
+
+        queued     it was handed to the cycle and the tube will ring it
+        refused    the cycle already had four of his clips waiting
+        withheld   it has no picture, and the tube is busy with one
+
+    THE REST TIMER, AND WHY IT IS STAMPED ON ALL THREE.
+
+    _STING_AT is the "never twice inside the gap" clock: sting_due() reads
+    it and refuses to roll the dice again until _sting_rest has passed.
+    The road this replaces stamped it at the moment it appended the file to
+    the segment, so the stamp has always meant "he has just punctuated".
+
+    Not stamping was the obvious mistake to make.  A round is assembled
+    turn by turn and sting_due() is rolled on every booth turn, so a
+    six-turn round rolls six times; if a diverted sting left the clock
+    untouched he would roll again on the very next turn with no rest at
+    all, hand the cycle a second clip, then a third, then a fourth, and the
+    cycle's own cap (four waiting, sfx_cycle_request) would start refusing
+    them.  That turns a cadence into a firehose and then into a wall of
+    refusals, and it makes sting_due() redraw its pool sets on every turn
+    for nothing.
+
+    Stamping on a REFUSAL looks like it costs him a cadence he never spent,
+    and it is worth saying plainly why it does not.  A refusal means four
+    of his own clips are already queued for the tube - his punctuation is
+    not missing, it is in flight, and it will be heard before anything he
+    could add now.  Resting is the honest reading of that.  The same is
+    true of a withheld audio sting: the tube is carrying a clip with a
+    soundtrack at that exact moment, so something of his IS sounding.
+
+    And it is what the other road already does.  dj_sting stamps _STING_AT
+    before the #1417 gate, so a video sting handed to the cycle there and
+    an audio sting refused there both spend the cadence.  Two roads that
+    disagree about what the rest clock means is how a station ends up with
+    a stuck-key soundboard on one road and silence on the other, so this
+    one matches it exactly.
+
+    In `trace` NOTHING is stamped and nothing is handed anywhere - the
+    counters move and the segment gets its sting exactly as it does now.
+    That is what "changes nothing that airs" has to mean to be useful."""
+    if sample is None or not sample:
+        return ""
+    try:
+        mode = sfx_soundboard_mode()
+    except Exception:  # noqa: BLE001
+        return ""
+    if mode == SOUNDBOARD_MODE_OFF:
+        return ""
+    try:
+        if not sfx_video_mode_on():
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        is_video = bool(sfx_is_video(sample))
+    except Exception:  # noqa: BLE001
+        is_video = False
+    try:
+        planned = time.time() < float(_SFX_CYCLE.get("until") or 0)
+    except Exception:  # noqa: BLE001
+        planned = False
+    # An audio sting with a DARK tube is not a second track - it is the
+    # only one.  The endless set can have nothing planned (the book empty,
+    # every clip rested, the cycle stalled on an error) and in that minute
+    # silence is worse than a sound effect.  #1417 draws the line in the
+    # same place and this must not draw it anywhere else.
+    if not is_video and not planned:
+        return ""
+    try:
+        name = str(getattr(sample, "stem", "") or sample)
+    except Exception:  # noqa: BLE001
+        name = "a clip"
+    if mode == SOUNDBOARD_MODE_TRACE:
+        _SFX_SOUNDBOARD["would"] = int(_SFX_SOUNDBOARD.get("would") or 0) + 1
+        _SFX_SOUNDBOARD["last"] = ("%s would have gone to the tube" % name
+                                   if is_video else
+                                   "%s would have been withheld" % name)
+        _SFX_SOUNDBOARD["at"] = time.time()
+        return ""
+    verdict = "withheld"
+    if is_video:
+        try:
+            verdict = "queued" if sfx_cycle_request(sample, who) else "refused"
+        except Exception:  # noqa: BLE001
+            verdict = "refused"
+    _STING_AT[0] = time.time()                  # see the docstring above
+    key = {"queued": "to_cycle", "refused": "refused",
+           "withheld": "withheld"}[verdict]
+    _SFX_SOUNDBOARD[key] = int(_SFX_SOUNDBOARD.get(key) or 0) + 1
+    _SFX_SOUNDBOARD["last"] = "%s: %s" % (name, verdict)
+    _SFX_SOUNDBOARD["at"] = time.time()
+    try:
+        pipeline_log("air", "#1185: %s %s - the endless set is his "
+                            "soundboard" % (
+                                name,
+                                {"queued": "was handed to the cycle instead of "
+                                           "the segment",
+                                 "refused": "could not be handed over - four "
+                                            "of his clips are already waiting",
+                                 "withheld": "has no picture and the tube is "
+                                             "busy, so it was withheld"}[verdict]))
+    except Exception:  # noqa: BLE001
+        pass
+    return verdict
+
+
+def sfx_soundboard_hold_cadence() -> bool:
+    """Should the cadence's sample be held back this turn?
+
+    The cadence is the OTHER way a sound effect reaches the round's wav
+    (#1263 made it audio-only, which is precisely why it is a second track
+    under the set).  It is not handed to the cycle, and that is deliberate:
+    the clip it picks has no picture by construction, and the cycle's road
+    is page_picture_append - a soundtrack with nothing to show is not what
+    the tube is for.  It is held, and counted, and the tube goes on ringing
+    clips back to back anyway, so his punctuation is not lost.
+
+    His own half of the cadence - sfxguy_ready_pick, the take in his voice -
+    is NOT affected by this and is not read here.  That is the dialogue."""
+    try:
+        mode = sfx_soundboard_mode()
+        if mode == SOUNDBOARD_MODE_OFF or not sfx_video_mode_on():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    if mode == SOUNDBOARD_MODE_TRACE:
+        _SFX_SOUNDBOARD["would_cadence"] = int(
+            _SFX_SOUNDBOARD.get("would_cadence") or 0) + 1
+        return False
+    _SFX_SOUNDBOARD["cadence_held"] = int(
+        _SFX_SOUNDBOARD.get("cadence_held") or 0) + 1
+    _SFX_SOUNDBOARD["last"] = "a cadence sample was held for the tube"
+    _SFX_SOUNDBOARD["at"] = time.time()
+    return True
+
+
+def sfx_soundboard_state() -> dict[str, Any]:
+    """What happened, in the operator's own three questions.
+
+    How many of his stings went to the cycle instead of the segment, how
+    many hand-offs were refused because the queue was full, and whether the
+    singular-track rule is in force right now."""
+    try:
+        mode = sfx_soundboard_mode()
+    except Exception:  # noqa: BLE001
+        mode = SOUNDBOARD_MODE_OFF
+    try:
+        on = bool(sfx_video_mode_on())
+    except Exception:  # noqa: BLE001
+        on = False
+    try:
+        waiting = len(_SFX_CYCLE.get("requests") or [])
+    except Exception:  # noqa: BLE001
+        waiting = 0
+    force = bool(mode == SOUNDBOARD_MODE_SINGULAR and on)
+    book = dict(_SFX_SOUNDBOARD)
+    if force:
+        say = ("the video is the singular SFX track - %d sting(s) rang on "
+               "the tube instead of in the round, %d hand-off(s) were "
+               "refused with the queue full, %d audio sting(s) and %d "
+               "cadence clip(s) were held, %d waiting"
+               % (book.get("to_cycle") or 0, book.get("refused") or 0,
+                  book.get("withheld") or 0, book.get("cadence_held") or 0,
+                  waiting))
+    elif mode == SOUNDBOARD_MODE_SINGULAR:
+        say = ("the switch says singular, but the endless set is off - "
+               "nothing is being diverted and nothing is being held")
+    elif mode == SOUNDBOARD_MODE_TRACE:
+        say = ("counting only%s - %d sting(s) and %d cadence clip(s) would "
+               "have left the round if the rule were in force"
+               % ("" if on else " (and the endless set is off)",
+                  book.get("would") or 0, book.get("would_cadence") or 0))
+    else:
+        say = sfx_soundboard_say(mode)
+    return {"mode": mode, "in_force": force, "endless": on,
+            "positions": list(SOUNDBOARD_MODES),
+            "switch": str(SOUNDBOARD_DIR / "mode"),
+            "to_cycle": int(book.get("to_cycle") or 0),
+            "refused": int(book.get("refused") or 0),
+            "withheld": int(book.get("withheld") or 0),
+            "cadence_held": int(book.get("cadence_held") or 0),
+            "would": int(book.get("would") or 0),
+            "would_cadence": int(book.get("would_cadence") or 0),
+            "waiting": waiting,
+            "last": str(book.get("last") or ""),
+            "at": float(book.get("at") or 0.0),
+            "say": say}
 
 
 def sting_due() -> Path | None:
@@ -86035,7 +86403,39 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         turn_ix.append(-1)
                         line_ids.append(uuid.uuid4().hex)               # #1277
                         _sfx_extra_seconds += _extra["seconds"] + max(CONCAT_BEAT)
+                    # #1185: THE TUBE IS THE STING, AND THE SEGMENT IS NOT.
+                    #
+                    # "Have the video be the singular SFX track when enabled. ... have
+                    # him use the endless video as his soundboard when its active."
+                    #
+                    # THIS is the road every sting heard during a round took, and it
+                    # never asked whether the endless set was on. #1417 closed the
+                    # other door (dj_sting) and this one stayed open, so with the set
+                    # lit the operator heard two sound sources at once: the cycle's
+                    # clip on the tube with its own soundtrack, and whatever this
+                    # picked welded into the round's wav underneath it.
+                    #
+                    # sfx_soundboard_hand_off returns empty when the rule is not in
+                    # force, so with the switch off or the set off `_sting` survives
+                    # and everything below runs exactly as it has all along - the gold
+                    # bar, the seg append, the board row in the transcript, the log
+                    # line. When the rule IS in force it returns the reason instead
+                    # (queued to the cycle, refused with four already waiting, or
+                    # withheld because the clip has no picture and the tube is busy),
+                    # the sting is dropped here, and the whole block below is skipped
+                    # together - which it has to be, because seg_ix indexes into seg
+                    # and a transcript row for audio that was never appended would
+                    # point at the line before it.
+                    #
+                    # It also stamps the rest clock. The reasoning is written out in
+                    # full in sfx_soundboard_hand_off's docstring; the short of it is
+                    # that a refusal means four of his clips are already queued for
+                    # the tube, so resting is honest, and that dj_sting has always
+                    # stamped before its own #1417 gate.
                     _sting = "" if _keep_mic else sting_due()
+                    _sting_tube = sfx_soundboard_hand_off(_sting, "round") if _sting else ""
+                    if _sting_tube:
+                        _sting = ""
                     if _sting:
                         # Gold: a rhymed bar that already aired comes back
                         # from the other seat, the sting lands after it.
@@ -126413,7 +126813,8 @@ async def dj_graph_api(
                             for f in await asyncio.to_thread(sfx_folders)],
                 "made": len(list(SFX_MADE_DIR.glob("scratch-*.wav")))
                         if SFX_MADE_DIR.is_dir() else 0,
-                "rate": dj["sfx_rate"], "last": _STING_AT[0]},
+                "rate": dj["sfx_rate"], "last": _STING_AT[0],
+                "soundboard": sfx_soundboard_state()},   # #1185 on /api/dj
         "news": {"every": dj["news_every"], "hourly": dj["news_hourly"],
                  "latest": ((_DRUDGE_CACHE["headlines"] or [{}])[0]
                             .get("title", "")
