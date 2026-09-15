@@ -1486,3 +1486,23 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
   color: #cfe0e6; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
   white-space: pre-wrap; word-break: break-word;
 }
+
+/* #1168b: which entry on the sheet, and the admitted occurrence.
+ *
+ * The entry the clock is standing on is the one worth finding in a list
+ * of candidates, so it is lit; the rest are plain. And `slot.say` above
+ * the two prompt buttons is the one sentence an operator could act
+ * wrongly on - "a prompt saved for this segment reaches the road rather
+ * than one entry" - so when it is a ROAD it is amber and boxed, and
+ * when it really is one entry it is quiet. */
+.sp-segcand-now .sp-segrow-k, .sp-segcand-now .sp-segrow-v { color: #65c7da; }
+.sp-segocc {
+  margin: 6px 0; padding: 5px 0 5px 9px;
+  border-left: 3px solid #4fb0a6; background: #080d11; border-radius: 0 6px 6px 0;
+}
+.sp-segpr-reach {
+  flex: 0 0 auto; margin: 8px 14px 0; padding: 7px 9px;
+  border: 1px solid #24323a; border-radius: 8px; background: #080d11;
+  font-size: 11px; line-height: 1.5; color: #8ea0ad;
+}
+.sp-segpr-reach.sp-segpr-wide { border-color: #e3be63; color: #e3be63; background: #1a150a; }

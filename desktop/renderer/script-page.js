@@ -2170,20 +2170,75 @@
         'No gap over twelve seconds between consecutive heard lines inside it.'));
     }
 
-    /* The admitted playback occurrence, when the station carries one.
-       It does not today: the answer measured on air holds the per-line
-       air times and the timing block and nothing named for the
-       occurrence, so this says that rather than dressing the line
-       stamps up as one. */
-    var play = d.playback || d.occurrence || d.admitted || null;
-    var ps = segSection(body, 'The admitted playback occurrence');
-    if (play && typeof play === 'object') {
-      for (var pk in play) {
-        if (!Object.prototype.hasOwnProperty.call(play, pk)) continue;
-        if (play[pk] && typeof play[pk] === 'object') continue;
-        segRow(ps, pk.replace(/_/g, ' '), play[pk]);
+    /* WHICH ENTRY ON THE SHEET THIS ROAD IS.
+     *
+     * Usually not one entry, and that is the truth rather than a gap:
+     * the ledger records the ROAD a round was written for and when it
+     * was committed, but never the slot it was reserved against - only
+     * the live _ready_slot window knew that, and it is gone by the time
+     * anybody inspects. So `candidates` is every entry of this road in
+     * the running order, `on_air_now` marks the one the clock is
+     * standing on, and `slot_id` is filled only when there is exactly
+     * one of them. The station's own sentence is printed rather than
+     * summarised, here and beside the prompt buttons, because an
+     * operator who thinks he has edited ONE entry when he has edited a
+     * road will not find out until it is on air. */
+    var slot = d.slot || null;
+    if (slot) {
+      var sl = segSection(body, 'Which entry on the sheet');
+      segRow(sl, 'the hour’s sheet', slot.preset);
+      segRow(sl, 'this one entry', slot.slot_id,
+        segHas(slot.slot_id) ? '' : 'the ledger does not record it');
+      var cands = slot.candidates || [];
+      for (var c = 0; c < cands.length; c += 1) {
+        var cand = cands[c] || {};
+        var cr = segRow(sl, cand.on_air_now ? 'on air now' : 'candidate',
+          segWord(cand.label, cand.kind) + ' (' + segWord(cand.id, '?') + ')',
+          segHas(cand.minutes) ? cand.minutes + ' min' : '');
+        if (cand.on_air_now) cr.classList.add('sp-segcand-now');
       }
-    } else {
+      if (!cands.length) {
+        sl.appendChild(make('div', 'sp-segrow-why',
+          'No entry on the running order runs this road.'));
+      }
+      if (slot.say) sl.appendChild(make('div', 'sp-segrow-why', String(slot.say)));
+    }
+
+    /* THE ADMITTED PLAYBACK OCCURRENCE, LINKED BY EVIDENCE.
+     *
+     * The gate matches a block to an occurrence by the line ids that
+     * occurrence admitted (falling back to the words for a welded round
+     * whose cue carries no row id), and `lines_matched` says how many
+     * landed. One it cannot link it does not claim - so an empty array
+     * is not "none", it is the bounded window having moved past this
+     * segment, and the station's own sentence says which. */
+    var adm = d.admission || null;
+    var ps = segSection(body, 'The admitted playback occurrence');
+    var occs = (adm && adm.occurrences) || [];
+    for (var o = 0; o < occs.length; o += 1) {
+      var occ = occs[o] || {};
+      var card = make('div', 'sp-segocc');
+      segRow(card, 'occurrence', occ.occurrence_id);
+      segRow(card, 'position', segHas(occ.position) ? occ.position : null);
+      segRow(card, 'state', segWord(occ.state, null) + (segHas(occ.outcome)
+        ? '  ·  ' + occ.outcome : ''));
+      segRow(card, 'lane', occ.lane);
+      segRow(card, 'producer', occ.producer, segHas(occ.origin)
+        ? 'origin: ' + occ.origin : '');
+      segRow(card, 'lines matched', segHas(occ.lines_matched) ? occ.lines_matched : null,
+        'how this occurrence was linked to this block - by its line ids,'
+        + ' not by assertion');
+      var au = occ.audio || null;
+      segRow(card, 'audio', au ? (segWord(au.media, 'no media named')
+        + (segHas(au.seconds) ? '  ·  ' + segSecs(au.seconds) : '')
+        + (segHas(au.bytes) ? '  ·  ' + au.bytes + ' bytes' : '')) : null,
+        au && au.hash_method ? 'hashed by ' + au.hash_method : '');
+      segRow(card, 'script revision', occ.script_revision);
+      segRow(card, 'performer session', occ.performer_session);
+      ps.appendChild(card);
+    }
+    if (adm && adm.say) ps.appendChild(make('div', 'sp-segrow-why', String(adm.say)));
+    else if (!occs.length) {
       ps.appendChild(make('div', 'sp-segrow-why', 'The station did not send'
         + ' one. The per-line air times below are what it does hold.'));
     }
@@ -2440,7 +2495,10 @@
       parts.push('round: ' + (ident.round || 'unknown')
         + ' (the station sent no round record)');
     }
-    parts.push('hour: ' + (ident.hour || 'unknown'));
+    /* The inspect route's hour is derived from the round's commit time -
+       the hour the segment was WRITTEN in - so it outranks the hour the
+       element happened to be painted under. */
+    parts.push('hour: ' + (segHas(d.hour) ? d.hour : (ident.hour || 'unknown')));
     if (d.available === false) {
       parts.push('the station has no record of this block: '
         + String(d.why || '').slice(0, 160));
@@ -2461,6 +2519,23 @@
           + ' ' + segSecs(holes[h].seconds));
       }
       parts.push('holes: ' + hs.join(', '));
+    }
+    /* The occurrence the gate LINKED to this block, by the line ids it
+       admitted. It is the one thing in the report that points at the
+       audio rather than at the words, so it is named before the digest
+       that may be cut. */
+    var occs = (d.admission && d.admission.occurrences) || [];
+    for (var a = 0; a < occs.length && a < 3; a += 1) {
+      var occ = occs[a] || {};
+      parts.push('occurrence: ' + segWord(occ.occurrence_id, '?')
+        + ' at ' + segWord(occ.position, '?')
+        + ', ' + segWord(occ.state, '?') + '/' + segWord(occ.outcome, '?')
+        + ', ' + segWord(occ.lines_matched, '?') + ' line(s) matched'
+        + (occ.audio && segHas(occ.audio.seconds)
+          ? ', ' + segSecs(occ.audio.seconds) + ' of audio' : ''));
+    }
+    if (!occs.length && d.admission && d.admission.say) {
+      parts.push('occurrence: ' + String(d.admission.say).slice(0, 160));
     }
     /* The script and playback extract, appended line by line only while
        it still fits under the station's own cap. */
@@ -2613,13 +2688,31 @@
    * the station's own words for what that scope means. Nothing here
    * ever applies silently on a save.
    *
-   * The scene view knows no slot id - it is reading the air log, not
-   * the running order - so the entry is named by its KIND, which is
-   * what `prompt_kind` off the inspect route is for, and the route
-   * answers for that kind in general when no entry is named. The hour
-   * is sent only when it really looks like an hour key; anything else
-   * and the station's own default (the hour on air) is the right answer
-   * rather than a guess of ours. */
+   * WHICH ENTRY, AND THE SENTENCE THAT SAYS IT IS USUALLY NOT ONE.
+   *
+   * The entry is named by its KIND, which is what `prompt_kind` off the
+   * inspect route is for, and the route answers for that kind in
+   * general when no entry is named. The inspect route also sends
+   * `slot`, and its `slot_id` is EMPTY most of the time on purpose: the
+   * ledger records the road a round was written for and never the slot
+   * it was reserved against, because only the live _ready_slot window
+   * knew that and it is gone by the time anyone inspects. Several
+   * entries usually run one road.
+   *
+   * So `slot` is sent to the apply road ONLY when `slot_id` is
+   * non-empty, and the station's own sentence about it is printed above
+   * the two buttons, not paraphrased. A prompt saved "for this segment"
+   * reaches the ROAD, and an operator who believes he has edited one
+   * entry when he has edited every entry of that road will not find out
+   * until he can hear it. Saying so costs one line; not saying so costs
+   * an hour of air.
+   *
+   * The hour is the inspect route's own, which it derives from the
+   * round's commit time - the hour the segment was WRITTEN in, which is
+   * the one the prompt routes want. Until that answer arrives the
+   * element's hour stands in, and either is sent only when it really
+   * looks like an hour key; anything else and the station's own default
+   * (the hour on air) is the right answer rather than a guess of ours. */
   var SEG_HOUR_RE = /^\d{4}-\d{2}-\d{2}T\d{2}$/;
   var SEG_SCOPE_WHY = {
     'default': 'from now on - it goes into the running order itself and'
@@ -2640,6 +2733,7 @@
        very segment he is rewriting the instruction for. */
     var kind = String(ident.round || '');
     var hour = SEG_HOUR_RE.test(String(ident.hour || '')) ? String(ident.hour) : '';
+    var slotId = '';                     /* only when exactly one entry runs this road */
     var picked = null;                   /* the preset loaded into the box */
 
     var facts = make('div', 'sp-segpr-facts');
@@ -2698,6 +2792,15 @@
     sheet.box.appendChild(scopeRow);
     var scopeWhy = make('div', 'sp-segrow-why', '');
     sheet.box.appendChild(scopeWhy);
+
+    /* WHO THIS REACHES, IN THE STATION'S OWN WORDS, ABOVE THE BUTTONS.
+       Filled from the inspect route's `slot.say` - "3 entries on the
+       sheet run this road; ... a prompt saved for this segment reaches
+       the road rather than one entry" - because that is the one thing
+       about these two buttons an operator could get wrong. */
+    var reach = make('div', 'sp-segpr-reach', '');
+    reach.hidden = true;
+    sheet.box.appendChild(reach);
 
     var buttons = make('div', 'sp-segpr-row');
     var save = make('button', 'sp-segpr-save', 'Save as a new preset');
@@ -2896,6 +2999,13 @@
            rather than piling up a new one every time it is applied. */
         if (row.id) body.id = String(row.id);
         if (hour) body.hour = hour;
+        /* ONLY when the station said exactly one entry runs this road.
+           Naming a slot it did not name would pin a prompt to an entry
+           on a guess, and the apply road 404s an entry that is not in
+           that hour - both worse than letting it reach the road, which
+           is what the sentence above the buttons already says it will
+           do. */
+        if (slotId) body.slot = slotId;
         if (want === 'next_30') body.minutes = 30;
         if (want === 'next_hour') body.minutes = 60;
         return Promise.resolve(api().post('/api/schedule/promptbook/apply', body));
@@ -2915,21 +3025,37 @@
       });
     });
 
+    /* The scene's own round and hour paint the window at once, because
+       a window that waits on a second read is a window that looks
+       broken for a beat. The inspect route is then asked for the three
+       things only it knows for certain - the road (`prompt_kind`), the
+       hour the segment was WRITTEN in, and which entry, if any, this
+       reaches - and the window is read again only if one of them
+       actually differs. segInspect holds its answer for twenty seconds,
+       so inspecting and then opening this costs one question, not
+       two. */
     promptLoad();
-
-    /* The road the prompt routes want is the segment's KIND. The
-       inspect route names it (`prompt_kind`) and is the only thing that
-       knows it for certain, so when the scene gave us nothing we ask,
-       and read again once the answer arrives. */
-    if (!kind) {
-      segInspect(ident.block).then(function (d) {
-        if (!el('spSegPrompt')) return;
-        var got = String((d && d.prompt_kind) || '');
-        if (!got || got === kind) return;
-        kind = got;
-        promptLoad();
-      });
-    }
+    segInspect(ident.block).then(function (d) {
+      if (!el('spSegPrompt')) return;
+      d = d || {};
+      var again = false;
+      var road = String(d.prompt_kind || '');
+      if (road && road !== kind) { kind = road; again = true; }
+      if (SEG_HOUR_RE.test(String(d.hour || '')) && String(d.hour) !== hour) {
+        hour = String(d.hour);
+        again = true;
+      }
+      var slot = d.slot || null;
+      slotId = String((slot && slot.slot_id) || '');
+      if (slot && slot.say) {
+        reach.textContent = String(slot.say);
+        reach.hidden = false;
+        /* One entry is the quiet case; a road with several entries on
+           the sheet is the one he has to read, so it is marked. */
+        reach.classList.toggle('sp-segpr-wide', !slotId);
+      }
+      if (again) promptLoad();
+    });
     return sheet;
   }
 
