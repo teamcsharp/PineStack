@@ -561,13 +561,26 @@ def line_review_permits(gate: str, source: str, candidate: str = "",
                         reasons: Any = None, context: Any = None,
                         evaluation: Any = None, technical: bool = False,
                         record: bool = False,
-                        disposition: str = "cut") -> bool:
-    """Apply the operator's acceptance rule; grade-only calls never notify."""
+                        disposition: str = "cut",
+                        advisory: Any = None) -> bool:
+    """Apply the operator's acceptance rule; grade-only calls never notify.
+
+    2026-09-15 (#1196): `advisory` is a CLOSED list of exact reason
+    strings this particular caller declares to be advisory - recorded in
+    full, shown to the operator, and not by itself a refusal. It is an
+    argument rather than a property of the store on purpose: the store
+    has no business knowing which of a grader's sentences are about the
+    writing and which are about the corpus, and every caller that does
+    not pass it - the tint gate, the segment brief, the recording tint -
+    keeps the acceptance rule it has today, unchanged, with no switch
+    able to touch it. The only caller that passes it is the call
+    contract, and only when <data>/call_gate/mode says `air`.
+    """
     if _REJECTION_LAB_PREVIEW.get():
         return False
     verdict = _LINE_REVIEW.evaluate(
         gate, str(source or ""), str(candidate or ""), reasons,
-        context=context, technical=technical)
+        context=context, technical=technical, advisory=advisory)
     allowed = bool(verdict.get("allowed"))
     if record and not allowed:
         line_review_capture(gate, source, candidate, reasons, context,
@@ -34252,6 +34265,14 @@ def _call_line_review(entry: dict[str, Any], report: dict[str, Any],
                  "keys": list(entry.get("keys") or []),
                  "takes": list(entry.get("takes") or []),
                  "tint_progress": dict(entry.get("tint_progress") or {})},
+        # 2026-09-15 (#1196): the corpus-collision reasons are advisory
+        # when, and only when, <data>/call_gate/mode says `air`. This
+        # matters for the reports that were graded BEFORE the switch and
+        # stored - retire_check and row_retired both re-run this against
+        # entry["call"]["quality"], and without this the retire road
+        # would go on destroying calls on a stored collision fault that
+        # the live grader would no longer even raise.
+        advisory=call_gate_advisory(),
         evaluation=report, technical=not valid, record=record,
         disposition=disposition)
     return bool(allowed and valid)
@@ -82615,6 +82636,205 @@ def call_tint_report(plain: Any, tinted: Any,
             "faults": faults[:30]}
 
 
+# --- #1196: THE CALL GATE'S SEVERITY -----------------------------------
+#
+#     "adjust the system to make it more acceptable in the future whenever
+#      it comes to working and preventing us from having wasted work"
+#
+# MEASURED on the pending queue (data/line_review.sqlite3, 30,127 rows;
+# 126 pending call_contract cuts, none technical).  The grader's OWN
+# stored evidence for those 126 refusals: mean 13.1 turns, 5.51 caller
+# turns, caller share 0.43, 3.79 host questions of which 3.60 answered;
+# 113 introduced, 123 greeted, 123 closed, 123 resolved, 122 answered the
+# line.  These are not bad calls.  105 of the 126 are refused for ONE
+# fault, and 99 of those single faults are one of exactly two strings:
+#
+#     58 rows  the selected Speakerbox source is already assigned
+#              to another call
+#     41 rows  the premise or dialogue is too similar to a stored call
+#
+# Both of those say the same thing: the station wrote this well, and has
+# written something like it before, inside a 240-call lookback which at
+# the current quota is about a day.  That is a VARIETY fact and a
+# bookkeeping fact.  It is not a claim about the writing, and it is not
+# something the operator can decide by reading the call - the collision
+# is with a corpus he cannot see in the queue row.  Cutting on it
+# destroys a protocol-complete call to protect a lookback window.
+#
+# The station already reasoned its way to this conclusion at the
+# Speakerbox-novelty leg below on 2026-09-10 and then applied it to a
+# quarter of the queue: the softening rode on `soft_quality`, which is
+# bool(entry["use"] == "tinted"), and the pending rows are use=plain 54,
+# use=none 46, use=tinted 26.  26 of 126 got the decision; 100 got the
+# hard version of a fault the station had already ruled was not a reason
+# to cut.  This switch finishes that job.
+#
+# THE SWITCH IS <data>/call_gate/mode - one word, re-read at most every
+# three seconds, no restart and no settings round trip.  It is
+# track_talk_segment.TalkSwitch, literally the class #1179's record-talk
+# desk uses, so it inherits the STRICTER one-token parse: a file holding
+# a sentence is off, however promising a word inside it looks.  An
+# operator who leaves himself a note in a switch file has not thrown the
+# switch.  The env slot is REMAPPED to SPARK_AGENT_CALL_GATE so that no
+# other switch on the station - record talk, horizon, pantry orders, the
+# stalled hand-off road - can throw this one; that remap is the same one
+# #1188 and #1190 wrote for their own switches.
+#
+#   off    the station of 2026-09-15.  Every leg binds exactly as it
+#          binds today.  Not one verdict changes.
+#   trace  the widened readings are COMPUTED and written into the grade
+#          report and out to the operator's context surface, and not one
+#          of them decides anything.  This is the setting to leave on
+#          while reading the census.
+#   air    trace, and the widened readings BIND: the two collision legs
+#          become advisory, the opener test is the wide one, and the
+#          caller's first turn may be index 0, 1 or 2.
+CALL_GATE_DIR = data_path("call_gate")
+CALL_GATE_ENV = "SPARK_AGENT_CALL_GATE"
+CALL_GATE_SWITCH = track_talk_segment.TalkSwitch(
+    CALL_GATE_DIR,
+    env={track_talk_segment.ENV_NAME: os.environ.get(CALL_GATE_ENV, "")},
+    clock=time.time)
+_CALL_GATE_SAID: dict[str, Any] = {"mode": None}
+
+# THE CLOSED LIST, and it is closed on purpose.  These are the only two
+# reasons this station will ever treat as advisory, they are compared
+# EXACTLY, and they are the only two legs in call_flow_report whose
+# subject is the corpus rather than the call.  Everything else the grader
+# can say stays hard, including the third sole fault in the queue ("the
+# caller does not introduce themselves", 6 rows) - that one IS about the
+# writing and the operator can decide it by reading the row.
+CALL_GATE_ADVISORY: tuple[str, ...] = (
+    "the selected Speakerbox source is already assigned to another call",
+    "the premise or dialogue is too similar to a stored call",
+)
+CALL_GATE_ADVISORY_SAYS = (
+    "a collision with the stored corpus is recorded and shown, and on its "
+    "own it no longer refuses a call: 99 of the 126 pending call cuts were "
+    "a protocol-complete call whose only fault was that the 240-call "
+    "lookback had seen something like it (#1196)")
+
+# THE OPENER, in two readings.  MEASURED: the shipped test demands one of
+# ring / ringing / live / on air / go ahead / hello / pine box beside a
+# call/phone/line word, and across the refusal corpus it is wrong 52% of
+# the time - 66 rows name the phone AND audibly pick it up and are
+# refused anyway.  Two real refused openers:
+#
+#     "hold on, we got a call on line thirty-nine thousand nine hundred
+#      ninety-nine"
+#     "line thirty-three thousand six hundred seventy-six. hold on."
+#
+# The widening below is deliberately conservative: every shipped word is
+# KEPT, and every added phrase is a phrase a host says while physically
+# taking a call, not a word that could appear in ordinary banter.  The
+# call/phone/line clause still has to hold as well, so "hold on" alone -
+# which a host says constantly - cannot pass this on its own.
+CALL_GATE_OPENER_STRICT = (
+    r"\b(ring|ringing|live|on air|go ahead|hello|pine box)\b")
+CALL_GATE_OPENER_WIDE = (
+    r"\b(ring|ringing|live|on air|go ahead|hello|pine box"
+    r"|hold on|we got a call|lighting up|lit up|flashing"
+    r"|picking it up|picking them up|picking you up"
+    r"|you['\u2019]re on|we['\u2019]ve got|put you through"
+    r"|who['\u2019]s this)\b")
+
+# WHERE THE CALLER MAY FIRST BE HEARD.  MEASURED: 657 rows carry "the
+# caller is not heard immediately after the host answers".  559 of them
+# have NO caller turn at all, which is a different and entirely genuine
+# failure, and the test is right about every one of those - first_caller
+# < 0 stays a fault at every setting of this switch.  But 98 rows have
+# the caller at turn 2 or turn 3 (index 1 or 2): two hosts setting the
+# call up before the line opens, which is this station's own house
+# format and is exactly what a three-voice call sounds like.  The ceiling
+# moves by one index and no further.
+CALL_GATE_FIRST_CALLER = 2
+
+
+def call_gate_mode() -> str:
+    """off | trace | air.  Never raises; an unreadable switch is off.
+
+    Says so in the log when it CHANGES and only then, which is the rule
+    record_talk_mode keeps for the same reason: a line every three
+    seconds saying the switch is still off is not a log."""
+    mode = track_talk_segment.MODE_OFF
+    try:
+        mode = CALL_GATE_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return track_talk_segment.MODE_OFF
+    was = _CALL_GATE_SAID["mode"]
+    if mode != was:
+        _CALL_GATE_SAID["mode"] = mode
+        if was is not None:
+            try:
+                pipeline_log("call", "#1196: the call gate is now '%s' (off = "
+                             "tonight's gate, trace = the widened readings are "
+                             "recorded and decide nothing, air = a corpus "
+                             "collision is advisory and the opener and first "
+                             "caller tests are the wide ones)" % mode)
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def call_gate_binds() -> bool:
+    """Do the widened readings DECIDE anything?  Only at `air`."""
+    return call_gate_mode() == track_talk_segment.MODE_AIR
+
+
+def call_gate_advisory() -> tuple[str, ...]:
+    """The reasons the acceptance policy may treat as advisory right now.
+
+    Empty at `off` and at `trace`, which is what makes those two settings
+    byte-identical in effect to the station of 2026-09-15: the acceptance
+    policy's severity split is driven entirely by this tuple, and an
+    empty tuple leaves LineReviewStore.evaluate on its original path."""
+    return CALL_GATE_ADVISORY if call_gate_binds() else ()
+
+
+def call_gate_collisions(reasons: Any) -> list[str]:
+    """Which of these reasons are corpus collisions.  REPORTING ONLY.
+
+    Deliberately ignores the switch: this is the answer to "what would
+    leave the queue if you threw it", and the operator has to be able to
+    read that with the switch off."""
+    want = set(CALL_GATE_ADVISORY)
+    return [str(r) for r in (reasons or []) if str(r) in want]
+
+
+# The census the operator reads.  BLOCKING - it opens the review store -
+# so it is never called on the event loop; /api/orchestrator/rejections/
+# context goes through asyncio.to_thread.  Cached for a rest because the
+# panel and the LCD both poll that surface and the store is 3.0 GB.
+CALL_GATE_CENSUS_TTL = 20.0
+_CALL_GATE_CENSUS: dict[str, Any] = {"at": 0.0, "say": {}}
+
+
+def call_gate_census(status: str = "pending") -> dict[str, Any]:
+    """How the queue splits into what he can decide and what he cannot."""
+    now = time.time()
+    held = _CALL_GATE_CENSUS
+    if (held.get("say") and (now - float(held.get("at") or 0)) < CALL_GATE_CENSUS_TTL
+            and (held["say"] or {}).get("status") == status):
+        return dict(held["say"])
+    out: dict[str, Any] = {
+        "at": now, "status": status, "mode": call_gate_mode(),
+        "binds": call_gate_binds(), "advisory": list(CALL_GATE_ADVISORY),
+        "switch": str(CALL_GATE_DIR / "mode"), "env": CALL_GATE_ENV,
+        "says": CALL_GATE_ADVISORY_SAYS,
+        "opener_strict": CALL_GATE_OPENER_STRICT,
+        "opener_wide": CALL_GATE_OPENER_WIDE,
+        "first_caller_ceiling": CALL_GATE_FIRST_CALLER if call_gate_binds() else 1,
+    }
+    try:
+        out.update(_LINE_REVIEW.severity_census(
+            "call_contract", CALL_GATE_ADVISORY, status))
+        out["status"] = status
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)[:200]
+    _CALL_GATE_CENSUS.update(at=now, say=dict(out))
+    return dict(out)
+
+
 def call_flow_report(script: Any, caller_name: str = "",
                      caller2_name: str = "",
                      include_shelf: bool = True,
@@ -82714,12 +82934,30 @@ def call_flow_report(script: Any, caller_name: str = "",
     # the next host greets that person and starts the interview.
     opening_marker, opening_text = turns[0] if turns else ("", "")
     opening_flat = " ".join(opening_text.lower().split())
-    answered_line = bool(
-        opening_marker in ("A", "B", "D")
-        and re.search(r"\b(call|phone|phones|line|request line)\b",
-                      opening_flat)
-        and re.search(r"\b(ring|ringing|live|on air|go ahead|hello|pine box)\b",
-                      opening_flat))
+    # 2026-09-15 (#1196): TWO READINGS OF THE SAME OPENING, AND ONLY ONE
+    # OF THEM BINDS.  The switch is read ONCE here, at the earliest point
+    # in this function that needs it, and the same answer is used for all
+    # three of #1196's legs below - so one grade is graded against one
+    # setting of the switch even if the operator throws it mid-call.
+    #
+    # MEASURED: the strict reading below is wrong 52% of the time across
+    # the refusal corpus - 66 rows name the phone AND audibly pick it up
+    # and are refused anyway.  The wide reading keeps every shipped word
+    # and adds only phrases a host says while physically taking a call.
+    # The call/phone/line clause is unchanged and still has to hold, so
+    # no addition here can pass an opening that never mentions the line.
+    _gate_mode = call_gate_mode()
+    _gate_binds = bool(_gate_mode == track_talk_segment.MODE_AIR)
+    _opening_is_host = opening_marker in ("A", "B", "D")
+    _opening_names_line = bool(re.search(
+        r"\b(call|phone|phones|line|request line)\b", opening_flat))
+    answered_line_strict = bool(
+        _opening_is_host and _opening_names_line
+        and re.search(CALL_GATE_OPENER_STRICT, opening_flat))
+    answered_line_wide = bool(
+        _opening_is_host and _opening_names_line
+        and re.search(CALL_GATE_OPENER_WIDE, opening_flat))
+    answered_line = answered_line_wide if _gate_binds else answered_line_strict
     host_knew_name = bool(first_name and re.search(
         rf"\b{re.escape(first_name)}\b", opening_flat))
     first_words = re.findall(r"[a-z0-9']+", first_text.lower())
@@ -82753,7 +82991,15 @@ def call_flow_report(script: Any, caller_name: str = "",
     _share_floor = 0.30 if any(m in ("B", "D") for m, _t in turns) and any(m == "A" for m, _t in turns) else 0.35
     if caller_at and not _share_floor <= share <= 0.72:
         faults.append("the caller/host turn share is out of balance")
-    if first_caller < 0 or first_caller > 1:
+    # 2026-09-15 (#1196): 657 rows carry this fault.  559 of them have NO
+    # caller turn at all - a different and entirely genuine failure, and
+    # `first_caller < 0` below keeps refusing every one of them at every
+    # setting of the switch.  The other 98 have the caller at turn 2 or
+    # turn 3, which is two hosts setting the call up before the line
+    # opens: this station's own house format, and what a three-voice call
+    # sounds like.  The ceiling moves by ONE index and no further.
+    _first_caller_ceiling = CALL_GATE_FIRST_CALLER if _gate_binds else 1
+    if first_caller < 0 or first_caller > _first_caller_ceiling:
         faults.append("the caller is not heard immediately after the host answers")
     if not answered_line:
         faults.append("the opening host does not audibly answer a ringing line")
@@ -82783,13 +83029,35 @@ def call_flow_report(script: Any, caller_name: str = "",
     # fidelity fault below stays binding.
     soft: list[str] = []
     _soft = soft.append if soft_quality else faults.append
+    # 2026-09-15 (#1196): AND THE COLLISION LEGS ARE ADVISORY ON EVERY
+    # CALL, not only on one that has already been rapped.
+    #
+    # The argument is already written twenty lines below this, at the
+    # Speakerbox-novelty leg, and the station only applied a quarter of
+    # it: `soft_quality` is bool(entry["use"] == "tinted") and the 126
+    # pending rows are use=plain 54, use=none 46, use=tinted 26.  A
+    # collision with the stored corpus says the station wrote this well
+    # and has written something like it inside a 240-call lookback -
+    # about a day at the current quota.  That is a variety fact about the
+    # SHELF, not a fault in the call, and it is not something the
+    # operator can decide from the queue row because the thing it
+    # collided with is not in front of him.
+    #
+    # THE FACT IS PRESERVED EXACTLY: the collision still goes into the
+    # report as an advisory, `novelty` and `speakerbox_novelty` still
+    # carry their full evidence, call_entry_regrade still writes the
+    # advisory into the pipeline log, and call_gate_collisions names it
+    # on the operator's surface whatever the switch says.  The only thing
+    # that changes is whether it CUTS.
+    _novel = soft.append if (soft_quality or _gate_binds) else faults.append
     if grounded_questions < 2:
         _soft("fewer than two host questions pick up a concrete "
               "detail from the caller's prior answer")
     if len(turns) >= 6 and links / max(1, len(turns) - 1) < 0.2:
         faults.append("too few adjacent turns visibly connect")
     if not novelty["ok"]:
-        faults.append("the premise or dialogue is too similar to a stored call")
+        # #1196: 41 of the 126 pending rows are refused for THIS ALONE.
+        _novel("the premise or dialogue is too similar to a stored call")
     if not topic_grade["ok"]:
         _soft("the database topic is not carried by both caller and hosts")
     if not speakerbox_grade["ok"]:
@@ -82805,8 +83073,13 @@ def call_flow_report(script: Any, caller_name: str = "",
     # the caller road was already failing 86% of its attempts and the
     # schedule was missing 75 of 76 entries for want of one.
     if not speakerbox_novelty["ok"]:
-        _soft("the selected Speakerbox source is already assigned "
-              "to another call")
+        # #1196: 58 of the 126 pending rows are refused for THIS ALONE -
+        # the 27-of-301 the comment above counted, grown into the largest
+        # single reason the station is destroying finished calls. The
+        # comment's own reasoning now reaches the other three quarters of
+        # the queue instead of only the rapped quarter.
+        _novel("the selected Speakerbox source is already assigned "
+               "to another call")
     faults.extend(tint_grade.get("faults") or [])
     return {
         "ok": not faults, "turns": len(turns), "soft_faults": soft,
@@ -82823,6 +83096,20 @@ def call_flow_report(script: Any, caller_name: str = "",
         "topic": topic_grade, "speakerbox": speakerbox_grade,
         "speakerbox_novelty": speakerbox_novelty,
         "tint": tint_grade,
+        # 2026-09-15 (#1196): RECORDED WHATEVER THE SWITCH SAYS, because a
+        # key on a grade dict cannot refuse anything and the operator has
+        # to be able to read the effect of a switch BEFORE he throws it.
+        # With the gate off, `collision_faults` names the collisions that
+        # are still cutting this call and `collision_advisories` is empty;
+        # with it on, they swap. `answered_line_strict` and
+        # `answered_line_wide` say which reading refused this opening and
+        # which would not, so a regrade run can be counted either way.
+        "call_gate": _gate_mode,
+        "answered_line_strict": answered_line_strict,
+        "answered_line_wide": answered_line_wide,
+        "first_caller_ceiling": _first_caller_ceiling,
+        "collision_faults": call_gate_collisions(faults),
+        "collision_advisories": call_gate_collisions(soft),
         "story": str(_story.get("id") or ""),                     # #1039
         "plot": _plot_id,                                        # #1157
     }
@@ -120849,7 +121136,17 @@ async def api_line_review_context(
     logic = await api_orch_logic(authorization)
     pipeline = logic["pipeline"]
     stages = pipeline["stages"]
+    # 2026-09-15 (#1196): the queue page already asks this route for the
+    # acceptance policy, so the severity census belongs here rather than
+    # on a route of its own. It is READ ONLY and it ships unswitched -
+    # with the gate off it answers "this is how much smaller your queue
+    # would be", which is the question the operator has to be able to ask
+    # before he throws anything. BLOCKING: it opens the 3.0 GB review
+    # store, so it goes through a thread the way the queue page itself
+    # does (#1070), and it is cached for a rest either way.
+    _call_gate = await asyncio.to_thread(call_gate_census)
     return {
+        "call_gate": _call_gate,
         "at": time.time(), "policy": line_review_policy(),
         "orchestrator": logic,
         "writing": {"scripts": pipeline["total"],

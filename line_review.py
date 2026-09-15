@@ -407,9 +407,51 @@ class LineReviewStore:
             self._policy = new
             return copy.deepcopy(new)
 
-    def evaluate(self, gate, source, candidate, reasons, context=None, technical=False):
+    def evaluate(self, gate, source, candidate, reasons, context=None,
+                 technical=False, advisory=None):
+        """Apply the acceptance rule.  #1196: a reason may be ADVISORY.
+
+        max_faults is 0, so before today one fault of any kind was a
+        refusal: 546 of 581 pending rows carry exactly one fault, and a
+        Speakerbox bookkeeping collision was therefore the same event as
+        a lost negation.  It is not the same event.  An advisory reason
+        is a fact the machine observed that the OPERATOR CANNOT DECIDE
+        FROM THE ROW - the thing it collided with is not in front of him
+        - and the queue is meant to be the list of decisions he can
+        actually make.
+
+        WHAT THIS DELIBERATELY IS NOT.  It is not a severity the store
+        invents, and it is not a pattern, a prefix or a keyword: the
+        caller hands in a CLOSED LIST OF EXACT STRINGS and nothing else
+        in it is ever advisory.  The default is None, and with None this
+        function is byte-for-byte the function it was - `hard` is
+        `reasons`, the fault count is the same integer and the verdict is
+        the same verdict.  Every caller that does not pass the argument
+        (the tint gate, the segment brief, the recording tint, the
+        replacement lab) keeps today's rule exactly.
+
+        AND IT CANNOT LET A REAL EDITORIAL FAULT THROUGH, by
+        construction, at three points:
+
+          * `technical` is tested FIRST and is untouched - a cut for
+            missing audio or an unrenderable take is never advisory;
+          * a row with one advisory reason AND one hard reason is still
+            refused, because only the hard list is counted against
+            max_faults;
+          * `reasons` and `machine_rejected` are reported unchanged, so
+            everything downstream that records the evidence - the queue
+            row, the lab, the prompt-learning observer - still sees every
+            sentence the grader said.  Nothing is hidden; one class of
+            sentence stops voting.
+        """
         gate, source, candidate, reasons, context, technical = _inputs(
             gate, source, candidate, reasons, context, technical)
+        # The split, and the whole of it. An exact, closed, caller-supplied
+        # vocabulary; order preserved; a non-string in the list is ignored
+        # rather than matched loosely.
+        soft_names = {item for item in (advisory or []) if isinstance(item, str)}
+        soft_reasons = [r for r in reasons if r in soft_names]
+        hard = [r for r in reasons if r not in soft_names]
         fingerprint = _fingerprint(gate, source, candidate, context)
         # No database operation on the writing/recording hot path.
         with self._lock:
@@ -427,13 +469,17 @@ class LineReviewStore:
                 allowed, reason = True, "rejections_disabled"
             elif gate in policy["disabled_gates"]:
                 allowed, reason = True, "gate_disabled"
-            elif len(reasons) <= policy["max_faults"]:
-                allowed, reason = True, "no_flags" if not reasons else "within_fault_tolerance"
+            elif len(hard) <= policy["max_faults"]:
+                allowed, reason = True, ("no_flags" if not reasons else
+                                         "advisory_only" if not hard else
+                                         "within_fault_tolerance")
             else:
                 allowed, reason = False, "editorial_rejection"
             return {"allowed": allowed, "reason": reason, "gate": gate,
                     "policy_revision": policy["revision"], "operator_approved": approved,
-                    "technical": technical, "reasons": reasons, "fault_count": len(reasons),
+                    "technical": technical, "reasons": reasons, "fault_count": len(hard),
+                    "hard_reasons": hard, "advisory_reasons": soft_reasons,
+                    "advisory_count": len(soft_reasons),
                     "max_faults": policy["max_faults"], "machine_rejected": technical or bool(reasons)}
 
     @contextmanager
@@ -760,6 +806,67 @@ class LineReviewStore:
             item["decisions"] = [json.loads(row[0]) for row in db.execute(
                 "SELECT body FROM review_decisions WHERE review_id=? ORDER BY seq DESC LIMIT 100", (item["id"],))]
             return item
+
+    def severity_census(self, gate, advisory, status='pending'):
+        """#1196: how this gate's queue splits into hard and advisory.
+
+        READ ONLY.  It decides nothing, it writes nothing and it holds no
+        lock - it is a covered read on reviews_gate (gate, review_status,
+        latest_seq) over its own connection, which is 126 rows for the
+        call contract today.  The lock is deliberately NOT taken: #1397's
+        argument applies here word for word - the lock this would take is
+        the one a pool thread holds while it writes to a 3.0 GB review
+        store, and a reader that sees the table a write early or late
+        answers the same question it would have answered a moment later.
+
+        `advisory` is the caller's closed, exact vocabulary, the same one
+        evaluate is given, so the count below is the count of rows that
+        WOULD leave the operator's queue if that vocabulary were applied
+        - which is the whole question, and it is answerable with the
+        switch still off."""
+        gate = _gate(gate)
+        if status not in ("", "all", "pending", "allowed", "kept", "noted"):
+            raise ValueError("status must be pending, allowed, kept, noted, or all")
+        names = {item for item in (advisory or []) if isinstance(item, str)}
+        clauses, params = ["gate=?", "technical=0"], [gate]
+        if status not in ("", "all"):
+            clauses.append("review_status=?")
+            params.append(status)
+        with closing(self._connect()) as db:
+            rows = db.execute("SELECT reasons FROM line_reviews WHERE "
+                              + " AND ".join(clauses), params).fetchall()
+        out = {"gate": gate, "status": status, "rows": len(rows),
+               "advisory_vocabulary": sorted(names),
+               "advisory_only": 0, "queue_without_advisory": 0,
+               "clean": 0, "sole_fault": 0,
+               "advisory_reasons": {}, "hard_reasons": {}}
+        for raw in rows:
+            try:
+                got = [str(r) for r in (json.loads(raw["reasons"]) or [])]
+            except (TypeError, ValueError):
+                got = []
+            soft = [r for r in got if r in names]
+            hard = [r for r in got if r not in names]
+            if not got:
+                out["clean"] += 1
+            if len(got) == 1:
+                out["sole_fault"] += 1
+            for r in soft:
+                out["advisory_reasons"][r] = out["advisory_reasons"].get(r, 0) + 1
+            if hard:
+                out["queue_without_advisory"] += 1
+                for r in hard:
+                    out["hard_reasons"][r] = out["hard_reasons"].get(r, 0) + 1
+            else:
+                out["advisory_only"] += 1
+        # The operator reads these two numbers and nothing else has to be
+        # explained to him: how many rows are advisory-only under the new
+        # policy, and what the queue would be without them.
+        out["hard_reasons"] = dict(sorted(out["hard_reasons"].items(),
+                                          key=lambda kv: -kv[1])[:20])
+        out["advisory_reasons"] = dict(sorted(out["advisory_reasons"].items(),
+                                              key=lambda kv: -kv[1])[:20])
+        return out
 
     def summaries(self, after=0, before=0, limit=50, status='pending', gate=''):
         _integer(after, "after", 0, 2**63-1); _integer(before, "before", 0, 2**63-1)
