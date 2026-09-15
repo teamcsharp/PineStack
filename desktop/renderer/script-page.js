@@ -4509,6 +4509,14 @@
     var box = el('spScript');
     if (!box) return false;
     var now = Date.now();
+    /* 2026-09-15 (#1183): this is one HALF of the rule, and the other
+       half is in scriptRestore. A follow is held off while a restore is
+       fresh, which stops a follow undoing a place-hold. The reverse -
+       a restore landing in the middle of a follow's smooth animation -
+       is what produced the operator's 3,407 px jump, and it cannot be
+       caught here, because by the time a restore asks for the pane its
+       drift has already been measured against a moving layout. It is
+       refused where it is measured. */
     if (reason === 'follow' && scrollOwner === 'restore' && now - scrollAt < 80) {
       return false;
     }
@@ -4556,6 +4564,50 @@
     /* It left the page while it was being read. Leave the scroll alone:
        the browser's own anchoring has already chosen a neighbour. */
     if (!node || node.parentNode !== box) return;
+
+    /* 2026-09-15 (#1183): THE PLACE-HOLDER MEASURED THE FOLLOW'S OWN
+       ANIMATION AND ADDED IT TO THE SCROLL.
+
+       The operator filed a capture asking "Why did this jump like this?"
+       and the 26 transitions in it show the same shape twice. The
+       highlight lands off screen, the smooth follow starts, and one
+       sample later the scroll takes a single 3,407 px step past the line
+       it was chasing - lit_top_px 278, then -422, then -3829 - before
+       walking all the way back to 715 three and a half seconds later.
+       The second time, after the document jumped 34 revisions under the
+       reader, it was 941 px and four seconds.
+
+       The guard in moveScript is one-directional: a follow is held off
+       while a restore is fresh, and a restore is never held off while a
+       follow is in flight. A follow is a SMOOTH scroll, and the note
+       above it already measured that 21.9% of them are still running two
+       samples later. So the anchor is taken part-way through the
+       animation and read again a moment later, and the difference it
+       calls `drift` is mostly the animation's own travel. Adding that to
+       scrollTop puts the pane where the animation was going to end up
+       ANYWAY, and the animation then goes there again from the new
+       place.
+
+       #1273 is right about reader-driven scroll and keeps every bit of
+       its reach here. It is wrong only while the pane is scrolling
+       itself, and in that case there is no reader's place to hold: the
+       follow exists to put the lit line on screen. So the drift is
+       dropped and the follow is re-issued instead, against the layout
+       that exists now rather than the one it started from. */
+    if (Date.now() < selfScrollUntil && scrollOwner === 'follow') {
+      var lit = box.querySelector('.sp-el.sp-now');
+      scrollLog.push({at: Date.now(), why: 'restore:skipped-mid-follow',
+                      top: Math.round(box.scrollTop)});
+      if (scrollLog.length > 40) scrollLog.shift();
+      if (lit) {
+        moveScript('follow', function () {
+          try { lit.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+          catch (err) { lit.scrollIntoView(false); }
+        });
+      }
+      return;
+    }
+
     var drift = node.getBoundingClientRect().top - anchor.was;
     if (Math.abs(drift) > 0.5) {
       moveScript('restore', function (pane) {
