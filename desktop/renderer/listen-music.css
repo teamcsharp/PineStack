@@ -750,7 +750,18 @@
   font-size: 11px; color: var(--muted, #8fa0ad);
   font-variant-numeric: tabular-nums;
 }
+/* #1194: THE HONEST FAILURE NEEDS ROOM TO BE READ.
+   The value cell is 42px of tabular numbers, which is right for "120%" and
+   clips "(no desk here)" down to a shrug. When a row genuinely has no desk
+   to turn it stops being a number cell: it takes the width it needs and it
+   goes red, because a slider that cannot move the sound must look different
+   from one that can. */
+.pl-deskrow i.gone {
+  flex: 0 1 auto; font-size: 10px; letter-spacing: .01em;
+  color: var(--red, #e46b6b); text-align: right;
+}
 .pl-deskwhy { font-style: normal; font-size: 10px; line-height: 1.5; color: var(--muted, #8fa0ad); }
+#plDeskWhere { display: block; margin-top: 3px; opacity: .85; }
 
 /* The video backdrop sits exactly where the still does. object-fit: cover,
    because a backdrop that letterboxes shows the room its own black bars. */

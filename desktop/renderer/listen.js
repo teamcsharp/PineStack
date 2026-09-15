@@ -1547,16 +1547,29 @@
       + '<label class="pl-deskrow"><span>djs</span>'
       + '<input id="plDeskVoice" type="range" min="0" max="200" step="1">'
       + '<i id="plDeskVoiceVal"></i></label>'
+      /* #1194: THE DUCK ROW IS THE PANEL'S djDuck AND NOTHING ELSE.
+       * It sets how far the music dips while a DJ is talking - the depth
+       * djApplyGain multiplies into the music gain while djSpeaking. It is
+       * NOT PineDuck, which is the automatic 10%-while-a-report-is-open /
+       * 2%-while-dictation-listens hold; that one is reference counted,
+       * transient, and not a depth anybody dials. The title says so, so
+       * the two are never read as one control again. */
       + '<label class="pl-deskrow" title="How far the music dips while a '
-      + 'voice is talking. This is the one that decides whether you can '
-      + 'hear them over a record."><span>duck</span>'
+      + 'voice is talking, on this terminal. This is the one that decides '
+      + 'whether you can hear them over a record. It is the duck depth '
+      + 'this panel already has - not the automatic duck that steps the broadcast back '
+      + 'to 10% while a report is open, which sets itself."><span>duck</span>'
       + '<input id="plDeskReply" type="range" min="0" max="90" step="1">'
       + '<i id="plDeskReplyVal"></i></label>'
-      + '<label class="pl-deskrow"><span>here</span>'
+      + '<label class="pl-deskrow" title="What this terminal is playing at '
+      + 'overall - the master, above the three balances. In the desk app '
+      + 'this is the application volume; on the tablet it is the level of '
+      + 'the player itself."><span>here</span>'
       + '<input id="plDeskLocal" type="range" min="0" max="100" step="1">'
       + '<i id="plDeskLocalVal"></i></label>'
       + '<i class="pl-deskwhy">This terminal only. The station has no '
-      + 'per-listener level; these are the desk this panel already has.</i>'
+      + 'per-listener level; these are the desk this panel already has. '
+      + '<span id="plDeskWhere"></span></i>'
       + '</div>'
       + '<p id="plNote" class="pl-note"></p>'
       + '</div>';
@@ -1762,6 +1775,28 @@
       ["plDeskVoice", "voice", "plDeskVoiceVal"],
       ["plDeskReply", "duck", "plDeskReplyVal"]
     ];
+    /* #1194: WHAT THE LABEL IS ALLOWED TO SAY.
+     *
+     * The number is written from the slider SYNCHRONOUSLY - the thumb never
+     * waits on anything - and the honest failure is kept exactly as it was:
+     * "(no desk here)" when there is genuinely no road. What must never
+     * happen again is that phrase appearing on a screen that is plainly
+     * playing music, so it is now driven by a PROVEN answer: the road that
+     * setMix took, and, once a crossing has come back, whether the panel
+     * actually had the control (law.mixReached). Anything else - a road
+     * taken and not yet answered - shows the number alone, because a write
+     * in flight is not a failure. */
+    const deskSay = (stream, out, value, road) => {
+      const law = root.PineAudioLaw;
+      const label = el(out);
+      if (!label) return;
+      const reached = law && law.mixReached ? law.mixReached(stream) : null;
+      const gone = !road || reached === false;
+      label.textContent = Math.round(Number(value) || 0) + "%"
+        + (gone ? " (no desk here)" : "");
+      label.classList.toggle("gone", gone);
+    };
+
     for (const [id, stream, out] of rows) {
       const input = el(id);
       if (!input) continue;
@@ -1773,24 +1808,42 @@
        * back, so the knob read "not set", sat at 50, and appeared dead.
        *
        * A monitoring balance has to answer under the thumb, so it is driven
-       * live. There is no per-pixel cost to pay: this writes a gain node in
-       * this page, not a request. */
+       * live. On the tablet there is no per-pixel cost to pay: this writes a
+       * gain node in this page, not a request.
+       *
+       * ON THE DESK THERE IS A COST, AND IT IS PAID ONCE PER FRAME.
+       * "Honor the sliders that I'm setting in the Pine box application,
+       *  these are intended to be mixing the signal that I'm listening to."
+       * The gain nodes are inside the controlFrame webview - another
+       * document - and the only road there is executeJavaScript, one IPC
+       * round trip that returns a Promise. So PineAudioLaw.setMix coalesces:
+       * a move drops its value into a pending map and books ONE flush on the
+       * next animation frame, and while a crossing is in the air later moves
+       * only overwrite the map. A 200-pixel drag is therefore a handful of
+       * crossings carrying the value that was under the thumb at the time,
+       * never one per pixel and never a tail of stale writes landing after
+       * the finger stopped. Two rows moved together ride the same crossing. */
       input.addEventListener("input", () => {
         const law = root.PineAudioLaw;
-        const label = el(out);
-        const moved = law && law.setLocalMix
-          ? law.setLocalMix(stream, Number(input.value)) : false;
-        if (label) {
-          label.textContent = input.value + "%" + (moved ? "" : " (no desk here)");
-        }
+        deskTouched[stream] = Date.now();   /* a read-back must not fight the thumb */
+        const road = law && law.setMix
+          ? law.setMix(stream, Number(input.value))
+          : (law && law.setLocalMix && law.setLocalMix(stream, Number(input.value)) ? "local" : "");
+        deskSay(stream, out, input.value, road);
       });
-      /* The desktop renderer has no panel gains of its own, so there the
-       * knob still means the station - which is the only desk it can reach.
-       * Kept on `change` there for the reason it always was: a drag would
-       * post one write per pixel. */
+      /* THE STATION IS ONLY WRITTEN WHERE THERE IS NO LOCAL DESK AT ALL.
+       *
+       * This branch used to fire on the desk, because localMix() looked for
+       * the panel's sliders in THIS document and never found them - so a row
+       * labelled "this terminal only" posted a level for every listener on
+       * the station the moment the thumb came off it. With the webview road
+       * in place mixRoad names a real road there, and this stays what it was
+       * meant to be: the last resort, on `change` rather than per pixel
+       * because it is a request. */
       input.addEventListener("change", async () => {
         const law = root.PineAudioLaw;
         if (!law) return;
+        if (law.mixRoad && law.mixRoad(stream)) return;
         if (law.localMix && law.localMix(stream) !== null) return;
         if (stream === "duck") return;
         try {
@@ -1802,20 +1855,116 @@
       });
     }
 
-    /* ...and the one that is genuinely this terminal's own. */
+    /* A crossing that came back unreachable - the panel reloaded under the
+     * drawer, or this build has no controlFrame - repaints the labels it
+     * touched. Without this the row would sit there reading 120% while
+     * nothing had moved, which is the failure this whole change is about,
+     * only quieter. */
+    const law0 = root.PineAudioLaw;
+    if (law0 && law0.onMixReach) {
+      law0.onMixReach((reach) => {
+        for (const [id2, stream2, out2] of rows) {
+          if (!(stream2 in reach)) continue;
+          const input2 = el(id2);
+          if (!input2) continue;
+          deskSay(stream2, out2, input2.value,
+            reach[stream2] ? (law0.mixRoad ? law0.mixRoad(stream2) : "panel") : "");
+        }
+      });
+    }
+
+    /* ...and the one that is genuinely this terminal's own.
+     *
+     * #1194: HERE READ 0% ON A SCREEN PLAYING MUSIC, AND 0 WAS NOT TRUE.
+     *
+     * It wrote law.setLocalVolume, which walks THIS document for
+     * #musicPlayer - the station panel's player, which on the desk is
+     * inside the controlFrame webview and therefore not in this document at
+     * all. Nothing was touched. It then read itself back through
+     * law.localVolume, which fell to localStorage.pineMusicVolume; the
+     * shell has never written that key (the injected appVolumeScript writes
+     * it INSIDE the panel, a different origin and a different store), and
+     * Number(null) is 0 with Number.isFinite(0) true, so the "or 1"
+     * fallback was unreachable and the row printed 0%. Unread, not silent.
+     *
+     * So this row now goes through applyVolume, the ladder a few hundred
+     * lines above that already knows where this terminal's level lives:
+     * #appVolume (the desk's master, which renderer.js carries into every
+     * webview), then the law's own local volume, then the panel's music
+     * slider, then the element itself. One ladder, one answer, and an
+     * honest label when every rung misses. */
     const local = el("plDeskLocal");
     if (local) {
       local.addEventListener("input", () => {
-        const law = root.PineAudioLaw;
         const want = Number(local.value) / 100;
-        if (law) law.setLocalVolume(want);
+        /* ONE FRAME, NOT ONE PIXEL, HERE TOO. applyVolume's first rung
+         * dispatches `input` on the shell's #appVolume, and renderer.js
+         * answers that by injecting its levelling script into three
+         * webviews - so a drag down this row would be three IPC crossings
+         * per pixel. The label is written from a road PROBE (which rung
+         * exists, not which rung fired), so it is still honest in the same
+         * frame without waiting for anything. */
+        const where = hereApply(want);
         volume = want;
+        try { localStorage.setItem("pineListenVolume", String(volume)); }
+        catch (err) { /* a locked store must not stop the radio */ }
         const label = el("plDeskLocalVal");
-        if (label) label.textContent = local.value + "%";
+        if (label) {
+          label.textContent = local.value + "%" + (where ? "" : " (no desk here)");
+          label.classList.toggle("gone", !where);
+        }
         const vol = el("plVol");
         if (vol) vol.value = local.value;
       });
     }
+  }
+
+  /* The HERE row's writer and its road probe. The probe is applyVolume's
+   * own ladder asked as a question rather than pressed: #appVolume, then
+   * the panel's own player, then the panel's music slider. If every rung
+   * misses the row says "no desk here", which is the one thing about the
+   * old behaviour worth keeping. */
+  let hereWant = null;
+  let hereBooked = false;
+  function hereRoad() {
+    if (el("appVolume")) return "app";
+    if (el("musicPlayer")) return "player";
+    if (el("djGainMusic")) return "panel";
+    return "";
+  }
+  function hereApply(want) {
+    hereWant = want;
+    if (!hereBooked) {
+      hereBooked = true;
+      const go = () => {
+        hereBooked = false;
+        const send = hereWant;
+        hereWant = null;
+        if (send !== null) applyVolume(send);
+      };
+      if (typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(go);
+      else setTimeout(go, 16);
+    }
+    return hereRoad();
+  }
+
+  /* WHAT THIS TERMINAL IS ACTUALLY PLAYING AT, read from the same ladder
+   * applyVolume writes down. #appVolume first because on the desk it is the
+   * master every webview is levelled from; then the law, which now returns
+   * null rather than 0 for a store that was never written; then whatever
+   * this view last set. Never a bare 0 that nobody chose. */
+  function hereLevel() {
+    const slider = el("appVolume");
+    if (slider) {
+      const n = Number(slider.value) / 100;
+      if (Number.isFinite(n)) return Math.max(0, Math.min(1, n));
+    }
+    const law = root.PineAudioLaw;
+    const mine = law && law.localVolume ? law.localVolume() : null;
+    if (mine !== null && mine !== undefined && Number.isFinite(Number(mine))) {
+      return Math.max(0, Math.min(1, Number(mine)));
+    }
+    return Math.max(0, Math.min(1, Number(volume) || 0));
   }
 
   /* THE WHOLE OF WHAT IS PLAYING.
@@ -1980,7 +2129,31 @@
         input.min = String(range.min);
         input.max = String(Math.min(range.max, stream === "duck" ? 90 : 200));
         input.value = String(Math.round(mine));
-        if (label) label.textContent = Math.round(mine) + "%";
+        if (label) { label.textContent = Math.round(mine) + "%"; label.classList.remove("gone"); }
+        continue;
+      }
+      /* #1194: THE PANEL'S OWN DESK, FROM THE OTHER SIDE OF THE WEBVIEW.
+       *
+       * On the desk localMix() is null for all three - the sliders are in
+       * the controlFrame document - and the code below then asked the
+       * STATION for a level it only publishes when the broadcast device is
+       * a Nabu. That is how every row came to read "not set" or a station
+       * number while the real mix sat at 100 / 160 / 70 inside the panel.
+       * The true values are fetched across the boundary by deskFromPanel()
+       * below; what is drawn here first is the last answer it got, so an
+       * open drawer always has something true on it rather than a default
+       * while one round trip completes. */
+      const road = law.mixRoad ? law.mixRoad(stream) : "";
+      if (road) {
+        const seen = law.mixNow ? law.mixNow() : null;
+        const top = law.mixMax ? law.mixMax(stream) : (stream === "duck" ? 90 : 200);
+        input.min = "0";
+        input.max = String(top);
+        const value = seen && typeof seen[stream] === "number" ? seen[stream] : null;
+        if (value !== null) {
+          input.value = String(Math.min(top, Math.round(value)));
+          if (label) { label.textContent = input.value + "%"; label.classList.remove("gone"); }
+        }
         continue;
       }
       const read = law.levelOf(state, stream);
@@ -2003,11 +2176,27 @@
     }
     const local = el("plDeskLocal");
     if (local) {
-      const here = Math.round(law.localVolume() * 100);
+      const here = Math.round(hereLevel() * 100);
       local.value = String(here);
       const label = el("plDeskLocalVal");
-      if (label) label.textContent = here + "%";
+      if (label) { label.textContent = here + "%"; label.classList.remove("gone"); }
     }
+    /* WHERE THESE KNOBS LAND, SAID ON THE FACE OF THE DRAWER.
+     * The operator asked for the sliders to mix what he is hearing; when
+     * the desk they reach is in another document he should be able to see
+     * that without reading the code. */
+    const where = el("plDeskWhere");
+    if (where && law.mixRoad) {
+      const road = law.mixRoad("music");
+      where.textContent = road === "local"
+        ? "The mix is this page's own gain."
+        : road === "panel"
+          ? "Music and duck are the station panel's own gain, reached in "
+            + "the control frame; DJs ride this application's voice mix."
+          : "";
+    }
+    /* ...and then the crossing, which fills in what only the panel knows. */
+    deskFromPanel();
     /* And the talk-only switch reads the route, not a remembered flag. */
     const talk = el("plTalkOnly");
     if (talk) {
@@ -2015,6 +2204,49 @@
       talk.textContent = off ? "Music back on" : "Talk only";
       talk.classList.toggle("on", off);
     }
+  }
+
+  /* #1194: ONE CROSSING, AND ONLY WHEN THE DRAWER IS OPEN.
+   *
+   * paintDesk is called when the drawer opens and after the talk-only
+   * switch, not on a timer, so this is not a poller - it is the read half
+   * of the same road setMix writes down. It refuses to move a row the
+   * operator is holding: a value that landed 200 ms ago and a thumb that is
+   * still dragging would fight each other, and the thumb must win. Rows the
+   * panel could not show (it reloaded, or this build has no controlFrame)
+   * keep the honest label rather than a number nobody set. */
+  let deskTouched = {};
+  function deskFromPanel() {
+    const law = root.PineAudioLaw;
+    const desk = el("plDesk");
+    if (!law || !law.readMix || !desk || desk.hidden) return;
+    law.readMix().then((got) => {
+      if (!got) return;
+      const open = el("plDesk");
+      if (!open || open.hidden) return;
+      for (const [id, stream, out] of [["plDeskMusic", "music", "plDeskMusicVal"],
+        ["plDeskVoice", "voice", "plDeskVoiceVal"],
+        ["plDeskReply", "duck", "plDeskReplyVal"]]) {
+        const input = el(id);
+        const label = el(out);
+        if (!input) continue;
+        if (Date.now() - (deskTouched[stream] || 0) < 1200) continue;   /* the thumb wins */
+        const road = stream === "voice" ? (got.voiceRoad || "") : (got.road || "");
+        const top = law.mixMax ? law.mixMax(stream) : (stream === "duck" ? 90 : 200);
+        input.min = "0";
+        input.max = String(top);
+        const value = typeof got[stream] === "number" ? got[stream] : null;
+        if (value === null || !road) {
+          if (label) {
+            label.textContent = (input.value || "0") + "% (no desk here)";
+            label.classList.add("gone");
+          }
+          continue;
+        }
+        input.value = String(Math.min(top, Math.max(0, Math.round(value))));
+        if (label) { label.textContent = input.value + "%"; label.classList.remove("gone"); }
+      }
+    }, () => { /* a panel mid-navigation answers on the next open */ });
   }
 
   /* The loading simulation behind the show. Built once, on first need -
