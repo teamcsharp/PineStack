@@ -25490,6 +25490,42 @@ def _acknowledge_delivery_lines(delivery_id: str, clip: dict[str, Any],
                              else "stream")
             live["page_delivery"] = "playing"
             live["delivery_id"] = delivery_id
+            # 2026-09-15 (#1422b): AND THE SECOND FACT, WHICH DID NOT EXIST.
+            #
+            # This function is only reached from page_playback_ack under
+            # the one test the station has that means a line was genuinely
+            # HEARD: `audible > 0 and progressed and delivery["speech"]` -
+            # a listener's own element reporting `playing` or `ended`, at a
+            # volume that survived muting and the clamp to the element
+            # volume, from a position that had MOVED since the last
+            # acknowledgement, on a delivery the feed marked as speech.
+            # The rows that reach this loop have already been narrowed to
+            # the interval the playhead actually covered, a few lines up.
+            #
+            # That test already existed. What it produced was ONE global
+            # timestamp, _DIALOGUE_HEARD[0] - "a listener heard SOMETHING
+            # at 03:14" - and nothing at all per line. So no ledger could
+            # ever answer "was THIS line heard", and every ledger answered
+            # the publication question instead. On the night of
+            # 2026-09-14/15 the operator heard nothing for an hour and
+            # data/gap_log.jsonl recorded zero gaps.
+            #
+            # The stamp is the moment the line SOUNDED, not the moment the
+            # acknowledgement arrived. A burst is one delivery covering
+            # many rows and its ack lands at the end; stamping `now` on
+            # all of them would collapse a two-minute conversation onto a
+            # single instant, invent a hole in front of it and hide every
+            # hole inside it. `now - (position - row.from)` is the same
+            # arithmetic the #1288 air_at correction below already uses,
+            # and it is the correct one for the same reason.
+            #
+            # First hearing wins, exactly as #1288 froze air_at: a second
+            # listener starting the same clip an hour later is not new
+            # information about when it first came out of a speaker.
+            if not live.get(HEARD_STAMP):
+                live[HEARD_STAMP] = time.time() - max(
+                    0.0, position - float(row.get("from") or 0))
+                live[HEARD_STAMP_BY] = "page"
         who = str((live or row).get("who") or "")
         kind = str((live or row).get("kind") or "")
         text = (str(row.get("remember_text") or "")
@@ -25770,8 +25806,58 @@ def radio_state() -> dict[str, Any]:
 # What the desk is doing RIGHT NOW (#305): writing, voicing, speaking —
 # breadcrumbs the panel draws as an activity spectrograph, so a quiet
 # moment is visibly a pause and not a mystery.
-# #1288: the states that mean somebody has heard this line.
-AIR_AT_HEARD = ("published", "stream", "both", "box", "page", "airing")
+# 2026-09-15 (#1422a): WHAT THIS TUPLE ACTUALLY HOLDS, SAID IN ITS NAME.
+#
+# It was called AIR_AT_HEARD - "the states that mean somebody has heard
+# this line" - and the first member of it was "published". Nothing about
+# "published" means anybody heard anything: it is the state a clip takes
+# the instant it is appended to the page voice feed, before a browser has
+# fetched it, before an element exists, before a speaker is involved.
+# page_feed_append says so itself, three hundred lines up: "PUBLISHED IS
+# NOT HEARD. The page is a browser that may be muted, backgrounded, or
+# not there at all."
+#
+# The consequence, measured on the night of 2026-09-14/15: the operator
+# heard nothing for an hour, and data/gap_log.jsonl recorded ZERO gaps
+# across that hour. Every reader that asked this tuple whether a line had
+# been heard was handed the answer "yes, it was handed over", and thirteen
+# call sites asked it.
+#
+# So the tuple keeps its members EXACTLY - they are publication states and
+# the roads that set them are untouched - and loses the name that made the
+# lie easy. Anything that wants the other question asks line_heard_at().
+AIR_PUBLICATION_STATES = ("published", "stream", "both", "box", "page", "airing")
+
+# The row key the hearing stamp lives under. Deliberately not `aired` and
+# deliberately not `heard`: this is a SECOND, SEPARATE FACT laid beside the
+# publication state, never a replacement for it. A line can be published
+# and not heard (last night, for an hour, for every line); it cannot be
+# heard without having been published.
+HEARD_STAMP = "heard_ack_at"
+HEARD_STAMP_BY = "heard_ack_by"
+
+
+def line_heard_at(row: Any) -> float:
+    """When a LISTENER told us this line came out of a speaker, else 0.0.
+
+    The only writer is the playback acknowledgement handler, and only on
+    the exact test it already made for the dialogue clock (#1231): the
+    event is `playing` or `ended`, the audible volume is above zero after
+    muting has forced it to zero and clamped it to the element volume, the
+    position PROGRESSED since the last acknowledgement, and the delivery
+    was marked speech. Nothing else may stamp it. A render finishing, a
+    clip being appended to the feed, a box hand-off and a 200 on a media
+    fetch are all publication, and publication is what the old name of the
+    tuple above turned into a lie."""
+    try:
+        return max(0.0, float((row or {}).get(HEARD_STAMP) or 0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def line_was_heard(row: Any) -> bool:
+    """Whether a listener acknowledged this line audible and progressing."""
+    return line_heard_at(row) > 0
 
 
 def air_at_set(row: dict[str, Any], when: float) -> bool:
@@ -25798,7 +25884,7 @@ def air_at_set(row: dict[str, Any], when: float) -> bool:
 
     Returns whether the stamp was taken."""
     try:
-        if str(row.get("aired") or "") in AIR_AT_HEARD and row.get("air_at"):
+        if str(row.get("aired") or "") in AIR_PUBLICATION_STATES and row.get("air_at"):
             return False                 # it sounded when it sounded
         row["air_at"] = float(when)
         return True
@@ -72939,6 +73025,42 @@ GAP_CAST = ("dj", "cohost", "third", "caller", "caller2", "drop")
 GAP_NOT_SPEECH = ("chat", "marker", "sfx", "hangup", "analysis",
                   "image_analysis", "upstairs", "reply", "aside", "drop")
 GAP_AIRED = ("box", "stream", "both")
+# 2026-09-15 (#1422e): AND WHAT THOSE THREE WORDS ARE NOT.
+#
+# "box", "stream" and "both" are PUBLICATION states - the line was handed
+# to the box, or appended to the page feed, or both. gap_lines() below
+# filtered on them under a docstring that said "Cast lines that actually
+# AIRED, in the order the room heard them", and every dead-air row this
+# module has ever written descends from that filter. On the night of
+# 2026-09-14/15 the operator heard nothing for an hour and this ledger
+# recorded zero gaps, because the station was handing lines over at its
+# usual rate the whole time.
+#
+# A dead-air row now names the fact it was built on, in a field called
+# `basis`, so a reader can never again be misled about what the number
+# means:
+#
+#   heard      - the window contained at least one line a listener
+#                acknowledged audible, so the timeline is built from
+#                hearing stamps. A hole between two HEARD lines is real
+#                dead air whatever was published inside it. This is the
+#                reading the operator has been asking for.
+#   published  - the window contained no hearing stamp AND no listener
+#                was connected across it. There was nobody to
+#                acknowledge anything, so the publication timeline is
+#                the best evidence there is, and it is used unchanged.
+#                A box-only station, or a station nobody is tuned to, is
+#                not a silent station and must not be accused of one.
+#   unheard    - the window contained no hearing stamp and listeners WERE
+#                connected across it. This is the #1239 state exactly:
+#                "on, unpaused, three listeners, clips going out, not one
+#                acknowledged". The rows are still computed from
+#                publication, on purpose - see gap_lines - but they say
+#                so, and the hearing census puts the divergence in front
+#                of the operator in seconds and in line counts.
+GAP_BASIS_HEARD = "heard"
+GAP_BASIS_PUBLISHED = "published"
+GAP_BASIS_UNHEARD = "unheard"
 # Written live by construction (CANNOT_PREPARE plus the angle rounds that
 # no shelf can hold) - the kinds the stock-first rule steps around.
 GAP_LIVE_ONLY = ("deep", "recap", "guest", "bombshell")
@@ -73044,24 +73166,126 @@ def _gap_row_len(r: dict[str, Any]) -> float:
     return len(str(r.get("text") or "")) / 14.0
 
 
-def gap_lines(chat: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    """Cast lines that actually AIRED, in the order the room heard them.
+def _gap_listeners_between(lo: float, hi: float) -> int:
+    """How many players were connected at any point across this span.
 
-    Reads the booth ring (memory). When lane G1's durable air log is
-    merged, replace the source here with airlog_rows(...) - nothing else in
-    this module reads the ring. Held rows are excluded until the hold-shelf
-    drain flips them; operator chat, markers, stings and analysis rows are
-    not speech."""
+    2026-09-15 (#1422f): this is the question that separates "nobody was
+    there to hear it" from "they were there and heard nothing", and the
+    station already holds the answer - _LISTENER_SEEN carries a `first`
+    and an `at` per player. In memory only, so it forgets across a
+    restart; a window that straddles a restart therefore degrades towards
+    the publication basis, which is the cautious direction and is the
+    same standing rule as never quoting a dead-air rate across a restart
+    (dead-air-has-a-named-frame)."""
+    n = 0
+    try:
+        for row in list(_LISTENER_SEEN.values()):
+            first = float((row or {}).get("first") or 0)
+            last = float((row or {}).get("at") or 0)
+            if last >= lo and first <= hi and last > 0:
+                n += 1
+    except Exception:  # noqa: BLE001
+        return 0
+    return n
+
+
+def gap_basis(rows: list[dict[str, Any]], lo: float, hi: float) -> str:
+    """Which fact this window's dead-air timeline may honestly be built on.
+
+    THE RULE, AND WHY IT IS THIS RULE.
+
+    The defect being cured is a station that published continuously into a
+    house where nothing could sound and reported itself healthy. The cure
+    is to count hearing. But the opposite mistake is just as expensive: a
+    station whose listeners never acknowledge anything - a box-only house,
+    a night with nobody tuned in, the first minute after a restart - must
+    not have its whole night turned into one enormous gap. A gap row is
+    not an opinion: it arms the stock-first rule, pre-empts the manager,
+    spends the pantry and calls the emergency host. Shouting material at a
+    silence that is nobody listening cures nothing and costs the shelf.
+
+    So:
+
+      one hearing stamp anywhere in the window -> "heard". A listener's
+      player IS reporting, the road works, and a hole between two lines
+      that were heard is real dead air no matter how much was published
+      inside it. This is the operator's reading.
+
+      no stamp, and no listener connected across the window ->
+      "published". There was nobody to acknowledge anything. The
+      publication timeline is the only evidence there is; it is used
+      exactly as it was before this item, and the row says so.
+
+      no stamp, and listeners WERE connected -> "unheard". This is last
+      night. The rows are still computed from publication - deliberately,
+      so that the levers gap_rows drives keep behaving exactly as they
+      did and so that two days of gap_log stay comparable - but every row
+      carries basis="unheard", which is a reader-visible statement that
+      the seconds in it are publication seconds and that the room's own
+      account of the hour is missing. The divergence itself is measured
+      in seconds and in line counts by hearing_census(), which is where a
+      number that loud belongs: in front of the operator, not smuggled
+      into an arithmetic that other machinery depends on."""
+    try:
+        for r in rows:
+            if line_heard_at(r) > 0:
+                return GAP_BASIS_HEARD
+        if _gap_listeners_between(lo, hi) > 0:
+            return GAP_BASIS_UNHEARD
+    except Exception:  # noqa: BLE001
+        return GAP_BASIS_PUBLISHED
+    return GAP_BASIS_PUBLISHED
+
+
+def gap_lines(chat: list[dict[str, Any]] | None = None,
+              basis: str = "") -> list[dict[str, Any]]:
+    """Cast lines the room HEARD, in the order it heard them - where the
+    room said so, and honestly labelled where it did not.
+
+    Reads the booth ring (memory) unless a list is handed in; the hearing
+    census hands in durable air-log rows. Held rows are excluded until the
+    hold-shelf drain flips them; operator chat, markers, stings and
+    analysis rows are not speech.
+
+    2026-09-15 (#1422f): the docstring used to say "Cast lines that
+    actually AIRED, in the order the room heard them" and the filter under
+    it was `r["aired"] in GAP_AIRED` - box, stream, both - which are
+    states meaning the line was HANDED OVER. It is the sentence and the
+    code disagreeing that cost the operator an hour of silence with a
+    clean ledger. Now the timeline is built from hearing stamps whenever
+    the window holds any, and every line carries the `basis` it was built
+    on so gap_rows can put it on the row.
+
+    `basis` may be forced to "heard" or "published" by a caller that wants
+    one specific reading - hearing_census asks for both in turn so the
+    operator can see the two numbers side by side. Left empty it is
+    decided by gap_basis(), which is where the rule is written down."""
     src = chat if chat is not None else list(_RADIO.get("chat") or [])
-    out: list[dict[str, Any]] = []
+    cast: list[dict[str, Any]] = []
     for r in src:
         if not isinstance(r, dict):
             continue
         if r.get("who") not in GAP_CAST or r.get("kind") in GAP_NOT_SPEECH:
             continue
-        if r.get("aired") not in GAP_AIRED:
-            continue
-        t = _gap_row_time(r)
+        cast.append(r)
+    published = [r for r in cast if r.get("aired") in GAP_AIRED]
+    if basis not in (GAP_BASIS_HEARD, GAP_BASIS_PUBLISHED):
+        lo = hi = 0.0
+        for r in published:
+            t = _gap_row_time(r)
+            if t <= 0:
+                continue
+            lo = t if lo <= 0 else min(lo, t)
+            hi = max(hi, t + max(0.0, _gap_row_len(r)))
+        if lo <= 0:
+            lo = hi = time.time()
+        basis = gap_basis(cast, lo, hi)
+    heard_basis = basis == GAP_BASIS_HEARD
+    use = [r for r in cast if line_heard_at(r) > 0] if heard_basis else published
+    out: list[dict[str, Any]] = []
+    for r in use:
+        heard = line_heard_at(r)
+        t = heard if heard_basis else _gap_row_time(r)
         if t <= 0:
             continue
         ln = _gap_row_len(r)
@@ -73074,6 +73298,10 @@ def gap_lines(chat: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
             "page": str(r.get("clip_media") or r.get("media") or "")[:8],
             "source": str(r.get("source") or ""),
             "aired": str(r.get("aired") or ""),
+            # Which fact put this line on the timeline, and when the room
+            # said it heard it (absent when the room never said so).
+            "basis": basis,
+            "heard_at": round(heard, 3) if heard > 0 else None,
             "render_ms": int(rs.get("ms") or 0) if rs else 0,
             "name": str(r.get("name") or ""),
             "text": str(r.get("text") or "")[:80],
@@ -73191,7 +73419,8 @@ def _gap_cause(row: dict[str, Any]) -> str:
 
 def gap_rows(chat: list[dict[str, Any]] | None = None,
              now: float | None = None,
-             least: float = GAP_MIN_SECONDS) -> list[dict[str, Any]]:
+             least: float = GAP_MIN_SECONDS,
+             basis: str = "") -> list[dict[str, Any]]:
     """Every silence of `least` seconds or more between consecutive cast
     lines, end-of-previous to start-of-next, with what preceded and
     followed it and what the station was doing meanwhile.
@@ -73199,8 +73428,17 @@ def gap_rows(chat: list[dict[str, Any]] | None = None,
     #1150: `seconds` is the DEAD part - the pause the operator asked for
     is not a hole in the show. `wall_seconds` keeps the measured span
     and `paused_seconds` the overlap with the pause marks, and a silence
-    that was wholly a pause is not a row at all."""
-    lines = gap_lines(chat)
+    that was wholly a pause is not a row at all.
+
+    2026-09-15 (#1422g): and every row now carries `basis`, naming the
+    fact its seconds were measured against - "heard", "published" or
+    "unheard". See gap_basis() for the rule and why it is that rule. A
+    reader that finds a row without the field is reading a row written
+    before this item and should assume "published", which is what every
+    row written before this item was."""
+    lines = gap_lines(chat, basis)
+    _basis = str(lines[0].get("basis") or "") if lines else (
+        basis or GAP_BASIS_PUBLISHED)
     out: list[dict[str, Any]] = []
     prev: dict[str, Any] | None = None
     for cur in lines:
@@ -73225,6 +73463,11 @@ def gap_rows(chat: list[dict[str, Any]] | None = None,
                     "seconds": round(dead, 1),      # #1150: the hole
                     "wall_seconds": round(hole, 1),  # ...end to end
                     "paused_seconds": round(paused_s, 1),
+                    # 2026-09-15: what these seconds were measured
+                    # BETWEEN - two lines a listener said they heard, or
+                    # two lines the station merely handed over. Never
+                    # quote `seconds` without reading this field.
+                    "basis": _basis,
                     "boundary": boundary,
                     "prev": {k: prev[k] for k in ("id", "who", "kind", "page",
                                                    "source", "aired", "text")},
@@ -74561,10 +74804,44 @@ def deadair_census(hours: int = 24,
         "causes": ranked(causes, 10),
         "blocking_functions": ranked(funcs, 15),
         "blocking_sites": ranked(frames, 15),
+        # 2026-09-15 (#1422l): AND WHETHER ANY OF THIS WAS HEARD.
+        #
+        # Every number above it is built from lines being handed over.
+        # That was true before this item too, and the night of
+        # 2026-09-14/15 is what it costs: an hour of silence, a census
+        # reporting zero gaps, and nothing on this route to contradict
+        # it. The hearing block sits beside the dead-air block so the
+        # two can never again be read apart. Its own try: a fault in the
+        # air log must not cost the operator the dead-air census.
+        "hearing": _deadair_hearing(hours),
         # #1371: is the desk keeping up, or is it the next thing to look at.
         "learning_desk": learning_desk_state(),
         "say": verdict,
     }
+
+
+def _deadair_hearing(hours: int) -> dict[str, Any]:
+    """hearing_census, but a fault in it may not take the census with it."""
+    try:
+        return hearing_census(hours)
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False,
+                "why": "the hearing census could not be read: %r" % (exc,)}
+
+
+@app.get("/api/hearing")
+async def hearing_api(
+    hours: int = 1,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1422: how many lines were PUBLISHED and how many were HEARD.
+
+    The one route to ask when the room is quiet and every other meter is
+    green. It is a file read and a sort, so it is threaded like the
+    dead-air census beside it."""
+    require_read_auth(authorization)
+    hours = max(1, min(24 * 14, int(hours or 1)))
+    return await asyncio.to_thread(hearing_census, hours)
 
 
 @app.get("/api/deadair")
@@ -74592,9 +74869,158 @@ async def deadair_api(
     return got
 
 
+def hearing_census(hours: int = 1, now: float | None = None) -> dict[str, Any]:
+    """#1422: PUBLISHED AND HEARD, SIDE BY SIDE, FOR ONE WINDOW.
+
+    The report the operator did not have on the night of 2026-09-14/15.
+    He heard nothing for an hour. Every panel read green, the feed filled,
+    the render queue drained, and data/gap_log.jsonl recorded zero gaps -
+    because every ledger in this file counted lines being HANDED OVER.
+
+    Two counts and two dead-air totals, from the durable air log so the
+    window may reach back past a restart:
+
+      lines_published   lines the station handed over in the window
+      lines_heard       lines a listener's own player reported audible
+                        and progressing (see line_heard_at - the one
+                        honest test the station owns)
+      unheard_lines     the difference, named
+      unheard_speech_s  how many SECONDS of speech went out that nobody
+                        ever said they heard. This is the loud number.
+      dead_s_published  dead air measured between lines handed over -
+                        what every ledger said before this item
+      dead_s_heard      dead air measured between lines a listener heard
+
+    During a repeat of last night the two diverge as loudly as they can:
+    lines_heard is 0 against several hundred published, unheard_speech_s
+    is most of an hour of rendered speech, dead_s_published is near zero
+    and dead_s_heard is the whole span. `diverged` is True and `say`
+    states it in a sentence.
+
+    Sync, and it reads a file - call it from a thread. deadair_census
+    already runs in one and calls this there."""
+    now = float(now or time.time())
+    hours = max(1, min(24 * 14, int(hours or 1)))
+    since = now - hours * 3600.0
+    rows: list[dict[str, Any]] = []
+    try:
+        rows = [r for r in airlog_rows(since, now + 1.0, quiet=True)
+                if isinstance(r, dict)
+                and str(r.get("who") or "") in GAP_CAST
+                and str(r.get("kind") or "") not in GAP_NOT_SPEECH]
+    except Exception:  # noqa: BLE001
+        rows = []
+    published = [r for r in rows if str(r.get("aired") or "") in GAP_AIRED]
+    heard = [r for r in rows if line_heard_at(r) > 0]
+    unheard = [r for r in published if line_heard_at(r) <= 0]
+
+    def _speech(rs: list[dict[str, Any]]) -> float:
+        total = 0.0
+        for r in rs:
+            try:
+                total += max(0.0, _gap_row_len(r))
+            except Exception:  # noqa: BLE001
+                continue
+        return total
+
+    lo = hi = 0.0
+    for r in published:
+        t = _gap_row_time(r)
+        if t <= 0:
+            continue
+        lo = t if lo <= 0 else min(lo, t)
+        hi = max(hi, t + max(0.0, _gap_row_len(r)))
+    dead_published = dead_heard = 0.0
+    try:
+        dead_published = sum(float(g.get("seconds") or 0) for g in
+                             gap_rows(rows, now=now, basis=GAP_BASIS_PUBLISHED))
+    except Exception:  # noqa: BLE001
+        dead_published = 0.0
+    try:
+        dead_heard = sum(float(g.get("seconds") or 0) for g in
+                         gap_rows(rows, now=now, basis=GAP_BASIS_HEARD))
+    except Exception:  # noqa: BLE001
+        dead_heard = 0.0
+    note = ""
+    if published and not heard and hi > lo:
+        # NOTHING WAS HEARD. The hearing timeline has no lines in it, so
+        # it produces no gap rows, so the naive reading is "0 seconds of
+        # dead air" - which is the SAME lie from the other end, and the
+        # exact trap this item was written about. The honest reading when
+        # not one line was acknowledged is that the whole measured span
+        # was dead to the room, less whatever the operator paused out on
+        # purpose (#1150 - a pause is not a hole in the show).
+        _paused = 0.0
+        try:
+            _paused = _gap_paused_between(lo, hi)
+        except Exception:  # noqa: BLE001
+            _paused = 0.0
+        dead_heard = max(dead_heard, max(0.0, (hi - lo) - _paused))
+        note = ("not one line in this window was acknowledged by any "
+                "listener, so the whole measured span counts as dead on "
+                "the hearing basis")
+    basis = GAP_BASIS_PUBLISHED
+    try:
+        basis = gap_basis(rows, lo or since, hi or now)
+    except Exception:  # noqa: BLE001
+        basis = GAP_BASIS_PUBLISHED
+    unheard_s = _speech(unheard)
+    heard_s = _speech(heard)
+    published_s = _speech(published)
+    # `diverged` is the alarm, and it is kept NARROW on purpose: lines
+    # went out, listeners were connected across the window, and not one
+    # line was acknowledged. That is last night exactly, and it is the
+    # only shape that is certainly a fault. A wider test - say, a low
+    # heard share - would shout every day at a house that listens on the
+    # box with the panel open, because a box line is never acknowledged
+    # by a page. `heard_share` is published beside this for the operator
+    # to read; the alarm only fires where the evidence is unambiguous.
+    diverged = bool(published and not heard and basis == GAP_BASIS_UNHEARD)
+    say = ("in the last %dh the station published %d line(s) (%ds of "
+           "speech); %d of them (%ds) were acknowledged audible by a "
+           "listener. %d line(s) and %ds of speech went out that no "
+           "player ever reported hearing. Dead air on the publication "
+           "basis: %ds. On the hearing basis: %ds."
+           % (hours, len(published), round(published_s), len(heard),
+              round(heard_s), len(unheard), round(unheard_s),
+              round(dead_published), round(dead_heard)))
+    if diverged:
+        say = ("PUBLISHED BUT NEVER HEARD. " + say + " This is the shape of "
+               "the 2026-09-14/15 outage: the station kept working and the "
+               "room stayed silent. Check that a listener page is open and "
+               "unmuted before believing any dead-air number above.")
+    elif basis == GAP_BASIS_PUBLISHED and not heard:
+        say = (say + " No listener was connected across this window, so "
+               "there was nobody to acknowledge anything and the numbers "
+               "above are publication numbers - not a fault.")
+    return {
+        "window_hours": hours, "at": now, "basis": basis,
+        "lines_published": len(published), "lines_heard": len(heard),
+        "unheard_lines": len(unheard),
+        "published_speech_s": round(published_s, 1),
+        "heard_speech_s": round(heard_s, 1),
+        "unheard_speech_s": round(unheard_s, 1),
+        "heard_share": (round(len(heard) / len(published), 3)
+                        if published else None),
+        "dead_s_published": round(dead_published),
+        "dead_s_heard": round(dead_heard),
+        "span_s": round(max(0.0, hi - lo), 1),
+        "listeners_in_window": _gap_listeners_between(lo or since, hi or now),
+        "diverged": diverged,
+        "note": note,
+        "say": say,
+    }
+
+
 def _gap_log_slim(row: dict[str, Any]) -> dict[str, Any]:
+    # 2026-09-15 (#1422h): `basis` is in the keep list because this
+    # allowlist is the whole reason a field reaches data/gap_log.jsonl. A
+    # row that named its basis in memory and lost it on the way to the
+    # disk would leave the file exactly as misleading as it was on the
+    # night of 2026-09-14/15, when it recorded zero gaps across an hour
+    # the operator spent hearing nothing.
     keep = ("key", "at", "until", "seconds", "wall_seconds",
-            "paused_seconds", "boundary", "prev", "next",
+            "paused_seconds", "basis", "boundary", "prev", "next",
             "next_render_ms", "round", "takes", "stall_s", "stall_top",
             "marks", "cause")
     return {k: row.get(k) for k in keep if k in row}
@@ -110279,9 +110705,9 @@ async def said_why_api(
         flow.append({"step": "rendered", "label": "voiced as %s" % row.get("voice"),
                      "detail": "the engine is not on this row's record", "at": ""})
     _st = str(row.get("aired") or "")
-    _road = {"stream": "handed to the page and heard there",
-             "box": "handed to the box and heard there",
-             "both": "heard on the page and the box",
+    _road = {"stream": "handed to the page",
+             "box": "handed to the box, which reported the playout audible",
+             "both": "handed to the page and to the box",
              "published": "published to the page",
              "page": "played by the page",
              "airing": "going out right now",
@@ -110294,11 +110720,27 @@ async def said_why_api(
                  "detail": (str(row.get("withdrawn_why") or "")
                             or ("page delivery %s" % row.get("page_delivery") if row.get("page_delivery") else "")
                             or ("box delivery %s" % row.get("box_delivery") if row.get("box_delivery") else "")),
-                 "at": _when(row.get("air_at")) if _st in AIR_AT_HEARD else ""})
-    if _st in AIR_AT_HEARD and row.get("air_at"):
-        flow.append({"step": "heard", "label": "heard at %s" % _when(row.get("air_at")),
-                     "detail": ("%.1fs on air" % float(row.get("seconds") or 0))
-                     if float(row.get("seconds") or 0) > 0 else "",
+                 "at": _when(row.get("air_at")) if _st in AIR_PUBLICATION_STATES else ""})
+    # 2026-09-15 (#1422j): the flow chart drew a "heard" step for any line
+    # in a publication state. "a flow by flow flow chart explaining
+    # everything that's happened as far as how this piece of line came to
+    # be broadcasted" - and the last step of it was asserting the one
+    # thing nothing on the record knew. Two steps now, and a line only
+    # gets the second one when a listener's player said so.
+    _heard_flow = line_heard_at(row)
+    if _heard_flow > 0:
+        flow.append({"step": "heard",
+                     "label": "heard at %s" % _when(_heard_flow),
+                     "detail": (("%.1fs on air; " % float(row.get("seconds") or 0))
+                                if float(row.get("seconds") or 0) > 0 else "")
+                     + "a listener's player reported it audible and running",
+                     "at": _when(_heard_flow)})
+    elif _st in AIR_PUBLICATION_STATES and row.get("air_at"):
+        flow.append({"step": "published",
+                     "label": "published at %s" % _when(row.get("air_at")),
+                     "detail": ("%.1fs of audio; " % float(row.get("seconds") or 0)
+                                if float(row.get("seconds") or 0) > 0 else "")
+                     + "no listener has acknowledged hearing this line",
                      "at": _when(row.get("air_at"))})
     try:
         _place = script_ledger_order().get(want)
@@ -110433,7 +110875,7 @@ def hour_contract_delivered(since: float, until: float) -> dict[str, Any]:
     heard: dict[str, dict[str, Any]] = {}
     try:
         for row in airlog_rows(since, until, quiet=True):
-            if str(row.get("aired") or "") not in AIR_AT_HEARD:
+            if str(row.get("aired") or "") not in AIR_PUBLICATION_STATES:
                 continue
             road = str(row.get("round") or "") or str(row.get("kind") or "")
             if not road:
@@ -110557,6 +110999,8 @@ def segment_inspect(block: int) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         air = {}
     heard_at: list[float] = []
+    _published_at: list[float] = []     # 2026-09-15: the other question
+    _any_heard = False
     for r in led:
         lid = str(r.get("line_id") or "")
         got = air.get(lid) or {}
@@ -110571,8 +111015,26 @@ def segment_inspect(block: int) -> dict[str, Any]:
                     break
         aired = str(got.get("aired") or "")
         at = float(got.get("air_at") or 0)
-        if aired in AIR_AT_HEARD and at:
-            heard_at.append(at)
+        # 2026-09-15 (#1422i): THIS REPORT SAID "heard" AND MEANT "HANDED
+        # OVER". It reported `heard: aired in <the publication tuple>` for
+        # every line of a segment, so a segment whose every line was
+        # published into a silent house came back with a full timing
+        # block, a first_heard, a last_heard and a per-seat heard count.
+        # That is the report the operator would have opened during last
+        # night's outage, and it would have reassured him.
+        #
+        # Per line, `heard` is now the listener's own acknowledgement and
+        # nothing else. The segment's TIMING block degrades by the same
+        # rule gap_basis() writes down and for the same reasons: hearing
+        # stamps when the segment has any, publication otherwise, with
+        # `heard_basis` saying which, so a segment nobody was tuned in for
+        # is not reported as a segment that failed.
+        _heard_when = line_heard_at(got)
+        if aired in AIR_PUBLICATION_STATES and at:
+            _published_at.append(at)
+        if _heard_when > 0:
+            _any_heard = True
+            heard_at.append(_heard_when)
         trace = got.get("trace") if isinstance(got.get("trace"), dict) else {}
         render = trace.get("render") if isinstance(trace.get("render"), dict) else {}
         out["lines"].append({
@@ -110585,7 +111047,13 @@ def segment_inspect(block: int) -> dict[str, Any]:
             "aired": aired or None,
             "air_at": at or None,
             "at": time.strftime("%H:%M:%S", time.localtime(at)) if at else None,
-            "heard": aired in AIR_AT_HEARD,
+            # 2026-09-15: a listener's player said this line came out of a
+            # speaker. `published` is the old question, kept beside it and
+            # named correctly, because the difference between the two is
+            # the thing worth looking at.
+            "heard": _heard_when > 0,
+            "heard_at": _heard_when or None,
+            "published": aired in AIR_PUBLICATION_STATES,
             "withdrawn_why": str(got.get("withdrawn_why") or "") or None,
             "voice": str(got.get("voice") or "") or None,
             "engine": str(render.get("engine") or got.get("engine") or "") or None,
@@ -110636,9 +111104,21 @@ def segment_inspect(block: int) -> dict[str, Any]:
                         "met": None,
                         "say": "this road has no brief - the station does not "
                                "say what a %s segment must contain" % (road or "?")}
+    # 2026-09-15: hearing when the segment has any, publication otherwise,
+    # and the block says which. A segment with no acknowledgement at all is
+    # not a segment that failed - it may be a box-only house or an hour
+    # nobody was tuned in for - but it is also not a segment anybody can
+    # say was heard, and the label is the difference.
+    out["heard_basis"] = (GAP_BASIS_HEARD if _any_heard
+                          else GAP_BASIS_PUBLISHED)
+    out["lines_heard"] = sum(1 for _l in out["lines"] if _l.get("heard"))
+    out["lines_published"] = sum(1 for _l in out["lines"] if _l.get("published"))
+    if not heard_at and _published_at:
+        heard_at = list(_published_at)
     if heard_at:
         heard_at.sort()
         out["timing"] = {"first_heard": heard_at[0], "last_heard": heard_at[-1],
+                         "basis": out["heard_basis"],
                          "from": time.strftime("%H:%M:%S", time.localtime(heard_at[0])),
                          "to": time.strftime("%H:%M:%S", time.localtime(heard_at[-1])),
                          "span_s": round(heard_at[-1] - heard_at[0], 1),
@@ -111182,7 +111662,7 @@ def script_sequence_check(view: dict[str, Any]) -> dict[str, Any]:
         if len(f) < 9 or not f[2]:
             continue
         st = states.get(f[2][:8])
-        if st and st not in AIR_AT_HEARD:
+        if st and st not in AIR_PUBLICATION_STATES:
             unheard.append({"index": f[0], "line": f[2], "order": f[4],
                             "kind": f[5], "who": f[6], "state": st})
     out["unheard"] = unheard
@@ -136069,6 +136549,22 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
                  or (kind if kind in AIRLOG_TURN_ROUNDS else "banter"),
         "text": " ".join(str(entry.get("text") or "").split())[:600],
         "aired": str(entry.get("aired") or ""),
+        # 2026-09-15 (#1422c): AND THE HEARING STAMP, BESIDE IT.
+        #
+        # `aired` is a publication state and stays one. This is the other
+        # fact: a listener's player told us the line came out of a speaker
+        # at this moment. Absent means "no listener ever said so", which
+        # is a real and important answer and is exactly what the whole of
+        # last night's outage looks like on this ledger - every row
+        # aired="stream", not one row carrying this key.
+        #
+        # It lives in the durable row because the readers that were misled
+        # read the durable row: the segment inspector, the hour contract,
+        # the sheet-against-delivered report and the dead-air census all
+        # come here, not to the ring, and the ring holds four minutes.
+        **({HEARD_STAMP: round(float(entry.get(HEARD_STAMP) or 0), 3),
+            HEARD_STAMP_BY: str(entry.get(HEARD_STAMP_BY) or "")[:16]}
+           if entry.get(HEARD_STAMP) else {}),
         # 2026-09-14: the reason a withdrawn row was refused survives the
         # ring - the panel's tooltip and the script report read it back.
         **({"withdrawn_why": str(entry.get("withdrawn_why"))[:240]}
@@ -136131,7 +136627,15 @@ def airlog_row_hash(row: dict[str, Any]) -> str:
     """What a change looks like: the fields that get restamped after the
     ring append (#770 air_at, held->box, the #908 clip window, pictures)."""
     try:
+        # 2026-09-15 (#1422d): the hearing stamp is in the hash because
+        # the keeper upserts by id and only rewrites a row whose durable
+        # shape CHANGED. A line is normally written to the log the tick
+        # after it is handed over and stamped heard a moment later, with
+        # `aired` and `air_at` already at their final values - so without
+        # this the stamp would be computed, dropped, and the durable row
+        # would keep saying "never heard" for ever.
         bits = (row.get("aired"), row.get("air_at"), row.get("text"),
+                row.get(HEARD_STAMP),
                 row.get("clip_from"), row.get("clip_until"), row.get("media"),
                 row.get("round"), len(row.get("images") or []))
         return hashlib.sha1(repr(bits).encode("utf-8")).hexdigest()[:16]
@@ -137163,7 +137667,7 @@ def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
         rid = str((row or {}).get("id") or "")
         if not rid or rid in known:
             continue
-        if str(row.get("aired") or "") not in AIR_AT_HEARD:
+        if str(row.get("aired") or "") not in AIR_PUBLICATION_STATES:
             continue          # not heard yet; it may still be written
         kind = str(row.get("kind") or "")
         if kind in SCREENPLAY_SKIP_KINDS:
@@ -138195,7 +138699,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             _r = _e.get("row") or {}
             if _e.get("what") != "line":
                 continue
-            if str(_r.get("aired") or "") in AIR_AT_HEARD:
+            if str(_r.get("aired") or "") in AIR_PUBLICATION_STATES:
                 _floor = max(_floor, float(_e["at"] or 0))
         if _floor:
             # The latest air time each conversation actually reached.
@@ -138204,7 +138708,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 if _e.get("what") != "line":
                     continue
                 _r = _e.get("row") or {}
-                if str(_r.get("aired") or "") not in AIR_AT_HEARD:
+                if str(_r.get("aired") or "") not in AIR_PUBLICATION_STATES:
                     continue
                 _sid = str(_r.get("sid") or "")
                 if not _sid:
@@ -138217,7 +138721,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 if _e.get("what") != "line":
                     continue
                 _r = _e.get("row") or {}
-                if str(_r.get("aired") or "") in AIR_AT_HEARD:
+                if str(_r.get("aired") or "") in AIR_PUBLICATION_STATES:
                     continue
                 if str(_r.get("id") or "") in _ord_early:
                     continue          # #1343: the ledger places it
@@ -138391,7 +138895,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 # other unheard ones.
                 _heard_here = any(
                     str((events[_i].get("row") or {}).get("aired") or "")
-                    in AIR_AT_HEARD for _i in w)
+                    in AIR_PUBLICATION_STATES for _i in w)
                 _best: tuple[float, float] | None = None
                 for _i in w:
                     _r = events[_i].get("row") or {}
