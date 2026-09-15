@@ -456,6 +456,28 @@
     try { root.dispatchEvent(new Event('resize')); } catch (err) { /* old engine */ }
   }
 
+  /* #1193: A NAMED WAY TO TAKE THE VIEWS DOWN.
+   *
+   * closeAll() has existed since the rail did, and five call sites inside
+   * this file use it. It had no name outside because nothing outside
+   * needed one - until the desk's 3JS tab.
+   *
+   * MEASURED: on the desk a 3JS scene is promoted to full screen INSIDE
+   * the controlFrame <webview>, and the rail's view hosts (#sampler,
+   * #script, #slideshow and the rest) are siblings of that webview in the
+   * SHELL document, sitting at z-index 2147483000. A scene that is
+   * genuinely full screen in the panel is still completely covered if the
+   * operator had SLIDES open when he pressed 3JS - the same "nothing was
+   * broken, one number was three million too small" fault the z-index lift
+   * in three-full.css was written for, arriving from the other side of the
+   * boundary this time.
+   *
+   * On the tablet this cannot happen: there the scene and the view hosts
+   * share one document and .p3-full sits at 2147483030, above them. So
+   * this is called only on the desk road, and it is exported rather than
+   * duplicated. */
+  root.PineViewRail = {closeAll: closeAll};
+
   root.__pineViewRail = function () {
     if (document.getElementById('pineViewRail')) return 'already';
 
