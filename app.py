@@ -69460,6 +69460,27 @@ def sfx_video_mode_on() -> bool:
         return False
 
 
+def sfx_video_seam_on() -> bool:
+    """2026-09-15 (#1184): is the clip-to-clip hand-over meant to be
+    seamless - no collapse, no gap, the next picture on the frame this one
+    ends?
+
+    Held here rather than in a browser so it survives a restart and so the
+    desk and the tablet cannot disagree about it, which is the same reason
+    the picture share and the clip length live here. The station does not
+    act on it: every part of the behaviour is in the tube, and this is
+    only where the answer is kept.
+
+    Default OFF. The CRT collapse is a thing the operator asked for by
+    name and liked; seamless is the other choice, not the correction of a
+    fault, so it is not turned on for anybody who has not asked.
+    """
+    try:
+        return bool(dj_settings().get("sfx_video_seam"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # --- #1366: THE ENDLESS SET --------------------------------------------------
 #
 # "Put a play button next to the video button that if I click it puts the
@@ -69632,7 +69653,9 @@ async def sfx_video_cycle() -> None:
 def sfx_video_mode_state() -> dict[str, Any]:
     cycle = dict(_SFX_CYCLE)
     cycle["left"] = max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1))
-    return {"on": sfx_video_mode_on(), "share": sfx_video_share(),
+    return {"on": sfx_video_mode_on(),
+            "seamless": sfx_video_seam_on(),          # 2026-09-15 (#1184)
+            "share": sfx_video_share(),
             "dial": int((dj_settings() or {}).get("sfx_video_share") or 0),
             "length": int((dj_settings() or {}).get("sfx_video_len") or 0),
             "cycle": cycle, "pool": len(_SFX_VIDEO_MEMO.get("pool") or []),
@@ -69641,13 +69664,31 @@ def sfx_video_mode_state() -> dict[str, Any]:
             "queued": int(cycle.get("queued") or 0),
             "asked": len(cycle.get("requests") or []),        # #1417: the SFX guy's clips waiting their turn
             "ahead_s": max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1)),
+            # 2026-09-15 (#1184): AND WHAT SEAMLESS IS DOING, in the same
+            # voice, on the same line - because a switch whose effect the
+            # operator cannot read is a switch he has to test by staring
+            # at the tube through a changeover.
+            #
+            # It is honest about the half it does not reach. The seam
+            # this removes is the floating set's; the LISTEN view paints
+            # the endless clip on a wallpaper element of its own
+            # (listen.js paintEndless) and hands over on its own
+            # once-a-second clock, which this does not touch. Saying so
+            # here costs one clause and saves an evening of wondering why
+            # the wall still blinks.
             "say": ("the endless set is on - %d clip(s) rung, %s is on the "
-                    "tube with %.0fs left"
+                    "tube with %.0fs left%s"
                     % (cycle.get("rung") or 0, cycle.get("clip") or "nothing",
-                       cycle.get("left") or 0))
+                       cycle.get("left") or 0,
+                       (" - seamless: the tube cuts on the frame, the "
+                        "listen wall still fades") if sfx_video_seam_on()
+                       else " - seamless off: the tube collapses between clips"))
                    if sfx_video_mode_on() else
                    ("the endless set is off - %d%% of his clips carry a "
-                    "picture" % sfx_video_share())}
+                    "picture%s" % (sfx_video_share(),
+                                   (" - seamless is armed and will take "
+                                    "effect when the set is on")
+                                   if sfx_video_seam_on() else ""))}
 
 
 def sting_due() -> Path | None:
@@ -105785,7 +105826,8 @@ async def dj_video_api(
     # the endless set is the operator's explicit choice and rolls on.
     if radio_paused() and not sfx_video_mode_on():
         return {"clips": [], "server_ms": server_ms,
-                "cut_ms": cut_ms, "paused": True, "endless": False}
+                "cut_ms": cut_ms, "paused": True, "endless": False,
+                "seamless": sfx_video_seam_on()}       # 2026-09-15 (#1184)
     out = []
     for clip in list(_RADIO.get("voice_clips") or [])[-80:]:
         if not clip.get("video"):
@@ -105800,7 +105842,11 @@ async def dj_video_api(
             continue
         out.append({**clip, "broadcast_ms": broadcast})
     return {"clips": out, "server_ms": server_ms, "cut_ms": cut_ms,
-            "endless": sfx_video_mode_on()}         # 2026-09-14
+            "endless": sfx_video_mode_on(),         # 2026-09-14
+            # 2026-09-15 (#1184): the hand-over style, on the poll the set
+            # already makes. The station does nothing with this; it is the
+            # tube's behaviour, kept here so both surfaces agree.
+            "seamless": sfx_video_seam_on()}
 
 
 @app.post("/api/dj/voice/ack")
@@ -127799,6 +127845,25 @@ async def sfx_stats_api(
 SFX_SPEC_DIR = data_path("sfx_specs")
 
 
+def _sfx_file_facts(sample: Path) -> dict[str, Any]:
+    """Size and age, from the one stat that answers both (#1184).
+
+    Its own function and its own thread because this folder is very often
+    a CIFS share: a stat there is a round trip, and a round trip on the
+    event loop is the fault that has stopped this station's audio twice.
+    A folder that will not answer gives zeros, which the sheet prints as
+    "not known" rather than as a wrong number.
+    """
+    out: dict[str, Any] = {"bytes": 0, "made": 0}
+    try:
+        stamp = sample.stat()
+        out["bytes"] = int(stamp.st_size)
+        out["made"] = int(stamp.st_mtime)
+    except OSError:
+        pass
+    return out
+
+
 @app.get("/api/sfx/info")
 async def sfx_info_api(
     id: str = "",
@@ -127831,6 +127896,8 @@ async def sfx_info_api(
     row = sfx_plays().get(sid) or {}
     by = row.get("by") or {}
     top = max(by, key=by.get) if by else ""
+    facts = await asyncio.to_thread(_sfx_file_facts, sample)
+    shows = sfx_is_video(sample)
     return {
         "id": sid,
         "name": sample.stem,
@@ -127852,6 +127919,18 @@ async def sfx_info_api(
         "path": str(sample),
         "host_path": share_path_of(sample),
         "spec_url": f"/api/sfx/spec/{sid}?t={media_sign(sid)}",
+        # 2026-09-15 (#1184): "examine the video - how long, how big ...
+        # when it was made". Bytes on disk and the mtime as plain epoch
+        # seconds; 0 for either means the folder would not say, and the
+        # sheet prints that rather than guessing.
+        "bytes": int(facts.get("bytes") or 0),
+        "made": int(facts.get("made") or 0),
+        # Which of this station's two pictures this clip has. A video gets
+        # a real frame; anything else has only the spectrogram above, and
+        # the poster route answers 404 for it on purpose.
+        "video": bool(shows),
+        "poster_url": (f"/api/sfx/poster/{sid}?t={media_sign(sid)}"
+                       if shows else ""),
     }
 
 
@@ -127869,6 +127948,133 @@ async def sfx_weight_api(
         raise HTTPException(status_code=404, detail="No such sample")
     rows = sfx_set_weight(sid, float(payload.get("weight") or 1.0))
     return {"id": sid, "weight": rows.get(sid, 1.0)}
+
+
+SFX_POSTER_DIR = data_path("sfx_posters")
+# 2026-09-15 (#1184): how many posters the cache keeps. A tile is drawn at
+# about 92 px on the tablet and this renders at 320 wide, so one is a few
+# kilobytes; six hundred of them is a handful of megabytes and covers every
+# clip the endless cycle has shown in days.
+SFX_POSTER_MOST = 600
+SFX_POSTER_WIDE = 320
+# The render gate, made on first use because a Semaphore wants a loop.
+# TWO AT ONCE, NOT THIRTY. asyncio.to_thread hands work to the default
+# executor, which on this box is about thirty threads, and the sheet asks
+# for five tiles the instant it opens - on a cold cache that is five ffmpeg
+# processes arriving together on a machine whose whole job is not to stop
+# broadcasting. Two at a time makes a cold strip fill in a beat later and
+# costs the air nothing.
+_SFX_POSTER_GATE: Any = None
+
+
+def _sfx_poster_prune() -> None:
+    """Newest SFX_POSTER_MOST and no more (#1184).
+
+    Called only after a render actually happened, so a warm cache never
+    walks this folder at all, and never on the event loop - see the caller.
+    """
+    try:
+        kept = sorted(SFX_POSTER_DIR.glob("*.jpg"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for old in kept[SFX_POSTER_MOST:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def _render_poster(source: Path, out: Path) -> bool:
+    """One frame out of a video clip, as a small jpeg (#1184).
+
+    WHY -ss COMES BEFORE -i. In front of the input it is a seek to the
+    nearest keyframe and costs almost nothing; behind the input ffmpeg
+    decodes every frame up to that point, which on a thirty second clip is
+    the whole file. Half a second in rather than at zero because the first
+    frame of a grabbed clip is very often black or a fade.
+
+    AND IT TRIES AGAIN AT ZERO. Some clips in this library are shorter than
+    half a second, and a seek past the end writes no frame and returns
+    success - measured as a zero byte jpeg that the browser then drew as a
+    broken image. So the size is checked, not the exit code alone, and a
+    clip too short for the seek is taken from its first frame instead.
+
+    Twenty five seconds, not the spectrogram's three hundred: a single
+    keyframe is either there at once or the file is not one we can draw.
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    part = out.with_suffix(".part.jpg")
+    for seek in ("0.5", "0"):
+        try:
+            subprocess.run(
+                [exe, "-nostdin", "-loglevel", "error", "-y",
+                 "-ss", seek, "-i", str(source),
+                 "-frames:v", "1", "-an",
+                 "-vf", "scale=%d:-2" % SFX_POSTER_WIDE,
+                 "-q:v", "6", str(part)],
+                check=True, timeout=25)
+        except Exception:
+            part.unlink(missing_ok=True)
+            continue
+        try:
+            made = part.exists() and part.stat().st_size > 0
+        except OSError:
+            made = False
+        if made:
+            part.replace(out)
+            return True
+        part.unlink(missing_ok=True)
+    return False
+
+
+@app.get("/api/sfx/poster/{sid}")
+async def sfx_poster_api(
+    sid: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The clip's own first picture, rendered once and kept (#1184).
+
+    "i want the popup to show thumbnails of the last 2 videos played and
+     the next 2 videos planned for play"
+
+    A 404 for anything that is not a video is the honest answer and the
+    sheet knows what to do with it: an audio clip has no frame, and the
+    picture it does have is the spectrogram this route sits beside. The
+    strip asks for the poster on a video and the spec on anything else,
+    so neither route is ever asked a question it cannot answer.
+    """
+    if not re.match(r"^[a-f0-9]{16}\Z", sid or ""):
+        return Response(status_code=404)
+    signature = str(request.query_params.get("t") or "")
+    expected = media_sign(sid)
+    if not (expected and hmac.compare_digest(signature, expected)):
+        require_read_auth(authorization)
+    sample = await asyncio.to_thread(sfx_by_id, sid)
+    if sample is None or not sfx_is_video(sample):
+        return Response(status_code=404)
+    out = SFX_POSTER_DIR / f"{sid}.jpg"
+    if not out.exists():
+        global _SFX_POSTER_GATE
+        if _SFX_POSTER_GATE is None:
+            _SFX_POSTER_GATE = asyncio.Semaphore(2)
+        async with _SFX_POSTER_GATE:
+            # Asked again inside the gate: five tiles for the same clip can
+            # queue behind each other and only the first should spend an
+            # ffmpeg on it.
+            if not out.exists():
+                SFX_POSTER_DIR.mkdir(parents=True, exist_ok=True)
+                drawn = await asyncio.to_thread(_render_poster, sample, out)
+                if not drawn:
+                    return Response(status_code=404)
+                await asyncio.to_thread(_sfx_poster_prune)
+    body = await asyncio.to_thread(out.read_bytes)
+    return Response(body, media_type="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.get("/api/sfx/spec/{sid}")
@@ -133807,6 +134013,8 @@ async def sfx_video_mode_api(
         changed["sfx_video_share"] = max(0, min(100, int(body.get("share") or 0)))
     if body.get("length") is not None:                   # 2026-09-14
         changed["sfx_video_len"] = max(0, min(120, int(body.get("length") or 0)))
+    if body.get("seamless") is not None:                 # 2026-09-15 (#1184)
+        changed["sfx_video_seam"] = bool(body.get("seamless"))
     if changed:
         settings = load_settings()
         dj = dict(settings.get("dj") or {})
