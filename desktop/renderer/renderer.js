@@ -6606,6 +6606,460 @@ function wkRoadPop(road, anchor) {
   pop.wkTick = tick;
 }
 
+/* #1338 — THE BOARD, EXPANDED: the evidence under each summary line.
+ *
+ * The operator, with those five lines underlined:
+ *
+ *   "allow for these to be expanded out to analyze the details of these
+ *    elements."
+ *
+ * The lines a board row already opens to — written, recorded, ready,
+ * airtime standing by, the hour — are every one of them a NUMBER, and it
+ * is the number he has just read off the row above. #959 gave the road a
+ * triangle; this gives each of its lines one, and opening a line shows
+ * the SEGMENTS behind it: their ids, when each was written, how long each
+ * runs, which of their lines are actually in the pantry, and for anything
+ * that cannot air, the station's own named refusal. Never the number
+ * again — a restatement wearing a triangle is worth less than no
+ * triangle, because it costs a click to find out it said nothing.
+ *
+ * WHAT IT COSTS, because this drawer is thrown away and rebuilt every
+ * time the room's signature changes — which is most paints — and the
+ * tablet's frame pipeline is sensitive:
+ *
+ *   · ONE ROAD AT A TIME. Opening a line on a second road drops the
+ *     first road's evidence. The pane says so; eight shelves in the page
+ *     at once is not worth what it would cost.
+ *   · The evidence is asked for ONCE and stands for WK_BOARD_DEEP_FOR. A
+ *     repaint inside that window redraws from the cache and asks the
+ *     station nothing at all.
+ *   · A FAILED ask is remembered on the same clock, so a station that is
+ *     not carrying the detail road yet is asked once every twenty
+ *     seconds rather than once per paint.
+ *   · The hour is TWO calls SHARED by every road, on their own clock.
+ *   · At most WK_BOARD_SHOW rows go into the DOM. The rest are counted,
+ *     never drawn, and the pane says how many it is holding back.
+ *   · A pane exists only while its line is open and goes with the drawer
+ *     when it closes. Nothing is built for a line nobody has opened.
+ *
+ * The server half is /api/recording-room/detail/{kind} (#1338), which
+ * runs its walk on a thread: the loop under this station has been
+ * starved by smaller reads than a shelf of a hundred and thirty-nine. */
+const WK_BOARD_DEEP_FOR = 20000;      // one road's evidence stands this long
+const WK_BOARD_HOUR_FOR = 30000;      // the sheet and the contract, shared
+const WK_BOARD_ASK = 60;              // segments asked for, at most
+const WK_BOARD_SHOW = 12;             // segments DRAWN, at most
+
+/* The five lines, each with the Carbon glyph that marks it. Icons come
+ * out of the station's own sprite through pineIcon, the way every other
+ * renderer file asks for one — never a character somebody has to guess
+ * the meaning of. */
+const WK_BOARD_DEEP = {
+  written: ["c:document", "every segment this road is holding"],
+  recorded: ["c:microphone", "line by line — what is cut, and what is not"],
+  ready: ["c:checkmark", "what can air now, and why the rest cannot"],
+  airtime: ["c:time", "where the standing-by seconds actually are"],
+  hour: ["c:calendar", "what the sheet holds for this road this hour"]
+};
+
+/* The running order's kinds against the roads the rooms prepare — the
+ * panel's half of the station's SCHED_PREP_KIND. A "call with banter" is
+ * a caller entry; a bombshell is an advert-shaped read. Without this the
+ * hour pane would miss every banter_caller slot on the sheet, which on a
+ * normal hour is two of the three calls. */
+const WK_BOARD_ROAD = {
+  track_talk: "track_talk", ad: "ad", manager: "manager", caller: "caller",
+  banter_caller: "caller", bombshell: "ad", gallery: "gallery",
+  banter: "banter", news: "news"
+};
+
+/* The one road whose evidence is in hand, and which of its lines are
+ * open. Held in memory on purpose: the drawer's own open/shut state is
+ * worth writing to localStorage because it survives a restart, but which
+ * pane of it a person is reading for the next twenty seconds is not. */
+let wkBoardDeep = {kind: "", at: 0, busy: false, data: null, why: "",
+                   open: {}};
+let wkBoardHour = {at: 0, busy: false, hours: null, contract: null};
+
+function wkBoardIcon(ref) {
+  const n = document.createElement("span");
+  n.style.cssText = "flex:0 0 auto;display:inline-flex;opacity:.75";
+  try {
+    if (typeof window.pineIcon === "function") {
+      n.innerHTML = window.pineIcon(ref);
+    }
+  } catch (e) { /* the words beside it still name the line */ }
+  return n;
+}
+
+/* How long a thing runs. Seconds up to a minute and a half, because that
+ * is how the board says airtime; minutes and seconds after that. */
+function wkBoardSpan(secs) {
+  const s = Math.max(0, Math.round(Number(secs) || 0));
+  if (s < 90) return s + "s";
+  return Math.floor(s / 60) + "m " + (s % 60) + "s";
+}
+
+/* How long ago. The shelf holds work for days, so this has to reach days
+ * without turning an hour-old round into "3600s". */
+function wkBoardAgo(secs) {
+  const s = Math.max(0, Math.round(Number(secs) || 0));
+  if (s < 90) return s + "s ago";
+  if (s < 5400) return Math.round(s / 60) + " min ago";
+  if (s < 172800) return (s / 3600).toFixed(1) + " h ago";
+  return Math.round(s / 86400) + " days ago";
+}
+
+/* How long something has left to live. The shelf keeps work for days, so
+ * this reads in hours and days — wkBoardSpan is for AIRTIME, and putting
+ * a day through it gives "1435m 9s", which nobody can read. */
+function wkBoardKeep(secs) {
+  const s = Math.max(0, Math.round(Number(secs) || 0));
+  if (s < 3600) return Math.round(s / 60) + " min";
+  if (s < 172800) return (s / 3600).toFixed(1) + " h";
+  return (s / 86400).toFixed(1) + " days";
+}
+
+/* The evidence for ONE road, cached. Returns what is in hand right now —
+ * possibly the previous answer, possibly nothing — and asks the station
+ * only when the clock says the answer has gone stale. `paint` is called
+ * when a new answer lands, and never otherwise. */
+function wkBoardDeepAsk(kind, paint) {
+  const asked = String(kind);
+  if (wkBoardDeep.kind !== asked) {
+    /* Another road: the first road's segments go. The open lines stay,
+     * because "I was reading the ready list" is about the question, not
+     * about the road. */
+    wkBoardDeep = {kind: asked, at: 0, busy: false, data: null, why: "",
+                   open: wkBoardDeep.open};
+  }
+  if (wkBoardDeep.busy) return wkBoardDeep.data;
+  if (wkBoardDeep.at && Date.now() - wkBoardDeep.at < WK_BOARD_DEEP_FOR) {
+    return wkBoardDeep.data;
+  }
+  wkBoardDeep.busy = true;
+  api.get("/api/recording-room/detail/" + encodeURIComponent(asked)
+          + "?limit=" + WK_BOARD_ASK).then((got) => {
+    if (wkBoardDeep.kind !== asked) return;       // the road moved under it
+    wkBoardDeep.data = got;
+    wkBoardDeep.why = "";
+    wkBoardDeep.at = Date.now();
+    wkBoardDeep.busy = false;
+    paint();
+  }).catch((e) => {
+    if (wkBoardDeep.kind !== asked) return;
+    wkBoardDeep.data = null;
+    /* The honest failure. A station that has not been given the detail
+     * road answers 404 here, and saying that plainly is better than an
+     * empty pane that reads as "this road is holding nothing". */
+    wkBoardDeep.why = "the recording room would not hand over this road's "
+      + "segments — " + ((e && e.message) ? e.message : "no answer");
+    wkBoardDeep.at = Date.now();
+    wkBoardDeep.busy = false;
+    paint();
+  });
+  return wkBoardDeep.data;
+}
+
+/* The sheet and the hour's contract, shared by every road, on one clock.
+ * Neither call can reject: a station without /api/hour/contract still
+ * gets the sheet, and the pane says what it has. */
+function wkBoardHourAsk(paint) {
+  if (wkBoardHour.busy) return wkBoardHour;
+  if (wkBoardHour.at && Date.now() - wkBoardHour.at < WK_BOARD_HOUR_FOR) {
+    return wkBoardHour;
+  }
+  wkBoardHour.busy = true;
+  Promise.all([
+    api.get("/api/schedule/hours?count=1").catch(() => null),
+    api.get("/api/hour/contract").catch(() => null)
+  ]).then((both) => {
+    wkBoardHour.hours = both[0];
+    wkBoardHour.contract = both[1];
+    wkBoardHour.at = Date.now();
+    wkBoardHour.busy = false;
+    paint();
+  });
+  return wkBoardHour;
+}
+
+function wkBoardPane() {
+  const n = document.createElement("div");
+  n.style.cssText = "margin:2px 0 5px 15px;padding:5px 7px;border-radius:5px;"
+    + "background:#05090f;border:1px solid #1d2f3f;white-space:normal";
+  return n;
+}
+
+function wkBoardNote(pane, said, colour) {
+  const n = document.createElement("div");
+  n.textContent = String(said);
+  n.style.cssText = "font-size:9.5px;line-height:1.5;margin:2px 0;color:"
+    + (colour || "#8ba0b5");
+  pane.appendChild(n);
+  return n;
+}
+
+function wkBoardItem(pane, head, said, colour) {
+  const n = document.createElement("div");
+  n.style.cssText = "display:flex;gap:6px;align-items:baseline;"
+    + "font-size:9.5px;line-height:1.5;margin:2px 0;padding:2px 5px;"
+    + "border-radius:4px;background:#070d14;border-left:2px solid "
+    + (colour || "#24384a");
+  const a = document.createElement("b");
+  a.textContent = String(head);
+  a.style.cssText = "flex:0 0 auto;color:#9fd8ff;white-space:nowrap";
+  n.appendChild(a);
+  const b = document.createElement("span");
+  b.textContent = String(said);
+  b.style.cssText = "flex:1 1 auto;min-width:0;color:#c8d6e4;"
+    + "overflow-wrap:anywhere";
+  n.appendChild(b);
+  pane.appendChild(n);
+  return n;
+}
+
+/* "which entries of this road the sheet holds this hour, which have
+ * aired, and which are still to come."
+ *
+ * The sheet answers all three by itself: every entry carries its start
+ * time, its own id, and a `state` the station keeps — done, on air,
+ * coming. The hour's contract (#1164) is folded in underneath for the
+ * other half of the question: what the AIR LOG says was actually heard
+ * of this road, which is the check that catches an entry the sheet
+ * thinks went out. */
+function wkBoardHourPane(pane, k, paint) {
+  const h = wkBoardHourAsk(paint);
+  const sheet = h.hours && h.hours.hours && h.hours.hours[0];
+  if (!sheet) {
+    wkBoardNote(pane, h.busy ? "reading the sheet…"
+      : "the sheet for this hour could not be read",
+      h.busy ? "#8ba0b5" : "#f0a35e");
+    return;
+  }
+  wkBoardNote(pane, "the sheet for " + (sheet.label || sheet.key || "this hour")
+    + (sheet.preset ? " · " + sheet.preset : "")
+    + (sheet.overridden ? " · overridden for this hour" : ""));
+  const mine = (sheet.slots || []).filter((s) =>
+    (WK_BOARD_ROAD[String(s.kind)] || String(s.kind)) === String(k.kind));
+  if (!mine.length) {
+    wkBoardNote(pane, "the sheet holds no entry of this road this hour — "
+      + "anything it does put out is out of turn", "#f0a35e");
+  }
+  let gone = 0;
+  mine.forEach((s) => {
+    const state = String(s.state || (s.past ? "done" : "coming"));
+    if (state === "done") gone += 1;
+    wkBoardItem(pane, String(s.starts_at || "--:--") + " " + String(s.id || ""),
+      String(s.label || s.kind) + " · " + Math.round(s.minutes || 0)
+      + " min · " + state + (s.enabled === false ? " (switched off)" : ""),
+      state === "done" ? "#7ce8a9"
+        : state === "coming" ? "#3f7fa8" : "#f0a35e");
+  });
+  if (mine.length) {
+    wkBoardNote(pane, gone + " of " + mine.length
+      + " have gone, " + (mine.length - gone) + " still to come");
+  }
+  const c = h.contract;
+  if (!c) {
+    wkBoardNote(pane, "the hour's contract could not be read, so this is the "
+      + "sheet's word only — not the air log's");
+    return;
+  }
+  if (c.available === false) {
+    wkBoardNote(pane, "the hour's contract is unavailable: "
+      + String(c.why || "no reason given"), "#f0a35e");
+    return;
+  }
+  const heard = (c.delivered || []).filter(
+    (r) => String(r.road) === String(k.kind))[0];
+  if (heard) {
+    wkBoardNote(pane, "the air log heard " + (heard.lines || 0)
+      + " line(s) of this road, " + wkBoardSpan(heard.seconds)
+      + ((heard.seats && heard.seats.length)
+         ? " · " + heard.seats.join(", ") : ""), "#7ce8a9");
+    return;
+  }
+  const missed = (c.missing || []).filter(
+    (r) => String(r.road) === String(k.kind))[0];
+  wkBoardNote(pane, missed ? String(missed.say)
+    : "the air log carries no line of this road in the window", "#f0a35e");
+}
+
+/* The evidence under one line. Every pane reads the SAME single payload
+ * — one ask serves all five — so opening a second line on a road that is
+ * already open costs nothing but the nodes it draws. */
+function wkBoardEvidence(pane, k, which, paint) {
+  if (which === "hour") { wkBoardHourPane(pane, k, paint); return; }
+  const d = wkBoardDeepAsk(k.kind, paint);
+  if (!d) {
+    wkBoardNote(pane, wkBoardDeep.why
+      || ("reading the shelf for " + String(k.label || k.kind) + "…"),
+      wkBoardDeep.why ? "#f0a35e" : "#8ba0b5");
+    return;
+  }
+  const rows = d.rows || [];
+  const tot = d.totals || {};
+  if (!rows.length) {
+    wkBoardNote(pane, "this road is holding nothing at all — there is no "
+      + "segment here to look at");
+    return;
+  }
+  if (which === "written") {
+    /* "which segments exist on the shelf for this road: their ids, when
+     * each was written, how long each runs, and whether each is ready or
+     * still waiting on something." */
+    wkBoardNote(pane, (tot.written || 0) + " segment(s) on the shelf"
+      + (d.cap ? " of " + d.cap + " it may hold" : "")
+      + " · " + (tot.ready || 0) + " ready · "
+      + (tot.unaired || 0) + " never aired");
+    rows.slice(0, WK_BOARD_SHOW).forEach((r) => {
+      wkBoardItem(pane, "#" + r.i + (r.id ? " " + r.id : ""),
+        [wkBoardSpan(r.seconds),
+         (r.written_ago != null ? "written " + wkBoardAgo(r.written_ago)
+                                : "no writing time was kept"),
+         (r.lines || 1) + " line(s)",
+         (r.ready ? "ready"
+                  : "waiting — " + (r.ready_why || "no reason given")),
+         (r.head ? "“" + r.head + "”" : "")
+        ].filter(Boolean).join(" · "),
+        r.ready ? "#7ce8a9" : "#f0a35e");
+    });
+  } else if (which === "recorded") {
+    /* "which lines are cut into the pantry and which are not; the ones
+     * that are not are the interesting half." So the uncut half is what
+     * is drawn, and the whole ones are a count. */
+    wkBoardNote(pane, (tot.rendered || 0) + " of " + (tot.lines || 0)
+      + " line(s) the room wrote down as cut. The pantry is asked again "
+      + "for every segment listed here — where the two disagree the "
+      + "clip has been burned since it was made (#1106).");
+    const holed = rows.filter((r) => (r.uncut || []).length);
+    if (!holed.length) {
+      wkBoardNote(pane, "every line of every segment listed still has its "
+        + "clip in the pantry", "#7ce8a9");
+    }
+    holed.slice(0, WK_BOARD_SHOW).forEach((r) => {
+      wkBoardItem(pane, "#" + r.i,
+        (r.lines_recorded || 0) + " of " + (r.lines || 0)
+        + " line(s) are in the pantry"
+        + ((r.lines_made != null && r.lines_made !== r.lines_recorded)
+           ? " — the room wrote down " + r.lines_made : ""),
+        "#f0a35e");
+      (r.uncut || []).slice(0, 6).forEach((u) => {
+        wkBoardItem(pane, "line " + u.line + (u.who ? " · " + u.who : ""),
+          String(u.why || "")
+          + (u.head ? " — “" + u.head + "”" : ""), "#5b3f2a");
+      });
+      if ((r.uncut || []).length > 6) {
+        wkBoardNote(pane, "…and " + ((r.uncut || []).length - 6)
+          + " more line(s) of this one");
+      }
+    });
+  } else if (which === "ready") {
+    /* "which whole segments could air right now without touching the
+     * engine, and for the ones that cannot, the named reason." The
+     * reasons are tallied first, because on a shelf of a hundred rows
+     * the SHAPE of the refusal is the thing worth seeing. */
+    wkBoardNote(pane, (tot.ready || 0) + " of " + (tot.written || 0)
+      + " segment(s) can air without touching the engine. The refusals "
+      + "below are counted over the " + (d.shown || rows.length)
+      + " segment(s) this pane was handed.");
+    const can = rows.filter((r) => r.ready);
+    const tally = {};
+    rows.filter((r) => !r.ready).forEach((r) => {
+      const why = String(r.ready_why || "no reason given");
+      tally[why] = (tally[why] || 0) + 1;
+    });
+    Object.keys(tally).forEach((why) => {
+      wkBoardItem(pane, tally[why] + " held", why, "#f0a35e");
+    });
+    if (!can.length) {
+      wkBoardNote(pane, "nothing on this road can air as it stands",
+        "#f0a35e");
+    }
+    can.slice(0, WK_BOARD_SHOW).forEach((r) => {
+      wkBoardItem(pane, "#" + r.i + " can air",
+        [wkBoardSpan(r.seconds),
+         (r.unaired ? "never aired"
+                    : (r.airings || 0) + " airing(s)"
+                      + (r.aired_ago != null
+                         ? ", last " + wkBoardAgo(r.aired_ago) : "")),
+         (r.expires_in != null
+          ? (r.expires_in > 0 ? "keeps for " + wkBoardKeep(r.expires_in)
+                              : "past its keep") : "")
+        ].filter(Boolean).join(" · "), "#7ce8a9");
+    });
+  } else {
+    /* "what that total is made of, segment by segment." Longest first,
+     * with the running total beside it, because the question underneath
+     * "4804s" is always which handful of rounds is most of it. */
+    const listed = rows.slice().sort(
+      (a, b) => (Number(b.seconds) || 0) - (Number(a.seconds) || 0));
+    wkBoardNote(pane, Math.round(tot.seconds || 0) + "s standing by across "
+      + (tot.written || 0) + " segment(s) — longest first");
+    let run = 0;
+    listed.slice(0, WK_BOARD_SHOW).forEach((r) => {
+      run += Number(r.seconds) || 0;
+      wkBoardItem(pane, wkBoardSpan(r.seconds),
+        "#" + r.i + (r.id ? " " + r.id : "")
+        + " · " + (r.ready ? "ready" : "not ready")
+        + " · running total " + wkBoardSpan(run),
+        r.ready ? "#7ce8a9" : "#f0a35e");
+    });
+    const rest = (Number(tot.seconds) || 0) - run;
+    if (rest > 1) {
+      wkBoardNote(pane, "the segments not drawn here carry the other "
+        + wkBoardSpan(rest));
+    }
+  }
+  if (d.held > d.shown) {
+    wkBoardNote(pane, "the station was asked for " + d.shown + " of "
+      + d.held + " segment(s), the ones that cannot air first; the rest "
+      + "are counted in the figures above but never drawn — this panel "
+      + "repaints far too often to put a whole shelf in the page");
+  }
+}
+
+/* One summary line of the drawer, with the door in front of it. */
+function wkBoardLine(host, k, which, said, paint) {
+  const spec = WK_BOARD_DEEP[which] || WK_BOARD_DEEP.written;
+  const open = wkBoardDeep.kind === String(k.kind)
+    && !!wkBoardDeep.open[which];
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;align-items:baseline;gap:5px;"
+    + "cursor:pointer;margin:1px 0";
+  const caret = wkBoardIcon("c:caret--right");
+  caret.style.transform = open ? "rotate(90deg)" : "rotate(0deg)";
+  row.appendChild(caret);
+  row.appendChild(wkBoardIcon(spec[0]));
+  const text = document.createElement("span");
+  text.textContent = said;
+  text.style.cssText = "flex:1 1 auto;min-width:0";
+  row.appendChild(text);
+  row.onclick = (ev) => {
+    ev.stopPropagation();
+    /* ONE ROAD AT A TIME — see the note at the head of this block. */
+    if (wkBoardDeep.kind !== String(k.kind)) {
+      wkBoardDeep = {kind: String(k.kind), at: 0, busy: false, data: null,
+                     why: "", open: {}};
+    }
+    wkBoardDeep.open[which] = !wkBoardDeep.open[which];
+    paint();
+  };
+  host.appendChild(row);
+  if (!open) return;
+  const pane = wkBoardPane();
+  host.appendChild(pane);
+  wkBoardNote(pane, spec[1]);
+  try { wkBoardEvidence(pane, k, which, paint); }
+  catch (e) {
+    /* One pane that cannot draw must not take the other four with it —
+     * a drawer painted by one function loses everything after the throw,
+     * which is the shape of the blank-panel bug this desk has had twice. */
+    wkBoardNote(pane, "this pane could not be drawn: "
+      + ((e && e.message) ? e.message : String(e)), "#f0a35e");
+  }
+}
+
 /* #959 — one road of THE BOARD, with a tick that opens it.
  *
  * The board was nine lines of pre-formatted text. Each road is a row
@@ -6644,20 +7098,53 @@ function wkBoardRow(host, k) {
     + ";margin:3px 0 6px 14px;padding:5px 7px;border-radius:6px;"
     + "background:#070d14;border:1px solid #1d2f3f;font-size:10px;"
     + "line-height:1.55;color:#c8d6e4;white-space:pre-wrap";
+  /* #1338: the SAME five lines, word for word - the operator
+   * underlined these - except that each of them is now a door.
+   *
+   *   "allow for these to be expanded out to analyze the details of
+   *    these elements."
+   *
+   * The wording is not touched because the wording is what he reads. The
+   * caret in front of it is the change. */
   const fill = () => {
-    drawer.textContent =
+    drawer.textContent = "";
+    wkBoardLine(drawer, k, "written",
       "written — " + (k.written || 0) + " segment(s) off the model"
-      + (k.cap ? " of " + k.cap + " the shelf holds" : "") + "\n"
-      + "recorded — " + (k.rendered || 0) + " of " + (k.lines || 0)
-      + " line(s) cut into the pantry\n"
-      + "ready — " + (k.ready || 0)
-      + " whole segment(s) that can air without touching the engine\n"
-      + (k.recording ? "in the room now — " + k.recording + "\n" : "")
-      + "airtime standing by — " + Math.round(k.seconds || 0) + "s"
-      + (k.per_hour != null
-         ? "\nthe hour — " + (k.aired || 0) + " aired of " + k.per_hour
-           + (k.behind ? " (behind)" : " (on pace)") : "")
-      + (k.short ? "\nshort of the hour's calls by " + k.short : "");
+      + (k.cap ? " of " + k.cap + " the shelf holds" : ""), repaint);
+    wkBoardLine(drawer, k, "recorded",
+      "recorded — " + (k.rendered || 0) + " of " + (k.lines || 0)
+      + " line(s) cut into the pantry", repaint);
+    wkBoardLine(drawer, k, "ready",
+      "ready — " + (k.ready || 0)
+      + " whole segment(s) that can air without touching the engine",
+      repaint);
+    if (k.recording) {
+      /* Who is in the room THIS SECOND is live state the floor already
+       * owns; it stays a plain line rather than pretending to a shelf. */
+      const cur = document.createElement("div");
+      cur.textContent = "in the room now — " + k.recording;
+      cur.style.cssText = "margin:1px 0 1px 15px";
+      drawer.appendChild(cur);
+    }
+    wkBoardLine(drawer, k, "airtime",
+      "airtime standing by — " + Math.round(k.seconds || 0) + "s",
+      repaint);
+    /* The hour line was drawn for the two roads that carry a quota and
+     * for nobody else - but the sheet holds entries for news, paintings,
+     * adverts and booth rounds too, and "which of my entries this hour
+     * have gone" is the same question on every road. The quota roads keep
+     * their exact wording; the rest get a door to the sheet. */
+    wkBoardLine(drawer, k, "hour",
+      k.per_hour != null
+        ? "the hour — " + (k.aired || 0) + " aired of " + k.per_hour
+          + (k.behind ? " (behind)" : " (on pace)")
+        : "the hour — what the sheet holds for this road", repaint);
+    if (k.short) {
+      const shy = document.createElement("div");
+      shy.textContent = "short of the hour's calls by " + k.short;
+      shy.style.cssText = "margin:1px 0 1px 15px";
+      drawer.appendChild(shy);
+    }
     const more = document.createElement("button");
     more.textContent = "what is being done about it →";
     more.style.cssText = "display:block;margin-top:6px;font-size:9.5px;"
@@ -6665,6 +7152,14 @@ function wkBoardRow(host, k) {
       + "background:#0b1520;color:#9fd8ff;cursor:pointer";
     more.onclick = (ev) => { ev.stopPropagation(); wkRoadPop(k.kind, more); };
     drawer.appendChild(more);
+  };
+  /* A pane that arrives after the drawer has been thrown away must not
+   * repaint a node nobody can see. Every asynchronous answer comes back
+   * through here. */
+  const repaint = () => {
+    try { if (!document.body.contains(drawer)) return; }
+    catch (e) { /* no document to ask - draw it */ }
+    fill();
   };
   if (wkOpenBoard[key]) fill();
   head.onclick = (ev) => {

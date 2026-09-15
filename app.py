@@ -119602,6 +119602,380 @@ async def api_recording_room_rows(
             "who": who, "gates": gates, "rows": rows}
 
 
+# --- THE BOARD, EXPANDED (#1338) --------------------------------------
+#
+# The operator, on the recording room's board:
+#
+#   "allow for these to be expanded out to analyze the details of these
+#    elements."
+#
+# A board row already opens to four or five lines - written, recorded,
+# ready, airtime standing by, the hour - and each of them is a NUMBER he
+# has just read off the row above it. Opening one has to show the
+# EVIDENCE: which segments, written when, running how long, and for the
+# ones that are not ready the station's own named reason. Anything less
+# is the same number wearing a triangle.
+#
+# prep_board() counts; it never said WHICH. api_recording_room_rows
+# (#992) walks a shelf row by row but answers one question only - why is
+# this row not audio yet - covers six of the eight roads, because the
+# larder and the record bookends have no shelf, and carries neither the
+# length of a segment nor when it was written. Two of the five lines are
+# exactly those two fields.
+#
+# So this is an additive second reader: the SAME predicates the board
+# counts with, reported per row instead of summed, for all eight roads.
+# #992 is not touched - it does its file-stat walk on the event loop and
+# this station has been starved by less, so a road the panel polls gets
+# its own bounded reader on a thread rather than a widened old one.
+PREP_DETAIL_SCHEMA = 1338
+PREP_DETAIL_MOST = 200
+PREP_DETAIL_UNCUT_MOST = 40
+
+
+def dialogue_row_ready_why(kind: str, row: Any) -> str:
+    """The NAMED reason this stored segment cannot air - "" when it can.
+
+    dialogue_row_ready() is the one authoritative zero-work-to-air
+    predicate and it returns a bare bool, but every gate inside it
+    already has a name. This asks those gates IN THE SAME ORDER and
+    hands back the first that refuses, so "ready - 42 of 46" can be
+    opened into the other four.
+
+    It decides NOTHING. The air road keeps asking dialogue_row_ready;
+    this is only ever allowed to describe what that answered."""
+    try:
+        if not isinstance(row, dict):
+            return "this is not a stored segment"
+        if row.get("off_brief"):
+            return "off brief: " + str((row.get("brief") or {}).get("why")
+                                       or "the segment brief was failed")
+        if row.get("review_cancel_pending"):
+            return "a cancel is pending on its review"
+        entry = dialogue_entry(row)
+        if entry is not None:
+            if entry.get("off_brief"):
+                return "off brief: " + str((entry.get("brief") or {}).get("why")
+                                           or "the segment brief was failed")
+            if entry.get("review_cancel_pending"):
+                return "a cancel is pending on its review"
+            if not _larder_current(entry):
+                return ("the writing contract moved on - cast, crystal or "
+                        "plot act")
+            _call_gate = globals().get("call_entry_contract")
+            if (str(kind) == "caller" and callable(_call_gate)
+                    and not _call_gate(entry)):
+                return "the phone-call contract does not hold"
+        if not dialogue_tint_ready(str(kind), row):
+            return "the tinted version is not the active one"
+        if not dialogue_audio_ready(str(kind), row):
+            return "not every planned line has durable audio"
+        if not dialogue_row_ready(str(kind), row):
+            return "the ready gate refused it"
+        return ""
+    except Exception:  # noqa: BLE001
+        return "the ready gate could not be read"
+
+
+def _prep_detail_int(got: Any, fallback: int = -1) -> int:
+    try:
+        return int(got)
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def _prep_detail_lines(entry: dict[str, Any]) -> tuple[int, int, list[dict[str, Any]]]:
+    """Which LINES of a round are cut into the pantry and which are not.
+
+    "the ones that are not are the interesting half" - so the uncut ones
+    are what is listed. A take whose clip has been burned out of the
+    pantry and a line that was never recorded at all are different
+    failures and are named differently: the first is a loss, the second
+    is work still owed."""
+    takes = [t for t in (entry.get("takes") or []) if isinstance(t, dict)]
+    want = _prep_detail_int(entry.get("chunks"), 0) or len(takes)
+    if want < 0:
+        want = len(takes)
+    have = 0
+    seen: set[int] = set()
+    uncut: list[dict[str, Any]] = []
+    for at, take in enumerate(takes):
+        where = _prep_detail_int(take.get("i"), at)
+        if 0 <= where < max(want, len(takes)):
+            seen.add(where)
+        key = str(take.get("key") or "")
+        if key and _pantry_key_ready(key):
+            have += 1
+            continue
+        if len(uncut) < PREP_DETAIL_UNCUT_MOST:
+            uncut.append({
+                "line": where,
+                "who": str(take.get("who") or ""),
+                "voice": str(take.get("voice") or ""),
+                "head": " ".join(str(take.get("text") or "").split())[:90],
+                "why": ("the clip this take points at is no longer in the "
+                        "pantry" if key else "this take was never cut")})
+    for where in range(max(0, want)):
+        if where in seen:
+            continue
+        if len(uncut) >= PREP_DETAIL_UNCUT_MOST:
+            break
+        uncut.append({"line": where, "who": "", "voice": "", "head": "",
+                      "why": "no take has been made for this line yet"})
+    uncut.sort(key=lambda r: int(r.get("line") or 0))
+    return want, have, uncut
+
+
+def _prep_detail_row(kind: str, at: int, row: dict[str, Any],
+                     deep: bool) -> dict[str, Any]:
+    """One stored segment, said in full.
+
+    `deep` is the whole of the cost control: every row is asked whether
+    it is ready, because the totals have to tie out to the board, but
+    only the rows that will actually be SHOWN are walked take by take."""
+    now = time.time()
+    entry = dialogue_entry(row)
+    src = entry if entry is not None else row
+    text = str(row.get("text") or "")
+    if not text.strip():
+        text = str(src.get("script_plain") or src.get("script") or "")
+    written = 0.0
+    try:
+        written = float(row.get("at") or src.get("at") or 0)
+    except Exception:  # noqa: BLE001
+        written = 0.0
+    expires = 0.0
+    try:
+        expires = float(row.get("expires_at") or src.get("expires_at") or 0)
+    except Exception:  # noqa: BLE001
+        expires = 0.0
+    ready = bool(dialogue_row_ready(str(kind), row))
+    out: dict[str, Any] = {
+        "i": at,
+        # The stable id the retirement desk and the cupboard pin work by.
+        # Read first, derived only when the row has never carried one -
+        # retire_id writes it down, which is what it is for.
+        "id": str(row.get("sid") or "") or (retire_id(str(kind), row)
+                                            if deep else ""),
+        "label": str(row.get("label") or src.get("label") or "")[:80],
+        "at": written or None,
+        "written_ago": round(now - written, 1) if written else None,
+        "seconds": cupboard_row_seconds(str(kind), row),
+        "chars": len(text),
+        "head": " ".join(text.split())[:120],
+        "ready": ready,
+        "ready_why": "" if ready else dialogue_row_ready_why(str(kind), row),
+        "airings": _prep_detail_int(row.get("aired"), 0),
+        "unaired": bool(row_unaired(row)),
+        "preparing": bool(row.get("preparing") or src.get("preparing")),
+        "expires_in": round(expires - now, 1) if expires else None,
+    }
+    try:
+        out["aired_ago"] = (round(now - float(row.get("aired_at") or 0), 1)
+                            if row.get("aired_at") else None)
+    except Exception:  # noqa: BLE001
+        out["aired_ago"] = None
+    if entry is not None:
+        out["lines"] = _prep_detail_int(entry.get("chunks"), 0)
+        out["lines_made"] = _prep_detail_int(entry.get("made"), 0)
+        out["lines_recorded"] = out["lines_made"]
+        if deep:
+            # TWO COUNTS, AND THEY ARE ALLOWED TO DISAGREE. `made` is what
+            # the room wrote down when it cut the line, and it is what
+            # prep_board sums into "recorded - 582 of 697"; the verified
+            # count asks the pantry whether the clip is still there. #1106
+            # is the whole reason to keep both: the board once said 24
+            # station IDs were ready while slot_supply, which does ask,
+            # said one. When these two differ the difference IS the news.
+            want, have, uncut = _prep_detail_lines(entry)
+            out["lines"] = want
+            out["lines_recorded"] = have
+            out["uncut"] = uncut
+    else:
+        # A single read - an advert, a station ID. Its `key` IS the whole
+        # of its audio, unless it is a produced spot carrying a file.
+        key = str(row.get("key") or "")
+        cut = bool(key and _pantry_key_ready(key))
+        if not cut and row.get("produced"):
+            cut = bool(dialogue_audio_ready(str(kind), row))
+        out["lines"] = 1
+        out["lines_made"] = 1 if (key or row.get("produced")) else 0
+        out["lines_recorded"] = 1 if cut else 0
+        if deep and not cut:
+            out["uncut"] = [{
+                "line": 0, "who": "", "voice": str(row.get("voice") or ""),
+                "head": out["head"][:90],
+                "why": ("the produced file behind this read is gone"
+                        if row.get("produced") else
+                        "the clip this read points at is no longer in the "
+                        "pantry" if key else
+                        "nothing has been cut for this read yet")}]
+    return out
+
+
+def _prep_detail_track_row(at: int, tid: str, record: dict[str, Any],
+                           side: str, part: dict[str, Any],
+                           deep: bool) -> dict[str, Any]:
+    """One side of one record's own talk.
+
+    The bookends are not on a shelf and have no entry - each side is a
+    single line with its own key - so they get the same shape by hand
+    rather than being left off the board's only detailed view."""
+    now = time.time()
+    text = str(part.get("text") or "")
+    key = str(part.get("key") or "")
+    cut = bool(key and _pantry_key_ready(key))
+    ready = bool(track_talk_part_ready(part))
+    why = ""
+    if not ready:
+        if not text.strip():
+            why = "nothing has been written for this side yet"
+        elif part.get("off_brief"):
+            why = "off brief: " + str((part.get("brief") or {}).get("why")
+                                      or "the segment brief was failed")
+        elif part.get("review_cancel_pending"):
+            why = "a cancel is pending on its review"
+        elif not cut:
+            why = ("the clip this side points at is no longer in the pantry"
+                   if key else "nothing has been cut for this side yet")
+        else:
+            why = "the tinted version is not the active one"
+    title = str(record.get("title") or "").strip()
+    out: dict[str, Any] = {
+        "i": at,
+        "id": str(tid) + ":" + str(side),
+        "label": ((title or str(tid)) + " - " + str(side))[:80],
+        "at": None,
+        "written_ago": None,
+        "seconds": round(float(part.get("seconds") or 0), 1),
+        "chars": len(text),
+        "head": " ".join(text.split())[:120],
+        "ready": ready,
+        "ready_why": why,
+        "airings": _prep_detail_int(part.get("aired"), 0),
+        "aired_ago": None,
+        "unaired": bool(row_unaired(part)),
+        "preparing": False,
+        "expires_in": None,
+        "lines": 1,
+        "lines_made": 1 if key else 0,
+        "lines_recorded": 1 if cut else 0,
+    }
+    if deep and not cut:
+        out["uncut"] = [{"line": 0, "who": "", "voice": "",
+                         "head": out["head"][:90],
+                         "why": why or "this side has no durable take"}]
+    return out
+
+
+def prep_detail_rows(kind: str, limit: int = 60) -> dict[str, Any]:
+    """Every stored segment of one road, with the five lines' evidence.
+
+    The order is THE INTERESTING HALF FIRST: a segment that cannot air
+    comes before one that can, and newer before older inside each half,
+    because the whole reason to open "ready - 42 of 46" is the four. `i`
+    stays the row's true position on the shelf, so what is read here can
+    be found again where it actually lives.
+
+    The totals are computed over EVERY held row, not only the ones
+    listed, so an expansion can never disagree with the board line it
+    was opened from - that is the fault that makes a diagnostic worse
+    than no diagnostic."""
+    kind = str(kind or "").strip()
+    if kind not in PREP_BOARD_KINDS:
+        raise HTTPException(status_code=404, detail="no such road")
+    try:
+        want = int(limit or 60)
+    except Exception:  # noqa: BLE001
+        want = 60
+    want = max(1, min(PREP_DETAIL_MOST, want))
+    out: dict[str, Any] = {
+        "schema": PREP_DETAIL_SCHEMA, "kind": kind,
+        "label": PREP_BOARD_LABEL.get(kind, kind),
+        "at": round(time.time(), 3), "cap": 0, "held": 0, "shown": 0,
+        "totals": {"written": 0, "lines": 0, "rendered": 0, "ready": 0,
+                   "seconds": 0.0, "unaired": 0},
+        "rows": [],
+    }
+    made: list[dict[str, Any]] = []
+    try:
+        if kind == "track_talk":
+            out["cap"] = TRACK_TALK_MAX
+            sides: list[tuple[str, dict[str, Any], str, dict[str, Any]]] = []
+            for tid, record in list(_TRACK_TALK.items()):
+                if not isinstance(record, dict):
+                    continue
+                for side in ("intro", "outro"):
+                    part = record.get(side)
+                    if isinstance(part, dict):
+                        sides.append((str(tid), record, side, part))
+            out["held"] = len(sides)
+            shallow = [_prep_detail_track_row(n, t, r, s, p, False)
+                       for n, (t, r, s, p) in enumerate(sides)]
+            order = sorted(range(len(sides)),
+                           key=lambda n: (1 if shallow[n]["ready"] else 0, n))
+            for n in order[:want]:
+                tid, record, side, part = sides[n]
+                made.append(_prep_detail_track_row(n, tid, record, side, part,
+                                                   True))
+            for row in shallow:
+                out["totals"]["written"] += 1
+                out["totals"]["lines"] += 1
+                out["totals"]["rendered"] += int(row["lines_recorded"])
+                out["totals"]["ready"] += 1 if row["ready"] else 0
+                out["totals"]["seconds"] += float(row["seconds"] or 0)
+                out["totals"]["unaired"] += 1 if row["unaired"] else 0
+        else:
+            if kind == "banter":
+                out["cap"] = larder_cap()
+                held = [e for e in list(_LARDER) if isinstance(e, dict)]
+            else:
+                out["cap"] = shelf_cap(kind)
+                held = [r for r in list(_SHELF.get(kind) or [])
+                        if isinstance(r, dict)]
+            out["held"] = len(held)
+            shallow = [_prep_detail_row(kind, n, r, False)
+                       for n, r in enumerate(held)]
+            for row in shallow:
+                out["totals"]["written"] += 1
+                out["totals"]["lines"] += int(row["lines"])
+                out["totals"]["rendered"] += int(row["lines_recorded"])
+                out["totals"]["ready"] += 1 if row["ready"] else 0
+                out["totals"]["seconds"] += float(row["seconds"] or 0)
+                out["totals"]["unaired"] += 1 if row["unaired"] else 0
+            order = sorted(
+                range(len(held)),
+                key=lambda n: (1 if shallow[n]["ready"] else 0,
+                               -float(shallow[n]["at"] or 0), n))
+            for n in order[:want]:
+                made.append(_prep_detail_row(kind, n, held[n], True))
+    except Exception as exc:  # noqa: BLE001
+        # One unreadable road must never empty the board's own drawer.
+        out["why"] = "this road could not be read: %r" % (exc,)
+    out["totals"]["seconds"] = round(float(out["totals"]["seconds"]), 1)
+    out["rows"] = made
+    out["shown"] = len(made)
+    return out
+
+
+@app.get("/api/recording-room/detail/{kind}")
+async def api_recording_room_detail(
+    kind: str,
+    limit: int = 60,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1338: the EVIDENCE under one line of the board.
+
+    "allow for these to be expanded out to analyze the details of these
+     elements."
+
+    Handed to a thread on purpose. The panel that asks this repaints
+    often, the walk stats a pantry file per take, and the loop under
+    this station has been starved by smaller reads than that."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(prep_detail_rows, kind, limit)
+
+
 @app.get("/api/recording-room")
 async def api_recording_room(
     authorization: str | None = Header(default=None),
