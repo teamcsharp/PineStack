@@ -133590,40 +133590,109 @@ async def api_sfx_review(
 @app.get("/api/sfx/history")
 async def sfx_history_api(
     limit: int = 200,
+    before: int = 0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """#862: what has actually aired, newest first, each with how often
     it has come round, its weight and whether it is banned — the view
-    the operator judges the rotation from."""
+    the operator judges the rotation from.
+
+    #1200: AND IT CAN BE WALKED BACKWARDS NOW.
+
+        "I wanna be able to scroll backwards in the history and just keep
+         loading more and more of the history."
+
+    MEASURED BEFORE THIS CHANGE: this road took `limit` and nothing else,
+    clamped it to 1..1000, and answered `rows[-limit:]` reversed.  There
+    is no cursor in that.  A surface walking backwards could only ask for
+    a BIGGER first page — so everything it already held came back down the
+    wire on every ask, and at a thousand rows the road stopped while the
+    ledger kept two thousand.  `before` is the whole of what it needed.
+
+    `before` IS INCLUSIVE, deliberately.  A ts here is whole seconds and
+    two clips can go out inside one second, so an exclusive boundary would
+    silently drop whatever else aired in the boundary second and nothing
+    on either side would report it.  Inclusive hands the boundary row back
+    once more and the caller's dedupe throws it away, which costs nothing.
+    `more` says whether anything strictly older than the oldest row
+    returned exists, so a caller can tell the end of the ledger from a
+    page that merely filled up.
+
+    "video" is new on every row and the reason it is HERE rather than in
+    the renderer is #1199: the strip chooses between /api/sfx/poster/ (a
+    real frame) and /api/sfx/spec/ (a spectrogram, which for an mp4 draws
+    its SOUNDTRACK), and it used to decide by sniffing a file extension
+    off the clip's url — which has none, so every tile drew a picture of
+    the audio.  sfx_history_add() records `path.name`, the file's own
+    name, and sfx_is_video() is the same SFX_VIDEO_TYPES test the sample
+    draw itself uses.  One answer, out of one table, in the one place that
+    owns it.
+
+    AND NONE OF IT IS ON THE EVENT LOOP ANY MORE.  In one request, on the
+    loop, this used to do: a json.loads of a 2,000-row ledger (json holds
+    the GIL), a full pass counting plays per id, sfx_bans(), sfx_weights()
+    and a media_sign() per returned row.  Only the folder walk had been
+    moved off.  This station goes deaf when its loop stalls, and a road
+    the operator is about to hold his finger on and scroll is the last
+    place to leave a synchronous file read — so the whole body goes into a
+    worker thread, the way sfx_review_api() above it already does."""
     require_read_auth(authorization)
-    rows = sfx_history_rows()
-    counts: dict[str, int] = {}
-    for r in rows:
-        sid = str(r.get("id") or "")
-        counts[sid] = counts.get(sid, 0) + 1
-    banned = sfx_bans()
-    weights = sfx_weights()
-    out = []
-    for r in reversed(rows[-max(1, min(1000, limit)):]):
-        sid = str(r.get("id") or "")
-        out.append({**r, "plays": counts.get(sid, 0),
-                    "weight": float(weights.get(sid, 1.0)),
-                    "banned": sid in banned,
-                    "url": f"/sfx/{sid}?t={media_sign(sid)}"})
-    pool = len(_SFX_POOL_CACHE)
-    return {"rows": out, "distinct": len(counts), "total": len(rows),
-            "pool": pool, "folders": [str(f) for f in await asyncio.to_thread(sfx_folders)],
-            # #1062: what is new, and how the draw favours it.
-            "fresh": len(sfx_fresh_paths(list(_SFX_POOL_CACHE))),
-            "arrivals_48h": len(sfx_arrivals_recent()),
-            "fresh_share": SFX_FRESH_SHARE,
-            "walked_at": _SFX_POOL_AT[0],
-            "ready_at": _SFX_POOL_READY_AT[0],
-            "filling": _SFX_POOL_FILLING[0],
-            "note": ("Verified samples are ready while the library scan continues."
-                     if pool and _SFX_POOL_FILLING[0] else
-                     "The library scan has not found a verified playable sample yet."
-                     if not pool else "")}
+    want = max(1, min(1000, limit))
+    mark = max(0, int(before or 0))
+
+    def work() -> dict[str, Any]:
+        rows = sfx_history_rows()
+        counts: dict[str, int] = {}
+        for r in rows:
+            sid = str(r.get("id") or "")
+            counts[sid] = counts.get(sid, 0) + 1
+        banned = sfx_bans()
+        weights = sfx_weights()
+        # The window this page is cut from.  Inclusive on the mark; see the
+        # docstring for why an exclusive boundary loses airings.
+        window = rows
+        if mark > 0:
+            window = [r for r in rows if int(r.get("ts") or 0) <= mark]
+        page = window[-want:]
+        out = []
+        for r in reversed(page):
+            sid = str(r.get("id") or "")
+            out.append({**r, "plays": counts.get(sid, 0),
+                        "weight": float(weights.get(sid, 1.0)),
+                        "banned": sid in banned,
+                        # #1200: the station answers the picture question.
+                        "video": sfx_is_video(str(r.get("name") or "")),
+                        "url": f"/sfx/{sid}?t={media_sign(sid)}"})
+        oldest = int(page[0].get("ts") or 0) if page else 0
+        # Strictly older than the oldest row handed back — so a caller is
+        # told the end of the ledger and never has to infer it from a short
+        # page, which is a different thing and reads the same.
+        more = bool(oldest and any(
+            int(r.get("ts") or 0) < oldest for r in window))
+        pool = len(_SFX_POOL_CACHE)
+        return {"rows": out, "distinct": len(counts), "total": len(rows),
+                "before": mark, "limit": want,
+                "oldest": oldest, "newest": (int(page[-1].get("ts") or 0)
+                                             if page else 0),
+                "more": more, "shown": len(out), "window": len(window),
+                "pool": pool, "folders": [str(f) for f in sfx_folders()],
+                # #1062: what is new, and how the draw favours it.
+                "fresh": len(sfx_fresh_paths(list(_SFX_POOL_CACHE))),
+                "arrivals_48h": len(sfx_arrivals_recent()),
+                "fresh_share": SFX_FRESH_SHARE,
+                "walked_at": _SFX_POOL_AT[0],
+                "ready_at": _SFX_POOL_READY_AT[0],
+                "filling": _SFX_POOL_FILLING[0],
+                "page_with": ("GET /api/sfx/history?limit=N&before=<ts of the "
+                              "oldest row you hold>; `before` is INCLUSIVE, so "
+                              "dedupe on (ts, id). `more` is false at the end "
+                              "of the ledger."),
+                "note": ("Verified samples are ready while the library scan continues."
+                         if pool and _SFX_POOL_FILLING[0] else
+                         "The library scan has not found a verified playable sample yet."
+                         if not pool else "")}
+
+    return await asyncio.to_thread(work)
 
 
 @app.get("/api/sfx/stats")

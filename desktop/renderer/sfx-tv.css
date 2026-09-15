@@ -250,3 +250,72 @@
 .sfx-tv-head { display: none !important; }
 .sfx-tv:active { cursor: grabbing; }
 .sfx-tv-screen { flex: 1 1 auto; }
+
+
+/* #1200: the strip pages backwards through the station's own history.
+
+   "I wanna be able to scroll backwards in the history and just keep
+    loading more and more of the history."
+
+   touch-action is the whole of the TOUCH gesture on the tablet, which has
+   no wheel: a sideways drag along the strip is handed to the WebView's own
+   scroller, with its own momentum, so there is no touch code to go wrong
+   and the drag can never become the sheet's vertical scroll or a drag of
+   the floating set. overscroll-behavior stops a flick that reaches either
+   end from being passed on to the page underneath - the wheel handler
+   preventDefaults for the same reason, and both roads need saying because
+   only one of them is JavaScript. */
+.sfx-tv-strip {
+  touch-action: pan-x;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(159, 216, 255, .32) transparent;
+}
+.sfx-tv-strip::-webkit-scrollbar { height: 5px; }
+.sfx-tv-strip::-webkit-scrollbar-track { background: transparent; }
+.sfx-tv-strip::-webkit-scrollbar-thumb {
+  background: rgba(159, 216, 255, .32);
+  border-radius: 3px;
+}
+
+/* A tile out of the ledger, a shade quieter than the cycle's own. */
+.sfx-tv-tile.sfx-tv-hist { opacity: .9; }
+
+/* The note at the old end, and the seam the ceiling cut. Three states have
+   to be told apart at a glance - loading, the end of the ledger, and a page
+   that FAILED - so the note carries a Carbon icon that changes with them
+   (hourglass, checkmark, warning) and never an emoji. */
+.sfx-tv-oldend,
+.sfx-tv-seam {
+  flex: 0 0 auto;
+  width: 66px;
+  min-height: 57px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 0 4px;
+  border-radius: 6px;
+  border: 1px dashed rgba(159, 216, 255, .28);
+  background: rgba(159, 216, 255, .04);
+  color: #b9d3e4;
+  font: inherit;
+  font-size: 8.5px;
+  line-height: 11px;
+  text-align: center;
+}
+.sfx-tv-seam {
+  border-style: solid;
+  border-color: rgba(216, 168, 87, .5);
+  color: #e8cfa6;
+  cursor: pointer;
+}
+.sfx-tv-seam:hover { background: rgba(216, 168, 87, .12); }
+.sfx-tv-oldend .pi-icon,
+.sfx-tv-seam .pi-icon { width: 14px; height: 14px; }
+.sfx-tv-oldword {
+  font-style: normal;
+  display: block;
+  overflow: hidden;
+}

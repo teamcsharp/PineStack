@@ -224,6 +224,71 @@
   var heard = [];                  // {id, url, sting} of clips already played
   var HEARD_MOST = 6;              // bounded, and small - the strip shows two
   var STRIP_EACH = 2;              // "the last 2 ... and the next 2"
+  /* #1200: SCROLLING BACKWARDS THROUGH EVERYTHING THAT HAS GONE OUT.
+   *
+   * "Allow me to roll the wheel or scroll through the previous history of
+   *  videos that's been loaded or thumbnails or MP4s. I wanna be able to
+   *  scroll backwards in the history and just keep loading more and more
+   *  of the history."
+   *
+   * `heard` above is the CYCLE'S memory and HEARD_MOST is six; the strip
+   * draws STRIP_EACH (2) of them. So there were two tiles of history in
+   * the page, they lived only as long as the tab, and there was next to
+   * nothing to scroll through at all.
+   *
+   * The station has kept one all along. data/sfx_history.json is appended
+   * by sfx_history_add() on every airing and trimmed to the last 2,000
+   * rows, and GET /api/sfx/history has served it since #862. MEASURED
+   * before a line of this was written: that road took only `limit`,
+   * clamped it to 1..1000 and answered `rows[-limit:]` reversed - so a
+   * second page meant asking for a BIGGER first page, everything already
+   * held came back down the wire again, and at a thousand rows it stopped.
+   * It could not page. #1200's server half adds `before` (a ts), and
+   * moves the whole read - a 2,000-row json.loads, the bans, the weights,
+   * the folder walk and a media_sign per row - off the event loop into a
+   * worker thread, because this station goes deaf when its loop stalls
+   * and that has been the single largest source of dead air on it.
+   *
+   * WHAT IS HELD HERE, AND WHY IT IS BOUNDED. `hist` is plain objects and
+   * nothing else, for the reason #1312 wrote down in this same file:
+   * orphaned <video> elements each held an HTTP connection, a WebView
+   * allows about six per host, and after a few taps every request on the
+   * page hung - a fetch of /api/pulse that never returned while the same
+   * url answered the desk in 0.02 s.
+   *
+   *   HIST_PAGE = 24. The station's poster road renders one still per clip
+   *   in a worker thread behind a SEMAPHORE OF TWO, so a page is not a
+   *   burst of requests - it is a QUEUE with an ffmpeg at the front of it.
+   *   At the 0.4-0.9 s a still has measured, 24 tiles two at a time is
+   *   five to eleven seconds: the last of a page lands while he is still
+   *   looking at the first. Forty would be twenty seconds of queue for
+   *   tiles that are off the end of the strip. 24 is also about five
+   *   screens of 76 px tiles inside a 420 px sheet, so one page is several
+   *   flicks rather than one.
+   *
+   *   HIST_MOST = 120, five pages. 120 tiles is roughly 9,100 px of row -
+   *   some twenty screenfuls at that width - far more than a browse, and
+   *   it is also what bounds the poster cache, because there is exactly
+   *   one cached <img> per row and no other road that grows it. Past the
+   *   ceiling the window SLIDES: the newest fetched rows are let go and
+   *   the seam where they were says so out loud. An <img> is not the #1312
+   *   hazard - it releases its connection once it has loaded - but
+   *   unbounded is unbounded. */
+  var HIST_PAGE = 24;              // one page of older tiles
+  var HIST_MOST = 120;             // the ceiling: five pages held at once
+  var HIST_NEAR = 72;              // "against the old end", in px
+  var hist = [];                   // plain rows, OLDEST FIRST
+  var histSeen = Object.create(null);  // ts|id -> 1, so a page cannot repeat
+  var histAt = 0;                  // the `before` cursor for the next page
+  var histMore = true;             // the station says there is older still
+  var histBusy = false;            // a page is in flight
+  var histBad = false;             // the last page FAILED (not the end)
+  var histSay = '';                // what the note at the old end reads
+  var histLost = 0;                // rows the ceiling let go of
+  var stripEl = null;              // the open sheet's strip, for prepending
+  var stripClip = null;            // the clip that sheet was opened for
+  var stripSay = null;             // that sheet's note line
+  var histNoteEl = null;           // the note tile at the old end
   var wallWired = false;           // the document-level gesture road is on
   var wallPress = null;            // a touch hold in progress on the wall
   var wallTimer = 0;
@@ -269,6 +334,13 @@
     sheetWrap = null;
     sheetOnWall = false;
     panel = null;                  // it was inside the sheet
+    /* #1200: the strip was inside it too. The ROWS are kept - closing the
+       sheet and opening it again must not re-ask the station for pictures
+       it has already handed over - but the element handles go, because a
+       page landing after this would otherwise insert tiles into a strip
+       that is no longer in any document. */
+    stripEl = null;
+    histNoteEl = null;
     if (!wasOnWall) return;        // it goes with the set being swept
     try { if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap); }
     catch (err) { /* already gone */ }
@@ -284,6 +356,8 @@
     sheetWrap = null;
     sheetOnWall = false;                                 /* #1184 */
     panel = null;                                        /* #1184 */
+    stripEl = null;                                      /* #1200 */
+    histNoteEl = null;                                   /* #1200 */
     try { if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap); }
     catch (err) { /* already gone */ }
     var due = owed;
@@ -1759,6 +1833,10 @@
     var b = document.createElement('button');
     b.type = 'button';
     b.className = 'sfx-tv-tile';
+    /* #1200: a tile the HISTORY put there, told apart from the cycle's own
+       so that the ceiling can cut the right ones off the end of the run
+       without anything having to keep a list of elements. */
+    if (row && row.when === 'past') b.className += ' sfx-tv-hist';
     var s = b.style;
     s.flex = '0 0 auto'; s.width = '76px'; s.padding = '0';
     s.display = 'flex'; s.flexDirection = 'column'; s.gap = '2px';
@@ -1771,19 +1849,15 @@
     shot.style.height = '44px'; shot.style.background = '#05080b';
     shot.style.overflow = 'hidden'; shot.style.position = 'relative';
     if (row.id) {
-      var img = document.createElement('img');
-      img.alt = '';
-      img.style.width = '100%'; img.style.height = '100%';
-      img.style.objectFit = 'cover'; img.style.display = 'block';
-      /* Signed the way every other media url on this station is, and
-         through the same base the clip itself is fetched through, so it
-         works on the tablet (relative) and in the shell (absolute). */
-      img.onerror = function () {
-        try { if (img.parentNode) img.parentNode.removeChild(img); }
-        catch (err) { /* already gone */ }
-      };
-      img.src = base.replace(/\/+$/, '') + posterOf(row);
-      shot.appendChild(img);
+      /* #1200: THROUGH THE QUEUE, never straight to an <img src>.
+         The url is still signed the way every other media url on this
+         station is and still built on the same base the clip itself is
+         fetched through, so it works on the tablet (relative) and in the
+         shell (absolute) - shotFor does both. What changed is WHEN the src
+         is set: at most two are in flight at a time, so a page of
+         twenty-four tiles is a line that drains rather than twenty-four
+         requests landing on an ffmpeg behind a semaphore of two. */
+      shot.appendChild(shotFor(row).img);
     }
     var when = document.createElement('i');
     /* #1195: a "next" tile says HOW SOON, because "next" on four tiles in a
@@ -1794,7 +1868,8 @@
       if (wait > 0) soon = ' ' + (wait > 99 ? '99+' : String(wait)) + 's';
     }
     when.textContent = row.when === 'now' ? 'on now'
-      : (row.when === 'next' ? ('next' + soon) : 'played');
+      : (row.when === 'next' ? ('next' + soon)
+      : (row.when === 'past' ? agoOf(row.ts) : 'played'));  /* #1200 */
     var ws = when.style;
     ws.position = 'absolute'; ws.left = '0'; ws.right = '0'; ws.bottom = '0';
     ws.fontStyle = 'normal'; ws.fontSize = '8.5px'; ws.lineHeight = '12px';
@@ -1810,7 +1885,13 @@
     b.appendChild(shot);
     b.appendChild(name);
     b.title = (row.when === 'now' ? 'This one - ' : '')
-      + String(row.sting || 'clip') + ' - tap to open its menu';
+      + String(row.sting || 'clip')
+      /* #1200: the station counts every airing of a clip, and on a strip a
+         hundred tiles long the same name coming round four times is worth
+         saying out loud rather than leaving him to notice. */
+      + (row.when === 'past' && Number(row.plays) > 1
+         ? ' - ' + row.plays + ' airings' : '')
+      + ' - tap to open its menu';
     b.addEventListener('click', function (ev) {
       ev.stopPropagation();
       if (mine) { say('that is the one on the tube'); return; }
@@ -1819,7 +1900,18 @@
          well". So it re-opens here rather than playing at once, and the
          sheet it opens carries a Play it of its own - examining a clip
          and jumping to it are two different intentions and a single tap
-         must not guess between them. */
+         must not guess between them.
+         #1200: AND A HISTORY TILE IS THE SAME TAP, deliberately. A clip
+         out of the ledger is a clip that has already gone out, which is
+         exactly what a `heard` tile is, and the sheet already knows what
+         that means: it is not the one on the tube, so it grows a Play it,
+         and Play it takes jump()'s BACK road - a replay ALONGSIDE the
+         cycle with the queue untouched, not a rewind of the plan. Inspect,
+         Path, Where is it, More/Less, Send to a pad, Never again and
+         Delete all read the clip's id, and the ledger row carries the same
+         id the cycle does, so every one of them is already correct for a
+         clip that aired an hour ago. There was nothing to add and adding
+         a second behaviour would have been the fault. */
       var at = sheetAt;
       sheetClose();
       sheet({id: row.id, url: row.url, sting: row.sting,
@@ -1861,25 +1953,588 @@
     return road + encodeURIComponent(id) + (sign ? '?t=' + sign : '');
   }
 
-  function stripBuild(clip, say) {
+  /* #1200: TWENTY-FOUR TILES MUST NOT ALL ASK AT ONCE.
+   *
+   * The station's poster road renders one frame per clip in a worker
+   * thread behind a SEMAPHORE OF TWO. So a page of twenty-four tiles each
+   * setting an <img src> at once is not twenty-four answers, it is a queue
+   * twenty-two deep with an ffmpeg at the front of it - and the next page
+   * is another twenty-four behind those. The pattern sampler-face.js
+   * settled on for its sixteen pads is followed here rather than a second
+   * one being invented: AT MOST TWO IN FLIGHT, the same two the station
+   * will serve, ONE CACHED ELEMENT PER SLOT, re-used rather than rebuilt.
+   *
+   * The element is created at once and handed to the tile straight away -
+   * an <img> with no src draws nothing - and only its `src` waits its
+   * turn. That is what keeps the record free of any reference to the tile
+   * it sits in: when a picture lands it is already where it belongs, so
+   * nothing has to remember where to put it. Re-used, not rebuilt: an
+   * <img> that has loaded and is moved to another parent does not fetch
+   * again, so a clip is asked for exactly ONCE per session however many
+   * times the sheet is opened and closed over it.
+   *
+   * The key is the ROW, not the clip: a clip that aired four times is four
+   * rows in the ledger and wants four tiles, and one element cannot be in
+   * four places. Four records asking one url is four cache hits at the
+   * browser, which costs the station nothing. */
+  var SHOT_AT_ONCE = 2;            /* the station's own semaphore is two */
+  var shots = Object.create(null); /* row key -> {key, url, state, img} */
+  var shotQueue = [];
+  var shotLive = 0;
+
+  function shotKey(row) {
+    return String((row && row.key) || (row && row.id) || (row && row.url) || '');
+  }
+
+  function shotUrl(row) {
+    return base.replace(/\/+$/, '') + posterOf(row);
+  }
+
+  function shotPump() {
+    while (shotLive < SHOT_AT_ONCE && shotQueue.length) {
+      var rec = shotQueue.shift();
+      if (!rec || rec.dropped || shots[rec.key] !== rec) continue;
+      shotLive += 1;
+      rec.state = 'flight';
+      rec.img.src = rec.url;
+    }
+  }
+
+  function shotLanded(rec, how) {
+    return function () {
+      if (rec.state !== 'flight') return;   /* load and error both fired */
+      rec.state = how;
+      shotLive = shotLive > 0 ? shotLive - 1 : 0;
+      /* A 404 is the station's honest answer for a clip it cannot draw -
+         an older mp4 ffmpeg will not seek, or a clip the poster road has
+         never heard of. The tile keeps its name on a dark box and nothing
+         is said about it, which is what the onerror here did before the
+         queue existed. */
+      if (how === 'bad') {
+        try { rec.img.style.display = 'none'; } catch (err) { /* gone */ }
+      }
+      shotPump();
+    };
+  }
+
+  function shotFor(row) {
+    var key = shotKey(row);
+    var url = shotUrl(row);
+    var rec = shots[key];
+    if (rec && rec.url === url) return rec;
+    if (rec) rec.dropped = true;          /* the slot changed clip */
+    var img = document.createElement('img');
+    img.alt = '';
+    img.style.width = '100%'; img.style.height = '100%';
+    img.style.objectFit = 'cover'; img.style.display = 'block';
+    rec = {key: key, url: url, state: 'queued', img: img, dropped: false};
+    shots[key] = rec;
+    img.addEventListener('load', shotLanded(rec, 'ok'));
+    img.addEventListener('error', shotLanded(rec, 'bad'));
+    shotQueue.push(rec);
+    shotPump();
+    return rec;
+  }
+
+  /* #1200: AND THE LINE IS BOUNDED TOO, not just the cache.
+   *
+   * MEASURED while writing the ceiling test rather than read out of the
+   * code: after six pages the `shots` map held the hundred and twenty rows
+   * it should, and shotQueue held a hundred and FORTY-TWO records - every
+   * row the ceiling had let go was still standing in the line, marked
+   * dropped, waiting for shotPump to walk past it one day.
+   *
+   * Nothing would ever have reported that. The line drains on its own as
+   * pictures land, so it only grows without bound when pages arrive faster
+   * than the station renders them - which is precisely the case the
+   * operator creates by flicking. So it is swept where rows go away, in
+   * one pass, at the one moment there is anything to sweep. */
+  function shotSweep() {
+    if (!shotQueue.length) return;
+    var kept = [];
+    for (var i = 0; i < shotQueue.length; i += 1) {
+      var rec = shotQueue[i];
+      if (rec && !rec.dropped && shots[rec.key] === rec) kept.push(rec);
+    }
+    shotQueue = kept;
+  }
+
+  /* A row the ceiling let go of takes its picture with it - that is what
+     binds the poster cache to the rows, and there is no other road that
+     grows it. A record still standing in the line is marked dropped so
+     shotPump steps over it; one already in flight is left to land,
+     because cancelling it would waste the ffmpeg the station has already
+     started. */
+  function shotForget(row) {
+    var key = shotKey(row);
+    var rec = shots[key];
+    if (!rec) return;
+    rec.dropped = true;
+    delete shots[key];
+    try {
+      if (rec.img && rec.img.parentNode) rec.img.parentNode.removeChild(rec.img);
+    } catch (err) { /* already gone */ }
+  }
+
+  /* #1200: HOW LONG AGO, in one short word. "played" on a hundred and
+     twenty tiles tells him nothing he did not already know from where the
+     tile sits; the ts the station sends with every history row does. */
+  function agoOf(ts) {
+    var when = Number(ts) || 0;
+    if (when <= 0) return 'played';
+    var secs = Math.round((now() / 1000) - when);
+    if (secs < 0) return 'played';
+    if (secs < 90) return secs + 's ago';
+    var mins = Math.round(secs / 60);
+    if (mins < 90) return mins + 'm ago';
+    var hours = Math.round(mins / 60);
+    if (hours < 36) return hours + 'h ago';
+    return Math.round(hours / 24) + 'd ago';
+  }
+
+  /* #1200: THE VIDEO FLAG ON A HISTORY ROW, AND WHO IS ENTITLED TO SAY.
+   *
+   * #1199's cure in this same file must not be undone. posterOf used to
+   * decide video-or-not by sniffing a file extension off the CLIP'S URL;
+   * an sfx url has none - the station builds them as /sfx/<hex>?t=<sig> -
+   * so every tile took the spectrogram road and drew a picture of the
+   * clip's SOUNDTRACK instead of a frame. The flag rides on the row now
+   * and the sniff is only a fallback.
+   *
+   * History rows did not carry that flag, so one had to be found for them.
+   * THE STATION ANSWERS IT: the server half of #1200 puts
+   * "video": sfx_is_video(name) on every history row, out of the same
+   * SFX_VIDEO_TYPES table the sample draw itself uses. That was chosen
+   * over deciding it here for two reasons - the station owns the list of
+   * what counts as a picture (six suffixes today, and it has grown
+   * before), and a renderer that decides for itself is a second answer to
+   * one question that will disagree the day a seventh is added.
+   *
+   * Underneath it the fallback reads the row's NAME, never its url. That
+   * is not #1199's guess coming back through the window: sfx_history_add()
+   * records `path.name`, so the name genuinely IS the file's own name with
+   * its own suffix on it, while the url genuinely cannot answer. It is
+   * here only so an older station that has not taken the server half still
+   * draws frames rather than soundtracks. */
+  function histVideo(r) {
+    if (r && typeof r.video === 'boolean') return r.video;
+    return /\.(mp4|m4v|webm|mov|mkv|ogv)$/i.test(String((r && r.name) || ''));
+  }
+
+  /* Every clip the CYCLE is already showing a tile for. A history row for
+     one of those is dropped on arrival rather than at draw time, so the
+     rows and the tiles stay one for one - which is what lets the ceiling
+     cut the right number of tiles off the end without counting them. */
+  function liveIds() {
+    var out = Object.create(null);
     var rows = stripRows();
+    for (var i = 0; i < rows.length; i += 1) {
+      out[String(rows[i].id)] = 1;
+    }
+    return out;
+  }
+
+  /* #1200: ONE PAGE OLDER, AND WHAT EVERY ANSWER MEANS.
+   *
+   * `before` is the ts of the oldest row already held and the station
+   * answers rows at or before it - INCLUSIVE on purpose. A ts is whole
+   * seconds and two clips can air inside one, so an exclusive boundary
+   * would quietly drop whatever else went out in that second; an inclusive
+   * one hands the boundary row back and `histSeen` throws it away here,
+   * where it costs nothing. That is why the dedupe is not optional.
+   *
+   * A page that adds NO new rows at all is the end of the road however the
+   * station described itself. Without that rule an inclusive cursor
+   * sitting on a second that holds a whole page of clips would ask the
+   * same question for ever. */
+  function histFetch() {
+    if (histBusy || !histMore) return;
+    var bridge = api();
+    if (!bridge || !bridge.get) {
+      histMore = false;
+      histBad = true;
+      histSay = 'no road to the station from here';
+      histPaint();
+      return;
+    }
+    histBusy = true;
+    histBad = false;
+    histSay = 'looking further back...';
+    histPaint();
+    var path = '/api/sfx/history?limit=' + HIST_PAGE
+      + (histAt > 0 ? '&before=' + histAt : '');
+    bridge.get(path).then(function (got) {
+      histBusy = false;
+      try { histLand(got); }
+      catch (err) {
+        histBad = true;
+        histSay = 'that page would not draw: '
+          + String((err && err.message) || err).slice(0, 40);
+        histPaint();
+      }
+    }, function (err) {
+      /* #1200: A PAGE THAT NEVER ARRIVED IS NOT THE END OF THE LIST, and
+         it must never read like one. `histMore` is left TRUE, the note
+         says what went wrong and says to try again, and the next reach at
+         the old end asks again. A failure that looked like the end would
+         quietly teach him there is no more history when there is. */
+      histBusy = false;
+      histBad = true;
+      histSay = 'that page did not arrive: '
+        + String((err && err.message) || err).slice(0, 34) + ' - scroll again';
+      histPaint();
+    });
+  }
+
+  function histLand(got) {
+    var rows = (got && got.rows) || [];
+    var live = liveIds();
+    var fresh = [];
+    var oldest = 0;
+    var i;
+    for (i = 0; i < rows.length; i += 1) {
+      var r = rows[i] || {};
+      var id = String(r.id || '');
+      var ts = Number(r.ts) || 0;
+      if (ts > 0 && (!oldest || ts < oldest)) oldest = ts;
+      if (!id) continue;
+      var key = ts + '|' + id;
+      if (histSeen[key]) continue;
+      histSeen[key] = 1;
+      if (live[id] === 1) continue;     /* the cycle already draws this one */
+      fresh.push({key: key, id: id, ts: ts,
+                  url: String(r.url || ''),
+                  sting: String(r.name || id),
+                  video: histVideo(r),                    /* #1199/#1200 */
+                  plays: Number(r.plays) || 0,
+                  seconds: 0, when: 'past'});
+    }
+    /* The cursor moves on what the STATION sent, not on what survived the
+       dedupe - a page that was entirely repeats must still walk backwards
+       or the next ask is the same ask. */
+    if (oldest > 0) histAt = oldest;
+    fresh.reverse();                   /* newest-first on the wire; the
+                                          strip runs oldest-left */
+    if (!fresh.length) {
+      histMore = false;
+      histSay = rows.length
+        ? 'that is as far back as the ledger goes'
+        : 'that is the whole history - nothing older';
+      histPaint();
+      return;
+    }
+    histMore = (got && typeof got.more === 'boolean')
+      ? !!got.more
+      : rows.length >= HIST_PAGE;      /* an older station with no `more` */
+    histSay = histMore ? '' : 'that is the whole history - nothing older';
+    hist = fresh.concat(hist);
+    histDraw(fresh.length);
+  }
+
+  /* #1200: PUT THE NEW TILES IN AND KEEP HIS PLACE.
+   *
+   * "keeps the tiles already drawn" - so nothing already in the strip is
+   * rebuilt. Only the new rows are built, and they go in AHEAD of
+   * everything, just after the note that always sits at the old end.
+   *
+   * PREPENDING MOVES THE VIEW. Tiles inserted at the left push what he is
+   * looking at to the right by exactly the width they took, and scrollLeft
+   * is measured from the left - so without the correction below the strip
+   * jumps and he loses his place mid-flick. It is MEASURED as the change
+   * in scrollWidth rather than computed from a tile width, because the
+   * gap, the borders and the note all count and none of them are the
+   * number a guess would use. */
+  function histDraw(count) {
+    var strip = stripEl;
+    /* A page that landed after the sheet was closed still counts against
+       the ceiling: the rows are held, so they must be bounded, and there
+       is no strip to cut tiles out of. */
+    if (!strip) { histCeiling(); histPaint(); return; }
+    var wide = Number(strip.scrollWidth) || 0;
+    var ref = (strip.children && strip.children.length > 1)
+      ? strip.children[1] : null;
+    var say = stripSay || function () {};
+    for (var i = 0; i < count; i += 1) {
+      if (!hist[i]) continue;
+      strip.insertBefore(stripTile(hist[i], false, say), ref);
+    }
+    var grew = (Number(strip.scrollWidth) || 0) - wide;
+    if (grew > 0) {
+      try { strip.scrollLeft = (Number(strip.scrollLeft) || 0) + grew; }
+      catch (err) { /* nothing scrolls here */ }
+    }
+    histCeiling();
+    histPaint();
+  }
+
+  /* #1200: THE CEILING, AND WHAT HAPPENS WHEN HE KEEPS GOING PAST IT.
+   *
+   * Past HIST_MOST rows the window SLIDES rather than the strip growing
+   * without end: the NEWEST fetched rows are let go - the ones nearest the
+   * live tiles, which he has already scrolled past - and their cached
+   * pictures go with them, which is what binds the poster cache to the
+   * rows. The cycle's own tiles are never touched by this; they are the
+   * last heard, the one on the tube and what is rung ahead, they are
+   * rebuilt from the rings every time, and they are his place in the
+   * night.
+   *
+   * IT IS NOT DONE QUIETLY. A seam tile sits where the let-go rows were,
+   * saying how many went, and it is a real button that puts the strip back
+   * to now. A gap nobody is told about is the kind of thing this station
+   * treats as a fault in its own right. */
+  function histCeiling() {
+    if (hist.length <= HIST_MOST) return;
+    var over = hist.length - HIST_MOST;
+    var gone = hist.splice(hist.length - over, over);
+    histCut(gone.length);
+    for (var i = 0; i < gone.length; i += 1) shotForget(gone[i]);
+    shotSweep();                                           /* #1200 */
+    histLost += gone.length;
+    if (!stripEl) return;
+    var seam = histSeamEl();
+    if (seam) { histSeamWord(seam); return; }
+    stripEl.insertBefore(histSeam(), seamBefore());
+  }
+
+  /* The last N tiles of the HISTORY run, taken out of the strip. Found by
+     walking the children and reading the class rather than by holding the
+     elements in a list - #1312's rule in this file is that nothing keeps a
+     list of elements, and a walk of a hundred and twenty nodes once every
+     five pages is not a cost worth breaking it for. */
+  function histCut(many) {
+    var strip = stripEl;
+    if (!strip || !many || !strip.children) return;
+    var left = many;
+    for (var i = strip.children.length - 1; i >= 0 && left > 0; i -= 1) {
+      var el = strip.children[i];
+      var cls = String((el && el.className) || '');
+      if (cls.indexOf('sfx-tv-hist') < 0) continue;
+      strip.removeChild(el);
+      left -= 1;
+    }
+  }
+
+  function histSeamEl() {
+    var strip = stripEl;
+    if (!strip || !strip.children) return null;
+    for (var i = 0; i < strip.children.length; i += 1) {
+      var el = strip.children[i];
+      if (String((el && el.className) || '').indexOf('sfx-tv-seam') >= 0) {
+        return el;
+      }
+    }
+    return null;
+  }
+
+  /* Where the seam belongs: immediately after the last history tile. */
+  function seamBefore() {
+    var strip = stripEl;
+    if (!strip || !strip.children) return null;
+    var last = -1;
+    for (var i = 0; i < strip.children.length; i += 1) {
+      var cls = String((strip.children[i] && strip.children[i].className) || '');
+      if (cls.indexOf('sfx-tv-hist') >= 0) last = i;
+    }
+    return (last >= 0 && strip.children[last + 1]) ? strip.children[last + 1] : null;
+  }
+
+  /* The Carbon mark, and only ever a Carbon mark: pineIcon('c:name'),
+     guarded, because a surface with no icon sheet loaded must still read.
+     The children are taken out by hand before the markup goes in - a real
+     DOM would drop them with the innerHTML write, and saying it out loud
+     costs one line and makes the function true everywhere. */
+  function markOn(box, ref) {
+    if (!box) return;
+    while (box.children && box.children.length) {
+      box.removeChild(box.children[box.children.length - 1]);
+    }
+    var mark = '';
+    try {
+      if (typeof root.pineIcon === 'function') mark = root.pineIcon(ref, '') || '';
+    } catch (err) { mark = ''; }
+    box.innerHTML = mark;
+  }
+
+  function histSeamWord(seam) {
+    if (!seam) return;
+    markOn(seam, 'c:renew');
+    var word = document.createElement('i');
+    word.className = 'sfx-tv-oldword';
+    word.textContent = histLost + ' newer let go';
+    seam.appendChild(word);
+    seam.title = histLost + ' newer history tiles were let go to keep the '
+      + 'strip small. Tap to forget the history and start again from now.';
+  }
+
+  function histSeam() {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'sfx-tv-seam';
+    b.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      histReset();
+      stripFill();
+      if (stripSay) stripSay('the strip is back at now');
+    });
+    histSeamWord(b);
+    return b;
+  }
+
+  /* #1200: THE NOTE AT THE OLD END - three states that must never look
+     alike. A page in flight, the end of the ledger and a page that FAILED
+     are one spinning tile if nobody writes them down, and the third of
+     those silently teaches him there is no more history when there is.
+     A <div>, never a button: there is nothing to press here, because the
+     gesture that asks for more is the scroll itself. */
+  function histNote() {
+    var box = document.createElement('div');
+    box.className = 'sfx-tv-oldend';
+    histWord(box);
+    return box;
+  }
+
+  function histWord(box) {
+    if (!box) return;
+    var text = histSay;
+    if (!text) text = histMore ? 'scroll back for more' : 'no more history';
+    var ref = histBad ? 'c:warning--alt'
+      : (histBusy ? 'c:hourglass' : (histMore ? 'c:time' : 'c:checkmark'));
+    markOn(box, ref);
+    var word = document.createElement('i');
+    word.className = 'sfx-tv-oldword';
+    word.textContent = text;
+    box.appendChild(word);
+    box.title = text;
+  }
+
+  function histPaint() { histWord(histNoteEl); }
+
+  function histReset() {
+    for (var i = 0; i < hist.length; i += 1) shotForget(hist[i]);
+    hist = [];
+    histSeen = Object.create(null);
+    histAt = 0;
+    histMore = true;
+    histBusy = false;
+    histBad = false;
+    histSay = '';
+    histLost = 0;
+  }
+
+  /* #1200: THE WHEEL OVER THE STRIP SCROLLS THE STRIP, AND NOTHING ELSE.
+   *
+   * A mouse wheel reports deltaY; a trackpad's sideways gesture reports
+   * deltaX. Whichever of the two is larger is the one he meant, so both
+   * roll the strip and neither has to be configured.
+   *
+   * preventDefault is UNCONDITIONAL and that is the whole point of it.
+   * Without it a wheel at either end of the strip hands the gesture on,
+   * and what takes it is the sheet - which is overflow-y:auto where it is
+   * opened over the LISTEN wall - or the page underneath. "It must not
+   * scroll the sheet or the page underneath" is not a preference; a strip
+   * that slides the menu out from under the pointer is unusable.
+   *
+   * deltaMode 1 is LINES and 2 is PAGES, not pixels. Firefox and several
+   * mice send 1, and treating a delta of 3 as three pixels is what makes a
+   * wheel handler look dead to everyone who tests it on the wrong mouse. */
+  function stripWheel(ev) {
+    var strip = stripEl;
+    try { if (ev && ev.preventDefault) ev.preventDefault(); }
+    catch (err) { /* a passive listener somewhere up the tree */ }
+    try { if (ev && ev.stopPropagation) ev.stopPropagation(); }
+    catch (err) { /* nothing above us cares */ }
+    if (!strip) return;
+    var dx = Number(ev && ev.deltaX) || 0;
+    var dy = Number(ev && ev.deltaY) || 0;
+    var by = Math.abs(dx) > Math.abs(dy) ? dx : dy;
+    var mode = Number(ev && ev.deltaMode) || 0;
+    if (mode === 1) by *= 16;
+    else if (mode === 2) by *= 320;
+    if (!by) return;
+    var want = (Number(strip.scrollLeft) || 0) + by;
+    if (want < 0) want = 0;
+    try { strip.scrollLeft = want; } catch (err) { /* nothing scrolls here */ }
+    /* Toward the past AND already against the old end: that is the reach
+       the operator asked to keep loading on. It is asked on the GESTURE
+       and not only on a scroll event, because a strip holding five tiles
+       cannot scroll at all - there a wheel would fire no scroll event and
+       the history would never arrive however long he rolled. */
+    if (by < 0 && (Number(strip.scrollLeft) || 0) <= HIST_NEAR) histFetch();
+  }
+
+  /* #1200: AND THE TABLET, WHICH HAS NO WHEEL. The touch gesture there is
+     a plain sideways drag along the strip: `touch-action: pan-x` (set both
+     inline and in sfx-tv.css) hands it to the WebView's own scroller, with
+     its own momentum, so there is no touch code here to go wrong and the
+     drag can never become the sheet's vertical scroll or a drag of the
+     set. It cannot fight the hot corners either - hot-corners.js's
+     _overControl walks up from the press, every tile is a real <button>
+     and every ancestor of this strip carries the `sfx-tv` class that its
+     OWNED list names, so a finger landing in one of the four 110 px corner
+     squares over this strip scrolls and never gestures. This is the road
+     that page arrives on there. */
+  function stripScrolled() {
+    var strip = stripEl;
+    if (!strip) return;
+    if ((Number(strip.scrollLeft) || 0) <= HIST_NEAR) histFetch();
+  }
+
+  function stripBuild(clip, say) {
     var strip = document.createElement('div');
     strip.className = 'sfx-tv-strip';
     strip.style.display = 'flex'; strip.style.gap = '5px';
     strip.style.overflowX = 'auto'; strip.style.overflowY = 'hidden';
     strip.style.margin = '0 0 6px 0'; strip.style.paddingBottom = '2px';
-    if (!rows.length) {
+    strip.style.touchAction = 'pan-x';                     /* #1200 */
+    strip.style.overscrollBehaviorX = 'contain';           /* #1200 */
+    strip.addEventListener('wheel', stripWheel, {passive: false});
+    strip.addEventListener('scroll', stripScrolled);
+    stripEl = strip;
+    stripClip = clip || null;
+    stripSay = (typeof say === 'function') ? say : function () {};
+    stripFill();
+    return strip;
+  }
+
+  /* The strip's contents, oldest on the left: the note at the old end, the
+     history already fetched, the seam if the ceiling has cut, then the
+     cycle's own tiles - the last heard, the one on the tube, what is rung
+     ahead. Called on a build and again when the seam puts him back at now;
+     a page does NOT come through here, because a page must keep every tile
+     already drawn. */
+  function stripFill() {
+    var strip = stripEl;
+    if (!strip) return;
+    while (strip.children && strip.children.length) {
+      strip.removeChild(strip.children[strip.children.length - 1]);
+    }
+    var rows = stripRows();
+    var here = stripClip ? clipId(stripClip) : '';
+    var say = stripSay || function () {};
+    var i;
+    histNoteEl = histNote();
+    strip.appendChild(histNoteEl);
+    for (i = 0; i < hist.length; i += 1) {
+      strip.appendChild(stripTile(hist[i], false, say));
+    }
+    if (histLost > 0) strip.appendChild(histSeam());
+    if (!rows.length && !hist.length) {
       var none = document.createElement('i');
       none.className = 'sfx-tv-note';
       none.textContent = 'nothing else in the cycle yet';
       strip.appendChild(none);
-      return strip;
+      return;
     }
-    var here = clipId(clip);
-    for (var i = 0; i < rows.length; i += 1) {
+    for (i = 0; i < rows.length; i += 1) {
       strip.appendChild(stripTile(rows[i], rows[i].id === here, say));
     }
-    return strip;
+    /* The live tiles are at the RIGHT end, because history grows leftwards
+       - so the sheet opens showing NOW rather than wherever he had
+       scrolled back to the last time he opened it. The browser clamps
+       this to the real width; a strip that does not overflow stays at 0
+       and fires no scroll event, which is why opening the sheet does not
+       quietly ask the station for a page nobody wanted. */
+    try { strip.scrollLeft = 1e7; } catch (err) { /* nothing scrolls here */ }
   }
 
   /* #1184: JUMPING, FORWARD AND BACK, AND WHAT EACH MEANS TO THE CYCLE.
@@ -3092,6 +3747,27 @@
       catch (err) { showing = false; return false; }
     },
     playing: function () { return playing; },
+    /* #1200: NUMBERS RATHER THAN A CLAIM IN A COMMENT. The one thing that
+       has to be PROVED about the poster queue is a negative - that more
+       than two are never in flight - and a negative cannot be seen on
+       screen. Same reason sampler-face.js exports its own two. */
+    shotsInFlight: function () { return shotLive; },
+    shotsWaiting: function () { return shotQueue.length; },
+    history: function () { return hist.slice(); },
+    histState: function () {
+      return {rows: hist.length, more: histMore, busy: histBusy,
+              bad: histBad, say: histSay, lost: histLost, at: histAt};
+    },
+    /* #1200: THE STRIP ON ITS OWN. The sheet it normally lives in wants a
+       pointer, a set that is already up and a clip on the tube; the paging
+       in it wants none of those. This door builds the same element the
+       sheet builds, through the same road, so a test drives the real wheel
+       handler, the real fetch and the real ceiling rather than a copy of
+       them that could agree with itself while the strip was broken. */
+    strip: function (clip, say) {
+      return stripBuild(clip || null,
+                        typeof say === 'function' ? say : function () {});
+    },
     /* #1173: how far into the clip on the tube the station is, in seconds
      * on this machine's clock - so the LISTEN view's wallpaper (listen.js,
      * paintEndless) joins the SAME frame as this set rather than starting
