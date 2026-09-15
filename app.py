@@ -16101,6 +16101,13 @@ def air_first() -> bool:
 UNHEARD_QUIET_AFTER = 20.0     # seconds of cast silence
 UNHEARD_QUIET_EVERY = 15.0     # the rest that replaces the interval
 UNHEARD_RETRY_EVERY = 20.0     # what a refused pick costs instead
+# 2026-09-15 (#1186): the rest that replaces the interval when it is the
+# HEARING clock that has gone quiet rather than the cast clock. Longer
+# than UNHEARD_QUIET_EVERY on purpose - see unheard_stock_air. A house
+# that listens on the box never acknowledges a line, so this clock can
+# sit high for hours on a perfectly well station, and the shelf walk it
+# paces is not free.
+UNHEARD_QUIET_DIALOGUE = 60.0
 
 
 def cupboard_unheard_every() -> float:
@@ -16435,7 +16442,30 @@ def unheard_state() -> dict[str, Any]:
                  "of turn at all" % (shut[0]["label"], shut[0]["ready"]))
     sweep = dict(_UNHEARD_SWEEP)
     sweep["blocked"] = dict(sweep.get("blocked") or {})
-    sweep["next_in"] = max(0.0, round(cupboard_unheard_every()
+    # 2026-09-15 (#1186): AND IT SAYS WHICH INTERVAL IT IS COUNTING.
+    #
+    # This read the raw dial and ignored the #1301 collapse entirely, so
+    # the number in front of the operator was the one figure that could
+    # not be acted on. Tonight it said next_in_s 361 while the room had
+    # been silent for 103 seconds - under #1301 the true rest was 15,
+    # and under this item's addition to it, 60. An operator reading 361
+    # concludes the consumer is waiting when it is not, which is exactly
+    # what the diagnosis had to be unpicked through.
+    #
+    # Same arithmetic as unheard_stock_air's own, deliberately: if the
+    # two ever disagree again the fix is to make this read the one
+    # function, not to nudge the number.
+    AIR1186_NEXTIN_K = cupboard_unheard_every()
+    try:
+        if talk_quiet_for() >= UNHEARD_QUIET_AFTER:
+            AIR1186_NEXTIN_K = min(AIR1186_NEXTIN_K, UNHEARD_QUIET_EVERY)
+        if dialogue_quiet_for() >= DIALOGUE_QUIET_ALARM:
+            AIR1186_NEXTIN_K = min(AIR1186_NEXTIN_K, UNHEARD_QUIET_DIALOGUE)
+    except Exception:  # noqa: BLE001
+        pass
+    sweep["rest_now"] = round(AIR1186_NEXTIN_K)
+    sweep["rest_dial"] = round(cupboard_unheard_every())
+    sweep["next_in"] = max(0.0, round(AIR1186_NEXTIN_K
                                       - (now - _UNHEARD_AT[0])))
     if sweep.get("why") and sweep["why"] != "aired":
         said_sweep = ("the sweep has not aired anything: %s (last looked %s "
@@ -16963,6 +16993,46 @@ async def unheard_stock_air(force: bool = False) -> str:
         hush = 0.0
     if hush >= UNHEARD_QUIET_AFTER:
         rest = min(rest, UNHEARD_QUIET_EVERY)
+    # 2026-09-15 (#1186): AND THE CLOCK ABOVE IS RESET BY THE FILLER.
+    #
+    # #1301 reads talk_quiet_for() and its comment calls that "the
+    # station's own measure of cast silence". It is not quite. The one
+    # writer, talk_said_now, is called from dj_speak for every row whose
+    # `who` is in ("dj", "cohost", "third", "caller", "caller2",
+    # "drop") - and "drop" is the station IDs and the SFX guy's liners,
+    # which is to say the thing that EXISTS to cover dead air. So the
+    # filler that papers over a hole also resets the clock that would
+    # have armed the guard that fills it properly. A station whose SFX
+    # guy is doing his job is a station where #1301 rarely arms.
+    #
+    # Measured on the live process tonight, both clocks at the same
+    # instant: talk_quiet 103s, dialogue_quiet 1039s. The last thing the
+    # station said was a drop, not a DJ. Ten times the silence, invisible
+    # to the guard.
+    #
+    # dialogue_quiet_for() is the clock that cannot be fooled this way:
+    # it is stamped only where a LISTENER's own player reported the pair
+    # audible and progressing, and it returns -1 on an empty house, so
+    # an unlistened station is never called silent by it. The threshold
+    # is DIALOGUE_QUIET_ALARM, which is the same five minutes air_watch
+    # already promotes this clock at (#1231) - reused rather than
+    # invented.
+    #
+    # It collapses to a MIDDLE rest, not to UNHEARD_QUIET_EVERY. The
+    # walk this interval paces reads four shelves through
+    # dialogue_row_ready and that cost is the reason the interval
+    # exists (#1142). On a box-only house dialogue_quiet_for is high
+    # more or less permanently, so granting it the full fifteen-second
+    # collapse would run the full walk four times a minute for ever.
+    # Sixty seconds is seven times faster than the 420-second interval
+    # and still a bounded load.
+    try:
+        AIR1186_REST_S = dialogue_quiet_for()
+    except Exception:  # noqa: BLE001
+        AIR1186_REST_S = -1.0
+    if AIR1186_REST_S >= DIALOGUE_QUIET_ALARM:
+        rest = min(rest, UNHEARD_QUIET_DIALOGUE)
+        hush = max(hush, AIR1186_REST_S)
     if force:
         rest = 0.0                                  # #1313: dead air waits for nothing
     if now - _UNHEARD_AT[0] < rest:
@@ -48647,6 +48717,66 @@ async def entry_unanswered_fill() -> str:
     return kind
 
 
+# 2026-09-15 (#1186): HOW LONG ANYTHING IN A DEAD-AIR PASS MAY WAIT.
+#
+# Deliberately not dials. The pass ticks every twenty seconds and its
+# whole value is that it keeps ticking; these only say that no single
+# step inside it may hold the rest of the station's dead-air machine
+# open. They are generous - the point is a CEILING, not a schedule.
+#
+# AIR1186_PARK_AIR_S matches the 25 seconds #1340 already chose for the
+# same call from the troubleshooting console, for the same reason and
+# with the same consolation: the round is queued either way and the page
+# starts it at its next poll.
+AIR1186_PARK_S = 20.0            # a floor grab, a memo, a gap filler
+AIR1186_PARK_WEDGE_S = 15.0      # clearing a page wedge
+AIR1186_PARK_AIR_S = 25.0        # anything that waits for a playout
+# Where the current pass is, and when it last got all the way round. A
+# surface reading `at` far in the past and `where` naming a step is
+# looking at a parked watchdog, which is what tonight was.
+_DEAD_AIR_PASS: dict[str, Any] = {"at": 0.0, "where": "not started",
+                                  "since": 0.0, "passes": 0, "late": {}}
+
+
+def _dead_air_pass(where: str) -> None:
+    """Stamp where the dead-air pass is. Never raises; costs two writes."""
+    try:
+        now = time.time()
+        _DEAD_AIR_PASS["where"] = str(where or "")[:64]
+        _DEAD_AIR_PASS["since"] = now
+        if where == "top":
+            _DEAD_AIR_PASS["at"] = now
+            _DEAD_AIR_PASS["passes"] = int(
+                _DEAD_AIR_PASS.get("passes") or 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _dead_air_late(what: str) -> None:
+    """A bound fired. Say so loudly - this is the evidence that was
+    missing tonight, and a step that times out repeatedly is a fault
+    somebody should be looking at rather than a thing to live with."""
+    try:
+        book = _DEAD_AIR_PASS.setdefault("late", {})
+        book[str(what)[:48]] = int(book.get(str(what)[:48]) or 0) + 1
+        pipeline_log("air", "the dead-air watchdog stopped waiting for %s - "
+                     "it had the pass open too long and everything after it "
+                     "was not running. The work is not lost; it is queued "
+                     "(#1186)" % what)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _dead_air_serve_once() -> str:
+    """The ordinary cupboard chain as ONE awaitable, so it can be bounded.
+
+    Byte-for-byte the expression that was inline here before #1186, in a
+    coroutine only so asyncio.wait_for has something to hold."""
+    return (await entry_unanswered_fill()
+            or await entry_arrears_serve()
+            or await unheard_stock_air())
+
+
 async def dead_air_watch() -> None:
     """The silence ceiling (#338, #340). Nothing playing and nobody
     talking for longer than the slider allows → kick the show forward.
@@ -48672,8 +48802,29 @@ async def dead_air_watch() -> None:
             continue
         await asyncio.sleep(20)
         try:
+            # 2026-09-15 (#1186): THE HEARTBEAT, because the evidence for
+            # what went wrong tonight had to be inferred from a counter
+            # that had stopped climbing.
+            #
+            # This loop is the station's whole dead-air machine: the
+            # needle drop, dead_air_rescue, the standing cupboard
+            # consumer, the SFX guy's music road, the strike counter and
+            # the show restart all live inside one pass of it. When it
+            # parks, every one of them stops, and nothing anywhere says
+            # so - the panels go on reporting the last value of
+            # everything the pass used to write. The operator's own
+            # reading was "the standing consumer has put 1 of them on
+            # the air out of turn since the process started", which is
+            # true and is not an explanation.
+            #
+            # Two dict writes a pass and one per risky await. `where` is
+            # the name of the step the pass is inside, so a surface can
+            # say "parked in the cupboard for 421s" rather than "the
+            # watchdog last did something a while ago".
+            _dead_air_pass("top")
             limit = dj_settings()["dead_air_seconds"]
             if not limit or not _RADIO.get("on"):
+                _dead_air_pass("idle")
                 strikes = 0
                 continue
             # #689: now_really_playing, not "is `now` set" — a finished
@@ -48729,7 +48880,16 @@ async def dead_air_watch() -> None:
             # waits for a gap to ask would never ask. It handles the
             # floor itself.
             try:
-                await manager_break_in()
+                # 2026-09-15 (#1186): BOUNDED, like everything below it.
+                # manager_break_in's own comment says it "handles the
+                # floor itself", and handling the floor means awaiting
+                # _FLOOR_LOCK.acquire(), which #1146 measured a writer
+                # holding for six to seventy-eight seconds a line. A
+                # watchdog that queues behind the thing it is watching
+                # for is not a watchdog.
+                await asyncio.wait_for(manager_break_in(), AIR1186_PARK_S)
+            except asyncio.TimeoutError:
+                _dead_air_late("the memo from upstairs")
             except Exception:  # noqa: BLE001
                 pass
             # #1202: AND ASK WHETHER THE PAGE HAS STUCK. #1200 put this
@@ -48741,7 +48901,11 @@ async def dead_air_watch() -> None:
             # occurrences of the fault it was written for.
             try:
                 if page_wedge_state().get("wedged"):
-                    await page_wedge_clear()
+                    _dead_air_pass("unwedging the page")
+                    await asyncio.wait_for(page_wedge_clear(),
+                                           AIR1186_PARK_WEDGE_S)
+            except asyncio.TimeoutError:
+                _dead_air_late("clearing the page wedge")
             except Exception:  # noqa: BLE001
                 pass
             # #1313: SILENCE ALWAYS LOSES, AND IT IS ASKED FIRST.
@@ -48768,11 +48932,48 @@ async def dead_air_watch() -> None:
                     # station cannot - and a wedge left in place would
                     # keep queueing every ordinary round behind it.
                     _floor_break("the silence rescue needed the air")
-                    _went = await unheard_stock_air(force=True)
+                    # 2026-09-15 (#1186): THIS IS THE ONE THAT PARKED.
+                    #
+                    # unheard_stock_air waits for the line to actually
+                    # reach the air, which is a render and a playout.
+                    # #1340 measured that exact wait from the
+                    # troubleshooting console - "it ran past 120s and
+                    # the caller gave up" - and gave the console call
+                    # site a 25-second bound for it. These two call
+                    # sites, which are the ONLY ones in ordinary
+                    # running, never got one.
+                    #
+                    # Measured tonight: 124 finished rounds never heard,
+                    # the oldest written two and a half days ago, the
+                    # consumer showing walks 2 and aired 1 for a whole
+                    # process lifetime, next_in 361 against an interval
+                    # of 420 - a walk begun 59 seconds earlier that
+                    # never came back - and the room silent for 103s and
+                    # climbing. Everything below this line in the pass
+                    # had not run since.
+                    #
+                    # #1340's own argument for stopping the wait applies
+                    # here word for word: the work is not wasted when
+                    # the wait ends, because the round is already queued
+                    # and the page starts it at its next poll. The
+                    # honest thing is to stop waiting and say so, not to
+                    # hold the whole station's dead-air machine open.
+                    _dead_air_pass("the cupboard (silence rescue)")
+                    _went = ""
+                    try:
+                        _went = await asyncio.wait_for(
+                            unheard_stock_air(force=True), AIR1186_PARK_AIR_S)
+                    except asyncio.TimeoutError:
+                        _dead_air_late("the cupboard's silence rescue")
                     if not _went:
-                        await sfx_fill_gap(
-                            "silence outranks the floor (#1313)",
-                            under_floor=True, ignore_rest=True)
+                        _dead_air_pass("the gap filler")
+                        try:
+                            await asyncio.wait_for(sfx_fill_gap(
+                                "silence outranks the floor (#1313)",
+                                under_floor=True, ignore_rest=True),
+                                AIR1186_PARK_S)
+                        except asyncio.TimeoutError:
+                            _dead_air_late("the gap filler")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -48786,9 +48987,18 @@ async def dead_air_watch() -> None:
                     # to 103 hours while the same roads were written live
                     # 90 times in a day. It runs after both, so a road
                     # that is owed its own entry is still paid first.
-                    (await entry_unanswered_fill()
-                     or await entry_arrears_serve()
-                     or await unheard_stock_air())
+                    # 2026-09-15 (#1186): and the ordinary road is
+                    # bounded for the same reason as the rescue above -
+                    # all three of these end in _ready_shelf_air, which
+                    # waits for a render and a playout. The chain is
+                    # bounded as a whole rather than each limb, because
+                    # its own shape is "first one that works wins" and
+                    # the budget belongs to the pass, not to a limb.
+                    _dead_air_pass("the cupboard (ordinary road)")
+                    await asyncio.wait_for(
+                        _dead_air_serve_once(), AIR1186_PARK_AIR_S)
+                except asyncio.TimeoutError:
+                    _dead_air_late("the cupboard's ordinary road")
                 except Exception:  # noqa: BLE001
                     pass
             # #1235: ASK THE SFX GUY FIRST. The reset below is right
@@ -132164,7 +132374,380 @@ AIR_LADDER: list[tuple[float, str, str]] = [
 _AIR_WATCH: dict[str, Any] = {
     "quiet": 0.0, "rung": -1, "at": 0.0, "tried": [], "worked": "",
     "last_restart": 0.0, "runs": 0, "say": "watching",
+    # 2026-09-15 (#1186): and WHICH ROAD said so, with the numbers.
+    "road": "", "why": [], "evidence": {},
 }
+
+# --- #1186: THE SECOND ROAD INTO THE LADDER ---------------------------
+#
+# THE SWITCH, and it defaults to the station exactly as it runs tonight.
+#
+# <data>/air_stall/mode, one word, re-read every three seconds, no
+# restart and no settings round trip - the shape of
+# <data>/record_talk/mode, and literally its class, so it inherits the
+# STRICTER one-token parse: a file holding a sentence is off, however
+# promising a word inside it looks. An operator who leaves himself a
+# note in a switch file has not thrown the switch. `env={}` because
+# TalkSwitch falls back to its own environment variable and that one
+# belongs to the record-talk desk; this switch is a file or it is off.
+#
+#   off    the station of 2026-09-15. The second road is not even
+#          evaluated and not one byte of behaviour changes.
+#   trace  the road is evaluated and its verdict is written into
+#          _AIR_WATCH and out to /api/broadcast/watch and the console,
+#          and it NEVER opens the ladder. This is the setting to leave
+#          on for a night before trusting it.
+#   air    trace, and the road may open the ladder.
+AIR_STALL_DIR = data_path("air_stall")
+AIR_STALL_SWITCH = track_talk_segment.TalkSwitch(AIR_STALL_DIR, env={},
+                                                 clock=time.time)
+_AIR_STALL_SAID: dict[str, Any] = {"mode": None}
+
+# HOW LONG THE ROOM MUST HAVE BEEN QUIET before the second road may open.
+#
+# Above every rung of AIR_LADDER's first two thresholds (90s relieve,
+# 120s flush) on purpose. #1213's warning is the one to respect here:
+# "a record playing with no talk due produces none - measured at 60s+
+# between lines on a perfectly healthy station". Sixty seconds is
+# healthy; a hundred and fifty is not, and the three other clauses below
+# have to hold as well.
+AIR_STALL_QUIET = 150.0
+# The window the three-way hearing rule is asked about. Long enough that
+# a single dropped acknowledgement does not change the answer, short
+# enough that a listener who left an hour ago is not still counted.
+AIR_STALL_HOUSE_WINDOW = 900.0
+# A dead-air pass older than this means the pass is PARKED. It ticks
+# every twenty seconds and its own steps are now bounded at 15-25s, so
+# ninety seconds is several missed passes, not a slow one.
+AIR_STALL_PASS_S = 90.0
+# How many finished-but-never-heard rounds count as "there is material".
+AIR_STALL_READY = 1
+
+
+def air_stall_mode() -> str:
+    """off | trace | air. Never raises; an unreadable switch is off.
+
+    Says so in the log when it CHANGES and only then, which is the rule
+    record_talk_mode keeps for the same reason: a line every twenty
+    seconds saying the switch is still off is not a log."""
+    mode = track_talk_segment.MODE_OFF
+    try:
+        mode = AIR_STALL_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return track_talk_segment.MODE_OFF
+    was = _AIR_STALL_SAID["mode"]
+    if mode != was:
+        _AIR_STALL_SAID["mode"] = mode
+        if was is not None:
+            try:
+                pipeline_log("air", "#1186: the stalled-hand-off road is now "
+                             "'%s' (off = the page-wedge road alone, trace = "
+                             "it decides but never acts, air = it may open "
+                             "the ladder)" % mode)
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def air_house_basis(now: float | None = None,
+                    window: float = AIR_STALL_HOUSE_WINDOW) -> str:
+    """#1422's three-way rule, asked of the LIVE clocks, no walk.
+
+    THE WATCHDOG MUST NOT FIRE ON A NIGHT WHEN NOBODY IS TUNED IN, and
+    the station already owns the distinction that draws that line -
+    gap_basis's rule, written the same night this item comes from:
+
+      a hearing stamp in the window          -> "heard"
+      no stamp, nobody connected             -> "published"  (empty house)
+      no stamp, but listeners WERE connected -> "unheard"    (the fault)
+
+    gap_basis answers it by walking the air log, which is a file read and
+    a sort and has no business in a twenty-second watchdog. These are the
+    same two facts read off the live state instead:
+
+      _DIALOGUE_HEARD[0] is written in page_playback_ack under exactly
+      the test that writes the per-line HEARD_STAMP that line_heard_at
+      reads - audible above zero after muting and the element clamp, the
+      position PROGRESSED since the last acknowledgement, and the
+      delivery marked speech. It is the same hearing fact, not a second
+      one, and it is one float.
+
+      _gap_listeners_between is the same function gap_basis itself calls
+      for its middle clause, over _LISTENER_SEEN, which is a handful of
+      dict rows.
+
+    The road below fires on "heard" and on "unheard" and never on
+    "published". Both of tonight's readings are covered: the first
+    complaint was published-to-four-listeners-who-acknowledged-nothing,
+    which is "unheard"; the second was published 162 / heard 162 with
+    nothing being handed over at all, which is "heard". An empty house
+    is not a fault and is not this road's business."""
+    now = float(now or time.time())
+    lo = now - max(60.0, float(window or AIR_STALL_HOUSE_WINDOW))
+    try:
+        if float(_DIALOGUE_HEARD[0] or 0) >= lo:
+            return GAP_BASIS_HEARD
+        if _gap_listeners_between(lo, now) > 0:
+            return GAP_BASIS_UNHEARD
+    except Exception:  # noqa: BLE001
+        return GAP_BASIS_PUBLISHED
+    return GAP_BASIS_PUBLISHED
+
+
+def air_watch_evidence(quiet: float, waiting: int,
+                       now: float | None = None) -> dict[str, Any]:
+    """Everything the decision needs, and NOT ONE NEW WALK OF ANYTHING.
+
+    Every figure here is either a live float, a small dict, or the LAST
+    VALUE of a memo something else already paid for:
+
+      _FLOW_MEMO    dialogue_flow_state's three-second memo. Every open
+                    panel, app and tune page polls /api/dj, which fills
+                    it. Read, never called - _dialogue_flow_state_fresh
+                    walks schedule_adherence, hour_needs, the whole
+                    cupboard and track_lookahead, and #1149 moved that
+                    behind a memo precisely because paying it on the
+                    loop cost healthz 3-8 seconds.
+      _UNHEARD_MEMO unheard_state's twenty-second memo, same argument -
+                    it walks every shelf and the larder.
+      _UNHEARD_SWEEP, _UNHEARD_LOG, _RESCUE_AT, _DEAD_AIR_PASS
+                    plain state the standing consumer keeps as it runs.
+
+    A memo nobody has refreshed is reported as stale and its clause
+    simply does not hold, which is the safe direction: a station with no
+    panel open does not get its feed flushed on the strength of a figure
+    from an hour ago."""
+    now = float(now or time.time())
+    got: dict[str, Any] = {"at": now, "quiet": round(float(quiet or 0), 1),
+                           "waiting": int(waiting or 0),
+                           "needs_waiting": PAGE_WEDGE_WAITING,
+                           "needs_quiet": AIR_STALL_QUIET}
+    try:
+        got["mode"] = air_stall_mode()
+    except Exception:  # noqa: BLE001
+        got["mode"] = track_talk_segment.MODE_OFF
+    try:
+        got["basis"] = air_house_basis(now)
+        got["listeners"] = _gap_listeners_between(
+            now - AIR_STALL_HOUSE_WINDOW, now)
+    except Exception:  # noqa: BLE001
+        got["basis"] = GAP_BASIS_PUBLISHED
+        got["listeners"] = 0
+    # The dead-air watchdog's heartbeat. -1 means it has not stamped at
+    # all yet, which on a fresh process is ordinary and must not read as
+    # a park; the decision treats -1 as "not known" and never as proof.
+    try:
+        _at = float(_DEAD_AIR_PASS.get("at") or 0)
+        got["pass_age"] = round(now - _at, 1) if _at else -1.0
+        got["pass_where"] = str(_DEAD_AIR_PASS.get("where") or "")
+        got["pass_count"] = int(_DEAD_AIR_PASS.get("passes") or 0)
+    except Exception:  # noqa: BLE001
+        got["pass_age"] = -1.0
+        got["pass_where"] = ""
+        got["pass_count"] = 0
+    flow = None
+    try:
+        if now - float(_FLOW_MEMO.get("at") or 0) < 60.0:
+            flow = _FLOW_MEMO.get("value")
+    except Exception:  # noqa: BLE001
+        flow = None
+    got["flow_fresh"] = flow is not None
+    got["flow_ready"] = int((flow or {}).get("ready") or 0)
+    got["flow_target"] = int((flow or {}).get("target") or 0)
+    bank = None
+    try:
+        if now - float(_UNHEARD_MEMO.get("at") or 0) < 120.0:
+            bank = _UNHEARD_MEMO.get("value")
+    except Exception:  # noqa: BLE001
+        bank = None
+    got["bank_fresh"] = bank is not None
+    got["banked_ready"] = int((bank or {}).get("ready") or 0)
+    got["banked_unheard"] = int((bank or {}).get("unheard") or 0)
+    got["banked_overdue"] = int((bank or {}).get("overdue") or 0)
+    # How long since the standing consumer actually put something on the
+    # air - not since it last LOOKED, which is what _UNHEARD_SWEEP["at"]
+    # records and which climbs perfectly happily while nothing airs.
+    # Clamped to the show's own age so a fresh process does not read as a
+    # consumer that has been idle since the epoch.
+    try:
+        aired_at = float(_RESCUE_AT[0] or 0)
+        if _UNHEARD_LOG:
+            aired_at = max(aired_at, float(_UNHEARD_LOG[-1].get("at") or 0))
+        born = float(_RADIO.get("show_started") or 0) or now
+        got["consumer_idle"] = round(now - max(aired_at, born), 1)
+        got["consumer_aired"] = int(_UNHEARD_SWEEP.get("aired") or 0)
+        got["consumer_walks"] = int(_UNHEARD_SWEEP.get("walks") or 0)
+        got["consumer_why"] = str(_UNHEARD_SWEEP.get("why") or "")
+    except Exception:  # noqa: BLE001
+        got["consumer_idle"] = 0.0
+        got["consumer_aired"] = 0
+        got["consumer_walks"] = 0
+        got["consumer_why"] = ""
+    return got
+
+
+def air_watch_roads(e: dict[str, Any]) -> dict[str, Any]:
+    """PURE. Which road is open, on what evidence, and what it will say.
+
+    Pure so a harness can drive it against made-up stations - a healthy
+    quiet musical stretch, tonight's stalled hand-off, an empty house, a
+    page wedge - and prove it fires on exactly the right ones. It reads
+    only its argument and the module constants; it takes no clock, no
+    lock and no state.
+
+    THE TWO ROADS, AND THEY SHARE ONE LADDER.
+
+    WEDGE (#1213, unchanged in every respect): the page is holding at
+    least PAGE_WEDGE_WAITING clips it has not begun. That is the fault
+    #1213 was written for and it is the fault it stays written for.
+
+    STALL (#1186): the room has been quiet longer than any healthy
+    musical stretch, the house is LISTENING, there is finished material
+    ready, and the road that carries material to the air has not moved.
+    All four, and the last two are what make the first two safe.
+
+      quiet     >= AIR_STALL_QUIET. Above the first two ladder rungs, so
+                a sixty-second gap between lines on a healthy station
+                cannot reach this even if everything else held.
+      house     basis is not "published" - see air_house_basis. A night
+                with nobody tuned in is not a fault and this road has
+                nothing to say about it.
+      material  finished work exists that could go out: banked unheard
+                stock, or the reserve at or above its own target.
+                Tonight, both - 124 never heard and 32 ready against a
+                target of 12.
+      stalled   and the road that carries it has stopped. Either the
+                dead-air watchdog has not completed a pass in
+                AIR_STALL_PASS_S (it is parked - this is what tonight
+                actually was, and it is the most direct evidence the
+                station owns), or the standing consumer has put nothing
+                on the air for at least as long as the room has been
+                silent.
+
+    WHY THIS EVIDENCE AND NOT SOMETHING SIMPLER. "Ready against target"
+    alone is not a fault: a station that has written ahead is a station
+    doing well, and on most nights ready exceeds target while everything
+    airs perfectly. "Banked unheard" alone is not a fault either - the
+    cupboard is MEANT to hold stock, and #1075 is emphatic that unheard
+    work is the station's best stock rather than its oldest rubbish. It
+    is the pairing of stock with a consumer that has stopped consuming,
+    while listeners are there and the room is silent, that cannot be
+    anything but a fault. Each clause on its own would shout on a good
+    night; together they described tonight and nothing else.
+
+    HOW THE TWO ROADS SHARE ONE LADDER, WHICH IS THE THING MOST WORTH
+    GETTING RIGHT. They do not each own a ladder. They are ENTRY
+    CONDITIONS ONLY: whichever one opens, the caller falls through to
+    the same `due` computation over AIR_LADDER, the same held-rung
+    suppression, the same AIR_WATCH_SETTLE, the same AIR_RESTART_REST
+    and the same single _AIR_WATCH dict with one `rung` and one `at`. A
+    rung fired through the stall road is remembered by the wedge road
+    and the other way about, so they cannot race, cannot double-fire and
+    cannot rob each other of a settle.
+
+    The one genuine hazard a second door creates is that it can open
+    part-way UP a ladder that was never climbed. `quiet` on the stall
+    road is often already enormous when the road first opens - tonight's
+    dialogue clock read 1039s, which is past every threshold including
+    "restart the station process". Firing a restart as the first act of
+    a brand-new road is precisely the trigger-happiness this must not
+    have. So when the stall road and only the stall road opened the
+    door, the rung is capped at one above whatever is held: the ladder
+    is climbed a rung at a time from the bottom, each given its settle,
+    starting with `relieve` - which #1217 put first because it is the
+    only rung that touches a congested loop and is nearly free to be
+    wrong about. Cost: a genuine stall takes about five and a half
+    minutes to reach a restart instead of reaching it at once. The
+    operator waited seventeen minutes tonight. The wedge road is not
+    capped and its behaviour is byte-identical to before."""
+    quiet = float(e.get("quiet") or 0)
+    waiting = int(e.get("waiting") or 0)
+    need_wait = int(e.get("needs_waiting") or PAGE_WEDGE_WAITING)
+    mode = str(e.get("mode") or "off")
+    basis = str(e.get("basis") or GAP_BASIS_PUBLISHED)
+    pass_age = float(e.get("pass_age") if e.get("pass_age") is not None else -1)
+    flow_ready = int(e.get("flow_ready") or 0)
+    flow_target = int(e.get("flow_target") or 0)
+    banked = int(e.get("banked_ready") or 0)
+    idle = float(e.get("consumer_idle") or 0)
+    every = AIR_WATCH_EVERY
+
+    # --- the wedge road, #1213, untouched ------------------------------
+    wedge = waiting >= need_wait
+    wedge_say = ("the page is holding %d clip(s) it has not begun, it needs "
+                 "%d" % (waiting, need_wait))
+
+    # --- the stall road, #1186 ----------------------------------------
+    t_quiet = quiet >= AIR_STALL_QUIET
+    t_house = basis != GAP_BASIS_PUBLISHED
+    material = (banked >= AIR_STALL_READY
+                or (flow_target > 0 and flow_ready >= flow_target))
+    parked = pass_age >= AIR_STALL_PASS_S
+    unserved = idle >= max(quiet, AIR_STALL_QUIET)
+    stalled = parked or unserved
+    t_material = material and stalled
+    stall = bool(t_quiet and t_house and t_material)
+
+    why: list[str] = []
+    why.append("WEDGE road (#1213): %s - %s"
+               % ("OPEN" if wedge else "shut", wedge_say))
+    why.append("STALL road (#1186): %s - the switch reads '%s'"
+               % ("OPEN" if stall else "shut", mode))
+    why.append("  quiet     %s: %ds, it needs %ds"
+               % ("yes" if t_quiet else "NO", int(quiet), int(AIR_STALL_QUIET)))
+    why.append("  house     %s: the hearing basis is '%s' with %d "
+               "listener(s) seen - an empty house is not a fault"
+               % ("yes" if t_house else "NO", basis, int(e.get("listeners") or 0)))
+    why.append("  material  %s: %d round(s) banked and never heard, %d "
+               "ready against a target of %d%s"
+               % ("yes" if material else "NO", banked, flow_ready, flow_target,
+                  "" if e.get("bank_fresh") and e.get("flow_fresh")
+                  else " (the panel's figures are STALE - nothing has "
+                       "polled them, so this clause cannot hold)"))
+    why.append("  stalled   %s: the dead-air watchdog last finished a pass "
+               "%s ago%s, and the standing consumer has aired nothing for "
+               "%ds (%d airing(s), %d walk(s), last answer: %s)"
+               % ("yes" if stalled else "NO",
+                  ("%ds" % int(pass_age)) if pass_age >= 0 else "never yet",
+                  (" - parked in '%s'" % e.get("pass_where"))
+                  if parked and e.get("pass_where") else "",
+                  int(idle), int(e.get("consumer_aired") or 0),
+                  int(e.get("consumer_walks") or 0),
+                  str(e.get("consumer_why") or "none recorded")))
+
+    road = ""
+    fire = False
+    cap = False
+    if wedge:
+        road, fire, cap = "wedge", True, False
+    elif stall and mode == track_talk_segment.MODE_AIR:
+        road, fire, cap = "stall", True, True
+    elif stall:
+        road, fire, cap = "stall", False, False
+
+    if fire and road == "wedge":
+        say = ("WEDGE road (#1213): quiet %ds and the page is holding %d "
+               "clip(s) it has not begun." % (int(quiet), waiting))
+    elif fire:
+        say = ("STALL road (#1186): quiet %ds, the house is listening "
+               "(basis '%s', %d listener(s)), %d round(s) ready against a "
+               "target of %d with %d banked unheard, and the hand-off has "
+               "stalled (%s)."
+               % (int(quiet), basis, int(e.get("listeners") or 0),
+                  flow_ready, flow_target, banked,
+                  ("the dead-air watchdog last finished a pass %ds ago, "
+                   "parked in '%s'" % (int(pass_age), e.get("pass_where") or "?"))
+                  if parked else
+                  ("the standing consumer has aired nothing for %ds" % int(idle))))
+    elif road == "stall":
+        say = ("the stalled-hand-off road WOULD fire, and the switch reads "
+               "'%s' so it will not act. %s Next look in %ds."
+               % (mode, " ".join(why[2:]), int(every)))
+    else:
+        say = ("no road is open. %s Next look in %ds."
+               % (" | ".join(why), int(every)))
+    return {"road": road, "fire": fire, "cap_rung": cap, "why": why,
+            "say": say, "evidence": dict(e)}
 
 
 def air_quiet_for() -> float:
@@ -132273,21 +132856,65 @@ async def air_watch() -> None:
             # watchdog would flush the feed in the middle of every quiet
             # musical stretch, which is worse than the fault it is for.
             waiting = int((page_wedge_state() or {}).get("waiting") or 0)
-            if waiting < PAGE_WEDGE_WAITING:
-                _AIR_WATCH.update(
-                    rung=-1,
-                    say=("quiet %ds, but nothing is queued for the page - "
-                         "that is the schedule, not a fault" % int(quiet)))
+            # 2026-09-15 (#1186): TWO ROADS IN, ONE LADDER, AND IT SAYS
+            # WHICH EVERY SINGLE TIME.
+            #
+            # What stood here was #1213's gate and nothing else, and
+            # #1213 is right about the fault it was written for: silence
+            # alone is not a fault, a record playing with no talk due
+            # produces sixty seconds of quiet on a healthy station, and
+            # flushing the feed in the middle of every quiet musical
+            # stretch is worse than the thing it cures. That gate is
+            # still here, unchanged, as the `wedge` road inside
+            # air_watch_roads.
+            #
+            # What it could not see is the opposite shape. On the night
+            # of 2026-09-15 the page was holding nothing precisely
+            # BECAUSE the hand-off upstream had stalled, and the
+            # sentence this gate wrote - "quiet 1043s, but nothing is
+            # queued for the page - that is the schedule, not a fault" -
+            # was confidently wrong for seventeen minutes while
+            # dialogue_quiet read 1039s, dialogue_flow read 32 ready
+            # against a target of 12, and four listeners acknowledged
+            # everything they were sent. The operator noticed before the
+            # station did, and the cure was a container restart.
+            #
+            # The decision is a pure function so it can be driven
+            # against made-up stations, and the outcome names the road,
+            # the numbers, the rung and the next look whether it fires
+            # or not. The operator's standing instruction is that the
+            # orchestrator must be able to explain what it did, and this
+            # is the surface where it failed to.
+            AIR1186_LOOP_K = air_watch_roads(air_watch_evidence(quiet, waiting))
+            _AIR_WATCH.update(road=str(AIR1186_LOOP_K.get("road") or ""),
+                              why=list(AIR1186_LOOP_K.get("why") or []),
+                              evidence=dict(AIR1186_LOOP_K.get("evidence") or {}))
+            if not AIR1186_LOOP_K.get("fire"):
+                _AIR_WATCH.update(rung=-1,
+                                  say=str(AIR1186_LOOP_K.get("say") or ""))
                 continue
-            # Silent, on, unpaused, and holding work. Which rung is due?
+            # Silent, on, unpaused, and one of the two roads is open.
+            # Which rung is due?
             due = -1
             for index, (after, _step, _said) in enumerate(AIR_LADDER):
                 if quiet >= after:
                     due = index
             held = int(_AIR_WATCH.get("rung") or -1)
+            if AIR1186_LOOP_K.get("cap_rung"):
+                # See air_watch_roads: the stall road can open part-way
+                # up a ladder nobody climbed, because its `quiet` is
+                # often already past every threshold when it first
+                # opens. One rung at a time from the bottom, each given
+                # AIR_WATCH_SETTLE, starting with the cheapest.
+                due = min(due, held + 1, len(AIR_LADDER) - 1)
             if due <= held:
-                _AIR_WATCH["say"] = ("quiet %ds - giving '%s' time to work"
-                                     % (int(quiet), AIR_LADDER[held][1]))
+                _AIR_WATCH["say"] = (
+                    "%s road: quiet %ds - giving '%s' time to work, %ds of "
+                    "its %ds settle gone"
+                    % (str(AIR1186_LOOP_K.get("road") or "?"), int(quiet),
+                       AIR_LADDER[held][1],
+                       int(time.time() - float(_AIR_WATCH.get("at") or 0)),
+                       int(AIR_WATCH_SETTLE)))
                 continue
             if time.time() - float(_AIR_WATCH.get("at") or 0) < AIR_WATCH_SETTLE:
                 continue
@@ -132301,14 +132928,33 @@ async def air_watch() -> None:
                         % int(quiet))
                     continue
                 _AIR_WATCH["last_restart"] = time.time()
-            _AIR_WATCH.update(rung=due, at=time.time(),
-                              runs=int(_AIR_WATCH.get("runs") or 0) + 1,
-                              say="quiet %ds - %s" % (int(quiet), said))
-            pipeline_log("air", "nothing has been heard for %ds - %s (#1213)"
-                         % (int(quiet), said))
+            # #1186: and WHY, in numbers, on the durable row. A person
+            # asking tomorrow why the station was quiet for seventeen
+            # minutes gets an answer with figures in it rather than the
+            # name of a lever.
+            AIR1186_NOTE_K = {
+                "road": str(AIR1186_LOOP_K.get("road") or ""),
+                "why": list(AIR1186_LOOP_K.get("why") or []),
+                "evidence": dict(AIR1186_LOOP_K.get("evidence") or {})}
+            _AIR_WATCH.update(
+                rung=due, at=time.time(),
+                runs=int(_AIR_WATCH.get("runs") or 0) + 1,
+                # 2026-09-15 (#1186): the road, the rung, the evidence
+                # and when the next one comes - in the one string the
+                # console prints, because that string is what was wrong
+                # for seventeen minutes.
+                say=("%s | rung %d of %d: %s. Next look in %ds; the next "
+                     "rung needs %ds of settle."
+                     % (str(AIR1186_LOOP_K.get("say") or ""), due + 1,
+                        len(AIR_LADDER), said, int(AIR_WATCH_EVERY),
+                        int(AIR_WATCH_SETTLE))))
+            pipeline_log("air", "%s road: nothing has been heard for %ds - %s "
+                         "(#1213/#1186)"
+                         % (str(AIR1186_LOOP_K.get("road") or "?"),
+                            int(quiet), said))
             note = {"at": time.time(), "event": "tried", "step": step,
                     "quiet": round(quiet, 1), "said": said,
-                    "waiting": waiting}
+                    "waiting": waiting, **AIR1186_NOTE_K}
             # #1215: MEASURE BEFORE PULLING A LEVER. #1214 was a fault
             # with no error anywhere - every lever on this ladder would
             # have run and failed, which is what happened for two days.
@@ -132533,6 +133179,7 @@ async def broadcast_watch_api(
     require_read_auth(authorization)
     quiet = air_quiet_for()
     rung = int(_AIR_WATCH.get("rung") or -1)
+    AIR1186_WATCHAPI_K = air_stall_mode()
     return {
         "at": time.time(),
         "quiet_seconds": (round(quiet, 1) if quiet >= 0 else None),
@@ -132545,6 +133192,28 @@ async def broadcast_watch_api(
         "tried": list(_AIR_WATCH.get("tried") or [])[-8:],
         "recovered_by": str(_AIR_WATCH.get("worked") or ""),
         "runs": int(_AIR_WATCH.get("runs") or 0),
+        # 2026-09-15 (#1186): WHICH ROAD, AND THE NUMBERS BEHIND IT.
+        #
+        # This route already answered "what has the orchestrator been
+        # doing about the silence" and could only answer it with a lever
+        # name and a sentence. The sentence was wrong for seventeen
+        # minutes on 2026-09-15 and there was nothing beside it to check
+        # it against. `why` is the per-test transcript - every clause of
+        # both roads with its own numbers and a yes or a NO - and
+        # `evidence` is the raw state the decision was made on, so the
+        # decision can be re-run by hand afterwards.
+        "road": str(_AIR_WATCH.get("road") or ""),
+        "why": list(_AIR_WATCH.get("why") or []),
+        "evidence": dict(_AIR_WATCH.get("evidence") or {}),
+        "switch": AIR1186_WATCHAPI_K,
+        "switch_file": str(AIR_STALL_DIR / "mode"),
+        "next_look_s": AIR_WATCH_EVERY,
+        "settle_s": AIR_WATCH_SETTLE,
+        "restart_rest_s": AIR_RESTART_REST,
+        # The dead-air watchdog's own heartbeat, because a parked one is
+        # what silenced the station on the night this item comes from
+        # and no surface could say so.
+        "dead_air_pass": dict(_DEAD_AIR_PASS),
     }
 
 
@@ -132567,6 +133236,7 @@ async def broadcast_console_api(
     require_read_auth(authorization)
     state = page_wedge_state()
     now = time.time()
+    AIR1186_CONSOLE_K = air_stall_mode()
     heard = float(state.get("heard_at") or 0)
     tail = []
     for row in list(_RADIO.get("pipeline") or [])[-40:]:
@@ -132583,6 +133253,30 @@ async def broadcast_console_api(
         # #1213: and what the orchestrator is doing about it unaided.
         "watch": str(_AIR_WATCH.get("say") or ""),
         "watch_working": int(_AIR_WATCH.get("rung") or -1) >= 0,
+        # 2026-09-15 (#1186): ...AND WHICH ROAD SAID SO, WITH NUMBERS.
+        #
+        # `watch` above is the sentence that read "quiet 1043s, but
+        # nothing is queued for the page - that is the schedule, not a
+        # fault" for seventeen minutes while the DJs were inaudible, 32
+        # rounds sat ready against a target of 12 and four listeners
+        # acknowledged everything. A confident sentence with nothing
+        # beside it is how that lasted seventeen minutes.
+        "watch_road": str(_AIR_WATCH.get("road") or ""),
+        "watch_why": list(_AIR_WATCH.get("why") or []),
+        "watch_evidence": dict(_AIR_WATCH.get("evidence") or {}),
+        "watch_switch": AIR1186_CONSOLE_K,
+        # And the dead-air watchdog's heartbeat. It carries the whole
+        # dead-air machine - the needle drop, dead_air_rescue, the
+        # standing cupboard consumer, the SFX guy's music road, the
+        # strike counter and the show restart - in one pass, so a pass
+        # that stopped completing is every one of them stopped. On
+        # 2026-09-15 it was parked inside an unbounded wait for a round
+        # to reach the air, and the only outward sign was a walk counter
+        # that had stopped climbing.
+        "dead_air_pass": dict(_DEAD_AIR_PASS),
+        "dead_air_parked": bool(
+            float(_DEAD_AIR_PASS.get("at") or 0)
+            and now - float(_DEAD_AIR_PASS.get("at") or 0) >= AIR_STALL_PASS_S),
         "clips_waiting": int(state.get("waiting") or 0),
         "stalls": int(state.get("stalls") or 0),
         "heard_seconds_ago": (round(now - heard, 1) if heard else None),
