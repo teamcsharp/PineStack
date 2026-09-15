@@ -22259,6 +22259,331 @@ def admission_state(limit: int = 40) -> dict[str, Any]:
 
 
 # --- broadcast admission (2026-09-15) --- end
+# --- script production (2026-09-15) ---
+#
+# THE PRODUCER FOR `docs/notes/speaker-recording-and-script-assembly.md`.
+#
+#     Finalized conversation and cast -> frozen production script with
+#     ordered line identities -> one recording session per performer ->
+#     speaker masters + verified line cuts -> assembly in original script
+#     order -> finished audio + exact line cue sheet -> ready candidate
+#     selection -> atomic commitment to the broadcast sequence -> one
+#     playback controller.
+#
+# The five boundary modules are built and tested and the admission gate is
+# deployed and observing. What did not exist was a producer that used any of
+# it. This is the glue; the work is in `script_production.py`.
+#
+# WHICH CAPABILITY. The station renders every scripted chunk with its own
+# call to the engine and welds the results, so one file IS one scripted line
+# and its boundary is RETAINED FROM SYNTHESIS: `boundary_method` is
+# `renderer_boundary`, the master's mode is `segmented`, and nothing here
+# calls it a continuous performance. The bench settled the trade
+# (`docs/notes/continuous-take-bench-2026-09-15.md`): a continuous take was
+# 21% SLOWER uncontended with an identical read-back error rate, and the
+# XTTS clone server truncates at 1,000 characters silently. The continuous
+# road exists behind the same switch, with its own identity, and is off.
+#
+# OFF BY DEFAULT, and it turns on without a restart - the admission gate's
+# own idea, because the station is on air:
+#
+#     <data>/script_production/mode      re-read every three seconds
+#       off       the default; nothing is produced
+#       shadow    produce the whole flow, then THROW IT AWAY and air exactly
+#                 what would have aired, recording what the two roads
+#                 disagreed about
+#       on        carry the assembled cue map and identities to air
+#
+# It is built HERE for the same reason the admission controller is: below
+# `data_path` and `VOICE_MEDIA_DIR`, which it needs, and above every road
+# that starts broadcast audio.
+try:
+    import script_production as _production_module
+except Exception as _production_import_error:  # noqa: BLE001
+    _production_module = None
+    _PRODUCTION_WHY = "script_production could not be imported: %r" % (
+        _production_import_error,)
+else:
+    _PRODUCTION_WHY = ""
+
+_PRODUCTION: Any = None
+# The last few rounds' reference sets, for the incident capture. Bounded.
+_PRODUCTION_SEEN: list[dict[str, Any]] = []
+
+
+def script_producer() -> Any:
+    """The producer, or None. NEVER raises and never blocks the air.
+
+    The blanket except is the admission controller's lesson taken the first
+    time rather than the second: a producer that can throw out of here would
+    be a new way for a prepared round to fail to air, and this road exists to
+    make the station more certain, not less."""
+    global _PRODUCTION, _PRODUCTION_WHY
+    if _production_module is None:
+        return None
+    try:
+        if _PRODUCTION is None:
+            _PRODUCTION = _production_module.ScriptProducer(
+                DATA_DIR, VOICE_MEDIA_DIR)
+        return _PRODUCTION
+    except Exception as exc:  # noqa: BLE001
+        _PRODUCTION_WHY = "the producer is unusable: %r" % (exc,)
+        return None
+
+
+def _production_config(who: str, voice: str, engine: str) -> dict[str, Any]:
+    """The renderer configuration that is part of the performance contract.
+
+    Anything in here changes the frozen revision, so it holds only what
+    genuinely changes the sound: the engine's request cap and the sentence
+    cap the chunks were cut at. NOT the random per-line effects - those are
+    drawn once and baked into the audio, and putting a fresh draw in the
+    contract would make every round a new revision."""
+    try:
+        return {"sample_rate": 24000,
+                "max_request_chars": int(VOICE_MAX_CHARS),
+                "line_cap": int(say_line_cap()),
+                "seat": str(who or "")}
+    except Exception:  # noqa: BLE001
+        return {"seat": str(who or "")}
+
+
+def _production_instructions(who: str, voice: str) -> str:
+    """The performance instructions this seat is carrying, as text."""
+    try:
+        vec = performance_vector(who, voice) or {}
+        if not vec:
+            return ""
+        return " ".join("%s=%s" % (k, vec[k]) for k in sorted(vec))[:200]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _production_conversation(entry: dict[str, Any]) -> str:
+    """This conversation's own name, stable across passes.
+
+    NOT a fresh uuid: a round prepared over three sittings must freeze to the
+    same conversation, or its revision changes under its own audio."""
+    for key in ("sid", "id", "round_id", "shelf_id"):
+        got = str((entry or {}).get(key) or "")
+        if got:
+            return got
+    try:
+        import hashlib as _hashlib
+        seed = "\x00".join(str((entry or {}).get(k) or "") for k in
+                            ("script", "caller_name", "prep_kind"))
+        return "round-" + _hashlib.sha1(seed.encode("utf-8")).hexdigest()[:20]
+    except Exception:  # noqa: BLE001
+        return "round-unnamed"
+
+
+async def script_production_round(entry: dict[str, Any], plan: Any,
+                                  voices: Any, line_plan: Any = None) -> None:
+    """Run the whole production flow over a round that has just become ready.
+
+    OFFLOADED. It reads every take's bytes and runs ffmpeg once per strip
+    plus once for the mix; on the event loop that is the station going quiet
+    while it works. `asyncio.to_thread` is the same door the mixer already
+    goes through.
+
+    It is also PACED and it YIELDS: `due()` holds it to one round per
+    `every=` seconds, and `prep_should_stop()` - the same question the
+    preparer asks between every line - stands it down the moment the live
+    road wants the engine."""
+    producer = script_producer()
+    if producer is None or _production_module is None:
+        return
+    try:
+        settings = producer.settings()
+        if settings.off or not producer.due(settings):
+            return
+        try:
+            if prep_should_stop():
+                return          # the air wants the room; this can wait
+        except Exception:  # noqa: BLE001
+            pass
+        source, refusals = _production_module.round_source(
+            _production_conversation(entry), list(plan or []),
+            dict(voices or {}),
+            engine_for=voice_engine_for,
+            clip_for=lambda text, voice, engine: pantry_get(
+                pantry_key(text, voice, engine)),
+            media_root=VOICE_MEDIA_DIR,
+            line_plan=list(line_plan or []),
+            cache_key_for=pantry_key,
+            config_for=_production_config,
+            instructions_for=_production_instructions,
+            label=str(entry.get("label") or entry.get("prep_kind") or ""),
+            kind=str(entry.get("prep_kind") or ""))
+        if refusals:
+            # "No incomplete conversation may be admitted." A round the
+            # producer cannot even describe is recorded and dropped; the
+            # existing road airs it exactly as it would have.
+            entry["production"] = {"available": False, "mode": settings.mode,
+                                   "why": str(refusals[0].get("reason") or ""),
+                                   "refusal": str(refusals[0].get("code") or "")}
+            producer.ledger.record({
+                "at": time.time(), "mode": settings.mode, "road": settings.road,
+                "conversation_id": source.conversation_id, "ok": False,
+                "lines": len(source.lines),
+                "refusal": str(refusals[0].get("code") or ""),
+                "refusal_codes": [str(r.get("code") or "") for r in refusals],
+                "refusal_reasons": [str(r.get("reason") or "")
+                                    for r in refusals[:4]]})
+            return
+        result = await asyncio.to_thread(producer.produce, source,
+                                         settings=settings)
+        payload = producer.round_payload(result)
+        entry["production"] = payload["production"]
+        _production_remember(payload["production"])
+        if "cue_map" in payload:
+            # `on` ONLY. In shadow this key is absent by construction and the
+            # round airs byte for byte as it would have.
+            entry["cue_map"] = payload["cue_map"]
+            entry["production_lines"] = [
+                {"ordinal": row["ordinal"],
+                 "occurrence_id": row["occurrence_id"],
+                 "cut_id": row["cut_id"], "take_id": row["take_id"],
+                 "script_revision": result.revision,
+                 "assembly_id": result.assembly_id,
+                 "performer_session": str((result.sessions.get(row["actor"])
+                                           or {}).get("session_id") or ""),
+                 "final_audio_hash": str(result.cue_map.get(
+                     "final_audio_hash") or ""),
+                 "cue_map_revision": str(result.cue_map.get(
+                     "cue_map_revision") or ""),
+                 "mode": result.mode,
+                 # The text this identity belongs to. The playlist pairs by
+                 # position and then CHECKS THIS, because #1330's lesson is
+                 # that two lists of the same shape, wrongly paired, is a
+                 # silent fault that lights one line and sounds another.
+                 "text": str(source.lines[row["ordinal"] - 1].text)[:200]}
+                for row in producer.occurrence_map(source, result)]
+        else:
+            entry.pop("production_lines", None)
+            entry.pop("cue_map", None)
+        if result.ok:
+            pipeline_log(
+                "lookahead",
+                "the production road %s this round in %.1fs - %d lines, "
+                "revision %s, assembly %s%s"
+                % ("aired" if result.aired else "shadowed",
+                   result.cost_seconds, len(result.cuts),
+                   result.revision[:12], result.assembly_id[:12],
+                   ("" if not result.disagreement.get("comparable") else
+                    ", cue positions differ from the estimate by %.3fs mean / "
+                    "%.3fs worst" % (result.disagreement.get("mean_abs_s") or 0,
+                                     result.disagreement.get("max_abs_s") or 0))))
+        else:
+            pipeline_log(
+                "drop", "the production road refused a ready round: %s"
+                % ("; ".join(result.reasons[:2]) or "no reason recorded")[:280])
+    except Exception as exc:  # noqa: BLE001
+        # A round must never fail to air because the new road fell over.
+        try:
+            pipeline_log("drop", "script production raised and was ignored",
+                         extra="%r" % (exc,))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _production_remember(references: Any) -> None:
+    """Bounded: the last twelve reference sets, for the incident capture."""
+    try:
+        if not isinstance(references, dict):
+            return
+        _PRODUCTION_SEEN.append(dict(references, at=time.time()))
+        del _PRODUCTION_SEEN[:-12]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def production_state(limit: int = 12) -> dict[str, Any]:
+    """The switch, what shadow measured, and the last rounds' references."""
+    if _production_module is None:
+        return {"available": False, "mode": "off",
+                "why": _PRODUCTION_WHY or "script_production is not installed"}
+    try:
+        got = _production_module.state(DATA_DIR, limit=max(1, int(limit)))
+        got["recent_references"] = list(_PRODUCTION_SEEN)[-max(1, int(limit)):]
+        got["mode_file"] = str(data_path("script_production") / "mode")
+        return got
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "mode": "error", "why": "%r" % (exc,)}
+
+
+# THE REFERENCES THE GATE COULD NOT CARRY.
+#
+# `docs/notes/admission-and-playout-2026-09-15.md` names five of them and
+# says where each would come from: script_revision, performer_session,
+# take_id, accepted_cuts and a declared final_audio_hash. A welded round off
+# the burst road has none of them, and that is the road most of the show
+# takes. A round the producer made has all five.
+#
+# `admission_admit_round` is REBOUND rather than edited, the same move
+# `patch_admission.py` made on both transports: Python resolves a global by
+# name at call time, so the one call site inside the burst path goes through
+# this from the moment the module finishes importing, and `patch_admission`'s
+# own text is not touched and its revert still works.
+#
+# In every mode but `on` this is the original function, called with the
+# original arguments.
+if "admission_admit_round" in globals():
+    _admission_admit_round_before_production = admission_admit_round
+
+    def admission_admit_round(clip: Any, rows: Any, length: float,
+                              producer: str = "") -> str:
+        try:
+            held: dict[str, Any] = {}
+            for row in (rows or []):
+                if isinstance(row, dict) and isinstance(row.get("production"),
+                                                        dict) and row["production"]:
+                    held = dict(row["production"])
+                    break
+            if (str(held.get("mode") or "") == "on"
+                    and str(held.get("assembly_id") or "")
+                    and _admission_module is not None):
+                controller = admission_controller()
+                if controller is not None:
+                    for row in (rows or []):
+                        got = dict((row or {}).get("production") or {})
+                        # Only now, and only on this road: the gate's cue
+                        # identity becomes the FROZEN occurrence id instead of
+                        # the uuid the air road mints per airing. Two airings
+                        # of one assembly remain two admissions with two
+                        # playback occurrences - that is minted by the
+                        # controller, not by this.
+                        if got.get("occurrence_id"):
+                            row["occurrence_id"] = str(got["occurrence_id"])
+                        if got.get("cut_id"):
+                            row["cut_id"] = str(got["cut_id"])
+                    candidate = _admission_module.welded_round_candidate(
+                        path=str((clip or {}).get("path") or ""),
+                        sig=str((clip or {}).get("sig") or ""),
+                        rows=list(rows), length=float(length or 0.0),
+                        producer=producer or "_speak_turns_floorless",
+                        script_revision=str(held.get("script_revision") or ""),
+                        assembly_id=str(held.get("assembly_id") or ""),
+                        label=str((clip or {}).get("label") or "")[:120],
+                        meta={"session_id": str(held.get("performer_session")
+                                                or ""),
+                              "take_id": str(held.get("take_id") or ""),
+                              "cue_map_revision": str(
+                                  held.get("cue_map_revision") or ""),
+                              "final_audio_hash": str(
+                                  held.get("final_audio_hash") or ""),
+                              "production": "script_production"})
+                    record = controller.admit(candidate)
+                    return str(record.get("occurrence_id") or "")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                pipeline_log("air", "a produced round could not be admitted "
+                                    "with its references", extra="%r" % (exc,))
+            except Exception:  # noqa: BLE001
+                pass
+        return _admission_admit_round_before_production(clip, rows, length,
+                                                        producer)
+# --- script production (2026-09-15) --- end
 _NABU_SPEECH_ACTIVE: dict[str, Any] = {}
 _NABU_SPEECH_CONTROL = asyncio.Lock()
 _NABU_SPEECH_EPOCH = {"voice": 0, "reply": 0}
@@ -33192,6 +33517,25 @@ async def larder_prepare(entry: dict[str, Any],
             entry["prepared"] = False
         if entry["prepared"]:
             entry.pop("yielded", None)
+            # --- script production (2026-09-15) ---
+            # THE FIRST MOMENT A COMPLETE CONVERSATION EXISTS.
+            #
+            # Every scripted line of this round now has finished audio behind
+            # it, the script is frozen against it, and nothing has aired yet.
+            # That is exactly the note's precondition for freezing a
+            # production script and it is the only place in the file where it
+            # is true.
+            #
+            # `script_plan` and not `plan`: `plan` was re-sorted by performer
+            # a hundred lines above so one actor could run all their lines in
+            # one sitting. The assembler consumes ORIGINAL SCRIPT ORDINALS,
+            # never recording order, and `script_plan` is the untouched copy.
+            #
+            # Off by default, offloaded, paced, and it stands down the moment
+            # `prep_should_stop()` says the air wants the room.
+            await script_production_round(entry, script_plan, voices,
+                                          line_plan)
+            # --- script production (2026-09-15) --- end
             if entry.get("review_ids"):
                 line_review_recorded(entry)
             pipeline_log("lookahead", f"a round is READY to air - "
@@ -83340,16 +83684,46 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # failure has no live-render or per-turn synthesis escape hatch.
         if not ready_takes:
             return []
+        # --- script production (2026-09-15) ---
+        # The frozen occurrence identity for this round, if it has one.
+        # `entry["production_lines"]` is written by the producer only in `on`
+        # mode; in `off` and `shadow` it is absent and everything below adds
+        # an empty dict to each item and changes nothing at all.
+        #
+        # `line_id` is deliberately NOT touched. It is the SCRIPT LEDGER's
+        # name for this row and it is minted per airing; the occurrence id is
+        # the FROZEN name of a line in a revision, and one airing of a round
+        # is not the same thing as the round. Conflating them would make two
+        # airings of one conversation share ledger row identities.
+        _prod_lines = list((ready_meta or {}).get("production_lines") or [])
+        # --- script production (2026-09-15) --- end
         for take in ready_takes:
             clip = take.get("clip") or {}
             name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
             if (not name or not (VOICE_MEDIA_DIR / name).is_file()
                     or (VOICE_MEDIA_DIR / name).stat().st_size <= 0):
                 return []
+            # --- script production (2026-09-15) ---
+            # PAIRED BY POSITION, THEN CHECKED BY TEXT. The takes are sorted
+            # into script order and the production lines were minted from that
+            # same order, so position is the right join - but #1330's lesson
+            # is that two lists of the same shape wrongly paired is a silent
+            # fault that lights one line and sounds another, so the pairing
+            # has to PROVE itself. A row that does not match its text carries
+            # nothing rather than carrying the wrong thing.
+            _prod = {}
+            if len(playlist) < len(_prod_lines):
+                _prod = dict(_prod_lines[len(playlist)] or {})
+                if str(_prod.get("text") or "") != str(take["text"])[:200]:
+                    _prod = {}
+            # --- script production (2026-09-15) --- end
             playlist.append({"who": take["who"], "voice": take["voice"],
                              "chunk": take["text"], "turn_text": take["text"],
                              "ready_clip": dict(clip), "turn_end": True,
                              "line_id": uuid.uuid4().hex,      # #1277
+                             # --- script production (2026-09-15) ---
+                             "production": _prod,
+                             # --- script production (2026-09-15) --- end
                              "vec": {}, "big": False})
         turns = []
         recorded, whole, render_stream = True, True, True
@@ -84537,6 +84911,18 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                      who, caller_name if who == "caller"
                                      else caller2_name if who == "caller2" else ""),
                                  "from": offset, "until": offset + _real,
+                                 # --- script production (2026-09-15) ---
+                                 # The frozen identities, so the admission
+                                 # gate stops recording an empty
+                                 # `script_revision` for every line the
+                                 # station broadcasts. Empty on every round
+                                 # the producer did not make, which today is
+                                 # all of them.
+                                 "production": (
+                                     dict(aired_items[_ti].get("production")
+                                          or {})
+                                     if 0 <= _ti < len(aired_items) else {}),
+                                 # --- script production (2026-09-15) --- end
                                  **_extra_fields})
                     offset += _real
                 # #770: 160 here against 240 everywhere else meant a busy
@@ -108488,6 +108874,119 @@ SCRIPT_REPORTS_DIR = data_path("script_reports")
 _SCRIPT_REPORT_STORE = ScriptReportStore(SCRIPT_REPORTS_DIR)
 
 
+def hour_contract_delivered(since: float, until: float) -> dict[str, Any]:
+    """2026-09-15 (#1164): WHAT THE HOUR PROMISED AGAINST WHAT IT SAID.
+
+    "I am noticing some of the scripts missing entire segments, for example
+    the manager is supposed to call during the manager's segment."
+
+    A report that a segment is missing could not be checked: the incident
+    named the segments that WERE delivered - the scene headings on the page
+    - and nothing said which were scheduled. The station holds both. The
+    sheet's entries for the hour are the promise; the roads that actually
+    put a line on the air in that window are the delivery; and
+    SEGMENT_BRIEF already says, per road, what a segment of that road is
+    supposed to contain and which words it looks for.
+
+    So the answer to "where is the manager's message" becomes a list: what
+    was promised, what was heard, and what was promised and never heard.
+    Measured from the air log by ROUND, which is the road that was
+    dispatching - not `kind`, which is the shape of a row and has never
+    been the road (see the running-order notes)."""
+    out: dict[str, Any] = {"schema": 1, "since": since, "until": until,
+                           "promised": [], "delivered": [], "missing": [],
+                           "available": True}
+    try:
+        # The entries live under the ACTIVE PRESET, not at the top level:
+        # schedule_read() hands back {presets: {name: [...]}} and it is
+        # schedule_public() that resolves which preset the clock is on.
+        # Reading `sheet["slots"]` found nothing and the promise half of
+        # this answer came back empty while the delivery half was right.
+        sheet = schedule_public() or {}
+        slots = [r for r in (sheet.get("slots") or []) if isinstance(r, dict)
+                 and r.get("enabled", True)]
+        promised: list[dict[str, Any]] = []
+        for r in slots:
+            road = str(SCHED_PREP_KIND.get(str(r.get("kind") or ""))
+                       or r.get("kind") or "")
+            if not road:
+                continue
+            promised.append({"road": road,
+                             "label": str(r.get("label") or "")[:80],
+                             "minutes": float(r.get("minutes") or 0),
+                             "wants": str((SEGMENT_BRIEF.get(road) or {}).get("want") or "")})
+        out["promised"] = promised[:40]
+    except Exception as exc:  # noqa: BLE001
+        out["available"] = False
+        out["why"] = "the sheet could not be read: %r" % (exc,)
+        return out
+    heard: dict[str, dict[str, Any]] = {}
+    try:
+        for row in airlog_rows(since, until, quiet=True):
+            if str(row.get("aired") or "") not in AIR_AT_HEARD:
+                continue
+            road = str(row.get("round") or "") or str(row.get("kind") or "")
+            if not road:
+                continue
+            got = heard.setdefault(road, {"road": road, "lines": 0,
+                                          "seconds": 0.0, "first": 0.0,
+                                          "last": 0.0, "seats": set()})
+            got["lines"] += 1
+            got["seconds"] += float(row.get("seconds") or 0)
+            at = float(row.get("air_at") or 0)
+            got["first"] = at if not got["first"] else min(got["first"], at)
+            got["last"] = max(got["last"], at)
+            got["seats"].add(str(row.get("who") or ""))
+    except Exception as exc:  # noqa: BLE001
+        out["available"] = False
+        out["why"] = "the air log could not be read: %r" % (exc,)
+        return out
+    for road, got in heard.items():
+        got["seats"] = sorted(x for x in got["seats"] if x)
+        got["seconds"] = round(float(got["seconds"]), 1)
+        out["delivered"].append(got)
+    out["delivered"].sort(key=lambda r: -float(r.get("lines") or 0))
+    promised_roads: dict[str, int] = {}
+    for p in out["promised"]:
+        promised_roads[p["road"]] = promised_roads.get(p["road"], 0) + 1
+    for road, times in sorted(promised_roads.items()):
+        if road in heard:
+            continue
+        brief = SEGMENT_BRIEF.get(road) or {}
+        # A ROAD THAT HAS NO LINES BY NATURE IS NOT A MISSING SEGMENT.
+        # The first reading of this reported "the sheet asked for record 2
+        # time(s) and not one line of it was heard" - a record slot spins a
+        # record; it was never going to put a spoken line in the air log.
+        # SEGMENT_BRIEF is the station's own list of roads that owe the
+        # hour WORDS, so a road absent from it is skipped rather than
+        # accused. A check that can only ever say yes is not a check, and
+        # one that cries wolf is worse than none.
+        if not brief:
+            continue
+        out["missing"].append({
+            "road": road, "promised_times": times,
+            "wants": str(brief.get("want") or ""),
+            "say": "the sheet asked for %s %d time(s) this hour and not one "
+                   "line of it was heard" % (road, times)})
+    # A road that was heard but whose SEAT never spoke is the other half of
+    # the operator's complaint: the manager has a seat, a voice and a place
+    # in the cast, and in the twenty-four hours to 02:30 on 2026-09-15 it
+    # said nothing at all while its segment ran.
+    for road in sorted(promised_roads):
+        got = heard.get(road)
+        if not got:
+            continue
+        if road in ("manager", "caller", "banter_caller") and road not in (got.get("seats") or []):
+            out["missing"].append({
+                "road": road, "promised_times": promised_roads[road],
+                "wants": str((SEGMENT_BRIEF.get(road) or {}).get("want") or ""),
+                "say": "the %s segment ran (%d line(s)) but the %s seat never "
+                       "spoke in it - the seats heard were %s"
+                       % (road, int(got.get("lines") or 0), road,
+                          ", ".join(got.get("seats") or []) or "none")})
+    return out
+
+
 def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict[str, Any]:
     """Passive incident context from bounded in-memory records, never a repair.
 
@@ -108598,10 +109097,45 @@ def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict
     except Exception as _admission_exc:  # noqa: BLE001
         out["admission"] = {"available": False, "why": "%r" % (_admission_exc,)}
     # # --- broadcast admission (2026-09-15) --- end
+    # --- script production (2026-09-15) ---
+    # Section 5 of the recording note: "Extend the existing incident capture
+    # with references to the relevant script revision, performer session,
+    # accepted cut, assembly and playback occurrence... An unavailable
+    # reference must be reported explicitly."
+    #
+    # Every field is present. One this station does not have is None with
+    # `available: false` and a sentence, never filled in with something
+    # plausible - which for a station in `off` or `shadow` is most of them,
+    # and saying so is the point.
+    try:
+        out["production"] = production_state(8)
+    except Exception as _production_exc:  # noqa: BLE001
+        out["production"] = {"available": False, "why": "%r" % (_production_exc,)}
+    # --- script production (2026-09-15) --- end
+    # 2026-09-15 (#1164): the hour's promise beside its delivery, so a
+    # report that a segment is missing can be checked rather than argued.
+    try:
+        _now = time.time()
+        out["hour_contract"] = hour_contract_delivered(_now - 3600.0, _now + 1.0)
+    except Exception as _hc_exc:  # noqa: BLE001
+        out["hour_contract"] = {"available": False, "why": "%r" % (_hc_exc,)}
     return out
 
 
 # --- broadcast admission (2026-09-15) ---
+@app.get("/api/hour/contract")
+async def hour_contract_api(
+    hours: float = 1.0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-15 (#1164): what the sheet asked for this hour, what was
+    heard, and what was asked for and never heard."""
+    require_read_auth(authorization)
+    now = time.time()
+    span = max(0.1, min(12.0, float(hours or 1.0))) * 3600.0
+    return await asyncio.to_thread(hour_contract_delivered, now - span, now + 1.0)
+
+
 @app.get("/api/admission")
 async def admission_api(limit: int = Query(default=40, ge=1, le=200),
                         authorization: str | None = Header(default=None)) -> Any:
@@ -108627,6 +109161,32 @@ async def admission_api(limit: int = Query(default=40, ge=1, le=200),
 
 
 # --- broadcast admission (2026-09-15) --- end
+# --- script production (2026-09-15) ---
+@app.get("/api/script/production")
+async def script_production_api(limit: int = Query(default=12, ge=1, le=200),
+                                authorization: str | None = Header(default=None)
+                                ) -> Any:
+    """WHAT SHADOW MEASURED.
+
+    How often the new flow produced a complete admissible conversation, how
+    often it refused and with which named refusal, how far its measured cue
+    positions sit from the rescaled estimates the stream path uses today, and
+    what a round cost in seconds. Read-only; it runs nothing."""
+    require_read_auth(authorization)
+    payload = production_state(limit)
+    payload["how_to_switch"] = (
+        "write one line into the mode file: 'off' (the default), 'shadow' to "
+        "produce everything and throw it away while recording what the two "
+        "roads disagreed about, or 'on' to carry the assembled cue map and "
+        "identities to air. Add 'continuous' for the continuous-take road, "
+        "'budget=90' for the seconds one round may spend, 'every=180' for "
+        "the seconds between two productions and 'lines=48' for the longest "
+        "round it will attempt. It is re-read within three seconds; no "
+        "restart.")
+    return payload
+
+
+# --- script production (2026-09-15) --- end
 def _view_num(view: dict[str, Any], *keys: str) -> float:
     for k in keys:
         try:

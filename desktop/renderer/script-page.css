@@ -1177,3 +1177,77 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
 .sp-inbox-details { margin: 6px 0; padding-left: 8px; border-left: 2px solid #35414c; }
 .sp-inbox-details summary { cursor: pointer; min-height: 32px; line-height: 32px; color: #65c7da; }
 .sp-inbox-img { display: block; max-width: 100%; max-height: 260px; margin: 6px 0; border-radius: 6px; background: #000000; }
+
+/* --- #1164: THE DROP-DOWN UNDER THE SCRIPT'S NAME ----------------------
+ *
+ * "I want to be able to tap and hold on the name of the script as being
+ *  run for that particular session and I want a drop-down menu that comes
+ *  down that lets me pick options like complain, mark issue and report
+ *  missing segment."
+ *
+ * It COMES DOWN. The reason sheet and the inbox are modals in the middle
+ * of the glass, which is right for what they are and wrong for this: this
+ * hangs off the heading inside .sp-right, which is already position:
+ * relative, and script-page.js sets its top from the heading's own
+ * offsets - the rule here is only the fallback for a surface with no
+ * geometry yet. Colours are the reason sheet's, because it is the same
+ * road with a different door.
+ *
+ * Every row is 44 px. The operator works this view with a thumb while the
+ * station is playing, and a press-and-hold that lands on a 20 px row is a
+ * press-and-hold that files the wrong report.
+ */
+.sp-scripthead {
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  touch-action: manipulation; cursor: context-menu;
+}
+/* The same two marks the caution button and the report icon wear while a
+   report is in flight, so the name answers the hold the way they do. */
+.sp-scripthead.sp-firing { opacity: .55; }
+.sp-scripthead.sp-fired-bad { color: #ff5d5d; }
+
+.sp-headmenu {
+  position: absolute; z-index: 9; top: 24px; left: 6px;
+  width: min(320px, 88vw); max-height: 72%;
+  display: flex; flex-direction: column; overflow-y: auto;
+  border: 1px solid #35414c; border-radius: 10px;
+  background: #0b1116; color: #dfe7ee;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .55);
+}
+.sp-headmenu-say {
+  padding: 8px 14px; background: #10202a; color: #65c7da;
+  font-weight: 600; border-bottom: 1px solid #24323a;
+}
+.sp-headmenu-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 0 14px;
+  border: 0; border-bottom: 1px solid #101823; background: none; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-headmenu-item.on { color: #65c7da; background: #0e1a21; }
+.sp-headmenu-mark { display: inline-flex; flex: 0 0 auto; color: #8ea0ad; }
+.sp-headmenu-item.on .sp-headmenu-mark { color: #65c7da; }
+.sp-headmenu-mark .pi-icon { width: 20px; height: 20px; }
+.sp-headmenu-text { flex: 1 1 auto; min-width: 0; }
+/* Cancel is the way out, not a choice among the three: quieter, and last. */
+.sp-headmenu-cancel { color: #8ea0ad; border-bottom: 0; }
+
+/* "let him say WHAT is missing" - revealed under its own row, never open
+   by default, and prefilled with nothing. */
+.sp-headmenu-ask { padding: 8px 14px; background: #080d11; border-bottom: 1px solid #101823; }
+.sp-headmenu-ta {
+  width: 100%; box-sizing: border-box; min-height: 68px; padding: 8px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee;
+  font: inherit; resize: vertical;
+}
+.sp-headmenu-ta::placeholder { color: #6f8291; }
+.sp-headmenu-row { display: flex; gap: 8px; margin-top: 8px; }
+.sp-headmenu-dictate {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 0 12px;
+  border: 1px solid #35414c; border-radius: 9px; background: #0b1116; color: #dfe7ee;
+  font: inherit; cursor: pointer;
+}
+.sp-headmenu-dictate .pi-icon { width: 16px; height: 16px; }
+.sp-headmenu-file {
+  flex: 1 1 auto; min-height: 44px; border: 1px solid #65c7da; border-radius: 9px;
+  background: #10202a; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}

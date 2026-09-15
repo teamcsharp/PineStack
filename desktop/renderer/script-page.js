@@ -1499,6 +1499,331 @@
     });
   }
 
+  /* ---- #1164: the drop-down under the script's name --------------- */
+
+  /* C. HOLD THE NAME OF THE SCRIPT AND SAY WHAT IS WRONG WITH IT.
+   *
+   * Inbox #1164, in the operator's own words:
+   *
+   *   "I want to be able to tap and hold on the name of the script as
+   *    being run for that particular session and I want a drop-down menu
+   *    that comes down that lets me pick options like complain, mark
+   *    issue and report missing segment. I am noticing some of the
+   *    scripts missing entire segments, for example the manager is
+   *    supposed to call during the manager's segment."
+   *
+   * THE GESTURE IS THE ONE THIS FILE ALREADY HAS. holdOpen() above -
+   * half a second, eight pixels of travel cancels it, the trailing
+   * synthetic click is swallowed by `pineHeld`, and the desk's
+   * right-click and the WebView's own long-press menu are both turned
+   * into the same answer. The SFX button, the caution button and the
+   * report icon are already on it; the heading is the fourth, and it
+   * cannot fight the other three because none of them is inside it -
+   * the caution button lives in #spScript and the report icon in the
+   * bar on the other half of the screen.
+   *
+   * IT COMES DOWN, it does not arrive. sheetShell() builds a modal with
+   * a backdrop in the middle of the glass, which is right for the reason
+   * sheet and the inbox and wrong here: the operator asked for "a
+   * drop-down menu that comes down", so this hangs off the heading
+   * inside .sp-right (already position: relative) and is placed from the
+   * heading's own offsets. Its `say` line copies sheetShell's four-second
+   * rule so a message on this surface behaves like a message on that one.
+   *
+   * WHAT IT FILES, AND WHERE THAT LANDS. Every choice goes down the
+   * caution button's road and no other: reportGather() for the window,
+   * the motion ring and the view snapshot, then POST /api/script/report
+   * through reportFire(), then the ten-second post-capture and the
+   * picture. Nothing new is invented and nothing is asked of the station
+   * that it does not already answer.
+   *
+   * AND THE CONTEXT IS WRITTEN INTO `reason`, DELIBERATELY. It would
+   * read better as its own field on the view - it is structured, and a
+   * field is easier to query than a sentence. It would also be thrown
+   * away: normalize_view() in script_diagnostics.py says so in its own
+   * docstring - "Unknown fields are excluded by schema" - and the report
+   * store encodes only what that function returns, so a new key stamped
+   * on the view or on its snapshot never reaches the .json or the .md.
+   * `reason` is the one thing that survives whole: app.py leads the
+   * inbox item with it ("Script diagnostic capture: " + reason) and
+   * render_report() prints it under "## Operator report". A field that
+   * is silently discarded looks, from in here, exactly like one that
+   * arrived - so the hour, the script's name, the two scene headings and
+   * the visible block.ord range are written where they will be read.
+   * 1200 characters is the store's cap on it; the sentence below runs to
+   * about three hundred.
+   */
+  var HEADER_MENU_ID = 'spHeadMenu';
+  var HEADER_TEXT_CAP = 160;        /* a scene heading, not a scene */
+  var headerUnwatch = null;         /* PineDismiss's handle on the open menu */
+
+  /* The three the operator named, and Cancel. `ask` is the one that
+     stops to let him say WHAT is missing before anything is filed -
+     "the manager is supposed to call during the manager's segment" is a
+     fact no diagnostic on this page could work out for itself.
+     Icons are Carbon out of the vendored set through folderIcon(), and
+     all four are in pine-icons.js: that is the house rule, and the set
+     is checked before choosing rather than after. */
+  var HEADER_CHOICES = [
+    {kind: 'complain', label: 'Complain', icon: 'c:bullhorn',
+     why: 'Something about this hour is wrong and you want it on the record'},
+    {kind: 'mark issue', label: 'Mark issue', icon: 'c:warning--alt',
+     why: 'Mark this moment: keep the ledger around it for the station to read'},
+    {kind: 'report missing segment', label: 'Report missing segment', icon: 'c:misuse',
+     why: 'A whole segment never happened - say which one', ask: true}
+  ];
+
+  function headerClose() {
+    var menu = el(HEADER_MENU_ID);
+    if (menu) menu.remove();
+    if (headerUnwatch) {
+      try { headerUnwatch(); } catch (err) { /* already gone */ }
+      headerUnwatch = null;
+    }
+    var name = el('spScriptName');
+    if (name) name.setAttribute('aria-expanded', 'false');
+  }
+
+  /* One heading, on one line. */
+  function headerText(node) {
+    return String((node && node.textContent) || '')
+      .replace(/\s+/g, ' ').trim().slice(0, HEADER_TEXT_CAP);
+  }
+
+  /* Where the SCRIPT put this element, as the node already carries it -
+     #1330 writes data-block and data-ord onto every one. Absent on a
+     plan row or a spacer, and absent is said as absent. */
+  function headerOrd(node) {
+    if (!node || !node.getAttribute) return '';
+    var block = node.getAttribute('data-block');
+    var ord = node.getAttribute('data-ord');
+    if (!block && !ord) return '';
+    return String(block || '?') + '.' + String(ord || '?');
+  }
+
+  function headerSeat(node) {
+    try { return node.getBoundingClientRect(); }
+    catch (err) { return {top: 0, bottom: 0, height: 0}; }
+  }
+
+  /* WHICH SEGMENT THE VIEW IS SHOWING, by the segment's own words.
+   *
+   * Two answers, because they are two different questions and on this
+   * page they disagree all the time: the reader scrolls away from the
+   * air (follow stands down, #1282) and then the top of the pane and the
+   * lit line are in different segments. A report that named only one of
+   * them would be answering the wrong one half the time.
+   *
+   *   top_scene   the scene heading the READER is under - the last one
+   *               walked past before the first element the pane is
+   *               actually showing, so a heading scrolled off the top
+   *               still names the segment on screen
+   *   mark_scene  the scene heading above the line that is SOUNDING
+   *               (.sp-now), or nothing when nothing is lit
+   *
+   * DOM order is script order here - the reconciler (#1273) stitches the
+   * canonical list flat - so one walk down the pane answers both, and
+   * the first and last visible block.ord are the range without sorting
+   * anything.
+   */
+  function headerWhere() {
+    var out = {title: '', hour: hourKey, before: beforeKey, top_scene: '',
+      mark_scene: '', block_from: '', block_to: '', visible: 0};
+    var line = el('spScriptHead');
+    if (line) out.title = headerText(line);
+    var pane = el('spScript');
+    if (!pane || !pane.querySelectorAll) return out;
+    var lip = headerSeat(pane);
+    var all = pane.querySelectorAll('.sp-el');
+    var scene = '';
+    for (var i = 0; i < all.length; i += 1) {
+      var node = all[i];
+      var cls = String(node.className || '');
+      if (/(^|\s)sp-scene(\s|$)/.test(cls)) scene = headerText(node);
+      var seat = headerSeat(node);
+      var shown = seat.height > 0 && seat.bottom > lip.top && seat.top < lip.bottom;
+      if (/(^|\s)sp-now(\s|$)/.test(cls)) out.mark_scene = scene;
+      if (!shown) continue;
+      if (!out.top_scene) out.top_scene = scene || '(no scene heading above it)';
+      out.visible += 1;
+      var at = headerOrd(node);
+      if (at) {
+        if (!out.block_from) out.block_from = at;
+        out.block_to = at;
+      }
+    }
+    return out;
+  }
+
+  /* The sentence the inbox leads with. The operator's chosen kind comes
+     FIRST and alone, so "Script diagnostic capture: complain" reads as
+     what it is before anything else is said; his own words about what is
+     missing come second; the evidence follows, semicolon-separated the
+     way the reason sheet already writes its list. */
+  function headerReason(kind, note) {
+    var where = headerWhere();
+    var parts = [String(kind || 'complain')];
+    if (note) parts.push('missing: ' + String(note).slice(0, 400));
+    if (where.title) parts.push('the script: ' + where.title);
+    if (where.hour) {
+      parts.push('hour: ' + where.hour
+        + (where.before ? ' (with ' + where.before + ' before it on the page)' : ''));
+    }
+    parts.push('at the top of the pane: ' + (where.top_scene || 'nothing on screen'));
+    parts.push('at the mark: ' + (where.mark_scene || 'nothing is lit'));
+    parts.push('visible: ' + (where.block_from
+      ? 'block.ord ' + where.block_from + ' to ' + where.block_to
+        + ', ' + where.visible + ' elements'
+      : where.visible + ' elements, none carrying a block.ord'));
+    return parts.join('; ');
+  }
+
+  function headerOpen(name) {
+    var into = name && name.parentNode;
+    if (!into) return null;
+    headerClose();
+
+    var menu = make('div', 'sp-headmenu');
+    menu.id = HEADER_MENU_ID;
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', 'File a report about this script');
+
+    /* sheetShell's say line: same four seconds, same hold. */
+    var sayLine = make('div', 'sp-headmenu-say', '');
+    sayLine.hidden = true;
+    menu.appendChild(sayLine);
+    var sayTimer = 0;
+    function menuSay(text, hold) {
+      if (sayTimer) clearTimeout(sayTimer);
+      sayTimer = 0;
+      sayLine.textContent = String(text || '');
+      sayLine.hidden = !sayLine.textContent;
+      if (!hold && sayLine.textContent) {
+        sayTimer = setTimeout(function () { sayTimer = 0; sayLine.hidden = true; }, 4000);
+      }
+    }
+
+    /* The context is read BEFORE the menu goes, so the report describes
+       the view the operator was looking at when he chose - not the one
+       left behind once the drop-down was taken off it. */
+    function fire(kind, note) {
+      var reason = headerReason(kind, note);
+      headerClose();
+      reportFire(name, reason);
+    }
+
+    function row(cls, icon, label, why) {
+      var b = make('button', 'sp-headmenu-item' + (cls ? ' ' + cls : ''), '');
+      b.type = 'button';
+      b.setAttribute('role', 'menuitem');
+      var mark = make('span', 'sp-headmenu-mark', '');
+      mark.innerHTML = folderIcon(icon, '');
+      if (!mark.innerHTML) mark.textContent = '\u00b7';
+      b.appendChild(mark);
+      b.appendChild(make('span', 'sp-headmenu-text', label));
+      if (why) b.title = why;
+      return b;
+    }
+
+    /* SAY WHAT IS MISSING. The reason sheet's custom row, in the same
+       shape: a box that is revealed rather than always open, a Dictate
+       button that borrows the dot's ear (PineTalkDot.captureNext), and
+       an honest answer on a surface that has no microphone instead of a
+       button that pretends. Nothing is prefilled - the words have to be
+       his, because "the manager is supposed to call during the manager's
+       segment" is not a thing this page could have guessed. */
+    var ask = make('div', 'sp-headmenu-ask');
+    ask.hidden = true;
+    var ta = make('textarea', 'sp-headmenu-ta', '');
+    ta.placeholder = 'what is missing from this hour?';
+    ta.rows = 3;
+    ta.setAttribute('aria-label', 'What is missing from this script');
+    var tools = make('div', 'sp-headmenu-row');
+    var dictate = make('button', 'sp-headmenu-dictate', '');
+    dictate.type = 'button';
+    dictate.innerHTML = folderIcon('c:microphone', '');
+    dictate.appendChild(document.createTextNode('Dictate'));
+    dictate.title = 'Say it: the dot lends its ear and the words land in the box';
+    dictate.addEventListener('click', function () {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') { menuSay('no microphone on this surface'); return; }
+      try {
+        dot.captureNext(function (words) {
+          words = String(words || '').trim();
+          if (!words) { menuSay('nothing was heard'); return; }
+          ta.value = (ta.value ? String(ta.value).replace(/\s+$/, '') + ' ' : '') + words;
+          menuSay('heard: ' + words.slice(0, 80));
+        });
+        menuSay('listening\u2026', true);
+      } catch (err) {
+        menuSay('the dot could not listen: ' + String((err && err.message) || err).slice(0, 80));
+      }
+    });
+    var file = make('button', 'sp-headmenu-file', 'File the report');
+    file.type = 'button';
+    file.addEventListener('click', function () {
+      var own = String(ta.value || '').replace(/\s+/g, ' ').trim();
+      if (!own) { menuSay('say what is missing, or dictate it'); return; }
+      fire('report missing segment', own);
+    });
+    tools.appendChild(dictate);
+    tools.appendChild(file);
+    ask.appendChild(ta);
+    ask.appendChild(tools);
+
+    for (var i = 0; i < HEADER_CHOICES.length; i += 1) {
+      (function (choice) {
+        var b = row('', choice.icon, choice.label, choice.why);
+        b.addEventListener('click', function () {
+          if (!choice.ask) { fire(choice.kind, ''); return; }
+          var open = ask.hidden;
+          ask.hidden = !open;
+          b.setAttribute('aria-expanded', open ? 'true' : 'false');
+          b.classList.toggle('on', open);
+          if (open) { try { ta.focus(); } catch (err) { /* no focus on this surface */ } }
+        });
+        menu.appendChild(b);
+        if (choice.ask) menu.appendChild(ask);
+      })(HEADER_CHOICES[i]);
+    }
+
+    var cancel = row('sp-headmenu-cancel', 'c:close--filled', 'Cancel',
+                     'Close this menu and file nothing');
+    cancel.addEventListener('click', headerClose);
+    menu.appendChild(cancel);
+
+    into.appendChild(menu);
+    /* Under the name, from the name's own offsets: .sp-right is the
+       positioned ancestor, and the heading's height moves with the type
+       setting (#1272's paper and big-type looks both change it). */
+    try {
+      menu.style.top = ((name.offsetTop || 0) + (name.offsetHeight || 0) + 2) + 'px';
+      menu.style.left = (name.offsetLeft || 0) + 'px';
+    } catch (err) { /* no geometry on this surface; the CSS stands */ }
+    name.setAttribute('aria-expanded', 'true');
+
+    /* "if I'm interacting with one of the systems that's a diagnostic,
+       then duck the broadcast audio" - this menu files reports, so it is
+       one. The hold is tied to the menu element, so PineDuck's sweep
+       gives the radio back by itself the moment the menu leaves the
+       page: no close path in here, and no route that tears this view
+       down from outside, can leave the station quiet. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-' + HEADER_MENU_ID, root.PineDuck.REPORT, menu);
+    }
+    /* Tap away and Escape, through the one rule every other pop-up on
+       this page is on. The heading is spared so its own hold re-opens
+       rather than close-then-open, and `open` is answered by the menu's
+       presence rather than by its measured box - a drop-down that has
+       not been laid out yet is still open. */
+    if (root.PineDismiss && typeof root.PineDismiss.watch === 'function') {
+      headerUnwatch = root.PineDismiss.watch(menu, headerClose, [name], function () {
+        return !!el(HEADER_MENU_ID);
+      });
+    }
+    return menu;
+  }
+
   /* ---- #1385: the word search ------------------------------------ */
 
   /* The station does the counting (/api/said/search, #1380); this only
@@ -4483,9 +4808,35 @@
 
     var right = make('div', 'sp-right');     /* 7 */
     var head = make('div', 'sp-scripthead');
+    head.id = 'spScriptName';
     head.appendChild(make('b', '', 'The script'));
     head.appendChild(make('i', 'sp-scriptwhy', ''));
     head.lastChild.id = 'spScriptHead';
+    /* #1164: "I want to be able to tap and hold on the name of the
+       script as being run for that particular session and I want a
+       drop-down menu that comes down". The same holdOpen() the SFX
+       button, the caution button and the report icon are already on -
+       one hold gesture in this file, not four of them drifting apart.
+       A short tap never opens it; a short tap while it IS open puts it
+       away, which is the toggle a menu on a name ought to have. */
+    head.setAttribute('role', 'button');
+    head.setAttribute('tabindex', '0');
+    head.setAttribute('aria-haspopup', 'menu');
+    head.setAttribute('aria-expanded', 'false');
+    head.title = 'Hold this name (or right-click it): complain, mark an issue, report a missing segment';
+    holdOpen(head, function () { headerOpen(head); });
+    head.addEventListener('click', function () {
+      if (head.pineHeld) return;              /* the hold has just answered */
+      if (el(HEADER_MENU_ID)) headerClose();
+    });
+    /* At the desk there is a keyboard, and a role="button" that cannot
+       be worked from it is a button in name only. */
+    head.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+      ev.preventDefault();
+      if (el(HEADER_MENU_ID)) headerClose();
+      else headerOpen(head);
+    });
     right.appendChild(head);
     /* One line, console-shaped, directly under the heading: what is
        happening with the line that is being said. */
@@ -4785,6 +5136,7 @@
       folderClose();                                  /* 2026-09-14 */
       reasonClose();
       inboxClose();
+      headerClose();                                  /* #1164 */
       if (stop) stop();
       stop = null;
       if (beat) clearInterval(beat);
