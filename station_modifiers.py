@@ -74,7 +74,18 @@ KIND_GUEST = "guest"
 KIND_TOPIC = "topic"
 KIND_EVENT = "event"
 KIND_PLOT = "plot"
-KINDS = (KIND_GUEST, KIND_TOPIC, KIND_EVENT, KIND_PLOT)
+# #1179: THE RECORD ON THE DECK, and the half of its talk this is.  A
+# record's introduction and its send-off had no identity of any kind -
+# measured over 48.6 hours of air_log.jsonl, 140 of 140 `intro` rows and
+# 3,354 of 3,386 `interject` rows carry no sid at all - so a link could
+# not be joined to the record it was about, to the segment it aired in,
+# or to the other half of its own pair.  It is a fifth KIND here rather
+# than a second book for the reason the head of this file gives about the
+# other four: the music store keeps the truth about the record, this keeps
+# only the id, the clock and the join.  The key is `<track id>.<part>`,
+# minted by track_talk_segment.part_key.
+KIND_TALK = "talk"
+KINDS = (KIND_GUEST, KIND_TOPIC, KIND_EVENT, KIND_PLOT, KIND_TALK)
 
 # How each kind reads in a sentence a presenter could hear.
 KIND_SAYS = {
@@ -82,7 +93,17 @@ KIND_SAYS = {
     KIND_TOPIC: "on the table",
     KIND_EVENT: "what is going on",
     KIND_PLOT: "the story running",
+    KIND_TALK: "the record on the deck",
 }
+
+# Kinds that are TRACED and never SPOKEN.  A modifier is colour the pair
+# may use; a record's own link is not colour, it is the thing they are
+# about to read out, and handing it back to them as "standing now" would
+# have the pair discussing the introduction instead of introducing the
+# record.  So it rides every ledger and reaches no prompt and no gap
+# filler - which also keeps the #1170 dead-air road from announcing a
+# send-off that has not happened yet.
+SILENT_KINDS = (KIND_TALK,)
 
 # --- the switch -----------------------------------------------------------
 # `<data>/modifiers/mode`, one word, re-read every few seconds, no restart.
@@ -103,6 +124,10 @@ DEFAULT_STANDS_S = {
     KIND_PLOT: 0.0,             # the plot desk's own span governs it
     KIND_TOPIC: 1800.0,
     KIND_EVENT: 5400.0,
+    # #1179: a record is on the deck for as long as it is turning.  The
+    # caller passes the record's own length; this is only the answer for a
+    # record whose length the store does not know.
+    KIND_TALK: 240.0,
 }
 
 # Ceilings.  A ride row names at most this many ids, and the book holds at
@@ -505,7 +530,8 @@ def standing_clause(rows: Iterable[Mapping[str, Any]]) -> str:
     Deliberately short.  A modifier is colour, and a prompt that spends
     four hundred words on colour has stopped being a prompt about a radio
     show."""
-    says = [record_says(r) for r in rows]
+    says = [record_says(r) for r in rows
+            if str((r or {}).get("kind") or "") not in SILENT_KINDS]
     says = [s for s in says if s]
     if not says:
         return ""
@@ -533,6 +559,8 @@ def gap_lines(rows: Iterable[Mapping[str, Any]], cap: int = 3) -> list[dict[str,
         if not mid or not name:
             continue
         kind = str(row.get("kind") or "")
+        if kind in SILENT_KINDS:
+            continue                    # #1179: traced, never spoken
         if kind == KIND_GUEST:
             text = "We have got %s in here with us tonight." % name
         elif kind == KIND_PLOT:

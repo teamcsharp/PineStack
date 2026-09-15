@@ -61,6 +61,7 @@ from crystal_source import clean_repair_prompt_echo, strip_repair_prompt_echo
 from segment_contract import ad_sale_evidence
 from store_retention import retention_sweep, store_sizes
 import station_modifiers                 # #1169/#1170: the modifier desk
+import track_talk_segment                # #1179: a record's talk desk
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
                       director_lessons_clause, director_notes, director_path,
@@ -16834,6 +16835,13 @@ def cupboard_finish_sweep() -> int:
             gone += 1
             continue
         if cupboard_row_complete(kind, row):
+            # #1179b: ...AND IT GOES IN THE QUEUE, not back on the
+            # shelf.  This branch already knows the round is finished
+            # and already logs it; what it has never done is tell the
+            # air anybody asked for it.  The operator pressed "resume
+            # recording" and meant "and be ran" - one action, and this
+            # is the assignment that makes it one.  (RECTALK1179Z9)
+            record_follow_cue(kind, row)
             queue["ids"].remove(rid)
             queue["why"].pop(rid, None)
             queue["done"] = (list(queue.get("done") or [])
@@ -19148,6 +19156,390 @@ def event_road_wants(kind: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return False
+
+
+# --- #1179: A RECORD'S TALK, ON THE SHEET, MADE, IDENTIFIED, PLAYED ---
+#
+# The operator, at the production board, photographing the same row twice:
+# "make sure that this is scheduled to be resolved by the orchestrator.
+# Make sure this is put in an hourly segment and it is made, id'd and
+# given play."
+#
+# #1177 (just above) gave this road a second way to ask - its own shelf -
+# and station IDs began producing within seven minutes.  Record talk did
+# not, and the station said why: "it measures about 160s on this box and
+# the window open right now allows 22s".
+#
+# FOUR THINGS WERE MEASURED BEFORE ANY OF THIS WAS WRITTEN.  The whole
+# account, with the arithmetic, is at the head of track_talk_segment.py;
+# this is the station's side - where the stores are, when the clock ticks,
+# and what airs.  In short:
+#
+#   THE SHEET COULD ALWAYS HAVE NAMED IT.  `track_talk` has been a
+#   first-class schedule kind since #1089 - SCHEDULE_KINDS, SCHED_PREP_KIND,
+#   ALT_PREP_KINDS, out of CANNOT_PREPARE, and coord_upcoming has carried a
+#   `road == "track_talk"` branch that measures one queued record with two
+#   bookends as ONE covered entry.  It is never reached, because
+#   data/schedule.json has active "canonical hour (fits the engine)", and
+#   that preset - unlike the plain "canonical hour" beside it - drops the
+#   one track_talk entry.  What it keeps is two `record` entries an hour.
+#   So a RECORD ENTRY OWES ITS BOOKENDS.  Not a new schedule kind: a new
+#   kind would have to be typed into every preset by hand, and "have the
+#   orchestrator resolve it" is the opposite of that.
+#
+#   THE WINDOW IS NOT THE LEVER; THE RESERVE IS.  160.2s is the p90 of
+#   sixty samples in data/task_costs.json whose newest is SEVENTY-SIX
+#   HOURS old and among which 1,728 of 1,964 lifetime attempts failed.
+#   Priced by its steps instead - one model visit 49.6s, one tint round
+#   81.3s, one rendered line 58.7s - a part is about 190s, and only the
+#   render scales with words.  So no brief makes a part fit an 82s window.
+#   prep_deadline_pick already says what to do about that in as many
+#   words: a deadline is measured against the RESERVE and against a window
+#   merely being OPEN, never against the budget, "and efficiency does not
+#   get to overrule the clock".  NAMING IT ON THE SHEET IS WHAT GIVES IT
+#   ROOM.  There is no second mechanism here, and that is the point.
+#
+#   NOTHING THE PAIR SAY ABOUT A RECORD HAS EVER HAD AN IDENTITY.  Over
+#   48.6 hours of data/air_log.jsonl: 140 of 140 `intro` rows carry no
+#   sid, and 3,354 of 3,386 `interject` rows carry none.  A record's
+#   introduction belongs to no segment, names no record, and cannot be
+#   joined to the send-off that answers it.  So #1169's road is reused as
+#   it stands - station_modifiers.KIND_TALK, one book, one join - and the
+#   part is given a sid, which dj_speak already carries onto the air-log
+#   row and which script_ledger_commit already stamps.
+#
+#   THE SEND-OFF'S ABSENCE IS THE SHELF, AND THE METER COULD NOT HAVE SEEN
+#   IT EITHER WAY.  The air path DOES ask - _record_talk_body takes the
+#   outro of the record just gone and speaks it in the co-host's voice.
+#   What is under it is empty.  But "not one send-off has ever aired" was
+#   never provable, because a send-off goes out as dj_speak("interject",
+#   ...) with no kind of its own and no sid: one row in a bucket of 3,386.
+#   Two things keep that shelf empty for send-offs in particular, and both
+#   are cured below - the one affordable visit always went to the half
+#   that already has a live fallback, and the sweep can destroy a finished
+#   send-off in the seconds between it being owed and it being asked for.
+#
+# BEHIND A SWITCH, DEFAULTING OFF, in the shape of data/modifiers/mode:
+# <data>/record_talk/mode, one word, re-read every few seconds, no restart
+# and no settings round trip.  `off` is the station exactly as it runs
+# tonight; `trace` gives the parts ids and changes nothing that airs;
+# `air` puts the record entry's bookends on the sheet.
+RECORD_TALK_DIR = data_path("record_talk")
+RECORD_TALK_SWITCH = track_talk_segment.TalkSwitch(RECORD_TALK_DIR,
+                                                   clock=time.time)
+_RECORD_TALK_SAID: dict[str, Any] = {"mode": None}
+
+
+def record_talk_mode() -> str:
+    """off | trace | air.  Never raises; an unreadable switch is off.
+
+    Says so in the log when it CHANGES and only then - the rule #1177's
+    switch keeps two hundred lines above, and for its reason: a line every
+    few seconds saying the switch is still off is not a log."""
+    mode = track_talk_segment.MODE_OFF
+    try:
+        mode = RECORD_TALK_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return track_talk_segment.MODE_OFF
+    was = _RECORD_TALK_SAID["mode"]
+    if mode != was:
+        _RECORD_TALK_SAID["mode"] = mode
+        if was is not None:
+            try:
+                pipeline_log("lookahead", "#1179: "
+                             + track_talk_segment.board_say(mode))
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def record_talk_sheet_on() -> bool:
+    """Does a record entry owe its bookends?"""
+    return record_talk_mode() == track_talk_segment.MODE_AIR
+
+
+def record_talk_trace_on() -> bool:
+    """Do the parts get ids that ride?  Changes nothing that airs."""
+    return record_talk_mode() != track_talk_segment.MODE_OFF
+
+
+def record_talk_entry(kind: Any, road: Any, cannot: Any) -> tuple[str, str]:
+    """(road, cannot) for one schedule entry - THE WHOLE SHEET CHANGE.
+
+    Every reader that decides whether an entry expresses demand reads the
+    entry's road and its cannot and nothing else, so this is the only
+    place the derivation has to happen.  Off, the arguments come back
+    unchanged; anything going wrong also returns them unchanged, which is
+    the safe direction here - an entry that owes nothing is the station of
+    tonight."""
+    try:
+        return track_talk_segment.entry_demand(kind, road, cannot,
+                                               record_talk_mode())
+    except Exception:  # noqa: BLE001
+        return (str(road or ""), str(cannot or ""))
+
+
+def record_talk_part_order() -> tuple[str, ...]:
+    """Which half prep_track_talk writes first.
+
+    On, THE SEND-OFF.  The intro has a live fallback on the air path and
+    the send-off has none, so whichever half the one affordable visit
+    reaches is the half that exists - and it should be the half that
+    cannot otherwise happen."""
+    try:
+        return track_talk_segment.part_order(record_talk_mode())
+    except Exception:  # noqa: BLE001
+        return ("intro", "outro")
+
+
+def record_talk_brief(part: Any) -> str:
+    """The word brief the writer is given for this part.
+
+    Off, byte-identical to the clause that has always been in the prompt.
+    On, a send-off is the operator's "one or two lines" - 12 to 32 words,
+    still inside track_talk_text_report's twelve-word floor."""
+    try:
+        return track_talk_segment.brief_sentence(part, record_talk_mode())
+    except Exception:  # noqa: BLE001
+        return "Use 2 to 4 natural spoken sentences and 12 to 70 words."
+
+
+def record_talk_stamp(track: Any, part: Any) -> dict[str, Any]:
+    """The identity written onto a part when it is MADE.
+
+    {} off, so a side dict written with the switch off is what it is
+    today.  It persists for free: track_talk_save writes the whole side to
+    data/track_talk_queue.json and track_read_keep files the whole side
+    into data/track_reads.json, so the id outlives a deploy and outlives
+    the record coming round again."""
+    try:
+        return track_talk_segment.part_stamp(track if isinstance(track, dict)
+                                             else {}, part, time.time(),
+                                             record_talk_mode())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def record_talk_ride(track: Any, part: Any, held: Any = None) -> str:
+    """Identify one part the air path is about to say, and return the SID
+    to hand dj_speak.  "" off, and "" on anything going wrong.
+
+    The id is the modifier id `talk:<track>.<part>`; the sid is derived
+    from the record, the half and the second, so the same airing is the
+    same segment however many roads record it.  Riding it through
+    _MODIFIER_BOOK is what puts it in data/modifier_rides.jsonl and - while
+    the modifier desk is tracing - into the `mods` list that
+    airlog_row_from and script_ledger_commit already stamp on every row.
+
+    The sid alone is the durable half of the join: it lands on the air-log
+    row whatever the modifier desk is set to, and it is DERIVED, so a
+    reader with the record and the second can recompute it.  A failed trace
+    never stops a line going out - #1169's rule, and colour may not take
+    the station off the air."""
+    try:
+        if record_talk_mode() == track_talk_segment.MODE_OFF:
+            return ""
+        plan = track_talk_segment.ride_plan(
+            track if isinstance(track, dict) else {}, part, time.time(),
+            record_talk_mode(), held if isinstance(held, dict) else None)
+        if not plan:
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        with _MODIFIER_LOCK:
+            _MODIFIER_BOOK.raise_(plan["kind"], plan["key"], plan["name"],
+                                  stands_s=plan["stands_s"],
+                                  source=plan["source"])
+            _MODIFIER_BOOK.ride(plan["sid"], [plan["id"]],
+                                round_kind="track_talk",
+                                source=str(plan["part"]))
+    except Exception:  # noqa: BLE001
+        pass                    # the sid still rides; the book can wait
+    return str(plan.get("sid") or "")
+
+
+def record_talk_report() -> dict[str, Any]:
+    """What the board should say about this road, in one place.
+
+    Read-only and cheap: the operator's panel asked "why is this zero" four
+    separate times before #1177, and #1128's lesson was that an instrument
+    nothing reads is a dead wire.  This one is read by
+    /api/coordinator/road/track_talk through coord_road_report."""
+    mode = record_talk_mode()
+    out: dict[str, Any] = {"mode": mode, "switch": str(RECORD_TALK_SWITCH.path),
+                           "sheet_on": mode == track_talk_segment.MODE_AIR,
+                           "trace_on": mode != track_talk_segment.MODE_OFF,
+                           "part_order": list(record_talk_part_order())}
+    try:
+        out["sizing"] = {
+            part: track_talk_segment.sizing(part, mode, prep_room_left(),
+                                            prepared_seconds())
+            for part in ("intro", "outro")}
+    except Exception:  # noqa: BLE001
+        out["sizing"] = {}
+    try:
+        out["say"] = track_talk_segment.board_say(mode)
+    except Exception:  # noqa: BLE001
+        out["say"] = ""
+    return out
+
+
+# --- #1179b: AND THE SAME PRINCIPLE FOR EVERYTHING THE ROOM FINISHES ---
+#
+# "When I resume the recording room for these clips, that means that I
+# also want them to be scheduled by the orchestrator into hourly segments
+# and be ran. So make sure that the orchestrator is keeping track of these
+# elements behind the scenes and making sure that they make it to the air."
+#
+# A record's intro and send-off are one instance.  The 134 incomplete
+# rounds behind the retirement desk's button are another.  The 131
+# finished rounds in the cupboard that have never been heard - 42 of them
+# past the two hours the dial allows, the oldest over two days - are a
+# third.  The whole account is at the foot of track_talk_segment.py; the
+# two things it comes down to are:
+#
+#   RESUMING PUTS IT BACK ON A SHELF, NOT IN A QUEUE.  cupboard_finish_add
+#   queues an id; the keeper works the row; cupboard_finish_sweep drops
+#   the id the moment the row is complete and LOGS that it is finished.
+#   That is the end of the road - the row never moved, and from that
+#   moment it is indistinguishable from the other 458 rows in the
+#   cupboard.  `cue_at` is the one durable mark meaning A PERSON ASKED FOR
+#   THIS, and unheard_pick() reads it FIRST, on every road, with no dial.
+#   The finish road and the cue road have simply never been connected.
+#
+#   AND THERE IS ONE PLACE TO ASK.  The facts are all on the cupboard row
+#   already - when it was made, whether it is finished, whether it was
+#   resumed, whether it is cued, whether the four-hour plan has bound it
+#   to an entry, whether it aired and in which entry of which hour.  What
+#   there was not was anywhere that put them in a line and named the step
+#   an item is stuck at.  It rides on GET /api/cupboard/finish, which is
+#   the desk the operator is already looking at and the only route on the
+#   station that speaks in cupboard ids - extended, not duplicated.
+FINISHED_WORK_DIR = data_path("finished_work")
+FINISHED_WORK_SWITCH = track_talk_segment.FollowSwitch(FINISHED_WORK_DIR,
+                                                       clock=time.time)
+# How many items the desk follows in one answer.  A desk is read by a
+# browser on a timer; a walk of every shelf on every poll is a walk of
+# every shelf on every poll.
+FOLLOW_ROWS_MOST = 60
+
+
+def record_follow_on() -> bool:
+    """Is the desk answering "where did this get to"?  A read either way."""
+    try:
+        return FINISHED_WORK_SWITCH.traces()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def record_follow_cue(kind: Any, row: Any) -> bool:
+    """A round the operator resumed has just been finished - PUT IT IN THE
+    QUEUE, do not merely put it back on the shelf.
+
+    One assignment, and it is the operator's own sentence: "resume
+    recording" and "and be ran" are one action.  `cue_at` survives a save,
+    a restart and a reorder, unheard_pick() honours it ahead of everything
+    else on any road with no two-hour wait, and cupboard_cued() clears it
+    by itself the moment the row is no longer unaired - so this can never
+    pin a round that has gone out.
+
+    Idempotent: a row already cued keeps the moment it was first asked
+    for, because that is what the desk sorts by."""
+    try:
+        if not FINISHED_WORK_SWITCH.cues() or not isinstance(row, dict):
+            return False
+        if float(row.get("cue_at") or 0) > 0:
+            return False
+        row["cue_at"] = time.time()
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        pipeline_log("lookahead", "#1179: a round the operator sent back to "
+                     "the recording room is finished AND CUED - it goes out "
+                     "in the next gap rather than joining the cupboard (%s)"
+                     % str(kind))
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def _record_follow_facts(kind: Any, row: Any, resumed: Any, owed: Any,
+                         now: float) -> dict[str, Any]:
+    """One cupboard row, as track_talk_segment.follow_row wants it."""
+    entry = dialogue_entry(row) or {}
+    rid = retire_id(str(kind), row)
+    blocked = ""
+    try:
+        if (str(_READY_SHELF_WHY.get("kind") or "") == str(kind)
+                and now - float(_READY_SHELF_WHY.get("at") or 0) < 300):
+            blocked = str(_READY_SHELF_WHY.get("why") or "")
+    except Exception:  # noqa: BLE001
+        blocked = ""
+    return {
+        "id": rid, "road": str(kind), "label": retire_kind_label(str(kind)),
+        "seconds": float(entry.get("seconds") or 0),
+        "made_at": float(row.get("at") or entry.get("at") or 0),
+        "complete": bool(cupboard_row_complete(str(kind), row)),
+        "resumed": rid in (resumed or ()),
+        "cued_at": float(row.get("cue_at") or 0),
+        "owed": rid in (owed or ()),
+        "entry": str((row.get("used_by") or {}).get("slot_id") or ""),
+        "aired": int(row.get("aired") or 0),
+        "aired_at": float(row.get("aired_at") or 0),
+        "used_by": row.get("used_by") or {},
+        "blocked": blocked,
+    }
+
+
+def record_follow_desk() -> dict[str, Any]:
+    """MADE AT X, OWED BY Y, AIRED AT W - or the step it is stuck at.
+
+    Every cupboard row that is not finished business: the incomplete ones,
+    the ones the operator resumed, and the finished ones that have never
+    been heard.  Read-only, bounded, and {} when the switch is off, so the
+    desk is exactly what it is today until somebody turns it on."""
+    now = time.time()
+    if not record_follow_on():
+        return {}
+    try:
+        resumed = set((_cupboard_finish_load().get("ids") or []))
+    except Exception:  # noqa: BLE001
+        resumed = set()
+    try:
+        owed = set(commitment_inventory_plan().get("selected_ids") or [])
+    except Exception:  # noqa: BLE001
+        owed = set()
+    seen: set[int] = set()
+    rows: list[dict[str, Any]] = []
+    try:
+        piles: list[tuple[str, list[Any]]] = [("banter", list(_LARDER))]
+        piles += [(str(k), list(v or [])) for k, v in list(_SHELF.items())]
+        for kind, pile in piles:
+            for row in pile:
+                if not isinstance(row, dict) or id(row) in seen:
+                    continue
+                seen.add(id(row))
+                rows.append(track_talk_segment.follow_row(
+                    _record_follow_facts(kind, row, resumed, owed, now), now))
+                if len(rows) >= FOLLOW_ROWS_MOST * 2:
+                    break
+            if len(rows) >= FOLLOW_ROWS_MOST * 2:
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    # What has NOT reached the air first, oldest first inside that - the
+    # desk is a queue, and a round that went out is an answer rather than
+    # a job.  An aired row is still listed, because "aired at W" is half
+    # of the question the operator asked.
+    rows.sort(key=lambda r: (str(r.get("step") or "") == "aired",
+                             -float(r.get("waited_seconds") or 0)))
+    out = track_talk_segment.follow_summary(rows, now)
+    out["rows"] = rows[:FOLLOW_ROWS_MOST]
+    out["mode"] = FINISHED_WORK_SWITCH.mode()
+    out["switch"] = str(FINISHED_WORK_SWITCH.path)
+    return out
+
 
 
 def prep_plan(skip: Any = None) -> dict[str, Any]:
@@ -29993,7 +30385,13 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
                          "started - the words and the voice were both made "
                          "during an earlier record (#869)")
             await dj_speak("intro", track,
-                           line=str(_ahead_intro.get("text") or ""))
+                           line=str(_ahead_intro.get("text") or ""),
+                           # #1179: the part carries the id it was made
+                           # with into the segment it airs in, so this
+                           # introduction can be traced to this record.
+                           # "" off.  (RECTALK1179Z9)
+                           sid=record_talk_ride(track, "intro",
+                                                _ahead_intro))
         except Exception:  # noqa: BLE001
             pass
     else:
@@ -30001,6 +30399,11 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
             "request" if track.get("requested") else "intro",
             track, extra=notes,
             who=seat_stand_in("dj"),            # #1034: whoever is here
+            # #1179: the LIVE introduction is identified too - it is
+            # the one that runs 140 rows out of 140 with no segment at
+            # all today, and it is the one that costs the dead air.
+            # (RECTALK1179Z9)
+            sid=record_talk_ride(track, "intro"),
             note=(" The record is ALREADY turning underneath you — "
                   "you are talking over its opening, so name it and "
                   "get out of the way rather than announcing "
@@ -30036,7 +30439,15 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
                              "record (#869)")
                 await dj_speak("interject", None,
                                line=str(_back.get("text") or ""),
-                               who=str(_back.get("who") or "cohost"))
+                               who=str(_back.get("who") or "cohost"),
+                               # #1179: and the send-off stops being one
+                               # anonymous row in a bucket of 3,386. The
+                               # record it sends off is IN the id, so
+                               # "has a send-off ever aired" becomes a
+                               # question the air log can answer.
+                               # (RECTALK1179Z9)
+                               sid=record_talk_ride(_gone, "outro",
+                                                    _back))
                 await asyncio.sleep(0.8)
     except Exception:  # noqa: BLE001
         pass
@@ -35682,6 +36093,17 @@ def _track_talk_prune() -> int:
         coming = str((_RADIO.get("coming") or {}).get("id") or "")
         if coming:
             allowed.add(coming)         # selected, but not on the needle yet
+        # #1179: ...AND THE RECORD JUST GONE, whose send-off has not
+        # aired yet.  The line above says that about `now`, and by the
+        # time _record_talk_body asks for a send-off the needle is down
+        # on the NEXT record: the one being sent off is neither `now`,
+        # nor `coming`, nor in the queue, so a sweep landing in that gap
+        # destroys a finished, paid-for part one moment before it is
+        # owed.  Two are kept, because a skip can put a third record's
+        # worth of history between them.  Off, untouched.
+        # (RECTALK1179Z9)
+        allowed = track_talk_segment.prune_allow(
+            allowed, _RADIO.get("history") or [], record_talk_mode())
         stale = [k for k, r in list(_TRACK_TALK.items())
                  if now - float((r or {}).get("at") or 0)
                  > PANTRY_BURN_SECONDS]
@@ -35724,7 +36146,10 @@ async def track_talk_write(track: dict[str, Any], part: str) -> str:
     prompt = (
         "Write ONE pre-recorded radio link for one exact music record. "
         f"The record is {identity}. Your job is to {job}. "
-        "Use 2 to 4 natural spoken sentences and 12 to 70 words. Name the "
+        # #1179: a send-off is "one or two lines" - 12 to 32 words,
+        # still above track_talk_text_report's twelve-word floor.  The
+        # intro keeps the brief it has always had.  (RECTALK1179Z9)
+        f"{record_talk_brief(part)} Name the "
         "exact title or artist at least once. Make one specific observation "
         "about the sound, mood, performance, or transition. Do not quote or "
         "invent lyrics. Do not mention a schedule, prompt, database, cache, "
@@ -35831,7 +36256,13 @@ async def prep_track_talk() -> bool:
         for track in track_lookahead():
             if track.get("tape") or not track.get("id"):
                 continue            # the mail writes its own introduction
-            for part in ("intro", "outro"):
+            # #1179: THE SEND-OFF FIRST.  One part per visit, and the
+            # intro is the half that already has a live fallback on the
+            # air path - an expensive one, 50.4s of dead air an airing,
+            # but a fallback.  The send-off has none at all, and not one
+            # has ever been on the shelf.  Off, this is ("intro",
+            # "outro") exactly as it has always been.  (RECTALK1179Z9)
+            for part in record_talk_part_order():
                 held = track_talk_get(track, part)
                 if not track_talk_part_ready(held):
                     want = (track, part, held)
@@ -35876,6 +36307,10 @@ async def prep_track_talk() -> bool:
                 return False
         side.update({"text": text, "who": who,
                      "at": float(side.get("at") or time.time())})
+        # #1179: and it is IDENTIFIED the moment it is made, so the
+        # thing that was written and the thing that aired can be shown
+        # to be the same thing.  {} off.  (RECTALK1179Z9)
+        side.update(record_talk_stamp(track, part))
         row[part] = side                    # keep the paid-for write on refusal
         track_talk_save(True)              # resumable across a deploy
         if (dialogue_tint_wanted() and not side.get("tint_ok")
@@ -38370,7 +38805,14 @@ def schedule_demand_entries(hours: float = 0.0) -> list[dict[str, Any]]:
         kind = str(slot.get("kind") or "")
         road = str(SCHED_PREP_KIND.get(kind) or kind)
         left = float(sched_entry_left() or 0)
-        if (kind and road in ALT_PREP_KINDS and kind not in CANNOT_PREPARE
+        # #1179: ...and the record that has the air RIGHT NOW owes its
+        # send-off, which is the one part nothing else can ever fill.
+        # The future entries come through coord_upcoming and are already
+        # derived; this branch reads the sheet directly and needs the
+        # same reading.  (RECTALK1179Z9)
+        road, _ = record_talk_entry(kind, road, "")
+        if (kind and road in ALT_PREP_KINDS
+                and (kind not in CANNOT_PREPARE or road == "track_talk")
                 and left > 1.0):
             share = min(left, horizon)
             out.append({
@@ -44469,6 +44911,17 @@ def coord_upcoming(window: float = 0.0,
             mins = max(0.25, float(slot.get("minutes") or 3)) * 60.0
             road = str(SCHED_PREP_KIND.get(kind) or kind)
             cannot = CANNOT_PREPARE.get(kind) or ""
+            # #1179: A RECORD ENTRY OWES ITS BOOKENDS.  This is the
+            # only line of the sheet change: a `record` row is skipped
+            # here - "a record is not a round, the needle just drops" -
+            # before any road is derived from it, so the four records an
+            # hour on the live sheet have never expressed demand for the
+            # talk that rides them.  Give the entry the road its talk
+            # already has and the branch directly below measures it the
+            # way it has measured a `track_talk` entry since #1089: one
+            # queued record with two bookends is ONE covered entry.
+            # (RECTALK1179Z9)
+            road, cannot = record_talk_entry(kind, road, cannot)
             if road == "track_talk" and measure:
                 # A track-talk entry is one exact queued MUSIC carrier with
                 # two bookends. One ready pair covers one entry regardless of
@@ -131638,6 +132091,13 @@ async def cupboard_finish_get_api(
     require_read_auth(authorization)
     got = cupboard_finish_state()
     got["cue"] = cupboard_cue_state()
+    # #1179b: ...and where every item of unfinished business actually
+    # got to - made at X, owed by Y, aired at W, or the step it is
+    # stuck at.  On the desk the operator is already looking at and on
+    # the only route that speaks in cupboard ids, rather than a second
+    # route saying the same thing differently.  {} off.
+    # (RECTALK1179Z9)
+    got["follow"] = record_follow_desk()
     # #1383: every unfinished row, not only the queued ones, so the desk
     # can grey them out (#1107) without a second walk of the shelves.
     try:
