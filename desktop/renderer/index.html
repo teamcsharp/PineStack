@@ -44,6 +44,11 @@
   <link rel="stylesheet" href="./clip-doctor.css">
   <!-- 2026-09-15 (#1178): the ladder behind the words "Pine Box". -->
   <link rel="stylesheet" href="./pine-revive.css">
+  <!-- 2026-09-15 (#1191): the orchestrator glass - what the conductor is
+       doing right now, the arithmetic behind every number he is working
+       towards, and the blind spots of the register that feeds it. Mounted
+       at BODY level for the same reason the SFX set is. -->
+  <link rel="stylesheet" href="./orchestrator-glass.css">
   <!-- 2026-09-14: the hot corners - screenshot and draw, export the
        screen video, inspect the last line, replay the last SFX clip. -->
   <link rel="stylesheet" href="./hot-corners.css">
@@ -875,6 +880,29 @@
   <!-- 2026-09-15 (#1178): click "Pine Box" and get the sound back. Last,
        because it drives pineMonitorSay, pineMixer and PineDuck. -->
   <script src="./pine-revive.js"></script>
+  <!-- 2026-09-15 (#1191): THE ORCHESTRATOR GLASS.
+
+       After hot-corners.js, because it asks _cornerAt and _overControl
+       rather than reimplementing either, and after pine-duck.js, because a
+       triangle opening takes a hold. It mounts only a small face that opens
+       it; the face has no clock and makes no request, and the pop-up itself
+       asks the station for nothing at all while it is shut. -->
+  <script src="./orchestrator-glass.js"></script>
+  <script>
+    (function () {
+      var go = function () {
+        try { if (window.PineOrchGlass) window.PineOrchGlass.dot(); }
+        catch (err) {
+          /* The panel below is the whole application; a face that will not
+             go up must never take it down with it. */
+          console.error('[orchestrator glass] the face did not go up', err);
+        }
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', go);
+      } else { go(); }
+    })();
+  </script>
   <!-- #1344: PUT THE RAIL UP HERE TOO.
 
        rail.js has always been device-agnostic and byte-identical to the

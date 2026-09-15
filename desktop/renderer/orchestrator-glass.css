@@ -1,0 +1,389 @@
+/* THE ORCHESTRATOR GLASS (orchestrator-glass.js, #1191).
+
+   The same dark glass as the clip doctor, the talk dot's transcript and the
+   Pine Cam box, so it reads as the station explaining itself rather than as
+   a browser dialog. It floats at BODY level over whatever view is up, it is
+   dragged by its head, and it is sized in px because its position is saved
+   and restored - a box that comes back somewhere else is a box the operator
+   has to find again.
+
+   ONE RULE WORTH STATING because it is easy to undo: everything in here is
+   drawn in a single colour per state and never in an emoji. The icons are
+   Carbon vectors from the injected sprite (pine-icons.js) and inherit
+   currentColor, so a chip that turns amber turns its icon amber with it. */
+
+.og {
+  position: fixed;
+  z-index: 2147483005;
+  display: flex;
+  flex-direction: column;
+  min-width: 320px;
+  min-height: 260px;
+  max-width: 96vw;
+  max-height: 92vh;
+  border: 1px solid #35414c;
+  border-radius: 12px;
+  background: rgba(10, 14, 18, .975);
+  color: #edf3f5;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .62);
+  font: 13px/1.5 Inter, "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* The mood is on the box, not only on the chip: a two-pixel edge is
+   readable from across the room, which is the whole point of the face. */
+.og[data-mood="angry"] { border-color: #b4423a; }
+.og[data-mood="anxious"] { border-color: #b8873a; }
+.og[data-mood="rushing"] { border-color: #b8873a; }
+.og[data-mood="thinking"] { border-color: #3f7f96; }
+.og[data-mood="pleased"] { border-color: #3f8f63; }
+
+/* ------------------------------------------------------------- the head */
+
+.og-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  border-bottom: 1px solid #35414c;
+  background: rgba(16, 22, 28, .9);
+  cursor: grab;
+  touch-action: none;          /* the drag is ours, not the scroller's */
+  user-select: none;
+}
+.og-head:active { cursor: grabbing; }
+.og-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: #8ea0ad;
+  padding-top: 3px;
+}
+.og-state {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  margin-left: 4px;
+  padding-top: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* GLYPHY, TOP RIGHT. A real button, so hot-corners' own _overControl
+   already answers true over him and a press on his face can never be taken
+   for a corner gesture. The monospace is load-bearing: the sprite is drawn
+   on a character grid and a proportional font shears his head off. */
+.og-avatar {
+  flex: 0 0 auto;
+  margin-left: auto;
+  background: rgba(6, 9, 12, .8);
+  border: 1px solid #2b353f;
+  border-radius: 8px;
+  padding: 3px 5px;
+  cursor: pointer;
+  color: #9fd6e8;
+}
+.og-avatar:hover { border-color: #4a5a68; }
+.og-avatar:active { transform: translateY(1px); }
+.og-face {
+  margin: 0;
+  font: 8px/1.02 "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+  white-space: pre;
+  letter-spacing: 0;
+}
+.og[data-mood="angry"] .og-avatar { color: #e3796f; }
+.og[data-mood="anxious"] .og-avatar,
+.og[data-mood="rushing"] .og-avatar { color: #e0ad63; }
+.og[data-mood="pleased"] .og-avatar { color: #74c493; }
+
+.og-x {
+  flex: 0 0 auto;
+  background: none;
+  border: 0;
+  color: #8ea0ad;
+  cursor: pointer;
+  padding: 2px;
+  line-height: 0;
+}
+.og-x:hover { color: #edf3f5; }
+
+/* What he is saying, why, or the brief - stepped by pressing his face. */
+.og-say {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 7px 12px;
+  border-bottom: 1px solid #222b33;
+  background: rgba(14, 19, 25, .8);
+}
+.og-say-what {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: #6f8090;
+}
+.og-say-text { color: #cfe3ea; }
+
+/* ------------------------------------------------------------- the body */
+
+.og-main {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 8px 12px;
+}
+
+/* ---------------------------------------------------------- the triangle */
+
+.og-fold { margin: 2px 0; }
+.og-tri {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: #d7e5ec;
+  font: inherit;
+  padding: 5px 6px;
+  cursor: pointer;
+}
+.og-tri:hover { background: rgba(255, 255, 255, .045); }
+/* THE TRIANGLE ITSELF. There is no c:caret--down in the 114 vendored
+   Carbon icons, so the right-facing caret is turned ninety degrees when the
+   fold opens - which is what a disclosure triangle does anyway, and it
+   animates rather than swapping glyph. */
+.og-tri .og-i {
+  flex: 0 0 auto;
+  display: inline-flex;
+  line-height: 0;
+  color: #7f95a4;
+  transition: transform .12s ease;
+}
+.og-fold.open > .og-tri .og-i { transform: rotate(90deg); color: #9fd6e8; }
+.og-tri-title { flex: 1 1 auto; min-width: 0; }
+.og-tri-sum {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #7f95a4;
+  white-space: nowrap;
+}
+.og-body {
+  padding: 2px 6px 8px 22px;
+  border-left: 1px solid #222c34;
+  margin-left: 11px;
+}
+
+/* A pass that is open right now, and a road with a saturated multiplier on
+   it, are the two things worth spotting without reading. */
+.og-fold.og-live > .og-tri { background: rgba(63, 127, 150, .16); }
+.og-fold.og-pinned > .og-tri-title,
+.og-fold.og-pinned > .og-tri .og-tri-title { color: #e0ad63; }
+.og-fold.og-blindfold > .og-tri { color: #b8a06a; }
+
+/* ------------------------------------------------------------ the pieces */
+
+.og-lead {
+  color: #bed3dc;
+  margin: 4px 0 8px;
+}
+.og-sub {
+  margin: 10px 0 4px;
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: #6f8090;
+}
+.og-quiet {
+  color: #8296a3;
+  font-style: italic;
+  margin: 4px 0;
+}
+.og-pair {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 1px 0;
+}
+.og-pair-k { flex: 1 1 auto; color: #8ea0ad; min-width: 0; }
+.og-pair-v {
+  flex: 0 0 auto;
+  color: #edf3f5;
+  font-variant-numeric: tabular-nums;
+}
+
+.og-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #35414c;
+  border-radius: 999px;
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 18px;
+  color: #a9bcc7;
+  white-space: nowrap;
+}
+.og-kind { border-color: #2f4854; color: #86b8cb; }
+.og-more { border-color: #4a4230; color: #c9ab72; }
+.og-count { border-color: #2b353f; color: #8ea0ad; }
+.og-note { border: 0; color: #7f95a4; padding: 0; font-size: 11px; }
+.og-bad { border-color: #6d3a35; color: #e3796f; }
+.og-factor { border-color: #4a4230; color: #e0ad63; font-variant-numeric: tabular-nums; }
+.og-mood { border-color: #2f4854; color: #86b8cb; }
+.og-mood-angry { border-color: #6d3a35; color: #e3796f; }
+.og-mood-anxious, .og-mood-rushing { border-color: #5c4a2c; color: #e0ad63; }
+.og-mood-pleased { border-color: #2f5a41; color: #74c493; }
+
+.og-step {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 2px 0;
+  flex-wrap: wrap;
+}
+.og-step-text { flex: 1 1 200px; color: #cfe3ea; min-width: 0; word-break: break-word; }
+.og-sys {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 2px 0;
+  flex-wrap: wrap;
+}
+.og-sys .og-i { line-height: 0; color: #6f8090; }
+.og-sys-name { color: #cfe3ea; }
+
+/* ------------------------------------------------- the arithmetic chain */
+
+.og-link {
+  border-left: 2px solid #2f4854;
+  padding: 4px 0 6px 8px;
+  margin: 4px 0;
+}
+/* AT ITS CAP. A factor pinned at its ceiling for 187 hours carries no
+   information, and noticing that is the most useful thing on this screen -
+   so it is the loudest thing in the fold. */
+.og-link.og-capped { border-left-color: #c08a3a; background: rgba(192, 138, 58, .07); }
+.og-link-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.og-link-name { color: #edf3f5; }
+.og-link-sum {
+  font-variant-numeric: tabular-nums;
+  color: #9fd6e8;
+  margin: 2px 0;
+}
+.og-cap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #e0ad63;
+  font-size: 11px;
+  letter-spacing: .05em;
+}
+.og-cap .og-i { line-height: 0; }
+.og-rule { color: #8ea0ad; font-size: 12px; margin: 2px 0 4px; }
+.og-input {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 0 0 0 10px;
+}
+.og-input-k { flex: 1 1 auto; color: #7f95a4; font-size: 12px; min-width: 0; }
+.og-input-v {
+  flex: 0 0 auto;
+  color: #cfe3ea;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Asked against granted, side by side, because the gap between them is the
+   thing the operator is looking for. */
+.og-two { display: flex; gap: 8px; }
+.og-col {
+  flex: 1 1 0;
+  border: 1px solid #2b353f;
+  border-radius: 8px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+.og-col-h {
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: #6f8090;
+}
+.og-col-v {
+  font-size: 16px;
+  color: #edf3f5;
+  font-variant-numeric: tabular-nums;
+}
+.og-col-s { font-size: 11px; color: #8ea0ad; }
+
+.og-refuse {
+  border-left: 2px solid #6d5a35;
+  padding: 4px 0 4px 8px;
+  color: #d9c79c;
+}
+
+.og-warn {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  border: 1px solid #5c4a2c;
+  border-radius: 8px;
+  background: rgba(192, 138, 58, .09);
+  padding: 6px 8px;
+  margin: 4px 0 8px;
+  color: #dcc189;
+}
+.og-warn .og-i { flex: 0 0 auto; line-height: 0; padding-top: 2px; }
+
+.og-blind { padding: 3px 0; }
+.og-blind-g { display: block; color: #cfe3ea; }
+.og-blind-n {
+  display: block;
+  color: #7f95a4;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+/* THE WAY IN. A small face parked out of the way, dragged where the
+   operator wants it, right-clicked (or long-pressed) to put it away. It has
+   no clock and makes no request - "a closed pop-up must ask for nothing at
+   all" has to include the thing that opens it. */
+.og-dot {
+  position: fixed;
+  z-index: 2147483004;
+  background: rgba(10, 14, 18, .9);
+  border: 1px solid #2b353f;
+  border-radius: 10px;
+  padding: 4px 6px;
+  cursor: pointer;
+  color: #9fd6e8;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, .45);
+  touch-action: none;
+  line-height: 0;
+}
+.og-dot:hover { border-color: #4a5a68; }
+.og-dot:active { transform: translateY(1px); }
+
+/* THE TABLET. The kiosk runs this file byte-identical, on a narrower screen
+   and under a thumb rather than a pointer, so the touch targets grow and the
+   two-column comparison stacks rather than squeezing to nothing. */
+@media (max-width: 760px) {
+  .og { min-width: 280px; max-width: 98vw; }
+  .og-tri { padding: 9px 6px; }
+  .og-x { padding: 6px; }
+  .og-two { flex-direction: column; }
+}

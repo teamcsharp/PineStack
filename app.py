@@ -12640,6 +12640,9 @@ def _director_stamp(engine: str) -> None:
 
 async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
     """THE seam. Add an engine here and the rest of the system inherits it."""
+    # 2026-09-15 (#1191): ...and therefore the one place every render can
+    # be recorded against the keeper that asked for it, by engine name.
+    orch_used("the voice engine", str(engine)[:40])
     if engine == "piper":
         return await asyncio.wait_for(_piper_synthesize(text, voice), 90), "wav"
     if engine == "ha_file":
@@ -26956,12 +26959,413 @@ def avoid_reruns() -> str:
     return out
 
 
+# =====================================================================
+# 2026-09-15 (#1191): THE ORCHESTRATOR'S OWN REGISTER.
+#
+# THE ASK.  "I want to be able to access a pop-up that gives me advanced
+# information about how the orchestrator is behaving in the background...
+# a task list in order of tasks that are actively being pursued by the
+# orchestrator and how they're being handled... what supportive systems
+# are being summoned and triggered by the orchestrator as he's using and
+# managing tools."
+#
+# WHY NONE OF THAT COULD BE DRAWN.  Three things were measured on this
+# file on 2026-09-15 before a line of this was written:
+#
+#   1. NO LOOP ON THIS STATION COUNTS ITS OWN ACTIONS, and the process
+#      exposed no boot stamp.  "How many times has this keeper acted
+#      since boot" was unanswerable for every one of the SEVENTY-FIVE
+#      timer loops in this file (counted: functions containing both a
+#      `while` and an `await asyncio.sleep`).  Not "about forty" - 75.
+#      A surface could show a keeper's last say and nothing else; it
+#      could not tell a keeper that has run four thousand times from one
+#      whose task died at boot and has run once.  That distinction is the
+#      whole of "is this thing working".
+#
+#   2. THE ORCHESTRATOR'S NARRATION OF ITS OWN REASONING GOES NOWHERE.
+#      Every "the coordinator closed 08:00 - last half hour lost 431s of
+#      air across 8 gap(s)" line goes to pipeline_log, which appends to
+#      _RADIO["pipeline"] and then does `del log[:-240]`.  A 240-entry
+#      in-memory ring, never persisted, shared with the whole voice
+#      machine, and on a live station it rotates in minutes.  The single
+#      most valuable prose the station writes about itself has a lifetime
+#      of minutes and appears in no file anywhere.
+#
+#   3. THERE IS NO RECORD ANYWHERE OF WHICH SUPPORTING SYSTEM A GIVEN
+#      PIECE OF WORK SUMMONED.  call_ollama counts its own jobs,
+#      synthesize knows its engine, crystal_tint knows it ran - but
+#      nothing joins "the larder keeper was working" to "and it called
+#      the writing model, and then the voice engine".  So "what is being
+#      summoned" had no answer at all, in any store, at any moment.
+#
+# WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT.
+#
+# It is a BOUNDED IN-MEMORY REGISTER.  One dict per instrumented keeper
+# holding a counter and the turn currently open, and one bounded deque
+# holding the tail of turns that actually DID something.  That is all.
+#
+# IT WRITES NOTHING TO DISK, EVER, ON ANY PATH.  This is not caution for
+# its own sake.  The single largest source of dead air measured on this
+# station on 2026-09-14 was an fsync-bearing store write called from the
+# event loop: the loop stopped, the page stopped being fed, and the show
+# went silent while every server reading stayed green.  A telemetry
+# register that took a lock or touched a file would be the next one, and
+# it would do it while the operator was watching the very screen meant to
+# explain the silence.  So the honest trade is made openly: this register
+# lives and dies with the process.  /api/orchestrator/glass ships the
+# boot stamp so the pop-up can say, in words, exactly how far back its
+# memory goes - "since 03:12, 4h 18m ago" - instead of implying it goes
+# back forever.
+#
+# WHAT A TURN COSTS.  orch_turn: a dict lookup, three stores and one
+# ContextVar.set.  orch_used: one ContextVar.get and two dict lookups.
+# orch_step: those, plus an append to a list capped at ten.  Nothing here
+# allocates unboundedly, takes a lock, awaits, or can raise into its
+# caller - every entry point is wrapped, because a meter that can break
+# the thing it measures is worse than no meter.
+#
+# WHY A ContextVar AND NOT A GLOBAL.  Only one coroutine runs at a time
+# on this loop, but they interleave at every `await`, so a plain global
+# "who is running" would attribute the voice engine's call to whichever
+# keeper happened to be resumed.  asyncio gives every Task its own copy
+# of the context, so a keeper that sets _ORCH_WHO once owns that name for
+# everything it awaits - and a task it spawns with fire_and_forget
+# INHERITS the name, which is why a commission fired off by the
+# coordinator is correctly recorded as the coordinator summoning the
+# commission desk before the commission claims a row of its own.
+# asyncio.to_thread copies the context too, so work handed to a worker
+# thread is still attributed.
+#
+# HONESTY ABOUT COVERAGE IS PART OF THE FEATURE.  ORCH_SEEN, ORCH_BLIND
+# and ORCH_DOORS below are shipped to the pop-up verbatim.  This operator
+# has been bitten repeatedly by surfaces that implied sight they did not
+# have - "a check that can only print one answer is the artifact" - so
+# the pop-up names its blind spots on its own face rather than drawing an
+# empty list and letting him conclude the station is idle.
+# =====================================================================
+
+ORCH_REG_TAIL = 240          # turns that DID something, newest last
+ORCH_REG_SYSTEMS = 12        # supporting systems recorded per turn
+ORCH_REG_STEPS = 10          # narration lines recorded per turn
+
+# THE BOOT STAMP THAT DID NOT EXIST.  Module import time is process
+# start; everything in the register is relative to this, and the pop-up
+# prints it so "42 turns" can be read as a rate rather than a number.
+_ORCH_BOOT: float = time.time()
+
+# Which keeper the currently-running coroutine belongs to.  Empty for an
+# HTTP handler or anything else outside an instrumented loop, and work
+# reached from there is deliberately NOT attributed to anybody - a wrong
+# attribution is worse than a missing one.
+_ORCH_WHO: ContextVar[str] = ContextVar("orch_keeper", default="")
+
+_ORCH_KEEPERS: dict[str, dict[str, Any]] = {}
+_ORCH_TAIL: collections.deque = collections.deque(maxlen=ORCH_REG_TAIL)
+
+# WHAT THIS REGISTER CAN SEE.  (name, what it is, how often it wakes).
+# Fifteen timer loops and four orchestration ticks, chosen because they
+# are the ones that decide what the station makes and airs.  Every one is
+# stamped at the top of every pass.
+ORCH_SEEN: tuple[tuple[str, str, str], ...] = (
+    ("coordinator", "closes the half hour and writes the work order",
+     "every COORD_TICK"),
+    ("coord_plan", "turns the shortfall into a priced, ordered plan",
+     "at each half hour, and every 120s inside it"),
+    ("pantry_orders_tick", "turns the plan's seconds into countable orders",
+     "fired from the coordinator's tick"),
+    ("pantry_keeper", "builds the finished-audio buffer", "every 6s"),
+    ("larder_keeper", "writes the next round when the desk is free",
+     "every 3s"),
+    ("dead_air_watch", "the silence ceiling and the restart ladder",
+     "every 20s"),
+    ("gap_keeper", "records and closes measured holes in the air",
+     "every 60s"),
+    ("air_watch", "the reinitialise ladder", "every AIR_WATCH_EVERY"),
+    ("needle_watch", "keeps the playhead honest", "every 4s"),
+    ("talk_watch", "decides when the pair should speak", "an adaptive tick"),
+    ("box_delivery_watch", "proves delivered audio was actually heard",
+     "every BOX_WATCH_TICK"),
+    ("switchboard_keeper", "the callers' road", "every 20s"),
+    ("sfx_guy_watch", "fills dead air with the SFX guy",
+     "every SFX_WATCH_TICK"),
+    ("airlog_keeper", "writes down what reached the air", "every AIRLOG_TICK"),
+    ("screenplay_keeper", "keeps the script ahead of the show",
+     "every SCREENPLAY_TICK"),
+    ("storage_keeper", "holds the disk allowance", "every STORAGE_SWEEP"),
+    ("reflection_clock", "writes down what the station learned",
+     "every REFLECTION_TICK"),
+    ("workshop_tick", "improves banter while the station is paused",
+     "fired from the coordinator when paused"),
+    ("reel_tick", "cuts the resume reel",
+     "fired from the coordinator when paused"),
+)
+
+# WHAT IT CANNOT SEE, NAMED.  Seventy-five timer loops were counted in
+# this file; fifteen of them are stamped above.  These are the sixty that
+# are not, listed as groups so the pop-up can print a true sentence
+# rather than a reassuring one.  A keeper absent from this panel is not
+# idle - it is UNMEASURED, and those are different things.
+ORCH_BLIND: tuple[tuple[str, str], ...] = (
+    ("the engines and their health",
+     "one_engine_keeper, xtts_idle_clock, comfy_doctor, comfy_idle_clock, "
+     "resource_clock, gpu_temp_clock - these keep the models alive; the "
+     "register sees the calls they serve, not their own passes"),
+    ("the box and the wire",
+     "_box_vigil, _box_hold_drain_soon, hold_shelf_groomer, "
+     "_nabu_link_ladder, _deaf_box_restart, page_recovery_start, "
+     "_paged_settle, satellite_watch, nabu_music_keeper"),
+    ("the show's own clocks",
+     "_radio_loop, _dj_loop, dj_show, _dj_speak_floorless, caller_clock, "
+     "ad_clock, news_clock, dj_news, topic_cooker, entry_fill_out, "
+     "continuity_clock, episode_clock, _speak_turns_floorless"),
+    ("the rewrite roads",
+     "tint_recovery_clock, _tint_turn_yields, crystal_rhyme_clock, "
+     "response_bank_clock, regrade_once, line_review_recovery_loop"),
+    ("the rest",
+     "retention_clock, records_warmer, dialogue_watchdog, onair_watchdog, "
+     "_deep_repair, _pulse_beat, _gc_freeze_clock, speakbox_index_clock, "
+     "sfx_levels_keeper, sfx_arrivals_keeper, sfx_keeper, sfx_video_cycle, "
+     "_sfxguy_ready_clock, ad_studio_clock, mx_ad_clock, heat_clock, "
+     "upstairs_clock, tape_watch, paper_clock, suno_catalog_refresh, "
+     "alt_generate_job, regenerate_job, recast_job, _torrent_talk"),
+)
+
+# WHERE A SUMMONED SYSTEM IS RECORDED.  Seven doors, named here so the
+# pop-up can say so.  Work that reaches a supporting system by any other
+# road is NOT counted - which is why this list is shipped rather than
+# hidden.  The first three were chosen because each is a genuine seam
+# every caller must pass through, and none of them is hot: call_ollama
+# spends seconds to minutes in ollama, synthesize seconds, crystal_tint
+# minutes.  A dict bump beside any of those is unmeasurable.
+ORCH_DOORS: tuple[tuple[str, str], ...] = (
+    ("the writing model", "call_ollama - every model visit, by model name"),
+    ("the voice engine", "synthesize - every render, by engine name"),
+    ("the crystal", "crystal_tint - every second-pass rewrite"),
+    ("the commission desk",
+     "pantry_orders_tick, when the coordinator fires it"),
+    ("the planner", "coord_plan, when the coordinator calls it"),
+    ("the banter workshop", "workshop_tick, when the coordinator fires it"),
+    ("the resume reel", "reel_tick, when the coordinator fires it"),
+)
+
+
+def _orch_shut(row: dict[str, Any], now: float) -> None:
+    """Close the turn this keeper had open and, IF IT DID ANYTHING, put
+    it on the tail.
+
+    An idle pass is deliberately not kept.  larder_keeper wakes every
+    three seconds and needle_watch every four; keeping every one of those
+    would push a 240-deep tail through in about four minutes and bury the
+    coordinator's half-hourly reasoning under thousands of rows saying
+    "woke, nothing to do".  The counter still moves, so "how many times
+    has it acted" is answered whether or not the pass is on the tail -
+    and the tail becomes what the operator actually asked for: the list
+    of things being PURSUED, in the order they were pursued."""
+    try:
+        open_at = float(row.get("open_at") or 0)
+        if not open_at:
+            return
+        row["open_at"] = 0.0
+        steps = list(row.get("turn_steps") or [])
+        systems = [dict(v) for v in (row.get("turn_systems") or {}).values()]
+        if not steps and not systems:
+            return
+        _ORCH_TAIL.append({
+            "keeper": str(row.get("name") or ""),
+            "turn": int(row.get("turns") or 0),
+            "at": round(open_at, 3),
+            "ms": max(0, int((now - open_at) * 1000)),
+            "say": str(row.get("say") or ""),
+            "steps": steps,
+            "systems": systems,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def orch_turn(name: str, what: str = "", claim: bool = True) -> None:
+    """A keeper has woken and is beginning a pass.
+
+    `claim` decides whether this name owns the context from here on.  A
+    loop running in its own asyncio Task claims it; a synchronous helper
+    called from inside another keeper's pass (coord_plan, inside the
+    coordinator) does NOT, because taking the name would mean everything
+    the coordinator did after the plan was filed under the planner."""
+    try:
+        now = time.time()
+        row = _ORCH_KEEPERS.get(name)
+        if row is None:
+            row = {"name": name, "turns": 0, "first_at": now, "at": now,
+                   "open_at": 0.0, "say": "", "systems": {},
+                   "turn_systems": {}, "turn_steps": [], "acted": 0}
+            _ORCH_KEEPERS[name] = row
+        _orch_shut(row, now)
+        row["turns"] = int(row.get("turns") or 0) + 1
+        row["at"] = now
+        row["open_at"] = now
+        if what:
+            row["say"] = str(what)[:160]
+        row["turn_systems"] = {}
+        row["turn_steps"] = []
+        if claim:
+            _ORCH_WHO.set(str(name))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def orch_used(system: str, note: str = "") -> None:
+    """A supporting system was summoned by whoever is running now.
+
+    Silently does nothing outside an instrumented keeper's pass.  That is
+    the honest behaviour: an HTTP handler that calls the voice engine is
+    not the orchestrator doing it, and filing it under the last keeper to
+    run would be a lie the pop-up would then draw as fact."""
+    try:
+        who = _ORCH_WHO.get("")
+        if not who:
+            return
+        row = _ORCH_KEEPERS.get(who)
+        if row is None or not row.get("open_at"):
+            return
+        bag = row.get("turn_systems")
+        if bag is None:
+            return
+        key = str(system)[:48]
+        got = bag.get(key)
+        if got is None:
+            if len(bag) >= ORCH_REG_SYSTEMS:
+                return
+            got = {"system": key, "calls": 0, "note": ""}
+            bag[key] = got
+        got["calls"] = int(got.get("calls") or 0) + 1
+        if note:
+            got["note"] = str(note)[:80]
+        life = row.get("systems")
+        if life is not None:
+            life[key] = int(life.get(key) or 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def orch_step(kind: str, text: str, has_extra: bool = False) -> None:
+    """One line of the orchestrator's narration, attached to the pass
+    that produced it.
+
+    This is the cure for finding 2.  pipeline_log calls it, so every
+    sentence the station already writes about its own reasoning is now
+    ALSO filed against the keeper's pass that wrote it - and survives on
+    the tail rather than only in a 240-row ring shared with the whole
+    voice machine that rotates in minutes.  It is the same words; what is
+    new is that they have an owner and an order."""
+    try:
+        who = _ORCH_WHO.get("")
+        if not who:
+            return
+        row = _ORCH_KEEPERS.get(who)
+        if row is None or not row.get("open_at"):
+            return
+        steps = row.get("turn_steps")
+        if steps is None or len(steps) >= ORCH_REG_STEPS:
+            return
+        steps.append({"kind": str(kind)[:24], "text": str(text)[:200],
+                      "has_extra": bool(has_extra),
+                      "at": round(time.time(), 3)})
+        row["acted"] = int(row.get("acted") or 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def orch_register_state(most: int = 48) -> dict[str, Any]:
+    """The register, composed for a surface.  A pure read: no clock is
+    moved, nothing is recomputed, nothing is written."""
+    now = time.time()
+    keepers: list[dict[str, Any]] = []
+    live: list[dict[str, Any]] = []
+    for row in list(_ORCH_KEEPERS.values()):
+        try:
+            turns = int(row.get("turns") or 0)
+            at = float(row.get("at") or 0)
+            first = float(row.get("first_at") or 0)
+            span = max(1.0, now - first)
+            life = row.get("systems") or {}
+            keepers.append({
+                "name": str(row.get("name") or ""),
+                "turns": turns,
+                "acted": int(row.get("acted") or 0),
+                "at": round(at, 3),
+                "quiet_for": round(max(0.0, now - at), 1) if at else None,
+                "per_minute": round(turns / span * 60.0, 2),
+                "say": str(row.get("say") or ""),
+                "systems": sorted(
+                    [{"system": k, "calls": int(v)} for k, v in life.items()],
+                    key=lambda one: -int(one["calls"]))[:ORCH_REG_SYSTEMS],
+            })
+            if row.get("open_at"):
+                steps = list(row.get("turn_steps") or [])
+                systems = [dict(v) for v in
+                           (row.get("turn_systems") or {}).values()]
+                if steps or systems:
+                    live.append({
+                        "keeper": str(row.get("name") or ""),
+                        "turn": turns,
+                        "at": round(float(row.get("open_at") or 0), 3),
+                        "ms": max(0, int(
+                            (now - float(row.get("open_at") or now)) * 1000)),
+                        "say": str(row.get("say") or ""),
+                        "steps": steps, "systems": systems, "open": True})
+        except Exception:  # noqa: BLE001
+            continue
+    keepers.sort(key=lambda one: -float(one.get("at") or 0))
+    live.sort(key=lambda one: -float(one.get("at") or 0))
+    tail = list(_ORCH_TAIL)[-max(1, int(most)):][::-1]
+    return {
+        "boot_at": round(_ORCH_BOOT, 3),
+        "up_seconds": round(max(0.0, now - _ORCH_BOOT), 1),
+        "keepers": keepers,
+        "live": live,
+        "recent": tail,
+        "tail_depth": len(_ORCH_TAIL),
+        "tail_most": int(ORCH_REG_TAIL),
+        "oldest_at": round(float(tail[-1].get("at") or 0), 3) if tail else 0.0,
+        # THE BLIND SPOTS, SHIPPED.  The pop-up prints these; it does not
+        # get to decide whether the operator sees them.
+        "coverage": {
+            "loops_measured": 75,
+            "loops_seen": 15,
+            "ticks_seen": 4,
+            "seen": [{"name": n, "what": w, "when": h}
+                     for n, w, h in ORCH_SEEN],
+            "blind": [{"group": g, "names": n} for g, n in ORCH_BLIND],
+            "doors": [{"system": a, "where": b} for a, b in ORCH_DOORS],
+            "persisted": False,
+            "say": ("This register is held in memory only and starts empty "
+                    "at every restart. It stamps 15 of the 75 timer loops "
+                    "in this station and 4 orchestration ticks; supporting "
+                    "systems are recorded at 7 named doors. Anything not "
+                    "named here is UNMEASURED, which is not the same as "
+                    "idle."),
+        },
+    }
+
+
 def pipeline_log(kind: str, text: str, extra: str = "") -> None:
     """Behind the glass (#308): the running commentary of the whole voice
     machine — model calls, speakbox mining, synthesis, announces — kept as
     a ring the 🔬 window scrolls through live. `extra` is the click-to-
     expand detail (#309, #310): the actual prompt, the actual reply, the
     actual lines mined."""
+    # 2026-09-15 (#1191): AND FILED AGAINST WHOEVER IS RUNNING.
+    #
+    # The ring below is 240 rows shared by the entire voice machine and it
+    # rotates in minutes on a live station, so the coordinator's own
+    # reasoning - "the coordinator closed 08:00 - last half hour lost 431s
+    # of air across 8 gap(s)" - was gone before anybody could read it and
+    # was written to no file anywhere. It still goes in the ring exactly as
+    # before; it ALSO goes on the register now, attached to the keeper's
+    # pass that produced it, which is what lets a pop-up show a task and
+    # the sentences that task wrote about itself. One list append, capped
+    # at ten per pass, and a no-op outside an instrumented keeper.
+    orch_step(kind, text, bool(extra))
     log = _RADIO.setdefault("pipeline", [])
     entry = {"ts": int(time.time() * 1000), "kind": kind,
              "text": str(text)[:200]}
@@ -37971,6 +38375,8 @@ async def pantry_keeper() -> None:
     and it is re-asked between every single item, not once per pass."""
     while True:
         await asyncio.sleep(6)
+        orch_turn("pantry_keeper",  # 2026-09-15 (#1191)
+                  "building the finished-audio buffer")
         try:
             pantry_burn()               # the 24-hour ceiling, every pass
             if globals().get("_system2") and _system2().owns_preparation:   # #1070
@@ -38700,6 +39106,8 @@ async def larder_keeper() -> None:
         # advert is carrying the air. A 15-second polling gap left the reserve
         # empty long after a model slot became available.
         await asyncio.sleep(3)
+        orch_turn("larder_keeper",  # 2026-09-15 (#1191)
+                  "keeping a written round always ready")
         try:
             # #1150: A PAUSED STATION MAY NOT EAT ITS OWN LARDER. This
             # prune ages rounds by WALL clock, and a pause is exactly
@@ -41687,6 +42095,9 @@ _WORKSHOP_LAST = [0.0]
 
 
 async def workshop_tick() -> None:
+    orch_used("the banter workshop", "workshop_tick")   # 2026-09-15 (#1191)
+    orch_turn("workshop_tick",
+              "improving banter while the station is paused")
     try:
         if not radio_paused() or not _RADIO.get("on"):
             return
@@ -41746,6 +42157,8 @@ _REEL_BUSY = [False]
 
 
 async def reel_tick() -> None:
+    orch_used("the resume reel", "reel_tick")           # 2026-09-15 (#1191)
+    orch_turn("reel_tick", "cutting the reel the unpause opens onto")
     """Build (or keep) the reel while paused. Cheap and idempotent."""
     try:
         if not radio_paused() or not _RADIO.get("on"):
@@ -47735,6 +48148,9 @@ def coord_carry_forward(road: str, label: str = "") -> int:
 
 
 def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
+    orch_used("the planner", "coord_plan")             # 2026-09-15 (#1191)
+    orch_turn("coord_plan", "pricing and ordering the shortfall",
+              claim=False)
     """#942: THE WORK ORDER for the next half hour.
 
     Every road the coming entries call for, costed against what it
@@ -47790,6 +48206,19 @@ def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
             plan["tasks"].append({
                 "road": road,
                 "label": SHELF_LABEL.get(road, road),
+                # 2026-09-15 (#1191): THE WORKING, not just the answer.
+                "chain": [{
+                    "name": "the shortfall",
+                    "value": round(want, 1), "unit": "s",
+                    "rule": "owed over the horizon, minus what is held, "
+                            "plus any dead air this road bled",
+                    "inputs": [
+                        {"name": "owed", "value": round(owed, 1), "unit": "s"},
+                        {"name": "held", "value": round(held, 1), "unit": "s"},
+                        {"name": "bled last half hour",
+                         "value": round(extra, 1), "unit": "s"},
+                    ],
+                }],
                 "want_seconds": round(want, 1),
                 "held_seconds": round(held, 1),
                 "owed_seconds": round(owed, 1),
@@ -47825,15 +48254,53 @@ def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
             misses = int(_BARE_ARRIVALS.get(road) or 0)
             task["bare_arrivals"] = misses
             if misses:
+                _was = float(task["want_seconds"])          # 2026-09-15 (#1191)
+                _f = 1.0 + 0.25 * min(4, misses)
                 task["want_seconds"] = round(
                     float(task["want_seconds"]) * (1.0 + 0.25 * min(4, misses)),
                     1)
+                task["chain"].append({
+                    "name": "bare-arrival premium",
+                    "factor": round(_f, 3), "was": round(_was, 1),
+                    "value": float(task["want_seconds"]), "unit": "s",
+                    "rule": "1 + 0.25 x min(4, times this road arrived bare)",
+                    "cap": 2.0, "capped": misses >= 4,
+                    "inputs": [{"name": "bare arrivals", "value": misses}],
+                })
                 task["why"] = (task["why"] + "; it has arrived bare "
                                + str(misses) + " time(s), so it is asked "
                                "for more")
             learned = coord_learning_factor(road)
             task["learning_factor"] = round(learned, 3)
             if learned > 1.001:
+                # 2026-09-15 (#1191): THE RATCHET, made legible. A road
+                # that keeps missing is asked for more, which it also
+                # misses. At 3.00 this multiplier has stopped carrying
+                # information and is only inflating the number - which is
+                # exactly what `capped` says on the face of the pop-up.
+                _learn = dict(_HOUR_LEARNING.get(road) or {})
+                task["chain"].append({
+                    "name": "closed-hour miss premium",
+                    "factor": round(learned, 3),
+                    "was": round(float(task["want_seconds"]), 1),
+                    "value": round(float(task["want_seconds"]) * learned, 1),
+                    "unit": "s",
+                    "rule": "raised each closed hour this road missed its "
+                            "requirement, decayed 10% each hour it met it, "
+                            "bounded to 3.00",
+                    "cap": 3.0, "capped": learned >= 2.999,
+                    "inputs": [
+                        {"name": "closed hours",
+                         "value": int(_learn.get("hours") or 0)},
+                        {"name": "consecutive misses",
+                         "value": int(_learn.get("miss_streak") or 0)},
+                        {"name": "consecutive successes",
+                         "value": int(_learn.get("success_streak") or 0)},
+                        {"name": "attainment (moving average)",
+                         "value": round(float(
+                             _learn.get("attainment_ema") or 0), 4)},
+                    ],
+                })
                 task["want_seconds"] = round(
                     float(task["want_seconds"]) * learned, 1)
                 task["why"] = (task["why"] + f"; its closed-hour miss "
@@ -47845,6 +48312,29 @@ def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
             judged = coord_judgment_factor(road)
             task["judgment_factor"] = round(judged, 3)
             if abs(judged - 1.0) > 0.001:
+                # 2026-09-15 (#1191): and the same honesty about the
+                # operator's own thumb. 2.00 is its ceiling, and the book
+                # reached it the same way the premium above did - by the
+                # station re-asking itself and auto-answering "keep
+                # pushing it" every time an hour disproved the judgment.
+                _judged_row = (_JUDGMENT["roads"].get(road) or {})
+                task["chain"].append({
+                    "name": "the operator's standing judgment",
+                    "factor": round(judged, 3),
+                    "was": round(float(task["want_seconds"]), 1),
+                    "value": round(float(task["want_seconds"]) * judged, 1),
+                    "unit": "s",
+                    "rule": "the weight this road's answers earned in the "
+                            "judgment book, bounded to 0.50-2.00",
+                    "cap": 2.0, "floor": 0.5,
+                    "capped": judged >= 1.999 or judged <= 0.501,
+                    "inputs": [
+                        {"name": "the lesson on the book",
+                         "value": str(_judged_row.get("lesson") or "")[:160]},
+                        {"name": "answered alone",
+                         "value": bool(_judged_row.get("alone"))},
+                    ],
+                })
                 task["want_seconds"] = round(
                     float(task["want_seconds"]) * judged, 1)
                 task["why"] = (task["why"] + f"; the operator's standing "
@@ -48439,6 +48929,11 @@ def pantry_orders_state() -> dict[str, Any]:
 
 
 async def pantry_orders_tick() -> dict[str, Any]:
+    # 2026-09-15 (#1191): recorded as a SUMMONS against the coordinator
+    # that fired it, and then as a pass of its own. See ORCH_DOORS.
+    orch_used("the commission desk", "pantry_orders_tick")
+    orch_turn("pantry_orders_tick",
+              "turning the plan's seconds into countable orders")
     """#1187: the plan's numbers, become orders, on the plan's own clock.
 
     Off, this returns at once and the station is exactly as it was.  In
@@ -48607,6 +49102,8 @@ async def coordinator() -> None:
     since = time.time()
     while True:
         await asyncio.sleep(COORD_TICK)
+        orch_turn("coordinator",  # 2026-09-15 (#1191)
+                  "closing the books and writing the work order")
         try:
             coord_air_sample()
             # #1157: the STORYLINE's clock, on the same fifteen-second
@@ -49917,6 +50414,8 @@ async def needle_watch() -> None:
     """
     while _RADIO.get("on"):
         await asyncio.sleep(4)
+        orch_turn("needle_watch",  # 2026-09-15 (#1191)
+                  "keeping the playhead honest")
         try:
             if not _RADIO.get("on") or not _RADIO.get("now"):
                 continue
@@ -49987,6 +50486,8 @@ async def box_delivery_watch() -> None:
     await asyncio.sleep(90)             # let a restart settle first
     while True:
         await asyncio.sleep(BOX_WATCH_TICK)
+        orch_turn("box_delivery_watch",  # 2026-09-15 (#1191)
+                  "proving delivered audio was actually heard")
         try:
             if not _RADIO.get("on"):
                 continue
@@ -51130,6 +51631,8 @@ async def dead_air_watch() -> None:
             await asyncio.sleep(5)
             continue
         await asyncio.sleep(20)
+        orch_turn("dead_air_watch",  # 2026-09-15 (#1191)
+                  "watching the silence ceiling")
         try:
             # 2026-09-15 (#1186): THE HEARTBEAT, because the evidence for
             # what went wrong tonight had to be inferred from a counter
@@ -66442,6 +66945,8 @@ async def switchboard_keeper() -> None:
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(20)
+        orch_turn("switchboard_keeper",  # 2026-09-15 (#1191)
+                  "working the callers' road")
 
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
@@ -73611,6 +74116,8 @@ async def sfx_guy_watch() -> None:
     while True:
         try:
             await asyncio.sleep(SFX_WATCH_TICK)
+            orch_turn("sfx_guy_watch",  # 2026-09-15 (#1191)
+                      "filling dead air with the SFX guy")
             _SFX_WATCH["ticks"] = int(_SFX_WATCH.get("ticks") or 0) + 1
             if radio_paused() or not _RADIO.get("on"):
                 _SFX_WATCH["why"] = "the station is off air"
@@ -78182,6 +78689,8 @@ async def gap_keeper() -> None:
     except Exception:  # noqa: BLE001
         pass
     while True:
+        orch_turn("gap_keeper",  # 2026-09-15 (#1191)
+                  "recording and closing measured holes in the air")
         await asyncio.sleep(60)
         try:
             if not _RADIO.get("on"):
@@ -78759,6 +79268,8 @@ async def talk_watch() -> None:
     hole. What it catches is nothing coming at all."""
     await asyncio.sleep(5 if talk_is_incessant() else 45)
     while True:
+        orch_turn("talk_watch",  # 2026-09-15 (#1191)
+                  "deciding when the pair should speak")
         await asyncio.sleep(talk_watch_tick())
         try:
             if not _RADIO.get("on"):
@@ -96394,6 +96905,12 @@ async def call_ollama(
     # calls at once measured 35.24s span against 31.5s of summed
     # compute, the second spending 18.35s purely queued. Overlap
     # across DIFFERENT models is free and is what this preserves.
+    # 2026-09-15 (#1191): THE WRITING MODEL, RECORDED AGAINST THE PASS
+    # THAT SUMMONED IT. Every model visit on this station comes through
+    # here. A no-op unless an instrumented keeper is the caller, and this
+    # function is about to spend seconds to minutes inside ollama - two
+    # dict lookups beside that are unmeasurable.
+    orch_used("the writing model", str(model)[:60])
     category, _cap = _ollama_category(purpose)
     admitted = sum(row["model"] == model and row["category"] == category
                    for row in _OLLAMA_JOBS.values())
@@ -103877,6 +104394,8 @@ async def reflection_clock() -> None:
     await asyncio.sleep(180)
     while True:
         await asyncio.sleep(REFLECTION_TICK)
+        orch_turn("reflection_clock",  # 2026-09-15 (#1191)
+                  "writing down what the station learned")
         try:
             if not _RADIO.get("on"):
                 continue
@@ -105180,6 +105699,7 @@ async def crystal_tint(script: str, kind: str = "",
     same number of turns, the same beats in the same order. Anything else
     and the two versions are not comparable, and #1016's whole point is
     choosing between them."""
+    orch_used("the crystal", str(kind or "a round")[:40])  # 2026-09-15 (#1191)
     out: dict[str, Any] = {"ok": False, "script": "", "why": "",
                            "armed": "", "prompt": "", "chunks": [],
                            "world": "", "ms": 0, "progress": {},
@@ -120440,6 +120960,169 @@ _REJECTION_WORKBENCH = install_rejection_workbench(app, globals())
 _SYSTEM2_RUNTIME = install_system2(app, globals())
 
 
+# =====================================================================
+# 2026-09-15 (#1191): THE DOOR THE #1191 POP-UP READS.
+#
+# ONE route, because the pop-up must be ONE poll. The panel has been
+# starved before by surfaces that asked too often, and on the tablet's
+# 400 kB/s link a 2.4 kB /api/orchestrator/asks was measured waiting 19 s
+# behind six full sockets - "that queue is what the operator feels as
+# 'the popup is slow'". So everything this screen draws comes back
+# together, and every expensive part of it is either a cached read or
+# memoised here.
+#
+# WHAT IS FREE: the register (plain dicts), the plan and its chains
+# (_COORD_PLAN, already computed by the coordinator's own tick), the
+# commission (_PANTRY_ORDER_LAST, a cache written when the order was
+# placed) and the learning ledger. WHAT IS NOT: glyphy_state, which walks
+# coord_upcoming and the prepared totals - so it is memoised for
+# GLASS_FACE_EVERY seconds and two pop-ups (the desk and the tablet)
+# cannot double its cost.
+# =====================================================================
+GLASS_FACE_EVERY = 3.0
+_GLASS_FACE_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def orch_glass_face() -> dict[str, Any]:
+    """glyphy_state, memoised. The avatar is the whole reason the face is
+    on this route at all, and two surfaces asking for it at once must not
+    cost twice."""
+    now = time.time()
+    try:
+        if (_GLASS_FACE_MEMO.get("value") is not None
+                and now - float(_GLASS_FACE_MEMO.get("at") or 0)
+                < GLASS_FACE_EVERY):
+            return dict(_GLASS_FACE_MEMO["value"])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        got = glyphy_state()
+    except Exception:  # noqa: BLE001
+        got = {"at": now, "mood": "watching", "say": "", "why": "",
+               "console": []}
+    _GLASS_FACE_MEMO["at"] = now
+    _GLASS_FACE_MEMO["value"] = got
+    return dict(got)
+
+
+def orch_glass_roads() -> list[dict[str, Any]]:
+    """The plan as the operator asked to see it: what was ASKED and what
+    was GRANTED side by side, the arithmetic that got from one to the
+    other, and the sentence that refused the difference.
+
+    Nothing is computed here. `chain` was written by coord_plan when the
+    plan was made; the order rows were written by pantry_orders_tick when
+    it placed or refused them. This only joins them by road, which is the
+    join no surface had."""
+    out: list[dict[str, Any]] = []
+    try:
+        order = dict(_PANTRY_ORDER_LAST)
+        placed = {str(r.get("road")): r for r in (order.get("orders") or [])}
+        refused = {str(r.get("road")): r
+                   for r in (order.get("stood_down") or [])}
+        for task in list(_COORD_PLAN.get("tasks") or [])[:16]:
+            road = str(task.get("road") or "")
+            got = placed.get(road) or {}
+            no = refused.get(road) or {}
+            out.append({
+                "road": road,
+                "label": str(task.get("label") or road),
+                "asked_seconds": round(float(task.get("want_seconds") or 0), 1),
+                "due_in": task.get("due_in"),
+                "bare": bool(task.get("bare")),
+                "estimate_seconds": task.get("estimate_seconds"),
+                "why": str(task.get("why") or ""),
+                # THE WORKING (#1191). Every link names its own inputs and
+                # says whether it is sitting on its ceiling.
+                "chain": list(task.get("chain") or []),
+                "learning": dict(_HOUR_LEARNING.get(road) or {}),
+                "learning_factor": task.get("learning_factor"),
+                "judgment_factor": task.get("judgment_factor"),
+                "granted": ({
+                    "items": got.get("items"),
+                    "room_seconds": got.get("room_seconds"),
+                    "covers_seconds": got.get("covers_seconds"),
+                    "each_seconds": got.get("each_seconds"),
+                    "cost_seconds": got.get("cost_seconds"),
+                    "odds": got.get("odds"),
+                    "why": str(got.get("why") or "")} if got else None),
+                "refused": ({
+                    "wanted_items": no.get("wanted_items"),
+                    "want_seconds": no.get("want_seconds"),
+                    "each_seconds": no.get("each_seconds"),
+                    "odds": no.get("odds"),
+                    # THE SENTENCE THAT REFUSED THE DIFFERENCE. This is
+                    # the "234s is left of the 900s this half hour may
+                    # spend" line, and it is the end of the chain.
+                    "why": str(no.get("why") or "")} if no else None),
+            })
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+def orch_glass_state(most: int = 48) -> dict[str, Any]:
+    """Everything the #1191 pop-up draws, in one read."""
+    out: dict[str, Any] = {"at": time.time()}
+    try:
+        out["on"] = bool(_RADIO.get("on"))
+        out["paused"] = radio_paused()
+    except Exception:  # noqa: BLE001
+        out["on"] = False
+        out["paused"] = False
+    try:
+        out.update(orch_register_state(most))
+    except Exception:  # noqa: BLE001
+        out["keepers"] = []
+        out["live"] = []
+        out["recent"] = []
+    out["face"] = orch_glass_face()
+    out["roads"] = orch_glass_roads()
+    try:
+        order = dict(_PANTRY_ORDER_LAST)
+        out["commission"] = {
+            "at": order.get("at"),
+            "half": order.get("half"),
+            # NOT pantry_orders_mode(). That reads the switch off DISK, and
+            # this is a poll handler on the event loop - the loop stalling
+            # on a file is how this station goes deaf, and a screen built to
+            # explain a silence must not be able to cause one. This is the
+            # last mode the switch reported, which on a fifteen-second
+            # coordinator tick is never more than a tick stale. #1191.
+            "mode": _PANTRY_ORDER_SAID.get("mode"),
+            "budget_seconds": order.get("budget_seconds"),
+            "asked_seconds": order.get("asked_seconds"),
+            "asked_items": order.get("asked_items"),
+            "items": order.get("items"),
+            "spent_seconds": order.get("spent_seconds"),
+            "left_seconds": order.get("left_seconds"),
+            "say": order.get("say"),
+        }
+    except Exception:  # noqa: BLE001
+        out["commission"] = {}
+    try:
+        out["plan_why"] = str(_COORD_PLAN.get("why") or "")
+    except Exception:  # noqa: BLE001
+        out["plan_why"] = ""
+    return out
+
+
+@app.get("/api/orchestrator/glass")
+async def api_orch_glass(
+    most: int = 48,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1191: the orchestrator's behaviour, live, in one read.
+
+    A pure composition of the register and of state already computed by
+    the coordinator's own clocks. It moves no clock, commissions nothing
+    and writes nothing - a panel read may never become a station action
+    (#1091 was exactly that mistake, and it turned a coordinator decision
+    into a browser poll)."""
+    require_read_auth(authorization)
+    return orch_glass_state(max(1, min(200, int(most))))
+
+
 @app.get("/api/orchestrator/logic")
 async def api_orch_logic(
     authorization: str | None = Header(default=None),
@@ -135337,6 +136020,8 @@ async def air_watch() -> None:
     while True:
         try:
             await asyncio.sleep(AIR_WATCH_EVERY)
+            orch_turn("air_watch",  # 2026-09-15 (#1191)
+                      "climbing the reinitialise ladder")
             if not _RADIO.get("on"):
                 _AIR_WATCH.update(rung=-1, say="the station is off")
                 continue
@@ -140627,6 +141312,8 @@ async def airlog_keeper() -> None:
         pass
     while True:
         await asyncio.sleep(AIRLOG_TICK)
+        orch_turn("airlog_keeper",  # 2026-09-15 (#1191)
+                  "writing down what reached the air")
         try:
             _ensure_chat_ids()
             # #1339: anything that reached the air without a written
@@ -142109,6 +142796,8 @@ async def screenplay_keeper() -> None:
     while True:
         try:
             await asyncio.sleep(SCREENPLAY_TICK)
+            orch_turn("screenplay_keeper",  # 2026-09-15 (#1191)
+                      "keeping the script ahead of the show")
             _ensure_chat_ids()
             fresh = screenplay_pick_lines(list(_RADIO.get("chat") or []))
             if fresh:
@@ -158170,6 +158859,8 @@ async def storage_keeper() -> None:
     show, which is the only time any of these folders grow."""
     while _RADIO.get("on"):
         await asyncio.sleep(STORAGE_SWEEP)
+        orch_turn("storage_keeper",  # 2026-09-15 (#1191)
+                  "holding the disk allowance")
         try:
             did = await asyncio.to_thread(_storage_enforce)
         except Exception:  # noqa: BLE001
