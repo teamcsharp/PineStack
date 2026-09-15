@@ -165,6 +165,36 @@
   const DOUBLE_TAP_MS = 320;    /* two taps further apart than this are two */
   const DOUBLE_TAP_PX = 48;     /* ...or further apart than a thumb is wide */
   const TOGGLE_REST_MS = 400;   /* one gesture, one toggle */
+  /* #1163 - "If I set the video to full screen, then reload it in full
+   * screen as well on the next video open. Retain the scale settings on
+   * reload in the web client."
+   *
+   * THIS OVERTURNS A DECISION MADE IN THIS FILE, AND THE REASON IT WAS
+   * MADE IS STILL TRUE. #1152's note said, in as many words: "SESSION
+   * ONLY, AND NEVER STUCK. Nothing here is written to localStorage: the
+   * operator asked for a gesture, not a setting, and a remembered bare
+   * screen is a tablet that looks dead on the shelf the next morning."
+   * He has now asked for the opposite, explicitly, and the reason is
+   * plain: this kiosk relaunches every few minutes behind the gallery
+   * wallpaper, so a session-only full screen is a full screen he keeps
+   * losing to something that is not his doing. His ask wins.
+   *
+   * THE CONCERN BEHIND THE OLD NOTE IS ANSWERED, NOT DISCARDED. A tablet
+   * that looks dead on the shelf is a tablet whose operator was told
+   * nothing. A restored bare screen therefore says what it is and how to
+   * leave it - one quiet line, for six seconds, then it fades and the
+   * glass is the picture and the dot. A gesture does NOT raise the line:
+   * a man who has just double tapped the screen knows what he did.
+   *
+   * SIX SECONDS, on the same clock check inside paint() that everything
+   * else in here uses. Long enough to read eleven words at reading
+   * distance, short enough that it is not still sitting on the picture
+   * when he looks up.
+   */
+  const BARE_KEY = "pineListenBare";
+  const NOTE_SHOW_MS = 6000;
+  let barePending = false;      /* stored bare, waiting for a clip */
+  let noteAt = 0;               /* when the restored-state line went up */
   let viewHost = null;          /* the section this view was mounted into */
   let bare = false;             /* #1152: the chrome is hidden on purpose */
   let idleDim = false;          /* #1150: the chrome is faded, nobody is here */
@@ -672,6 +702,47 @@
    * decision to fade is left to the clock.
    * ================================================================== */
 
+  /* THE STORE, AND WHAT IS AND IS NOT IN IT.
+   *
+   * #1163 also says "retain the scale settings on reload in the web
+   * client", and the honest answer for THIS view is that it has none to
+   * retain. Nothing on this screen is scaled by hand: fitHead() derives a
+   * headline size from the box it is given and nothing else here has a
+   * zoom, a size or a pinch. The two numbers the operator does choose -
+   * the volume and his request history - have been in localStorage since
+   * the view was written (pineListenVolume, pineRequests). The scale half
+   * of #1163 belongs to the SFX set's pop-up, which has carried its own
+   * geometry since #1122 and is not this file's to touch. So what is
+   * added here is the one thing that was missing: the full screen itself.
+   *
+   * A JSON object rather than a bare flag, so a number this view does not
+   * have yet has somewhere to go without a second key and a second
+   * migration. Read defensively in both directions: a locked store, a
+   * store that throws on access - which it does on this stack, in a
+   * private window and under a thumbnail capture - or a corrupt value all
+   * mean the same thing, and the safe direction is NOT bare. A screen
+   * that wrongly comes up with its panel showing is a nuisance; one that
+   * wrongly comes up blank is a tablet somebody thinks is broken. */
+  function readBare() {
+    let saved = null;
+    try { saved = JSON.parse(root.localStorage.getItem(BARE_KEY) || "null"); }
+    catch (err) { saved = null; }
+    return !!(saved && saved.bare === true);
+  }
+
+  /* Written ONLY from a deliberate act - the double tap and Escape. The
+   * automatic restores (the view being closed, the document going hidden)
+   * are this file keeping its "never stuck" promise, not the operator
+   * changing his mind, and recording them would mean his full screen was
+   * cancelled every time he glanced at another view. That distinction is
+   * the whole of "reload it in full screen as well on the next video
+   * open": leaving the view is not a decision, coming back is. */
+  function writeBare(on) {
+    try {
+      root.localStorage.setItem(BARE_KEY, JSON.stringify({bare: !!on}));
+    } catch (err) { /* a locked store must not stop the radio */ }
+  }
+
   /* Is this view the one on the glass? Either host class missing means the
    * operator has gone somewhere else and the chrome must come back. */
   function viewOpen() {
@@ -701,17 +772,47 @@
      * to explain it is furniture the operator cannot find, and this
      * function is the only writer of it. */
     const doc = document.documentElement;
-    if (doc && doc.classList) doc.classList.toggle("pine-listen-bare", bare);
+    const saying = bare && !!noteAt;
+    if (doc && doc.classList) {
+      doc.classList.toggle("pine-listen-bare", bare);
+      /* #1163: while the line is up the rail comes back to full strength
+       * too. #1156 puts the tabs at five percent in full screen, which is
+       * right for a screen the operator just chose - and wrong for the
+       * first six seconds after a relaunch, when the one thing he must be
+       * able to find is the way out of a view he did not ask to be in. */
+      doc.classList.toggle("pine-listen-bare-said", saying);
+    }
+    /* The line lives OUTSIDE .pl-face, with the backdrop layers, because
+     * .pl-face is the thing being hidden - a note inside it would be a
+     * note at opacity zero. */
+    const said = el("plBareNote");
+    if (said) said.classList.toggle("on", saying);
     if (!viewHost) return;
     viewHost.classList.toggle("pl-bare", bare);
     viewHost.classList.toggle("pl-idle", idleDim && !bare);
   }
 
-  /* Everything comes back. Every road out of this view runs through here. */
-  function showChrome() {
-    if (!bare && !idleDim) return;
+  /* Everything comes back. Every road out of this view runs through here.
+   *
+   * #1163: `deliberate` says whether this was the operator leaving full
+   * screen or this file keeping him out of a corner. Only the first is
+   * written down - see writeBare(). */
+  function showChrome(deliberate) {
+    if (deliberate) { barePending = false; writeBare(false); }
+    if (!bare && !idleDim && !noteAt) return;
+    /* #1163: AND IT RE-ARMS. barePending is spent the first time a stored
+     * full screen is applied, so without this the promise made two
+     * paragraphs up - that leaving the view is not him cancelling it -
+     * would only hold across a RELAUNCH, and not across the far commoner
+     * case of stepping over to MUSIC and back inside one page load. The
+     * store is consulted rather than the flag trusted, so a deliberate
+     * exit that has just written false re-arms to false, which is the
+     * same answer by a shorter road. At most one read per trip out of
+     * full screen. */
+    if (!deliberate && bare) barePending = readBare();
     bare = false;
     idleDim = false;
+    noteAt = 0;
     paintChrome();
   }
 
@@ -724,13 +825,40 @@
   }
 
   /* #1150's clock check. Called from paint() on the feed's 250ms tick. */
+  /* #1163's half of the tick: bring a stored full screen back, and take
+   * the line that explains it down again six seconds later.
+   *
+   * IT WAITS FOR A CLIP. "Reload it in full screen as well on the NEXT
+   * VIDEO OPEN" - so the stored flag is pending, not applied, until the
+   * endless set actually has something on the wall. That is his sentence
+   * read literally, and it is also the safe reading: a bare screen over a
+   * gallery still is a view that has hidden itself for no reason, and a
+   * relaunch that lands while the set is off would have produced exactly
+   * that. paint() calls paintEndless before this, so the flag it reads is
+   * this tick's, not the last one's. */
+  function paintBare(at) {
+    if (noteAt && at - noteAt >= NOTE_SHOW_MS) {
+      noteAt = 0;
+      paintChrome();
+    }
+    if (!barePending) return;
+    if (!endlessBackdrop || !viewOpen() || !onScreen()) return;
+    barePending = false;
+    bare = true;
+    idleDim = false;
+    idleAt = at;
+    bareAt = at;
+    noteAt = at;
+    paintChrome();
+  }
+
   function paintIdle(at) {
     if (!viewHost) return;
     if (!viewOpen() || !onScreen()) {
       /* Left, closed, or behind another app: nothing is hidden and
        * nothing is faded on a screen the operator is not looking at, or
        * he comes back to a black rectangle and no way out of it. */
-      showChrome();
+      showChrome(false);
       idleAt = at;
       return;
     }
@@ -757,7 +885,12 @@
     bare = !bare;
     idleDim = false;
     idleAt = at;
+    /* #1163: a gesture never raises the line - he has just done it and
+     * knows what he did - and a gesture is always written down. */
+    barePending = false;
+    noteAt = 0;
     paintChrome();
+    writeBare(bare);
   }
 
   /* Does this tap belong to the backdrop rather than to a control? While
@@ -777,6 +910,9 @@
     if (!host) return;
     viewHost = host;
     idleAt = Date.now();
+    /* #1163: whatever he left it at. Pending until a clip is on the wall -
+     * see paintBare. */
+    barePending = readBare();
 
     /* THE DOUBLE TAP IS COUNTED HERE RATHER THAN LEFT TO `dblclick`.
      * A WebView synthesises dblclick from two taps only when it feels like
@@ -816,7 +952,7 @@
     document.addEventListener("keydown", function (event) {
       if (!viewOpen()) return;
       /* #1152: "Also restore on Escape." */
-      if (event.key === "Escape") { showChrome(); return; }
+      if (event.key === "Escape") { showChrome(true); return; }
       stir();
     });
 
@@ -829,7 +965,9 @@
     if (!chromeWatch && typeof root.MutationObserver === "function") {
       chromeWatch = new root.MutationObserver(function () {
         if (viewOpen()) return;
-        showChrome();
+        /* NOT deliberate: leaving the view is not the operator cancelling
+         * his full screen, so #1163 keeps it for the next time round. */
+        showChrome(false);
         /* #1147: and the plexus is a requestAnimationFrame loop. A closed
          * view must not keep one running behind another screen. */
         showPlexus(false);
@@ -974,7 +1112,8 @@
     /* The set first, so the gallery sees the flag before it paints. */
     paintEndless(at, false);
     paintBackdrop(state, at);
-    /* #1150 last, because it reads the flag paintEndless just set. */
+    /* #1163 then #1150, both reading the flag paintEndless just set. */
+    paintBare(at);
     paintIdle(at);
   }
 
@@ -1090,6 +1229,12 @@
        * and object-fit cannot touch it. */
       + '<canvas id="plBackFx" class="pl-back pl-back-fx"></canvas>'
       + '<div class="pl-shade"></div>'
+      /* #1163: the line a RESTORED full screen puts on the glass. Outside
+       * .pl-face on purpose - that is the element bare mode hides - and
+       * pointer-events:none so the double tap it is describing goes
+       * straight through it to the backdrop underneath. */
+      + '<p id="plBareNote" class="pl-barenote">full screen - double tap '
+      + 'to show the panel</p>'
       + '<div class="pl-face">'
       + '<div class="pl-top"><b id="plStation">Pine Box FM</b>'
       /* THE GRAB PAD LIVES UP HERE, beside the clock, which is where the
@@ -2219,7 +2364,9 @@
      * with no visible way out. #1147: and the plexus stops - it is a
      * requestAnimationFrame loop, and on the tablet rAF keeps firing with
      * the screen off. */
-    showChrome();
+    /* NOT deliberate, for the same reason the closed view is not: the
+     * screen going away is not him changing his mind (#1163). */
+    showChrome(false);
     showPlexus(false);
   });
 

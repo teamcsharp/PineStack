@@ -1163,3 +1163,64 @@ html.pine-listen-bare #pineViewRail:focus-within { opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
   #pineViewRail { transition: none; }
 }
+
+/* ==========================================  THE LINE ON A RESTORED
+                                                FULL SCREEN  ============
+
+   #1163 - "If I set the video to full screen, then reload it in full
+   screen as well on the next video open. Retain the scale settings on
+   reload in the web client."
+
+   #1152 refused to remember the bare screen, and said why: "a remembered
+   bare screen is a tablet that looks dead on the shelf the next morning".
+   The operator has overruled that, and he is right to - this kiosk
+   relaunches every few minutes on its own, so a session-only full screen
+   is one he keeps losing to something he did not do. But the objection was
+   never wrong about the failure mode, only about the price. A tablet that
+   looks dead is a tablet that was told nothing. This is the telling.
+
+   It is a SIBLING of .pl-face, not a child, because .pl-face is the
+   element bare mode takes to zero - a note inside it would be a note
+   nobody can read. And it is pointer-events:none, so the double tap it
+   describes goes through it to the backdrop, where onBackdrop() is
+   waiting.
+
+   Bottom centre, above the console strip's 26px and well clear of the
+   talk dot in the corner. Six seconds on listen.js's clock, then the same
+   600ms ease everything else in this view fades on. */
+
+.pl-barenote {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  z-index: 3;
+  margin: 0;
+  padding: 7px 15px;
+  border: 1px solid rgba(101, 199, 218, .3);
+  border-radius: 999px;
+  background: rgba(8, 11, 15, .72);
+  color: var(--text, #dfe7ee);
+  font-size: 12.5px;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  max-width: calc(100% - 32px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 600ms ease;
+}
+.pl-barenote.on { opacity: 1; }
+
+/* #1163: and while that line is up the rail is at full strength, not at
+   #1156's five percent. Five percent is right for a full screen the
+   operator just chose; it is wrong for the first six seconds after a
+   relaunch he did not choose, when the way OUT of the view is the one
+   thing he must be able to find. Two classes and an id, so it beats the
+   #1156 rule above it without needing !important. */
+html.pine-listen-bare.pine-listen-bare-said #pineViewRail { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pl-barenote { transition: none; }
+}
