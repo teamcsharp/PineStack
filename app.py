@@ -6555,6 +6555,13 @@ async def resource_sample() -> dict[str, Any]:
         snapshot = {"at": now, "memory": memory, "gpu": gpu,
                     "booths": booths, "writing": writing,
                     "engines_last_render_seconds": pressure.get("engine_last_render") or {},
+                    # #1204::station-pressure:: the WHOLE director answer,
+                    # not one key of it. This dict is what the orchestrator
+                    # glass reads; it is refreshed on this 45 s clock and
+                    # never fetched on the glass's own 5 s poll. An empty
+                    # dict here means the director did not answer, and every
+                    # reader below must say that rather than print a zero.
+                    "pressure": pressure,
                     "models": [{"name": row.get("name"), "bytes": row.get("size"),
                                 "gpu_bytes": row.get("size_vram"),
                                 "station_owned": row.get("name") in owned,
@@ -123063,6 +123070,114 @@ def orch_glass_roads() -> list[dict[str, Any]]:
     return out
 
 
+def orch_glass_pressure() -> dict[str, Any]:
+    """#1204::station-pressure:: WHAT THE BOX IS DOING TO ITSELF, IN WORDS.
+
+    "I want to find out what happened, prevent it, and also offer dialogue
+     to prevent that sort of issue from happening by offering to basically
+     relieve the pressure if this sort of situation comes up."
+
+    WHY THIS PANE EXISTS. On 2026-09-15 the DGX Spark froze at 09:50:14
+    after 35 hours up - no shutdown sequence, the journal stops mid-
+    sentence, and it had to be power-cycled. The machine had been warning
+    for fourteen hours and the only place it warned was a text file on the
+    host that nobody reads until after a freeze:
+
+        2026-09-15 08:22:03 avail=16.7G tier1: ComfyUI cache freed
+
+    16.7G is below the valve's own tier2 threshold of 18 and tier2 wrote
+    nothing at all, because its only move was to unload an IDLE engine and
+    at 08:22 this station renders essentially all of its dialogue in real
+    time, so nothing was idle. "Nothing was idle" was recorded as silence,
+    which reads exactly like "not needed". Meanwhile the kernel had logged
+    NINETEEN NVRM NV_ERR_NO_MEMORY failures in that boot - GPU driver
+    allocations failing - eight of them in the last two and a half hours,
+    and the valve was watching CPU-side MemAvailable, which counts
+    reclaimable page cache and never fell below 12G.
+
+    The valve on the host is fixed (#1204, voice_director_service.py: the
+    ladder now walks every tier, every tier says what it did or why it
+    could not, and the NVRM rate drives the ladder on its own). This is the
+    other half: the station is a radio station with an orchestrator that
+    explains itself, and pressure building on the box is exactly the kind
+    of thing it should surface IN PLAIN WORDS BEFORE IT IS A CRISIS, and
+    offer to act on.
+
+    WHAT THIS FUNCTION MAY AND MAY NOT DO. It is called from
+    orch_glass_state, which is a GET handler polled every five seconds. It
+    therefore touches NO socket and NO file. Everything it returns comes
+    out of _RESOURCE_STATE, the dict resource_clock refreshes on its own
+    45-second tick (#1204 anchor 1 above puts the director's whole answer
+    in there). A panel read may never become a station action - #1091 was
+    exactly that mistake - so this composes and returns, and nothing else.
+
+    AND IT NEVER PRINTS A ZERO IT DID NOT MEASURE. An unanswering director
+    gives {}, an old director gives a payload with no "nvrm" key, and a
+    director that could not read the kernel log gives nvrm.readable false.
+    Those are three different sentences, and none of them is "0"."""
+    out: dict[str, Any] = {"at": time.time()}
+    try:
+        got = _RESOURCE_STATE.get("pressure")
+        out["heard_seconds"] = (round(time.time()
+                                      - float(_RESOURCE_STATE.get("at") or 0), 1)
+                                if _RESOURCE_STATE.get("at") else None)
+    except Exception:  # noqa: BLE001
+        got, out["heard_seconds"] = None, None
+    if not isinstance(got, dict) or not got:
+        out["readable"] = False
+        out["say"] = ("The voice director on the host is not answering, so "
+                      "nothing about this box's memory or its GPU can be "
+                      "read from here. That is itself worth knowing: the "
+                      "director is the service that renders the DJs.")
+        out["offers"] = []
+        return out
+    out["readable"] = True
+    nvrm = got.get("nvrm") if isinstance(got.get("nvrm"), dict) else None
+    for name in ("avail_gb", "tier", "mem_tier", "gpu_tier"):
+        if got.get(name) is not None:
+            out[name] = got.get(name)
+    out["nvrm"] = nvrm or {}
+    out["offers"] = got.get("offers") or []
+    out["recent"] = (got.get("recent") or [])[-6:]
+    # THE SENTENCE. The host composes one (_pressure_why) so that
+    # pressure.log, the director's console and this pane cannot drift into
+    # telling the operator three different stories about the same box. It
+    # is preferred whenever it is there. The rest of this is the fallback
+    # for a director that has not been taught #1204 yet, and the extra
+    # clause the station adds on its own: what it is OFFERING to do.
+    said = str(got.get("why") or "").strip()
+    if not said:
+        avail = got.get("avail_gb")
+        said = (("%.1fG of memory free on the host." % float(avail))
+                if isinstance(avail, (int, float))
+                else "The host answered but did not say how much memory is "
+                     "free.")
+        said += (" This director has not been taught to watch the GPU "
+                 "driver yet, so a failing GPU allocation would not show "
+                 "here - that is the signal that preceded the 2026-09-15 "
+                 "freeze by fourteen hours.")
+    elif nvrm is not None and nvrm.get("readable") is None:
+        said += (" (The kernel log has not been scanned yet - the valve "
+                 "reads it within 45 seconds of a restart.)")
+    tier = int(got.get("tier") or 0)
+    if tier <= 0:
+        said += " Nothing needs doing."
+    elif tier == 1:
+        said += (" Nothing is wrong yet. The valve will free the image "
+                 "cache on its own; you can ask for it now instead.")
+    elif tier == 2:
+        said += (" This is the level at which the valve went quiet on the "
+                 "morning of the freeze. It will unload an idle voice "
+                 "engine if it finds one and say so either way.")
+    else:
+        said += (" This is the top of the ladder. The language models go "
+                 "first because they are the cheapest large thing to "
+                 "reload; a working voice engine is only taken off the air "
+                 "under 12G free.")
+    out["say"] = said
+    return out
+
+
 def orch_glass_state(most: int = 48) -> dict[str, Any]:
     """Everything the #1191 pop-up draws, in one read."""
     out: dict[str, Any] = {"at": time.time()}
@@ -123106,6 +123221,14 @@ def orch_glass_state(most: int = 48) -> dict[str, Any]:
         out["plan_why"] = str(_COORD_PLAN.get("why") or "")
     except Exception:  # noqa: BLE001
         out["plan_why"] = ""
+    # #1204::station-pressure:: on the EXISTING glass road, deliberately.
+    # A second route for this would be a second thing to poll, a second
+    # thing to authorise and a second thing to go stale unnoticed, on a
+    # panel whose whole argument is that one read explains the station.
+    try:
+        out["pressure"] = orch_glass_pressure()
+    except Exception:  # noqa: BLE001
+        out["pressure"] = {}
     return out
 
 
@@ -123123,6 +123246,75 @@ async def api_orch_glass(
     into a browser poll)."""
     require_read_auth(authorization)
     return orch_glass_state(max(1, min(200, int(most))))
+
+
+@app.post("/api/orchestrator/pressure/relieve")
+async def api_orch_pressure_relieve(
+    tier: int = 1,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1204::station-pressure:: THE OFFER, ACCEPTED.
+
+    "and it OFFERS to relieve it, so he can press something and have the
+     ladder run a tier deliberately rather than waiting for a threshold."
+
+    AN OFFER HE CAN DECLINE IS THE POINT, so this road only ever runs
+    because a person pressed something. It is a POST for exactly that
+    reason - the glass's own five-second poll is a GET and cannot reach
+    it - and it adds NO POWER the valve did not already have: it runs one
+    rung of the host ladder, and tier 3 by hand obeys the same under-12G
+    guard on taking a working engine off the air that tier 3 by threshold
+    does. The station is never given initiative to evict anything.
+
+    It is also the only thing in #1204 that talks to the host on demand,
+    which is safe because a button press is not a poll."""
+    require_auth(authorization)
+    step = max(1, min(3, int(tier)))
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                f"{VOICE_DIRECTOR_URL}/host/pressure/relieve",
+                params={"tier": step})
+            response.raise_for_status()
+            got = response.json()
+            if not isinstance(got, dict):
+                raise ValueError("the director did not answer with an object")
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "tier": step, "said": [],
+                "say": ("The voice director did not take it (%s). Nothing "
+                        "was freed, and nothing was lost by asking."
+                        % type(err).__name__)}
+    said = [str(s) for s in (got.get("said") or [])]
+    before, after = got.get("before_gb"), got.get("after_gb")
+    say = "Asked the host for tier %d." % step
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+        gained = float(after) - float(before)
+        say += ("  Memory went %.1fG to %.1fG (%+.1fG)."
+                % (float(before), float(after), gained))
+        if gained <= 0.05:
+            # An honest nothing. The valve freeing nothing is a real and
+            # frequent outcome - ComfyUI mid-picture, every engine busy -
+            # and it must read as a measurement, not as a failed button.
+            say += ("  Nothing came back, which is an answer: what the "
+                    "valve is allowed to take was already gone or still "
+                    "in use. The lines below say which.")
+    if not said:
+        say += "  The host ran the rung but wrote no line for it."
+    # Refresh the cached snapshot so the pane tells the truth on its very
+    # next five-second poll instead of up to 45 seconds later.
+    try:
+        fire_and_forget(resource_sample())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        station_flow_event("resources", "ok",
+                           "the operator asked the host for tier %d" % step,
+                           {"pressure_relieve": {"tier": step, "said": said}})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "tier": step, "said": said, "say": say,
+            "before_gb": before, "after_gb": after,
+            "why": str(got.get("why") or "")}
 
 
 @app.get("/api/orchestrator/logic")

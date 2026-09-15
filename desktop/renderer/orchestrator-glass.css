@@ -330,6 +330,46 @@
 }
 .og-col-s { font-size: 11px; color: #8ea0ad; }
 
+/* --------------------------------------------- #1202: THE HEADLINE NUMBER
+
+   "It is nightmarish to hear of lines being recorded stored and never
+   intended to be used or played."
+
+   The waste pane leads with what was made and never heard, in minutes, at a
+   size that can be read without reading - and it is the only number on this
+   screen drawn at 26px, deliberately, because a second headline is no
+   headline. The amber variant is not "an error"; it is the measured fact
+   that some minutes of speech were made and never went out, which is what he
+   opened this panel to find out. When the number could not be read it stays
+   in the plain frame and says so in words, because a red-hot "could not be
+   counted" would read as a big bad number, which is the opposite of true. */
+.og-big {
+  border: 1px solid #2b353f;
+  border-left: 3px solid #3f7f96;
+  border-radius: 8px;
+  background: rgba(63, 127, 150, .07);
+  padding: 8px 10px;
+  margin: 4px 0 10px;
+}
+.og-big.og-big-bad {
+  border-left-color: #c08a3a;
+  background: rgba(192, 138, 58, .09);
+}
+.og-big-h {
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: #6f8090;
+}
+.og-big-v {
+  font-size: 26px;
+  line-height: 1.15;
+  color: #edf3f5;
+  font-variant-numeric: tabular-nums;
+}
+.og-big.og-big-bad .og-big-v { color: #e0ad63; }
+.og-big-s { font-size: 11px; color: #8ea0ad; margin-top: 2px; }
+
 .og-refuse {
   border-left: 2px solid #6d5a35;
   padding: 4px 0 4px 8px;
@@ -386,4 +426,60 @@
   .og-tri { padding: 9px 6px; }
   .og-x { padding: 6px; }
   .og-two { flex-direction: column; }
+  /* The headline stays a headline on a 9-inch glass - it is the number he
+     opened the panel for, and shrinking it with the rest would bury it. */
+  .og-big-v { font-size: 24px; }
+}
+
+/* #1204 - THE PRESSURE PANE'S OFFER. A button that spends something has to
+   show what it spends, so the price sits under every one of them and is
+   never a hover or a second screen. The armed state is a different colour
+   because the second press is the one that acts. */
+.og-offer {
+  border: 1px solid #2b353f;
+  border-radius: 8px;
+  padding: 7px 8px;
+  margin: 6px 0;
+  background: rgba(14, 20, 26, .6);
+}
+.og-offer-cold { opacity: .62; }
+.og-offer-b {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: #17303c;
+  color: #cfe9f2;
+  border: 1px solid #2f4d5c;
+  border-radius: 7px;
+  padding: 7px 9px;
+  font: inherit;
+  cursor: pointer;
+}
+.og-offer-b:hover:not(:disabled) { border-color: #66b6cf; }
+.og-offer-b:disabled { cursor: default; opacity: .6; }
+.og-offer-b .og-i { flex: 0 0 auto; line-height: 0; }
+.og-offer-armed {
+  background: #4a3313;
+  color: #f0cf95;
+  border-color: #9b7233;
+}
+.og-offer-cost {
+  color: #8ea3b1;
+  font-size: 11px;
+  margin-top: 5px;
+  line-height: 1.45;
+}
+/* The valve's own log lines, quoted verbatim - they are the record that
+   used to live only in a text file on the host. */
+.og-valve-line {
+  color: #9fb4c1;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 2px 0;
+  word-break: break-word;
+}
+@media (max-width: 760px) {
+  .og-offer-b { padding: 10px; }
 }
