@@ -343,4 +343,9 @@ async function fromFrames({ dir, pattern, fps, out }, options) {
 }
 
 module.exports = { planArgs, mux, findFfmpeg, dbToLinear, stash, forget, lastReal,
+  /* #1182: the screen ring runs its own concat and its own frame pull, and
+   * it must use THIS runner - the one that turns ffmpeg's wall of chatter
+   * into the one line that says why it refused. A second execFile beside it
+   * would report exit codes, which name nothing. */
+  run,
   fromFrames };

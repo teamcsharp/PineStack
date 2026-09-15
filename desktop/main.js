@@ -8,6 +8,14 @@ const { LcdFirmware } = require("./lcd-firmware.cjs");
 const { saveLcdSample } = require("./lcd-samples.cjs");
 const { TerminalHost } = require("./terminal-host.cjs");
 const clipMux = require("./clip-mux.cjs");
+/* #1182: THE ROLLING RECORD OF THIS WINDOW.
+ *
+ * "Only the tablet has a rolling recorder; this window does not, so a local
+ * capture still films forwards" - the note at glass:clip, now out of date.
+ * The renderer films (renderer/screen-ring.js) and hands finished pieces
+ * down; this keeps them on disk and cuts what is asked for out of them. */
+const { ScreenRing, HOLD_MIN_S, HOLD_MAX_S, HOLD_DEFAULT_S } = require("./screen-ring.cjs");
+const screenRing = new ScreenRing();
 /* Twice the size and sharpened, for every picture taken of the tablet. */
 const shotEnhance = require("./shot-enhance.cjs");
 const glassParts = require("./terminal-glass.cjs");
@@ -711,6 +719,28 @@ function createWindow() {
   try {
     session.defaultSession.setDevicePermissionHandler(() => true);
   } catch (err) { /* likewise */ }
+
+  /* #1182: WHICH SCREEN THE RING RECORDS, DECIDED HERE AND NOWHERE ELSE.
+   *
+   * getDisplayMedia normally raises a picker. Two reasons it must not here:
+   * the recorder starts itself a couple of seconds after the app opens, and
+   * a picker nobody is sitting in front of is a feature that never runs; and
+   * the wrong choice in that picker would quietly record somebody's email
+   * into a ring that gets exported. The answer is this window, always, and
+   * the renderer is given no say in it.
+   *
+   * `video: win` hands Electron the BrowserWindow itself rather than a
+   * desktopCapturer source id, so the capture follows the window rather
+   * than a screen region, and audio is refused outright - the broadcast is
+   * pulled from PineAir's own ring when a clip is cut, exactly as the
+   * forward recorder already does it, and capturing it twice would put it
+   * in the file twice. */
+  try {
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+      if (!win || win.isDestroyed()) return callback({});
+      callback({ video: win, audio: false });
+    }, { useSystemPicker: false });
+  } catch (err) { /* older Electron: getDisplayMedia simply will not start */ }
 
   // #786: the window comes back EXACTLY as it was left — size and place —
   // and the minimums match the responsive chrome (it genuinely works small).
@@ -2320,6 +2350,514 @@ ipcMain.handle("shot:view", async (event) => {
     return { ok: true, dataUrl: image.toDataURL() };
   } catch (error) {
     return { ok: false, why: error.message };
+  }
+});
+
+/* ===================================================================== */
+/* #1182: THE SCREEN RING'S ROADS.
+ *
+ * The same names the tablet answers to, because the same renderer calls
+ * them: hot-corners.js checks typeof on each one and draws the export sheet
+ * out of what it finds. Until tonight it found nothing here and said so on
+ * the sheet - "no screen recording road on this surface" - which is what the
+ * operator photographed.
+ *
+ * The shapes are the tablet's shapes, documented in the kiosk's
+ * pine-bridge.js. Where the two machines genuinely differ, the difference is
+ * in WHERE a file lands, never in what an answer looks like.
+ */
+
+/* Where a finished recording goes. The operator's own recordings folder
+ * first - that is the one he named in #1114 and the one the courier already
+ * carries to - then the system's videos folder, then downloads. No save
+ * dialog: this is the end of a corner swipe, not a menu. */
+function replayFolder() {
+  const cfg = readConfig() || {};
+  const tries = [cfg.saveDir, (() => { try { return app.getPath("videos"); } catch (e) { return ""; } })(),
+    (() => { try { return app.getPath("downloads"); } catch (e) { return ""; } })()];
+  for (const dir of tries) {
+    if (!dir) continue;
+    try { fs.mkdirSync(dir, { recursive: true }); return dir; } catch (e) { /* next */ }
+  }
+  return os.tmpdir();
+}
+
+function replayName(seconds) {
+  const when = new Date();
+  const two = (n) => String(n).padStart(2, "0");
+  const stamp = String(when.getFullYear()) + two(when.getMonth() + 1) + two(when.getDate())
+    + "-" + two(when.getHours()) + two(when.getMinutes()) + two(when.getSeconds());
+  return "pinebox-screen-" + stamp + "-" + Math.round(seconds) + "s.mp4";
+}
+
+/* The renderer, saying a piece is finished. The only road that carries
+ * bytes upward, and it carries them as an ArrayBuffer rather than base64:
+ * a two-second piece is about 400 KB, and base64 would make every one of
+ * them a third larger for no reason at all. */
+ipcMain.handle("replay:push", (_event, buffer, meta) => {
+  try { return screenRing.take(Buffer.from(buffer), meta || {}); }
+  catch (error) { return { ok: false, why: error.message }; }
+});
+
+/* #1182c: WHICH SOURCE, WITHOUT ASKING FOR A GESTURE.
+ *
+ * getDisplayMedia needs transient user activation, and the ring starts
+ * itself a couple of seconds after the app opens, when nothing has been
+ * pressed. getMediaSourceId names THIS window, and getUserMedia with the
+ * chromeMediaSource constraints opens it with no activation at all. The
+ * renderer is told which source rather than choosing one, for the same
+ * reason the display-media handler answers with this window and no picker:
+ * the wrong choice would quietly record somebody else's screen into a ring
+ * that gets exported. */
+ipcMain.handle("replay:source", () => {
+  try {
+    if (!win || win.isDestroyed()) return { ok: false, detail: "no window" };
+    return { ok: true, id: win.getMediaSourceId() };
+  } catch (error) {
+    return { ok: false, detail: error.message };
+  }
+});
+
+ipcMain.handle("replay:begin", (_event, opts) => {
+  try {
+    const cfg = readConfig() || {};
+    const held = Number(cfg.replayHoldSeconds || 0) || HOLD_DEFAULT_S;
+    return screenRing.begin({ holdSeconds: held, ...(opts || {}) });
+  } catch (error) { return { ok: false, why: error.message }; }
+});
+
+ipcMain.handle("replay:stop", (_event, why) => {
+  try { return screenRing.stop(why); }
+  catch (error) { return { ok: false, why: error.message }; }
+});
+
+ipcMain.handle("replay:state", () => {
+  try {
+    const got = screenRing.state();
+    /* The bounds ride along so the preference control can draw its own
+     * limits from the thing that enforces them, rather than carrying a
+     * second copy of two numbers that would go stale. */
+    /* `atLeast` is the tablet's word for the DESIGN FLOOR, and the sheet
+     * prints it as "the ring holds N s (at least M s)". On the tablet the
+     * ring is bounded by bytes, so it routinely holds several times its
+     * floor; here it is bounded by seconds as well, so the floor and the
+     * hold are the same number. Said anyway, because the sheet reads it.
+     *
+     * `audio` is null and that is the honest answer: this ring records
+     * picture only. The broadcast is laid under a cut when the cut is
+     * made, out of PineAir's own ring, which is where the sound has always
+     * come from on this machine. */
+    return { ...got, atLeast: got.holds, audio: null,
+      min: HOLD_MIN_S, max: HOLD_MAX_S, fallback: HOLD_DEFAULT_S };
+  } catch (error) { return { ok: false, running: false, seconds: 0, holds: 0,
+    bytes: 0, detail: error.message }; }
+});
+
+/* How long the ring keeps. Persisted, because a hold the operator set has to
+ * survive the app closing. */
+ipcMain.handle("replay:hold", (_event, seconds) => {
+  try {
+    const set = screenRing.setHold(seconds);
+    writeConfig({ replayHoldSeconds: set });
+    return { ok: true, holds: set, min: HOLD_MIN_S, max: HOLD_MAX_S };
+  } catch (error) { return { ok: false, why: error.message }; }
+});
+
+/* #1182d: FINISH THE PIECE YOU ARE ON, THEN CUT.
+ *
+ * Measured against the live ring: a ten-second ask came back as eight
+ * seconds ending two seconds ago, and a five-second scrub strip spanned 1.8
+ * seconds with no frame at "now". The piece being recorded has not reached
+ * the disk yet, so the newest cuttable moment is up to one whole piece old -
+ * and the moment worth keeping is nearly always the one that just happened.
+ *
+ * This asks the recorder to close the piece it is on. The renderer stops its
+ * MediaRecorder, which emits immediately and starts the next, and we wait
+ * for the count of landed pieces to move. The ceiling is short on purpose: a
+ * recorder that has died must cost a cut a few hundred milliseconds, never
+ * hang it, so the cut goes ahead with whatever is on disk and the answer
+ * still says honestly where the window landed. */
+function replayFlush(ms) {
+  return new Promise((resolve) => {
+    if (!win || win.isDestroyed() || !screenRing.running) return resolve(false);
+    const was = screenRing.taken;
+    let done = false;
+    const finish = (got) => { if (done) return; done = true; clearInterval(tick);
+      clearTimeout(stop); resolve(got); };
+    const tick = setInterval(() => { if (screenRing.taken !== was) finish(true); }, 25);
+    const stop = setTimeout(() => finish(false), Math.max(200, Number(ms) || 900));
+    try { win.webContents.send("replay-flush"); }
+    catch (error) { finish(false); }
+  });
+}
+
+ipcMain.handle("replay:frames", async (_event, want) => {
+  try {
+    const asked = want || {};
+    /* THE SCRUB STRIP MAY NOT ASK PAST THE OLD END. `back` is clamped to
+     * what the ring actually holds, and the unclamped ask is echoed back as
+     * `asked_back` with `clamped` beside it, because the strip draws its
+     * slider from those two: a slider that can travel where there is no
+     * video is a slider that lies. The edge default is 640, which is the
+     * tablet's SCRUB_EDGE - the strip sizes its thumbnails from what comes
+     * back, so a different default here would make the two surfaces look
+     * like different features. */
+    /* The strip is dragged, so it asks often; a flush is only worth its
+     * few hundred milliseconds for the window that ends at NOW. A window
+     * that ends in the past is already whole on disk. */
+    if (!(Number(asked.back) > 1)) await replayFlush(700);
+    const state = screenRing.state();
+    const seconds = Math.max(1, Math.min(30, Number(asked.seconds) || 5));
+    const askedBack = Math.max(0, Number(asked.back) || 0);
+    const back = Math.min(askedBack, Math.max(0, (state.seconds || 0) - seconds));
+    const got = await screenRing.frames(
+      { seconds, count: asked.count, edge: Number(asked.edge) || 640, back },
+      { ffmpeg: (readConfig() || {}).ffmpeg });
+    return { ...got, asked_back: askedBack,
+      clamped: !!got.clamped || (askedBack - back > 0.6) };
+  } catch (error) {
+    return { ok: false, held: 0, detail: error.message };
+  }
+});
+
+ipcMain.handle("replay:export", async (_event, want) => {
+  const asked = Math.max(1, Number((want || {}).seconds) || 30);
+  try {
+    await replayFlush(900);
+    const made = await screenRing.cut({ seconds: asked, back: (want || {}).back || 0 },
+      { ffmpeg: (readConfig() || {}).ffmpeg });
+    if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
+    /* The broadcast goes under the picture here too. A screen recording of a
+     * radio station with no radio on it is half a recording, and the sheet
+     * offers "Allow video without complete audio" precisely because the
+     * sound is meant to be there unless it is refused. */
+    const dressed = await replayWithSound(made, !!((want || {}).video_only));
+    made.out = dressed.path;
+    made.bytes = fs.statSync(dressed.path).size;
+    const folder = replayFolder();
+    const name = String((want || {}).name || "") || replayName(made.seconds);
+    const where = path.join(folder, name.replace(/[^\w.-]+/g, "-"));
+    try {
+      fs.copyFileSync(made.out, where);
+    } catch (error) {
+      clipMux.forget(made.dir);
+      return { ok: false, detail: "could not write " + where + ": " + error.message };
+    }
+    /* The station's export courier, when asked for. A courier that is not
+     * there is uploaded:{ok:false} with a reason - never a failed save. The
+     * file on this machine is already written by the time this runs. */
+    let uploaded = null;
+    if (want && want.upload) {
+      uploaded = { ok: false, detail: "not attempted" };
+      try {
+        const cfg = readConfig() || {};
+        const url = cfg.baseUrl + "/api/export/upload?what=screen&seconds="
+          + encodeURIComponent(made.seconds) + "&name=" + encodeURIComponent(path.basename(where));
+        const response = await fetch(url, { method: "PUT",
+          headers: { "Content-Type": "video/mp4", ...authHeaders(cfg) },
+          body: fs.readFileSync(where) });
+        const text = await response.text();
+        let body = {};
+        try { body = text ? JSON.parse(text) : {}; } catch (e) { body = { text }; }
+        uploaded = response.ok
+          ? { ok: true, id: body.id || body.name || null, dest: body.where || body.path || null }
+          : { ok: false, detail: (body.detail || body.error || response.status + " " + response.statusText) };
+      } catch (error) {
+        uploaded = { ok: false, detail: error.message };
+      }
+    }
+    clipMux.forget(made.dir);
+    return { ok: true, where, bytes: made.bytes, asked,
+      seconds: made.seconds, held: made.held, clamped: !!made.clamped,
+      uploaded, audio: dressed.audio, detail: "" };
+  } catch (error) {
+    return { ok: false, detail: error.message };
+  }
+});
+
+/* THE SAME CUT, BUT INTO THE STATION'S VIDEO EDITOR.
+ *
+ * This is NOT the desk's own clip window. hot-corners.js takes the answer's
+ * `source_id` straight to openVideoEditor(), which loads the STATION's
+ * /video-editor/?source=<32 hex characters> in an iframe - so the cut has to
+ * reach the station and come back as an identity, exactly as it does from
+ * the tablet. Returning a local window's success here would have left the
+ * renderer calling openVideoEditor(undefined) and the operator looking at a
+ * broken frame.
+ *
+ * The broadcast is laid under the picture BEFORE the upload, out of
+ * PineAir's ring, for the window the video actually covers - the video is a
+ * slice of the past, so the sound must be the same slice of the past, not
+ * the last N seconds counted from now. `video_only` skips that.
+ *
+ * And if the upload fails the captured moment is still written to the
+ * recordings folder, said as `original_saved` and `where`. The tablet does
+ * the same thing for the same reason: the recording is the part that cannot
+ * be taken again. */
+
+/* OkHttp will not carry a non-ASCII header and neither will this one. JSON
+ * escapes keep the unicode and the device details without letting a control
+ * character into a header - the tablet's VideoEditorContract.audioHeader,
+ * word for word, because the station parses what both of them send. */
+function asciiHeader(value) {
+  let out = "";
+  const text = String(value == null ? "" : value);
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if (code >= 32 && code <= 126) out += ch;
+    else out += "\\u" + code.toString(16).padStart(4, "0");
+  }
+  return out;
+}
+
+function videoIdentity(value) {
+  const id = String(value || "");
+  if (!/^[0-9a-f]{32}$/.test(id)) throw new Error("invalid video editor identity");
+  return id;
+}
+
+/* The picture as it is, with the broadcast laid under it when there is one.
+ * Returns {path, dir, audio, notes}. */
+async function replayWithSound(made, videoOnly) {
+  const notes = [];
+  const audio = { source: "pine-air-ring", present: false, complete: false,
+    state: "unavailable", detail: "", video_only_explicit: !!videoOnly };
+  if (videoOnly) {
+    audio.state = "unavailable";
+    audio.detail = "video only, as asked";
+    return { path: made.out, dir: made.dir, audio, notes };
+  }
+  let wav = null;
+  try {
+    const raw = await win.webContents.executeJavaScript(
+      glassParts.broadcastQuestion(made.from.toFixed(3), made.to.toFixed(3)), true);
+    const got = JSON.parse(String(raw));
+    if (got && got.ok) wav = Buffer.from(got.b64, "base64");
+    else audio.detail = String((got && got.why) || "the ring did not answer");
+  } catch (error) {
+    audio.detail = error.message;
+  }
+  if (!wav || wav.length <= 44) {
+    audio.state = "unavailable";
+    if (!audio.detail) audio.detail = "the broadcast ring held nothing for that window";
+    notes.push("no broadcast audio: " + audio.detail);
+    return { path: made.out, dir: made.dir, audio, notes };
+  }
+  const wavPath = path.join(made.dir, "broadcast.wav");
+  const out = path.join(made.dir, "with-sound.mp4");
+  try {
+    fs.writeFileSync(wavPath, wav);
+    await clipMux.mux({ video: made.out, broadcast: { path: wavPath, offset: 0 },
+      mic: null, gains: {}, inPoint: 0, outPoint: made.seconds, out },
+      { ffmpeg: (readConfig() || {}).ffmpeg });
+    audio.present = true;
+    audio.complete = true;
+    audio.state = "captured";
+    audio.detail = "the broadcast, from PineAir's ring";
+    return { path: out, dir: made.dir, audio, notes };
+  } catch (error) {
+    audio.state = "partial";
+    audio.detail = "the sound would not lay under the picture: " + error.message;
+    notes.push(audio.detail);
+    return { path: made.out, dir: made.dir, audio, notes };
+  }
+}
+
+ipcMain.handle("replay:edit", async (_event, want) => {
+  const opts = want || {};
+  const asked = Math.max(1, Math.min(HOLD_MAX_S, Number(opts.seconds) || 60));
+  let made = null;
+  let file = "";
+  try {
+    await replayFlush(900);
+    made = await screenRing.cut({ seconds: asked, back: opts.back || 0 },
+      { ffmpeg: (readConfig() || {}).ffmpeg });
+    if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
+    const dressed = await replayWithSound(made, !!opts.video_only);
+    file = dressed.path;
+    const bytes = fs.statSync(file).size;
+    if (!bytes || bytes > 256 * 1024 * 1024) {
+      throw new Error("the capture must be between 1 byte and 256 MiB (it is "
+        + bytes + ")");
+    }
+    const cfg = readConfig() || {};
+    const name = replayName(made.seconds);
+    const response = await fetch(cfg.baseUrl + "/api/video-editor/sources", {
+      method: "POST",
+      headers: { "Content-Type": "video/mp4", Accept: "application/json",
+        "X-Capture-Audio": asciiHeader(JSON.stringify(dressed.audio)),
+        "X-Capture-Name": name.replace(/[^ -~]/g, " ").slice(0, 120),
+        ...authHeaders(cfg) },
+      body: fs.readFileSync(file)
+    });
+    const text = await response.text();
+    let body = {};
+    try { body = text ? JSON.parse(text) : {}; } catch (e) { body = { text }; }
+    if (!response.ok) {
+      throw new Error(body.detail || body.error || (response.status + " " + response.statusText));
+    }
+    const source = videoIdentity(body.source_id || body.id);
+    clipMux.forget(made.dir);
+    return { ...body, ok: true, source_id: source, id: source,
+      editor_url: "/video-editor/?source=" + source,
+      seconds: made.seconds, audio: dressed.audio, notes: dressed.notes };
+  } catch (error) {
+    /* The moment is the part that cannot be taken again. */
+    let kept = { ok: false, where: "" };
+    try {
+      if (file && fs.existsSync(file) && fs.statSync(file).size > 0) {
+        const where = path.join(replayFolder(),
+          "pinebox-original-" + Date.now() + ".mp4");
+        fs.copyFileSync(file, where);
+        kept = { ok: true, where };
+      }
+    } catch (e) { kept = { ok: false, where: "" }; }
+    if (made && made.dir) clipMux.forget(made.dir);
+    return { ok: false, detail: error.message,
+      original_saved: !!kept.ok, where: kept.where, audio: null };
+  }
+});
+
+/* THE EDITED VIDEO, KEPT.
+ *
+ * renderer/video-editor.js:292 has been calling this on a surface that never
+ * had it - a desk-only file reaching for a road only the tablet implemented.
+ * The station does the editing; this fetches the finished export and puts it
+ * in the operator's recordings folder, which is the half a browser cannot
+ * do. A file that is not finished is refused by name rather than saved
+ * half-written. */
+ipcMain.handle("replay:keep-edited", async (_event, want) => {
+  const opts = want || {};
+  try {
+    const exportId = videoIdentity(opts.export_id || opts.exportId);
+    const cfg = readConfig() || {};
+    const info = await fetchJson(cfg.baseUrl + "/api/video-editor/exports/" + exportId);
+    if (String(info.status || "") !== "complete") {
+      return { ok: false, detail: "the edited video is not ready to save ("
+        + String(info.status || "no status") + ")", export_id: exportId };
+    }
+    const response = await fetch(cfg.baseUrl + "/api/video-editor/exports/"
+      + exportId + "/file", { headers: { ...authHeaders(cfg) } });
+    if (!response.ok) {
+      throw new Error(response.status + " " + response.statusText);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    let name = String(opts.name || info.name || ("pine-edited-" + exportId + ".mp4"));
+    if (!/\.mp4$/i.test(name)) name += ".mp4";
+    const where = path.join(replayFolder(), name.replace(/[^\w.-]+/g, "-"));
+    fs.writeFileSync(where, bytes);
+    return { ok: true, where, bytes: bytes.length, export_id: exportId,
+      detail: "kept to " + where };
+  } catch (error) {
+    return { ok: false, detail: error.message };
+  }
+});
+
+/* THE CORNER PREFERENCES, WHICH THE DESK HAS NEVER HAD.
+ *
+ * hot-corners.js:1835 and :1885 have been calling these on a surface that
+ * answers neither, so the desk's corner settings lived only until the app
+ * closed. Read, or merge-and-persist; either way what settles is
+ * {enabled, tl, tr, bl, br, ring} and a set pushes that same object back
+ * into the page, exactly as the tablet's HotCorners.kt does. `ring` is the
+ * screen ring's hold and is read-only here - replayHold is the road that
+ * changes it. */
+const CORNER_KEYS = ["tl", "tr", "bl", "br"];
+
+function cornersRead() {
+  const cfg = readConfig() || {};
+  const held = cfg.hotCorners || {};
+  const out = { enabled: held.enabled !== false, ring: screenRing.state().holds };
+  for (const key of CORNER_KEYS) out[key] = String(held[key] || "");
+  return out;
+}
+
+ipcMain.handle("corners:read", () => cornersRead());
+
+ipcMain.handle("corners:set", (_event, patch) => {
+  try {
+    const cfg = readConfig() || {};
+    const held = { ...(cfg.hotCorners || {}) };
+    const given = patch || {};
+    if (Object.prototype.hasOwnProperty.call(given, "enabled")) {
+      held.enabled = !!given.enabled;
+    }
+    for (const key of CORNER_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(given, key)) {
+        held[key] = String(given[key] || "");
+      }
+    }
+    writeConfig({ hotCorners: held });
+    const settled = cornersRead();
+    /* The page is told, so a preference changed in one window is the
+     * preference the gesture uses in the next second rather than after a
+     * reload. */
+    try {
+      if (win && !win.isDestroyed()) {
+        win.webContents.executeJavaScript(
+          "try{window.PineHotCorners&&window.PineHotCorners.configure("
+          + JSON.stringify(settled) + ")}catch(e){}", true);
+      }
+    } catch (err) { /* a page that will not take it is not a failed save */ }
+    return settled;
+  } catch (error) {
+    return { ...cornersRead(), detail: error.message };
+  }
+});
+
+/* THE SAME CUT INTO THE DESK'S OWN TRIM WINDOW - a second road, not a
+ * rival. replayEdit above is the one the corner gesture uses, because that
+ * is the one the renderer's contract names; this one opens the local clip
+ * window (openClipExport) with its trim, its channels and its gains, which
+ * is a thing the tablet has no equivalent of and the desk should not lose.
+ * It is registered under a name of its own: two handlers on one channel is
+ * a throw at startup, not a fallback.
+ *
+ * openClipExport is the window the forward recorder already opens - trim,
+ * channels, gains - and it takes exactly what localClip() returns. So the
+ * ring's cut is dressed in that same shape, including the broadcast audio,
+ * which is pulled out of PineAir's ring for the window the video covers.
+ * That is the one piece that has to line up: the video is a slice of the
+ * past, so the audio must be the same slice of the past, not the last N
+ * seconds counted from now. */
+ipcMain.handle("replay:local-edit", async (_event, want) => {
+  const asked = Math.max(1, Number((want || {}).seconds) || 30);
+  try {
+    const made = await screenRing.cut({ seconds: asked, back: (want || {}).back || 0 },
+      { ffmpeg: (readConfig() || {}).ffmpeg });
+    if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
+    const notes = ["this window was recorded, not the tablet",
+      "cut out of the rolling ring - " + made.seconds.toFixed(1) + "s ending "
+      + (made.to <= 0.6 ? "now" : made.to.toFixed(1) + "s ago")];
+    if (made.clamped) {
+      notes.push("the ring did not reach the whole way back - it holds "
+        + Math.round(made.held) + "s");
+    }
+    const audio = { broadcast: null, mic: null };
+    if (!(want && want.video_only)) {
+      try {
+        const fromAgo = made.from;
+        const toAgo = made.to;
+        const raw = await win.webContents.executeJavaScript(
+          glassParts.broadcastQuestion(fromAgo.toFixed(3), toAgo.toFixed(3)), true);
+        const got = JSON.parse(String(raw));
+        if (got && got.ok) {
+          audio.broadcast = { wav: Buffer.from(got.b64, "base64"), offset: 0 };
+        } else {
+          notes.push("no broadcast audio: " + ((got && got.why) || "the ring did not answer"));
+        }
+      } catch (error) {
+        notes.push("no broadcast audio: " + error.message);
+      }
+    }
+    const mp4 = fs.readFileSync(made.out);
+    clipMux.forget(made.dir);
+    openClipExport({ ok: true, mp4, bytes: mp4.length, seconds: made.seconds,
+      at: Date.now(), audio, notes });
+    return { ok: true, seconds: made.seconds, bytes: mp4.length, held: made.held,
+      clamped: !!made.clamped, notes };
+  } catch (error) {
+    return { ok: false, detail: error.message };
   }
 });
 

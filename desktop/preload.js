@@ -29,6 +29,47 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   showInFolder: (target) => ipcRenderer.invoke("show:in-folder", target),
   pickFolder: (opts) => ipcRenderer.invoke("pick:folder", opts),
   shotView: () => ipcRenderer.invoke("shot:view"),
+  /* #1182: THE ROLLING RECORD OF THIS WINDOW, under the names the tablet
+   * answers to - hot-corners.js checks typeof on each of these and draws its
+   * export sheet out of what it finds. See screen-ring.cjs.
+   *
+   *   replayState()  -> {ok, running, seconds, holds, bytes, detail, min, max}
+   *                     `seconds` is what is HELD, which is less than `holds`
+   *                     for the first half minute after the app opens.
+   *   replayExport({seconds, upload, name?})
+   *                  -> {ok, where, bytes, asked, seconds, uploaded, detail}
+   *   replayFrames({seconds, count, back?, edge?})
+   *                  -> {ok, seconds, held, from, to, frames:[{at, image}], ...}
+   *   replayEdit({seconds, video_only}) opens the clip editor on the cut.
+   *   replayHold(seconds) sets how long the ring keeps, and remembers it.
+   *
+   * replayBegin/replayStop/replayPush are the recorder's own three, used by
+   * renderer/screen-ring.js and nothing else. replayPush is also the tell
+   * that this is the desk: the tablet's bridge has no such name. */
+  replayState: () => ipcRenderer.invoke("replay:state"),
+  replayExport: (want) => ipcRenderer.invoke("replay:export", want),
+  replayFrames: (want) => ipcRenderer.invoke("replay:frames", want),
+  replayEdit: (want) => ipcRenderer.invoke("replay:edit", want),
+  replayHold: (seconds) => ipcRenderer.invoke("replay:hold", seconds),
+  /* #1182b: the edited video comes back from the station and is kept in the
+   * operator's recordings folder - renderer/video-editor.js has been calling
+   * this on a surface that never had it. */
+  replayKeepEdited: (want) => ipcRenderer.invoke("replay:keep-edited", want),
+  /* The desk's own trim window on the same cut - its trim, its channels,
+   * its gains. The corner gesture uses replayEdit; this is the local one. */
+  replayLocalEdit: (want) => ipcRenderer.invoke("replay:local-edit", want),
+  /* The corner preferences, persisted. {enabled, tl, tr, bl, br, ring}. */
+  hotCorners: () => ipcRenderer.invoke("corners:read"),
+  hotCornersSet: (patch) => ipcRenderer.invoke("corners:set", patch),
+  /* #1182c: this window's media source id, so the recorder can open the
+   * capture without a user gesture. */
+  replaySource: () => ipcRenderer.invoke("replay:source"),
+  /* #1182d: the main process asking the recorder to close the piece it is
+   * on, so a cut can reach all the way to now. */
+  onReplayFlush: (callback) => ipcRenderer.on("replay-flush", () => callback()),
+  replayBegin: (opts) => ipcRenderer.invoke("replay:begin", opts),
+  replayStop: (why) => ipcRenderer.invoke("replay:stop", why),
+  replayPush: (buffer, meta) => ipcRenderer.invoke("replay:push", buffer, meta),
   lcdState: () => ipcRenderer.invoke("lcd:state"),
   lcdConfigure: (cfg) => ipcRenderer.invoke("lcd:configure", cfg),
   lcdDiscover: () => ipcRenderer.invoke("lcd:discover"),
