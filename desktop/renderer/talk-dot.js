@@ -683,8 +683,10 @@
     pad = null;
   }
 
-  function reportOpen(heard) {
+  var padImage = '';
+  function reportOpen(heard, image, dictateNow) {
     padClose();
+    padImage = String(image || '');
     pad = document.createElement('div');
     pad.id = 'pineReportPad';
     pad.setAttribute('style', 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);'
@@ -739,7 +741,7 @@
       if (!text) { note.textContent = 'there is nothing to send yet'; return; }
       b.disabled = true;
       note.textContent = 'sending...';
-      Promise.resolve(api().post('/api/pine-requests', {text: text, debug: !!debug.checked}))
+      Promise.resolve(api().post('/api/pine-requests', {text: text, debug: !!debug.checked, images: padImage ? [padImage] : []}))
         .then(function (got) {
           var id = got && got.submitted && got.submitted.id;
           var said = 'Filed as Pine report #' + id + '.';
@@ -755,6 +757,14 @@
     btn('Cancel', '', function () { padClose(); announce('Report cancelled.'); });
     pad.appendChild(head);
     pad.appendChild(hint);
+    if (padImage) {
+      /* 2026-09-14: the picture the key chord took rides the report. */
+      var shot = document.createElement('img');
+      shot.src = padImage;
+      shot.alt = 'the screen as it was';
+      shot.setAttribute('style', 'width:100%;max-height:34vh;object-fit:contain;border:1px solid #2a3a44;border-radius:8px;background:#000');
+      pad.appendChild(shot);
+    }
     pad.appendChild(area);
     pad.appendChild(debugRow);
     pad.appendChild(row);
@@ -766,7 +776,30 @@
     if (body.split(/\s+/).length >= 3) area.value = body;
     note.textContent = body ? 'that is what was heard after "report" - edit it, or Dictate more' : 'press Dictate and say the report';
     try { (body ? area : dictate).focus(); } catch (e) {}
+    if (dictateNow) {
+      /* the chord: the dot comes up listening at once */
+      setTimeout(function () { try { dictate.click(); } catch (e) { /* the button is there */ } }, 350);
+    }
   }
+
+  /* 2026-09-14: THE KEY CHORD ON THE TABLET. "if I press the lock button
+   * and the volume up button ... take a picture of the screen ... flash
+   * like a photograph ... the dot should come up and begin taking my
+   * speech ... then come up showing a notepad with my message on it."
+   * Android never hands an app the power key, so the kiosk listens for
+   * volume-up pressed TWICE within a moment (MainActivity.onKeyDown),
+   * takes the picture with PixelCopy, and calls this with it. */
+  function fromKey(dataUrl) {
+    try {
+      var flash = document.createElement('div');
+      flash.setAttribute('style', 'position:fixed;inset:0;background:#fff;opacity:.92;z-index:2147483045;pointer-events:none;transition:opacity .45s ease-out');
+      document.body.appendChild(flash);
+      setTimeout(function () { flash.style.opacity = '0'; }, 30);
+      setTimeout(function () { if (flash.parentNode) flash.parentNode.removeChild(flash); }, 520);
+    } catch (e) { /* the pad still opens */ }
+    reportOpen('', String(dataUrl || ''), true);
+  }
+  root.PineReport = {fromKey: fromKey, open: function (image) { reportOpen('', image || '', false); }};
 
   async function act(text) {
     /* 2026-09-14: the pad first. A capture takes the sentence as text;

@@ -844,6 +844,144 @@
     };
   }
 
+  /* 2026-09-14: THE CAUTION BUTTON AND THE ROLLING RECORD.
+   *
+   * "a caution button in the script view that when clicked / tapped files
+   *  a script analysis report ... along with a rolling report of the last
+   *  5 seconds of script viewer motion with the actively selected element
+   *  in an information dense SHA style format separated by | symbols ...
+   *  the script entries up and down the page for the last 20 entries up
+   *  and the last 10 entries down ... scripts not having their lines
+   *  inserted sequentially ... it's jumping up and down pages."
+   *
+   * So the view keeps a RING of its own motion, sampled four times a
+   * second while mounted: which element is lit, where it sits in page
+   * order, its block.ord from the ledger (#1330), the pane's scroll
+   * position and what the playhead reads. The report carries the last
+   * fifteen seconds of that (more than asked - the moment before the
+   * jump is the one worth having), plus the twenty elements above and
+   * ten below the lit one at the moment of the tap. Both are pipe rows
+   * with a legend, and the station's side of the report (app.py
+   * script_report_reading) reads them back: backward jumps, page-sized
+   * jumps, and rows whose block.ord runs against page order. */
+  var motion = [];
+  var MOTION_MS = 250;
+  var MOTION_KEEP = 60;
+  var motionTimer = 0;
+  var lastMotionIndex = -1;
+  var offScreenFor = 0;
+
+  function elOrder(node) {
+    var b = node && node.dataset ? node.dataset.block : '';
+    var o = node && node.dataset ? node.dataset.ord : '';
+    return (b || o) ? (String(b || '-') + '.' + String(o || '-')) : '-';
+  }
+  function elWho(all, i) {
+    /* the nearest character heading above, as the screenplay says it */
+    for (var k = i; k >= 0 && k > i - 40; k -= 1) {
+      if (all[k].classList.contains('sp-character')) return String(all[k].textContent || '').trim().slice(0, 12);
+    }
+    return '';
+  }
+  function elKind(node) {
+    var m = /\bsp-([a-z_-]+)/.exec(String(node.className || '').replace('sp-el', '').replace('sp-now', ''));
+    return m ? m[1] : '';
+  }
+  function short(t, n) {
+    return String(t || '').replace(/\s+/g, ' ').replace(/\|/g, '/').trim().slice(0, n);
+  }
+  function sampleMotion() {
+    var pane = el('spScript');
+    if (!pane) return;
+    var all = pane.querySelectorAll('.sp-el');
+    var lit = pane.querySelector('.sp-el.sp-now');
+    var idx = -1;
+    if (lit) { for (var i = 0; i < all.length; i += 1) { if (all[i] === lit) { idx = i; break; } } }
+    var head = null;
+    try { head = bridgeHead(); } catch (e) { head = null; }
+    var pos = head && typeof head.position === 'number' ? head.position.toFixed(1)
+      : head && typeof head.at === 'number' ? head.at.toFixed(1) : '';
+    var row = [
+      new Date().toISOString().slice(11, 23),
+      idx,
+      idx >= 0 && lastMotionIndex >= 0 ? (idx - lastMotionIndex) : '',
+      lit && lit.dataset ? String(lit.dataset.line || '').slice(0, 8) : '',
+      lit ? elOrder(lit) : '',
+      Math.round(pane.scrollTop),
+      lit ? Math.round(lit.getBoundingClientRect().top - pane.getBoundingClientRect().top) : '',
+      pos ? 'r' + pos : 'e',
+      lit ? short(lit.textContent, 28) : ''
+    ].join('|');
+    lastMotionIndex = idx;
+    motion.push(row);
+    /* 2026-09-14: THE LIT LINE, OFF SCREEN, WITH FOLLOW ON (report #1131:
+     * lit_top -3965 px for fifteen seconds). markNow only scrolls when
+     * the id CHANGES, so a re-fit, a fold or a long record line could
+     * leave the mark out of view for as long as the line lasted. If the
+     * mark has been off the pane for two seconds while following and no
+     * scroll of ours is in flight, bring it back the gentle way. */
+    try {
+      if (lit && follow && Date.now() >= selfScrollUntil) {
+        var pr = pane.getBoundingClientRect(), lr = lit.getBoundingClientRect();
+        var onScreen = lr.bottom > pr.top && lr.top < pr.bottom;
+        offScreenFor = onScreen ? 0 : offScreenFor + 1;
+        if (offScreenFor >= 8) {
+          offScreenFor = 0;
+          selfScrollUntil = Date.now() + 1200;
+          lit.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+        }
+      } else { offScreenFor = 0; }
+    } catch (e) { offScreenFor = 0; }
+    if (motion.length > MOTION_KEEP) motion.splice(0, motion.length - MOTION_KEEP);
+    ensureCaution();
+  }
+  var MOTION_LEGEND = 'time|lit_index|delta_index|line8|block.ord|scrollTop|lit_top_px|head(r=read secs,e=estimated)|text28';
+  var WINDOW_LEGEND = 'index|delta|line8|el8|block.ord|kind|who|secs|text64';
+
+  function reportWindow(all, litIndex) {
+    var rows = [];
+    if (!all.length) return rows;
+    var from = litIndex >= 0 ? Math.max(0, litIndex - 20) : 0;
+    var to = litIndex >= 0 ? Math.min(all.length - 1, litIndex + 10) : Math.min(all.length - 1, 30);
+    for (var i = from; i <= to; i += 1) {
+      var n = all[i];
+      rows.push([
+        i, litIndex >= 0 ? (i - litIndex) : '',
+        String(n.dataset.line || '').slice(0, 8), String(n.dataset.el || '').slice(0, 8),
+        elOrder(n), elKind(n), elWho(all, i), n.dataset.secs || '',
+        short(n.textContent, 64)
+      ].join('|'));
+    }
+    return rows;
+  }
+
+  var reportKind = 'report';
+  function ensureCaution() {
+    var pane = el('spScript');
+    if (!pane) return;
+    var wrap = document.getElementById('spCautionWrap');
+    if (wrap && wrap.parentNode === pane && pane.firstChild === wrap) return;
+    if (!wrap) {
+      wrap = make('div', 'sp-caution-wrap', '');
+      wrap.id = 'spCautionWrap';
+      var b = make('button', 'sp-caution', '');
+      b.type = 'button';
+      b.title = 'The script is erratic, out of order or jumping? Tap: the last fifteen seconds of this view\'s motion and the lines around the mark go to the Pine inbox for analysis';
+      b.setAttribute('aria-label', 'Report the script as erratic');
+      try { if (typeof root.pineIcon === 'function') b.innerHTML = root.pineIcon('c:warning--alt', 'Report the script as erratic'); } catch (e) { /* text */ }
+      if (!b.innerHTML) b.textContent = '!';
+      b.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        reportKind = 'caution';
+        b.classList.add('sp-firing');
+        try { reportFire(b); } finally { setTimeout(function () { reportKind = 'report'; }, 100); }
+      });
+      wrap.appendChild(b);
+    }
+    pane.insertBefore(wrap, pane.firstChild);
+  }
+
   function reportGather() {
     var pane = el('spScript');
     var paneRect = pane ? pane.getBoundingClientRect()
@@ -874,7 +1012,12 @@
     }
     return {
       request: 1115,
+      kind: reportKind,
       at: Date.now(),
+      motionLegend: MOTION_LEGEND,
+      motion: motion.slice(),
+      windowLegend: WINDOW_LEGEND,
+      window: reportWindow(all, litIndex),
       hourKey: hourKey,
       beforeKey: beforeKey,
       fetchedAgeMs: fetchedAt ? Date.now() - fetchedAt : null,
@@ -1188,8 +1331,8 @@
       + '<button id="spMixDot" class="sp-mixdot" type="button" '
       + 'title="Levels: voices, music, SFX, videos" aria-label="Levels"></button>'
       + '<div class="sp-transport">'
-      + '<button id="spPrev" class="sp-tbtn" title="The station’s previous track">⏮</button>'
-      + '<button id="spNext" class="sp-tbtn" title="Skip to the next track">⏭</button>'
+      + '<button id="spPrev" class="sp-tbtn" title="The station’s previous track" aria-label="The station’s previous track">⏮</button>'
+      + '<button id="spNext" class="sp-tbtn" title="Skip to the next track" aria-label="Skip to the next track">⏭</button>'
       + '</div>';
     return box;
   }
@@ -3215,6 +3358,7 @@
   }
 
   function mount(node) {
+    if (!motionTimer) motionTimer = setInterval(function () { try { sampleMotion(); } catch (e) { /* the ring is a courtesy */ } }, MOTION_MS);   /* 2026-09-14 */
     if (mounted) return Promise.resolve(true);
     build(node);
     wirePlayer();

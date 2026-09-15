@@ -60,6 +60,11 @@
         <!-- 2026-09-10: whether this app is the newest source on the
              share, so the mark says whether it needs pressing. -->
         <p id="buildLine" class="build-line"></p>
+        <!-- 2026-09-14: whether the endless video set is running; a click
+             flips it. Painted by sfx-tv.js from the ring's own answer. -->
+        <p id="endlessLine" class="build-line" hidden
+           title="Endless video - the clips one after another, at random. Click to switch it on or off."
+           style="cursor:pointer"></p>
       </div>
       <!-- OFF AIR, WHICH IS NOT OFF. The FM switch below stops the
            station and every service under it. This shuts only the door
@@ -67,7 +72,7 @@
            crystal keep working, and everything they make is banked for
            when you come back. -->
       <button id="airPauseBtn" class="air-pause"
-              title="Go off air without stopping the booth">&#9208;</button>
+              title="Go off air without stopping the booth" aria-label="Go off air without stopping the booth">&#9208;</button>
     </div>
     <section class="route-panel">
       <label class="fm-row" for="fmSwitch">
@@ -501,14 +506,14 @@
       </div>
       <div class="top-actions">
         <button id="reloadFrameBtn" title="Reload current panel">R</button>
-        <button id="fullscreenBtn" title="Hide desktop chrome">[]</button>
-        <button id="openBrowserBtn" title="Open in browser">^</button>
-        <button id="refreshBtn" title="Refresh status">!</button>
+        <button id="fullscreenBtn" title="Hide desktop chrome" aria-label="Hide desktop chrome">[]</button>
+        <button id="openBrowserBtn" title="Open in browser" aria-label="Open in browser">^</button>
+        <button id="refreshBtn" title="Refresh status" aria-label="Refresh status">!</button>
         <!-- #1043b: the endless press - split the main area and run
              every Gazette issue, newspaper then tabloid, down the
              right half. The same page the web panel opens. -->
         <button id="slidesSplitBtn"
-                title="The endless press - every Gazette issue scrolling down the right half">&#128478;</button>
+                title="The endless press - every Gazette issue scrolling down the right half" aria-label="The endless press - every Gazette issue scrolling down the right half">&#128478;</button>
       </div>
     </header>
 
@@ -655,7 +660,7 @@
   <aside id="stationDrawer" class="station-drawer" hidden>
     <div class="drawer-head">
       <b>○ The Station</b>
-      <button id="stationClose" title="Close">✕</button>
+      <button id="stationClose" title="Close" aria-label="Close">✕</button>
     </div>
     <div class="drawer-body">
       <section id="sparkSection">
@@ -668,7 +673,7 @@
         </div>
         <div class="drawer-row">
           <button id="sparkRestart">🌲 Restart agent</button>
-          <button id="sparkRefresh">↻</button>
+          <button id="sparkRefresh" title="Refresh" aria-label="Refresh">↻</button>
         </div>
       </section>
       <section>
@@ -679,8 +684,8 @@
         </div>
         <div class="drawer-row">
           <input id="pubLink" readonly placeholder="the shareable link lands here">
-          <button id="pubCopy" title="Copy the link">⧉</button>
-          <button id="pubOpen" title="Open in browser">↗</button>
+          <button id="pubCopy" title="Copy the link" aria-label="Copy the link">⧉</button>
+          <button id="pubOpen" title="Open in browser" aria-label="Open in browser">↗</button>
         </div>
         <div class="drawer-row">
           <button id="pubRecheck">↻ Re-check</button>

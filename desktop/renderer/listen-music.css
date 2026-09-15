@@ -923,3 +923,86 @@
 @media (prefers-reduced-motion: reduce) {
   .pl-pad.busy i { animation: none; }
 }
+
+/* THE ENDLESS SET AS THE BACKDROP (listen.js paintEndless).
+   "In endless video mode replace the background of the page ... just have
+   the background be the video's loading." The same element the gallery
+   uses for its occasional clip, with a little more presence than a
+   wallpaper still gets: the operator asked for the video to BE the
+   background, not to hide behind the shade. Still under the text - the
+   shade gradient above it is what keeps the headline readable. */
+.pl-back-vid.pl-endless {
+  object-fit: cover;
+  opacity: .58;
+  filter: none;
+}
+
+/* THE LINE ON AIR, AS A MARQUEE, WITH THE VOICE UNDER IT (listen.js
+   paintSaid / drawSpectrogram).
+   Last in the controls row and the full width of it, so the buttons stay
+   on one line above and the text has the whole width to travel. The
+   track holds the line twice and moves by exactly one copy per cycle -
+   that is the seam-free loop; the duration is set from the measured
+   width by the script so the speed stays ~90 px/s whatever the length.
+   The mask fades the edges rather than cutting them. */
+.pl-said {
+  order: 20;
+  flex: 1 1 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 2px;
+}
+.pl-marquee {
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: var(--text, #dfe7ee);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 3%, #000 97%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 3%, #000 97%, transparent 100%);
+  transition: opacity 600ms ease;
+}
+.pl-marquee-track {
+  display: inline-flex;
+  will-change: transform;
+  animation: plMarquee 12s linear infinite;
+}
+.pl-said-copy {
+  display: inline-block;
+  white-space: nowrap;
+  box-sizing: border-box;
+  padding-right: 4em;
+}
+/* The speaker, in a colour the text is not. */
+.pl-said-copy b {
+  color: var(--cyan, #65c7da);
+  font-weight: 700;
+  margin-right: .6em;
+}
+/* Nothing being said: the last line stays, dimmed. */
+.pl-said.dim .pl-marquee { opacity: .42; }
+@keyframes plMarquee {
+  from { transform: translate3d(0, 0, 0); }
+  to   { transform: translate3d(-50%, 0, 0); }
+}
+
+/* A fixed height for the same reason the meters have one: a canvas in a
+   flex column has no size of its own. */
+.pl-said-spec {
+  display: block;
+  width: 100%;
+  height: 48px;
+  border-radius: 6px;
+  background: #05080a;
+}
+.pl-said-note {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--muted, #8fa0ad);
+}
+.pl-said-note:empty { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .pl-marquee-track { animation: none; }
+}

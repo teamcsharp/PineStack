@@ -643,6 +643,7 @@
       if (playing) sheet(playing);
     });
 
+    if (veiled) host.style.visibility = 'hidden';   /* 2026-09-14: the listen view has it */
     host.appendChild(screen);
     grip(host);
     /* A sibling of <main>, never inside a view: that is the whole reason
@@ -1468,6 +1469,14 @@
     try {
       var got = await api().get('/api/dj/video?since=' + seen);
       var serverMs = Number((got && got.server_ms) || now());
+      if (got && typeof got.endless === 'boolean') {
+        endlessPaint(got.endless);
+        if (!got.endless) {
+          /* 2026-09-14: off means off - the rung-ahead copies go */
+          for (var qi = queue.length - 1; qi >= 0; qi -= 1) { if (queue[qi].endless) queue.splice(qi, 1); }
+          if (warm && warm.clip && warm.clip.endless) warmDrop();
+        }
+      }
       ((got && got.clips) || []).forEach(function (clip) {
         seen = Math.max(seen, Number(clip.ts || 0));
         /* The station's clock, carried onto this one - the box and this
@@ -1479,7 +1488,140 @@
     } finally { busy = false; }
   }
 
+  /* 2026-09-14: "whenever I turn off endless video mode ... it turns
+   * off." The station withdraws what it rang ahead; this drops the copies
+   * this set already holds (queue and warm), and the clip on the tube
+   * simply finishes. And the switch is SHOWN: a line in the desk's
+   * sidebar and an ENDLESS tab on the tablet's rail, each a toggle. */
+  var endlessOn = null;
+  var veiled = false;
+
+  function endlessPaint(on) {
+    on = !!on;
+    if (on === endlessOn) return;
+    endlessOn = on;
+    var line = document.getElementById('endlessLine');
+    if (line) {
+      line.hidden = false;
+      line.textContent = on ? 'endless video: on - click for the dials'
+                            : 'endless video: off - click for the dials';
+      line.classList.toggle('on', on);
+      if (!line.__wired) {
+        line.__wired = true;
+        line.addEventListener('click', function (ev) { ev.stopPropagation(); endlessSheet(); });
+      }
+    }
+    var rail = document.getElementById('pineViewRail');
+    if (rail) {
+      var tab = document.getElementById('pineViewTab-endless');
+      if (!tab) {
+        tab = document.createElement('button');
+        tab.id = 'pineViewTab-endless';
+        tab.type = 'button';
+        tab.className = 'pine-view-tab pine-view-tab-endless';
+        tab.textContent = 'ENDLESS';
+        tab.title = 'Endless video - the clips one after another. Tap to switch it on or off.';
+        tab.addEventListener('click', function (ev) { ev.stopPropagation(); endlessSheet(); });
+        rail.appendChild(tab);
+      }
+      tab.classList.toggle('on', on);
+      tab.style.color = on ? '#54d18b' : '';
+    }
+  }
+
+  /* 2026-09-14: "tap it and have parameters for adjusting the frequency
+   * in which MP4 videos are played on general broadcast compared to MP3s.
+   * And also the average length of video that is grabbed when using
+   * endless video." The indicator opens this sheet: the switch, the
+   * picture share (#1366's dial - what share of the SFX guy's clips carry
+   * a picture) and the clip length the book aims for (0 = any). Every
+   * change posts to /api/sfx/video/mode, which is the station's held
+   * setting, so it survives restarts and reaches every surface. */
+  var sheetEl = null;
+  function endlessSheet() {
+    if (sheetEl && sheetEl.parentNode) { sheetEl.parentNode.removeChild(sheetEl); sheetEl = null; return; }
+    if (!api() || !api().get) return;
+    var box = document.createElement('div');
+    box.id = 'sfxEndlessSheet';
+    box.setAttribute('style', 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);'
+      + 'width:min(92vw,420px);padding:14px 16px;border:1px solid #2a3a44;border-radius:12px;'
+      + 'background:#0b1116;color:#dfe7ee;font:14px/1.4 system-ui,sans-serif;z-index:2147483040;'
+      + 'box-shadow:0 18px 60px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:10px');
+    box.setAttribute('data-pine-drag', '1');
+    var head = document.createElement('b');
+    head.textContent = 'Endless video';
+    head.setAttribute('data-pine-drag-handle', '1');
+    head.style.cursor = 'move';
+    var note = document.createElement('div');
+    note.setAttribute('style', 'color:#9fb3c0;font-size:12px;min-height:16px');
+    function row(label, min, max, step, val, fmt, key) {
+      var wrap = document.createElement('label');
+      wrap.setAttribute('style', 'display:flex;flex-direction:column;gap:4px;font-size:12px;color:#9fb3c0');
+      var top = document.createElement('span');
+      var out = document.createElement('b');
+      out.style.color = '#dfe7ee';
+      top.textContent = label + ': ';
+      top.appendChild(out);
+      var r = document.createElement('input');
+      r.type = 'range'; r.min = String(min); r.max = String(max); r.step = String(step); r.value = String(val);
+      r.style.width = '100%';
+      var paint = function () { out.textContent = fmt(Number(r.value)); };
+      paint();
+      r.addEventListener('input', paint);
+      r.addEventListener('change', function () {
+        var body = {}; body[key] = Number(r.value);
+        note.textContent = 'saving...';
+        api().post('/api/sfx/video/mode', body).then(function (got) {
+          note.textContent = String((got && got.say) || 'saved');
+        }, function (err) { note.textContent = String((err && err.message) || err).slice(0, 80); });
+      });
+      wrap.appendChild(top); wrap.appendChild(r);
+      return wrap;
+    }
+    var sw = document.createElement('button');
+    sw.type = 'button';
+    sw.setAttribute('style', 'min-height:40px;border-radius:8px;border:1px solid #2c7a8c;background:#1d4d5a;color:#dfe7ee;font-size:14px;cursor:pointer');
+    var paintSw = function (on) { sw.textContent = on ? 'ON - tap to stop the set' : 'OFF - tap to start the set'; sw.style.background = on ? '#1d5a3a' : '#1d4d5a'; };
+    sw.addEventListener('click', function (ev) { ev.stopPropagation(); endlessFlip(); setTimeout(function () { paintSw(!!endlessOn); }, 800); });
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = 'Close';
+    close.setAttribute('style', 'min-height:36px;border-radius:8px;border:1px solid #2a3a44;background:#111922;color:#dfe7ee;cursor:pointer');
+    close.addEventListener('click', function (ev) { ev.stopPropagation(); endlessSheet(); });
+    box.appendChild(head);
+    box.appendChild(sw);
+    box.appendChild(note);
+    document.body.appendChild(box);
+    sheetEl = box;
+    api().get('/api/sfx/video/mode').then(function (st) {
+      paintSw(!!(st && st.on));
+      box.insertBefore(row('Pictures among the SFX guy\'s clips', 0, 100, 1, Number((st && st.dial) || 0),
+        function (v) { return v + '% of his clips carry a picture (mp4 vs mp3)'; }, 'share'), note);
+      box.insertBefore(row('Clip length the endless set aims for', 0, 60, 1, Number((st && st.length) || 0),
+        function (v) { return v ? ('about ' + v + ' seconds (draws between ' + Math.round(v * 0.6) + ' and ' + Math.round(v * 1.6) + ')') : 'any length in the library'; }, 'length'), note);
+      box.appendChild(close);
+      note.textContent = String((st && st.say) || '');
+    }, function (err) { note.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 60); box.appendChild(close); });
+  }
+
+  function endlessFlip() {
+    if (!api() || !api().post) return;
+    var want = !endlessOn;
+    endlessOn = null;                               /* repaint on the next answer */
+    api().post('/api/sfx/video/mode', {on: want}).then(function (got) {
+      endlessPaint(!!(got && got.on));
+      if (!want) { queue.length = 0; warmDrop(); if (hold) { clearTimeout(hold); hold = null; } }
+    }, function () { /* the next poll paints the truth */ });
+  }
+
   root.PineSfxTv = {
+    /* 2026-09-14: for the LISTEN view's backdrop - is the set on, and
+       hide the floating set while the view shows the clip as wallpaper. */
+    endless: function () { return !!endlessOn; },
+    veil: function (on) {
+      veiled = !!on;
+      try { if (host) host.style.visibility = veiled ? 'hidden' : ''; } catch (err) { /* no set up */ }
+    },
     mount: function (opts) {
       if (mounted) return;
       mounted = true;

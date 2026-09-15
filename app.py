@@ -1253,6 +1253,10 @@ DEFAULT_DJ = {
     # #1366: the endless set. Off by default - it changes what the
     # operator's own screens are doing, so it only ever starts by hand.
     "sfx_video_mode": False,
+    # 2026-09-14: "the average length of video that is grabbed when using
+    # endless video" - the clip length the book's pick aims for, in
+    # seconds; 0 means any length the library holds.
+    "sfx_video_len": 0,
     "sfx_every_units": 0,
     "sfxguy_every_units": 4,
     # #799: how often what he says is a freshly WARPED invention (0-100).
@@ -2296,6 +2300,7 @@ def validate_settings(data: Any) -> dict[str, Any]:
         # deliberate 0 into the default on every other dial here, which is
         # why this one asks whether the key is present instead - "sound
         # only" is a setting somebody may actually want.
+        "sfx_video_len": max(0, min(120, int(raw_dj.get("sfx_video_len") or 0))),
         "sfx_video_share": max(0, min(100, int(
             raw_dj.get("sfx_video_share",
                        DEFAULT_DJ["sfx_video_share"]) if
@@ -23969,6 +23974,8 @@ def page_picture_append(clip: dict[str, Any], at_ms: int = 0) -> dict[str, Any]:
         # #1395: ...unless the caller is planning ahead on purpose.
         "broadcast_ms": int(at_ms) if at_ms and int(at_ms) > stamp else stamp,
     }
+    if clip.get("endless"):
+        rung["endless"] = True             # 2026-09-14: the set may drop it
     for edge in ("from", "to"):
         try:
             value = float(clip.get(edge))
@@ -67418,7 +67425,8 @@ async def sfx_video_cycle() -> None:
             start = max(now, last_end + SFX_CYCLE_GAP)
             page_picture_append({
                 "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
-                "sting": pick.stem, "id": key, "seconds": seconds},
+                "sting": pick.stem, "id": key, "seconds": seconds,
+                "endless": True},          # 2026-09-14: withdrawable
                 at_ms=int(start * 1000))
             plan.append({"sting": pick.stem, "start": start,
                          "end": start + seconds})
@@ -67440,6 +67448,7 @@ def sfx_video_mode_state() -> dict[str, Any]:
     cycle["left"] = max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1))
     return {"on": sfx_video_mode_on(), "share": sfx_video_share(),
             "dial": int((dj_settings() or {}).get("sfx_video_share") or 0),
+            "length": int((dj_settings() or {}).get("sfx_video_len") or 0),
             "cycle": cycle, "pool": len(_SFX_VIDEO_MEMO.get("pool") or []),
             # #1395: the book is what the set is fed from now.
             "book": sfx_db_counts().get("video_playable", 0),
@@ -90208,6 +90217,19 @@ async def generate_answer(
     # outrank every detector below - the memory road included, because
     # "remember that I like more callers" is an order to the station, not
     # a fact for the agent to file.
+    # 2026-09-14: "whenever I ask the orchestrator what happened" - the
+    # newest script report's verdict and explanation, and the last ten
+    # minutes of gaps, said plainly. A question, so it stays under the
+    # commands and above the model.
+    if parse_what_happened(user_text):
+        feature_meta["system_status_used"] = True
+        return (await asyncio.to_thread(script_happened_words)), {
+            **feature_meta,
+            "active_prompt": prompt_entry["name"],
+            "model": "script-report",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
     export_cmd = parse_export_command(user_text)
     directive_cmd = None if export_cmd else parse_directive(user_text)
     manual_cmd = (None if (export_cmd or directive_cmd
@@ -102576,7 +102598,7 @@ async def dj_video_api(
     # the endless set is the operator's explicit choice and rolls on.
     if radio_paused() and not sfx_video_mode_on():
         return {"clips": [], "server_ms": server_ms,
-                "cut_ms": cut_ms, "paused": True}
+                "cut_ms": cut_ms, "paused": True, "endless": False}
     out = []
     for clip in list(_RADIO.get("voice_clips") or [])[-80:]:
         if not clip.get("video"):
@@ -102590,7 +102612,8 @@ async def dj_video_api(
         if server_ms > broadcast + grace:
             continue
         out.append({**clip, "broadcast_ms": broadcast})
-    return {"clips": out, "server_ms": server_ms, "cut_ms": cut_ms}
+    return {"clips": out, "server_ms": server_ms, "cut_ms": cut_ms,
+            "endless": sfx_video_mode_on()}         # 2026-09-14
 
 
 @app.post("/api/dj/voice/ack")
@@ -107142,6 +107165,193 @@ def _view_num(view: dict[str, Any], *keys: str) -> float:
             continue
     return 0.0
 
+def script_sequence_check(view: dict[str, Any]) -> dict[str, Any]:
+    """2026-09-14: the caution button's question, answered from the page's
+    own record. `motion` rows: time|lit_index|delta|line8|block.ord|
+    scrollTop|lit_top|head|text. `window` rows: index|delta|line8|el8|
+    block.ord|kind|who|secs|text. Backward jumps and page-sized jumps in
+    the motion are the 'jumping up and down'; a window whose block.ord
+    falls while its index rises is a page that was not laid out in the
+    ledger's order."""
+    out: dict[str, Any] = {"motion_rows": 0, "backward_jumps": [], "big_jumps": [],
+                           "lit_changes": 0, "unlit_samples": 0, "order_faults": [],
+                           "window_rows": 0}
+    rows = [r for r in (view.get("motion") or []) if isinstance(r, str)]
+    out["motion_rows"] = len(rows)
+    prev_idx = None
+    prev_line = None
+    for r in rows:
+        f = r.split("|")
+        if len(f) < 9:
+            continue
+        try:
+            idx = int(f[1])
+        except ValueError:
+            idx = -1
+        if idx < 0:
+            out["unlit_samples"] += 1
+        if f[3] and f[3] != prev_line:
+            if prev_line is not None:
+                out["lit_changes"] += 1
+            prev_line = f[3]
+        if prev_idx is not None and idx >= 0 and prev_idx >= 0:
+            d = idx - prev_idx
+            if d < 0:
+                out["backward_jumps"].append({"at": f[0], "from": prev_idx, "to": idx, "line": f[3], "order": f[4]})
+            if abs(d) > 15:
+                out["big_jumps"].append({"at": f[0], "from": prev_idx, "to": idx, "line": f[3], "order": f[4]})
+        if idx >= 0:
+            prev_idx = idx
+    win = [r for r in (view.get("window") or []) if isinstance(r, str)]
+    out["window_rows"] = len(win)
+    last: tuple[int, int] | None = None
+    last_row = ""
+    for r in win:
+        f = r.split("|")
+        if len(f) < 9:
+            continue
+        got = re.match(r"^(\d+)\.(\d+)$", f[4] or "")
+        if not got:
+            continue
+        cur = (int(got.group(1)), int(got.group(2)))
+        if last is not None and cur < last:
+            out["order_faults"].append({"index": f[0], "line": f[2], "order": f[4],
+                                        "after": last_row, "kind": f[5]})
+        last, last_row = cur, f[4]
+    return out
+
+
+def script_explain(view: dict[str, Any], reading: dict[str, Any]) -> list[str]:
+    """2026-09-14: "I need the orchestrator capable of explaining to me what
+    it is that happened." For every jump the report measured, the ledger
+    is asked which block each side belongs to, whether the same round was
+    committed as more than one block (the twin call of #1129/#1130: block
+    6505 at 20:03:14 and 6511 at 20:04:06, one aired, one not), and what
+    the air log says aired between them. Plain sentences, for a person."""
+    out: list[str] = []
+    try:
+        led = script_ledger_rows()
+    except Exception:  # noqa: BLE001
+        return ["the ledger could not be read"]
+    by_line: dict[str, dict[str, Any]] = {}
+    by_block: dict[int, list[dict[str, Any]]] = {}
+    for r in led:
+        lid = str(r.get("line_id") or "")
+        if lid:
+            by_line[lid] = r
+        try:
+            by_block.setdefault(int(r.get("block") or 0), []).append(r)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def find(line8: str) -> dict[str, Any] | None:
+        if not line8:
+            return None
+        for lid, r in by_line.items():
+            if lid.startswith(line8):
+                return r
+        return None
+
+    def when(r: dict[str, Any] | None) -> str:
+        try:
+            return time.strftime("%H:%M:%S", time.localtime(float((r or {}).get("at") or 0)))
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    seq = reading.get("sequence") or {}
+    win = [str(r) for r in (view.get("window") or [])]
+    win_ids = [w.split("|")[2] for w in win if w.count("|") >= 8]
+    # twins: a round committed as more than one block among the window's blocks
+    sids: dict[str, set[int]] = {}
+    for w in win:
+        f = w.split("|")
+        if len(f) < 9:
+            continue
+        r = find(f[2])
+        if r and r.get("sid"):
+            sids.setdefault(str(r["sid"]), set()).add(int(r.get("block") or 0))
+    for sid, blocks in sids.items():
+        if len(blocks) > 1:
+            bl = sorted(blocks)
+            firsts = [by_block.get(b, [{}])[0] for b in bl]
+            out.append("the %s round %s was committed as %d blocks - %s - so the page carries "
+                       "the same lines %d times; the earlier copies never aired and read as "
+                       "planned lines, and anything stamped between them lands inside them"
+                       % (str(firsts[0].get("round") or "?"), sid[:10], len(bl),
+                          ", ".join("block %d at %s" % (b, when(f)) for b, f in zip(bl, firsts)),
+                          len(bl)))
+    for kind, label in (("backward_jumps", "backwards"), ("big_jumps", "a page")):
+        for j in (seq.get(kind) or [])[:3]:
+            to = find(str(j.get("line") or ""))
+            if to is None:
+                out.append("at %s the mark jumped %s (index %s -> %s) to line %s, which the ledger "
+                           "does not hold - an unledgered element (a record, a sting off the "
+                           "board, a filler) placed by its clock slot"
+                           % (j.get("at"), label, j.get("from"), j.get("to"), j.get("line")))
+            else:
+                out.append("at %s the mark jumped %s (index %s -> %s) to %s/%s of block %d "
+                           "(%s, committed %s%s)"
+                           % (j.get("at"), label, j.get("from"), j.get("to"),
+                              to.get("who"), to.get("kind"), int(to.get("block") or 0),
+                              str(to.get("round") or "?"), when(to),
+                              ", not scripted - welded in" if not to.get("scripted", True) else ""))
+    for f in (seq.get("order_faults") or [])[:2]:
+        r = find(str(f.get("line") or ""))
+        out.append("index %s (%s, block.ord %s) sits below %s on the page: the page's order is "
+                   "not the ledger's there%s"
+                   % (f.get("index"), f.get("line"), f.get("order"), f.get("after"),
+                      (" - block %d was committed %s" % (int(r.get("block") or 0), when(r))) if r else ""))
+    if not out:
+        out.append("nothing in the ledger contradicts the page: the mark moved as the script was written")
+    return out[:8]
+
+
+def script_happened_words() -> str:
+    """The orchestrator's answer to "what happened": the newest caution
+    report's verdict and explanation, and the last ten minutes of the gap
+    log, in a few spoken sentences."""
+    bits: list[str] = []
+    try:
+        files = sorted(SCRIPT_REPORTS_DIR.glob("script_*.md"), key=lambda p: p.stat().st_mtime)
+        if files:
+            txt = files[-1].read_text(encoding="utf-8", errors="ignore")
+            age = time.time() - files[-1].stat().st_mtime
+            got = re.search(r"^## What the station says happened\n(.*?)(?=^## |\Z)", txt, re.S | re.M)
+            ver = re.search(r"^## Verdict\n(.*?)(?=^## |\Z)", txt, re.S | re.M)
+            lines = [l.lstrip("- ").strip() for l in ((got.group(1) if got else "") + "\n" + (ver.group(1) if ver else "")).splitlines() if l.strip().startswith("-")]
+            if lines:
+                bits.append("The last script report was %d minutes ago. %s" % (int(age // 60), " ".join(l.rstrip(".") + "." for l in lines[:3])))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        now = time.time()
+        rows = [r for r in gap_rows(now=now) if isinstance(r, dict) and now - float(r.get("at") or 0) < 600]
+        if rows:
+            causes: dict[str, int] = {}
+            for r in rows:
+                causes[str(r.get("cause") or "?")] = causes.get(str(r.get("cause") or "?"), 0) + 1
+            dead = sum(float(r.get("seconds") or 0) for r in rows)
+            bits.append("In the last ten minutes there were %d gaps, %d seconds of dead air, mostly %s."
+                        % (len(rows), int(dead), max(causes, key=causes.get)))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        bits.append(str(pulse_report(600).get("reading") or "").rstrip(".") + ".")
+    except Exception:  # noqa: BLE001
+        pass
+    return " ".join(b for b in bits if b) or "I have no script report and no gaps to explain."
+
+
+_HAPPENED_RX = re.compile(
+    r"^(?:pine\s*box[, ]+)?(?:so[, ]+)?(?:what|why)\b.{0,40}\b(?:happen|went wrong|go wrong|"
+    r"jump|jumped|glitch|broke|broken|erratic|out of order|highlight|script)", re.I)
+
+
+def parse_what_happened(text: str) -> bool:
+    t = " ".join(str(text or "").lower().split()).rstrip("?!. ")
+    return bool(t) and len(t) < 160 and bool(_HAPPENED_RX.match(t))
+
+
 
 def script_report_reading(view: dict[str, Any]) -> dict[str, Any]:
     """#1115: the station's side of the picture - what it is saying, where
@@ -107220,12 +107430,52 @@ def script_report_reading(view: dict[str, Any]) -> dict[str, Any]:
                        "exists but is not where the eye is" % view.get("follow"))
     except Exception:  # noqa: BLE001
         pass
+    try:
+        seq = script_sequence_check(view)
+        out["sequence"] = seq
+        if seq.get("backward_jumps"):
+            j = seq["backward_jumps"]
+            why.append("the mark jumped BACKWARDS %d time(s) in the last %d samples "
+                       "(first at %s: index %s -> %s, line %s) - the page was marking "
+                       "a line above the one before it" % (len(j), seq["motion_rows"],
+                       j[0]["at"], j[0]["from"], j[0]["to"], j[0]["line"]))
+        if seq.get("big_jumps"):
+            j = seq["big_jumps"]
+            why.append("%d page-sized jump(s) of the mark (over 15 elements) - first at %s: %s -> %s"
+                       % (len(j), j[0]["at"], j[0]["from"], j[0]["to"]))
+        if seq.get("order_faults"):
+            f = seq["order_faults"]
+            why.append("%d element(s) in the window sit BELOW a later block.ord (first: index %s, "
+                       "line %s, %s after %s) - the page order is not the ledger order (#1330)"
+                       % (len(f), f[0]["index"], f[0]["line"], f[0]["order"], f[0]["after"]))
+        if seq.get("motion_rows") and seq.get("unlit_samples") == seq.get("motion_rows"):
+            why.append("nothing was lit in any of the last %d samples" % seq["motion_rows"])
+    except Exception as exc:  # noqa: BLE001
+        out["sequence"] = {"error": str(exc)[:120]}
     if "stall" in str(out.get("loop") or ""):
         why.append("the loop reports stalls - the feed itself may be late: "
                    + str(out.get("loop"))[:160])
     out["verdict"] = why or ["no fault the station can see from here - the "
                              "picture and the page's own reading decide"]
     return out
+
+
+@app.get("/api/script-reports/{name}")
+async def script_report_file_api(
+    name: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-14: "I wanna see every markdown file listed next to it with
+    ticks to expand it and show the contents" - the inbox card folds the
+    report open from here."""
+    require_read_auth(authorization)
+    if not re.fullmatch(r"script_[0-9_-]{8,40}\.md", name or ""):
+        raise HTTPException(status_code=400, detail="bad name")
+    path = SCRIPT_REPORTS_DIR / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no such report")
+    text = await asyncio.to_thread(path.read_text, "utf-8")
+    return {"name": name, "bytes": len(text), "text": text[:400000]}
 
 
 @app.post("/api/script/report")
@@ -107242,6 +107492,10 @@ async def script_report_api(
     text = str(payload.get("text") or "")[:20000]
     image = str(payload.get("image") or "")
     reading = await asyncio.to_thread(script_report_reading, view)
+    try:
+        reading["explain"] = await asyncio.to_thread(script_explain, view, reading)
+    except Exception as exc:  # noqa: BLE001
+        reading["explain"] = ["the explanation road failed: %s" % str(exc)[:100]]
     stamp = time.strftime("%Y-%m-%d_%H%M%S")
     SCRIPT_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     saved = _save_pine_images([image]) if image else []
@@ -107250,6 +107504,16 @@ async def script_report_api(
           *("- " + v for v in (reading.get("verdict") or [])), "",
           "## What the page saw", "```json",
           json.dumps(view, indent=1, default=str)[:30000], "```", "",
+          "## Motion of the view (last %d samples, 4/s; newest last)" % len(view.get("motion") or []),
+          "```", str(view.get("motionLegend") or ""),
+          *(str(r) for r in (view.get("motion") or [])), "```", "",
+          "## The window: 20 above the mark, 10 below (page order)",
+          "```", str(view.get("windowLegend") or ""),
+          *(str(r) for r in (view.get("window") or [])), "```", "",
+          "## What the station says happened",
+          *("- " + w for w in (reading.get("explain") or [])), "",
+          "## Sequence check", "```json",
+          json.dumps(reading.get("sequence") or {}, indent=1, default=str)[:12000], "```", "",
           "## The screen, as text", "```",
           text or "(no text rendering)", "```", "",
           "## What the station was doing", "```json",
@@ -107270,11 +107534,15 @@ async def script_report_api(
         else "estimated"
     age = int(_view_num(view, "fetchedAgeMs", "fetched_age_ms",
                         "fetchedAge") / 1000)
-    summary = ("#1115 script view report: %s\n\nthe page marks `%s`; the "
+    kind = "CAUTION" if str(view.get("kind") or "") == "caution" else "view"
+    summary = ("#1115 script %s report: %s\n\nthe page marks `%s`; the "
                "station is saying `%s`; playhead %s; the script on the page "
                "is %ss old.\n\nfull report: data/script_reports/%s"
-               % ("; ".join(reading.get("verdict") or []), lit, said, head,
+               % (kind, "; ".join(reading.get("verdict") or []), lit, said, head,
                   age, path.name))
+    if reading.get("explain"):
+        summary += "\n\nwhat the station says happened:\n" + "\n".join(
+            "- " + w for w in reading["explain"][:4])
     try:
         summary = (summary + await pine_context_block()).strip()
     except Exception:  # noqa: BLE001
@@ -127923,7 +128191,22 @@ def _sfx_db_pick_any(video: bool = True,
     try:
         con = sfx_db_reader()          # #1362d: never behind the writer
         want = 1 if video else 0
-        if True:
+        # 2026-09-14: the length dial. A target of N seconds draws from
+        # clips between 0.6N and 1.6N; a window that holds nothing falls
+        # back to the whole book rather than to no picture.
+        aim = 0.0
+        if video:
+            try:
+                aim = float((dj_settings() or {}).get("sfx_video_len") or 0)
+            except Exception:  # noqa: BLE001
+                aim = 0.0
+        windows = ([(aim * 0.6, aim * 1.6)] if aim > 0 else []) + [None]
+        for win in windows:
+            where = "playable = 1 AND video = ?"
+            args: tuple = (want,)
+            if win:
+                where += " AND seconds BETWEEN ? AND ?"
+                args = (want, win[0], win[1])
             for _ in range(max(1, tries)):
                 # #1362c: UNIFORM. The first cut of this took a random
                 # rowid and walked forward to the first match, and three
@@ -127938,15 +128221,13 @@ def _sfx_db_pick_any(video: bool = True,
                 # against a frame - and every clip is as likely as every
                 # other, which is what "random" was supposed to mean.
                 n = con.execute(
-                    "SELECT COUNT(*) AS n FROM clips WHERE playable = 1 "
-                    "AND video = ?", (want,)).fetchone()
+                    "SELECT COUNT(*) AS n FROM clips WHERE " + where, args).fetchone()
                 count = int((n and n["n"]) or 0)
                 if not count:
-                    return None
+                    break                       # the next window, if any
                 row = con.execute(
-                    "SELECT path, seconds FROM clips WHERE playable = 1 "
-                    "AND video = ? LIMIT 1 OFFSET ?",
-                    (want, random.randrange(count))
+                    "SELECT path, seconds FROM clips WHERE " + where
+                    + " LIMIT 1 OFFSET ?", args + (random.randrange(count),)
                 ).fetchone()
                 if row is None:
                     return None
@@ -128463,17 +128744,35 @@ async def sfx_video_mode_api(
         changed["sfx_video_mode"] = bool(body.get("on"))
     if body.get("share") is not None:
         changed["sfx_video_share"] = max(0, min(100, int(body.get("share") or 0)))
+    if body.get("length") is not None:                   # 2026-09-14
+        changed["sfx_video_len"] = max(0, min(120, int(body.get("length") or 0)))
     if changed:
         settings = load_settings()
         dj = dict(settings.get("dj") or {})
         dj.update(changed)
         save_settings({**settings, "dj": dj})
+        if "sfx_video_mode" in changed and not changed["sfx_video_mode"]:
+            # 2026-09-14: "whenever I turn off endless video mode ... it
+            # turns off". The cycle rings clips ahead of now, so OFF used
+            # to mean "after the two already rung". Withdraw those from
+            # the ring and reset the plan; the sets drop what they hold.
+            try:
+                now_ms = int(time.time() * 1000)
+                ring = _RADIO.get("voice_clips") or []
+                ring[:] = [c for c in ring if not (c.get("endless")
+                           and int(c.get("broadcast_ms") or 0) > now_ms - 2000)]
+                _SFX_CYCLE.update({"until": 0.0, "queued": 0, "requests": [],
+                                   "why": "the endless set is off"})
+            except Exception:  # noqa: BLE001
+                pass
         note_action("you %s" % (
             ("turned the endless video set %s"
              % ("on" if changed["sfx_video_mode"] else "off"))
             if "sfx_video_mode" in changed else
             ("set the SFX Guy's picture share to %d%%"
-             % changed["sfx_video_share"])))
+             % changed["sfx_video_share"]) if "sfx_video_share" in changed else
+            ("set the endless set's clip length to %ss"
+             % (changed.get("sfx_video_len") or "any"))))
     return {"ok": True, "changed": changed, **sfx_video_mode_state()}
 
 @app.get("/api/sfx/anxiety")
@@ -133562,6 +133861,20 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     # named row rather than at a computed time, so nothing about it
     # moves when the hour grows.
     _spine: list[tuple[int, int, int]] = []     # (block, ord, index)
+    # 2026-09-14: A STING WELDED INTO A ROUND RIDES THE ROUND. The spine
+    # took scripted rows only, so the SFX guy's sting inside a call
+    # (block 6511, ord 3 - not scripted) kept its raw stamp and was drawn
+    # inside an EARLIER copy of the same call; the mark jumped thirteen
+    # elements backwards when it aired (report #1130). A row the ledger
+    # placed inside a block of two or more rows sits at its ord; only the
+    # single-row blocks of #1336 (lines caught up after the fact) still
+    # hang off the spine by their stamp.
+    _blocksize: dict[int, int] = {}
+    try:
+        for _v in _ord.values():
+            _blocksize[int(_v[0])] = _blocksize.get(int(_v[0]), 0) + 1
+    except Exception:  # noqa: BLE001
+        _blocksize = {}
     _raw_of: dict[int, float] = {}
     for _ix, _e in enumerate(events):
         _row = _e.get("row") or {}
@@ -133570,7 +133883,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         _raw_of[_ix] = float(_row.get("air_at") or _row.get("ts")
                              or _e.get("at") or 0)
         _got = _ord.get(str(_row.get("id") or "")) if _ord else None
-        if _got and len(_got) > 2 and _got[2]:
+        if _got and len(_got) > 2 and (_got[2] or _blocksize.get(int(_got[0]), 0) >= 2):
             _spine.append((int(_got[0]), int(_got[1]), _ix))
     _spine.sort()
 
@@ -201565,6 +201878,40 @@ async function submitPine() {
  * edits to reports easily via double clicking." The card becomes a box with
  * the whole body; "Drop the debug block" cuts the station's account (#1379)
  * and keeps the attachments; Save PUTs it back to the file. */
+/* 2026-09-14: "I wanna see every markdown file listed next to it with ticks
+ * to expand it and show the contents". A report names its file
+ * (data/script_reports/script_<stamp>.md); the card lists each one as a
+ * fold, fetched the first time it is opened. */
+function pineFileFolds(rq, card) {
+  const names = [];
+  String(rq.text || "").replace(/data\/script_reports\/(script_[0-9_\-]+\.md)/g, (m, n) => { if (names.indexOf(n) < 0) names.push(n); return m; });
+  if (!names.length) return;
+  const wrap = document.createElement("div");
+  wrap.className = "pine-files";
+  names.forEach((name) => {
+    const d = document.createElement("details");
+    d.className = "pine-file";
+    const sum = document.createElement("summary");
+    sum.textContent = name;
+    sum.style.cssText = "cursor:pointer;font-size:12px;margin-top:6px";
+    const pre = document.createElement("pre");
+    pre.style.cssText = "white-space:pre-wrap;font:12px/1.35 ui-monospace,monospace;max-height:60vh;overflow:auto;margin:6px 0";
+    pre.textContent = "";
+    d.appendChild(sum);
+    d.appendChild(pre);
+    d.addEventListener("toggle", async () => {
+      if (!d.open || pre.textContent) return;
+      pre.textContent = "reading\u2026";
+      try {
+        const got = await api("/api/script-reports/" + encodeURIComponent(name));
+        pre.textContent = (got && got.text) || "(empty)";
+      } catch (e) { pre.textContent = "could not read it: " + e.message; }
+    });
+    wrap.appendChild(d);
+  });
+  card.appendChild(wrap);
+}
+
 function pineEdit(rq, card) {
   if (card.querySelector("textarea")) return;
   const body = card.querySelector(".body");
@@ -201648,6 +201995,7 @@ async function loadPineInbox() {
     card.appendChild(top);
     card.appendChild(body);
     card.title = "Double-click to edit this report";
+    pineFileFolds(rq, card);
     card.addEventListener("dblclick", (ev) => { ev.stopPropagation(); pineEdit(rq, card); });
     if (imgRefs.length) {
       const strip = document.createElement("div");
