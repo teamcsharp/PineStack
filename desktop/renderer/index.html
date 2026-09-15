@@ -42,6 +42,9 @@
   <link rel="stylesheet" href="./sfx-tv.css">
   <link rel="stylesheet" href="./pine-cam.css">
   <link rel="stylesheet" href="./clip-doctor.css">
+  <!-- 2026-09-14: the hot corners - screenshot and draw, export the
+       screen video, inspect the last line, replay the last SFX clip. -->
+  <link rel="stylesheet" href="./hot-corners.css">
   <!-- The SVG sprite, for icon-only buttons that need a real <svg> with an
        aria-label rather than a bare character. -->
   <script src="./pine-icons.js"></script>
@@ -801,6 +804,7 @@
   <script src="./view-chrome.js"></script>
   <script src="./console-line.js"></script>
   <script src="./console-trace.js"></script>
+  <script src="./pine-duck.js"></script>
   <script src="./audio-law.js"></script>
   <script src="./talk-dot.js"></script>
   <script src="./pine-meters.js"></script>
@@ -844,6 +848,10 @@
        whatever is showing. -->
   <script src="./sfx-tv.js"></script>
   <script src="./rail.js"></script>
+  <!-- 2026-09-14: the hot corners. After rail.js: it adds its own tab to
+       the rail when the rail is already up, and rail.js calls it when the
+       rail is built later. -->
+  <script src="./hot-corners.js"></script>
   <script src="./pine-cam.js"></script>
   <script src="./tablet-doctor.js"></script>
   <!-- #1361b: the clip doctor opens from the SCRIPT view here as it does on the tablet -->

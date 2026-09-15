@@ -213,6 +213,15 @@
     dot.innerHTML = '<canvas id="pineTalkFx" class="pine-talk-fx"></canvas>'
       + '<i class="pine-talk-core"></i>';
     dot.addEventListener('click', toggle);
+    /* 2026-09-14: the canvas is the voice window; a tap on it while
+       listening cancels rather than sends (see cancel()). */
+    var fx = dot.querySelector('#pineTalkFx');
+    if (fx) fx.addEventListener('click', function (ev) {
+      if (state !== LISTENING) return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      cancel();
+    });
     /* #1355: and the other button picks the ear. A right-click rather
      * than a second piece of chrome - the dot is deliberately one
      * object, and this is a setting that is changed once. */
@@ -226,6 +235,7 @@
 
     var say = document.createElement('div');
     say.id = 'pineTalkSay';
+    say.addEventListener('click', function (ev) { if (state === LISTENING) { ev.stopPropagation(); cancel(); } });   /* 2026-09-14 */
     say.className = 'pine-talk-say';
     say.hidden = true;
     document.body.appendChild(say);
@@ -284,6 +294,15 @@
 
   function duck(on) {
     clearTimeout(duckSafety);
+    /* 2026-09-14: "any time that I'm dealing with dictation, always duck
+       the audio completely or to 2%." PineDuck (pine-duck.js) is the one
+       levelled road every surface shares; the 0.12 below is only the
+       fallback for a page that loaded without it. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      if (on) { root.PineDuck.hold('dictation', root.PineDuck.DICTATION); return 1; }
+      root.PineDuck.release('dictation');
+      return 0;
+    }
     if (on) {
       /* Re-ducking without an intervening release would record 0.12 as the
        * volume to restore, and the sound would never come back. */
@@ -400,6 +419,7 @@
 
   async function listen() {
     mount();
+    cancelled = false;
 
     /* The native ear first, where there is one. */
     if (haveNativeEar()) {
@@ -548,6 +568,30 @@
     frame = requestAnimationFrame(tick);
   }
 
+  /* 2026-09-14: "During dictation if I tap on the voice window, cancel it."
+   * The dot's core still finishes and SENDS (a tap on the dot is how it
+   * has always ended); the WINDOW - the particle canvas that grows while
+   * it listens, and the "Listening..." note - now cancels: the recording
+   * stops and is thrown away, nothing is sent, the show comes back up. */
+  var cancelled = false;
+  function cancel() {
+    if (state !== LISTENING) return;
+    cancelled = true;
+    cancelAnimationFrame(frame);
+    duck(false);
+    try { if (native && root.pineDesktop && root.pineDesktop.micStop) root.pineDesktop.micStop(); } catch (e) { /* the ear closes by itself */ }
+    try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch (e) { /* already stopped */ }
+    if (stream) {
+      stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* gone */ } });
+      stream = null;
+    }
+    chunks = [];
+    capture = null;
+    setState(IDLE);
+    announce('Cancelled - nothing was sent.');
+    release(1500);
+  }
+
   function finish() {
     if (state !== LISTENING) return;
     setState(THINKING);
@@ -562,6 +606,7 @@
    * cost a third more bytes and buy nothing, since nothing here wants the
    * audio, only what was said. */
   async function sendNative() {
+    if (cancelled) { cancelled = false; return; }   /* 2026-09-14: thrown away */
     /* The scene is NOT stopped here any more: it has the words to assemble
      * next. Ducking also holds, because the spoken reply follows. */
     duck(false);
@@ -603,6 +648,7 @@
   }
 
   async function send() {
+    if (cancelled) { cancelled = false; return; }   /* 2026-09-14: thrown away */
     duck(false);
     if (stream) {
       stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* gone */ } });
@@ -770,6 +816,9 @@
     pad.appendChild(row);
     pad.appendChild(note);
     document.body.appendChild(pad);
+    /* 2026-09-14: "Whenever I'm filing a report ... lower the broadcast to
+       10%." The hold is tied to the pad: when the pad leaves, so does it. */
+    if (root.PineDuck) root.PineDuck.hold('report-pad', root.PineDuck.REPORT, pad);
     /* The sentence that opened the pad may carry the report already:
        "make a pine report: the sampler is silent". Keep what follows. */
     var body = String(heard || '').replace(/^.*?\breport\b[\s:,.-]*/i, '').trim();
@@ -1164,6 +1213,11 @@
      * assemble, ask, answer, speak. Anything that bypassed it would be a
      * second, quietly different experience. */
     act: act,
+    cancel: cancel,
+    /* 2026-09-14: lend the ear - the next heard sentence goes to `fn`
+       instead of the model (the caution sheet dictates its reason
+       this way). Starts listening at once. */
+    captureNext: function (fn) { capture = typeof fn === 'function' ? fn : null; try { listen(); } catch (e) { capture = null; throw e; } },
     /* 2026-09-14: the report pad, for a button or a test. */
     report: reportOpen,
     state: function () { return state; }

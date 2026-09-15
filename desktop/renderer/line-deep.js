@@ -127,7 +127,7 @@
     box.innerHTML =
       '<div class="ld-head">'
       + '<b>How this line came to be</b>'
-      + '<button class="ld-close" type="button" aria-label="close">×</button>'
+      + '<button class="ld-close" type="button" aria-label="close" title="close">×</button>'
       + '</div>'
       /* #1113 the scene row. Until the station answers, the select says
        * so; sceneRow() replaces the whole row once gather() is back. */
@@ -140,6 +140,7 @@
       + '<div class="ld-flowwhy"></div></div>'
       + '<div class="ld-body"></div>';
     document.body.appendChild(box);
+    if (root.PineDuck) root.PineDuck.hold('line-deep', root.PineDuck.REPORT, box);   /* 2026-09-14: a diagnostic ducks the broadcast */
     box.querySelector('.ld-said').textContent = String(line.said || '').slice(0, 300);
     box.querySelector('.ld-close').addEventListener('click', function (e) {
       e.stopPropagation();
@@ -176,9 +177,16 @@
       soft(api().get('/api/pipeline/detail?kind=voice')),
       soft(api().get('/api/cupboard/worn?most=60')),
       soft(api().get('/api/airlog?limit=400')),
-      soft(api().get('/api/dj/scenario?line=' + encodeURIComponent(line.id || '')))
+      soft(api().get('/api/dj/scenario?line=' + encodeURIComponent(line.id || ''))),
+      /* 2026-09-14, the hot corners: what SET the line (#1117) - round,
+       * voice, engine, model, aired state, the systems that were on - is
+       * the sixth ask, for the stepper at the top of the body. It 404s
+       * for a line in neither the booth nor the air log, and that is
+       * allowed to fail like the others. */
+      soft(api().get('/api/said/why/' + encodeURIComponent(line.id || '')))
     ]).then(function (got) {
-      return {prov: got[0], road: got[1], worn: got[2], air: got[3], scene: got[4]};
+      return {prov: got[0], road: got[1], worn: got[2], air: got[3], scene: got[4],
+        why: got[5]};
     });
   }
 
@@ -206,12 +214,217 @@
 
     sceneRow(line, all.scene);
 
+    /* 2026-09-14, the hot corners: "a flow by flow flow chart explaining
+     * everything that's happened as far as how this piece of line came to
+     * be broadcasted and all the parameters pertaining to it." At the TOP,
+     * before the admin options, because it is the answer to the question
+     * the corner swipe asked. */
+    section(body, 'how this line came to be broadcast, step by step', flowNode(line, all));
+    section(body, 'admin options - what reached this line', adminNode(all));   /* 2026-09-14 */
     section(body, 'how often it has gone out', timesNode(line, all));
     section(body, 'why it keeps coming up', whyNode(line, all));
     section(body, 'the room that wrote it', wroteNode(all));
     section(body, 'what it was shown', shownNode(all));
     section(body, 'the road, step by step', roadNode(all));
     section(body, 'if you never want to hear it again', retireNode(line, all));
+  }
+
+  /* ---------------------------------------------------------- the stepper */
+
+  /* 2026-09-14, THE HOT CORNERS' INSPECTOR. "If I swipe from the left
+   * corner up to the center, I want to basically bring up a dialogue
+   * window of what just happened. So basically it's an inspector window
+   * that shows the last line of dialogue or the active playing dialogue,
+   * and it gives me a flow by flow flow chart explaining everything that's
+   * happened as far as how this piece of line came to be broadcasted and
+   * all the parameters pertaining to it."
+   *
+   * A vertical stepper - numbered nodes joined by a line - built from what
+   * gather() already fetches: /api/said/why (round, voice, engine, model,
+   * aired, the systems that were on), the provenance (written.model and
+   * .at, render.engine/.voice/.ms, schedule.kind/.prompt, how/prepared),
+   * and the ledger's place, which reaches the page only as data-block /
+   * data-ord on a script row (script-page.js #1330) or as block/ord on
+   * the line object itself. In this order when known:
+   *
+   *   the round was called  ->  the line was written  ->  rendered  ->
+   *   handed over  ->  heard at  ->  the ledger's place
+   *
+   * A step the station could not say is drawn dimmed, with the reason as
+   * its detail - never invented. If the station's answer carries
+   * `why.flow` ([{step, label, detail, at}]) that is rendered instead,
+   * verbatim: the server may start writing the flow itself.
+   */
+  function clock(at) {
+    var t = Number(at);
+    if (!isFinite(t) || t <= 0) return '';
+    if (t > 1e12) t = t / 1000;                      /* milliseconds */
+    if (t < 1e9) return '';                          /* not an epoch */
+    var d = new Date(t * 1000);
+    var two = function (n) { return (n < 10 ? '0' : '') + n; };
+    return two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
+
+  function ledgerPlace(line, all) {
+    var node = line && line.node;
+    var why = (all && all.why) || {};
+    var row = ((all && all.prov) || {}).line || (line && line.row) || {};
+    var b = null, o = null;
+    var cands = [
+      [line && line.block, line && line.ord],
+      [why.block, why.ord],
+      [row.block, row.ord],
+      [node && node.dataset ? node.dataset.block : null,
+        node && node.dataset ? node.dataset.ord : null]
+    ];
+    for (var i = 0; i < cands.length; i += 1) {
+      var cb = cands[i][0], co = cands[i][1];
+      if (cb === undefined || cb === null || cb === '' || co === undefined || co === null || co === '') continue;
+      b = String(cb); o = String(co);
+      break;
+    }
+    return b === null ? null : {block: b, ord: o};
+  }
+
+  function flowSteps(line, all) {
+    var why = (all.why && all.why.ok) ? all.why : null;
+    var prov = all.prov || {};
+    var row = prov.line || (line && line.row) || {};
+    var written = prov.written || {};
+    var render = prov.render || {};
+    var sched = prov.schedule || {};
+    var now = Date.now() / 1000;
+
+    if (why && why.flow && why.flow.length) {
+      return why.flow.map(function (f) {
+        f = f || {};
+        return {label: String(f.label || f.step || ''), detail: String(f.detail || ''),
+          at: f.at, known: true};
+      });
+    }
+
+    var steps = [];
+    var join = function (bits) {
+      return bits.filter(function (b) { return !!b; }).join('  ·  ');
+    };
+
+    /* 1. the round was called */
+    var kind = String(sched.kind || row.kind || (why && why.kind) || '');
+    var round = String(row.round || (why && why.round) || '');
+    steps.push({
+      label: 'the round was called',
+      detail: join([
+        kind ? 'the ' + kind + ' road' : '',
+        round ? 'round ' + round : '',
+        sched.prompt ? 'brief: ' + String(sched.prompt).slice(0, 160) : '',
+        prov.how === 'shelf' ? 'served off the shelf' : (prov.how ? String(prov.how) : ''),
+        prov.prepared ? String(prov.prepared) : ''
+      ]) || 'the station did not say why this round was called',
+      at: written.at || row.ts,
+      known: !!(kind || round)
+    });
+
+    /* 2. the line was written */
+    var model = String(written.model || (why && why.model) || '');
+    var on = [];
+    if (why && why.systems) {
+      why.systems.forEach(function (s) { if (s && s.on) on.push(String(s.name)); });
+    }
+    var place = ledgerPlace(line, all);
+    steps.push({
+      label: 'the line was written',
+      detail: join([
+        model ? 'by ' + model : '',
+        written.ms ? Number(written.ms) + ' ms' : '',
+        round ? 'round ' + round : '',
+        place ? 'block ' + place.block + '.' + place.ord : '',
+        on.length ? 'with ' + on.join(', ') : '',
+        written.at ? 'committed ' + clock(written.at) : ''
+      ]) || (all.prov === null
+        ? 'past the booth’s 240-row ring: the writing room can no longer be asked'
+        : 'no paperwork is held for the writing of this line'),
+      at: written.at || row.ts,
+      known: !!(model || written.prompt)
+    });
+
+    /* 3. rendered */
+    var engine = String(render.engine || row.engine || (why && why.engine) || '');
+    var voice = String(render.voice || row.voice || (why && why.voice) || '');
+    var seconds = Number(row.seconds || (line && line.row && line.row.seconds) || 0);
+    steps.push({
+      label: 'rendered',
+      detail: join([
+        engine ? 'on ' + engine : '',
+        voice ? 'voice ' + voice : '',
+        seconds ? seconds.toFixed(1) + ' s' : '',
+        render.ms ? Number(render.ms) + ' ms to render' : '',
+        render.fallback ? 'fell back from ' + String(render.fallback) : ''
+      ]) || 'no render is recorded for this line',
+      at: null,
+      known: !!(engine || voice || seconds)
+    });
+
+    /* 4. handed over */
+    var aired = String((why && why.aired) || row.aired || (line && line.row && line.row.aired) || '');
+    var roads = {
+      stream: 'the stream', box: 'the box', both: 'both outputs',
+      published: 'the page, awaiting playback', page: 'the page',
+      airing: 'on the air now', prepared: 'written, never heard',
+      held: 'held back', analysis: 'analysis only - never for the air',
+      failed: 'the audio failed'
+    };
+    steps.push({
+      label: 'handed over',
+      detail: aired ? 'state ' + aired + ' - ' + (roads[aired] || 'an output the page does not name')
+        : 'no hand-over is recorded',
+      at: null,
+      known: !!aired
+    });
+
+    /* 5. heard at */
+    var airAt = Number(row.air_at || (line && line.row && line.row.air_at) || 0);
+    steps.push({
+      label: 'heard at',
+      detail: airAt ? clock(airAt) + (now > airAt ? '  (' + ago(now - airAt) + ')' : '  (yet to come)')
+        : 'no air time is recorded',
+      at: airAt || null,
+      known: !!airAt
+    });
+
+    /* 6. the ledger's place */
+    steps.push({
+      label: 'the ledger’s place',
+      detail: place ? 'block ' + place.block + ', line ' + place.ord + ' of the script ledger'
+        : 'not on the script ledger as far as this page can see - minted outside a round, or opened from a row that carries no place',
+      at: null,
+      known: !!place
+    });
+    return steps;
+  }
+
+  function flowNode(line, all) {
+    var steps = flowSteps(line, all);
+    if (!steps.length) return null;
+    var wrap = make('div', '');
+    var list = make('ol', 'ld-stepper');
+    steps.forEach(function (s, i) {
+      var li = make('li', 'ld-step' + (s.known ? '' : ' unknown'));
+      li.appendChild(make('i', 'ld-step-n', String(i + 1)));
+      var body = make('div', 'ld-step-body');
+      body.appendChild(make('b', '', s.label));
+      if (s.detail) body.appendChild(make('p', '', s.detail));
+      li.appendChild(body);
+      li.appendChild(make('span', 'ld-step-at', clock(s.at)));
+      list.appendChild(li);
+    });
+    wrap.appendChild(list);
+    var why = all.why;
+    if (why && why.say) wrap.appendChild(make('p', 'ld-dim ld-step-say', String(why.say)));
+    else if (why === null || (why && why.ok === false)) {
+      wrap.appendChild(make('p', 'ld-dim ld-step-say',
+        'the station could not say what set this line (/api/said/why answered nothing)'));
+    }
+    return wrap;
   }
 
   /* ------------------------------------------------------------ the scene */
@@ -383,6 +596,34 @@
       {label: 'the schedule', got: !!(prov.schedule || prov.slot)},
       {label: 'on air', got: true}
     ];
+  }
+
+  /* 2026-09-14: "do a section above for admin options and show how each of
+   * these options contributed to the current line ... how any pref or
+   * modifier made it into the line." The station judges each desk dial
+   * against this line's own paperwork (/api/dj/scenario `admin`): a green
+   * dot is 'reached this line' with the proof in the how-line, red is
+   * 'did not', grey is 'governs the station but is not traceable on one
+   * line' - said as such rather than claimed. */
+  function adminNode(all) {
+    var rows = ((all.scene || {}).admin) || [];
+    if (!rows.length) return null;
+    var wrap = make('div', 'ld-admin');
+    var applied = rows.filter(function (r) { return r.applied === true; });
+    wrap.appendChild(make('p', 'ld-dim', applied.length
+      + ' of ' + rows.length + ' options can be seen in this line\'s paperwork; the rest govern the station without a trace on one line'));
+    var list = make('ul', 'ld-facts ld-admin-list');
+    rows.forEach(function (r) {
+      var li = make('li', 'ld-admin-row ' + (r.applied === true ? 'on' : r.applied === false ? 'off' : 'na'));
+      var dot = make('i', 'ld-admin-dot', '');
+      var name = make('b', '', String(r.label || r.key || ''));
+      var val = make('span', '', String(r.value || ''));
+      var how = make('em', 'ld-admin-how', String(r.governs || '') + (r.how ? ' \u00b7 ' + r.how : ''));
+      li.appendChild(dot); li.appendChild(name); li.appendChild(val); li.appendChild(how);
+      list.appendChild(li);
+    });
+    wrap.appendChild(list);
+    return wrap;
   }
 
   function timesNode(line, all) {

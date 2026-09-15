@@ -986,3 +986,141 @@
 .sp-caution:hover { background: #2a2010; color: #ffd37a; }
 .sp-caution.sp-firing { opacity: .55; }
 .sp-caution.sp-fired-bad { border-color: #ff5d5d; color: #ff5d5d; }
+
+/* 2026-09-14: WHERE THE CLIPS COME FROM - the folder sheet a hold of the
+   video button opens. The shell is the word search's (.sp-find-back /
+   .sp-find-box); these are the parts it adds. Rows are 44 px on touch so
+   the tri, the box and the name are each a thumb's target (36 px under a
+   mouse); the sample list under an open folder is dense on purpose - it
+   is a preview, not a player. Every colour is written out: the sheet is
+   the same dark on the desk and on the tablet, whatever the platform's
+   theme says. The video button itself refuses the platform's long-press
+   selection and callout, since a hold on it now means something. */
+.sp-btn.sp-reel { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+.sp-folder-box {
+  width: min(720px, 96vw); max-height: 86vh; overflow: hidden;
+  display: flex; flex-direction: column; background: #0b1116; color: #dfe7ee;
+}
+.sp-folder-say { padding: 8px 14px; background: #10202a; color: #65c7da; font-weight: 600; border-bottom: 1px solid #24323a; }
+.sp-folder-top { flex: 0 0 auto; padding: 8px 14px 10px; border-bottom: 1px solid #35414c; display: flex; flex-direction: column; gap: 6px; }
+.sp-folder-hours-row { display: flex; align-items: center; gap: 12px; min-height: 44px; cursor: pointer; }
+.sp-folder-hours-label { flex: 0 0 150px; color: #dfe7ee; font-weight: 600; }
+.sp-folder-hours { flex: 1 1 auto; min-height: 44px; margin: 0; accent-color: #65c7da; cursor: pointer; }
+.sp-folder-pin-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 32px; }
+.sp-folder-pin { flex: 1 1 auto; min-width: 0; color: #8ea0ad; }
+.sp-folder-pin.on { color: #ffd479; }
+.sp-folder-clear {
+  flex: 0 0 auto; min-height: 40px; padding: 0 14px; border: 1px solid #65c7da; border-radius: 9px;
+  background: #0b1116; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-folder-filter {
+  width: 100%; box-sizing: border-box; min-height: 40px; padding: 6px 10px;
+  border: 1px solid #35414c; border-radius: 9px; background: #06090c; color: #dfe7ee; font: inherit;
+}
+.sp-folder-filter::placeholder { color: #6f8291; }
+.sp-folder-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.sp-folder-note { padding: 10px 14px; color: #8ea0ad; }
+.sp-folder-row { border-bottom: 1px solid #101823; }
+.sp-folder-line { display: flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 10px 0 6px; }
+.sp-folder-tri, .sp-folder-check {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 40px; min-height: 40px; padding: 0; border: 0; border-radius: 8px;
+  background: none; color: #8ea0ad; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-folder-tri .pi-icon, .sp-folder-ico .pi-icon { width: 18px; height: 18px; }
+.sp-folder-tri .pi-icon { transition: transform .16s ease; }
+.sp-folder-tri[aria-expanded="true"] { color: #65c7da; }
+.sp-folder-tri[aria-expanded="true"] .pi-icon { transform: rotate(90deg); }
+.sp-folder-tri:disabled { opacity: .3; cursor: default; }
+.sp-folder-check .pi-icon { width: 20px; height: 20px; }
+.sp-folder-check[aria-pressed="true"] { color: #65c7da; }
+.sp-folder-row.under .sp-folder-check { color: #3f7f8c; }
+.sp-folder-ico { display: inline-flex; flex: 0 0 auto; color: #6f8291; }
+.sp-folder-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #dfe7ee; cursor: pointer; }
+.sp-folder-row.pinned .sp-folder-name { color: #65c7da; font-weight: 600; }
+.sp-folder-row.under .sp-folder-name { color: #9fd6e0; }
+.sp-folder-n { flex: 0 0 auto; font-size: 11.5px; color: #8ea0ad; white-space: nowrap; }
+.sp-folder-samples { padding: 2px 10px 8px 52px; background: #080d11; }
+.sp-folder-sample { padding: 4px 0; border-top: 1px solid #101823; }
+.sp-folder-sample-line { display: flex; align-items: center; gap: 6px; min-height: 24px; font-size: 12px; }
+.sp-folder-kind { display: inline-flex; flex: 0 0 auto; color: #6f8291; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+.sp-folder-kind .pi-icon { width: 14px; height: 14px; }
+.sp-folder-sample-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cfe0e6; }
+.sp-folder-sample-len { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; color: #8ea0ad; font-size: 11px; white-space: nowrap; }
+.sp-folder-sample-len .pi-icon { width: 12px; height: 12px; }
+.sp-folder-media { display: block; width: 100%; max-width: 420px; height: 32px; margin: 2px 0 0; }
+video.sp-folder-media { height: auto; max-height: 120px; background: #000000; border-radius: 6px; }
+@media (pointer: fine) {
+  .sp-folder-line { min-height: 36px; }
+  .sp-folder-tri, .sp-folder-check { min-width: 32px; min-height: 32px; }
+}
+
+/* 2026-09-14: THE REASON SHEET (a hold on the caution button) and THE
+   INBOX SHEET (a hold on the report icon). The same shell and the same
+   dark as the folder sheet above: #0b1116 box, #dfe7ee text, #65c7da
+   accent, every colour written out. Reason rows are 44 px, full width,
+   one thumb each; the inbox card is a header, a first line and a caret,
+   and its body is monospace that wraps - a report is read here, not
+   edited. The x that deletes goes red on the first tap and only the
+   second tap, inside three seconds, does the deed. */
+.sp-caution, .sp-btn.sp-report { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+.sp-sheet-say { padding: 8px 14px; background: #10202a; color: #65c7da; font-weight: 600; border-bottom: 1px solid #24323a; }
+.sp-reason-box, .sp-inbox-box {
+  max-height: 86vh; overflow: hidden; display: flex; flex-direction: column;
+  background: #0b1116; color: #dfe7ee;
+}
+.sp-reason-box { width: min(520px, 94vw); }
+.sp-inbox-box { width: min(760px, 96vw); }
+.sp-reason-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 0; }
+.sp-reason-choice {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 0 14px;
+  border: 0; border-bottom: 1px solid #101823; background: none; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-reason-choice.on { color: #65c7da; background: #0e1a21; }
+.sp-reason-mark { display: inline-flex; flex: 0 0 auto; color: #8ea0ad; }
+.sp-reason-choice.on .sp-reason-mark { color: #65c7da; }
+.sp-reason-mark .pi-icon { width: 20px; height: 20px; }
+.sp-reason-text { flex: 1 1 auto; }
+.sp-reason-custom { display: flex; align-items: flex-start; gap: 8px; padding: 8px 14px; background: #080d11; }
+.sp-reason-ta {
+  flex: 1 1 auto; min-width: 0; min-height: 72px; box-sizing: border-box; padding: 8px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee; font: inherit; resize: vertical;
+}
+.sp-reason-ta::placeholder { color: #6f8291; }
+.sp-reason-dictate {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 0 12px;
+  border: 1px solid #35414c; border-radius: 9px; background: #0b1116; color: #dfe7ee; font: inherit; cursor: pointer;
+}
+.sp-reason-dictate .pi-icon { width: 16px; height: 16px; }
+.sp-reason-file {
+  flex: 0 0 auto; margin: 8px 14px 12px; min-height: 44px; border: 1px solid #65c7da; border-radius: 9px;
+  background: #10202a; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-inbox-refresh {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px;
+  margin-left: auto; border: 0; border-radius: 8px; background: none; color: #8ea0ad; font: inherit; cursor: pointer;
+}
+.sp-inbox-refresh + .sp-find-x { margin-left: 0; }
+.sp-inbox-refresh .pi-icon { width: 18px; height: 18px; }
+.sp-inbox-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.sp-inbox-card { border-bottom: 1px solid #101823; }
+.sp-inbox-line { display: flex; align-items: center; gap: 6px; min-height: 44px; padding: 4px 6px; }
+.sp-inbox-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; cursor: pointer; }
+.sp-inbox-head { font-size: 12px; color: #8ea0ad; }
+.sp-inbox-status { color: #ffd479; font-weight: 400; }
+.sp-inbox-first { color: #dfe7ee; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-inbox-x {
+  flex: 0 0 auto; min-width: 40px; min-height: 40px; border: 1px solid transparent; border-radius: 8px;
+  background: none; color: #8ea0ad; font: 20px/1 inherit; cursor: pointer;
+}
+.sp-inbox-x.armed { color: #ffffff; background: #c0392b; border-color: #e46b6b; }
+.sp-inbox-x:disabled { opacity: .4; cursor: default; }
+.sp-inbox-body { padding: 0 14px 10px 46px; }
+.sp-inbox-pre {
+  margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere;
+  font: 12px/1.45 ui-monospace, Consolas, Menlo, monospace; color: #cfe0e6;
+}
+.sp-inbox-details { margin: 6px 0; padding-left: 8px; border-left: 2px solid #35414c; }
+.sp-inbox-details summary { cursor: pointer; min-height: 32px; line-height: 32px; color: #65c7da; }
+.sp-inbox-img { display: block; max-width: 100%; max-height: 260px; margin: 6px 0; border-radius: 6px; background: #000000; }

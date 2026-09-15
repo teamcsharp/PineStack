@@ -417,6 +417,18 @@
       } catch (err) { /* the rail is more important than the handle */ }
     }
 
+    /* HOT CORNERS (2026-09-14). "I also want preferences ... for each of
+     * the hot corners ... change these and set these and disable these."
+     *
+     * A tab on the same edge, opening the preference sheet as a pop-up
+     * over whatever is showing: a master switch and one select per corner
+     * (hot-corners.js). Built through the module's own railTab() so the
+     * kiosk, whose injection order is its own, gets the same tab whether
+     * this file or that one is evaluated first - both check the id. */
+    if (root.PineHotCorners && typeof root.PineHotCorners.railTab === 'function') {
+      try { root.PineHotCorners.railTab(); } catch (err) { /* the rail is more important than the handle */ }
+    }
+
     /* The talk dot, on every screen - the operator asked for it on all of
      * them, not only the one it was designed against. */
     if (root.PineTalkDot) {

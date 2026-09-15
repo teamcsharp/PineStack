@@ -55,6 +55,14 @@
     var d = document.getElementById('tabletDoc');
     var f = document.getElementById('tabletDocFold');
     if (d) d.hidden = !open;
+    /* 2026-09-14: the doctor is a diagnostic - the broadcast steps back to
+       10% while its transcript is open. */
+    try {
+      if (window.PineDuck) {
+        if (open && d) window.PineDuck.hold('tablet-doctor', window.PineDuck.REPORT);
+        else window.PineDuck.release('tablet-doctor');
+      }
+    } catch (err) { /* no duck on this page */ }
     if (f) f.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
   /* The icon's state: 'busy' while the ladder climbs, 'ok' when the last

@@ -65153,6 +65153,153 @@ def _sfx_all_walk() -> list[Path]:
     return made + [p for folder in sfx_folders() for p in sfx_list(folder)]
 
 
+# --- 2026-09-14: THE FOLDER PIN --------------------------------------------
+#
+# "specify what folder out of all the folders in the SFX collection clips are
+#  being taken out of for the next hour ... that folder and subfolders
+#  possibly be the active folder that all clips are used from by the SFX guy
+#  for the next hour or hours. Also the same thing for videos."
+#
+# One pin, timed, kept in data/sfx_folder_pin.json: a folder path and an
+# `until`. While it stands, sfx_all() (the pool every sting road draws from)
+# and the book's pick (the endless set's and the cue road's draw) both keep
+# only paths under it. Expiry needs no clock task: every read checks it.
+SFX_PIN_PATH = data_path("sfx_folder_pin.json")
+_SFX_PIN_MEMO: dict[str, Any] = {"at": 0.0, "got": None}
+
+
+def sfx_pin() -> dict[str, Any] | None:
+    now = time.time()
+    if now - float(_SFX_PIN_MEMO.get("at") or 0) < 3.0:
+        got = _SFX_PIN_MEMO.get("got")
+    else:
+        try:
+            got = json.loads(SFX_PIN_PATH.read_text(encoding="utf-8"))
+            got = got if isinstance(got, dict) else None
+        except Exception:  # noqa: BLE001
+            got = None
+        _SFX_PIN_MEMO.update({"at": now, "got": got})
+    if not got or not got.get("path"):
+        return None
+    if float(got.get("until") or 0) <= now:
+        return None
+    return dict(got)
+
+
+def sfx_pin_prefix() -> str:
+    got = sfx_pin()
+    if not got:
+        return ""
+    return str(got["path"]).rstrip("/") + "/"
+
+
+def sfx_pin_set(path: str, hours: float) -> dict[str, Any]:
+    SFX_PIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not path:
+        try:
+            SFX_PIN_PATH.unlink()
+        except OSError:
+            pass
+        _SFX_PIN_MEMO.update({"at": 0.0, "got": None})
+        try:
+            _SFX_ALL_MEMO.update({"at": 0.0})
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+    hours = max(0.25, min(24.0, float(hours or 1)))
+    got = {"path": str(path).rstrip("/"), "name": Path(str(path)).name,
+           "until": time.time() + hours * 3600.0, "hours": hours, "at": time.time()}
+    SFX_PIN_PATH.write_text(json.dumps(got), encoding="utf-8")
+    _SFX_PIN_MEMO.update({"at": 0.0, "got": None})
+    try:
+        _SFX_ALL_MEMO.update({"at": 0.0})       # the pool re-reads at once
+    except Exception:  # noqa: BLE001
+        pass
+    return got
+
+
+def sfx_pin_view() -> dict[str, Any] | None:
+    got = sfx_pin()
+    if not got:
+        return None
+    left = max(0.0, float(got["until"]) - time.time())
+    return {"path": got["path"], "name": got.get("name") or Path(str(got["path"])).name,
+            "until": got["until"], "hours_left": round(left / 3600.0, 2),
+            "minutes_left": int(left // 60), "subfolders": True}
+
+
+def sfx_folders_view() -> dict[str, Any]:
+    """Every folder the book knows, with counts and a few samples to
+    preview - one read of the book, grouped here."""
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        con = sfx_db_reader()
+        rows = con.execute(
+            "SELECT path, sid, name, video, seconds FROM clips WHERE playable = 1").fetchall()
+    except Exception:  # noqa: BLE001
+        rows = []
+    for r in rows:
+        p = str(r["path"] or "")
+        d = p.rsplit("/", 1)[0] if "/" in p else ""
+        if not d:
+            continue
+        f = out.setdefault(d, {"path": d, "name": d.rsplit("/", 1)[-1], "audio": 0, "video": 0, "samples": []})
+        is_v = bool(r["video"])
+        f["video" if is_v else "audio"] += 1
+        want = 3
+        have = sum(1 for x in f["samples"] if x["video"] == is_v)
+        if have < want:
+            sid = str(r["sid"] or "")
+            f["samples"].append({"id": sid, "name": str(r["name"] or "")[:60], "video": is_v,
+                                 "url": f"/sfx/{sid}?t={media_sign(sid)}",
+                                 "seconds": round(float(r["seconds"] or 0), 1)})
+    folders = sorted(out.values(), key=lambda f: f["path"])[:300]
+    pin = sfx_pin_view()
+    return {"ok": True, "folders": folders, "pin": pin,
+            "say": ("all clips come from %s for another %d min" % (pin["name"], pin["minutes_left"]))
+                   if pin else "every folder - no pin"}
+
+
+@app.get("/api/sfx/folders")
+async def sfx_folders_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await asyncio.to_thread(sfx_folders_view)
+
+
+@app.get("/api/sfx/folder-pin")
+async def sfx_folder_pin_get_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    pin = sfx_pin_view()
+    return {"ok": True, "pin": pin, "say": ("all clips come from %s for another %d min" % (pin["name"], pin["minutes_left"])) if pin else "every folder - no pin"}
+
+
+@app.post("/api/sfx/folder-pin")
+async def sfx_folder_pin_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    path = str(body.get("path") or "").strip()
+    if body.get("clear") or not path:
+        sfx_pin_set("", 0)
+        note_action("you let the SFX guy draw from every folder again")
+        return {"ok": True, "pin": None, "say": "every folder again - the pin is cleared"}
+    root_ok = any(path == str(r).rstrip("/") or path.startswith(str(r).rstrip("/") + "/")
+                  for r in (SFX_ROOT, SFX_MADE_DIR))
+    if not root_ok or ".." in path:
+        raise HTTPException(status_code=400, detail="that is not a folder in the SFX collection")
+    hours = float(body.get("hours") or 1)
+    got = sfx_pin_set(path, hours)
+    pin = sfx_pin_view()
+    note_action("you pinned the SFX guy to %s for %s hour(s)" % (pin["name"] if pin else path, got.get("hours")))
+    pipeline_log("air", "sfx folder pin: %s for %.2f h (stings and endless video) (2026-09-14)" % (path, got.get("hours") or 0))
+    return {"ok": True, "pin": pin,
+            "say": "for the next %s hour(s) every sting and every endless clip comes from %s and its subfolders"
+                   % (("%g" % got.get("hours", 1)), pin["name"] if pin else path)}
+
+
 def sfx_all() -> list[Path]:
     """Every sample they may reach for: the packs you named, plus the
     scratches this box makes for itself (#211).
@@ -65161,13 +65308,19 @@ def sfx_all() -> list[Path]:
     the single largest attributed cause of dead air on this station."""
     try:
         key = (tuple(str(f) for f in sfx_folders()),
-               bool(dj_settings()["sfx_make"]))
+               bool(dj_settings()["sfx_make"]),
+               sfx_pin_prefix())                 # 2026-09-14: the folder pin
         now = time.time()
         if (_SFX_ALL_MEMO["value"] is not None
                 and _SFX_ALL_MEMO["key"] == key
                 and now - float(_SFX_ALL_MEMO["at"]) < SFX_ALL_TTL):
             return list(_SFX_ALL_MEMO["value"])
         got = _sfx_all_walk()
+        _pin = sfx_pin_prefix()
+        if _pin:
+            _kept = [p for p in got if str(p).replace("\\", "/").startswith(_pin)]
+            if _kept:
+                got = _kept          # an empty pinned folder falls back to all
         _SFX_ALL_MEMO.update({"at": now, "key": key, "value": list(got)})
         return list(got)
     except Exception:  # noqa: BLE001
@@ -71925,32 +72078,51 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     entry = dict(dialogue_entry(row) or {})
     entry["prep_kind"] = kind
 
+    def _takes_same() -> str:
+        """2026-09-14: WHICH FIELD MOVED. The hand-off compares the takes it
+        reserved with the takes the shelf holds now, and used to answer
+        with a bare False - sixteen withdrawn rows in ten minutes said
+        "refused by the caller's own check" and nothing more."""
+        current = _ready_round_takes(kind, row)
+        fields = ("i", "key", "text", "voice", "who")
+        if not current:
+            return "the round's takes are gone from the shelf"
+        if len(current) != len(takes):
+            return "the round now has %d take(s), it had %d" % (len(current), len(takes))
+        for _ix, (_c, _t) in enumerate(zip(current, takes)):
+            for f in fields:
+                if _c.get(f) != _t.get(f):
+                    return "take %d's %s changed (%s -> %s)" % (
+                        _ix + 1, f, str(_t.get(f))[:24], str(_c.get(f))[:24])
+        return ""
+
     def can_handoff() -> bool:
         if not any(held is row for held in shelf_rows(kind)):
+            _HANDOFF_NO.update({"at": time.time(), "why": "the row left the shelf while it waited"})
             return False
         if free:
             # The round still has to be intact; it simply no longer has to
             # belong to whatever entry the clock is standing on.
-            current = _ready_round_takes(kind, row)
-            fields = ("i", "key", "text", "voice", "who")
-            return bool(current
-                        and [[t.get(f) for f in fields] for t in current]
-                        == [[t.get(f) for f in fields] for t in takes])
+            _why = _takes_same()
+            if _why:
+                _HANDOFF_NO.update({"at": time.time(), "why": _why})
+            return not _why
         current_window = _ready_slot_window(kind)
         if window is not None and (not current_window or any(
                 current_window.get(field) != window.get(field)
                 for field in ("occurrence", "slot_id", "kind"))):
+            _HANDOFF_NO.update({"at": time.time(), "why": "the sheet moved to another entry while it waited"})
             return False
         if current_window and min(float(current_window.get("deadline") or 0),
                 float((window or current_window).get("deadline") or 0)) <= time.time():
+            _HANDOFF_NO.update({"at": time.time(), "why": "its entry's deadline passed while it waited"})
             return False
-        current = _ready_round_takes(kind, row)
-        fields = ("i", "key", "text", "voice", "who")
         # The player checks its measured joined duration immediately before
         # this proof. Do not charge raw duration/assembly a second time.
-        return bool(current
-                    and [[take.get(f) for f in fields] for take in current]
-                    == [[take.get(f) for f in fields] for take in takes])
+        _why = _takes_same()
+        if _why:
+            _HANDOFF_NO.update({"at": time.time(), "why": _why})
+        return not _why
 
     def commit() -> None:
         nonlocal committed
@@ -72005,6 +72177,15 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
         entry = dict(dialogue_entry(row) or {})
         entry["prep_kind"] = kind
         entry["_ready_slot"] = window
+        # 2026-09-14: THE RESCUE WAS REFUSED ONE DOOR LATER. `free` (dead air,
+        # or a round overdue past the dial) lets this function ignore the
+        # running order - and then _speak_turns_floorless re-ran
+        # _ready_round_fits with `_ready_slot` None, read the sheet's current
+        # entry, found it belonged to another road, and returned []. Measured
+        # the first ten minutes after refusals learned to say why: 41 rows
+        # withdrawn, every one "the sheet is on the news entry, not gallery".
+        # The cupboard was answering silence and being turned away inside.
+        entry["_ready_free"] = bool(free)
         # #1322: `force` IS the silence rescue (#1313) - it is set only
         # under talk_quiet_for() >= SILENCE_LOSES_AFTER - so it, and
         # nothing broader, is what lets the booth air a repeat. `rescue`
@@ -82410,6 +82591,90 @@ async def speak_turns(turns: list[tuple[str, str]],
         _floor_drop(_owned)
 
 
+_WITHDRAWN_LAST: dict[str, Any] = {"at": 0.0, "why": "", "sid": "", "rows": 0,
+                                   "kind": ""}
+_HANDOFF_NO: dict[str, Any] = {"at": 0.0, "why": ""}      # 2026-09-14: can_handoff's reason
+
+
+def _burst_withdraw(entries: list[dict[str, Any]], why: str) -> None:
+    """2026-09-14: A ROUND THE STATION REFUSED IS NOT ON THE AIR.
+
+    Every turn of a coalesced round is appended to the feed as `prepared`
+    the moment it is written, with an ESTIMATED air stamp that then runs
+    on like a clock. When the hand-over below refuses the round - the
+    slot has moved on, the station is paused, System2 calls it a repeat,
+    neither the page nor the box took it - the function returned [] and
+    left those rows behind. Measured on 2026-09-14 over four hours: 1,466
+    prepared rows never heard against 25 that were; 57 of 58 rounds with
+    prepared rows never aired at all, a 31-line gallery round among them
+    every ten minutes. The script page carries them as planned lines with
+    running clocks, the lines that DID air thread between them in the
+    ledger's order, and the operator reads "lines skipped" and "out of
+    order" (reports #1136, #1137).
+
+    So a refusal now WITHDRAWS its rows - state `withdrawn`, the reason
+    on the row - and records the reason where the shelf's own verdict
+    ("the booth did not put it out") picks it up, so the station can say
+    which it was instead of that it happened."""
+    n = 0
+    sid = ""
+    kind = ""
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        sid = sid or str(e.get("sid") or "")
+        kind = kind or str(e.get("kind") or "")
+        if str(e.get("aired") or "prepared") in ("prepared", ""):
+            e["aired"] = "withdrawn"
+            e["withdrawn_why"] = str(why)[:240]
+            n += 1
+    _BANTER_WHY.update({"at": time.time(), "why": str(why)})
+    if n:
+        _WITHDRAWN_LAST.update({"at": time.time(), "why": str(why), "sid": sid,
+                                "rows": n, "kind": kind})
+        try:
+            pipeline_log("drop", "a %s round was refused at hand-over and its %d "
+                                 "line(s) withdrawn from the feed: %s" % (kind or "?", n, why))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _burst_refusal_why(ready_meta: Any, length: float, start_at: float | None = None,
+                       can_handoff: Any = None) -> str:
+    """The reason a finished round did not fit, in numbers a person can
+    check - the hand-over condition below is one `or` of five things and
+    used to answer with nothing."""
+    kind = str((ready_meta or {}).get("prep_kind") or "round")
+    try:
+        if radio_paused():
+            return "the station is paused"
+        if not _RADIO.get("on"):
+            return "the station is off"
+        win = None if (ready_meta or {}).get("_ready_free") else _ready_slot_window(kind)
+        now = time.time()
+        if win is not None:
+            deadline = float(win.get("deadline") or 0)
+            on_air = str(win.get("kind") or "")
+            if deadline <= 0 and on_air and on_air != kind:
+                return ("the sheet is on the %s entry, not %s - a %s round may only air "
+                        "inside its own entry" % (on_air, kind, kind))
+            if deadline <= now:
+                return "the %s entry on the sheet has already ended" % kind
+            left = deadline - max(now, float(start_at or now))
+            grace = segment_overrun(deadline, kind)
+            if float(length or 0) + 1.0 > left + grace:
+                return ("the %s round runs %ds and its entry has %ds left (%ds grace) - "
+                        "the round is longer than the time the sheet gives it"
+                        % (kind, int(float(length or 0)), int(max(0.0, left)), int(grace)))
+        if callable(can_handoff) and not can_handoff():
+            _h = (str(_HANDOFF_NO.get("why") or "")
+                  if time.time() - float(_HANDOFF_NO.get("at") or 0) < 5 else "")
+            return "the hand-off was refused: " + (_h or "the caller's own check said no (can_handoff)")
+    except Exception as exc:  # noqa: BLE001
+        return "the station would not put it out (%s)" % exc
+    return "the station would not put it out"
+
+
 async def _speak_turns_floorless(turns: list[tuple[str, str]],
                       track: dict[str, Any] | None, limit: int,
                       vouched: list[str] | None = None,
@@ -83812,13 +84077,16 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # that is a caller cut off mid-sentence with no sign-off.
                     if (not played_any) and ready_takes is not None and (
                             radio_paused() or not _RADIO.get("on")
-                            or not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
+                            or (not ready_meta.get("_ready_free")   # 2026-09-14: the free road
+                                                                and not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
                                 ready_takes, ready_meta.get("_ready_slot"),
-                                seconds=length, start_at=_pstart)
+                                seconds=length, start_at=_pstart))
                             or (callable(can_handoff) and not can_handoff())):
+                        _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, _pstart, can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
                     if not played_any and not _system2_repeat_rows(rows, ready_meta):
+                        _burst_withdraw(_entries, "System2 counts these lines as already aired - a repeat")   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
                     page_delivery = page_feed_append({
@@ -83865,13 +84133,16 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # listener is already hearing.
                     if (not played_any and not page_delivery
                             and not _system2_repeat_rows(rows, ready_meta)):
+                        _burst_withdraw(_entries, "System2 counts these lines as already aired - a repeat")   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
                     if (not played_any and ready_takes is not None and not page_delivery
                             and (radio_paused() or not _RADIO.get("on")
-                                 or not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
-                                     ready_takes, ready_meta.get("_ready_slot"), seconds=length)
+                                 or (not ready_meta.get("_ready_free")   # 2026-09-14: the free road
+                                                                and not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
+                                     ready_takes, ready_meta.get("_ready_slot"), seconds=length))
                                   or (callable(can_handoff) and not can_handoff()))):
+                        _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, None, can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
                     if ready_meta.get("_system2") and callable(on_handoff):
@@ -83955,6 +84226,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # #760: the burst is done, not the round. Returning here
                 # is what made the whole conversation one clip.
                 if ready_takes is not None and not (page_delivery or (to_box and played_ok)):
+                    _burst_withdraw(_entries, "neither the page nor the box took the clip")   # 2026-09-14
                     _sfx_cadence_release(_sfx_meta.values())
                     return []
                 played_any = True
@@ -106955,6 +107227,117 @@ def scene_inputs(kind: str = "", who: str = "") -> list[dict[str, Any]]:
     return out
 
 
+def _pretty_key(k: str) -> str:
+    return str(k).replace("_", " ")
+
+
+def admin_options_for_line(row: dict[str, Any], prov: dict[str, Any]) -> list[dict[str, Any]]:
+    """2026-09-14: "show how each of these options contributed to the current
+    line ... how any pref or modifier made it into the line." Every dial on
+    the DJ desk, with what it governs and - where the line's paperwork can
+    say - whether it reached THIS line: a persona or a mind note whose words
+    are in the prompt as sent; the speakbox rates by whether a passage was
+    quoted; the crystal by a shard in the prompt; render dials by the engine
+    that rendered it. Anything the paperwork cannot see is said as
+    'governs' rather than claimed."""
+    try:
+        dj = dj_settings() or {}
+    except Exception:  # noqa: BLE001
+        dj = {}
+    written = dict(prov.get("written") or {})
+    prompt = str(written.get("prompt") or "")
+    docs = prov.get("documents") or []
+    crystal = prov.get("crystal") or []
+    render = dict(prov.get("render") or {})
+    who = str(row.get("who") or "")
+    seat = {"dj": "dj", "host": "dj", "cohost": "cohost", "third": "third"}.get(who.lower(), "")
+    out: list[dict[str, Any]] = []
+
+    def put(key: str, label: str, value: Any, governs: str, applied: Any, how: str) -> None:
+        out.append({"key": key, "label": label, "value": str(value)[:160], "governs": governs,
+                    "applied": applied, "how": how})
+
+    def in_prompt(text: str) -> bool | None:
+        if not prompt:
+            return None
+        t = " ".join(str(text or "").split())[:60]
+        return bool(t) and t in " ".join(prompt.split())
+
+    # the seat's character
+    for k, lbl, whos in (("persona", "host persona", ("dj",)), ("cohost_persona", "co-host persona", ("cohost",)),
+                         ("third_persona", "third seat persona", ("third",))):
+        text = str(dj.get(k) or "")
+        if not text:
+            continue
+        mine = seat in whos
+        ap = in_prompt(text) if mine else False
+        put(k, lbl, text[:80] + ("..." if len(text) > 80 else ""), "the writing prompt",
+            ap, ("its words are in the prompt as sent" if ap else "not this seat's line" if not mine
+                 else "the booth no longer holds the prompt" if ap is None else "not found in the prompt as sent"))
+    # mind adjustments for the seat
+    try:
+        notes = [r for r in ((dj.get("mind_adjustments") or {}).get(seat) or []) if isinstance(r, dict)]
+        for n in notes[-6:]:
+            t = str(n.get("text") or "")
+            ap = in_prompt(t)
+            put("mind_adjustments", "mind note (%s)" % (seat or "?"), t[:100], "the writing prompt", ap,
+                "in the prompt as sent" if ap else "not in this prompt" if ap is False else "prompt not held")
+    except Exception:  # noqa: BLE001
+        pass
+    # system prompt in force
+    sysp = dict(prov.get("system") or {})
+    put("system_prompt", "system prompt", sysp.get("name") or sysp.get("armed_now") or "-",
+        "the station's disposition", bool(sysp.get("station_followed")),
+        "the station's disposition was in the prompt" if sysp.get("station_followed") else "the agent's prompt never reaches the booth (#983)")
+    # the speakbox
+    quoted = [d for d in docs if d.get("quoted")]
+    put("speakbox_rate", "started from the speakbox", "%d%%" % round(float(dj.get("speakbox_rate") or 0) * 100),
+        "whether a passage seeds the round", bool(docs), ("seeded from %s" % ", ".join(str(d.get("file")) for d in docs[:2])) if docs else "no passage on this line")
+    put("speakbox_prepend_rate", "prepend a quote", "%d%%" % round(float(dj.get("speakbox_prepend_rate") or 0) * 100),
+        "a quoted passage before the brief", bool(quoted), "a passage was quoted in the prompt" if quoted else "nothing quoted")
+    put("speakbox_append_rate", "append a quote", "%d%%" % round(float(dj.get("speakbox_append_rate") or 0) * 100),
+        "a quoted passage after the brief", bool(quoted), "a passage was quoted in the prompt" if quoted else "nothing quoted")
+    # the crystal
+    shards = [c for c in crystal if c.get("in_prompt")]
+    put("crystal", "crystal tint", ", ".join(str(c.get("name") or c.get("id")) for c in crystal_active()) or "off",
+        "the tint of the prompt", bool(shards), ("%d shard(s) in the prompt" % len(shards)) if shards else "no shard in this prompt")
+    # writing dials
+    for k, lbl in (("chattiness", "chattiness"), ("interject_rate", "interject rate"), ("deep_rate", "deep conversation rate"),
+                   ("banter_min_lines", "banter min lines"), ("banter_max_lines", "banter max lines"),
+                   ("hostile_rate", "hostile rate"), ("name_remark_rate", "name remark rate"), ("story_rate", "story rate")):
+        if k in dj:
+            put(k, lbl, dj.get(k), "the round's shape when it was written", None, "governs the writer; not traceable on one line")
+    if written.get("model"):
+        put("model", "model", "%s · %s ms · %s chars" % (written.get("model"), written.get("ms"), written.get("chars")),
+            "the writing room", True, "this call wrote it")
+    for k, lbl in (("temp", "temperature"), ("budget", "reply budget"), ("num_ctx", "context window")):
+        if written.get(k) is not None:
+            put(k, lbl, written.get(k), "the writing call", True, "used on this call")
+    # render dials
+    eng = str(render.get("engine") or row.get("engine") or "")
+    for k, lbl in (("speech_rate", "speech rate"), ("voice_speed", "voice speed"), ("overlap", "overlap"),
+                   ("avoid_piper", "avoid piper"), ("cast_engine_lock", "cast engine lock"), ("clone_engine", "clone engine")):
+        if k in dj:
+            put(k, lbl, dj.get(k), "the recording room", bool(eng), ("rendered by %s" % eng) if eng else "render not held")
+    for k, lbl in (("caller_every", "caller every"), ("manager_every", "manager every"), ("news_every", "news every"),
+                   ("sfxguy_rate", "SFX guy rate"), ("sfx_video_share", "picture share"), ("ad_every", "ad every")):
+        if k in dj:
+            put(k, lbl, dj.get(k), "the running order", None, "governs when this kind of round is called")
+    # anything else that looks like a dial, listed once, so nothing is hidden
+    seen = {o["key"] for o in out}
+    for k in sorted(dj.keys()):
+        if k in seen or k in ("persona", "cohost_persona", "third_persona", "mind_adjustments", "radio_prompt_overrides",
+                              "radio_prompt_enabled", "radio_prompt_presets", "speakbox_weights", "speakbox_files",
+                              "intro_phrases", "open_phrases", "station_ids", "request_phrases", "interject_phrases",
+                              "diatribe_interjections", "sponsors", "role_engine", "sfx_drop_folders", "sfx_folders",
+                              "speakbox_minds"):
+            continue
+        v = dj.get(k)
+        if isinstance(v, (int, float, bool, str)) and len(str(v)) <= 60:
+            put(k, _pretty_key(k), v, "a desk dial", None, "governs the station; not traceable on one line")
+    return out[:120]
+
+
 @app.get("/api/dj/scenario")
 async def dj_scenario_api(
     line: str = "",
@@ -106983,19 +107366,282 @@ async def dj_scenario_api(
     on = [i for i in inputs if i["on"]
           and i["key"] not in ("schedule", "prompt", "persona", "station")]
     label = scene_kind_label(kind) if kind else "the show as it runs"
+    # 2026-09-14: the admin options, judged against this line's paperwork
+    prov: dict[str, Any] = {}
+    if want:
+        try:
+            prov = await dj_provenance_api(want, authorization)
+        except Exception:  # noqa: BLE001
+            prov = {}
+    admin = await asyncio.to_thread(admin_options_for_line, row, prov)
     scenario = {"label": label, "kind": kind,
                 "road": str(row.get("round") or row.get("kind")
                             or _RADIO.get("sched_kind") or ""),
                 "brief": brief[:900],
                 "since": float(row.get("ts") or 0) if row else 0.0,
                 "where": "the schedule desk"}
-    return {"ok": True, "scenario": scenario, "inputs": inputs,
+    return {"ok": True, "scenario": scenario, "inputs": inputs, "admin": admin,
             "line": {"id": want, "kind": row.get("kind"),
                      "round": row.get("round"), "who": who,
                      "name": row.get("name")},
             "say": ("%s, shaped by %s"
                     % (label, ", ".join(i["label"].lower() for i in on)))
             if on else ("%s - nothing else is steering the scene" % label)}
+
+
+# --- 2026-09-14: A VOTE ON A LINE ------------------------------------------
+#
+# "If I tap and hold on a message ... an option to say that I like that piece
+#  of dialogue. That means that I want that piece to get a triple expiration
+#  date and I want it to be reused in the future ... if it's something that
+#  the SFX guy says then add it to his catchphrase. If it's for the host or
+#  the co-host, then add it to their repertoire ... an up vote and down vote
+#  and if I downvote it that means that the dialogue just didn't work and it
+#  doesn't need to be used in the future."
+#
+# The vote is kept by line id in data/line_votes.json. UP finds the welded
+# round the line lives in (the chat row's clip_media against the round's
+# key/media) and gives it three times its keep and three times its innings,
+# and remembers the words: the SFX guy's go into his quips (the catchphrase
+# book he draws from), a presenter's become a mind adjustment for that seat
+# - "the operator liked this line of yours; say things like it, and you may
+# repeat it" - which is the standing lever the writing room already reads.
+# DOWN marks the round so it airs no more (innings floored at what has
+# aired), drops the words from the quips if they were there, and leaves it
+# to the retirement desk's own clock.
+LINE_VOTES_PATH = data_path("line_votes.json")
+_LINE_VOTES_LOCK = RLock()
+
+
+def line_votes_read() -> dict[str, Any]:
+    try:
+        got = json.loads(LINE_VOTES_PATH.read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def line_votes_write(rows: dict[str, Any]) -> None:
+    LINE_VOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    items = sorted(rows.items(), key=lambda kv: float((kv[1] or {}).get("at") or 0))[-2000:]
+    tmp = LINE_VOTES_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(dict(items), indent=1), encoding="utf-8")
+    tmp.replace(LINE_VOTES_PATH)
+
+
+def line_row_of(line_id: str) -> dict[str, Any]:
+    """The line as the booth or the air log remembers it."""
+    want = str(line_id or "")
+    if not want:
+        return {}
+    try:
+        _ensure_chat_ids()
+        for r in reversed(_RADIO.get("chat") or []):
+            if isinstance(r, dict) and str(r.get("id") or "") == want:
+                return dict(r)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        now = time.time()
+        for r in airlog_rows(now - 48 * 3600, now, quiet=True):
+            if str(r.get("id") or "") == want:
+                return dict(r)
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def round_of_line(row: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """The welded round a line lives in, by its clip media, walked the way
+    cupboard_find walks - by identity, so a change lands on the row the
+    air holds."""
+    media = str(row.get("clip_media") or row.get("media") or "")
+    stem = media.rsplit("/", 1)[-1].rsplit(".", 1)[0] if media else ""
+    if not stem:
+        return "", None
+
+    def hit(r: Any) -> bool:
+        if not isinstance(r, dict):
+            return False
+        pool = [r, r.get("entry") if isinstance(r.get("entry"), dict) else {}]
+        for d in pool:
+            for k in ("key", "media", "file", "audio", "path", "clip", "mp3"):
+                v = d.get(k)
+                if isinstance(v, str) and v and (v == media or v.rsplit("/", 1)[-1].rsplit(".", 1)[0] == stem):
+                    return True
+        return False
+
+    try:
+        for entry in list(_LARDER):
+            if hit(entry):
+                return "banter", entry
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for kind, rows in list(_SHELF.items()):
+            for r in list(rows or []):
+                if hit(r):
+                    return str(kind), r
+    except Exception:  # noqa: BLE001
+        pass
+    return "", None
+
+
+def _seat_of(who: str) -> str:
+    w = str(who or "").lower()
+    if w in ("dj", "host"):
+        return "dj"
+    if w in ("cohost", "co-host", "skip"):
+        return "cohost"
+    if w in ("third", "guest"):
+        return "third"
+    if w in ("sfxguy", "board", "sfx"):
+        return "sfxguy"
+    return ""
+
+
+def line_vote_apply(line_id: str, vote: str) -> dict[str, Any]:
+    row = line_row_of(line_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="that line is in neither the booth nor the air log")
+    text = str(row.get("text") or "").strip()
+    who = str(row.get("who") or "")
+    seat = _seat_of(who)
+    kind, rnd = round_of_line(row)
+    said: list[str] = []
+    now = time.time()
+    if vote == "up":
+        if rnd is not None:
+            try:
+                rule = retire_rule(kind)
+                keep_h = float(rule.get("keep_hours") or 96.0)
+                until = max(float(rnd.get("keep_until") or 0), now + 3.0 * keep_h * 3600.0)
+                rnd["keep_until"] = until
+                if isinstance(rnd.get("entry"), dict):
+                    rnd["entry"]["keep_until"] = until
+                have = int(rnd.get("innings") or rule.get("innings") or 3)
+                rnd["innings"] = max(1, min(60, have * 3))
+                rnd["liked"] = True
+                rnd.pop("disliked", None)
+                said.append("its %s round is kept %d hours longer and may air %d times"
+                            % (kind, int(3 * keep_h), rnd["innings"]))
+            except Exception as exc:  # noqa: BLE001
+                said.append("the round could not be re-timed: %s" % str(exc)[:80])
+        else:
+            said.append("its round is not on a shelf any more, so only the words are kept")
+        if text:
+            if seat == "sfxguy":
+                try:
+                    quips = sfxguy_quips()
+                    if text not in quips:
+                        sfxguy_quips_save([text] + quips)
+                    said.append("added to the SFX guy's catchphrases")
+                except Exception as exc:  # noqa: BLE001
+                    said.append("his catchphrases would not take it: %s" % str(exc)[:60])
+            elif seat in ("dj", "cohost", "third"):
+                try:
+                    settings = load_settings()
+                    bucket = settings.setdefault("dj", {}).setdefault("mind_adjustments", {})
+                    rows = [r for r in (bucket.get(seat) or []) if isinstance(r, dict)]
+                    note = ("The operator liked this line of yours: \"%s\" - say things like "
+                            "it, and you may repeat it." % text[:300])
+                    if not any(str(r.get("text") or "") == note for r in rows):
+                        rows.append({"id": uuid.uuid4().hex[:8], "text": note, "at": now, "liked_line": line_id})
+                    bucket[seat] = rows[-40:]
+                    save_settings(settings)
+                    said.append("added to the %s's repertoire" % ("host" if seat == "dj" else "co-host" if seat == "cohost" else "third seat"))
+                except Exception as exc:  # noqa: BLE001
+                    said.append("the repertoire would not take it: %s" % str(exc)[:60])
+    elif vote == "down":
+        if rnd is not None:
+            try:
+                rnd["disliked"] = True
+                rnd.pop("liked", None)
+                rnd["innings"] = max(1, int(rnd.get("aired") or 0) or 1)
+                rnd["keep_until"] = 0.0
+                if isinstance(rnd.get("entry"), dict):
+                    rnd["entry"]["keep_until"] = 0.0
+                said.append("its %s round airs no more and may go when its time comes" % kind)
+            except Exception as exc:  # noqa: BLE001
+                said.append("the round could not be marked: %s" % str(exc)[:80])
+        if text and seat == "sfxguy":
+            try:
+                quips = sfxguy_quips()
+                if text in quips:
+                    sfxguy_quips_save([q for q in quips if q != text])
+                    said.append("taken out of his catchphrases")
+            except Exception:  # noqa: BLE001
+                pass
+        if text and seat in ("dj", "cohost", "third"):
+            try:
+                settings = load_settings()
+                bucket = settings.setdefault("dj", {}).setdefault("mind_adjustments", {})
+                rows = [r for r in (bucket.get(seat) or []) if isinstance(r, dict) and str(r.get("liked_line") or "") != line_id]
+                bucket[seat] = rows
+                save_settings(settings)
+            except Exception:  # noqa: BLE001
+                pass
+    else:
+        if rnd is not None:
+            rnd.pop("liked", None)
+            rnd.pop("disliked", None)
+        said.append("the vote is cleared")
+    with _LINE_VOTES_LOCK:
+        votes = line_votes_read()
+        if vote in ("up", "down"):
+            votes[line_id] = {"vote": vote, "at": now, "who": who, "seat": seat,
+                              "text": text[:300], "round": kind}
+        else:
+            votes.pop(line_id, None)
+        line_votes_write(votes)
+    try:
+        note_action("you %s a %s line: %s" % (
+            "liked" if vote == "up" else "downvoted" if vote == "down" else "unvoted",
+            who or "?", text[:60]))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "vote": vote, "who": who, "seat": seat, "round": kind,
+            "repertoire": ("sfxguy" if seat == "sfxguy" else seat) if vote == "up" and seat else None,
+            "say": "; ".join(said) or "noted"}
+
+
+@app.post("/api/line/vote")
+async def line_vote_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    line_id = str(payload.get("id") or "").strip()
+    vote = str(payload.get("vote") or "").strip().lower()
+    if not line_id:
+        raise HTTPException(status_code=400, detail="which line?")
+    if vote not in ("up", "down", "none", ""):
+        raise HTTPException(status_code=400, detail="vote must be up, down or none")
+    return await asyncio.to_thread(line_vote_apply, line_id, vote or "none")
+
+
+@app.get("/api/line/vote")
+async def line_vote_get_api(
+    id: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    row = line_votes_read().get(str(id or "")) or {}
+    return {"id": str(id or ""), "vote": str(row.get("vote") or ""),
+            "at": row.get("at"), "seat": row.get("seat")}
+
+
+@app.get("/api/line/liked")
+async def line_liked_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Every line the operator has voted on, newest first."""
+    require_read_auth(authorization)
+    votes = line_votes_read()
+    rows = sorted(({"id": k, **v} for k, v in votes.items()), key=lambda r: -float(r.get("at") or 0))
+    return {"count": len(rows), "rows": rows[:200]}
 
 
 @app.get("/api/said/why/{line_id}")
@@ -107103,11 +107749,83 @@ async def said_why_api(
         if i:
             systems.append({"name": i["label"].lower(), "on": i["on"],
                             "note": i["value"]})
+    # 2026-09-14: "a flow by flow flow chart explaining everything that's
+    # happened as far as how this piece of line came to be broadcasted".
+    # One step per desk the line crossed, in order, each with what is
+    # actually on record for it - a step the record does not hold is
+    # left out rather than invented.
+    flow: list[dict[str, Any]] = []
+
+    def _when(v: Any) -> str:
+        try:
+            return time.strftime("%H:%M:%S", time.localtime(float(v))) if float(v or 0) > 0 else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    trace = row.get("trace") if isinstance(row.get("trace"), dict) else {}
+    flow.append({"step": "called",
+                 "label": "the %s road was called" % (row.get("round") or kind or "?"),
+                 "detail": (str(sched.get("label") or sched.get("kind") or "")
+                            or "the schedule desk chose the road"),
+                 "at": _when(row.get("ts"))})
+    if written.get("model") or (trace.get("written") or {}).get("model"):
+        _w = written if written.get("model") else (trace.get("written") or {})
+        flow.append({"step": "written",
+                     "label": "written by %s" % _w.get("model"),
+                     "detail": ("%s ms" % _w.get("ms") if _w.get("ms") else "")
+                     + ((" - brief: " + str(sched.get("prompt"))[:140]) if sched.get("prompt") else ""),
+                     "at": _when(_w.get("at") or row.get("ts"))})
+    rend = trace.get("render") if isinstance(trace.get("render"), dict) else {}
+    if rend or row.get("engine"):
+        _secs = float(rend.get("seconds") or row.get("seconds") or 0)
+        flow.append({"step": "rendered",
+                     "label": "rendered by %s" % (rend.get("engine") or row.get("engine")),
+                     "detail": "voice %s%s%s%s" % (
+                         rend.get("voice") or row.get("voice") or "?",
+                         (", %.1fs of audio" % _secs) if _secs > 0 else "",
+                         (", in %d ms" % int(rend.get("ms"))) if rend.get("ms") else "",
+                         (" (fell back: %s)" % rend.get("fallback")) if rend.get("fallback") else ""),
+                     "at": _when(trace.get("queued_at"))})
+    elif row.get("voice"):
+        flow.append({"step": "rendered", "label": "voiced as %s" % row.get("voice"),
+                     "detail": "the engine is not on this row's record", "at": ""})
+    _st = str(row.get("aired") or "")
+    _road = {"stream": "handed to the page and heard there",
+             "box": "handed to the box and heard there",
+             "both": "heard on the page and the box",
+             "published": "published to the page",
+             "page": "played by the page",
+             "airing": "going out right now",
+             "held": "held for the box - not yet heard",
+             "prepared": "prepared and appended to the feed - never heard",
+             "withdrawn": "refused at hand-over - withdrawn from the air",
+             "never": "produced no audio",
+             "muted": "played while the box was muted"}.get(_st, "state: %s" % (_st or "unknown"))
+    flow.append({"step": "handed", "label": _road,
+                 "detail": (str(row.get("withdrawn_why") or "")
+                            or ("page delivery %s" % row.get("page_delivery") if row.get("page_delivery") else "")
+                            or ("box delivery %s" % row.get("box_delivery") if row.get("box_delivery") else "")),
+                 "at": _when(row.get("air_at")) if _st in AIR_AT_HEARD else ""})
+    if _st in AIR_AT_HEARD and row.get("air_at"):
+        flow.append({"step": "heard", "label": "heard at %s" % _when(row.get("air_at")),
+                     "detail": ("%.1fs on air" % float(row.get("seconds") or 0))
+                     if float(row.get("seconds") or 0) > 0 else "",
+                     "at": _when(row.get("air_at"))})
+    try:
+        _place = script_ledger_order().get(want)
+        if _place:
+            flow.append({"step": "ledger",
+                         "label": "block %d, line %d of the script" % (int(_place[0]), int(_place[1]) + 1),
+                         "detail": "scripted" if (len(_place) < 3 or _place[2]) else "welded in, not scripted",
+                         "at": ""})
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True, "id": want, "said": str(row.get("text") or "")[:400],
             "who": who, "name": row.get("name"), "kind": row.get("kind"),
             "round": row.get("round"), "voice": row.get("voice"),
             "engine": row.get("engine"), "model": written.get("model"),
             "aired": row.get("aired"), "properties": properties,
+            "flow": flow,
             "prompt": prompt, "systems": systems, "provenance_ok": bool(prov),
             "say": "%s on the %s road; %d thing(s) set it"
                    % (row.get("name") or who,
@@ -107204,6 +107922,47 @@ def script_sequence_check(view: dict[str, Any]) -> dict[str, Any]:
             prev_idx = idx
     win = [r for r in (view.get("window") or []) if isinstance(r, str)]
     out["window_rows"] = len(win)
+    # 2026-09-14 (#1143-#1145): THE SFX GUY'S QUIP IS COMMITTED ALONE. An
+    # interjection gets its own block number, later than the round it
+    # cuts into, and the page pins it where it was heard (#1342) - so
+    # block 6700.4 read "below" block 6704.0 and the check called it a
+    # fault. It is the ledger's numbering, not the page's order. Blocks
+    # that are one or two interjection rows are set aside as such.
+    inter_blocks: set[int] = set()
+    try:
+        _blk: dict[int, list[str]] = {}
+        for _lr in script_ledger_rows():
+            _blk.setdefault(int(_lr.get("block") or 0), []).append(str(_lr.get("kind") or ""))
+        for _b, _ks in _blk.items():
+            if len(_ks) <= 2 and all(k in ("interject", "sfxguy", "gold") for k in _ks):
+                inter_blocks.add(_b)
+    except Exception:  # noqa: BLE001
+        inter_blocks = set()
+    out["interjections"] = []
+    # 2026-09-14: WHICH OF THESE LINES WERE EVER HEARD. The window is the
+    # page's own record and says nothing about air; the feed and the air
+    # log do. A line whose newest state is `prepared` or `withdrawn` was
+    # written and voiced and never played - the "skipped" line.
+    states: dict[str, str] = {}
+    try:
+        _now = time.time()
+        for _r in airlog_rows(_now - 12 * 3600, _now + 3600, quiet=True):
+            states[str(_r.get("id") or "")[:8]] = str(_r.get("aired") or "")
+        for _r in _RADIO.get("chat") or []:
+            if isinstance(_r, dict) and _r.get("id"):
+                states[str(_r.get("id"))[:8]] = str(_r.get("aired") or "")
+    except Exception:  # noqa: BLE001
+        states = {}
+    unheard: list[dict[str, Any]] = []
+    for r in win:
+        f = r.split("|")
+        if len(f) < 9 or not f[2]:
+            continue
+        st = states.get(f[2][:8])
+        if st and st not in AIR_AT_HEARD:
+            unheard.append({"index": f[0], "line": f[2], "order": f[4],
+                            "kind": f[5], "who": f[6], "state": st})
+    out["unheard"] = unheard
     last: tuple[int, int] | None = None
     last_row = ""
     for r in win:
@@ -107214,6 +107973,10 @@ def script_sequence_check(view: dict[str, Any]) -> dict[str, Any]:
         if not got:
             continue
         cur = (int(got.group(1)), int(got.group(2)))
+        if cur[0] in inter_blocks:                                # 2026-09-14
+            out["interjections"].append({"index": f[0], "line": f[2], "order": f[4],
+                                         "kind": f[5], "who": f[6]})
+            continue                       # pinned where it was heard; not in the run
         if last is not None and cur < last:
             out["order_faults"].append({"index": f[0], "line": f[2], "order": f[4],
                                         "after": last_row, "kind": f[5]})
@@ -107274,12 +108037,33 @@ def script_explain(view: dict[str, Any], reading: dict[str, Any]) -> list[str]:
         if len(blocks) > 1:
             bl = sorted(blocks)
             firsts = [by_block.get(b, [{}])[0] for b in bl]
-            out.append("the %s round %s was committed as %d blocks - %s - so the page carries "
-                       "the same lines %d times; the earlier copies never aired and read as "
-                       "planned lines, and anything stamped between them lands inside them"
-                       % (str(firsts[0].get("round") or "?"), sid[:10], len(bl),
-                          ", ".join("block %d at %s" % (b, when(f)) for b, f in zip(bl, firsts)),
-                          len(bl)))
+            # 2026-09-14 (#1141/#1142): TWINS SHARE THEIR LINES; PARTS DO
+            # NOT. A conversation goes out in batches and each batch is
+            # committed as its own block (6699: three lines at 21:21:00,
+            # 6700: seven more at 21:21:39) - one round, several blocks,
+            # nothing duplicated. That is not the twin commit of #1129.
+            def _texts(b: int) -> set[str]:
+                return {" ".join(str(r.get("text") or "").lower().split())[:60]
+                        for r in by_block.get(b, []) if r.get("kind") != "sfx"}
+            shared = 0
+            for _a, _b in zip(bl, bl[1:]):
+                _ta, _tb = _texts(_a), _texts(_b)
+                if _ta and _tb and len(_ta & _tb) * 2 >= min(len(_ta), len(_tb)):
+                    shared += 1
+            if shared:
+                out.append("the %s round %s was committed as %d blocks - %s - so the page carries "
+                           "the same lines %d times; the earlier copies never aired and read as "
+                           "planned lines, and anything stamped between them lands inside them"
+                           % (str(firsts[0].get("round") or "?"), sid[:10], len(bl),
+                              ", ".join("block %d at %s" % (b, when(f)) for b, f in zip(bl, firsts)),
+                              len(bl)))
+            else:
+                out.append("the %s round %s went out in %d parts, each committed as its own block - %s "
+                           "- one conversation written in batches; the page reads the parts in order "
+                           "and nothing in them is duplicated"
+                           % (str(firsts[0].get("round") or "?"), sid[:10], len(bl),
+                              ", ".join("block %d (%d lines) at %s" % (b, len(by_block.get(b, [])), when(f))
+                                        for b, f in zip(bl, firsts))))
     for kind, label in (("backward_jumps", "backwards"), ("big_jumps", "a page")):
         for j in (seq.get(kind) or [])[:3]:
             to = find(str(j.get("line") or ""))
@@ -107301,9 +108085,55 @@ def script_explain(view: dict[str, Any], reading: dict[str, Any]) -> list[str]:
                    "not the ledger's there%s"
                    % (f.get("index"), f.get("line"), f.get("order"), f.get("after"),
                       (" - block %d was committed %s" % (int(r.get("block") or 0), when(r))) if r else ""))
+    # 2026-09-14: THE BLOCK THAT WAS VOICED AND NEVER HEARD. "Why are
+    # lines skipped? Why is this segment out of order?" (#1136) - because
+    # a round was written into the ledger, rendered, appended to the feed
+    # with a running clock, and then refused at hand-over; the page lays
+    # its lines in the ledger's order and the round that actually aired
+    # threads between them. Said per block, with the station's reason
+    # when it recorded one.
+    blocks: dict[int, dict[str, Any]] = {}
+    for u in (seq.get("unheard") or []):
+        r = find(str(u.get("line") or ""))
+        b = int(r.get("block") or 0) if r else -1
+        got = blocks.setdefault(b, {"n": 0, "state": str(u.get("state") or ""), "r": r or {}})
+        got["n"] += 1
+    for b, info in sorted(blocks.items())[:3]:
+        r = info["r"]
+        rows_of = by_block.get(b) or []
+        why = ""
+        try:
+            sid = str(r.get("sid") or "")
+            for c in _RADIO.get("chat") or []:
+                if isinstance(c, dict) and sid and str(c.get("sid") or "") == sid and c.get("withdrawn_why"):
+                    why = str(c.get("withdrawn_why"))
+                    break
+            if not why and sid and str(_WITHDRAWN_LAST.get("sid") or "") == sid:
+                why = str(_WITHDRAWN_LAST.get("why") or "")
+        except Exception:  # noqa: BLE001
+            why = ""
+        if b < 0:
+            out.append("%d line(s) in the window are in state '%s' and the ledger does not hold "
+                       "them - written to the feed, never heard, never scripted" % (info["n"], info["state"]))
+            continue
+        out.append("block %d (%s, %d lines, written %s) was voiced but never heard - %d of its "
+                   "lines stand in the window in state '%s'%s; the page lays them in the ledger's "
+                   "order, so the round that DID air threads between them and reads as skipped "
+                   "or out of order"
+                   % (b, str(r.get("round") or "?"), len(rows_of), when(r), info["n"], info["state"],
+                      (" - the station's reason: " + why) if why else
+                      " - the station recorded no reason (the round was written before this "
+                      "process started, or refused on a road that does not say)"))
+    if blocks:
+        try:
+            wq = why_quiet()
+            if isinstance(wq, dict) and wq.get("say"):
+                out.append("the station's own account: " + str(wq.get("say"))[:400])
+        except Exception:  # noqa: BLE001
+            pass
     if not out:
         out.append("nothing in the ledger contradicts the page: the mark moved as the script was written")
-    return out[:8]
+    return out[:10]
 
 
 def script_happened_words() -> str:
@@ -107450,6 +108280,21 @@ def script_report_reading(view: dict[str, Any]) -> dict[str, Any]:
                        % (len(f), f[0]["index"], f[0]["line"], f[0]["order"], f[0]["after"]))
         if seq.get("motion_rows") and seq.get("unlit_samples") == seq.get("motion_rows"):
             why.append("nothing was lit in any of the last %d samples" % seq["motion_rows"])
+        if seq.get("interjections"):                              # 2026-09-14
+            why.append("%d interjection(s) in the window (the SFX guy, gold) are pinned where they "
+                       "were heard; each is committed alone so its block number is later than the "
+                       "round it cuts into - that is the ledger's numbering, not a fault"
+                       % len(seq["interjections"]))
+        if seq.get("unheard"):                                    # 2026-09-14
+            u = seq["unheard"]
+            _st: dict[str, int] = {}
+            for _u in u:
+                _st[str(_u.get("state"))] = _st.get(str(_u.get("state")), 0) + 1
+            why.append("%d of the %d lines in the window were written and voiced but never "
+                       "heard (%s) - they stand on the page as planned lines, the mark cannot "
+                       "land on them, and the lines that did air thread between them"
+                       % (len(u), seq.get("window_rows") or 0,
+                          ", ".join("%d %s" % (n, k) for k, n in sorted(_st.items()))))
     except Exception as exc:  # noqa: BLE001
         out["sequence"] = {"error": str(exc)[:120]}
     if "stall" in str(out.get("loop") or ""):
@@ -107491,6 +108336,9 @@ async def script_report_api(
     view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
     text = str(payload.get("text") or "")[:20000]
     image = str(payload.get("image") or "")
+    # 2026-09-14: "specify a reason for the report ... so that way you know
+    # what it is that I'm actually having an issue with"
+    reason = str(payload.get("reason") or "").strip()[:1200]
     reading = await asyncio.to_thread(script_report_reading, view)
     try:
         reading["explain"] = await asyncio.to_thread(script_explain, view, reading)
@@ -107500,6 +108348,7 @@ async def script_report_api(
     SCRIPT_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     saved = _save_pine_images([image]) if image else []
     md = ["# Script view report - %s" % time.strftime("%Y-%m-%d %H:%M:%S"), "",
+          *(["## Why the operator filed it", reason, ""] if reason else []),
           "## Verdict",
           *("- " + v for v in (reading.get("verdict") or [])), "",
           "## What the page saw", "```json",
@@ -107540,6 +108389,8 @@ async def script_report_api(
                "is %ss old.\n\nfull report: data/script_reports/%s"
                % (kind, "; ".join(reading.get("verdict") or []), lit, said, head,
                   age, path.name))
+    if reason:
+        summary = "%s\n\n%s" % (reason, summary)
     if reading.get("explain"):
         summary += "\n\nwhat the station says happened:\n" + "\n".join(
             "- " + w for w in reading["explain"][:4])
@@ -118734,6 +119585,63 @@ def courier_pending() -> list[dict[str, Any]]:
     return out
 
 
+@app.put("/api/export/upload")
+async def export_upload_api(
+    request: Request,
+    name: str = Query(default=""),
+    what: str = Query(default="screen"),
+    seconds: float = Query(default=0.0),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-14: "swipe into the center from the top right and be able to
+    export a video of whatever has been happening on the tablet for the
+    last X amount of time and save that to the directory." The tablet
+    cannot reach the export share and this container cannot write it
+    (#1114), so the file lands here and the desk's courier carries it to
+    the folder the operator named. Raw body, not multipart - the
+    container has no multipart parser and a 100 MB clip does not want one."""
+    require_auth(authorization)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "").strip())[:120].strip("._")
+    if not safe:
+        safe = "%s-%s.mp4" % (re.sub(r"[^a-z0-9]+", "-", str(what or "upload").lower()) or "upload",
+                              time.strftime("%Y%m%d-%H%M%S"))
+    folder = data_path("exports")
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / safe
+    wrote = 0
+    try:
+        with path.open("wb") as fh:
+            async for chunk in request.stream():
+                if chunk:
+                    fh.write(chunk)
+                    wrote += len(chunk)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            path.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=500, detail="the upload did not complete: %s" % exc) from exc
+    if wrote <= 0:
+        try:
+            path.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=400, detail="the body was empty")
+    dest = export_desk_dir()
+    if not dest:
+        try:
+            dest = export_dir_windows(str(pinelink_prefs_read().get("export_dir") or ""))
+        except Exception:  # noqa: BLE001
+            dest = ""
+    row = courier_add(path, dest, str(what or "screen")[:24]) if dest else None
+    note_action("the tablet sent %s (%d KB, %ss of screen)%s" % (
+        safe, wrote // 1024, int(float(seconds or 0)),
+        (" - owed to " + dest) if dest else " - no export folder is set, it stays in data/exports"))
+    return {"ok": True, "id": str(row.get("id") if row else ""), "name": safe,
+            "bytes": wrote, "dest": dest, "carried": bool(row),
+            "path": share_path_of(path)}
+
+
 @app.get("/api/export/courier")
 async def export_courier_api(
     authorization: str | None = Header(default=None),
@@ -128201,12 +129109,16 @@ def _sfx_db_pick_any(video: bool = True,
             except Exception:  # noqa: BLE001
                 aim = 0.0
         windows = ([(aim * 0.6, aim * 1.6)] if aim > 0 else []) + [None]
+        _pin = sfx_pin_prefix()                 # 2026-09-14: the folder pin
         for win in windows:
             where = "playable = 1 AND video = ?"
             args: tuple = (want,)
             if win:
                 where += " AND seconds BETWEEN ? AND ?"
                 args = (want, win[0], win[1])
+            if _pin:
+                where += " AND path LIKE ?"
+                args = args + (_pin.replace("%", "%%") + "%",)
             for _ in range(max(1, tries)):
                 # #1362c: UNIFORM. The first cut of this took a random
                 # rowid and walked forward to the first match, and three
@@ -131462,6 +132374,10 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
                  or (kind if kind in AIRLOG_TURN_ROUNDS else "banter"),
         "text": " ".join(str(entry.get("text") or "").split())[:600],
         "aired": str(entry.get("aired") or ""),
+        # 2026-09-14: the reason a withdrawn row was refused survives the
+        # ring - the panel's tooltip and the script report read it back.
+        **({"withdrawn_why": str(entry.get("withdrawn_why"))[:240]}
+           if entry.get("withdrawn_why") else {}),
         # #1201: WHERE THIS LINE SITS IN ITS SCRIPT. Without these,
         # "line 7 played before line 6" was not a checkable statement -
         # `round` is the road, not the conversation, and nothing carried
@@ -132578,17 +133494,55 @@ def script_ledger_order() -> dict[str, tuple[int, int]]:
     sting, an emergency filler, anything minted outside a round - keeps
     the clock-ordered slot it has always had."""
     out: dict[str, tuple[int, int]] = {}
+    # 2026-09-14: A STING'S AIR ROW DOES NOT CARRY THE LEDGER'S LINE ID. The
+    # SFX guy's sting welded into a round airs under the SAMPLE id (the air
+    # row's `id` is the sfx id), while the ledger wrote its own line_id at
+    # the weld - so every lookup by id missed, the sting kept its stamp,
+    # and the mark jumped backwards to it (reports #1130, #1132-#1134).
+    # What the two rows share is the ROUND id (`sid`) and the text, so a
+    # second key is kept for exactly that.
+    by_round_text: dict[tuple[str, str], tuple[int, int, bool]] = {}
     for r in script_ledger_rows():
         lid = str(r.get("line_id") or "")
+        got = (int(r.get("block") or 0), int(r.get("ord") or 0),
+               bool(r.get("scripted", True)))
         if lid:
-            # #1343: and whether anybody wrote it down in advance.
-            # A row committed with its round is the SPINE of the
-            # script; one caught up afterwards (a gold bar, a rescue
-            # quip) got its block number minutes later and must not
-            # be ordered by it - see the composer.
-            out[lid] = (int(r.get("block") or 0), int(r.get("ord") or 0),
-                        bool(r.get("scripted", True)))
+            out[lid] = got
+        sid = str(r.get("sid") or "")
+        if sid and r.get("kind") == "sfx":
+            key = (sid, " ".join(str(r.get("text") or "").lower().split()))
+            by_round_text.setdefault(key, got)
+    _LEDGER_ROUND_TEXT.clear()
+    _LEDGER_ROUND_TEXT.update(by_round_text)
     return out
+
+
+_LEDGER_ROUND_TEXT: dict[tuple[str, str], tuple[int, int, bool]] = {}
+
+
+def _ord_of(order: Any, row: Any) -> Any:
+    """The ledger's (block, ord, scripted) for an air row: by line id, else
+    - for a sting - by the round it was welded into and its text."""
+    if not isinstance(order, dict) or not isinstance(row, dict):
+        return None
+    got = order.get(str(row.get("id") or ""))
+    if got:
+        return got
+    # 2026-09-14 (#1133/#1134): ON THE PAGE A STING IS AN ACTION EVENT,
+    # and the action's own id is `ac-sting-<row id>`; the air row's id
+    # rides in `line`. Without this the welded sting was placed by its
+    # clock - 20:42:20, in the tail of the gallery round that was still
+    # being read - three hundred rows above the round the ledger wrote
+    # it into, and the mark fell back 153 rows when it lit.
+    if str(row.get("tag") or "") == "sting" and row.get("line"):
+        got = order.get(str(row.get("line") or ""))
+        if got:
+            return got
+    if str(row.get("kind") or "") == "sfx":
+        key = (str(row.get("sid") or ""), " ".join(str(row.get("text") or "").lower().split()))
+        if key[0] and key[1]:
+            return _LEDGER_ROUND_TEXT.get(key)
+    return None
 
 
 # --- P0 end ----------------------------------------------------------------
@@ -133819,7 +134773,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     _runs: dict[int, list[tuple[int, int]]] = {}
     if _ord:
         for _ix, _e in enumerate(events):
-            _got = _ord.get(str((_e.get("row") or {}).get("id") or ""))
+            _got = _ord_of(_ord, _e.get("row") or {})          # 2026-09-14
             if _got:
                 _runs.setdefault(_got[0], []).append((_got[1], _ix))
     # #1337: AND NOT AT ALL FOR AN HOUR IT KNOWS NOTHING ABOUT.
@@ -133882,7 +134836,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         # been rewriting.
         _raw_of[_ix] = float(_row.get("air_at") or _row.get("ts")
                              or _e.get("at") or 0)
-        _got = _ord.get(str(_row.get("id") or "")) if _ord else None
+        _got = _ord_of(_ord, _row) if _ord else None          # 2026-09-14
         if _got and len(_got) > 2 and (_got[2] or _blocksize.get(int(_got[0]), 0) >= 2):
             _spine.append((int(_got[0]), int(_got[1]), _ix))
     _spine.sort()
@@ -134074,8 +135028,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     # by this point, so it can simply be read.
     _blk_at: list[int] = []
     for _e in events:
-        _g = _ord.get(str((_e.get("row") or {}).get("id") or "")) \
-            if isinstance(_ord, dict) else None
+        _g = _ord_of(_ord, _e.get("row") or {})               # 2026-09-14
         _blk_at.append(int(_g[0]) if _g else -1)
     _inside: set[int] = set()
     for _i, _b in enumerate(_blk_at):
@@ -149583,6 +150536,22 @@ async def pine_edit(
             raise HTTPException(status_code=404, detail="No such request")
         text = str(payload.get("text") if payload.get("text") is not None
                    else it["text"])
+        # 2026-09-14 (#1140): "tap the image to full screen it and use my
+        # finger as a cursor to draw on it in red and then go back." The
+        # drawn-on copy is saved as a new upload; when `replace` names the
+        # picture that was tapped, its reference in the text is swapped for
+        # the new one, else the new picture is appended.
+        if payload.get("image"):
+            _new = _save_pine_images([payload.get("image")])
+            if not _new:
+                raise HTTPException(status_code=400, detail="that picture could not be read")
+            _n = _new[0]
+            _old = re.sub(r"[^A-Za-z0-9._\-]", "", str(payload.get("replace") or ""))
+            if _old and _old in text:
+                text = text.replace(_old, _n)
+            else:
+                text = text.rstrip() + "\n\n![pasted image](data/pine_uploads/%s) [img:%s]" % (_n, _n)
+            it["image"] = _n
         if payload.get("drop_debug"):
             tail = _pine_attachments(text)
             text = text.split(PINE_CONTEXT_MARK)[0].rstrip()
@@ -149596,7 +150565,25 @@ async def pine_edit(
         it["text"] = text
         PINE_REQUESTS_PATH.write_text(_pine_render(items), encoding="utf-8")
     note_action("you edited Pine request #%d" % int(req_id))
-    return {"ok": True, "edited": it, "count": len(items)}
+    return {"ok": True, "edited": it, "count": len(items),
+            "image": str(it.get("image") or ""),
+            "url": ("/api/pine-uploads/%s" % it.get("image")) if it.get("image") else ""}
+
+
+@app.delete("/api/pine-requests/{req_id}")
+async def pine_delete_api(
+    req_id: int,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """2026-09-14: "offer a X on the side that allows me to delete it ...
+    where I have to tap it twice". The item leaves the file with no reply
+    and nothing spoken - a discard, not a resolution."""
+    require_auth(authorization)
+    gone = await pine_remove(int(req_id))
+    if gone is None:
+        raise HTTPException(status_code=404, detail="No such request")
+    note_action("you discarded Pine request #%d" % int(req_id))
+    return {"ok": True, "deleted": gone, "count": len(pine_read())}
 
 
 @app.post("/api/pine-requests/{req_id}/resolve")
@@ -170626,6 +171613,13 @@ function djTalkRowInner(line) {
         + "reconnects (stored so the dialogue is never lost)";
       off.style.cssText = "font-size:10px;opacity:.6";
       said.appendChild(off); said.style.opacity = ".72";
+    } else if (line.aired === "withdrawn") {
+      // 2026-09-14: written and voiced, then refused at hand-over - the
+      // reason rides on the row. It was never on the air.
+      const off = el("span", "", " ✕ not aired");
+      off.title = "Refused at hand-over: " + (line.withdrawn_why || "the station would not put it out");
+      off.style.cssText = "font-size:10px;opacity:.7";
+      said.appendChild(off); said.style.opacity = ".45";
     } else if (["page", "published", "prepared"].includes(line.aired)) {
       const off = el("span", "", " 📵");
       off.title = "Recorded or published; awaiting audible playback acknowledgment";
@@ -201981,8 +202975,38 @@ async function loadPineInbox() {
     const st = document.createElement("span");
     st.className = "st";
     st.textContent = rq.status;
+    /* 2026-09-14: "Put a trash can icon in the top right of each report
+     * allowing it to be deleted if the report turns out to not be
+     * legitimate." Two taps: the first arms it (red, "tap again"), the
+     * second within three seconds DELETEs the item - no reply, nothing
+     * spoken. The glyph is the panel's own convention: an emoji codepoint
+     * the PineIcons font renders as a Carbon outline. */
+    const bin = document.createElement("button");
+    bin.type = "button";
+    bin.className = "pine-bin";
+    bin.title = "Delete this report (tap twice)";
+    bin.textContent = "\uD83D\uDDD1";
+    bin.style.cssText = "margin-left:8px;background:none;border:1px solid transparent;border-radius:6px;padding:2px 6px;cursor:pointer;color:inherit;font-size:14px;line-height:1;height:auto";
+    bin.onclick = async (ev) => {
+      ev.stopPropagation();
+      if (bin.dataset.armed !== "1") {
+        bin.dataset.armed = "1";
+        bin.style.color = "#ff5d5d";
+        bin.style.borderColor = "#ff5d5d";
+        bin.title = "tap again to delete";
+        setTimeout(() => { bin.dataset.armed = ""; bin.style.color = "inherit"; bin.style.borderColor = "transparent"; bin.title = "Delete this report (tap twice)"; }, 3000);
+        return;
+      }
+      bin.disabled = true;
+      try {
+        await api("/api/pine-requests/" + rq.id, {method: "DELETE"});
+        card.remove();
+        loadPineInbox();
+      } catch (e) { bin.disabled = false; bin.title = e.message; }
+    };
     top.appendChild(idspan);
     top.appendChild(st);
+    top.appendChild(bin);
     const body = document.createElement("div");
     body.className = "body";
     const imgRefs = [];
