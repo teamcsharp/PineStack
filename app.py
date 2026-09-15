@@ -17135,8 +17135,13 @@ def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
         # ceiling at twice it, and the retirement desk. And the audio
         # rides with the row, because pantry_spoken_for protects the clips
         # of any viable row and an unaired row is viable.
-        if not float(row.get("aired_at") or 0) and not int(
-                row.get("aired") or 0):
+        # 2026-09-15 (#1189): AIRINGS ARE THE METER, and in `honest` the
+        # meter includes the airings this station has PROVED rather than
+        # only the ones a dispatcher stamped. A round that has genuinely
+        # been out starts its clock; an unheard one still has none, which
+        # is #1180's rule untouched and is why this may only ever become
+        # more willing to start the clock and never less.
+        if not round_heard_ever(str(kind), row):
             return 0.0                  # never heard: no clock on it
         return max(at + max(PANTRY_BURN_SECONDS, REPEAT_KEEP_SECONDS), kept_until)
     except Exception:  # noqa: BLE001
@@ -17162,6 +17167,600 @@ def stock_used_by() -> dict[str, Any]:
         return {"at": time.time()}
 
 
+# =====================================================================
+# 2026-09-15 (#1189): AN AIRING IS WHAT A LISTENER COULD HAVE HEARD.
+#
+# WHAT WAS ASKED, AND WHAT THE LOGS ACTUALLY SAY.  The brief for this
+# round was that gallery round gallery-8d086ef8fe had aired FIFTY-ONE
+# times between 09-14 08:12 and 09-14 21:52 while its shelf row read
+# aired = 1, and that gallery under-counted airings by 2.3x and manager
+# by 3.6x.  That was measured before anything here was written, and the
+# direction of it is wrong.  The numbers, from data/air_log.jsonl:
+#
+#   the 51 line rows carrying that round's first take split
+#     49  aired = "prepared"     the station's own legend for this state,
+#                                at the /api/line/flow legend below, is
+#                                "prepared and appended to the feed -
+#                                 never heard"
+#      1  aired = "withdrawn"    refused at hand-over (_burst_withdraw)
+#      1  aired = "published"    it went out ONCE, at 09-14 21:49:57
+#
+#   its row: aired = 1, aired_at = 09-14 21:49:58.188132, and the
+#   taken_at beside it reads 21:49:58.188493 - 361 microseconds later,
+#   which is the signature of commit() in _ready_shelf_air and of
+#   nothing else in the file.  The count was RIGHT.
+#
+# Joining data/screenplay_rounds.jsonl to data/air_log.jsonl by line id
+# (screenplay_round_row stamps the ids of every feed row the round
+# added) and keeping only the rows whose text is one of that round's own
+# takes, over 939 stamped rounds:
+#
+#   road      stamped   heard   ghosts     marks on the pile today
+#   gallery       276     105      171     121
+#   manager       199      50      149      58
+#   banter        223     134       30    1092
+#   caller        114      70       35     233
+#   news           90      30       59       -
+#
+# So "536 airings from 228 rounds" is 444 PREPARATIONS THAT WERE NEVER
+# HEARD counted as airings.  screenplay_round_stamp writes a row
+# whenever the chat ring grew ("if not row.get(\"lines\"): return"), not
+# when anything was heard, so that ledger cannot answer the question it
+# was being asked.  And no road under-counts: every road marks MORE than
+# it airs.  The two the brief calls honest are the two that are worst -
+# banter by 8.1x and caller by 3.3x - because they stamp the mark at
+# DISPATCH, before _banter_air, and a round that then falls through the
+# freshness gate below still carries the mark.
+#
+# WHAT IS ACTUALLY WRONG, THEN.  Two things, and they have one cause.
+#
+#   1. NOTHING ANYWHERE RECORDS THAT A PREPARATION FAILED.  A round that
+#      is selected, published to the feed as "prepared" and then refused
+#      at hand-over leaves the shelf exactly as it found it - same row,
+#      same position in alt_take_order, same everything - so the next
+#      walk offers the same row again and it fails the same way again.
+#      gallery-8d086ef8fe was offered and refused 49 times in 13.7
+#      hours, a median of 391s apart and twice 19 SECONDS apart, and it
+#      only stopped when the fiftieth attempt finally got out.  Three
+#      gallery rows account for 85 of the road's 171 ghosts.  Meanwhile
+#      10 gallery rows, 8 manager rows and 33 caller rows on the shelf
+#      this minute have never been heard once.  That is the mechanism
+#      behind "124 finished rounds had never been heard".
+#
+#   2. THE MARK MEANS TWO DIFFERENT THINGS ON DIFFERENT ROADS.  On
+#      gallery, manager and news it is written at HAND-OFF by commit()
+#      and means "it went out".  On banter (the larder, below at the
+#      dj_banter serve) and on caller (shelf_take) it is written at
+#      DISPATCH and means "it was chosen".  shelf_innings, repeat_safe,
+#      shelf_rest_now and stock_expires_at all read that one field and
+#      cannot tell which of the two they are holding.
+#
+# THE CURE IS ONE MARK AT ONE DOOR, TAKEN FROM PROOF.  _banter_air says
+# of itself "this is the one place every prepared round passes through
+# on its way to the air", and that is true of all five roads and of any
+# sixth somebody adds tomorrow.  round_air_mark() below is called there,
+# once, beside the paperwork stamp that is already there, and it does
+# not ask the caller anything: it reads the round's OWN feed rows and
+# asks whether any of them reached a state in AIR_PUBLICATION_STATES -
+# the same test /api/line/flow uses to draw "handed".  A round whose
+# rows are still "held" or "prepared" at that instant counts as a GHOST,
+# which is the conservative direction: this may never invent an airing.
+#
+# IT IS A COUNTER BESIDE THE OLD ONE, NOT OVER IT.  `heard`, `heard_at`,
+# `ghosts`, `ghost_run` and `ghost_at` are new fields.  `aired` and
+# `aired_at` are not touched by any of this and every throttle keeps
+# reading them, so the counting change ships switched off and changes
+# nothing that airs.  Correcting the old counts from the log was
+# considered and refused: the durable air log reaches back two days and
+# the oldest manager rows were banked on 09-09, the round identity only
+# resolves for part of the pile, and the existing numbers are wrong in
+# BOTH directions - writing back a log-derived count would DROP caller
+# from 233 to 70 and banter from 1092 to 134 and hand the rounds that
+# are genuinely repeating a fresh set of innings.  #1157 is what a sweep
+# that thought it knew better costs this station.
+#
+# THE SWITCH.  data/airings/mode, one word, re-read every three seconds,
+# no restart - the shape of data/record_talk/mode (#1179) including its
+# strict one-token parse, because an operator's note to himself must
+# never read as permission.  `legacy` (the default, and what a missing,
+# empty, unreadable or unrecognised file reads as) is the station
+# exactly as it runs tonight.  `honest` makes the four throttles read
+# max(aired, heard) and sends a row that has ghosted three times running
+# to the BACK of the take order.
+#
+# max(), not heard: `heard` starts at zero on all 405 rows now on the
+# shelves, so a throttle reading `heard` alone would UN-throttle the
+# whole cupboard the second the switch was thrown.  max() can only ever
+# tighten, it tightens by at most the airings measured after the switch
+# went in, and on the day it is thrown it changes nothing at all.  That
+# is deliberate: re-arming a 3-inning ceiling on 116 gallery rows at
+# once could take a road off the air, and that is the operator's
+# decision to make slowly.
+# =====================================================================
+AIRINGS_DIR = data_path("airings")
+AIRINGS_LEDGER_PATH = data_path("airings.jsonl")
+AIRINGS_ENV = "PINE_AIRINGS_MODE"
+AIRINGS_MODE_LEGACY = "legacy"
+AIRINGS_MODE_HONEST = "honest"
+AIRINGS_MODES = (AIRINGS_MODE_LEGACY, AIRINGS_MODE_HONEST)
+# How many preparations in a row a shelf row may fail before the take
+# order stops offering it first. Three, because gallery-8d086ef8fe was
+# offered 49 times and the first three failures already said everything
+# the fiftieth said.
+AIRINGS_GHOST_PATIENCE = max(1, int(os.getenv("PINE_AIRINGS_PATIENCE", "3")))
+# The ledger is one short line per round that reached the booth. A week
+# of this station is about a thousand lines; two megabytes of tail is
+# several weeks and bounds the read whatever happens.
+AIRINGS_LEDGER_TAIL_BYTES = 2_000_000
+
+
+def airings_parse_mode(text: Any) -> str:
+    """One word into a mode. Anything else at all is `legacy`.
+
+    Copied from track_talk_segment.parse_mode (#1179) on purpose, strict
+    arm included: ONE WORD MEANS ONE WORD, so a switch file holding a
+    sentence is legacy however promising a word inside it looks. "on" is
+    read as `honest` because that is plainly what somebody typing it
+    meant, and because the switch this one is modelled on spells it that
+    way."""
+    words = str(text or "").replace(",", " ").split()
+    if len(words) != 1:
+        return AIRINGS_MODE_LEGACY
+    low = words[0].strip().lower()
+    if low in AIRINGS_MODES:
+        return low
+    return AIRINGS_MODE_HONEST if low in ("on", "true", "yes") else AIRINGS_MODE_LEGACY
+
+
+class _AiringsSwitch:
+    """`<data>/airings/mode`, re-read at most every `ttl` seconds.
+
+    DEFAULTS LEGACY. Missing file, empty file, unreadable file, a word
+    this does not know, a file being rewritten underneath us: legacy,
+    every time."""
+
+    def __init__(self, root: Any, env: Any = None, ttl: float = 3.0,
+                 clock: Any = time.time):
+        self.root = Path(root)
+        self.path = self.root / "mode"
+        self.ttl = float(ttl)
+        self.clock = clock
+        self._env = dict(os.environ if env is None else env)
+        self._read_at = 0.0
+        self._cached = AIRINGS_MODE_LEGACY
+
+    def _text(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, ValueError):
+            return ""
+
+    def mode(self) -> str:
+        now = float(self.clock())
+        if self._read_at and (now - self._read_at) < self.ttl:
+            return self._cached
+        text = self._text()
+        if not text:
+            text = str(self._env.get(AIRINGS_ENV, "")).strip()
+        self._read_at = now
+        self._cached = airings_parse_mode(text)
+        return self._cached
+
+    def write(self, text: str) -> None:
+        """Tests and operator tools only; never the station itself."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + "." + uuid.uuid4().hex + ".tmp")
+        tmp.write_text(str(text).strip() + "\n", encoding="utf-8")
+        os.replace(tmp, self.path)
+        self._read_at = 0.0
+
+
+AIRINGS_SWITCH = _AiringsSwitch(AIRINGS_DIR, clock=time.time)
+_AIRINGS_SAID: dict[str, Any] = {"mode": None}
+
+
+def airings_mode() -> str:
+    """legacy | honest. Never raises; an unreadable switch is legacy.
+
+    Says so in the log when it CHANGES and only then - a line every
+    three seconds saying the switch is still off is not a log (#1179)."""
+    mode = AIRINGS_MODE_LEGACY
+    try:
+        mode = AIRINGS_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return AIRINGS_MODE_LEGACY
+    was = _AIRINGS_SAID.get("mode")
+    if mode != was:
+        _AIRINGS_SAID["mode"] = mode
+        if was is not None:
+            try:
+                pipeline_log(
+                    "lookahead",
+                    "#1189: the airing counter switch is now %s - %s"
+                    % (mode,
+                       "the innings ceiling, the three-hour rest, the expiry "
+                       "clock and the take order now read max(aired, heard), "
+                       "and a row that has ghosted %d times running goes to "
+                       "the back of the walk" % AIRINGS_GHOST_PATIENCE
+                       if mode == AIRINGS_MODE_HONEST else
+                       "the throttles are back on the `aired` field alone; "
+                       "the honest counter keeps counting beside it"))
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def airings_honest() -> bool:
+    """Do the throttles read the measured count as well as the old one?"""
+    return airings_mode() == AIRINGS_MODE_HONEST
+
+
+def round_heard_now(row: Any) -> int:
+    """How many airings of this row #1189 has PROVED, ever."""
+    try:
+        return max(0, int((row or {}).get("heard") or 0))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def round_airings_now(kind: str, row: Any) -> int:
+    """What the throttles count as this row's airings.
+
+    legacy: `aired`, byte for byte what every one of them read before.
+    honest: max(aired, heard) - see the switch note above for why max()
+    and not heard, and why throwing the switch is a no-op on the day."""
+    try:
+        aired = int((row or {}).get("aired") or 0)
+    except Exception:  # noqa: BLE001
+        aired = 0
+    try:
+        if not airings_honest():
+            return aired
+        return max(aired, round_heard_now(row))
+    except Exception:  # noqa: BLE001
+        return aired
+
+
+def round_heard_ever(kind: str, row: Any) -> bool:
+    """Has this row been on the air at all? stock_expires_at's question.
+
+    #1180's rule is that a round does not start going stale until it has
+    been heard, so this must stay generous in legacy and may only ever
+    become MORE willing to start the clock, never less."""
+    try:
+        if float((row or {}).get("aired_at") or 0) or int((row or {}).get("aired") or 0):
+            return True
+        if not airings_honest():
+            return False
+        return bool(float((row or {}).get("heard_at") or 0) or round_heard_now(row))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def airings_ghost_last(kind: str, order: Any) -> list[dict[str, Any]]:
+    """honest only: rows that keep being prepared and refused go LAST.
+
+    NOTHING IS REMOVED and nothing is refused - this is a reorder of the
+    walk shelf_take was going to do anyway, so a road whose every row is
+    ghosting behaves exactly as it does today. It exists because three
+    gallery rows produced 85 of that road's 171 failed preparations
+    while ten never-heard rows sat behind them in the same queue."""
+    try:
+        rows = list(order or [])
+        if not airings_honest() or len(rows) < 2:
+            return rows
+        hot = [r for r in rows
+               if int((r or {}).get("ghost_run") or 0) < AIRINGS_GHOST_PATIENCE]
+        if not hot or len(hot) == len(rows):
+            return rows
+        cold = [r for r in rows
+                if int((r or {}).get("ghost_run") or 0) >= AIRINGS_GHOST_PATIENCE]
+        return hot + cold
+    except Exception:  # noqa: BLE001
+        return list(order or [])
+
+
+def _airings_norm(text: Any) -> str:
+    """One line, whitespace-collapsed and cased down, for comparison."""
+    try:
+        return " ".join(str(text or "").split()).lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def airings_pile_row(entry: Any) -> tuple[str, Any]:
+    """The OUTER row that owns this entry, and the road it stands on.
+
+    By IDENTITY first, because four of the five roads hand _banter_air
+    the shelf row's own entry dict. _ready_shelf_air does not - it hands
+    over `dict(dialogue_entry(row) or {})`, a COPY - so the bank stamp
+    is the second key: entry["at"] is a float with microseconds on it
+    and it is the same field screenplay_round_row writes as `banked_at`.
+    Bounded by the piles, which are about 450 rows in total.
+
+    (None) means a live round that was written on air and belongs to no
+    pile. It is still written to the ledger; there is simply no row to
+    carry a count."""
+    prep = ""
+    try:
+        if not isinstance(entry, dict):
+            return ("", None)
+        prep = str(entry.get("prep_kind") or "")
+        for held in list(_LARDER):
+            if held is entry:
+                return ("banter", held)
+        piles = list(_SHELF.items())
+        for kind, rows in piles:
+            for row in list(rows or []):
+                if row is entry:
+                    return (str(kind), row)
+                if isinstance(row, dict) and row.get("entry") is entry:
+                    return (str(kind), row)
+        want = 0.0
+        try:
+            want = round(float(entry.get("at") or 0), 3)
+        except (TypeError, ValueError):
+            want = 0.0
+        if want > 0:
+            for kind, rows in piles:
+                if prep and str(kind) != prep:
+                    continue
+                for row in list(rows or []):
+                    if not isinstance(row, dict):
+                        continue
+                    inner = row.get("entry")
+                    at = (inner or {}).get("at") if isinstance(inner, dict) else row.get("at")
+                    try:
+                        at = round(float(at or 0), 3)
+                    except (TypeError, ValueError):
+                        at = 0.0
+                    if at and at == want:
+                        return (str(kind), row)
+            for held in list(_LARDER):
+                try:
+                    if round(float((held or {}).get("at") or 0), 3) == want:
+                        return ("banter", held)
+                except (TypeError, ValueError):
+                    continue
+        return (prep, None)
+    except Exception:  # noqa: BLE001
+        return (prep, None)
+
+
+def round_air_mark(entry: Any, mark: Any, spoken: Any = None) -> dict[str, Any]:
+    """#1189: count this round's airing FROM ITS OWN FEED ROWS.
+
+    Called once from the bottom of _banter_air, which is the one door
+    every prepared and every live round leaves by. It asks nothing of
+    its caller and nothing of `spoken`: it takes the ids that were NOT
+    in the chat ring when this round opened (screenplay_round_open's
+    `had`), keeps the ones whose text is this round's own, and asks
+    whether any of them reached AIR_PUBLICATION_STATES - the identical
+    test /api/line/flow uses to say a line was handed out.
+
+    Never raises and never returns early with the row half-marked: a
+    paperwork ledger may not be the thing that takes the show off air."""
+    out: dict[str, Any] = {"heard": False, "seen": 0, "kind": "", "sid": ""}
+    now = time.time()
+    try:
+        if not isinstance(entry, dict):
+            return out
+        if not isinstance(mark, dict):
+            mark = {}
+        if mark.get("counted_1189"):
+            return out              # one _banter_air call is one airing
+        mark["counted_1189"] = True
+        had = mark.get("had") or set()
+        try:
+            _ensure_chat_ids()
+        except Exception:  # noqa: BLE001
+            pass
+        script = _airings_norm(entry.get("script")
+                               or entry.get("script_tinted")
+                               or entry.get("script_plain") or "")
+        texts: set[str] = set()
+        for take in (entry.get("takes") or []):
+            got = _airings_norm((take or {}).get("text")
+                                if isinstance(take, dict) else take)
+            if len(got) > 8:
+                texts.add(got)
+        for line in (spoken or []):
+            got = _airings_norm(line)
+            if len(got) > 8:
+                texts.add(got)
+        mine: list[dict[str, Any]] = []
+        for row in list(_RADIO.get("chat") or []):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("id") or "") in had:
+                continue
+            # The board's stings and the SFX guy's drops ride inside a
+            # round and are not the round: #1263's tube and #1147's
+            # mouths would otherwise vote on whether a memo was heard.
+            if str(row.get("who") or "") in ("board", "drop"):
+                continue
+            got = _airings_norm(row.get("text"))
+            if not got:
+                continue
+            if got in texts or (len(got) > 12 and script and got in script):
+                mine.append(row)
+        states: dict[str, int] = {}
+        for row in mine:
+            st = str(row.get("aired") or "")
+            states[st] = int(states.get(st) or 0) + 1
+        try:
+            heard = any(st in AIR_PUBLICATION_STATES for st in states)
+        except Exception:  # noqa: BLE001
+            heard = False
+        kind, pile = airings_pile_row(entry)
+        kind = str(kind or entry.get("prep_kind") or "")
+        sid = ""
+        try:
+            sid = alt_sid_of(kind or "round", pile if pile is not None else entry)
+        except Exception:  # noqa: BLE001
+            sid = ""
+        out.update({"heard": bool(heard), "seen": len(mine),
+                    "kind": kind, "sid": sid})
+        # A round whose lines could not be identified at all is recorded
+        # and NOT counted, either way. This is the only honest answer
+        # when the ring has been wiped under it (dj_start does that) and
+        # it is the direction that cannot cost the station work.
+        if mine and isinstance(pile, dict):
+            if heard:
+                pile["heard"] = round_heard_now(pile) + 1
+                pile["heard_at"] = now
+                pile["ghost_run"] = 0
+            else:
+                pile["ghosts"] = max(0, int(pile.get("ghosts") or 0)) + 1
+                pile["ghost_at"] = now
+                pile["ghost_run"] = max(0, int(pile.get("ghost_run") or 0)) + 1
+        row_out: dict[str, Any] = {
+            "at": round(now, 3),
+            "kind": kind,
+            "sid": sid,
+            "banked_at": round(float(entry.get("at") or 0), 3),
+            "heard": bool(heard) if mine else False,
+            "seen": len(mine),
+            "states": states,
+            "on_pile": bool(isinstance(pile, dict)),
+            "aired": int((pile or {}).get("aired") or 0),
+            "heard_n": round_heard_now(pile),
+            "ghosts": int((pile or {}).get("ghosts") or 0),
+            "ghost_run": int((pile or {}).get("ghost_run") or 0),
+            "caller": str(entry.get("caller_name") or "")[:60],
+            "head": (script.replace("\n", " / ") or "")[:160],
+        }
+        try:
+            airlog_append_bg(AIRINGS_LEDGER_PATH, row_out)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+    except Exception:  # noqa: BLE001
+        return out
+
+
+def airings_ledger_read(since: float = 0.0) -> list[dict[str, Any]]:
+    """The tail of data/airings.jsonl. Sync - call it in a thread."""
+    out: list[dict[str, Any]] = []
+    try:
+        if not AIRINGS_LEDGER_PATH.exists():
+            return out
+        size = int(AIRINGS_LEDGER_PATH.stat().st_size)
+        with AIRINGS_LEDGER_PATH.open("rb") as handle:
+            if size > AIRINGS_LEDGER_TAIL_BYTES:
+                handle.seek(size - AIRINGS_LEDGER_TAIL_BYTES)
+                handle.readline()   # drop the half line the seek landed in
+            blob = handle.read().decode("utf-8", "replace")
+        for line in blob.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(row, dict):
+                continue
+            if since and float(row.get("at") or 0) < float(since):
+                continue
+            out.append(row)
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+def airings_today(most: int = 40, since: float = 0.0) -> dict[str, Any]:
+    """#1189: WHAT HAS BEEN ON THE AIR MORE THAN ONCE TODAY, AND HOW OFTEN.
+
+    Off the same ledger round_air_mark writes, so the surface and the
+    throttle can never again disagree about what an airing is - which is
+    the whole complaint that opened this round. Sync; cupboard_worn
+    already runs in a thread."""
+    now = time.time()
+    try:
+        if not since:
+            lt = time.localtime(now)
+            since = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
+    except Exception:  # noqa: BLE001
+        since = now - 86400.0
+    rows = airings_ledger_read(since)
+    by: dict[str, dict[str, Any]] = {}
+    heard_total = 0
+    ghost_total = 0
+    for row in rows:
+        try:
+            if not int(row.get("seen") or 0):
+                continue
+            key = str(row.get("sid") or "")
+            if not key:
+                key = "%s@%.3f" % (str(row.get("kind") or ""),
+                                   float(row.get("banked_at") or 0))
+            got = by.get(key)
+            if got is None:
+                got = by[key] = {
+                    "sid": str(row.get("sid") or ""),
+                    "road": str(row.get("kind") or ""),
+                    "label": SHELF_LABEL.get(str(row.get("kind") or ""),
+                                             str(row.get("kind") or "")),
+                    "banked_at": float(row.get("banked_at") or 0),
+                    "heard": 0, "ghosts": 0, "at": [],
+                    "aired_field": int(row.get("aired") or 0),
+                    "on_pile": bool(row.get("on_pile")),
+                    "head": str(row.get("head") or "")[:160],
+                }
+            if row.get("heard"):
+                got["heard"] = int(got["heard"]) + 1
+                got["at"].append(float(row.get("at") or 0))
+                heard_total += 1
+            else:
+                got["ghosts"] = int(got["ghosts"]) + 1
+                ghost_total += 1
+            got["aired_field"] = max(int(got["aired_field"]),
+                                     int(row.get("aired") or 0))
+        except Exception:  # noqa: BLE001
+            continue
+    for got in by.values():
+        stamps = sorted(float(x) for x in (got.get("at") or []))
+        got["first"] = stamps[0] if stamps else 0.0
+        got["last"] = stamps[-1] if stamps else 0.0
+        gaps = [round(b - a, 1) for a, b in zip(stamps, stamps[1:])]
+        got["closest"] = min(gaps) if gaps else 0.0
+        got["at"] = [round(x, 3) for x in stamps][:24]
+    again = [g for g in by.values() if int(g.get("heard") or 0) > 1]
+    again.sort(key=lambda g: (-int(g["heard"]), -int(g["ghosts"])))
+    rest = 0.0
+    try:
+        rest = shelf_rest_now()
+    except Exception:  # noqa: BLE001
+        rest = 0.0
+    inside = [g for g in again if 0 < float(g.get("closest") or 0) < rest]
+    return {
+        "at": now, "since": since, "mode": airings_mode(),
+        "patience": AIRINGS_GHOST_PATIENCE,
+        "rest": round(rest, 1),
+        "rounds": again[:max(0, int(most))],
+        "of": len(again),
+        "heard": heard_total,
+        "heard_rounds": sum(1 for g in by.values() if int(g.get("heard") or 0)),
+        "ghosts": ghost_total,
+        "ghost_rounds": sum(1 for g in by.values()
+                            if int(g.get("ghosts") or 0)
+                            and not int(g.get("heard") or 0)),
+        "inside_rest": len(inside),
+        "say": ("%d round(s) have been on the air more than once since "
+                "midnight - %d airings between them out of %d heard today, "
+                "the most-repeated %d time(s)%s. %d prepared round(s) were "
+                "never heard at all. The throttle switch reads `%s`."
+                % (len(again),
+                   sum(int(g["heard"]) for g in again),
+                   heard_total,
+                   (again[0]["heard"] if again else 0),
+                   ("; %d of them came back inside the %.0f-minute rest"
+                    % (len(inside), rest / 60.0)) if inside else "",
+                   ghost_total, airings_mode())),
+    }
+
+
 def shelf_is_repeat(kind: str, row: dict[str, Any]) -> bool:
     """#1052: is this row IN THE CUPBOARD - aired, reusable, and with
     airings left in it? These are the station's pre-rolled stock and
@@ -17173,7 +17772,10 @@ def shelf_is_repeat(kind: str, row: dict[str, Any]) -> bool:
             return False
         if not repeat_safe(kind, row):                            # #1055
             return False
-        return int(row.get("aired") or 0) < row_innings(kind, row)
+        # 2026-09-15 (#1189): the innings ceiling, off the honest count
+        # when the operator has thrown the switch. Legacy is `aired`
+        # exactly as before.
+        return round_airings_now(kind, row) < row_innings(kind, row)
     except Exception:  # noqa: BLE001
         return False
 
@@ -17787,6 +18389,19 @@ def shelf_take(kind: str, voice: str = "",
         # out ahead of it.
         _why: list[str] = []                                   # #1003
         _rk = resort_keys(str(kind))                           # #1151
+        # 2026-09-15 (#1189): AND A ROW THAT KEEPS FAILING GOES LAST.
+        #
+        # Measured: gallery-8d086ef8fe was selected, published to the feed
+        # as `prepared` and refused at hand-over 49 times between 09-14
+        # 08:12 and 09-14 21:47 - a median of 391s apart, twice 19 seconds
+        # apart - because a failed preparation left the shelf in exactly
+        # the state it found it and this walk therefore offered the same
+        # row again. Three gallery rows produced 85 of that road's 171
+        # failures in two days while ten rows behind them had never been
+        # heard at all. Nothing is removed and nothing is refused here:
+        # the ghosting rows go to the BACK, so a road whose every row is
+        # ghosting behaves exactly as it does today. `legacy` is a no-op.
+        _order = airings_ghost_last(str(kind), _order)
         for row in _order:
             if id(row) in globals().get("_READY_SHELF_BUSY", set()):
                 continue
@@ -17826,7 +18441,10 @@ def shelf_take(kind: str, voice: str = "",
                 elif str(kind) not in SHELF_REUSABLE:
                     _why.append("already aired")
                     continue        # should not be here at all
-                if int(row.get("aired") or 0) >= row_innings(kind, row):
+                # 2026-09-15 (#1189): and the take's own ceiling reads the
+                # same number shelf_is_repeat does. These two were already
+                # meant to be one answer.
+                if round_airings_now(kind, row) >= row_innings(kind, row):
                     _why.append("innings used")   # #1052
                     continue        # it has had its innings
                 # #1059: ...unless the operator has said to raid the
@@ -17952,7 +18570,10 @@ def shelf_take(kind: str, voice: str = "",
             return (time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
                     # #977: and an item that has had all its airings is done,
                     # even if the burn would still keep it.
-                    and int(r.get("aired") or 0) < row_innings(str(kind), r)
+                    # 2026-09-15 (#1189): the same count the ceiling above
+                    # uses, so a row cannot be spent by one test and fresh
+                    # by the other on the same walk.
+                    and round_airings_now(str(kind), r) < row_innings(str(kind), r)
                     # A completed phone call is history, never stock. Once-
                     # aired non-reusable rows left behind by an older build
                     # cannot occupy the queue or be offered as a "new" call
@@ -92047,6 +92668,30 @@ async def _banter_air(entry: dict[str, Any],
     # the line ids - everything the screenplay's provenance tree shows, and
     # all of it lives only on this dict until now.
     screenplay_round_stamp(entry, _sp_mark)
+    # 2026-09-15 (#1189): AND THE AIRING ITSELF, COUNTED HERE AND NOWHERE
+    # ELSE.
+    #
+    # There were four places that stamped an airing - commit() inside
+    # _ready_shelf_air, two branches of shelf_take and the larder serve in
+    # dj_banter - and they did not agree about what they were counting.
+    # The two that stamp at DISPATCH over-counted by 8.1x on banter (1,092
+    # marks against 134 airings measured in the log) and by 3.3x on caller
+    # (233 against 70). The two that stamp at HAND-OFF were close but
+    # could not say anything at all about the 444 rounds out of 939 that
+    # were prepared, published to the feed and never heard.
+    #
+    # This is the one door all five roads leave by - the comment at the
+    # top of this function has said so since #1005 - and a sixth road
+    # added tomorrow is counted without anybody remembering to. It does
+    # not trust `spoken` and it does not trust the caller: it reads the
+    # round's own feed rows and asks the same question /api/line/flow
+    # asks. `aired` and `aired_at` are NOT touched; this writes `heard`,
+    # `heard_at`, `ghosts` and `ghost_run` beside them, and nothing reads
+    # those until data/airings/mode says `honest`.
+    try:
+        round_air_mark(entry, _sp_mark, spoken)
+    except Exception:  # noqa: BLE001
+        pass
     if ready_takes is None and entry.get("seek_verdict") and spoken:
         asyncio.create_task(_sfx_verdict(spoken[-1]))
     if spoken:
@@ -118098,6 +118743,13 @@ def cupboard_worn(most: int = 40) -> dict[str, Any]:
                 "said_in_lines": said,
                 "phrases": len(hits),
                 "aired": round_airings(row, entry),
+                # 2026-09-15 (#1189): what the station has PROVED went out,
+                # and what it prepared and never got out. `aired` above is
+                # the old dispatcher's count and is left exactly as it is.
+                "heard": round_heard_now(row),
+                "ghosts": int((row or {}).get("ghosts") or 0),
+                "ghost_run": int((row or {}).get("ghost_run") or 0),
+                "counts": round_airings_now(kind, row),
                 "turns": script.count("\n") + 1,
                 "rhymed": bool(row_is_rhymed(kind, row)),
                 "head": script.strip().replace("\n", " / ")[:200],
@@ -118111,6 +118763,14 @@ def cupboard_worn(most: int = 40) -> dict[str, Any]:
     return {
         "at": time.time(),
         "threshold": PHRASE_ACROSS_LINES,
+        # 2026-09-15 (#1189): "what has been on the air more than once
+        # today, and how many times" - off data/airings.jsonl, which is
+        # written by the same function that moves the counter, so this
+        # surface and the throttles cannot drift apart again. It is
+        # deliberately NOT filtered by the phrase sweep above: a round
+        # heard five times today matters whether or not it carries a worn
+        # phrase.
+        "today": airings_today(max(0, int(most))),
         "rounds": found[:max(0, int(most))],
         "of": len(found),
         "airings": sum(int(f["aired"]) for f in found),
