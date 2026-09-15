@@ -1523,7 +1523,15 @@
     videoOnly.type = 'checkbox';
     var videoOnlyRow = make('label', 'hc-row hc-master');
     videoOnlyRow.appendChild(videoOnly);
-    videoOnlyRow.appendChild(make('span', '', 'Allow video without complete audio if unavailable'));
+    /* 2026-09-15 (#1205b): THE LABEL NOW HAS TO MEAN WHAT IT SENDS.
+     *
+     * It said "Allow video without complete audio if unavailable" and it
+     * sends `video_only`, which the cut reads as "do not carry the
+     * broadcast at all". Before tonight a desk recording was always silent,
+     * so the flag changed nothing and the wording cost nothing. Now that a
+     * cut carries the broadcast, ticking this is the difference between
+     * sound and none - so it says that. */
+    videoOnlyRow.appendChild(make('span', '', 'Record the picture only - no broadcast audio'));
     body.appendChild(big);
     body.appendChild(range);
     body.appendChild(ticks);

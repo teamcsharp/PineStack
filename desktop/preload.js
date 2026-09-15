@@ -33,9 +33,17 @@ contextBridge.exposeInMainWorld("pineDesktop", {
    * answers to - hot-corners.js checks typeof on each of these and draws its
    * export sheet out of what it finds. See screen-ring.cjs.
    *
-   *   replayState()  -> {ok, running, seconds, holds, bytes, detail, min, max}
+   *   replayState()  -> {ok, running, seconds, holds, bytes, detail, min, max,
+   *                      audio}
    *                     `seconds` is what is HELD, which is less than `holds`
    *                     for the first half minute after the app opens.
+   *                     #1205: `audio` is what the recorder's capture carries
+   *                     - {source, present, state, detail, supported,
+   *                     held_ratio} - and the export sheet prints its `state`
+   *                     and `detail` (hot-corners.js:1553) so the operator can
+   *                     see whether a cut will have the broadcast on it
+   *                     BEFORE cutting. It was null until the ring learned to
+   *                     film the sound with the picture.
    *   replayExport({seconds, upload, name?})
    *                  -> {ok, where, bytes, asked, seconds, uploaded, detail}
    *   replayFrames({seconds, count, back?, edge?})
@@ -62,11 +70,19 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   hotCorners: () => ipcRenderer.invoke("corners:read"),
   hotCornersSet: (patch) => ipcRenderer.invoke("corners:set", patch),
   /* #1182c: this window's media source id, so the recorder can open the
-   * capture without a user gesture. */
+   * capture without a user gesture.
+   *
+   * #1205: that road carries no audio, so it is the SECOND choice now - the
+   * answer also says {loopback, platform, detail}, which is how the recorder
+   * knows whether a silent recording is this platform's limit (Electron
+   * captures application audio on Windows only) or a gesture it never got. */
   replaySource: () => ipcRenderer.invoke("replay:source"),
   /* #1182d: the main process asking the recorder to close the piece it is
    * on, so a cut can reach all the way to now. */
   onReplayFlush: (callback) => ipcRenderer.on("replay-flush", () => callback()),
+  /* #1205: replayBegin also carries {audio:{source, present, state, detail,
+   * supported}} - the recorder telling the ring what its capture holds, since
+   * the renderer is the only side that can see the stream's track list. */
   replayBegin: (opts) => ipcRenderer.invoke("replay:begin", opts),
   replayStop: (why) => ipcRenderer.invoke("replay:stop", why),
   replayPush: (buffer, meta) => ipcRenderer.invoke("replay:push", buffer, meta),

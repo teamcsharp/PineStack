@@ -23,8 +23,17 @@ const { UsbDisk } = require("./usb-disk.cjs");
  * capture still films forwards" - the note at glass:clip, now out of date.
  * The renderer films (renderer/screen-ring.js) and hands finished pieces
  * down; this keeps them on disk and cuts what is asked for out of them. */
-const { ScreenRing, HOLD_MIN_S, HOLD_MAX_S, HOLD_DEFAULT_S } = require("./screen-ring.cjs");
+const { ScreenRing, HOLD_MIN_S, HOLD_MAX_S, HOLD_DEFAULT_S,
+  AUDIO_SOURCE } = require("./screen-ring.cjs");
 const screenRing = new ScreenRing();
+/* #1205: WHERE THE APPLICATION'S OWN SOUND CAN BE CAPTURED AT ALL.
+ *
+ * Electron 37.10.3's electron.d.ts, interface Streams: "Specifying a loopback
+ * device will capture system audio, and is currently only supported on
+ * Windows." One constant, read by the display-media handler and by the road
+ * that tells the renderer why a recording is silent, so the two can never
+ * disagree about what this machine can do. */
+const LOOPBACK_HERE = process.platform === "win32";
 /* Twice the size and sharpened, for every picture taken of the tablet. */
 const shotEnhance = require("./shot-enhance.cjs");
 const glassParts = require("./terminal-glass.cjs");
@@ -740,14 +749,60 @@ function createWindow() {
    *
    * `video: win` hands Electron the BrowserWindow itself rather than a
    * desktopCapturer source id, so the capture follows the window rather
-   * than a screen region, and audio is refused outright - the broadcast is
-   * pulled from PineAir's own ring when a clip is cut, exactly as the
-   * forward recorder already does it, and capturing it twice would put it
-   * in the file twice. */
+   * than a screen region.
+   *
+   * #1205: AND THE SOUND COMES WITH IT NOW. The comment that used to stand
+   * here said audio was refused deliberately, because "the broadcast is
+   * pulled from PineAir's own ring when a clip is cut... and capturing it
+   * twice would put it in the file twice". The first half of that was
+   * measured and found to be false on this desk: PineAir.start() has exactly
+   * one caller in the whole renderer (sampler.js:3247), so on a desk where
+   * the sampler is never opened there is no ring at all; and PineAir taps
+   * media elements in the document it RUNS in, which is the shell, while the
+   * broadcast plays in the panel - `<webview id="controlFrame">` - a separate
+   * document in a separate process. Every recording was silent, and the
+   * editor said so: "No audio was captured in this recording."
+   *
+   *   "Similar to the tablet, I always want to capture the broadcast audio
+   *    of the recording. So any time that I go into the video editor, I need
+   *    the audio of the broadcast."
+   *
+   * So the sound is captured WITH the picture, the way the tablet does it,
+   * and the second half of the old comment becomes the thing to handle: the
+   * after-the-fact PineAir road is now a fallback that runs only when the
+   * ring carried no sound, so nothing is ever muxed twice. See
+   * replayWithSound().
+   *
+   * WHAT 'loopback' IS, AND WHAT IT IS NOT (read off this Electron's own
+   * electron.d.ts, 37.10.3, interface Streams):
+   *
+   *   "If a string is specified, can be `loopback` or `loopbackWithMute`.
+   *    Specifying a loopback device will capture system audio, and is
+   *    currently only supported on Windows."
+   *
+   * So: Windows only, and this desk is Windows. Elsewhere the handler answers
+   * `audio: false`, the capture comes back with no audio track, and the
+   * renderer reports honest silence with a reason rather than a claim.
+   *
+   * 'loopback' AND NOT 'loopbackWithMute', AND NOT A WebFrameMain, and that
+   * choice is the station's sound. loopbackWithMute mutes local playback
+   * while it captures - it would silence the speakers for as long as the ring
+   * runs, which is every minute the app is open. Handing the panel's frame
+   * instead (`audio: <WebFrameMain>`) would reroute the panel's real playback
+   * through the capture path and, per the same typings, mutes it unless
+   * enableLocalEcho is set - a live broadcast is not the place to test that.
+   * Plain loopback is a passive read of what the machine is already playing:
+   * it opens no input device, it takes no microphone, and it changes nothing
+   * about the path the sound already travels to the speakers. */
   try {
     session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
       if (!win || win.isDestroyed()) return callback({});
-      callback({ video: win, audio: false });
+      /* Only when the page asked for it. Electron ignores an audio answer to
+       * a request that wanted none, and saying it anyway would make the log
+       * read as though every capture had sound. */
+      const wantsAudio = request && request.audioRequested !== false;
+      callback({ video: win,
+        audio: (LOOPBACK_HERE && wantsAudio) ? "loopback" : false });
     }, { useSystemPicker: false });
   } catch (err) { /* older Electron: getDisplayMedia simply will not start */ }
 
@@ -793,6 +848,36 @@ function createWindow() {
   win.on("move", rememberBounds);
   win.loadFile(path.join(__dirname, "renderer", "index.html"));
   win.webContents.once("did-finish-load", () => watchTheShare());
+  /* #1205: THE GESTURE THE RECORDER CANNOT FIND FOR ITSELF.
+   *
+   * getDisplayMedia requires transient user activation - #1182c measured
+   * that and the ring has been opened through the legacy getUserMedia
+   * constraints ever since, which is exactly why it was silent: the
+   * application's own audio is offered through the display-media handler
+   * and nowhere else.
+   *
+   * executeJavaScript's second argument IS an activation ("some HTML APIs
+   * like requestFullScreen can only be invoked by a gesture from the user.
+   * Setting userGesture to true will remove this limitation"), so the main
+   * process spends one on the recorder's behalf. `start()` returns early
+   * when the ring is already running, so this and the renderer's own backstop
+   * timer cannot both open a capture.
+   *
+   * On EVERY finished load, not once: a hot reload (see the note below the
+   * window) re-evaluates the renderer, and a ring that only got its sound on
+   * the first load would go quiet for the rest of the evening after one CSS
+   * save. */
+  win.webContents.on("did-finish-load", () => {
+    setTimeout(() => {
+      try {
+        if (!win || win.isDestroyed()) return;
+        win.webContents.executeJavaScript(
+          "(function(){try{return window.PineScreenRing"
+          + "?window.PineScreenRing.start({gesture:true})&&1:0}catch(e){return -1}})()",
+          true);
+      } catch (error) { /* a page that will not take it still films silently */ }
+    }, 2500);
+  });
 }
 
 /* ===========================================================================
@@ -2891,7 +2976,13 @@ ipcMain.handle("replay:push", (_event, buffer, meta) => {
 ipcMain.handle("replay:source", () => {
   try {
     if (!win || win.isDestroyed()) return { ok: false, detail: "no window" };
-    return { ok: true, id: win.getMediaSourceId() };
+    /* #1205: `loopback` travels with the source id so the renderer can say,
+     * in the one place a person will read it, whether a silent recording is
+     * this platform's limit or a gesture it never got. */
+    return { ok: true, id: win.getMediaSourceId(), loopback: LOOPBACK_HERE,
+      platform: process.platform,
+      detail: LOOPBACK_HERE ? "" : "Electron captures application audio on "
+        + "Windows only, so recordings on " + process.platform + " are silent" };
   } catch (error) {
     return { ok: false, detail: error.message };
   }
@@ -2922,11 +3013,14 @@ ipcMain.handle("replay:state", () => {
      * floor; here it is bounded by seconds as well, so the floor and the
      * hold are the same number. Said anyway, because the sheet reads it.
      *
-     * `audio` is null and that is the honest answer: this ring records
-     * picture only. The broadcast is laid under a cut when the cut is
-     * made, out of PineAir's own ring, which is where the sound has always
-     * come from on this machine. */
-    return { ...got, atLeast: got.holds, audio: null,
+     * #1205: `audio` was null here, and that used to be the honest answer -
+     * the ring recorded picture only. It records the desk's own mix now, so
+     * the recorder's own words come back instead: hot-corners.js:1553 prints
+     * `audio.state` and `audio.detail` into the export sheet, which is where
+     * the operator decides whether to tick "Allow video without complete
+     * audio". That line has to be true BEFORE the cut, not only after it. */
+    return { ...got, atLeast: got.holds,
+      audio: { ...(got.audio || {}), loopback_supported: LOOPBACK_HERE },
       min: HOLD_MIN_S, max: HOLD_MAX_S, fallback: HOLD_DEFAULT_S };
   } catch (error) { return { ok: false, running: false, seconds: 0, holds: 0,
     bytes: 0, detail: error.message }; }
@@ -3003,7 +3097,12 @@ ipcMain.handle("replay:export", async (_event, want) => {
   const asked = Math.max(1, Number((want || {}).seconds) || 30);
   try {
     await replayFlush(900);
-    const made = await screenRing.cut({ seconds: asked, back: (want || {}).back || 0 },
+    /* #1205: `video_only` reaches the CUT now rather than only the dressing
+     * step. The sound is in the pieces, so "video only" has to mean "do not
+     * carry it through the concat" - stripping it afterwards would be a
+     * second encode of a file that already had what was refused in it. */
+    const made = await screenRing.cut({ seconds: asked, back: (want || {}).back || 0,
+      video_only: !!((want || {}).video_only) },
       { ffmpeg: (readConfig() || {}).ffmpeg });
     if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
     /* The broadcast goes under the picture here too. A screen recording of a
@@ -3096,16 +3195,44 @@ function videoIdentity(value) {
 }
 
 /* The picture as it is, with the broadcast laid under it when there is one.
- * Returns {path, dir, audio, notes}. */
+ * Returns {path, dir, audio, notes}.
+ *
+ * #1205: THE SOUND IS USUALLY ALREADY THERE, AND THEN THIS DOES NOTHING.
+ *
+ * The ring films with the desk's loopback mix on it, so a cut comes back with
+ * the broadcast already under the picture, sample-aligned by construction -
+ * one file, one clock, nothing to drift. When that is what happened, this
+ * returns the cut untouched and reports the RING's provenance.
+ *
+ * That is also the rule that keeps the file honest: THE OLD PINEAIR ROAD
+ * RUNS ONLY WHEN THE RING CARRIED NOTHING. Muxing both would put the same
+ * broadcast in the file twice, a few hundred milliseconds apart - the exact
+ * fault the #1182 comment was written to avoid, arriving from the other
+ * direction. It is kept as a fallback rather than deleted because it costs
+ * nothing when there is no sound to add and because it is the road that
+ * works on a surface where these modules are injected into the panel itself
+ * (the tablet), where PineAir genuinely can hear the broadcast.
+ *
+ * On this desk it will almost never fire, and when it does not fire it says
+ * why: PineAir.start() has one caller in the whole renderer (sampler.js:3247)
+ * and it taps the shell, while the broadcast plays in the panel webview. */
 async function replayWithSound(made, videoOnly) {
   const notes = [];
-  const audio = { source: "pine-air-ring", present: false, complete: false,
-    state: "unavailable", detail: "", video_only_explicit: !!videoOnly };
-  if (videoOnly) {
-    audio.state = "unavailable";
-    audio.detail = "video only, as asked";
-    return { path: made.out, dir: made.dir, audio, notes };
+  const fromRing = (made && made.audio) || null;
+  if (fromRing && fromRing.present && !videoOnly) {
+    return { path: made.out, dir: made.dir, audio: fromRing, notes };
   }
+  if (videoOnly) {
+    return { path: made.out, dir: made.dir,
+      audio: fromRing || { source: AUDIO_SOURCE, present: false, complete: false,
+        state: "unavailable", detail: "video only, as asked",
+        coverage_ratio: 0, gaps: 0, video_only_explicit: true },
+      notes };
+  }
+  const audio = { ...(fromRing || {}), source: "pine-air-ring", present: false,
+    complete: false, state: "unavailable", detail: "",
+    ring_detail: (fromRing && fromRing.detail) || "",
+    video_only_explicit: !!videoOnly };
   let wav = null;
   try {
     const raw = await win.webContents.executeJavaScript(
@@ -3119,6 +3246,10 @@ async function replayWithSound(made, videoOnly) {
   if (!wav || wav.length <= 44) {
     audio.state = "unavailable";
     if (!audio.detail) audio.detail = "the broadcast ring held nothing for that window";
+    /* Both roads are named, because "no audio" with one reason reads like a
+     * fault and this is two different ones stacked: the recording had no
+     * loopback, and the after-the-fact tap had nothing either. */
+    if (audio.ring_detail) audio.detail = audio.ring_detail + "; " + audio.detail;
     notes.push("no broadcast audio: " + audio.detail);
     return { path: made.out, dir: made.dir, audio, notes };
   }
@@ -3132,10 +3263,21 @@ async function replayWithSound(made, videoOnly) {
     audio.present = true;
     audio.complete = true;
     audio.state = "captured";
+    audio.coverage_ratio = 1;
+    audio.covered_seconds = made.seconds;
+    audio.gaps = 0;
+    audio.gap_seconds = 0;
     audio.detail = "the broadcast, from PineAir's ring";
     return { path: out, dir: made.dir, audio, notes };
   } catch (error) {
-    audio.state = "partial";
+    /* #1205: "unavailable", not "partial". The file returned here is the
+     * ORIGINAL cut - the mux failed, so it has no audio track at all - and
+     * "partial" makes the editor print "Audio has gaps", which is a claim
+     * that some of the sound is in there. None of it is. */
+    audio.state = "unavailable";
+    audio.present = false;
+    audio.complete = false;
+    audio.coverage_ratio = 0;
     audio.detail = "the sound would not lay under the picture: " + error.message;
     notes.push(audio.detail);
     return { path: made.out, dir: made.dir, audio, notes };
@@ -3149,7 +3291,8 @@ ipcMain.handle("replay:edit", async (_event, want) => {
   let file = "";
   try {
     await replayFlush(900);
-    made = await screenRing.cut({ seconds: asked, back: opts.back || 0 },
+    made = await screenRing.cut({ seconds: asked, back: opts.back || 0,
+      video_only: !!opts.video_only },
       { ffmpeg: (readConfig() || {}).ffmpeg });
     if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
     const dressed = await replayWithSound(made, !!opts.video_only);
@@ -3294,15 +3437,36 @@ ipcMain.handle("corners:set", (_event, patch) => {
  *
  * openClipExport is the window the forward recorder already opens - trim,
  * channels, gains - and it takes exactly what localClip() returns. So the
- * ring's cut is dressed in that same shape, including the broadcast audio,
- * which is pulled out of PineAir's ring for the window the video covers.
+ * ring's cut is dressed in that same shape, including the broadcast audio.
  * That is the one piece that has to line up: the video is a slice of the
  * past, so the audio must be the same slice of the past, not the last N
- * seconds counted from now. */
+ * seconds counted from now.
+ *
+ * #1205: AND THE BROADCAST CHANNEL NOW COMES OUT OF THE CUT ITSELF.
+ *
+ * This window's export runs through clipMux.planArgs, which maps ONLY the
+ * channels it is handed and writes `-an` when it is handed none - so a cut
+ * that already carries the desk mix would have been exported silent, by a
+ * road that was reading the picture and throwing the sound away. The mix is
+ * therefore lifted out of the cut into a wav and handed over as the
+ * broadcast channel: the operator keeps the checkbox and the gain, the sound
+ * is the one that was recorded with the picture, and it is in the file
+ * exactly once. PineAir is asked only when the cut had nothing. */
+async function ringAudioAsWav(made) {
+  const out = path.join(made.dir, "ring-audio.wav");
+  const args = ["-hide_banner", "-nostdin", "-y", "-i", made.out,
+    "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", out];
+  await clipMux.run(clipMux.findFfmpeg((readConfig() || {}).ffmpeg).path, args, 120000);
+  const wav = fs.readFileSync(out);
+  if (wav.length <= 44) throw new Error("the cut's audio track was empty");
+  return wav;
+}
+
 ipcMain.handle("replay:local-edit", async (_event, want) => {
   const asked = Math.max(1, Number((want || {}).seconds) || 30);
   try {
-    const made = await screenRing.cut({ seconds: asked, back: (want || {}).back || 0 },
+    const made = await screenRing.cut({ seconds: asked, back: (want || {}).back || 0,
+      video_only: !!((want || {}).video_only) },
       { ffmpeg: (readConfig() || {}).ffmpeg });
     if (!made.ok) return { ok: false, detail: made.detail, held: made.held };
     const notes = ["this window was recorded, not the tablet",
@@ -3313,7 +3477,17 @@ ipcMain.handle("replay:local-edit", async (_event, want) => {
         + Math.round(made.held) + "s");
     }
     const audio = { broadcast: null, mic: null };
-    if (!(want && want.video_only)) {
+    const ring = made.audio || {};
+    if (!(want && want.video_only) && ring.present) {
+      try {
+        audio.broadcast = { wav: await ringAudioAsWav(made), offset: 0 };
+        notes.push("the broadcast was recorded with the picture - "
+          + String(ring.detail || "the desk mix"));
+      } catch (error) {
+        notes.push("the recorded sound would not come out of the cut: " + error.message);
+      }
+    }
+    if (!(want && want.video_only) && !audio.broadcast) {
       try {
         const fromAgo = made.from;
         const toAgo = made.to;
@@ -3334,7 +3508,8 @@ ipcMain.handle("replay:local-edit", async (_event, want) => {
     openClipExport({ ok: true, mp4, bytes: mp4.length, seconds: made.seconds,
       at: Date.now(), audio, notes });
     return { ok: true, seconds: made.seconds, bytes: mp4.length, held: made.held,
-      clamped: !!made.clamped, notes };
+      clamped: !!made.clamped, notes, audio: made.audio || null,
+      broadcast: !!audio.broadcast, mic: false };
   } catch (error) {
     return { ok: false, detail: error.message };
   }
