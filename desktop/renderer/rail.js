@@ -83,7 +83,7 @@
      * fallbacks are what the rail looks like before it has measured
      * anything, and before a display that cannot be measured. */
     'max-height:var(--pine-rail-max,100vh);overflow-y:auto;overscroll-behavior:contain;',
-    'padding:4px 0;gap:var(--pine-rail-gap,4px);',
+    'padding:5px 0;gap:var(--pine-rail-gap,5px);',
     'scrollbar-width:none;',
     'font-family:Inter,Segoe UI,system-ui,sans-serif}',
     '#pineViewRail::-webkit-scrollbar{display:none}',
@@ -134,7 +134,7 @@
      * are the two ends of the word and the horizontal padding is its
      * thickness. fit() writes the first and never touches the second,
      * because the second is the tap target. */
-    'padding:var(--pine-tab-pad,4px) 11px;',
+    'padding:var(--pine-tab-pad,5px) 11px;',
     /* The text cannot go below 12px: measured on the tablet, this rule
      * says font-size:10px and the WebView computes 12 - it enforces a
      * minimum font size and no stylesheet argues with that. So the height
@@ -192,8 +192,33 @@
   }
 
   /* Close everything, including the sampler, whose host predates this rail
-   * and uses its own `open` class on the same element id. */
+   * and uses its own `open` class on the same element id.
+   *
+   * #1193b: AND A 3JS SCENE IS ONE OF THE THINGS THAT IS OPEN.
+   *
+   * On the desk a full-screen scene is not a rail host - it is inside the
+   * controlFrame webview, with the shell's own frame carrier lifted over
+   * whatever pane the operator was on (three-full.js lift()). Every road
+   * that takes the rail's panes down has to take that with it, or he
+   * presses SCRIPT and gets the panel over the top of the Script view.
+   *
+   * This is the one funnel for that: TECH goes through it, every rail tab
+   * goes through it via open(), and the capture-phase handler on the
+   * shell's own nav goes through it. So the answer to "what does pressing
+   * another tab do while a scene is up" is the same answer the rail gives
+   * everywhere else - it closes what is open and goes where it was asked.
+   * The rail has never refused a tab and this is not the place to start.
+   *
+   * three-full.js does NOT call back into here, so there is no cycle: its
+   * close path restores the stacking and stops. */
+  var closingScene = false;
   function closeAll() {
+    if (!closingScene && root.PineThreeFull
+      && typeof root.PineThreeFull.close === 'function') {
+      closingScene = true;
+      try { root.PineThreeFull.close(); } catch (err) { /* the panes still close */ }
+      closingScene = false;
+    }
     for (var i = 0; i < VIEWS.length; i += 1) {
       var host = hostOf(VIEWS[i]);
       if (host) host.classList.remove('open');
@@ -261,11 +286,46 @@
    * If even RESERVE_MIN will not hold it, the cap stays and the rail
    * scrolls, which is the one honest answer left: better a reachable
    * corner and a rail you scroll than a corner that does nothing.
+   *
+   * ------------------------------------------------------------------
+   * 2026-09-15 (#1193b): THE FLOOR IS FIVE, BECAUSE HE ASKED FOR FIVE.
+   *
+   * "give these tabs a little more breathing room. At least give them
+   *  five pixels of buffer room around each side so that way the tabs
+   *  aren't so small and compressed in the pine box app."
+   *
+   * So PAD_MIN goes 2 -> 5 and GAP_MIN 3 -> 5, the rail's own end padding
+   * 4 -> 5, and the stylesheet fallbacks with them. The horizontal padding
+   * is 11px and already clears the floor; it is also the tap target and is
+   * not touched. Nothing else squeezes a tab - `flex:0 0 auto` since #1345
+   * means a tab is the size of its own word and gives up nothing when the
+   * column will not fit.
+   *
+   * WHAT RAISING THE FLOOR COSTS, said plainly rather than discovered
+   * later: the solver walks the padding DOWN to make the column fit, and
+   * gives the corner reserve away first. With a floor of five it reaches
+   * the floor sooner, so on a short window the rail will SCROLL where
+   * before it would have shrunk. That is the trade he asked for, and the
+   * two things that must survive it both do - the cap stays, so the
+   * corner band is never eaten, and the column still scrolls to its own
+   * ends.
+   *
+   * AND THE FLOOR WAS NOT THE WHOLE STORY. Measured while making this
+   * change: fit() had not been running AT ALL. It walks every
+   * `.pine-view-tab` in the rail and bails on any tab that measures zero,
+   * because a tab not yet laid out would make the solver promise room it
+   * does not have. But pine-cam.js appends a CAM tab at boot and sets
+   * `display:none` on it until the camera is live (pine-cam.js:1561) - a
+   * tab that measures zero for ever. So every call returned null,
+   * `--pine-rail-max` was removed, and the rail has been running on the
+   * stylesheet's fallback padding ever since the camera tabs landed.
+   * THAT is the cramped rail in his photograph; the floor alone would not
+   * have reached it, because nothing was reading the floor.
    */
 
-  var PAD_MIN = 2;          /* below this the border swallows the word */
+  var PAD_MIN = 5;          /* #1193b: "at least five pixels of buffer" */
   var PAD_MAX = 16;         /* #1345's desktop size, the biggest asked for */
-  var GAP_MIN = 3;          /* under 3, two rounded borders read as one shape */
+  var GAP_MIN = 5;          /* #1193b: the same floor between two tabs */
   var GAP_MAX = 8;
   var RESERVE_MIN = 56;     /* the corner band that must survive regardless */
   var PROBE_PAD = 4;        /* the padding the measuring pass is taken at */
@@ -306,9 +366,28 @@
     rail.style.setProperty('--pine-rail-gap', PROBE_PAD + 'px');
     rail.style.setProperty('--pine-rail-max', 'none');
 
-    var words = [], i, h;
+    var words = [], i, h, tab, hidden;
     for (i = 0; i < n; i += 1) {
-      h = tabs[i].offsetHeight || 0;
+      tab = tabs[i];
+      /* #1193b: DELIBERATELY HIDDEN IS NOT THE SAME AS NOT YET LAID OUT.
+       *
+       * pine-cam.js appends a CAM tab at boot and hides it until the
+       * camera is live. It measures zero for ever, so the bail below fired
+       * on every call and this solver has not run since those tabs landed
+       * - the rail has been sitting on the stylesheet fallback. A tab that
+       * is display:none takes no room in the column and is simply not
+       * counted; a tab that IS displayed and still measures zero has not
+       * been laid out, which is the case the bail was written for. */
+      hidden = false;
+      try {
+        hidden = !!(tab.style && tab.style.display === 'none');
+        if (!hidden && root.getComputedStyle) {
+          hidden = root.getComputedStyle(tab).display === 'none';
+        }
+      } catch (err) { hidden = false; }
+      if (hidden) continue;
+
+      h = tab.offsetHeight || 0;
       /* A tab that has not been laid out yet measures 0, and a zero-length
        * word would make the solver promise room it does not have. Skip the
        * whole pass and let the observer below call again. */
@@ -317,6 +396,11 @@
         return null;
       }
       words.push(h - (2 * PROBE_PAD));
+    }
+    /* Every tab hidden is not a column to solve for. */
+    if (!words.length) {
+      rail.style.removeProperty('--pine-rail-max');
+      return null;
     }
 
     /* The rail's own padding, from the stylesheet rather than a copy of
@@ -328,23 +412,15 @@
     } catch (err) { own = 8; }
 
     var glass = root.innerHeight || 800;
-    var corner = cornerPx();
-    var reserve = corner, pad = PAD_MIN, avail = 0, step;
-
-    /* Give the reserve away before the tabs, down to RESERVE_MIN. */
-    for (step = 0; step < 40; step += 1) {
-      avail = glass - (2 * reserve);
-      pad = padThatFits(words, own, avail);
-      if (pad > PAD_MIN || reserve <= RESERVE_MIN) break;
-      reserve = Math.max(RESERVE_MIN, reserve - 6);
-    }
-    avail = Math.max(120, glass - (2 * reserve));
+    var got = solve(words, own, glass, cornerPx());
+    var pad = got.pad, reserve = got.reserve, avail = got.cap;
 
     rail.style.setProperty('--pine-tab-pad', pad + 'px');
     rail.style.setProperty('--pine-rail-gap', gapFor(pad) + 'px');
     rail.style.setProperty('--pine-rail-max', avail + 'px');
 
-    var said = {tabs: n, glass: glass, reserve: reserve, pad: pad,
+    var said = {tabs: n, shown: words.length, glass: glass,
+                reserve: reserve, pad: pad,
                 gap: gapFor(pad), cap: avail,
                 column: rail.scrollHeight, scrolls: rail.scrollHeight > avail + 1};
     rail.setAttribute('data-fit', pad + '/' + reserve + '/' + n);
@@ -382,9 +458,32 @@
     scheduleFit();
   }
 
+  /* #1193b: the reserve walk is lifted out of fit() so the arithmetic for
+   * a given glass can be checked without a browser, and so fit() and the
+   * test cannot drift apart - fit() calls this, it is not a copy of it.
+   * See tests/test_rail_fit_2026_09_15.cjs. */
+  function solve(words, own, glass, corner) {
+    var reserve = corner, pad = PAD_MIN, avail = 0, step, sum = 0, i;
+    /* Give the reserve away before the tabs, down to RESERVE_MIN. */
+    for (step = 0; step < 40; step += 1) {
+      avail = glass - (2 * reserve);
+      pad = padThatFits(words, own, avail);
+      if (pad > PAD_MIN || reserve <= RESERVE_MIN) break;
+      reserve = Math.max(RESERVE_MIN, reserve - 6);
+    }
+    avail = Math.max(120, glass - (2 * reserve));
+    for (i = 0; i < words.length; i += 1) sum += words[i];
+    var column = sum + (2 * pad * words.length)
+      + (gapFor(pad) * (words.length - 1)) + own;
+    return {pad: pad, gap: gapFor(pad), reserve: reserve, cap: avail,
+            column: column, scrolls: column > avail + 1};
+  }
+
   root.PineRailFit = {fit: fit, _padThatFits: padThatFits, _gapFor: gapFor,
+                      _solve: solve,
                       PAD_MIN: PAD_MIN, PAD_MAX: PAD_MAX,
-                      RESERVE_MIN: RESERVE_MIN};
+                      GAP_MIN: GAP_MIN, GAP_MAX: GAP_MAX,
+                      RESERVE_MIN: RESERVE_MIN, CORNER_FALLBACK: 110};
 
   function mount(view, host) {
     if (host.dataset.pineMounted === '1') return 'already';
@@ -456,7 +555,7 @@
     try { root.dispatchEvent(new Event('resize')); } catch (err) { /* old engine */ }
   }
 
-  /* #1193: A NAMED WAY TO TAKE THE VIEWS DOWN.
+  /* #1193: A NAMED WAY TO TAKE THE VIEWS DOWN, AND TO ASK WHAT IS OPEN.
    *
    * closeAll() has existed since the rail did, and five call sites inside
    * this file use it. It had no name outside because nothing outside
@@ -472,11 +571,42 @@
    * in three-full.css was written for, arriving from the other side of the
    * boundary this time.
    *
-   * On the tablet this cannot happen: there the scene and the view hosts
-   * share one document and .p3-full sits at 2147483030, above them. So
-   * this is called only on the desk road, and it is exported rather than
-   * duplicated. */
-  root.PineViewRail = {closeAll: closeAll};
+   * #1193b: and closing the panes was the WRONG cure for it. "The 3JS
+   * pop-up should be able to pop up on any of these tabs in the
+   * application instead of just going to the main tab." So nothing is
+   * closed any more - three-full.js lifts the frame carrier over the pane
+   * instead and puts the stacking back afterwards. What it needs from
+   * here is `hosts()`, the list of elements whose z-index it must beat,
+   * read from this file's own VIEWS table rather than guessed at, and
+   * `railEl()`, so the rail can be lifted with it and stay pressable.
+   *
+   * On the tablet none of this is called: there the scene and the view
+   * hosts share one document and .p3-full sits at 2147483030, above
+   * them. */
+  root.PineViewRail = {
+    closeAll: closeAll,
+    railEl: function () { return document.getElementById('pineViewRail'); },
+    hosts: function () {
+      var out = [], i, host;
+      for (i = 0; i < VIEWS.length; i += 1) {
+        host = hostOf(VIEWS[i]);
+        if (host) out.push(host);
+      }
+      return out;
+    },
+    /* Which pane is showing, so a caller can say where it put the scene
+     * and - more to the point - prove it left him there. */
+    openIds: function () {
+      var out = [], i, host;
+      for (i = 0; i < VIEWS.length; i += 1) {
+        host = hostOf(VIEWS[i]);
+        if (host && host.classList && host.classList.contains('open')) {
+          out.push(VIEWS[i].id);
+        }
+      }
+      return out;
+    }
+  };
 
   root.__pineViewRail = function () {
     if (document.getElementById('pineViewRail')) return 'already';

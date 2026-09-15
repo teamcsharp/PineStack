@@ -37,12 +37,35 @@ const SOURCE = fs.readFileSync(
 
 /* ------------------------------------------------------------- a stub DOM */
 
+/* A style bag that behaves like a real CSSStyleDeclaration in the two ways
+ * the lift depends on: an unset property reads as the empty string, never
+ * undefined, and assigning the empty string REMOVES the declaration. A
+ * plain object gets both wrong, and getting them wrong is exactly how a
+ * restore writes the literal word "undefined" into a style. */
+function cssStyle() {
+  return new Proxy({}, {
+    get(bag, key) {
+      if (typeof key !== 'string') return bag[key];
+      if (key === 'setProperty') {
+        return (k, v) => { if (v === '' || v == null) delete bag[k]; else bag[k] = String(v); };
+      }
+      if (key === 'removeProperty') return (k) => { delete bag[k]; };
+      return bag[key] === undefined ? '' : bag[key];
+    },
+    set(bag, key, value) {
+      if (value === '' || value === undefined || value === null) delete bag[key];
+      else bag[key] = String(value);
+      return true;
+    }
+  });
+}
+
 class Element {
   constructor(tag) {
     this.tagName = tag;
     this.children = [];
     this.listeners = {};
-    this.style = {};
+    this.style = cssStyle();
     this.attrs = {};
     this.id = '';
     this.className = '';
@@ -92,6 +115,47 @@ function makeDocument(webviews) {
   return document;
 }
 
+/* #1193b: the desk as he actually has it - a rail down the right edge, a
+ * pane open on it, and the control section carrying the webview
+ * underneath. The pane is what the scene used to be closed for. */
+function dressShell(h, frame) {
+  const doc = h.document;
+  const carrier = new Element('section');
+  carrier.id = 'control';
+  carrier.classList.add('view');
+  carrier.classList.add('frame-view');
+  /* Something already inline, in a property the lift writes, and
+   * something in a property it does not - both must come back untouched. */
+  carrier.style.padding = '7px';
+  carrier.style.color = 'rebeccapurple';
+  carrier.appendChild(frame);
+  doc.body.appendChild(carrier);
+  doc.byId.control = carrier;
+
+  const rail = new Element('div');
+  rail.id = 'pineViewRail';
+  /* fit() writes these; a restore that cleared the style attribute would
+   * take them with it. */
+  rail.style.maxHeight = '578px';
+  doc.body.appendChild(rail);
+  doc.byId.pineViewRail = rail;
+
+  const tab = new Element('button');
+  tab.id = 'pineViewTab-3js';
+  rail.appendChild(tab);
+  doc.byId['pineViewTab-3js'] = tab;
+
+  /* The pane he was in the middle of. */
+  const pane = new Element('section');
+  pane.id = 'script';
+  pane.classList.add('pine-view-host');
+  pane.classList.add('open');
+  doc.body.appendChild(pane);
+  doc.byId.script = pane;
+
+  return {carrier, rail, tab, pane};
+}
+
 /* ------------------------------------------------------------- the panel */
 
 /* A second realm standing in for the controlFrame webview: its own window,
@@ -125,6 +189,7 @@ function makePanel(register) {
 
 function makeShell(opts) {
   const options = opts || {};
+  const ticks = [];
   const frames = [];
   if (options.frame) frames.push(options.frame);
   const document = makeDocument(frames);
@@ -137,15 +202,18 @@ function makeShell(opts) {
   if (options.register) win.PINE_3JS = options.register;
   const context = vm.createContext({
     window: win, document, console,
-    /* UNREF'd, BOTH OF THEM. watch() runs a 2s interval for as long as the
-     * shell believes a scene is up over there, and the shell only stops
-     * believing when the panel says so - which in a test it never does.
-     * A ref'd interval would hold node open for ever and the suite would
-     * hang with no output, which is exactly what it did the first time. */
+    /* UNREF'd. ask() puts a deadline on every call and clears it on the
+     * way out, but a ref'd timer would still hold node open long enough to
+     * hang the suite with no output - which is what it did the first
+     * time. */
     setTimeout: (fn, ms) => { const t = setTimeout(fn, ms); if (t.unref) t.unref(); return t; },
     clearTimeout: (t) => clearTimeout(t),
-    setInterval: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
-    clearInterval: (t) => clearInterval(t),
+    /* THE WATCHER IS DRIVEN BY HAND. It is the only thing that learns the
+     * scene has ended over in the panel, and all three of its endings have
+     * to put the stacking back - so the test drives its ticks rather than
+     * waiting 900ms and hoping. */
+    setInterval: (fn) => { ticks.push(fn); return ticks.length; },
+    clearInterval: (id) => { if (id) ticks[id - 1] = null; },
     Promise, Set, Array, String, Object, JSON,
     Event: class {},
     getComputedStyle: () => ({position: 'fixed', display: 'block', visibility: 'visible'})
@@ -155,6 +223,7 @@ function makeShell(opts) {
   return {
     win, document, context,
     api: win.PineThreeFull,
+    tick: () => { for (const fn of ticks.slice()) { if (fn) fn(); } },
     sheet: () => document.body.children.find((n) => n.className === 'p3-sheet'),
     all: (fn) => descendants(document.body).filter(fn),
     text: () => descendants(document.body)
@@ -249,10 +318,12 @@ test('pressing a tile opens and promotes the scene inside the panel', async () =
   panel.document.byId['pineWin-booth'] = win;
 
   const views = [];
+  const frame = webview('controlFrame', (src) => panel.run(src));
   const shell = makeShell({
-    frame: webview('controlFrame', (src) => panel.run(src)),
+    frame,
     selectView: (name) => views.push(name)
   });
+  const desk = dressShell(shell, frame);
 
   shell.api.chooser();
   await flush();
@@ -267,18 +338,155 @@ test('pressing a tile opens and promotes the scene inside the panel', async () =
   assert.ok(exit, 'the way out is built in the panel, on its body');
   assert.equal(exit.attrs['aria-label'], 'Close this experience');
 
-  /* The webview is inside a <section class="view"> that has to be the
-   * active one, or the scene is perfect and behind the Logs tab. */
-  assert.deepEqual(views, ['control']);
+  /* #1193b: HE IS NOT MOVED. The first cut called selectView('control')
+   * and closeAll(); both took him off whatever he was doing. The pane he
+   * had open is still open, and the shell's own idea of the current view
+   * was never touched. */
+  assert.deepEqual(views, []);
+  assert.equal(desk.pane.classList.contains('open'), true,
+    'the pane he was in the middle of stays open');
+  assert.equal(desk.carrier.classList.contains('active'), false,
+    'the active class - and so the shell\'s currentView - is never written');
   /* It worked, so the sheet gets out of the way. */
   assert.equal(shell.sheet(), undefined);
   assert.equal(shell.api.isFull(), true);
+
+  /* The carrier is lifted over the pane rather than the pane closed. */
+  assert.equal(desk.carrier.style.zIndex, '2147483002');
+  assert.equal(desk.rail.style.zIndex, '2147483003');
+  assert.equal(shell.api._lifted(), true);
 
   /* The X, pressed over there, really closes it over there. */
   exit.fire('click');
   assert.equal(win.classList.contains('p3-full'), false);
   assert.equal(panel.win.__pineThreeCore.state().full, false);
+
+  /* And the shell learns about it on the next watcher tick, and puts him
+   * back. Until then his tab is still covered, which is why the poll is
+   * 900ms and not the two seconds it started at. */
+  shell.tick();
+  await flush();
+  assert.equal(shell.api._lifted(), false);
+  assert.equal(desk.carrier.style.zIndex, '');
+  assert.equal(desk.pane.classList.contains('open'), true);
 });
+
+test('the scene comes up over the tab he is on, and leaves it exactly as it was',
+  async () => {
+    const opened = [];
+    const panel = makePanel(register(opened));
+    panel.document.byId['pineWin-booth'] = new Element('div');
+    const frame = webview('controlFrame', (src) => panel.run(src));
+    const shell = makeShell({frame});
+    const desk = dressShell(shell, frame);
+
+    /* Exactly what is on the elements before anything is touched. */
+    const beforeCarrier = Object.assign({}, desk.carrier.style);
+    const beforeRail = Object.assign({}, desk.rail.style);
+
+    assert.equal(await shell.api.show('booth'), 'booth');
+
+    /* LIFTED, not closed. Over the rail's hosts at 2147483000, with the
+     * rail one higher so it stays pressable, and the rail's 34px strip
+     * reserved so the tabs do not sit on top of the panel's own X. */
+    assert.equal(desk.carrier.style.display, 'block');
+    assert.equal(desk.carrier.style.position, 'fixed');
+    assert.equal(desk.carrier.style.right, '34px');
+    assert.equal(desk.carrier.style.left, '0px');
+    assert.equal(Number(desk.carrier.style.zIndex) > 2147483000, true);
+    assert.equal(Number(desk.rail.style.zIndex) >
+      Number(desk.carrier.style.zIndex), true);
+    assert.equal(frame.style.height, '100%');
+    assert.equal(desk.tab.classList.contains('on'), true,
+      'the 3JS tab reads as active while its scene is up, like every other tab');
+    assert.equal(desk.pane.classList.contains('open'), true);
+
+    /* PUT BACK FROM THE RECORD, property by property. The padding it
+     * overwrote comes back; the colour it never touched was never at
+     * risk; and the rail keeps the max-height fit() had written on it,
+     * which clearing the style attribute would have thrown away. */
+    await shell.api.close();
+    assert.deepEqual(Object.assign({}, desk.carrier.style), beforeCarrier);
+    assert.deepEqual(Object.assign({}, desk.rail.style), beforeRail);
+    assert.equal(desk.carrier.style.padding, '7px');
+    assert.equal(desk.carrier.style.color, 'rebeccapurple');
+    assert.equal(desk.rail.style.maxHeight, '578px');
+    assert.equal(desk.tab.classList.contains('on'), false);
+    assert.equal(desk.pane.classList.contains('open'), true);
+  });
+
+test('every way a scene can end puts the stacking back', async () => {
+  /* 1. THE PANEL RELOADED. The core went with the old document. */
+  {
+    const panel = makePanel(register([]));
+    panel.document.byId['pineWin-booth'] = new Element('div');
+    const frame = webview('controlFrame', (src) => panel.run(src));
+    const shell = makeShell({frame});
+    const desk = dressShell(shell, frame);
+    assert.equal(await shell.api.show('booth'), 'booth');
+    assert.equal(shell.api._lifted(), true);
+
+    delete panel.win.__pineThreeCore;      /* a new document has none */
+    shell.tick();
+    await flush();
+    assert.equal(shell.api._lifted(), false,
+      'a reloaded panel must not be left sitting over his tab');
+    assert.equal(desk.carrier.style.position, '');
+    shell.api.chooser();
+    await flush();
+    assert.ok(shell.text().includes('reloaded and took the scene with it'),
+      shell.text());
+  }
+
+  /* 2. THE PANEL STOPPED ANSWERING. */
+  {
+    const panel = makePanel(register([]));
+    panel.document.byId['pineWin-booth'] = new Element('div');
+    let deaf = false;
+    const frame = webview('controlFrame', (src) => (deaf
+      ? Promise.reject(new Error('Script failed to execute'))
+      : panel.run(src)));
+    const shell = makeShell({frame});
+    const desk = dressShell(shell, frame);
+    assert.equal(await shell.api.show('booth'), 'booth');
+    deaf = true;
+    shell.tick();
+    await flush();
+    assert.equal(shell.api._lifted(), false);
+    assert.equal(desk.carrier.style.zIndex, '');
+    shell.api.chooser();
+    await flush();
+    assert.ok(shell.text().includes('stopped answering while a scene was up'),
+      shell.text());
+  }
+
+  /* 3. IT OPENED BUT WOULD NOT PROMOTE. The scene is up as a window over
+   * there, which is not worth holding his tab for. */
+  {
+    const panel = makePanel(register([]));
+    /* No pineWin-booth element, so promote() never finds anything. */
+    const frame = webview('controlFrame', (src) => panel.run(src));
+    const shell = makeShell({frame});
+    const desk = dressShell(shell, frame);
+    const said = await shell.api.show('booth');
+    assert.ok(said.includes('cannot be made full screen'), said);
+    assert.equal(shell.api._lifted(), false);
+    assert.equal(desk.carrier.style.display, '');
+    assert.equal(desk.pane.classList.contains('open'), true);
+  }
+});
+
+test('a panel frame with no src is said, not lifted blank over his tab',
+  async () => {
+    const frame = webview('controlFrame', () => Promise.resolve(null));
+    frame.src = '';
+    const shell = makeShell({frame});
+    const desk = dressShell(shell, frame);
+    const said = await shell.api.show('booth');
+    assert.ok(said.includes('has not loaded in this window yet'), said);
+    assert.equal(shell.api._lifted(), false);
+    assert.equal(desk.carrier.style.display, '');
+  });
 
 test('the tablet keeps the direct road and never touches a frame', async () => {
   const opened = [];
@@ -307,6 +515,13 @@ test('the tablet keeps the direct road and never touches a frame', async () => {
   assert.equal(said, 'booth');
   assert.deepEqual(opened, ['booth']);
   assert.ok(shell.document.byId['pineWin-booth'].classList.contains('p3-full'));
+
+  /* #1193b: AND THE LIFT IS A NO-OP HERE, by construction rather than by a
+   * surface test - lift() is only reached on the bridge road, and the
+   * tablet never takes it. The promotion CSS already sits at 2147483030,
+   * above the rail's hosts, because over there it is all one document. */
+  assert.equal(shell.api._lifted(), false);
+  assert.equal(shell.api._drop(), false, 'nothing to put back on the tablet');
 });
 
 test('an unreachable panel says which thing happened, not nothing', async () => {

@@ -663,6 +663,178 @@
   }
 
   /* ====================================================================
+     THE FRAME CARRIER, LIFTED OVER WHATEVER TAB HE IS ON.
+
+     #1193b: "The 3JS pop-up should be able to pop up on any of these tabs
+     in the application instead of just going to the main tab."
+
+     The first cut of #1193 called PineViewRail.closeAll() before
+     promoting. That is a correct cure for "the scene is invisible" and the
+     wrong one for "I was in the middle of something": it took him off
+     SCRIPT or SLIDES and left him on the panel when the scene closed.
+
+     WHAT IS ACTUALLY IN THE WAY, measured rather than assumed, and it is
+     two different things depending on which tab he is on:
+
+       * ON A RAIL PANE (SAMPLER, SCRIPT, LISTEN, MUSIC, PRESENT, SLIDES):
+         the control section is still `.active`, so it is DISPLAYED and
+         merely COVERED. rail.js gives the pane `.pine-view-host`, which is
+         position:fixed;inset:0;z-index:2147483000 - the whole glass over
+         the top of it.
+
+       * ON ONE OF THE SHELL'S OWN NAV TABS (Radio, System2, Overview,
+         Logs, Settings, Guide, Terminal): the control section is HIDDEN
+         outright. styles.css:1069 is `.view{display:none}` and :1070 is
+         `.view.active{display:block}`, and renderer.js selectView (881)
+         toggles that class. No amount of z-index reaches a display:none
+         element.
+
+     So stacking alone is half the job, and the other half is making the
+     carrier visible and full-bleed for the duration.
+
+     WHAT IS *NOT* TOUCHED, deliberately: the `active` class, and therefore
+     the shell's `currentView`. Everything here is written as INLINE style,
+     which beats the stylesheet's class rules without lying to the shell
+     about which view it is on. renderer.js keeps its own bookkeeping, its
+     nav keeps working, and when this puts the styles back the DOM is
+     exactly what it was.
+
+     AND EVERY PROPERTY IS RECORDED BEFORE IT IS WRITTEN, individually,
+     and restored from that record - never from a guess about what it
+     "should" have been, and never by clearing the whole style attribute,
+     which would throw away the rail's own --pine-tab-pad and whatever else
+     another module had put there. That rule is not invented here: it is
+     the one the mute taught, when a value was assumed rather than
+     remembered and ended up written onto the wrong element.
+     ==================================================================== */
+
+  /* Above the rail's view hosts (2147483000), below everything that was
+   * already above the rail - the chooser sheet at 2147483040, the talk dot
+   * and the trace popup. The rail goes one higher than the carrier so it
+   * stays pressable over the scene: a way out he can always see. */
+  var LIFT_CARRIER = 2147483002;
+  var LIFT_RAIL = 2147483003;
+  /* The strip the rail occupies. .pine-view-host reserves exactly this
+   * (rail.js: `padding-right:34px`) so an open pane does not run under the
+   * tabs; a lifted carrier must reserve it too, or the rail would sit on
+   * top of the panel's own X, which lives at the top right of the scene. */
+  var RAIL_STRIP = '34px';
+
+  var CARRIER_PROPS = ['display', 'position', 'left', 'top', 'right',
+    'bottom', 'width', 'height', 'margin', 'padding', 'overflow', 'zIndex'];
+  var FRAME_PROPS = ['display', 'width', 'height'];
+  var RAIL_PROPS = ['zIndex'];
+
+  var lifted = null;
+
+  function stash(el, props) {
+    var rec = {el: el, was: {}}, i, had;
+    for (i = 0; i < props.length; i += 1) {
+      had = el.style[props[i]];
+      /* A real CSSStyleDeclaration reads an unset property as the empty
+       * string, and assigning the empty string back removes it - so the
+       * record says "there was nothing here" as faithfully as it says a
+       * value. The coercion is for anything that is not a real one:
+       * assigning undefined to a style property writes the literal word
+       * "undefined" into the declaration, which would be a restore that
+       * broke the thing it was restoring. */
+      rec.was[props[i]] = (typeof had === 'string') ? had : '';
+    }
+    return rec;
+  }
+
+  function putBack(rec) {
+    var k;
+    if (!rec) return;
+    for (k in rec.was) {
+      if (!Object.prototype.hasOwnProperty.call(rec.was, k)) continue;
+      /* '' is what an absent inline property reads as, and assigning ''
+       * removes the declaration. So this restores "there was nothing here"
+       * as faithfully as it restores a value. */
+      try { rec.el.style[k] = rec.was[k]; } catch (err) { /* keep going */ }
+    }
+  }
+
+  /* The element the shell shows and hides - the <section class="view">
+   * the webview sits in - found by walking up from the frame rather than
+   * by hard-coding #control, so a rearranged shell lifts the right thing.
+   * If nothing up the tree is a view, the frame is its own carrier. */
+  function carrierOf(frame) {
+    var node = frame ? frame.parentNode : null;
+    while (node && node.classList) {
+      if (node.classList.contains('view')) return node;
+      node = node.parentNode;
+    }
+    return frame;
+  }
+
+  function railEl() {
+    try {
+      if (root.PineViewRail && typeof root.PineViewRail.railEl === 'function') {
+        return root.PineViewRail.railEl();
+      }
+    } catch (err) { /* fall through */ }
+    return document.getElementById('pineViewRail');
+  }
+
+  function lift(frame) {
+    if (lifted) return lifted;
+    var carrier = carrierOf(frame);
+    var rail = railEl();
+    var tab = document.getElementById('pineViewTab-3js');
+
+    lifted = {
+      carrier: carrier ? stash(carrier, CARRIER_PROPS) : null,
+      frame: frame ? stash(frame, FRAME_PROPS) : null,
+      rail: rail ? stash(rail, RAIL_PROPS) : null,
+      tab: tab,
+      tabWasOn: !!(tab && tab.classList && tab.classList.contains('on'))
+    };
+
+    if (carrier) {
+      carrier.style.display = 'block';
+      carrier.style.position = 'fixed';
+      carrier.style.left = '0px';
+      carrier.style.top = '0px';
+      /* Only when there IS a rail to keep clear of. A shell without one
+       * would otherwise get a 34px strip of nothing down the right. */
+      carrier.style.right = rail ? RAIL_STRIP : '0px';
+      carrier.style.bottom = '0px';
+      /* auto, not 100%: the four insets are what size it, and a width of
+       * 100% would put it back under the rail strip reserved above. */
+      carrier.style.width = 'auto';
+      carrier.style.height = 'auto';
+      carrier.style.margin = '0px';
+      carrier.style.padding = '0px';
+      carrier.style.overflow = 'hidden';
+      carrier.style.zIndex = String(LIFT_CARRIER);
+    }
+    if (frame && frame.style) {
+      /* .frame-view.active is what normally gives the webview its height,
+       * and that rule needs the class this deliberately does not touch. */
+      frame.style.display = 'flex';
+      frame.style.width = '100%';
+      frame.style.height = '100%';
+    }
+    if (rail) rail.style.zIndex = String(LIFT_RAIL);
+    if (tab && tab.classList) tab.classList.add('on');
+    return lifted;
+  }
+
+  function drop() {
+    var rec = lifted;
+    if (!rec) return false;
+    lifted = null;
+    putBack(rec.carrier);
+    putBack(rec.frame);
+    putBack(rec.rail);
+    if (rec.tab && rec.tab.classList && !rec.tabWasOn) {
+      rec.tab.classList.remove('on');
+    }
+    return true;
+  }
+
+  /* ====================================================================
      THE ONE API, THE SAME SHAPE ON BOTH SURFACES.
 
      list() and show() are asynchronous on BOTH roads, even though the
@@ -740,35 +912,34 @@
       });
     }
 
-    if (!panelFrame()) {
+    var frame = panelFrame();
+    if (!frame) {
       inflight = '';
       lastNote = whyText({why: 'nowhere'});
       return Promise.resolve(lastNote);
     }
 
-    /* PUT THE PANEL IN FRONT FIRST. The scene is promoted inside the
-     * controlFrame webview, and a webview inside a <section class="view">
-     * that is not `.active` is not on screen at all - the operator would
-     * have got a perfect full-screen scene behind the Logs tab. */
-    try {
-      if (typeof root.selectView === 'function') root.selectView('control');
-    } catch (errView) { /* the scene still opens; it may just be behind */ }
+    /* A CARRIER WITH NO src HAS NOTHING TO LIFT. loadFrames() only gives
+     * a webview its src when its view is the current one (renderer.js
+     * 958-978); the control frame gets one at boot because currentView
+     * starts at "control" (renderer.js:23), but a shell that never loaded
+     * it would otherwise be lifted blank over his tab. */
+    if (!frame.src) {
+      inflight = '';
+      lastNote = 'the station panel has not loaded in this window yet - '
+        + 'open the Pine Box tab once and it will be there';
+      return Promise.resolve(lastNote);
+    }
 
-    /* AND TAKE THE RAIL'S VIEWS DOWN. They are siblings of the webview in
-     * THIS document at z-index 2147483000, so a scene promoted inside the
-     * panel - however perfectly - is covered by whatever view the operator
-     * had open when he reached for the 3JS tab. The tablet has no such
-     * problem: there the scene is in the same document and .p3-full sits
-     * above them at 2147483030. See rail.js's note on PineViewRail. */
-    try {
-      if (root.PineViewRail && typeof root.PineViewRail.closeAll === 'function') {
-        root.PineViewRail.closeAll();
-      }
-    } catch (errRail) { /* the rail is not worth losing the scene over */ }
+    /* OVER THE TAB HE IS ON, NOT INSTEAD OF IT. See the lift block above:
+     * nothing is closed, the carrier is brought forward and made
+     * full-bleed, and everything written is recorded first. */
+    lift(frame);
 
     return ask('window.__pineThreeCore.show(' + JSON.stringify(key) + ')', 30000)
       .then(function (res) {
         if (!res.ok) {
+          drop();
           lastNote = whyText(res);
           return settle(lastNote);
         }
@@ -779,7 +950,14 @@
           lastNote = '';
           watch();
         } else {
+          /* ANYTHING SHORT OF A PROMOTION PUTS HIM BACK. The scene may
+           * genuinely be up over there as a window - that is what "it is
+           * up as a window" means - but the lift is for a FULL SCREEN
+           * scene, and holding his tab hostage for a window he cannot see
+           * full is the outcome that is worse than doing nothing. The note
+           * tells him it is up; the Pine Box tab is one press away. */
           believeOpen = '';
+          drop();
           lastNote = said;
         }
         return settle(said);
@@ -803,11 +981,23 @@
    * This is deliberately a BARE ask: wrapInstalling would put the core
    * back before looking, and a freshly installed core reports "nothing is
    * up", which is case 1's answer given for case 2's reason. The
-   * distinction is the whole reason there are two wrappers. */
+   * distinction is the whole reason there are two wrappers.
+   *
+   * #1193b: ALL THREE PATHS CALL drop(). The carrier is lifted over
+   * whatever tab he was on, so a scene that ends without the stacking
+   * being put back leaves him looking at the panel over the top of the
+   * Script view - which is worse than the fault this replaced. There is no
+   * branch out of this watcher that does not restore.
+   *
+   * The poll is 900ms rather than the 2s it started at, for the same
+   * reason: the X is pressed inside the panel and the shell learns about
+   * it only here, so the interval is how long his tab stays covered after
+   * he has closed the scene. */
   function watch() {
     if (watcher) return;
     watcher = setInterval(function () {
       if (!believeOpen) {
+        drop();
         clearInterval(watcher);
         watcher = 0;
         return;
@@ -816,7 +1006,9 @@
         6000, true).then(function (res) {
         if (!believeOpen) return;
         if (!res.ok) {
+          /* 3. unreachable. */
           believeOpen = '';
+          drop();
           lastNote = 'the station panel stopped answering while a scene was '
             + 'up - ' + whyText(res);
           clearInterval(watcher);
@@ -824,7 +1016,9 @@
           return;
         }
         if (!res.value) {
+          /* 2. reloaded: the core went with the old document. */
           believeOpen = '';
+          drop();
           lastNote = 'the station panel reloaded and took the scene with it - '
             + 'pick it again and it will open in the new page';
           clearInterval(watcher);
@@ -832,23 +1026,33 @@
           return;
         }
         if (!res.value.full) {
+          /* 1. the X, pressed over there. Ordinary, and no note. */
           believeOpen = '';
+          drop();
           lastNote = '';
           clearInterval(watcher);
           watcher = 0;
         }
       });
-    }, 2000);
+    }, 900);
   }
 
   function shutScene() {
     if (registerIsHere()) {
+      /* The tablet lifts nothing, so drop() has nothing to put back - it
+       * returns false and this is a no-op there, by construction rather
+       * than by a surface test. */
       var core = localCore();
       believeOpen = '';
+      drop();
       if (core) { try { core.close(); } catch (err) { /* already gone */ } }
       return Promise.resolve('closed');
     }
     believeOpen = '';
+    /* The stacking goes back BEFORE the ask, not after it: if the panel
+     * has stopped answering, the ask will take nine seconds to say so and
+     * his tab must not be covered for those nine seconds. */
+    drop();
     return ask('window.__pineThreeCore ? window.__pineThreeCore.close() '
       + ': "nothing was up"', 9000, true).then(function (res) {
       return res.ok ? String(res.value) : whyText(res);
@@ -1042,7 +1246,10 @@
     _core: pineThreeCore,
     _source: function () { return CORE_SOURCE; },
     _registerIsHere: registerIsHere,
-    _frame: panelFrame
+    _frame: panelFrame,
+    _lift: lift,
+    _drop: drop,
+    _lifted: function () { return !!lifted; }
   };
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = root.PineThreeFull;
