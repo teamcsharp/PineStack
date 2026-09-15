@@ -17966,6 +17966,567 @@ def shelf_full(kind: str) -> bool:
                if dialogue_row_viable(str(kind), r)) >= shelf_cap(kind)
 
 
+# =====================================================================
+# #1197: THE BULLETINS THAT NEVER TALK ABOUT THE NEWS.
+#
+#   "use these entries to better structure the orchestrator and the
+#   prompts that we're using to create these scripts in order to get
+#   this to be even more acceptable... learn from it and make changes
+#   accordingly in order to ensure that the station is more fluidly able
+#   to pursue its goals."
+#
+# MEASURED, on 30,127 refusal rows.  378 of the 581 rows still pending
+# are news bulletins held with "the script never gets to the story the
+# wire carried".  Nineteen were read by hand and all 378 scanned: NOT
+# ONE tells a news story, and 25 per cent contain no proper noun, no
+# number and no story vocabulary whatsoever.  The checker is right about
+# essentially all of them.  This is a PROMPT fault.
+#
+# Every one of those 378 is a PREPARED round - banked 349, tinted 72,
+# restored 18, live ZERO - and _schedule_prompt_clause() returns ""
+# whenever prep_context_now() is true, so the news seed has never been
+# in the prompt of a single failing bulletin.
+#
+# THE SWITCH.  data/brief_prompts/mode, one word, re-read every three
+# seconds, no restart - the shape of data/record_talk/mode (#1179) by
+# way of data/airings/mode (#1189), strict one-token parse included,
+# because an operator's note to himself must never read as permission.
+# `legacy` (the default, and what a missing, empty, unreadable or
+# unrecognised file reads as) is the station exactly as it runs tonight.
+# `wire` delivers the brief to the prepared round, rewrites the news and
+# gallery seeds, demotes the show-notes to background, offers the theme
+# as colour on a round that has its own material, ends the prompt on
+# that material, and gives a round that misses its brief ONE more go
+# with the fault named before anything is held.
+# =====================================================================
+BRIEF_PROMPTS_DIR = data_path("brief_prompts")
+BRIEF_PROMPTS_ENV = "PINE_BRIEF_PROMPTS_MODE"
+BRIEF_MODE_LEGACY = "legacy"
+BRIEF_MODE_WIRE = "wire"
+BRIEF_MODES = (BRIEF_MODE_LEGACY, BRIEF_MODE_WIRE)
+
+
+def brief_parse_mode(text: Any) -> str:
+    """One word into a mode.  Anything else at all is `legacy`.
+
+    Copied from airings_parse_mode (#1189), which was copied from
+    track_talk_segment.parse_mode (#1179), strict arm included: ONE WORD
+    MEANS ONE WORD, so a switch file holding a sentence is legacy
+    however promising a word inside it looks.  "on" is read as `wire`
+    because that is plainly what somebody typing it meant."""
+    words = str(text or "").replace(",", " ").split()
+    if len(words) != 1:
+        return BRIEF_MODE_LEGACY
+    low = words[0].strip().lower()
+    if low in BRIEF_MODES:
+        return low
+    return BRIEF_MODE_WIRE if low in ("on", "true", "yes") else BRIEF_MODE_LEGACY
+
+
+class _BriefPromptsSwitch:
+    """`<data>/brief_prompts/mode`, re-read at most every `ttl` seconds.
+
+    DEFAULTS LEGACY.  Missing file, empty file, unreadable file, a word
+    this does not know, a file being rewritten underneath us: legacy,
+    every time."""
+
+    def __init__(self, root: Any, env: Any = None, ttl: float = 3.0,
+                 clock: Any = time.time):
+        self.root = Path(root)
+        self.path = self.root / "mode"
+        self.ttl = float(ttl)
+        self.clock = clock
+        self._env = dict(os.environ if env is None else env)
+        self._read_at = 0.0
+        self._cached = BRIEF_MODE_LEGACY
+
+    def _text(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, ValueError):
+            return ""
+
+    def mode(self) -> str:
+        now = float(self.clock())
+        if self._read_at and (now - self._read_at) < self.ttl:
+            return self._cached
+        text = self._text()
+        if not text:
+            text = str(self._env.get(BRIEF_PROMPTS_ENV, "")).strip()
+        self._read_at = now
+        self._cached = brief_parse_mode(text)
+        return self._cached
+
+    def write(self, text: str) -> None:
+        """Tests and operator tools only; never the station itself."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + "." + uuid.uuid4().hex + ".tmp")
+        tmp.write_text(str(text).strip() + "\n", encoding="utf-8")
+        os.replace(tmp, self.path)
+        self._read_at = 0.0
+
+
+BRIEF_PROMPTS_SWITCH = _BriefPromptsSwitch(BRIEF_PROMPTS_DIR, clock=time.time)
+_BRIEF_PROMPTS_SAID: dict[str, Any] = {"mode": None}
+
+
+def brief_prompts_mode() -> str:
+    """legacy | wire.  Never raises; an unreadable switch is legacy.
+
+    Says so in the log when it CHANGES and only then - a line every
+    three seconds saying the switch is still off is not a log (#1179)."""
+    mode = BRIEF_MODE_LEGACY
+    try:
+        mode = BRIEF_PROMPTS_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return BRIEF_MODE_LEGACY
+    was = _BRIEF_PROMPTS_SAID.get("mode")
+    if mode != was:
+        _BRIEF_PROMPTS_SAID["mode"] = mode
+        if was is not None:
+            try:
+                pipeline_log(
+                    "lookahead",
+                    "#1197: the brief-prompt switch is now %s - %s"
+                    % (mode,
+                       "a prepared round carries its kind's brief, the news "
+                       "and gallery seeds are the rewritten ones, the "
+                       "show-notes are background, the theme is colour on a "
+                       "round with its own material, the prompt ends on that "
+                       "material, and a round that misses its brief is asked "
+                       "again ONCE with the fault named before it is held"
+                       if mode == BRIEF_MODE_WIRE else
+                       "the prompts are back exactly as they were; the "
+                       "widened word list and the wire titles stay, because "
+                       "neither can hold a round"))
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def brief_prompts_wire() -> bool:
+    """Is the #1197 prompt work in force?"""
+    return brief_prompts_mode() == BRIEF_MODE_WIRE
+
+
+# ---------------------------------------------------------------------
+# THE SEEDS THE SWITCH SUBSTITUTES.
+#
+# NEWS.  The old seed says "React as yourselves, never as a wire
+# service" while SEGMENT_BRIEF["news"] requires report / reported /
+# according to / the story / headline / news / officials / said today /
+# the wire.  The instruction and the test contradicted each other, and
+# the model obeyed the instruction.  The new one puts the ORDER OF
+# BUSINESS first - name the thing that happened, say where it came
+# from, and only then be yourselves - and names the failure so plainly
+# that a model can check itself against it.
+#
+# GALLERY.  Measured on the same scan: 45 per cent of gallery refusals
+# plainly describe a picture and ZERO of 33 sell one.  The seed already
+# says "put a ludicrous price on it"; it says it in the middle, where a
+# model treats it as one item on a list.  The sale is the LAST BEAT
+# here, and it is checkable - see gallery_sale_evidence().
+# ---------------------------------------------------------------------
+SCHEDULE_SEED_WIRE: dict[str, str] = {
+    "news": (
+        "This is a NEWS segment and it is about the story in front of "
+        "you, not about you. WITHIN THE FIRST TWO TURNS one of you names "
+        "THE THING THAT HAPPENED - the person, the place, the "
+        "organisation, the number - in plain words taken out of the "
+        "headlines and the full story you have been handed and nothing "
+        "else. Say where it came from at least once: \"the wire says\", "
+        "\"it's reported that\", \"according to them\". THEN react as "
+        "yourselves - argue with it, be appalled by it, be funny about "
+        "it - and get back to the music before it turns into a lecture. "
+        "Do NOT open on a mood, an image, a philosophy, a memory or "
+        "anything you were talking about earlier. If the first two turns "
+        "could have been written without the wire in front of you, the "
+        "segment has FAILED."),
+    "gallery": (
+        "Sell the painting off what you can actually SEE in it. Describe "
+        "it in the first turns - what is in the frame, what it is doing, "
+        "what it is trying to get away with - and argue about what it "
+        "means. THEN MAKE THE SALE, and make it the LAST BEAT: in the "
+        "final two turns one of you names a PRICE out loud and the other "
+        "says WHO GETS IT - the first caller, whoever rings, the next "
+        "person through the door. The round is not a description with a "
+        "number in the middle; it is a pitch that ends on the sale."),
+}
+
+
+def schedule_seed_for(kind: str) -> str:
+    """The seed this road writes under.
+
+    Today's dictionary unless the #1197 switch is on and this road has a
+    rewritten seed, which is exactly two of them."""
+    try:
+        if brief_prompts_wire():
+            got = SCHEDULE_SEED_WIRE.get(str(kind or ""))
+            if got:
+                return got
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return str(SCHEDULE_PROMPT_SEED.get(str(kind or ""), ""))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# ---------------------------------------------------------------------
+# CAUSE 1: THE BRIEF NEVER ARRIVES.
+#
+# _schedule_prompt_clause() returns "" the moment prep_context_now() is
+# true, and every one of the 378 held bulletins is a prepared round.
+# #897 already built the road for the operator's own generate tickets:
+# alt_brief_set(brief) hangs a brief on THIS asyncio task, and
+# _schedule_prompt_clause reads it BEFORE the prep_context_now() guard.
+# The ordinary preparer walks the same road here.
+#
+# It never overrides an operator's brief: alt_brief_now() being set at
+# all means a generate ticket owns this task, and the operator's words
+# outrank the station's default seed every time.
+# ---------------------------------------------------------------------
+def prep_brief_seed(kind: str) -> bool:
+    """Hang this road's own brief on the task that is about to write.
+
+    Returns True when THIS task now carries it, so the caller knows to
+    clear it in a finally - a brief that outlived its ticket would be a
+    leak with a voice (#897's words, and its rule)."""
+    try:
+        if not brief_prompts_wire():
+            return False
+        if alt_brief_now():
+            return False            # the operator's own ticket owns this task
+        seed = schedule_seed_for(str(kind or ""))
+        if not seed:
+            return False
+        alt_brief_set(seed)
+        return bool(alt_brief_now())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------------
+# THE #1134 PATTERN, APPLIED TO NEWS, GALLERY, RECAP AND MANAGER.
+#
+# The advert road checks the brief at WRITE time and on failure re-asks
+# ONCE with the fault as a lesson, filing disposition="rewrite_rejected"
+# - a note, not an ask - then writes it again.  That is why the ad road
+# produced 189 brief failures in 36 hours and contributed ZERO rows to
+# the operator's queue.  The news road on the identical failure marked
+# off_brief, filed held_before_recording, and the round was lost.
+#
+# The lesson reaches the prompt the way #897's brief does: hung on THIS
+# task, read once by dj_banter while the angle is being assembled, and
+# cleared in a finally.  No road's signature changes, so a road that
+# never asks for a second chance is untouched down to the byte.
+# ---------------------------------------------------------------------
+_BRIEF_LESSON: dict[int, str] = {}
+
+BRIEF_RETRY_LESSON: dict[str, str] = {
+    "news": (
+        " THE LAST ATTEMPT NEVER TOLD THE STORY. It was written and "
+        "thrown away because nothing in it named what actually happened. "
+        "Start again, and this time the FIRST TWO TURNS name the thing "
+        "out of the headlines and the full story above - the person, the "
+        "place, the organisation, the number - and say where it came "
+        "from out loud. No mood, no image, no philosophy, no callback "
+        "until the story is on the table."),
+    "gallery": (
+        " THE LAST ATTEMPT NEVER SOLD THE PAINTING. It was written and "
+        "thrown away. Describe the picture, then END ON THE SALE: the "
+        "final two turns name a price out loud and say who gets it."),
+    "manager": (
+        " THE LAST ATTEMPT NEVER PRODUCED THE MEMO. It was written and "
+        "thrown away because nothing in it was the message from "
+        "upstairs. Read the memo out, in so many words, and then sulk "
+        "over it - the segment IS the memo and what it does to you."),
+    "recap": (
+        " THE LAST ATTEMPT NEVER RECAPPED THE HOUR. It was written and "
+        "thrown away. Say back, out loud and plainly, the subjects the "
+        "two of you and the callers actually got into this hour - three "
+        "or four of them, in the shape of \"the last hour we got into "
+        "this, and this, and this\" - before anything else."),
+}
+
+
+def brief_lesson_set(text: str) -> None:
+    """Write under this correction, in THIS task, until it is cleared."""
+    try:
+        task = asyncio.current_task()
+        if task is None:
+            return
+        if str(text or "").strip():
+            _BRIEF_LESSON[id(task)] = str(text)[:1200]
+        else:
+            _BRIEF_LESSON.pop(id(task), None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def brief_lesson_clear() -> None:
+    """Always in a finally, for #897's reason exactly."""
+    try:
+        task = asyncio.current_task()
+        if task is not None:
+            _BRIEF_LESSON.pop(id(task), None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def brief_lesson_now() -> str:
+    """The correction THIS task is writing under, or ""."""
+    try:
+        if not _BRIEF_LESSON:
+            return ""
+        task = asyncio.current_task()
+        return str(_BRIEF_LESSON.get(id(task)) or "") if task is not None else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def brief_lesson_clause() -> str:
+    """What dj_banter adds to the angle on a second attempt.  "" always,
+    on every round that is not one."""
+    got = brief_lesson_now()
+    return ("\n\n" + got.strip()) if got.strip() else ""
+
+
+async def brief_written_twice(kind: str, write: Any, script_of: Any,
+                              titles_of: Any = None,
+                              product_of: Any = None,
+                              live: bool = False) -> Any:
+    """Write the round; if it misses its own brief, ask again ONCE with
+    the fault named, and hold only on the second failure (#1134/#1197).
+
+    `write(lesson)` does the writing and returns whatever the road
+    returns; `script_of(got)` pulls the words out of it.  The first
+    failure is filed as `rewrite_rejected` - a NOTE in the review store,
+    not a row in the operator's queue - which is precisely the
+    difference between the ad road's 189 brief failures and zero holds
+    and the news road's 378 holds.
+
+    `live=True` MEANS THE FIRST ATTEMPT HAS ALREADY BEEN HEARD, and it
+    is not a nicety.  A round written with bank_to is banked and graded
+    before anybody hears it, which is true of every road here but one:
+    the recap has no preparation road at all - it reads the station's
+    own log at the moment it is written, so it is written LIVE and
+    dj_banter speaks it on the way out.  Asking that road twice would
+    put two recaps on air one after the other, which is a worse fault
+    than the one being cured.  A live road therefore gets the
+    diagnostic half of #1134 - the fault named and filed as a NOTE
+    rather than a hold, where today it is filed as nothing at all - and
+    never a second airing.  Said plainly here because a later reader
+    would otherwise "fix" this into a double recap.
+
+    With the switch off this calls `write("")` once and returns it, so
+    the road is byte-for-byte what it is tonight."""
+    if not brief_prompts_wire():
+        return await write("")
+    got = None
+    for attempt in range(1 if live else 2):
+        lesson = "" if attempt == 0 else str(
+            BRIEF_RETRY_LESSON.get(str(kind or ""), "") or "")
+        got = await write(lesson)
+        try:
+            script = str(script_of(got) or "")
+        except Exception:  # noqa: BLE001
+            return got
+        if not script.strip():
+            return got              # nothing was written; not a brief fault
+        try:
+            titles = str((titles_of(got) if titles_of else "") or "")
+            product = str((product_of(got) if product_of else "") or "")
+            aud = segment_audit(str(kind or ""), script,
+                                product=product, titles=titles)
+        except Exception:  # noqa: BLE001
+            return got
+        if not (aud.get("checked") and not aud.get("ok")):
+            return got              # it does what its entry is for
+        if attempt == 0:
+            try:
+                line_review_capture(
+                    "segment_brief", script,
+                    reasons=[str(aud.get("why") or "off brief")],
+                    context={"kind": str(kind or ""),
+                             "stage": "brief_rewrite_1197", "who": "",
+                             "script": script, "where": "written",
+                             "product": product},
+                    evaluation=aud, disposition="rewrite_rejected")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                pipeline_log(
+                    "drop",
+                    "a %s round missed its own brief in the writing - %s "
+                    "(#1134/#1197): %s"
+                    % (str(kind or "round"),
+                       "it was already on air, so the fault is filed as a "
+                       "note and nothing is asked again"
+                       if live else
+                       "asking again ONCE with the fault named, the way "
+                       "the ad studio does",
+                       str(aud.get("why") or "")[:160]),
+                    extra=script[:300])
+            except Exception:  # noqa: BLE001
+                pass
+            if live:
+                # The words are already out of the speakers. The fault
+                # is named and filed; nothing is asked again.
+                return got
+            continue
+        # The second failure falls through untouched: the ordinary road
+        # grades it, files held_before_recording, and the operator sees
+        # it - which is what should happen to a round that was told
+        # exactly what it got wrong and did it again.
+        try:
+            pipeline_log(
+                "drop",
+                "a %s round missed its brief TWICE - the second attempt "
+                "was told exactly what the first got wrong, so this one "
+                "is held for the operator (#1197)" % str(kind or "round"))
+        except Exception:  # noqa: BLE001
+            pass
+    return got
+
+
+# ---------------------------------------------------------------------
+# CAUSE 3: AN IMPERATIVE BEATS THE BRIEF.
+#
+# show_memory() appended "your own show-notes, kept by you, stay true to
+# them: " and the last two crystal notes.  Today's note reads "The
+# unresolved tension remains connecting feeding the beast to
+# acknowledging true hunger beyond mere food."  That is an ORDER
+# attached to an abstract subject sitting in the same prompt as a wire
+# story, and the wire story is merely data beside it.
+#
+# On a round whose facts ARE its material the notes are dropped
+# outright - the same test already applied to the speakbox seed and the
+# swath.  Everywhere else they stay, described as what they are for:
+# consistency of character, and a callback if one happens to fit.
+# ---------------------------------------------------------------------
+def show_notes_clause(notes: Any, own_material: bool = False) -> str:
+    """The show-notes line for one prompt, or "" when they are not this
+    round's business."""
+    rows = list(notes or [])
+    if not rows:
+        return ""
+    joined = " | ".join(str(n.get("note") or "")[:280] for n in rows[-2:])
+    if not brief_prompts_wire():
+        return "your own show-notes, kept by you, stay true to them: " + joined
+    if own_material:
+        return ""
+    return ("your own show-notes, kept by you - BACKGROUND ONLY, for who "
+            "you are and how you talk, and for a callback if one fits "
+            "naturally. They are NOT this round's subject and they never "
+            "displace the material you have been handed above: " + joined)
+
+
+# ---------------------------------------------------------------------
+# CAUSE 5: THE PROMPT ENDS ON THE WRONG THING.
+#
+# The last block before the model writes was two lists - prompts the
+# operator typed and pictures the station made.  Two bulletins on 09-15
+# wrote about Stable Diffusion checkpoint names: "you want us to scan
+# these other pictures; Like Flux Krea or Pinebox" and "look at Image
+# Turbo; kinetic energy pure as the rain".  A model finishing a long
+# prompt writes about the end of it.  On a round that has its own
+# material, the end of it is now that material.
+# ---------------------------------------------------------------------
+def tail_lists_clause(material: Any, pictures: Any,
+                      own_material: bool = False) -> str:
+    """The two trailing lists, or the line that replaces them."""
+    if own_material and brief_prompts_wire():
+        return ("Nothing else is being handed to you. The material above "
+                "is the round: write THAT.")
+    return ("The two lists below are prompts he typed and pictures we made "
+            "for him. They are not songs and must never be announced as "
+            "songs.\n"
+            "Things he keeps asking for:\n%s\n\n"
+            "Pictures he had us make:\n%s"
+            % (material or "- (nothing yet)", pictures or "- (none yet)"))
+
+
+# ---------------------------------------------------------------------
+# THE GALLERY ROUND'S MISSING HALF, MADE CHECKABLE.
+#
+# Measured: 45 per cent of gallery refusals plainly describe a picture
+# and ZERO of 33 sell one.  SEGMENT_BRIEF["gallery"] asks for "a
+# painting described and put up for sale" and then tests for the words
+# of a DESCRIPTION - painting, canvas, portrait, brush, oil - so a round
+# that describes and never sells passes.  This is the sale half, and it
+# reads the LAST TWO TURNS only, because a price in the middle of a
+# round is not an ending and the operator's complaint is about endings.
+#
+# Deliberately not a model call, for #968's reason: asking an LLM
+# whether an LLM did as it was told costs a writing-desk visit on the
+# one bottleneck the station queues behind.
+# ---------------------------------------------------------------------
+_GALLERY_MARKER = re.compile(r"(?:^|\s)([ABCD])\s*:\s*")
+# A price in a radio pitch is as often spoken as written - "two hundred
+# dollars", "forty quid", "a grand" - so a currency word on its own
+# counts, and so does a bare number in the closing turns, where a number
+# in a gallery round is a price and not much else. It errs towards
+# ACCEPTING, which is the safe direction for a test that can hold a
+# round: a false accept costs nothing, a false hold costs the round.
+_GALLERY_PRICE = re.compile(
+    r"(?:\$\s?\d|\b\d[\d,.]*\b"
+    r"|\b(?:dollars|bucks|quid|grand|pounds|euros|cents|pence)\b"
+    r"|\bfor nothing\b|\bfor free\b)", re.I)
+_GALLERY_TAKER = (
+    "first caller", "first person", "first listener", "whoever calls",
+    "whoever rings", "whoever gets", "caller takes", "takes it home",
+    "it's yours", "its yours", "yours if", "ring in", "rings in",
+    "call in now", "phone in", "next caller", "first one to", "goes to the",
+    "who gets it", "gets it")
+
+
+def gallery_turns(script: str) -> list[str]:
+    """The round split into spoken turns, wherever the markers fall.
+
+    banter_turns' own docstring is the authority on why this cannot be
+    line-anchored: the model returns whole exchanges on ONE line, which
+    is how #977's caller counter read zero on every call the station had
+    ever written."""
+    text = str(script or "")
+    parts = _GALLERY_MARKER.split(text)
+    if len(parts) < 3:
+        return [text.strip()] if text.strip() else []
+    turns: list[str] = []
+    for i in range(1, len(parts) - 1, 2):
+        body = str(parts[i + 1] or "").strip()
+        if body:
+            turns.append(body)
+    return turns
+
+
+def gallery_sale_evidence(script: str) -> dict[str, Any]:
+    """Do the last two turns name a price AND say who gets it?"""
+    out: dict[str, Any] = {"ok": False, "sale_actions": [], "price": "",
+                           "taker": "",
+                           "basis": "a price and a taker in the last two turns",
+                           "limitations": "this recognises the shape of a "
+                                          "sale; it does not price the "
+                                          "painting or prove the sale is "
+                                          "honest"}
+    try:
+        turns = gallery_turns(script)
+        if not turns:
+            return out
+        tail = " ".join(turns[-2:])
+        low = " " + " ".join(tail.lower().split()) + " "
+        price = _GALLERY_PRICE.search(tail)
+        taker = next((w for w in _GALLERY_TAKER if w in low), "")
+        out["price"] = price.group().strip() if price else ""
+        out["taker"] = taker
+        out["ok"] = bool(price and taker)
+        if out["ok"]:
+            out["sale_actions"] = ["sale:" + out["price"], "sale:" + taker]
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
 # #968: WHAT EACH SEGMENT PROMISED, AND WHETHER THE SCRIPT DELIVERS IT.
 #
 # "I need the orchestrator able to look over the scripts of these
@@ -18052,9 +18613,25 @@ SEGMENT_BRIEF: dict[str, dict[str, Any]] = {
     },
     "news": {
         "want": "the story the wire carried",
+        # 2026-09-15 (#1197): WIDENED WITH WHAT A PERSON ACTUALLY SAYS.
+        #
+        # Measured on 30,127 refusal rows: 378 of the 581 pending rows
+        # are bulletins held here, and 25 per cent of them contain no
+        # proper noun, no number and no story vocabulary at all - so the
+        # checker is right about essentially all of them and this list
+        # is not the fault.  It was, however, written in the register of
+        # a newsroom while the news road's own prompt asks the pair to
+        # say "okay, it says here-" and "wait, wait, listen to this-".
+        # Neither phrase was on the list.  Every original word is kept;
+        # these are added, and adding can only ever ACCEPT a round that
+        # would have been held - it can never hold one that stands.
         "any": ("report", "reported", "according to", "the story",
                 "headline", "news", "officials", "said today", "this week",
-                "authorities", "announced", "the wire"),
+                "authorities", "announced", "the wire",
+                "it says here", "says here", "listen to this", "turns out",
+                "apparently", "they're saying", "theyre saying",
+                "just came in", "over in", "out of", "this morning",
+                "yesterday", "last night", "the front page"),
     },
     "recap": {
         "want": "the hour that just went out",
@@ -18121,10 +18698,37 @@ def segment_audit(kind: str, script: str, *, product: str = "", titles: str = ""
         out["found"] = found[:6]
         out["marker"] = has_marker if marker else None
         out["ok"] = bool(found or has_marker)
+        # 2026-09-15 (#1197): THE GALLERY ROUND'S MISSING HALF.
+        #
+        # The brief says "a painting described and put up for sale" and
+        # then tests for the words of a DESCRIPTION - painting, canvas,
+        # portrait, brush, oil - so a round that describes and never
+        # sells has always passed.  Measured on the refusal scan: 45 per
+        # cent of gallery refusals plainly describe a picture and ZERO
+        # of 33 sell one.  The seed has been rewritten to make the sale
+        # the last beat; this is the test that says whether it was.
+        #
+        # Behind the #1197 switch, because unlike the widened word list
+        # above this one can HOLD a round that stands tonight, and that
+        # is the operator's decision to make.
+        _sale_missing = False
+        if str(kind or "") == "gallery" and brief_prompts_wire():
+            _gsale = gallery_sale_evidence(text)
+            out["sale_evidence"] = _gsale
+            if _gsale.get("ok"):
+                found.extend(_gsale.get("sale_actions") or [])
+                out["found"] = found[:6]
+            elif out["ok"]:
+                _sale_missing = True
+                out["ok"] = False
         if out["ok"]:
             out["why"] = ("the script does what the entry is for"
                           + (" - the caller has turns of their own"
                              if has_marker else ""))
+        elif _sale_missing:
+            out["why"] = ("the painting is described but never sold - the "
+                          "last two turns name no price and never say who "
+                          "gets it (#1197)")
         else:
             out["why"] = ("the script never gets to "
                           + str(brief.get("want") or "what the entry is for")
@@ -28664,7 +29268,7 @@ async def crystal_distill() -> None:
                  extra=note)
 
 
-def show_memory() -> str:
+def show_memory(own_material: bool = False) -> str:
     """Tonight, remembered (#361): a compact, evolving digest of the
     session — time on air, what has played, the talk and the calls, the
     weather in the booth — woven into every write so the show builds on
@@ -28720,12 +29324,31 @@ def show_memory() -> str:
     if recent:
         bits.append("the conversation so far, most recent last: "
                     + " // ".join(recent))
+    # 2026-09-15 (#1197): AN IMPERATIVE USED TO BEAT THE BRIEF HERE.
+    #
+    # This said "your own show-notes, kept by you, stay true to them: "
+    # and then the last two crystal notes.  Today's note reads "The
+    # unresolved tension remains connecting feeding the beast to
+    # acknowledging true hunger beyond mere food."  That is an ORDER
+    # attached to an abstract subject, sitting in the same prompt as a
+    # wire story that is merely offered as data - and the model obeyed
+    # the order.  25 per cent of the 378 held bulletins contain no
+    # proper noun, no number and no story vocabulary whatsoever; they
+    # are riffs on notes like that one.
+    #
+    # The note never dies either: crystal_distill() writes its next note
+    # from the last 14 aired lines, which were made of the previous
+    # note, which is why a theme switched off on 09-12 was still coming
+    # out of the speakers days later.
+    #
+    # So on a round whose facts ARE its material the notes stand down
+    # entirely - the same test already applied to the speakbox seed and
+    # the swath - and everywhere else they are described as what they
+    # are for rather than as an instruction.  See show_notes_clause.
     notes = crystal_read()
-    if notes:
-        bits.append("your own show-notes, kept by you, stay true to "
-                    "them: " + " | ".join(
-                        str(n.get("note") or "")[:280]
-                        for n in notes[-2:]))
+    _notes_bit = show_notes_clause(notes, own_material)
+    if _notes_bit:
+        bits.append(_notes_bit)
     # The outage clock (#410): the longer the pine box speaker has been
     # unable to carry them, the more the panic shows in the writing.
     if (_RADIO.get("voice_to") or "box") in ("box", "both"):
@@ -36084,7 +36707,24 @@ async def prep_round(kind: str) -> bool:
     except Exception:  # noqa: BLE001
         pass
     if kind == "manager":
-        await dj_manager_note(None, bank_to=pile)
+        # 2026-09-15 (#1197): the #1134 second chance on the memo road
+        # too. The operator's own words for what this segment IS, filed
+        # against a real one (#1176): "the DJs get an angry message from
+        # the manager and discuss / sulk over it for the segment." A
+        # round that comes back without the memo in it is told exactly
+        # that and asked again, rather than being held on the first go.
+        async def _write_memo(_lesson: str) -> list[dict[str, Any]]:
+            del pile[:]
+            brief_lesson_set(_lesson)
+            try:
+                await dj_manager_note(None, bank_to=pile)
+            finally:
+                brief_lesson_clear()
+            return pile
+
+        await brief_written_twice(
+            "manager", _write_memo,
+            lambda p: str((p[0] if p else {}).get("script") or ""))
     else:
         await dj_caller(None, bank_to=pile)
     if not pile:
@@ -36148,8 +36788,25 @@ async def prep_gallery() -> bool:
     This is the dearest road on the board and the one that pays back
     best - up to four vision passes, and not one word of it goes off."""
     pile: list[dict[str, Any]] = []
+
+    # 2026-09-15 (#1197): the #1134 second chance. Measured: 45 per cent
+    # of gallery refusals plainly describe a picture and ZERO of 33 sell
+    # one, so the seed now ends on the sale and the brief now tests for
+    # it - and a round that still misses it is TOLD SO and asked again
+    # before anything is held.
+    async def _write_gallery(_lesson: str) -> list[dict[str, Any]]:
+        del pile[:]
+        brief_lesson_set(_lesson)
+        try:
+            await dj_gallery_round(bank_to=pile)
+        finally:
+            brief_lesson_clear()
+        return pile
+
     try:
-        await dj_gallery_round(bank_to=pile)
+        await brief_written_twice(
+            "gallery", _write_gallery,
+            lambda p: str((p[0] if p else {}).get("script") or ""))
     except Exception:  # noqa: BLE001
         return False                    # the live road is untouched
     if not pile:
@@ -36369,7 +37026,28 @@ async def prep_news() -> bool:
                     "prep_news_titles") or "").split(" / "):
                 if title.strip():
                     avoid.append(title.strip())
-        await dj_news(bank_to=pile, avoid=avoid)
+        # 2026-09-15 (#1197): THE AD ROAD'S SECOND CHANCE, ON THE NEWS.
+        #
+        # Measured over 36 hours: the ad road failed its brief 189 times
+        # and contributed ZERO rows to the operator's queue, because
+        # #1134 checks the brief at write time and re-asks ONCE with the
+        # fault named.  The news road on the identical failure marked
+        # off_brief, filed held_before_recording, and lost the round -
+        # 378 of the 581 pending rows.  Same fault, same cure.
+        async def _write_news(_lesson: str) -> list[dict[str, Any]]:
+            del pile[:]
+            brief_lesson_set(_lesson)
+            try:
+                await dj_news(bank_to=pile, avoid=avoid)
+            finally:
+                brief_lesson_clear()
+            return pile
+
+        await brief_written_twice(
+            "news", _write_news,
+            lambda p: str((p[0] if p else {}).get("script") or ""),
+            titles_of=lambda p: str((p[0] if p else {}).get(
+                "prep_news_titles") or ""))
         if not pile:
             return False                # nothing on the wire to cover
         entry = pile[0]
@@ -37830,6 +38508,19 @@ async def _prep_one_work(kind: str) -> bool:
     # lines the moment there is a script to record.
     prep_note(str(kind), "writing")
     prep_context_set(str(kind))
+    # 2026-09-15 (#1197): THE BRIEF NOW ARRIVES.
+    #
+    # prep_context_set above is exactly what makes _schedule_prompt_clause
+    # return "" - deliberately, because a background call must not write
+    # under whatever segment happens to be live.  But the consequence,
+    # measured, is that SCHEDULE_PROMPT_SEED["news"] has never been in
+    # the prompt of a single failing bulletin: all 378 held bulletins are
+    # prepared rounds (banked 349, tinted 72, restored 18, live ZERO).
+    # The road's own seed is not the air's ambient instruction - it is
+    # the description of the segment being written - so it rides the
+    # #897 task-local brief, which _schedule_prompt_clause reads BEFORE
+    # the prep guard.  An operator's generate ticket still outranks it.
+    _seeded_brief = prep_brief_seed(str(kind))
     try:
         if kind == "track_talk":
             return await prep_track_talk()
@@ -37847,6 +38538,8 @@ async def _prep_one_work(kind: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     finally:
+        if _seeded_brief:
+            alt_brief_clear()           # 2026-09-15 (#1197): never outlive
         prep_context_clear()
         prep_note(str(kind), "stacked")
     return False
@@ -54627,7 +55320,10 @@ def schedule_defaults() -> dict[str, Any]:
                 "variants": [{
                     "id": f"{k['kind']}-default",
                     "name": "Station default",
-                    "text": SCHEDULE_PROMPT_SEED.get(k["kind"], ""),
+                    # 2026-09-15 (#1197): one road for the seed, so a
+                    # live bulletin and a prepared one are written to
+                    # the same description of the segment.
+                    "text": schedule_seed_for(k["kind"]),
                 }],
             } for k in SCHEDULE_KINDS
         },
@@ -55930,10 +56626,29 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
            if stats.get("calls") else "")
         # #1019: the Gazette's front page on this hour, if it has printed.
         + paper_recap_clause())
-    return await dj_banter(track, angle=angle, lines=6,
-                           render_stream=bool(
-                               dj_settings().get("stream_show", True)),
-                           own_material=True)            # the hour's log is the material
+    # 2026-09-15 (#1197): and the recap - the one of the four with no
+    # preparation road at all. It reads the station's own log at the
+    # moment it is written, so dj_banter SPEAKS it on the way out, and
+    # a second attempt here would put two recaps on air back to back.
+    # So this road takes the diagnostic half of #1134 only: the fault
+    # is named and filed as a note (`rewrite_rejected`) where today it
+    # is filed as nothing at all, and nothing is asked again. A real
+    # second chance for the recap means banking it before it airs,
+    # which is a rework of the road rather than a prompt fix.
+    async def _write_recap(_lesson: str) -> list[str]:
+        brief_lesson_set(_lesson)
+        try:
+            return await dj_banter(track, angle=angle, lines=6,
+                                   render_stream=bool(
+                                       dj_settings().get("stream_show", True)),
+                                   own_material=True)    # the hour's log is the material
+        finally:
+            brief_lesson_clear()
+
+    return await brief_written_twice(
+        "recap", _write_recap,
+        lambda said: "\n".join(str(x) for x in (said or [])),
+        live=True)              # already spoken: a note, never a re-ask
 
 
 def _schedule_pin_record() -> dict[str, Any] | None:
@@ -81015,7 +81730,14 @@ async def _news_once(hourly: bool = False,
         _said = await dj_banter(_RADIO.get("now"), angle=angle,
                                 lines=7 if hourly else 6,
                                 bank=bank_to is not None, bank_to=bank_to,
-                                own_material=True)       # the wire is the material
+                                own_material=True,       # the wire is the material
+                                # 2026-09-15 (#1197): and the headlines
+                                # ride WITH it, so the tint path can
+                                # grade the bulletin on the wire it was
+                                # written from. The stamp below still
+                                # writes the same value on the banked
+                                # row; this one arrives sooner.
+                                news_titles=_titles)
     finally:
         if bank_to is None:
             airlog_round_clear()                            # #1036 (G1)
@@ -86386,12 +87108,36 @@ def theme_owns_air() -> dict[str, Any]:
     return row
 
 
-def theme_air_clause(theme: dict[str, Any]) -> str:
-    """The line that tells a round what tonight is about (#775)."""
+def theme_air_clause(theme: dict[str, Any],
+                     own_material: bool = False) -> str:
+    """The line that tells a round what tonight is about (#775).
+
+    2026-09-15 (#1197): A SECOND SUBJECT WAS BEING INJECTED INTO THE
+    NEWS.  This clause was appended to every non-caller round, bulletins
+    included, and it does not ask - it says the station "has been told
+    to stay on" the subject and to "bring the conversation round to it".
+    A theme of "Broth - it tastes like our economy" at strength 84 wrote
+    itself into 23 to 34 bulletins a day.  It was switched off on 09-12
+    and THE PHRASE KEPT GOING, because the crystal distils its next note
+    from the last 14 aired lines, which were made of the previous note.
+
+    A round that already has its own material - the wire, the memo, the
+    hour's log, a painting - now gets the theme as COLOUR: one glancing
+    reference at most, left out entirely if it does not fit.  The
+    station's chosen subject still outranks its stock material
+    everywhere else, which is the whole meaning of setting it."""
     if not theme:
         return ""
+    subject = theme.get("text") or theme.get("name")
+    if own_material and brief_prompts_wire():
+        return (" Tonight the station is on the subject of "
+                f"\"{subject}\". That is COLOUR here, not the subject of "
+                "this round: at most ONE glancing reference to it, and "
+                "leave it out altogether if it does not fit what you have "
+                "been handed. The material above is what this round is "
+                "about.")
     return (" TONIGHT'S SUBJECT, which the station has been told to stay on: "
-            f"{theme.get('text') or theme.get('name')}. Bring the conversation "
+            f"{subject}. Bring the conversation "
             "round to it in your own way - argue about it, joke about it, "
             "take it somewhere - rather than announcing it.")
 
@@ -91059,6 +91805,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     call_meta: dict[str, Any] | None = None,
                     shelf_only: bool = False,
                     own_material: bool = False,    # 2026-09-08: the angle IS the material
+                    # 2026-09-15 (#1197): the wire headlines this round
+                    # was written from, stamped on the entry the moment
+                    # it is built rather than by the road afterwards -
+                    # the tint path grades the round BEFORE the road
+                    # gets it back, and was grading it with no wire
+                    # evidence at all.
+                    news_titles: str = "",
                     ) -> list[str]:
     """A short exchange between the two, spoken in their own voices.
 
@@ -91807,7 +92560,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # heat, which is what the operator kept hearing instead of their subject.
     _air_theme = theme_owns_air()
     if _air_theme and not caller_name:
-        angle += theme_air_clause(_air_theme)
+        angle += theme_air_clause(_air_theme, own_material=own_material)
+    # 2026-09-15 (#1197): and, on a SECOND attempt only, what the first
+    # one got wrong - the #1134 lesson, hung on this task by
+    # brief_written_twice and read exactly here.  "" on every round that
+    # is not a second attempt, which is nearly all of them.
+    try:
+        angle += brief_lesson_clause()
+    except Exception:  # noqa: BLE001
+        pass            # a missing lesson never silences the booth
     # The glancing heat aside is part of that stock material, so it stands
     # down for the same reason the call-side block does.
     if not caller_name and not _air_theme \
@@ -91991,7 +92752,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             + (f", and 'C: ...' for {caller_name} on the phone"
                if caller_name else "")
             + f".{seat_away_clause()}"           # #1034: the empty chair
-            f"{playing}{only_song}{aside}{show_memory()}{call_flow}"
+            f"{playing}{only_song}{aside}"
+            f"{show_memory(own_material=own_material)}{call_flow}"
             f"{crystal_clause(bank)}{avoid_reruns()}"
             f"{approach_clause(_approach)}\n\n"
             # #842: the banked round is told it is being PRE-RECORDED, so
@@ -92004,11 +92766,16 @@ async def dj_banter(track: dict[str, Any] | None = None,
                "the exchange, and a real landing on the last turn rather "
                "than a stop. Give us MORE TURNS rather than longer "
                "ones.\n\n" if _bank_rich else "")
-            + "The two lists below are prompts he typed and pictures we made "
-            "for him. They are not songs and must never be announced as "
-            "songs.\n"
-            f"Things he keeps asking for:\n{material or '- (nothing yet)'}\n\n"
-            f"Pictures he had us make:\n{pictures or '- (none yet)'}",
+            # 2026-09-15 (#1197): THE PROMPT ENDS ON THE ROUND'S OWN
+            # MATERIAL.  These two lists were the last thing the model
+            # read before writing, and two bulletins on 09-15 came back
+            # about Stable Diffusion checkpoint names - "you want us to
+            # scan these other pictures; Like Flux Krea or Pinebox" and
+            # "look at Image Turbo; kinetic energy pure as the rain".
+            # A model finishing a long prompt writes about the end of
+            # it.  On a round that has its own material, the end of it
+            # is that material.
+            + tail_lists_clause(material, pictures, own_material),
             spice=0.5,                  # wider intonation draw (#371)
             # Room for the whole swath to come back out (#210): a long
             # passage worked in needs more turns than a one-line remark, and
@@ -92554,6 +93321,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # manager is the one ringing it in.
         "prep_kind": (caller_seat if caller_name and caller_seat != "caller"
                       else "caller" if caller_name else "banter"),
+        # 2026-09-15 (#1197): the wire evidence, present from the start.
+        # segment_audit reads `titles` for the headline words a bulletin
+        # really used - #968's own census found found=[] on all 122 news
+        # briefs before that argument existed - and the tint path's
+        # brief_note simply did not pass it.
+        **({"prep_news_titles": str(news_titles)} if news_titles else {}),
         "source": source or seed.get("file", ""),
         "seed_text": seed.get("text", ""),
         # #838: the passages the rewrite may not touch, carried with the
@@ -92667,12 +93440,18 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 entry["script"] = entry["script_tinted"]
                 entry.pop("tint_progress", None)
                 try:
+                    # 2026-09-15 (#1197): titles=, which was missing.
+                    # Every other brief_note site in the file passes it;
+                    # this one did not, so a bulletin graded here was
+                    # graded with no wire evidence whatsoever.  It can
+                    # only ever ADD to `found`, so it ships unswitched.
                     _brief = brief_note(
                         str(entry.get("prep_kind") or "banter"),
                         str(entry.get("label") or
                             entry.get("prep_kind") or "banter"),
                         str(entry.get("script") or ""), where="tinted",
-                        product=str(entry.get("product") or ""))
+                        product=str(entry.get("product") or ""),
+                        titles=str(entry.get("prep_news_titles") or ""))
                     entry["brief"] = _brief
                     entry["off_brief"] = bool(_brief.get("checked")
                                               and not _brief.get("ok"))
@@ -104387,7 +105166,12 @@ REFLECTION_WORSE_BY = 0.10
 REFLECTION_GUIDANCE_CHARS = 1100
 REFLECTION_KINDS = ("banter", "caller", "manager", "gallery", "ad", "news", "recap", "station_id",
                     "track_talk", "guest")
-_REFLECTION: dict[str, Any] = {"loaded": False, "roads": {}, "running": "", "last": {}, "errors": []}
+_REFLECTION: dict[str, Any] = {"loaded": False, "roads": {}, "running": "", "last": {},
+                               # 2026-09-15 (#1197): the highest version
+                               # number ever ISSUED on each road, which
+                               # is not the same thing as the highest
+                               # one still in the six-deep window.
+                               "seq": {}, "errors": []}
 _REFLECTION_LOCK = RLock()
 
 
@@ -104402,6 +105186,16 @@ def _reflection_load() -> None:
                 roads = {str(k): [v for v in (vs or []) if isinstance(v, dict)]
                          for k, vs in (got.get("roads") or {}).items()}
                 _REFLECTION["last"] = dict(got.get("last") or {})
+                # 2026-09-15 (#1197): a store written before this change
+                # has no `seq`, and that is fine - reflection_next_version
+                # falls back to the highest version it can see, which on
+                # the five frozen roads is 7, so the next one issued is 8
+                # and the cache key moves again.
+                try:
+                    _REFLECTION["seq"] = {str(k): int(v or 0) for k, v
+                                          in (got.get("seq") or {}).items()}
+                except Exception:  # noqa: BLE001
+                    _REFLECTION["seq"] = {}
         except Exception:  # noqa: BLE001
             roads = {}
         _REFLECTION["roads"] = roads
@@ -104412,7 +105206,11 @@ def _reflection_save() -> None:
     try:
         with _REFLECTION_LOCK:
             body = {"roads": {k: v[-REFLECTION_KEEP:] for k, v in _REFLECTION["roads"].items()},
-                    "last": dict(_REFLECTION.get("last") or {}), "at": time.time()}
+                    "last": dict(_REFLECTION.get("last") or {}),
+                    # 2026-09-15 (#1197): the counter survives the trim
+                    # that broke the numbering in the first place.
+                    "seq": dict(_REFLECTION.get("seq") or {}),
+                    "at": time.time()}
         REFLECTION_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = REFLECTION_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(body, ensure_ascii=False, default=str))
@@ -104438,6 +105236,43 @@ def reflection_current(kind: str) -> dict[str, Any] | None:
 def reflection_version(kind: str) -> int:
     cur = reflection_current(kind)
     return int(cur.get("version") or 0) if cur else 0
+
+
+def reflection_next_version(kind: str) -> int:
+    """2026-09-15 (#1197): THE NEXT VERSION NUMBER, AND IT ONLY GOES UP.
+
+    This was len(reflection_versions(kind)) + 1, and the list is trimmed
+    to REFLECTION_KEEP = 6 immediately afterwards - so once a road had
+    six versions every later one was numbered 7 FOR EVER.  The store
+    proves it: caller, banter, news, gallery and ad all read
+    [7, 7, 7, 7, 7, 7]; manager reads [1, 2, 3, 4, 5, 6] and track_talk
+    [1, 2, 3, 4], the two roads that have not filled the window yet.
+
+    It is not a cosmetic number.  reflection_version(kind) is hashed
+    into the crystal guidance `profile`, which is the PROMPT CACHE KEY,
+    so on those five roads the key stopped changing when a rule was born
+    or retired and a new rule could sit behind a stale cached prompt.
+
+    max() of everything known, so a store with no `seq` (every store
+    written before today) still steps past the frozen 7 on its next
+    reflection, and so a hand-edited file can never make it go
+    backwards."""
+    _reflection_load()
+    with _REFLECTION_LOCK:
+        rows = list(_REFLECTION["roads"].get(str(kind)) or [])
+        highest = 0
+        for row in rows:
+            try:
+                highest = max(highest, int(row.get("version") or 0))
+            except (TypeError, ValueError):
+                continue
+        try:
+            issued = int((_REFLECTION.get("seq") or {}).get(str(kind)) or 0)
+        except (TypeError, ValueError):
+            issued = 0
+        nxt = max(highest, issued, len(rows)) + 1
+        _REFLECTION.setdefault("seq", {})[str(kind)] = nxt
+        return nxt
 
 
 def reflection_guidance(kind: str) -> str:
@@ -104632,7 +105467,11 @@ async def reflection_run(kind: str, force: bool = False) -> dict[str, Any]:
         picks = [accepted[i - 1] for i in parsed["exemplars"] if 1 <= i <= len(accepted)]
         if not picks:
             picks = [a for a in accepted if a.get("rhyme")][:2] or accepted[:2]
-        version = {"version": len(reflection_versions(kind)) + 1, "at": now, "kind": kind,
+        # 2026-09-15 (#1197): NOT len(reflection_versions(kind)) + 1.
+        # The list is trimmed to six lines below, so that expression
+        # returned 7 for ever on every road that had reflected six
+        # times - and the number is hashed into the prompt cache key.
+        version = {"version": reflection_next_version(kind), "at": now, "kind": kind,
                    "rules": parsed["rules"], "note": parsed["note"],
                    "exemplars": [{"source": p["source"], "candidate": p["candidate"]} for p in picks[:2]],
                    "accepted": len(accepted), "refused": len(gathered.get("refused") or []),
