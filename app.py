@@ -57847,7 +57847,8 @@ def _manager_memos_write(rows: list[dict[str, Any]]) -> None:
 
 def manager_memo_save(text: str, how: str = "",
                       aired: bool = False,
-                      memo_id: str = "") -> dict[str, Any] | None:
+                      memo_id: str = "",
+                      at: float = 0.0) -> dict[str, Any] | None:
     """Keep one memo, once - a twin only stamps the original's ledger.
 
     `memo_id` is the banked row's claim on its own book entry: a memo
@@ -57870,7 +57871,11 @@ def manager_memo_save(text: str, how: str = "",
                     row["print"] = print_
                     if aired:
                         row["uses"] = int(row.get("uses") or 0) + 1
-                        row["last"] = int(time.time())
+                        row["last"] = int(float(at or 0) or time.time())
+                        # 2026-09-15 (#1162): a memo banked in one hour
+                        # and read in another belongs, in the script, to
+                        # the hour it was READ in.
+                        row["ts"] = int(float(at or 0) or row.get("ts") or time.time())
                     _manager_memos_write(rows)
                     return row
         for row in rows:
@@ -57880,11 +57885,25 @@ def manager_memo_save(text: str, how: str = "",
                     row["last"] = int(time.time())
                     _manager_memos_write(rows)
                 return row
-        entry = {"id": uuid.uuid4().hex[:12], "ts": int(time.time()),
+        # 2026-09-15 (#1162): "This segment is supposed to have a
+        # manager's message happen. Where is the manager's message? I
+        # don't see it take place anywhere."
+        #
+        # It had happened, and the pair had read it - but the SCREENPLAY
+        # places "a memo comes down from upstairs" at this row's `ts`,
+        # and `ts` was the moment the RECEIPT came back. The receipt
+        # arrives when the whole round has finished, so the memo landed
+        # after every line that reads it: measured on the 01:59 memo,
+        # 7m 12s after the first line of its own round, which on a
+        # 48-line round puts it past the end of the segment entirely.
+        # The operator was looking in the right place; the memo was not
+        # in it. `at` is the air time of the round that carried it.
+        _at = float(at or 0) or time.time()
+        entry = {"id": uuid.uuid4().hex[:12], "ts": int(_at),
                  "text": script[:6000], "print": print_,
                  "how": str(how)[:40],
                  "uses": 1 if aired else 0,
-                 "last": int(time.time()) if aired else 0}
+                 "last": int(_at) if aired else 0}
         rows.append(entry)
         _manager_memos_write(rows)
         return entry
@@ -72774,8 +72793,27 @@ def _ready_round_ack(entry: dict[str, Any]) -> None:
     kind = str(entry.get("prep_kind") or "")
     if kind == "manager":
         quota_stamp("manager")
+        # 2026-09-15 (#1162): WHEN THIS ROUND ACTUALLY WENT OUT. The
+        # receipt is the end of the round; the memo belongs at its head.
+        # The feed holds the round's own rows with their air stamps, and
+        # the memo's script IS the round's script, so the earliest row
+        # whose words are in that script is the moment it began.
+        _memo_at = 0.0
+        try:
+            _script = " ".join(str(entry.get("script") or "").split())
+            if _script:
+                for _row in (_RADIO.get("chat") or [])[-240:]:
+                    if not isinstance(_row, dict):
+                        continue
+                    _txt = " ".join(str(_row.get("text") or "").split())
+                    if len(_txt) > 12 and _txt in _script:
+                        _when = float(_row.get("air_at") or _row.get("ts") or 0)
+                        if _when > 0 and (_memo_at == 0.0 or _when < _memo_at):
+                            _memo_at = _when
+        except Exception:  # noqa: BLE001
+            _memo_at = 0.0
         manager_memo_save(str(entry.get("script") or ""), "banked", True,
-                          str(entry.get("memo_id") or ""))
+                          str(entry.get("memo_id") or ""), at=_memo_at)
     elif kind == "news":
         stories = [s for s in entry.get("prep_news_stories") or [] if isinstance(s, dict)]
         airlog_news_said(uuid.uuid4().hex[:6], [str(s.get("title") or "") for s in stories],
