@@ -82,6 +82,10 @@ object PineNet {
      *  than the working set, which is the whole point. */
     private const val CACHE_BUDGET_BYTES = 256L * 1024 * 1024
 
+    /** #1182T: what the cache is cut to while another app has the glass.
+     *  See relax() for what this does and does not actually free. */
+    private const val RELAXED_BUDGET_BYTES = 16L * 1024 * 1024
+
     private val VENDOR = setOf("three.min.js", "three.module.js", "three.core.js")
 
     @Volatile private var appContext: Context? = null
@@ -384,16 +388,48 @@ object PineNet {
 
     /* ------------------------------------------------------------------ */
 
-    private fun trimCache() {
+    private fun trimCache(budget: Long = CACHE_BUDGET_BYTES) {
         val dir = imageDir ?: return
         val files = dir.listFiles() ?: return
         var total = files.sumOf { it.length() }
-        if (total <= CACHE_BUDGET_BYTES) return
+        if (total <= budget) return
         files.sortedBy { it.lastModified() }.forEach { f ->
-            if (total <= CACHE_BUDGET_BYTES) return
+            if (total <= budget) return
             total -= f.length()
             f.delete()
         }
+    }
+
+    /**
+     * #1182T: TRIM HARD, BECAUSE SOMEBODY ELSE IS USING THE DEVICE.
+     *
+     * AN HONEST NOTE ABOUT WHAT THIS BUYS AND WHAT IT DOES NOT, because the
+     * ask it answers has the arithmetic wrong. The AutoBrowse document lists
+     * "PineNet cache - up to 256 MB" in a table of releasable MEMORY, beside
+     * the ScreenReplay ring and the WebView. It is not memory. This cache is
+     * FILES, in cacheDir/pineimg - five thousand-odd transcoded pictures at
+     * about 50 kB each - and the budget is deliberately LARGER than the
+     * working set, because a cache smaller than the working set never hits,
+     * which is the whole reason this one was written. Trimming it frees
+     * /data, where there were 47 GB free when it was sized. It will not move
+     * one kilobyte of RSS in `dumpsys meminfo`.
+     *
+     * It is done anyway, and the reasons are real even if smaller than
+     * advertised: a smaller directory is a shorter walk on every housekeeping
+     * pass, and a tablet that is being shared should not be sitting on a
+     * quarter of a gigabyte of pictures nobody is looking at. But nobody
+     * should expect the acceptance run's RSS figure to thank us for it. The
+     * ring is the thing that moves that number.
+     *
+     * The floor is 16 MB rather than zero so the panel's current screenful
+     * survives. Emptying it outright would mean re-fetching and re-transcoding
+     * every visible picture the moment the operator came back, and that is
+     * about 200 ms of MT6768 apiece.
+     */
+    fun relax() {
+        Thread({
+            try { trimCache(RELAXED_BUDGET_BYTES) } catch (e: Throwable) { Log.w(TAG, "relax: $e") }
+        }, "pinenet-relax").apply { isDaemon = true }.start()
     }
 
     private fun sha1(s: String): String {

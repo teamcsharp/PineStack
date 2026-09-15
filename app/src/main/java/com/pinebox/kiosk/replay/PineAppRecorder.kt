@@ -64,9 +64,49 @@ class PineAppRecorder : Service() {
          * would pull from whichever it happened to reach. */
         replay = (applicationContext as? com.pinebox.kiosk.PineApp)?.replay
 
-        startForeground(NOTE_ID, note(),
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0)
+        /* #1182T: WRAPPED, FOR THE SAME REASON THE CAMERA'S IS.
+         *
+         * This service is started from BootReceiver ONE LINE EARLIER than the
+         * camera service that was measured killing the process on every boot,
+         * so it was read rather than assumed. What was found: this one's type
+         * is SPECIAL_USE, not `camera`, and specialUse is not one of the types
+         * Android 14 gates on a while-in-use permission - so there is no
+         * equivalent SecurityException waiting here, and none appears in the
+         * boot log. Its declarations are complete too:
+         * FOREGROUND_SERVICE_SPECIAL_USE is in the manifest, and so is the
+         * PROPERTY_SPECIAL_USE_FGS_SUBTYPE the platform demands beside it.
+         * Both were checked rather than taken on trust.
+         *
+         * It is wrapped anyway, and not out of caution for its own sake. A
+         * bare startForeground has now been measured, once, to be the
+         * difference between a terminal that boots and half an hour of dead
+         * air. The class of fault is "the foreground service manager is
+         * entitled to refuse, and a refusal here is a crash": an OTA that
+         * moves the rules, a manifest edit that loses the PROPERTY, or a
+         * notification channel that will not build would all land on this
+         * line. None of them is a reason to stop the radio.
+         *
+         * stopSelf() on a refusal rather than carrying on: started with
+         * startForegroundService we owe the platform a startForeground, and
+         * not paying it throws ForegroundServiceDidNotStartInTimeException
+         * into this process seconds later - the same death under another name.
+         * Stopping cancels that timer. begin() is also called from
+         * MainActivity.onResume, so a refusal costs the recording until the
+         * next time a view is on the glass, rather than costing the terminal. */
+        val standing = runCatching {
+            startForeground(NOTE_ID, note(),
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0)
+        }.onFailure { err ->
+            Log.w(TAG, "#1182T the recorder's foreground service was refused ("
+                + (err.message ?: err.toString()) + ") - standing down rather "
+                + "than taking the terminal with it")
+        }.isSuccess
+
+        if (!standing) {
+            stopSelf()
+            return
+        }
 
         /* THE PANEL, WATCHED HERE RATHER THAN IN THE ACTIVITY.
          *
@@ -113,6 +153,20 @@ class PineAppRecorder : Service() {
     }
 
     private fun wake() {
+        /* #1182T: THE GLASS LIT UP, SO THE TERMINAL IS NOT IN STANDBY.
+         *
+         * This is one of the four unconditional roads back, and it is here
+         * rather than anywhere else for the reason this service's own note
+         * gives: SCREEN_ON is a protected broadcast that a manifest receiver
+         * is not allowed to take, so it needs a live process, and a foreground
+         * service is one even when every activity has been destroyed. There
+         * may be no MainActivity at all at this moment; there is always this.
+         *
+         * Called BEFORE start(), because leaving standby restarts the encoder
+         * itself and start() is idempotent - it returns immediately if the
+         * ring is already running. The order is what stops the two of them
+         * racing to build a VirtualDisplay. */
+        com.pinebox.kiosk.kiosk.Standby.leave(this, "screen on")
         val why = replay?.start()
         if (why != null) Log.w(TAG, "recorder would not start: " + why)
     }

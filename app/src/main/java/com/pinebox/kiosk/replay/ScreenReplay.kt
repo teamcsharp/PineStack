@@ -324,6 +324,37 @@ class ScreenReplay(private val context: Context) {
     fun flush() = keep()
 
     /**
+     * #1182T: STAND DOWN COMPLETELY, AND GIVE THE MEMORY BACK.
+     *
+     * stop() releases the encoder and the VirtualDisplay and writes the
+     * history to disk, and that is right for the screen going dark - the ring
+     * is deliberately KEPT in memory there, because "the last minutes before
+     * the tablet was put down" is exactly what somebody picking it up wants.
+     *
+     * Standby is the other case. Another app is in the foreground on a 4 GB
+     * tablet, and the ring is the largest single thing this process holds:
+     * sized from the constants at 600 kbps x 1200 s with a quarter of
+     * headroom, capped at 100 MB, as one ByteArray on the Dalvik heap. The
+     * AutoBrowse port measured this terminal at 777 MB RSS and worth about
+     * 1.2 GB of MemAvailable; this is the biggest single piece of that which
+     * can be handed back without going anywhere near the radio.
+     *
+     * NOTHING IS LOST. stop() has already put the history on disk - that is
+     * what makes it a cache rather than a buffer - so letGo() drops a copy and
+     * not the record, and prime() reads it back in on the way out. It is
+     * exactly the round trip this class already makes across a process death,
+     * which is the strongest evidence there is that it works: the app goes
+     * away on every deploy and the history survives it.
+     */
+    @Synchronized
+    fun release() {
+        stop()
+        ring.letGo()
+        Log.i(TAG, "#1182T standing down: the ring is on disk and its memory is "
+            + "back with the heap")
+    }
+
+    /**
      * Write the last [want] seconds. Returns the file and what it holds.
      *
      * BOUNDED BY WHAT IS HELD, NOT BY HOLD_SECONDS. The ring is bounded by
@@ -336,17 +367,27 @@ class ScreenReplay(private val context: Context) {
      * exactly what can be offered, and a pull can never exceed it however
      * long the history reads.
      */
+    /**
+     * @param back #1155: seconds before the newest frame held where the
+     *   written clip ENDS. 0 - the default - is the tail, exactly as
+     *   before. See ReplayRing.save; [lastSavedEndBack] says where the cut
+     *   actually landed afterwards.
+     */
     @Synchronized
-    fun save(want: Double, allowVideoOnly: Boolean = false): Pair<File, Double> {
+    fun save(want: Double, allowVideoOnly: Boolean = false, back: Double = 0.0): Pair<File, Double> {
         val dir = File(context.cacheDir, "replay").apply { mkdirs() }
         val out = File(dir, "replay-" + System.currentTimeMillis() + ".mp4")
         /* A second of slack so "everything" does not fall a frame short of
          * the oldest keyframe and quietly drop the start. */
         val all = (ring.seconds() + 1.0).coerceAtLeast(1.0)
-        val got = try { ring.save(out, want.coerceIn(1.0, all), allowVideoOnly) }
+        val from = back.coerceIn(0.0, (all - 1.0).coerceAtLeast(0.0))
+        val got = try { ring.save(out, want.coerceIn(1.0, all - from), allowVideoOnly, from) }
         finally { lastSavedAudio = JSONObject(ring.lastSavedAudio.toString()).put("capture", audioStatus()) }
         return Pair(out, got)
     }
+
+    /** #1155: how far the last [save] ended behind the newest frame held. */
+    fun lastSavedEndBack(): Double = ring.lastSavedEndBack
 
     companion object {
         private const val TAG = "PineReplay"

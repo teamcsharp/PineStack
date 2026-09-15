@@ -148,6 +148,34 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         based = false
     }
 
+    /**
+     * #1182T: GIVE THE BLOB BACK TO THE HEAP.
+     *
+     * reset() empties the ring but keeps its storage, which is right for every
+     * caller it had: the ring is meant to be a fixed allocation that never
+     * grows and never needs emptying. Standby needs the other thing. The blob
+     * is sized from the design constants at up to 100 MB of Dalvik heap - the
+     * largest single releasable object this process holds - and while another
+     * app is in the foreground on a 4 GB tablet, holding it costs more than
+     * the minutes in it are worth for that while.
+     *
+     * NOTHING IS LOST BY CALLING THIS, and that is a property of the CALLER
+     * rather than of this method: ScreenReplay.release() writes the history to
+     * disk first and primes it back in afterwards. Called on its own, this
+     * does throw the held minutes away.
+     *
+     * `marks` is deliberately NOT dropped. It is about 1.4 MB against the
+     * blob's ninety, and half the methods here index it modulo marks.size - an
+     * empty array would turn a saving into an ArithmeticException on the next
+     * frame that arrived. add() already refuses an empty blob, and that is
+     * what makes leaving marks in place safe.
+     */
+    @Synchronized
+    fun letGo() {
+        reset()
+        blob = ByteArray(0)
+    }
+
     @Synchronized
     fun reset() {
         head = 0; first = 0; count = 0; wrote = 0
@@ -385,20 +413,37 @@ class ReplayRing(private val holdSeconds: Int = 60) {
     }
 
     /**
-     * Write the last [want] seconds to [out] as an mp4.
+     * #1155: how far the LAST save's clip ended behind the newest thing in
+     * the ring, in seconds. Zero for an ordinary save, which ends now; with
+     * [save]'s `back` it is roughly that. The scrub strip needs it to label
+     * a frame with its real distance from now, so it is reported rather
+     * than assumed - the cut lands on a packet boundary, not exactly where
+     * it was asked to.
+     */
+    @Volatile var lastSavedEndBack: Double = 0.0
+
+    /**
+     * Write [want] seconds to [out] as an mp4.
      *
+     * @param back #1155: seconds before the newest frame in the ring where
+     *   the written clip ENDS. 0 - the default, and what every caller
+     *   before this asked for - writes the tail: the last [want] seconds.
+     *   A larger value cuts a window out of the middle instead, which is
+     *   what lets the scrub strip reach the whole twenty minutes without
+     *   muxing everything between here and there: the cost of a window is
+     *   its own length, not its distance.
      * @return how many seconds were actually written, which can be less than
      *   asked for - the ring holds what it holds, and saying 30 when 11 were
      *   written would be a lie the operator only discovers on playback.
      */
-    fun save(out: File, want: Double, allowVideoOnly: Boolean = false): Double {
+    fun save(out: File, want: Double, allowVideoOnly: Boolean = false, back: Double = 0.0): Double {
         lastSavedAudio = JSONObject().put("source", "android-playback-mix").put("present", false)
             .put("source_scope", "eligible-device-media").put("device_volume_applied", false)
             .put("complete", false).put("state", "unavailable")
             .put("detail", "No replay window has been selected yet.")
         // Copy the selected encoded video under its short lock, then do disk
         // I/O unlocked. Audio capture uses an independent ring throughout.
-        val snapshot = synchronized(this) { videoSnapshot(want) }
+        val snapshot = synchronized(this) { videoSnapshot(want, back) }
         val fmt = snapshot.first
         val video = snapshot.second
         val zero = video.first().timeUs
@@ -453,12 +498,16 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         return (newest - zero) / 1_000_000.0
     }
 
-    private fun videoSnapshot(want: Double): Pair<MediaFormat, List<ReplayAudioPacket>> {
+    private fun videoSnapshot(want: Double, back: Double = 0.0): Pair<MediaFormat, List<ReplayAudioPacket>> {
         val fmt = format ?: throw IllegalStateException("the encoder has not started yet")
         if (count < 2) throw IllegalStateException("nothing has been recorded yet")
 
         val newest = marks[(first + count - 1) % marks.size].timeUs
-        val from = newest - (want * 1_000_000L).toLong()
+        /* #1155: the window's NEWEST edge. `back` of zero leaves this at
+         * the newest packet there is, which is the tail every caller before
+         * this asked for. */
+        val until = newest - (Math.max(0.0, back) * 1_000_000L).toLong()
+        val from = until - (want * 1_000_000L).toLong()
 
         /* WALK BACK TO A SYNC FRAME. H.264 refers backwards, so a file that
          * starts mid-GOP decodes as a smear until the next keyframe. Better
@@ -474,11 +523,26 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         }
         if (start < 0) throw IllegalStateException("no keyframe in the buffer yet")
 
-        val packets = ArrayList<ReplayAudioPacket>(count - start)
-        for (i in start until count) {
+        /* #1155: AND WHERE IT STOPS. Without a `back` this is the newest
+         * packet and the walk below runs to the end exactly as it always
+         * did. With one, the clip ends at the last packet at or before
+         * `until` - a packet boundary, so up to one frame earlier than
+         * asked - and lastSavedEndBack reports where it actually landed
+         * rather than letting the page assume. */
+        var stop = count - 1
+        if (back > 0.0) {
+            var i = count - 1
+            while (i > start && marks[(first + i) % marks.size].timeUs > until) i -= 1
+            stop = i
+        }
+        if (stop <= start) stop = Math.min(count - 1, start + 1)
+
+        val packets = ArrayList<ReplayAudioPacket>(stop - start + 1)
+        for (i in start..stop) {
             val mark = marks[(first + i) % marks.size]
             packets.add(ReplayAudioPacket(mark.timeUs, blob.copyOfRange(mark.at, mark.at + mark.size), mark.flags))
         }
+        lastSavedEndBack = (newest - packets[packets.size - 1].timeUs) / 1_000_000.0
         return Pair(fmt, packets)
     }
 }

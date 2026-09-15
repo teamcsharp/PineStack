@@ -132,6 +132,37 @@ class JackWatch(
         Log.i(TAG, "jack watch on")
     }
 
+    /**
+     * #1182T: PUT THE POLL DOWN WITHOUT TOUCHING THE ROUTE.
+     *
+     * Standby's `deep` wants the two-second `dumpsys input` poll off the CPU
+     * while another app has the glass. stop() would do that, and one other
+     * thing: it announces the jack OFF, deliberately, because a terminal
+     * shutting down while holding the audio on a cable nobody is listening to
+     * is worse than one that hands it back.
+     *
+     * That is right for a shutdown and catastrophic here. The announcement
+     * lives in the FRAMEWORK and not in this object - see the note on
+     * `announced` above, where a reinstall was measured leaving mMainType=0x1
+     * behind with no cable in the socket - so calling stop() to save a poll
+     * would move the operator's sound out of their headphones and onto the
+     * tablet's speaker the moment a browser came to the front. The owner's
+     * rule is that the radio does not stop; a radio that jumps to the built-in
+     * speaker in the middle of a show has broken that rule by a different door
+     * than the one everybody was watching.
+     *
+     * So this stops the THREAD and says nothing to anybody. `announced` is
+     * untouched, so when the poll wakes it agrees with the framework exactly as
+     * it did before, and a cable that was carrying the show still is.
+     */
+    fun rest() {
+        if (!running) return
+        running = false
+        ticker?.interrupt()
+        ticker = null
+        Log.i(TAG, "#1182T jack poll resting; the route is left exactly as it stands")
+    }
+
     fun stop() {
         running = false
         ticker?.interrupt()

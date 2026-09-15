@@ -64,6 +64,24 @@ class PineApp : Application() {
          * stop at the moment it starts mattering. */
         wallpaper.start()
 
+        /* #1182T: THE CAMERA'S DOOR, ON THE APPLICATION.
+         *
+         * Here rather than only in the activity or the boot receiver, because
+         * this is the one method that runs on EVERY way this process can come
+         * into existence - a boot, a launch from the app list, a bridge call,
+         * or the system bringing PineAppRecorder back under START_STICKY with
+         * no activity anywhere. The desktop's "connect to the webcam no matter
+         * what whenever I want" has to survive all four; before this it
+         * survived only the ones that reached BootReceiver or MainActivity.
+         *
+         * It is a LocalServerSocket and nothing else: one blocked thread, no
+         * notification, no foreground service and no permission. The camera
+         * SERVICE - the thing Android 14 refuses to start from a background
+         * context, which killed the process on every boot and cost thirty
+         * minutes of dead air each time - is asked for only when a reader
+         * actually knocks. See PineCameraDoor and BootReceiver. */
+        com.pinebox.kiosk.camera.PineCameraDoor.open(this)
+
         /* Remote debugging over `adb forward` + chrome://inspect. The
          * tablet is a userdebug LineageOS build on a private LAN with no
          * Play Services and no user accounts; the ability to open the

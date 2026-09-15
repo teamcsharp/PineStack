@@ -16,7 +16,6 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.media.ImageReader
-import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.Build
 import android.os.Handler
@@ -70,7 +69,6 @@ import kotlin.concurrent.thread
  */
 class PineCameraService : Service() {
 
-    private var server: LocalServerSocket? = null
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
@@ -79,14 +77,14 @@ class PineCameraService : Service() {
 
     /* THE DIALS, held across a lens change on purpose: switching to the
      * front camera to check something and losing a carefully set exposure is
-     * worse than either camera. */
-    @Volatile private var auto = true
-    @Volatile private var shutterNs = 0L
-    @Volatile private var iso = 0
-    @Volatile private var ev = 0
-    @Volatile private var slowShutter = false
-
-    @Volatile private var facing = REAR
+     * worse than either camera.
+     *
+     * #1182T MOVED THEM TO THE COMPANION, and that is not tidying. They used
+     * to be instance fields and that was safe because the service stood from
+     * boot to shutdown; it does not any more - it now stands down when the
+     * last reader disconnects, so instance fields would quietly reset every
+     * exposure the operator had set the moment they closed the window. The
+     * dials belong to the CAMERA, which outlives any one look through it. */
     @Volatile private var going = false
     @Volatile private var watchers = 0
     @Volatile private var frames = 0
@@ -97,15 +95,82 @@ class PineCameraService : Service() {
     override fun onCreate() {
         super.onCreate()
         live = this
-        startForeground(NOTE_ID, note(),
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0)
+
+        /* #1182T: THIS CALL USED TO BE BARE, AND IT SILENCED THE RADIO FOR
+         * HALF AN HOUR ON EVERY BOOT.
+         *
+         * Measured on the tablet on 15 Sep 2026: started from BootReceiver,
+         * which is a background context, Android 14 with targetSdk 34 refuses
+         * a foreground service of type `camera` - CAMERA is a foreground-only
+         * permission, so "the app must be in the eligible state" is the half
+         * that fails, not the permission grant. Both CAMERA and
+         * FOREGROUND_SERVICE_CAMERA are granted and are in our manifest; it is
+         * purely the background start. The SecurityException came out of HERE,
+         * uncaught, and took the whole process with it. It fired twice in
+         * three seconds (pids 2603 and 3182) and ActivityManager then
+         * scheduled the restart 1,800,000 ms later. Thirty minutes of silence,
+         * every time the tablet was switched on. Not a low-memory kill -
+         * OomAdjuster logged "Not killing cached processes" throughout.
+         *
+         * Two things changed. The door is no longer started from boot at all
+         * (see PineCameraDoor), so this service is created when a reader has
+         * actually knocked; and the refusal is now CAUGHT, because a decision
+         * the foreground service manager is entitled to make must never again
+         * be a decision to stop the broadcast.
+         *
+         * WHY stopSelf() ON A REFUSAL RATHER THAN CARRYING ON. We were started
+         * with startForegroundService, and the platform holds us to a promise:
+         * if startForeground never succeeds it throws
+         * ForegroundServiceDidNotStartInTimeException into this process a few
+         * seconds later - which would be the same process death under another
+         * name. Stopping the service cancels that timer. The DOOR is
+         * unaffected and stays listening, so the next knock - most likely with
+         * the kiosk on the glass, where the call is legal - simply works. */
+        val standing = runCatching {
+            startForeground(NOTE_ID, note(),
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0)
+        }.onFailure { err ->
+            lastError = "the foreground service was refused: " + (err.message ?: err.toString())
+            Log.w(TAG, "#1182T " + lastError + " - standing down rather than taking "
+                + "the terminal with it; the socket is still answered")
+        }.isSuccess
+
+        if (!standing) {
+            PineCameraDoor.turnAwayEveryone(lastError)
+            live = null
+            stopSelf()
+            return
+        }
+
         going = true
-        listen()
+        /* #1182T: the socket belongs to PineCameraDoor now and lives in the
+         * app process rather than here. Whoever is already waiting on it
+         * knocked before this service existed, which is why it exists. */
+        takeWaiting()
         Log.i(TAG, "camera service on duty")
     }
 
+    /**
+     * #1182T: pick up every reader the door has accepted.
+     *
+     * Called from onCreate, and from the door when the service is already
+     * standing. It drains a queue rather than taking one socket because two
+     * desktops can knock inside the same second and the second one must not
+     * be dropped on the floor with its socket never closed.
+     */
+    internal fun takeWaiting() {
+        while (going) {
+            val client = PineCameraDoor.waiting.poll() ?: break
+            thread { serve(client) }
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        /* #1182T: and pick up anyone who knocked while we were standing up or
+         * shutting down. The door calls begin() whenever its queue is still
+         * not empty after a hand-over, and this is where that arrives. */
+        takeWaiting()
         val want = intent?.getStringExtra(EXTRA_FACING)
         if (want != null && want != facing) {
             facing = if (want == FRONT) FRONT else REAR
@@ -117,26 +182,14 @@ class PineCameraService : Service() {
 
     /* ---------------------------------------------------------- the door */
 
-    private fun listen() {
-        thread {
-            try {
-                val door = LocalServerSocket(SOCKET)
-                server = door
-                Log.i(TAG, "listening on localabstract:" + SOCKET)
-                while (going) {
-                    val client = try { door.accept() } catch (err: Exception) { null }
-                        ?: break
-                    /* One watcher at a time is the honest shape: a second
-                     * desktop would be a second reader of one camera, and
-                     * the frames are the same frames. */
-                    thread { serve(client) }
-                }
-            } catch (err: Exception) {
-                lastError = err.message ?: "the socket would not open"
-                Log.w(TAG, "socket: " + lastError)
-            }
-        }
-    }
+    /* #1182T: THE DOOR IS NOT HERE ANY MORE. It used to be `listen()`, a
+     * LocalServerSocket accept loop started from onCreate, and having it here
+     * is what forced a camera-type foreground service to exist from boot -
+     * which is the call Android 14 refused, and the refusal that killed the
+     * radio for thirty minutes on every power-on. It now lives in
+     * PineCameraDoor, in the app process, where it costs one blocked thread,
+     * no notification, no foreground service type and no permission at all.
+     * See PineCameraDoor for the measurements. */
 
     private fun serve(client: LocalSocket) {
         watchers += 1
@@ -161,7 +214,22 @@ class PineCameraService : Service() {
         } finally {
             try { client.close() } catch (err: Exception) { /* gone */ }
             watchers -= 1
-            if (watchers <= 0) { watchers = 0; shutCamera() }
+            if (watchers <= 0) {
+                watchers = 0
+                shutCamera()
+                /* #1182T: AND STAND DOWN ALTOGETHER, which is new.
+                 *
+                 * Before, this service stood from boot to shutdown because it
+                 * was also the socket, so stopping it would have stopped the
+                 * door. The door is PineCameraDoor's now and outlives us, so
+                 * nothing is lost by going away: the desktop can still connect
+                 * whenever it likes and the service comes back for it. What is
+                 * gained is that the tablet is not sitting in a camera-type
+                 * foreground service, with the notification that goes with it,
+                 * at every moment of a day when nobody is looking through the
+                 * lens. */
+                if (PineCameraDoor.waiting.isEmpty()) stopSelf()
+            }
         }
     }
 
@@ -406,8 +474,10 @@ class PineCameraService : Service() {
         if (live === this) live = null
         going = false
         shutCamera()
-        try { server?.close() } catch (err: Exception) { /* gone */ }
-        server = null
+        /* #1182T: the socket is NOT closed here. It belongs to
+         * PineCameraDoor and must outlive this service - that is the whole
+         * point of the split. Closing it here would mean the desktop could
+         * only ever connect once. */
         super.onDestroy()
     }
 
@@ -446,6 +516,29 @@ class PineCameraService : Service() {
         const val REAR = "rear"
         const val FRONT = "front"
 
+        /* #1182T: THE DIALS AND THE LENS, HELD ABOVE THE SERVICE'S LIFETIME.
+         * See the note where these used to be declared, at the top of the
+         * class - the service now stands down between viewings, and a dial
+         * that resets when the operator closes a window is a dial nobody can
+         * set. */
+        @Volatile internal var auto = true
+        @Volatile internal var shutterNs = 0L
+        @Volatile internal var iso = 0
+        @Volatile internal var ev = 0
+        @Volatile internal var slowShutter = false
+        @Volatile internal var facing = REAR
+
+        /**
+         * Stand the service up.
+         *
+         * #1182T: THIS IS NO LONGER CALLED FROM BOOT, AND MUST NOT BE. It is
+         * called by PineCameraDoor when a reader has actually connected, and
+         * by nothing else. A camera-type foreground service started from a
+         * background context is refused on Android 14 with targetSdk 34, and
+         * the refusal killed the process - see onCreate for the measurement.
+         * The catch below covers the call site; onCreate covers the refusal
+         * that arrives later, inside the service.
+         */
         fun begin(context: Context, want: String?) {
             val go = Intent(context, PineCameraService::class.java)
             go.putExtra(EXTRA_FACING, if (want == FRONT) FRONT else REAR)

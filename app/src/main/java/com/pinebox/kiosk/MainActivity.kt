@@ -116,6 +116,11 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         startedAt = SystemClock.uptimeMillis()
         super.onCreate(savedInstanceState)
+        /* #1182T: the handle standby reaches us through. onCreate rather than
+         * onResume, because standby acts precisely while this activity is NOT
+         * in front - see the companion's note on how this differs from
+         * PineDesktopBridge.liveActivity. */
+        live = this
         setContentView(R.layout.activity_main)
 
         /* ASK FOR THE MICROPHONE UP FRONT.
@@ -486,9 +491,22 @@ class MainActivity : AppCompatActivity() {
          * visible activity is the one context that never is. */
         com.pinebox.kiosk.replay.PineAppRecorder.begin(this)
         /* The camera's door, open and waiting. The lens stays shut until
-         * somebody connects - see PineCameraService. */
-        com.pinebox.kiosk.camera.PineCameraService.begin(this, null)
+         * somebody connects, and #1182T moved the door OUT of the service so
+         * that "open and waiting" no longer means a camera-type foreground
+         * service standing all day - see PineCameraDoor. */
+        com.pinebox.kiosk.camera.PineCameraDoor.open(this)
         super.onResume()
+
+        /* #1182T: THE TERMINAL IS VISIBLE, SO IT IS NOT IN STANDBY.
+         *
+         * Unconditional, and early - before the media focus below, and before
+         * anything else in here reads the state of the world. A foreground app
+         * that asked us to relax and then died without saying otherwise does
+         * not get to leave the terminal relaxed while the operator is looking
+         * straight at it. This is one of the four roads back that need nobody
+         * alive to ask: this method, SCREEN_ON, an explicit level=off, and
+         * Revive. */
+        com.pinebox.kiosk.kiosk.Standby.leave(this, "kiosk onResume")
         /* #1296: a view is on the glass, so the wallpaper holds. Hanging
            one regenerates the Material You overlays, and the
            CONFIG_ASSETS_PATHS that follows relaunches this activity -
@@ -564,7 +582,26 @@ class MainActivity : AppCompatActivity() {
          * So the app holds media focus for as long as it is in front. On a
          * kiosk there is never a gesture for Chromium's own delegate to hang
          * a request on, and WebView ties media OUTPUT to focus. */
-        if (mediaFocus == null) mediaFocus = MediaFocus(applicationContext)
+        if (mediaFocus == null) {
+            mediaFocus = MediaFocus(applicationContext).also { focus ->
+                /* #1182T: A FOCUS LOSS IS A VOLUME EVENT, NOT A STOP, and
+                 * this is the line that carries it into the page.
+                 *
+                 * Audio focus can duck other apps for us; the framework will
+                 * not duck an app against itself, and the thing playing here
+                 * IS ours - the broadcast is an <audio> element inside this
+                 * WebView. So MediaFocus publishes a gain and the host applies
+                 * it, exactly as DuckController already does for the sampler.
+                 * See MediaFocus.note for what each focus message now means
+                 * and why AUDIOFOCUS_LOSS keeps playing. */
+                focus.onDuck = { gain ->
+                    runOnUiThread {
+                        runCatching { webView.evaluateJavascript(focusDuck(gain), null) }
+                            .onFailure { Log.w(TAG, "the duck would not reach the page: " + it) }
+                    }
+                }
+            }
+        }
         mediaFocus?.hold()
 
         /* #1241: and the timers, which nothing else can reach. Once
@@ -581,6 +618,46 @@ class MainActivity : AppCompatActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         KioskController.reassertImmersive(this, hasFocus)
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* #1182T: what standby is allowed to reach in here                    */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Rest or wake the jack poll. Main thread; Standby posts it there.
+     *
+     * rest() rather than stop() on purpose - stop() would hand the audio back
+     * from the headphone cable to the speaker, which is the owner's rule
+     * broken sideways. See JackWatch.rest.
+     */
+    internal fun standbyJackPoll(on: Boolean) {
+        if (on) jackWatch?.start() else jackWatch?.rest()
+    }
+
+    /**
+     * Drop the WebView's in-memory resource cache.
+     *
+     * clearCache(FALSE) - the argument is `includeDiskFiles` and passing true
+     * would take the disk cache with it, making the way back slower for
+     * nothing. What goes is decoded images and fetched sub-resources.
+     *
+     * WHAT IS DELIBERATELY NOT DONE HERE, and it is the largest thing the
+     * AutoBrowse document asked for: onPause(), pauseTimers(), and letting the
+     * document go. All three are refused and the evidence is our own. #1241
+     * measured this tablet with rAF firing and setTimeout and setInterval NOT
+     * - a fresh one-second interval managed zero ticks in fifteen - and what
+     * it cost was the whole station: the voice-feed poll, the reload stamp,
+     * the solo-gate un-gag and the stuck-clip watchdog are all setInterval, so
+     * the tablet went silent and could not be recovered from the web side at
+     * all. The timer guard above exists BECAUSE of that. And the document is
+     * out by one on the document itself: the broadcast the operator is
+     * listening to is an <audio> element inside it, so "let the WebView drop
+     * its document" is spelled, on this device, "stop the radio".
+     */
+    internal fun standbyDropWebCache() {
+        runCatching { webView.clearCache(false) }
+            .onFailure { Log.w(TAG, "the web cache would not drop: " + it) }
     }
 
     /**
@@ -636,6 +713,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        if (live === this) live = null                       // #1182T
         timerGuard?.let { webView.removeCallbacks(it) }      // #1241
         timerGuard = null
         if (::bridge.isInitialized) bridge.liveActivity = null
@@ -1480,6 +1558,22 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "PineKioskActivity"
 
+        /**
+         * #1182T: THE ACTIVITY THAT EXISTS, if one does.
+         *
+         * NOT the same thing as PineDesktopBridge.liveActivity, and the
+         * difference is the point. That one is set in onResume and cleared in
+         * onDestroy because its callers need a live WINDOW - the USB disk
+         * picker cannot show itself without one. Standby needs the opposite:
+         * it acts precisely while the kiosk is NOT in front, so it needs a
+         * handle that survives being backgrounded. Set in onCreate, cleared in
+         * onDestroy, and read only for things that are legal on a paused
+         * activity - resting a poll, dropping a cache.
+         */
+        @Volatile
+        var live: MainActivity? = null
+            private set
+
         /* #1241: how often the timer guard pokes resumeTimers(). Twenty
          * seconds is far below anything a listener would notice and far
          * above anything that costs measurable battery - the call is a
@@ -1549,6 +1643,42 @@ class MainActivity : AppCompatActivity() {
          * panel may not have bound the listener yet on a very early call, so
          * the keys are written here too. Belt and braces, and both are cheap.
          */
+        /**
+         * #1182T: CARRY AN AUDIO-FOCUS DUCK INTO THE PAGE.
+         *
+         * PineDuck IS THE ONE ROAD, and this deliberately uses nothing else.
+         * It is the standing rule for every duck on this terminal - reports,
+         * dictation, the SFX set - and it exists because a duck has to
+         * compose: the lowest hold wins, the last one out restores, and a
+         * level the operator moved by hand while a hold stood is not stamped
+         * on when the hold lifts. Setting el.volume here by hand would do all
+         * three of those things wrong, and the third is the one that would
+         * quietly overwrite the monitor slider every time a notification
+         * chimed.
+         *
+         * A HOLD WITH NO ELEMENT GETS A NINETY-SECOND CEILING from PineDuck,
+         * so a focus loss that outlasts it lifts the duck on its own. That is
+         * the right direction to fail in and is why it is not fought: the
+         * failure is the station coming back UP, never the station staying
+         * down. Everything in this pair of files fails towards being heard.
+         *
+         * If the page has not loaded PineDuck yet, nothing happens and the
+         * station plays at full volume. Also the right direction.
+         */
+        private fun focusDuck(gain: Float): String = """
+            (function () {
+              try {
+                var lvl = $gain;
+                if (!window.PineDuck || typeof window.PineDuck.hold !== "function") {
+                  return "no PineDuck; left at full";
+                }
+                if (lvl >= 0.999) { window.PineDuck.release("androidFocus"); return "released"; }
+                window.PineDuck.hold("androidFocus", lvl);
+                return "held at " + lvl;
+              } catch (err) { return "failed:" + err; }
+            })();
+        """.trimIndent()
+
         private fun monitorSet(level: Double): String = """
             (function () {
               try {

@@ -103,6 +103,18 @@ object Revive {
      */
     @Synchronized
     fun now(context: Context, why: String): Boolean {
+        /* #1182T: WHATEVER ELSE HAPPENS, COME OUT OF STANDBY FIRST.
+         *
+         * The fourth of the four unconditional roads back, and arguably the
+         * one that matters most, because Revive is the path taken when
+         * something has already gone wrong and nobody is yet sure what. A
+         * terminal being revived must not be revived into a relaxed state that
+         * some foreground app asked for and may well have died holding.
+         *
+         * Before the rested() check on purpose: a revive that DECLINES - too
+         * soon after the last one, or a restart loop already recognised -
+         * should still have woken the terminal on its way past. */
+        com.pinebox.kiosk.kiosk.Standby.leave(context, "revive: " + why)
         if (!rested(context)) {
             val run = inARow(context)
             if (run >= GIVE_UP_AFTER) {

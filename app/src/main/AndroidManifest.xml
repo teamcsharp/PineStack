@@ -43,6 +43,31 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- #1182T: STANDBY, AND WHO IS ALLOWED TO ASK FOR IT.
+
+         A second app now shares this tablet - AutoBrowse, a Chromium browser
+         being ported to the same Lenovo Tab M9 - and it asked for one entry
+         point through which a foreground app can say "I am using the glass
+         now, please relax". Measured by that port on 15 Sep 2026: with this
+         terminal not resident the device had 2.65 GB of MemAvailable, and with
+         it resident 1.39-1.44 GB. The terminal is worth roughly 1.2 GB on a
+         4 GB tablet, which is considerably more than its 777 MB RSS implies
+         once shared pages and its cache pressure are counted.
+
+         `signature` protection means the caller must be signed with the same
+         key this APK is. That is no hurdle for AutoBrowse - deploy.sh already
+         proves the platform-signing road on this device and they offered to
+         take it - and it IS a hurdle for everything else, which is the point:
+         an unguarded receiver that can stop the screen recorder is a receiver
+         that any app on the tablet can use to stop the screen recorder.
+
+         Nothing reachable through it touches audio, StationFeed or the Oboe
+         sampler at any level. See kiosk/Standby.kt. -->
+    <permission
+        android:name="com.pinebox.kiosk.permission.STANDBY"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.pinebox.kiosk.permission.STANDBY" />
+
     <!-- THE HEADPHONE JACK, AND WHY THIS PERMISSION IS HERE.
 
          Measured on this tablet with a cable in the socket:
@@ -299,6 +324,33 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Continuous rolling capture of this terminal's own screen, for the operator to extract from the Pine Box desktop application." />
         </service>
+
+        <!-- #1182T: THE DOOR A FOREGROUND APP KNOCKS ON.
+             Exported because the whole point is that another app can reach it,
+             and guarded by the signature-level permission declared above so
+             that "another app" means one signed with the platform key rather
+             than anything that happens to be installed.
+
+             The contract, in full:
+               action     com.pinebox.kiosk.action.SET_STANDBY
+               level      String  "off" | "light" | "deep"   (absent = off)
+               requester  String  the calling package, for our log
+               ttl_ms     long    how long the request is good for
+
+             Every extra is optional and every default is the waking one, so a
+             malformed request brings the terminal BACK rather than putting it
+             down. See kiosk/Standby.kt for what each level releases and, more
+             importantly, for the list of things no level is allowed to
+             touch. -->
+        <receiver
+            android:name=".kiosk.StandbyReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="com.pinebox.kiosk.permission.STANDBY">
+            <intent-filter>
+                <action android:name="com.pinebox.kiosk.action.SET_STANDBY" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name=".kiosk.BootReceiver"
