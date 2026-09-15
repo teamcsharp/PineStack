@@ -564,6 +564,59 @@
 /* Scrolled away from the live line: say so, and offer the way back. */
 .sp-now-line.adrift::before { content: '↩ '; color: var(--sp-on, #65c7da); }
 .sp-now-line.adrift::after { content: '  · tap to follow'; opacity: .7; }
+
+/* THE SYNCHRONIZATION STATE.
+ *
+ * "Preserve the last trustworthy position when playback evidence is
+ *  unavailable and expose the synchronization state. Merely preventing a
+ *  backward visual movement would hide an audio fault."
+ *
+ * So this strip is never absent and never neutral: it says, in two words
+ * and a reason, what the mark above it is standing on. The three states
+ * that are read off the sound are the only ones drawn in the live colour;
+ * everything else is drawn as the fault or the doubt it is. */
+.sp-sync {
+  flex: 0 0 auto;
+  display: flex; align-items: baseline; gap: 8px;
+  margin: -2px 0 6px;
+  padding: 3px 9px;
+  border-left: 3px solid var(--sp-line, #35414c);
+  border-radius: 0 4px 4px 0;
+  background: rgba(0, 0, 0, .18);
+  font-size: 10px; line-height: 1.4;
+  letter-spacing: .02em;
+  color: var(--sp-muted, #8fa0ad);
+  white-space: nowrap; overflow: hidden;
+}
+.sp-sync .sp-sync-name {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  flex: 0 0 auto;
+}
+.sp-sync .sp-sync-why {
+  font-style: normal;
+  opacity: .78;
+  overflow: hidden; text-overflow: ellipsis;
+}
+/* Read off the sound, mapped through the committed cue sheet. */
+.sp-sync[data-sync="read"] { border-left-color: var(--sp-on, #65c7da); color: var(--sp-text, #edf3f5); }
+.sp-sync[data-sync="read-gap"] { border-left-color: var(--sp-on, #65c7da); }
+/* Not read, or read and disagreeing with what was committed. */
+.sp-sync[data-sync="estimated"] { border-left-color: var(--sp-amber, #d8a657); }
+.sp-sync[data-sync="held"] { border-left-color: var(--sp-amber, #d8a657); }
+.sp-sync[data-sync="read-unmapped"] { border-left-color: #b078d8; color: #d9c2ec; }
+.sp-sync[data-sync="read-outside"] { border-left-color: #d86b57; color: #e9b5aa; }
+.sp-sync[data-sync="stalled"] { border-left-color: #d86b57; color: #e9b5aa; }
+.sp-sync[data-sync="paused"] { border-left-color: #6d7c88; opacity: .8; }
+/* A mark with no evidence under it must not look like one that has some. */
+.sp-sync.sp-sync-carried .sp-sync-name::after { content: ' · held'; opacity: .7; }
+/* The mark itself, while nothing is standing behind it. */
+.sp-page.sp-unsynced .sp-el.sp-now {
+  outline: 1px dashed var(--sp-amber, #d8a657);
+  outline-offset: 2px;
+}
+.sp-page.sp-unsynced .sp-el.sp-now::after { content: ''; }
 /* #1286: the crystal's rhyme mark rides on 433 of 693 dialogue
    elements - 63%, nearly every line - so as a highlight it carried no
    information and only crowded the one that did. Silent in the reading

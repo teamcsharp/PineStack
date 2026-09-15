@@ -101,6 +101,34 @@
   var PLAN_REST_MS = 30000;           /* a running order is not news */
   var beat = 0;
 
+  /* ------------------------------------------- THE ADMITTED CUE MAP
+   *
+   * "Render the committed sequence directly. Keep existing positions
+   *  stable as new material is appended. Use the selected player's
+   *  actual file and offset, mapped through its cue sheet, to identify
+   *  the active occurrence."
+   *
+   * `admitMap` is the station's committed sequence as last polled - the
+   * playout controller's own record, not a reconstruction from feed rows
+   * and not the server's wall clock. `lastGood` is the last position this
+   * view could TRUST, kept so a gap in the evidence shows the last true
+   * mark rather than a guess or a blank.
+   *
+   * And `syncState` is published, because the audit is explicit that
+   * hiding this would be the wrong cure: "Merely preventing a backward
+   * visual movement would hide an audio fault; it would not enforce
+   * playback order." */
+  var admitMap = null;
+  var lastGood = null;
+  var syncState = 'held';
+  var syncWhy = 'no playback evidence yet';
+  var syncSince = 0;
+  var syncRing = [];                  /* bounded: what the mark did, and why */
+  var SYNC_RING_MAX = 240;
+  var headWas = -1;                   /* the last READ position */
+  var headMovedAt = 0;                /* and when it last actually moved */
+  var STALL_MS = 8000;                /* read but motionless for this long */
+
   /* #1115: THE LAST ERRORS THIS PAGE SAW.
    *
    * A report about "the highlighted line is wrong" is worth little
@@ -1773,6 +1801,54 @@
     if (root.PineScriptDiagnostics) diagnosticRevision = root.PineScriptDiagnostics.revision(elements);
   }
 
+  /* The references, resolved against the admitted map. `available: false`
+     with a reason is a legitimate answer and the only honest one when the
+     station has not been patched to carry the field yet. */
+  function admissionReferences() {
+    var out = {available: false, why: 'the station is not sending an admitted cue map',
+      generation: null, mode: '', reader_position: null,
+      playback_occurrence_id: null, position: null, media: null,
+      script_revision: null, performer_session: null, assembly_id: null,
+      cue_map_revision: null, take_id: null, audio_hash: null,
+      accepted_cuts: null, origin: null};
+    if (!admitMap || !admitMap.ok) return out;
+    out.generation = admitMap.generation;
+    out.mode = admitMap.mode;
+    out.reader_position = admitMap.reader;
+    var want = (lastGood && lastGood.occurrence_id)
+      || (admitMap.current && admitMap.current.occurrence_id) || '';
+    var found = null;
+    for (var i = 0; i < admitMap.order.length; i += 1) {
+      if (admitMap.order[i].occurrence_id === want) { found = admitMap.order[i]; break; }
+    }
+    if (!found) {
+      out.why = want
+        ? 'the admitted map no longer carries occurrence ' + want
+        : 'no occurrence has been dispatched yet';
+      return out;
+    }
+    out.available = true;
+    out.why = '';
+    out.playback_occurrence_id = found.occurrence_id;
+    out.position = found.position;
+    out.media = found.media;
+    out.origin = found.origin;
+    /* Absent, not blank: an empty string from the server means the record
+       exists and the field is unset, and saying `null` says exactly that. */
+    out.script_revision = found.script_revision || null;
+    out.performer_session = found.performer_session || null;
+    out.assembly_id = found.assembly_id || null;
+    out.cue_map_revision = found.cue_map_revision || null;
+    out.take_id = found.take_id || null;
+    out.audio_hash = found.hash || null;
+    var cuts = [];
+    for (var c = 0; c < found.cues.length; c += 1) {
+      if (found.cues[c].cut_id) cuts.push(found.cues[c].cut_id);
+    }
+    out.accepted_cuts = cuts.length ? cuts.slice(0, 24) : null;
+    return out;
+  }
+
   function sampleMotion() {
     var pane = el('spScript');
     var rec = recorder();
@@ -1833,6 +1909,18 @@
         rows: (liveStream.rows || []).filter(function (r) { return String(r.id || '') === String(active.id || '') || String(r.id || '') === nowLineId; }).map(function (r) { return {id: r.id, from: r.from, until: r.until}; })} : null,
       viewport: {scroll_top_px: Math.round(pane.scrollTop), height_px: pane.clientHeight, width_px: pane.clientWidth, content_height_px: pane.scrollHeight, lit_top_px: top},
       paused: stationPaused, follow: follow, visibility: String(document.visibilityState || ''),
+      /* THE INCIDENT REFERENCES section 5 of the recording note asks
+         for: script revision, performer session, accepted cut, assembly
+         and playback occurrence. Every one of them is taken from what the
+         STATION actually returned. A reference the station does not carry
+         is absent here; it is never filled in with something plausible. */
+      admission: admissionReferences(),
+      sync: {state: syncState, why: syncWhy, since_ms: syncSince,
+        motion: syncRing.slice(-60),
+        last_trustworthy: lastGood ? {line_id: lastGood.line_id,
+          occurrence_id: lastGood.occurrence_id, position: lastGood.position,
+          media: lastGood.media, at_ms: lastGood.at} : null},
+      scroll: {owner: scrollOwner, at_ms: scrollAt, moves: scrollLog.slice(-12)},
       errors: caught.slice(-6)
     };
     rec.observe({at_ms: Date.now(), highlight_id: diagnosticSnapshot.highlight_id, active_id: diagnosticSnapshot.active_id,
@@ -2704,7 +2792,9 @@
      * of the hour is usually well past it; scrolling to the bottom after
      * every repaint would drag the operator away from the line being said
      * twenty seconds after it arrived. */
-    if (stick && atEnd && !(follow && nowLineId)) box.scrollTop = box.scrollHeight;
+    if (stick && atEnd && !(follow && nowLineId)) {
+      moveScript('end', function (pane) { pane.scrollTop = pane.scrollHeight; });
+    }
     /* #1273: THE MARK IS RE-ASSERTED, NOT MERELY REMEMBERED.
        #1269 asked whether a node with this id existed - not whether it
        still CARRIED the mark. A rebuilt node exists without .sp-now, so
@@ -2722,6 +2812,51 @@
        segment arrives folded rather than springing it open. */
     segApply();
     tick();
+  }
+
+  /* ONE SCROLL CONTROLLER.
+   *
+   * "Use one scroll controller."
+   *
+   * There were four movers of this pane and only one of them declared
+   * itself: the follow scroll in markNow stamped `selfScrollUntil`, while
+   * the stick-to-end after a repaint, the reader's-place restore and the
+   * tap-to-line jump all moved the box silently. Each of those fires the
+   * pane's own scroll handler, which reads "the operator has scrolled by
+   * hand" and switches following OFF - the page cancelling its own
+   * following, which is the exact fault #1282 was fixed for once already.
+   *
+   * So every movement goes through here, declares a reason, and is
+   * recorded for the incident report. A follow may not overrule a restore
+   * in the same frame: the operator's place beats an automatic move. */
+  var scrollOwner = '';
+  var scrollAt = 0;
+  var scrollLog = [];
+
+  function moveScript(reason, apply) {
+    var box = el('spScript');
+    if (!box) return false;
+    var now = Date.now();
+    if (reason === 'follow' && scrollOwner === 'restore' && now - scrollAt < 80) {
+      return false;
+    }
+    scrollOwner = reason;
+    scrollAt = now;
+    scrollLog.push({at: now, why: reason, top: Math.round(box.scrollTop)});
+    if (scrollLog.length > 40) scrollLog.shift();
+    selfScrollUntil = now + 2400;          /* backstop only */
+    /* #1330: on the box that actually scrolls - `scrollend` clears the
+       backstop early, and the backstop governs when it is unavailable. */
+    try {
+      if ('onscrollend' in box) {
+        box.addEventListener('scrollend', function done() {
+          box.removeEventListener('scrollend', done);
+          selfScrollUntil = 0;
+        }, {once: true});
+      }
+    } catch (err) { /* the backstop still covers it */ }
+    try { apply(box); } catch (err) { caughtNote('scroll:' + reason, err); }
+    return true;
   }
 
   /* #1273: HOLD THE READER'S PLACE ACROSS A REPAINT. Measure one row
@@ -2751,7 +2886,9 @@
     if (!node || node.parentNode !== box) return;
     var drift = node.getBoundingClientRect().top - anchor.was;
     if (Math.abs(drift) > 0.5) {
-      box.scrollTop = Math.max(0, box.scrollTop + drift);
+      moveScript('restore', function (pane) {
+        pane.scrollTop = Math.max(0, pane.scrollTop + drift);
+      });
     }
   }
 
@@ -3238,6 +3375,275 @@
    * arrival and hands back null once it is stale. Stale has to mean
    * absent: a frozen mark reads as a working one, which is worse than
    * falling back to the clock and is how this fault survived so long. */
+  /* ============================================ THE CUE MAP, PURELY
+   *
+   * Handed the admission payload and one reading, this says which
+   * occurrence and which line the room is in - or says, by name, that it
+   * cannot tell. No DOM, no clock, no fetch, so the cases the audit named
+   * can be held to it in node without a browser.
+   *
+   * The eight answers it can give are the synchronization state. Seven of
+   * them are not "on air", and the view SHOWS each of them rather than
+   * smoothing them into a stationary cursor. */
+  var PineScriptCues = (function () {
+    var SYNC = {
+      READ: 'read',                /* read off the sound and mapped to a cue */
+      GAP: 'read-gap',             /* read, inside the file, between cues */
+      UNMAPPED: 'read-unmapped',   /* read, but nothing admitted this file */
+      OUTSIDE: 'read-outside',     /* read, admitted file, offset off its map */
+      ESTIMATED: 'estimated',      /* a clock, not a playhead */
+      HELD: 'held',                /* no evidence; the last trustworthy mark */
+      PAUSED: 'paused',
+      STALL: 'stalled'             /* read, mapped, and no longer moving */
+    };
+    var TRUSTED = {};
+    TRUSTED[SYNC.READ] = true;
+    TRUSTED[SYNC.GAP] = true;
+
+    function key(url) {
+      var raw = String(url || '').split('?')[0].replace(/\\/g, '/');
+      var parts = raw.split('/');
+      return parts[parts.length - 1] || '';
+    }
+
+    /* NULL IS NOT ZERO, and this is where that matters most.
+     *
+     * `Number(null)` is 0 and `isFinite(0)` is true, so an absent playhead
+     * arrived here as an offset of exactly zero seconds - which lands
+     * inside the first cue of whatever file was named and lights its first
+     * line with no evidence whatever behind it. A cue whose window the
+     * assembler could not supply did the same in reverse: it became the
+     * window 0..0 and sat in the sheet as a line that can never be
+     * reached. Absent means absent. */
+    function num(value) {
+      if (value === null || value === undefined || value === '') return null;
+      var got = Number(value);
+      return isFinite(got) ? got : null;
+    }
+
+    /* The station's payload, turned into something that can be searched by
+       the one thing the player can tell us: the name of the file it is
+       sounding. Occurrences keep their COMMITTED order; nothing here sorts
+       by arrival, by air time or by anything that can be rewritten. */
+    function read(payload) {
+      var out = {ok: false, generation: null, mode: '', enforceOrder: false,
+        reader: null, current: null, order: [], byMedia: {}, count: 0,
+        why: 'the station is not sending an admitted cue map'};
+      if (!payload || typeof payload !== 'object') return out;
+      out.ok = true;
+      out.generation = num(payload.generation);
+      out.mode = String(payload.mode || '');
+      out.enforceOrder = !!payload.enforce_order;
+      out.reader = num(payload.reader_position);
+      var rows = payload.occurrences;
+      if (!rows || !rows.length) {
+        out.why = 'the admitted sequence is empty';
+        return out;
+      }
+      var kept = [];
+      for (var i = 0; i < rows.length; i += 1) {
+        var row = rows[i];
+        if (!row || !row.occurrence_id) continue;
+        var audio = row.audio || {};
+        var occurrence = {
+          occurrence_id: String(row.occurrence_id),
+          position: num(row.position),
+          state: String(row.state || ''),
+          outcome: String(row.outcome || ''),
+          lane: String(row.lane || ''),
+          producer: String(row.producer || ''),
+          origin: String(row.origin || ''),
+          media: key(audio.media || audio.path || ''),
+          sig: String(audio.sig || ''),
+          seconds: num(audio.seconds),
+          hash: String(audio.hash || ''),
+          dispatched_at: num(row.dispatched_at),
+          script_revision: String(row.script_revision || ''),
+          assembly_id: String(row.assembly_id || ''),
+          cue_map_revision: String(row.cue_map_revision || ''),
+          performer_session: String(row.performer_session || ''),
+          take_id: String(row.take_id || ''),
+          cues: []
+        };
+        var cues = row.cues || [];
+        for (var c = 0; c < cues.length; c += 1) {
+          var cue = cues[c];
+          if (!cue) continue;
+          var from = num(cue.start_s), until = num(cue.end_s);
+          if (from === null || until === null) continue;
+          occurrence.cues.push({
+            line_id: String(cue.line_id || cue.occurrence_id || ''),
+            position: num(cue.position),
+            ordinal: num(cue.ordinal),
+            from: from, until: until,
+            speechEnd: num(cue.speech_end_s) === null ? until : num(cue.speech_end_s),
+            who: String(cue.who || ''), name: String(cue.name || ''),
+            kind: String(cue.kind || ''), text: String(cue.text || '')
+          });
+        }
+        kept.push(occurrence);
+      }
+      kept.sort(function (a, b) {
+        return (a.position === null ? 0 : a.position)
+          - (b.position === null ? 0 : b.position);
+      });
+      out.order = kept;
+      out.count = kept.length;
+      for (var k = 0; k < kept.length; k += 1) {
+        var name = kept[k].media;
+        if (!name) continue;
+        if (!out.byMedia[name]) out.byMedia[name] = [];
+        out.byMedia[name].push(kept[k]);
+      }
+      var now = payload.current;
+      if (now && now.occurrence_id) {
+        out.current = {occurrence_id: String(now.occurrence_id),
+          position: num(now.position), media: key(now.media || ''),
+          started_at: num(now.started_at), seconds: num(now.seconds)};
+      }
+      if (!out.why || out.count) out.why = '';
+      return out;
+    }
+
+    /* WHICH ONE OF SEVERAL PLAYS OF THE SAME FILE.
+     *
+     * "A reusable sample's content ID is not its playback occurrence ID.
+     *  Playing the same sting twice produces two distinct occurrences in
+     *  the script."
+     *
+     * So a file name alone does not settle it. The occurrence the
+     * controller says is in flight wins; failing that, the most recently
+     * dispatched; failing that, the first still waiting. Picking the last
+     * in the list unconditionally is exactly the bug that lit an old
+     * burst's line while a new file was playing. */
+    function choose(list, current) {
+      if (!list || !list.length) return null;
+      var i;
+      if (current && current.occurrence_id) {
+        for (i = 0; i < list.length; i += 1) {
+          if (list[i].occurrence_id === current.occurrence_id) return list[i];
+        }
+      }
+      var best = null;
+      for (i = 0; i < list.length; i += 1) {
+        if (list[i].state !== 'dispatching') continue;
+        if (!best || (list[i].position || 0) > (best.position || 0)) best = list[i];
+      }
+      if (best) return best;
+      for (i = list.length - 1; i >= 0; i -= 1) {
+        if (list[i].dispatched_at !== null) return list[i];
+      }
+      return list[0];
+    }
+
+    function blank(sync, why, last) {
+      var out = {sync: sync, why: why, trustworthy: !!TRUSTED[sync],
+        line_id: '', occurrence_id: '', position: null, from: null,
+        until: null, speechEnd: null, index: -1, of: 0, media: '',
+        origin: '', carried: false};
+      if (last && last.line_id) {
+        /* PRESERVE THE LAST TRUSTWORTHY POSITION - and say it is being
+           preserved. A mark with no evidence behind it that looks exactly
+           like a mark with evidence behind it is the fault, not the cure. */
+        out.line_id = last.line_id;
+        out.occurrence_id = last.occurrence_id || '';
+        out.position = last.position === undefined ? null : last.position;
+        out.media = last.media || '';
+        out.origin = last.origin || '';
+        out.carried = true;
+      }
+      return out;
+    }
+
+    /* `look`:
+         file          what the player says it is sounding
+         position_s    its OWN offset into that file, never a wall clock
+         source        'bridge' | 'local' | 'estimated' | 'unavailable'
+         paused        the air is paused
+         stalledMs     how long the read position has been motionless
+         stallLimitMs  beyond which motionless is a fault (default 8000)
+         last          the last trustworthy answer, to carry */
+    function locate(map, look) {
+      look = look || {};
+      var last = look.last || null;
+      if (look.paused) return blank(SYNC.PAUSED, 'the air is paused', last);
+      var source = String(look.source || 'unavailable');
+      var at = num(look.position_s);
+      if (source === 'unavailable' || at === null || at < 0) {
+        return blank(SYNC.HELD, 'no playback evidence is available', last);
+      }
+      if (source === 'estimated') {
+        return blank(SYNC.ESTIMATED,
+          'the position is the station clock, not a playhead', last);
+      }
+      var file = key(look.file);
+      if (!file) {
+        return blank(SYNC.UNMAPPED, 'the player did not name its file', last);
+      }
+      if (!map || !map.ok || !map.count) {
+        return blank(SYNC.UNMAPPED,
+          'no admitted cue map to read ' + file + ' against', last);
+      }
+      var list = map.byMedia[file];
+      if (!list || !list.length) {
+        return blank(SYNC.UNMAPPED,
+          'nothing admitted names ' + file, last);
+      }
+      var occurrence = choose(list, map.current);
+      var got = {sync: SYNC.READ, why: '', trustworthy: true, line_id: '',
+        occurrence_id: occurrence.occurrence_id, position: occurrence.position,
+        from: null, until: null, speechEnd: null, index: -1,
+        of: occurrence.cues.length, media: file, origin: occurrence.origin,
+        carried: false, at: at};
+      for (var i = 0; i < occurrence.cues.length; i += 1) {
+        var cue = occurrence.cues[i];
+        if (at >= cue.from && at < cue.until) {
+          got.line_id = cue.line_id;
+          got.position = cue.position === null ? occurrence.position : cue.position;
+          got.from = cue.from; got.until = cue.until;
+          got.speechEnd = cue.speechEnd;
+          got.index = i;
+          var stall = num(look.stalledMs);
+          var limit = num(look.stallLimitMs);
+          if (limit === null) limit = 8000;
+          if (stall !== null && stall > limit) {
+            got.sync = SYNC.STALL;
+            got.trustworthy = false;
+            got.why = 'the playhead has not moved for '
+              + Math.round(stall / 1000) + 's';
+          }
+          return got;
+        }
+      }
+      var span = occurrence.seconds;
+      if (span !== null && at > span + 1.5) {
+        got.sync = SYNC.OUTSIDE;
+        got.trustworthy = false;
+        got.why = 'the player is past the end of the cue sheet for ' + file;
+        return got;
+      }
+      got.sync = SYNC.GAP;
+      got.why = 'inside ' + file + ', between two committed lines';
+      return got;
+    }
+
+    /* One short sentence for the operator, per state. */
+    function say(got) {
+      if (!got) return '';
+      if (got.sync === SYNC.READ) return 'in step with the sound';
+      if (got.sync === SYNC.GAP) return 'in step - a pause between lines';
+      if (got.sync === SYNC.PAUSED) return 'air paused';
+      if (got.sync === SYNC.STALL) return 'the sound stopped moving';
+      if (got.sync === SYNC.OUTSIDE) return 'the sound is off the cue sheet';
+      if (got.sync === SYNC.UNMAPPED) return 'sounding something unadmitted';
+      if (got.sync === SYNC.ESTIMATED) return 'estimated - no playhead';
+      return 'holding the last known line';
+    }
+
+    return {SYNC: SYNC, read: read, locate: locate, choose: choose,
+            key: key, say: say};
+  }());
+
   function bridgeHead() {
     try { return (root.pinePlayhead && root.pinePlayhead()) || null; }
     catch (e) { return null; }
@@ -3331,9 +3737,85 @@
     return isFinite(v) ? v : Number(row.clip_until);
   }
 
+  /* THE ADMITTED OCCURRENCE, from the player's own file and offset.
+   *
+   * This runs BEFORE every reconstruction below it. Where the station has
+   * committed a cue sheet for the file that is actually sounding, there is
+   * nothing left to infer: the answer is read, not searched for.
+   *
+   * Where it cannot, it returns null and the older roads have their go -
+   * and `syncState` already says which of the eight answers this was, so
+   * a fallback is visible rather than silent. */
+  function admittedRow() {
+    /* NO MAP AT ALL IS NOT A FAULT IN THE SOUND.
+     *
+     * A station that has not been patched to carry `admission` sends
+     * nothing, and treating that as "the player is sounding something
+     * unadmitted" would dash an outline round every line of the script,
+     * all day, for ever. The file already knows what that costs: "A
+     * readout that says the same worried thing all day teaches the
+     * operator to ignore it."
+     *
+     * So this is reported as ESTIMATED - which is exactly what the older
+     * roads below are doing - with the reason said once, and the per-line
+     * mark is left alone. */
+    if (!admitMap || !admitMap.ok || !admitMap.count) {
+      if (syncState !== 'estimated') {
+        syncState = 'estimated';
+        syncSince = Date.now();
+      }
+      syncWhy = (admitMap && admitMap.why)
+        || 'the station is not sending an admitted cue map';
+      return null;
+    }
+    var head = bridgeHead();
+    var player = head ? null : soundingPlayer();
+    var source = head ? 'bridge' : (player ? 'local' : 'unavailable');
+    var at = null, file = '';
+    if (head) { at = Number(head.t); file = String(head.file || ''); }
+    else if (player) {
+      at = Number(player.currentTime);
+      file = String(player.currentSrc || player.src || '');
+    } else if (liveStream && liveStream.at) {
+      source = 'estimated';
+      at = ((Date.now() + skewMs) / 1000) - Number(liveStream.at || 0);
+    }
+    var moved = 0;
+    if (source === 'bridge' || source === 'local') {
+      var now = Date.now();
+      if (headWas < 0 || Math.abs(Number(at) - headWas) > 0.05) {
+        headWas = Number(at); headMovedAt = now;
+      }
+      moved = headMovedAt ? now - headMovedAt : 0;
+    } else { headWas = -1; headMovedAt = 0; }
+    var got = PineScriptCues.locate(admitMap, {
+      file: file, position_s: at, source: source, paused: stationPaused,
+      stalledMs: moved, stallLimitMs: STALL_MS, last: lastGood});
+    if (syncState !== got.sync) { syncState = got.sync; syncSince = Date.now(); }
+    syncWhy = got.why || PineScriptCues.say(got);
+    if (got.trustworthy && got.line_id) {
+      lastGood = {line_id: got.line_id, occurrence_id: got.occurrence_id,
+        position: got.position, media: got.media, origin: got.origin,
+        at: Date.now()};
+    }
+    if (!got.line_id) return null;
+    return {id: got.line_id,
+      from: got.carried ? 0 : Number(got.from || 0),
+      until: got.carried ? 0 : Number(got.until || 0),
+      at: got.carried ? 0 : Number(got.at || 0),
+      index: got.index, of: got.of,
+      occurrence_id: got.occurrence_id, position: got.position,
+      sync: got.sync, carried: !!got.carried, admitted: true};
+  }
+
   function activeRow() {
-    var t = streamAt();
-    var rows = (liveStream && liveStream.rows) || [];
+    /* #1336 / the sequential-playout audit: the ADMITTED map first. Every
+       road below this line reconstructs a position from something that can
+       be rewritten - estimates, feed rows, a four-second poll. The cue
+       sheet the controller committed cannot be. */
+    var admitted = admittedRow();
+    if (admitted) return admitted;
+    var t = streamAt();    var rows = (liveStream && liveStream.rows) || [];
     var file = soundingFile();
     /* #1330: A BURST THAT HAS RUN OUT IS NOT A TABLE TO SEARCH.
      *
@@ -3592,29 +4074,13 @@
        * geometry that had not settled and switched following off. The
        * scroll cancelled itself, which is the very fault the guard
        * exists to prevent. `scrollend` says when it is really over. */
-      selfScrollUntil = Date.now() + 2400;        /* backstop only */
-      /* #1330: ON THE BOX THAT ACTUALLY SCROLLS.
-       *
-       * This said `script`, which is declared in build() and in
-       * planLayout() and in neither case is in scope here. Under 'use
-       * strict' it resolved through named access on the global object to
-       * <section id="script"> - the view HOST, which is overflow:hidden
-       * and never scrolls. So 'scrollend' never fired, selfScrollUntil
-       * never cleared early, and the 2400ms backstop governed every
-       * move: for 2.4s after each highlight the handler below returned
-       * at its first line and the operator's own scroll was discarded,
-       * which is the precise opposite of what the guard is for. */
-      var box = el('spScript');
-      try {
-        if (box && 'onscrollend' in box) {
-          box.addEventListener('scrollend', function done() {
-            box.removeEventListener('scrollend', done);
-            selfScrollUntil = 0;
-          }, {once: true});
-        }
-      } catch (err) { /* the backstop still covers it */ }
-      try { node.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
-      catch (err) { node.scrollIntoView(false); }
+      /* #1330 lives in moveScript() now, with the other three movers of
+         this pane: the backstop, the `scrollend` early clear and the box
+         that actually scrolls are declared in ONE place. */
+      moveScript('follow', function () {
+        try { node.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+        catch (err) { node.scrollIntoView(false); }
+      });
     }
   }
 
@@ -3635,6 +4101,13 @@
   function status() {
     var row = activeRow();
     if (stationPaused) return {state: 'paused', text: 'air paused — nothing is going out'};
+
+    /* A CARRIED MARK IS NOT "ON AIR". It is the last line this view could
+       prove, held up while the evidence is missing, and saying "4.2s left"
+       over it would be inventing a countdown for audio nobody can see. */
+    if (row && row.carried) {
+      return {state: 'wait', text: 'holding the last read line — ' + syncWhy};
+    }
 
     if (row && row.until > row.from) {
       var left = row.until - row.at;
@@ -3694,6 +4167,44 @@
     return {state: 'idle', text: rest};
   }
 
+  /* WHAT THE MARK IS STANDING ON, in two words and a reason.
+   *
+   * The audit's warning, kept literally: "Preserve the last trustworthy
+   * position when playback evidence is unavailable and expose the
+   * synchronization state. Merely preventing a backward visual movement
+   * would hide an audio fault." So a carried mark is drawn differently
+   * from a live one and says how old it is. */
+  function paintSync(row) {
+    var node = el('spSync');
+    if (!node) return;
+    var carried = !!(row && row.carried);
+    var state = String(syncState || 'held');
+    var name = PineScriptCues.say({sync: state});
+    var why = String(syncWhy || '');
+    if (carried && lastGood && lastGood.at) {
+      var age = Math.max(0, Math.round((Date.now() - lastGood.at) / 1000));
+      why = (why ? why + ' - ' : '') + 'holding the last read line for ' + age + 's';
+    }
+    if (admitMap && admitMap.ok && !admitMap.count && state !== 'paused') {
+      why = why || admitMap.why;
+    }
+    if (node.dataset.sync !== state) node.dataset.sync = state;
+    node.classList.toggle('sp-sync-carried', carried);
+    /* AND ON THE MARK ITSELF. A highlight held up without evidence must
+       not be drawn identically to one the sound is standing behind - that
+       is precisely the "hide an audio fault" the audit refuses. */
+    try {
+      var mapped = !!(admitMap && admitMap.ok && admitMap.count);
+      if (host) {
+        host.classList.toggle('sp-unsynced',
+          mapped && !(state === 'read' || state === 'read-gap'));
+      }
+    } catch (err) { /* the strip still says it */ }
+    var b = node.firstChild, i = node.lastChild;
+    if (b && b.__text !== name) { b.__text = name; b.textContent = name; }
+    if (i && i.__text !== why) { i.__text = why; i.textContent = why; }
+  }
+
   function paintStatus() {
     var line = el('spNow');
     if (!line) return;
@@ -3742,6 +4253,20 @@
 
   function tick() {
     var row = activeRow();
+    /* The bounded ring of what the mark did and why - the incident report
+       carries it, so a backward movement can be told apart from a document
+       reflow and from a gap in the evidence. */
+    var seen = syncRing[syncRing.length - 1];
+    var mine = {at: Date.now(), sync: syncState,
+      line: row ? String(row.id || '') : '',
+      occurrence: row ? String(row.occurrence_id || '') : '',
+      position: row && row.position !== undefined ? row.position : null,
+      carried: !!(row && row.carried)};
+    if (!seen || seen.sync !== mine.sync || seen.line !== mine.line
+        || seen.occurrence !== mine.occurrence) {
+      syncRing.push(mine);
+      if (syncRing.length > SYNC_RING_MAX) syncRing.shift();
+    }
     markNow(row ? row.id : '');
     markRun(row);                                            /* #1295 */
     paintSaying(row);                                        /* #1298 */
@@ -3758,6 +4283,7 @@
       host.classList.toggle('sp-quiet', !soundingPlayer() && !(row && row.id));
     } catch (err) { /* the mark still stands on its own */ }
     paintStatus();
+    paintSync(row);
   }
 
   /* #1303b: the row the sampler's own sourceFor() expects. A clip line
@@ -3813,7 +4339,9 @@
     if (!id) return;
     var node = document.querySelector('.sp-el[data-line="' + id + '"]');
     if (!node) return;
-    node.scrollIntoView({block: 'center'});
+    moveScript('jump', function () {
+      node.scrollIntoView({block: 'center'});
+    });
     node.classList.add('flash');
     setTimeout(function () { node.classList.remove('flash'); }, 1200);
   }
@@ -3965,6 +4493,14 @@
     now.id = 'spNow';
     now.dataset.state = 'idle';
     right.appendChild(now);
+    /* THE SYNCHRONIZATION STATE, said out loud.
+       A held mark and a live mark must not look the same. */
+    var sync = make('div', 'sp-sync');
+    sync.id = 'spSync';
+    sync.dataset.sync = 'held';
+    sync.appendChild(make('b', 'sp-sync-name', ''));
+    sync.appendChild(make('i', 'sp-sync-why', ''));
+    right.appendChild(sync);
 
     var script = make('div', 'sp-script');
     script.id = 'spScript';
@@ -4208,6 +4744,12 @@
           flow.talk_next_in = state.talk_next_in;
         }
         stationPaused = !!state.paused;
+        /* #1336: THE COMMITTED SEQUENCE. `admission` is the playout
+           controller's own record of what it admitted, in the order it
+           admitted it. Absent on a station that has not been patched yet,
+           in which case admitMap.ok stays false and every road below
+           falls back exactly as before. */
+        admitMap = PineScriptCues.read(state.admission);
         /* Cancel the clock difference between this tablet and the station
            rather than assuming they agree; four seconds of drift would
            point the highlight at the wrong line. */
@@ -4234,6 +4776,10 @@
 
   root.PineScriptPage = {
     mount: mount,
+    /* The cue-map arithmetic, exported for
+       tests/test_script_admission_view_2026_09_15.cjs. It is pure, so the
+       test holds the real code rather than a copy of it. */
+    cues: PineScriptCues,
     isMounted: function () { return mounted; },
     close: function () {
       folderClose();                                  /* 2026-09-14 */

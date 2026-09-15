@@ -21916,6 +21916,349 @@ def page_carries_music() -> bool:
     return False
 
 
+# --- broadcast admission (2026-09-15) ---
+#
+# ONE controller, opened once, over its own durable directory.
+#
+# It is built HERE, above `_play_on_box` and below `data_path`,
+# `VOICE_MEDIA_DIR` and `MEDIA_KEY_SHAPE`, because nothing below this point
+# may start broadcast audio without asking it first and nothing above it
+# has the paths this needs.
+#
+# A failure to open it must never take the station off air, so every road
+# out of this block leaves `_ADMISSION` as None and every helper below
+# returns the answer it would have returned before this patch existed.
+try:
+    import broadcast_admission as _admission_module
+except Exception as _admission_import_error:  # noqa: BLE001
+    _admission_module = None
+    _ADMISSION_WHY = "broadcast_admission could not be imported: %r" % (
+        _admission_import_error,)
+else:
+    _ADMISSION_WHY = ""
+
+_ADMISSION_DIR = data_path("broadcast_admission")
+_ADMISSION_MODE_FILE = _ADMISSION_DIR / "mode"
+_ADMISSION_MODE_READ = [0.0, ""]
+_ADMISSION_ROUTE_SEEN = [""]
+# Which TRANSPORTS have already carried each occurrence. Bounded, and the
+# reason it exists is at `admission_ticket`: the page and the box carrying
+# one committed line is a second ROUTE, but the box carrying the same sting
+# twice is a second PLAY, and only the route identity tells them apart.
+_ADMISSION_ROUTES: dict[str, set] = {}
+_ADMISSION: Any = None
+
+
+def _admission_resolve(path: str) -> Path | None:
+    """A media URL path to the file on disk - the same road `_clip_seconds`
+    takes. A resolver that guessed more widely would let the gate hash a
+    file the box will never be handed."""
+    try:
+        raw = str(path or "").split("?")[0]
+        target = Path(raw)
+        if target.is_file():
+            return target
+        key = raw.rsplit("/", 1)[-1]
+        if not key:
+            return None
+        if MEDIA_KEY_SHAPE.match(key):
+            guess = VOICE_MEDIA_DIR / key
+            if guess.is_file():
+                return guess
+        for room in (VOICE_MEDIA_DIR, data_path("sfx"), data_path("tape")):
+            guess = room / key
+            if guess.is_file():
+                return guess
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _admission_settings() -> tuple[str, set[str], bool]:
+    """mode, lanes, order - from the mode file if it has one, else the
+    environment. Re-read at most once every three seconds, so turning
+    enforcement on is a one-word write rather than a restart of a station
+    that is broadcasting."""
+    now = time.time()
+    if now - float(_ADMISSION_MODE_READ[0]) < 3.0 and _ADMISSION_MODE_READ[1]:
+        words = str(_ADMISSION_MODE_READ[1]).split()
+    else:
+        text = ""
+        try:
+            text = _ADMISSION_MODE_FILE.read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            text = ""
+        if not text:
+            text = " ".join(w for w in (
+                os.getenv("SPARK_AGENT_ADMISSION", "observe").strip().lower(),
+                os.getenv("SPARK_AGENT_ADMISSION_LANES", "").strip().lower(),
+                ("order" if os.getenv("SPARK_AGENT_ADMISSION_ORDER", "").strip()
+                 .lower() in ("1", "true", "yes", "on") else "")) if w)
+        _ADMISSION_MODE_READ[0] = now
+        _ADMISSION_MODE_READ[1] = text or "observe"
+        words = (text or "observe").split()
+    mode = "observe"
+    lanes: set[str] = set()
+    order = False
+    for word in words:
+        low = word.strip().lower()
+        if low in ("enforce", "observe", "off"):
+            mode = low
+        elif low == "order":
+            order = True
+        elif low:
+            lanes.update(p for p in low.replace(";", ",").split(",") if p)
+    return mode, lanes, order
+
+
+def admission_controller() -> Any:
+    """The controller, or None. NEVER raises, never blocks the air.
+
+    The blanket except is deliberate and was earned: an earlier cut let an
+    unusable controller throw out of here, and `admission_ticket` calls this
+    before its own try - so the exception escaped into `_play_on_box` and
+    the clip did not go out. A gate that can take the station off air is a
+    worse fault than the one it was installed to find."""
+    global _ADMISSION, _ADMISSION_WHY
+    if _admission_module is None:
+        return None
+    try:
+        mode, lanes, order = _admission_settings()
+        if mode == "off":
+            return None
+        if _ADMISSION is None:
+            try:
+                _ADMISSION = _admission_module.PlayoutController.open(
+                    _ADMISSION_DIR, resolve_audio=_admission_resolve,
+                    mode=mode, enforce_lanes=lanes, enforce_order=order)
+            except Exception as exc:  # noqa: BLE001
+                _ADMISSION_WHY = ("the admission store could not be opened: %r"
+                                  % (exc,))
+                return None
+        # The three switches are LIVE: the caller changes the mode file and
+        # the next dispatch is judged by the new rule, with no restart of a
+        # station that is on air.
+        _ADMISSION.mode = mode
+        _ADMISSION.enforce_lanes = set(lanes)
+        _ADMISSION.enforce_order = bool(order)
+        # A ROUTE CHANGE BUMPS THE OWNERSHIP GENERATION. "A route change or
+        # restart needs an ownership generation so late messages from the
+        # previous player cannot advance the current broadcast." The route
+        # is three fields of _RADIO, and this is the one place that reads
+        # all three on a clock the station already runs.
+        route = "|".join(str(_RADIO.get(k) or "") for k in
+                         ("voice_to", "voice_device", "box_talk"))
+        if _ADMISSION_ROUTE_SEEN[0] and route != _ADMISSION_ROUTE_SEEN[0]:
+            _ADMISSION.bump_generation("the output route changed to " + route)
+        _ADMISSION_ROUTE_SEEN[0] = route
+        return _ADMISSION
+    except Exception as exc:  # noqa: BLE001
+        _ADMISSION_WHY = "the admission controller is unusable: %r" % (exc,)
+        return None
+
+
+def _admission_remember_route(occurrence_id: str, routes: Any) -> None:
+    """Bounded: which transports have carried this occurrence."""
+    if not occurrence_id:
+        return
+    _ADMISSION_ROUTES[str(occurrence_id)] = set(routes)
+    if len(_ADMISSION_ROUTES) > 240:
+        for key in list(_ADMISSION_ROUTES)[:120]:
+            _ADMISSION_ROUTES.pop(key, None)
+
+
+def _admission_producer(depth: int = 2) -> str:
+    """WHICH PRODUCER STARTED THIS.
+
+    The audit asks for every broadcast producer and recovery path to be
+    audited. With both transports behind one door, the caller's own frame
+    IS that census - name and line, taken off the stack rather than off
+    thirty hand-edited call sites that would each be a separate chance to
+    take the station down."""
+    try:
+        # app.py has no module-level `sys`; it imports it locally as `_sys`
+        # where it needs frames (app.py:10158, 10204). Same habit here.
+        import sys as _sys
+        frame = _sys._getframe(depth)                 # noqa: SLF001
+        return "%s:%d" % (frame.f_code.co_name, frame.f_lineno)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _admission_lane(path: str, kind: str = "", reply: bool = False) -> str:
+    if reply or str(kind or "") == "reply":
+        return "reply"
+    low = (str(path or "") + " " + str(kind or "")).lower()
+    for needle, lane in (("/sfx/", "sfx"), ("sting", "sfx"), ("sfx", "sfx"),
+                         ("advert", "advert"), ("/ad/", "advert"),
+                         ("rescue", "rescue"), ("music", "music"),
+                         ("station_id", "station")):
+        if needle in low:
+            return lane
+    return "speech"
+
+
+def _admission_fresh(row: Any) -> bool:
+    """Is this occurrence still plausibly the one in the room?
+
+    A second transport onto the same audio is only a SECOND ROUTE while the
+    audio could still be sounding. After that it is a new play, and a new
+    play deserves its own occurrence - which is the whole of the audit's
+    reusable-sample rule: "Playing the same sting twice produces two
+    distinct occurrences in the script."""
+    if not isinstance(row, dict):
+        return False
+    at = float(row.get("dispatched_at") or row.get("admitted_at") or 0)
+    if at <= 0:
+        return True
+    span = float((row.get("audio") or {}).get("seconds") or 0)
+    return (time.time() - at) <= (span + 120.0)
+
+
+def admission_ticket(path: str, sig: str = "", *, route: str = "box",
+                     reply: bool = False, kind: str = "", text: str = "",
+                     seconds: float = 0.0,
+                     producer: str = "") -> dict[str, Any]:
+    """THE question both transports ask: was this committed first?
+
+    Returns a small dict rather than the controller's Verdict, so a station
+    with no controller at all reads exactly the same shape:
+
+        allow          may this audio go out (always True in observe mode)
+        occurrence_id  what to record the outcome against, or ""
+        owner          True when THIS transport started the occurrence
+        would_refuse   what enforcement would have done instead
+        reason         the refusal's name, or "admitted" / "route"
+    """
+    out: dict[str, Any] = {"allow": True, "occurrence_id": "", "owner": False,
+                           "would_refuse": False, "reason": "no_controller",
+                           "position": -1}
+    controller = admission_controller()
+    if controller is None:
+        return out
+    lane = _admission_lane(path, kind, reply=reply)
+    producer = producer or _admission_producer(3)
+    try:
+        # A SECOND ROUTE ONTO ONE OCCURRENCE IS NOT A SECOND OCCURRENCE.
+        # The burst airs on the page AND on the box; a sting is appended to
+        # the feed and handed to the speaker. Those are two deliveries of
+        # one committed line, and counting them twice would put a phantom
+        # position in the script for every line the station broadcasts.
+        got = controller.reconcile(media=path)
+        held = None
+        if got.get("occurrence_id"):
+            held = controller.occurrence(str(got.get("occurrence_id")))
+        state = str((held or {}).get("state") or "")
+        oid = str((held or {}).get("occurrence_id") or "")
+        carried = set(_ADMISSION_ROUTES.get(oid) or ())
+        # THE ROUTE IS WHAT TELLS THEM APART. The page and the box carrying
+        # one burst is two deliveries of ONE committed line. The box
+        # carrying the same sting twice is two PLAYS, and the audit is
+        # explicit that those are two occurrences with two positions. The
+        # only difference between the two cases is whether THIS transport
+        # has already carried this occurrence.
+        if (held and state in ("dispatching", "finished")
+                and _admission_fresh(held) and route not in carried):
+            carried.add(route)
+            _admission_remember_route(oid, carried)
+            controller.acknowledge(oid, listener=route, event="route:" + route)
+            out.update(allow=True, occurrence_id=oid, owner=False,
+                       reason="route", position=int(held.get("position") or -1))
+            return out
+        verdict = controller.gate(lane=lane, path=path, sig=sig,
+                                  producer=producer, reply=reply, kind=kind,
+                                  text=text, seconds=seconds)
+        if verdict.occurrence_id:
+            _admission_remember_route(str(verdict.occurrence_id), {route})
+        out.update(allow=bool(verdict.allow),
+                   occurrence_id=str(verdict.occurrence_id or ""),
+                   owner=bool(verdict.allow and verdict.occurrence_id),
+                   would_refuse=bool(verdict.would_refuse),
+                   reason=str(verdict.reason or ""),
+                   position=int(verdict.position))
+        return out
+    except Exception as exc:  # noqa: BLE001
+        # The gate must never be the reason the station went quiet.
+        try:
+            pipeline_log("air", "the admission gate errored and was ignored",
+                         extra="%r" % (exc,))
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+
+def admission_delivery(ticket: Any, outcome: str,
+                       evidence: Any = None) -> None:
+    """What became of it.
+
+    `accepted` is the honest verdict for a transport that returned a player
+    name: "Do not equate a command acknowledgment with proof that sound
+    reached a speaker." Only evidence that names how audibility was
+    established may ever be recorded as `delivered`."""
+    controller = admission_controller()
+    if controller is None or not ticket or not ticket.get("occurrence_id"):
+        return
+    try:
+        controller.record_delivery(str(ticket["occurrence_id"]), str(outcome),
+                                   evidence=dict(evidence or {}))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def admission_admit_round(clip: Any, rows: Any, length: float,
+                          producer: str = "") -> str:
+    """ADMIT A FINISHED WELDED ROUND, with its authoritative cue sheet,
+    BEFORE either transport is touched.
+
+        "Existing welded round files are useful: they already preserve
+         internal audio order. Retain those files and give them an
+         authoritative cue sheet rather than rebuilding voice generation."
+
+    `rows` is the burst's own per-turn timeline AFTER the loudness-pass
+    correction - the numbers the booth marker is already driven off. This
+    records them. It does not recompute them and it does not rescale them.
+    """
+    controller = admission_controller()
+    if controller is None or not rows or _admission_module is None:
+        return ""
+    try:
+        candidate = _admission_module.welded_round_candidate(
+            path=str((clip or {}).get("path") or ""),
+            sig=str((clip or {}).get("sig") or ""),
+            rows=list(rows), length=float(length or 0.0),
+            producer=producer or _admission_producer(2),
+            label=str((clip or {}).get("label") or "")[:120])
+        record = controller.admit(candidate)
+        return str(record.get("occurrence_id") or "")
+    except Exception as exc:  # noqa: BLE001
+        # A round that cannot be admitted is NOT stopped here. In observe
+        # mode the transports will record it as an unadmitted dispatch,
+        # which is precisely the measurement the caller is collecting.
+        try:
+            pipeline_log("air", "a round could not be admitted",
+                         extra="%r" % (exc,))
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+
+def admission_state(limit: int = 40) -> dict[str, Any]:
+    """The committed sequence, for the Script view and for /api/admission."""
+    controller = admission_controller()
+    if controller is None:
+        return {"available": False, "occurrences": [], "mode": "off",
+                "why": _ADMISSION_WHY
+                       or "the admission controller is switched off"}
+    try:
+        payload = controller.cue_map(limit=max(1, int(limit)))
+        payload["available"] = True
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "occurrences": [], "mode": "error",
+                "why": "%r" % (exc,)}
+
+
+# --- broadcast admission (2026-09-15) --- end
 _NABU_SPEECH_ACTIVE: dict[str, Any] = {}
 _NABU_SPEECH_CONTROL = asyncio.Lock()
 _NABU_SPEECH_EPOCH = {"voice": 0, "reply": 0}
@@ -22290,6 +22633,80 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
         return ""
 
 
+# --- broadcast admission (2026-09-15) ---
+#
+# THE BOX TRANSPORT, BEHIND THE GATE.
+#
+# `_play_on_box` is REBOUND rather than edited. Python resolves a global by
+# name at call time, so all 39 direct call sites - the burst, the sting,
+# the drop, the hold-shelf drain, the rescue, the produced ad, the probe,
+# the button ack, the recovery replay - go through this door from the
+# moment the module finishes importing, with no edit at any of them.
+#
+# That is what "migrate every producer and recovery route" has to mean when
+# the producers number thirty inside a 9.7 MB file that is on air: move the
+# door, not thirty thresholds. Each producer is still identified, by name
+# and line, from its own stack frame - so the observe-mode census names
+# every one of them without a single hand-edited call site.
+#
+# A refusal returns "", the existing box-declined contract every caller
+# already has a road for. #1120 is emphatic that it must be "" and not a
+# dict: two callers read the emptiness AS THE VERDICT, and a truthy return
+# told both of them a clip had been delivered when it had not.
+_play_on_box_admitted = _play_on_box
+
+
+@wraps(_play_on_box_admitted)
+async def _play_on_box(path: str, sig: str, reply: bool = False,
+                       replay: bool = False) -> str:
+    ticket = admission_ticket(path, sig, route="box", reply=reply,
+                              seconds=_clip_seconds(path),
+                              producer=_admission_producer(2))
+    if not ticket.get("allow"):
+        try:
+            note_activity("held", "not admitted to the broadcast sequence "
+                                  "- kept for the page")
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+    try:
+        played = await _play_on_box_admitted(path, sig, reply=reply,
+                                             replay=replay)
+    except BaseException as exc:                      # noqa: BLE001
+        admission_delivery(ticket, "failed",
+                           {"error": "%s: %s" % (type(exc).__name__, exc),
+                            "route": "box", "audible_confirmed": False})
+        raise
+    if not ticket.get("owner"):
+        # A second route onto an occurrence another transport started. Its
+        # verdict is recorded beside the first rather than over it.
+        admission_delivery(ticket, "accepted" if played else "blocked",
+                           {"route": "box", "second_route": True,
+                            "audible_confirmed": None})
+        return played
+    if not played:
+        # The transport declined before sending: paused, switched off, the
+        # breaker open, the firmware down, the shelf ahead of it. Blocked,
+        # and said so - an occurrence that never went out keeps its
+        # committed position and is not quietly forgotten.
+        admission_delivery(ticket, "blocked",
+                           {"route": "box", "audible_confirmed": False,
+                            "note": str(_ANNOUNCE_LAST.get("error") or "")[:200]
+                                    or "the box declined before sending"})
+        return played
+    receipt = dict(_LAST_PLAYOUT)
+    mine = receipt.get("key") == _played_out_key(path)
+    admission_delivery(ticket, "accepted", {
+        "route": "box", "player": str(played)[:80],
+        "audible_confirmed": receipt.get("audible_confirmed") if mine else None,
+        "evidence": (str(receipt.get("evidence") or "")[:120] if mine else
+                     "the shared playout meter held another clip's key (#807)"),
+        "ratio": receipt.get("ratio") if mine else None,
+        "note": str(receipt.get("evidence_note") or "")[:200] if mine else ""})
+    return played
+
+
+# --- broadcast admission (2026-09-15) --- end
 async def _nabu_played_since(t0: float) -> bool:
     """#822: audible proof. The Nabu's MEDIA PLAYER must have entered
     'playing' since this announce began — the entity being merely online
@@ -23972,6 +24389,75 @@ def page_feed_append(clip: dict[str, Any]) -> str:
         return ""
 
 
+# --- broadcast admission (2026-09-15) ---
+#
+# THE PAGE TRANSPORT, BEHIND THE SAME GATE.
+#
+# `page_feed_append` is "#1147: THE one door onto the page voice feed", and
+# the second of the two boundaries the audit names. Rebinding it puts all
+# 29 direct call sites behind admission at once - including the recovery
+# road, `page_recovery_start`, which republishes a preserved FIFO after a
+# deploy and must keep the committed identity of what it republishes.
+#
+# A clip carrying `stream: {length, rows}` already HAS its cue sheet: the
+# burst path computed it. Where that is present and nothing has been
+# admitted for the audio yet, it is admitted here, with those exact
+# offsets, before the clip reaches the feed.
+#
+# A refusal returns "", which is what this function already returns on
+# every failure path, and its callers read an empty delivery id as "not
+# published".
+_page_feed_append_admitted = page_feed_append
+
+
+@wraps(_page_feed_append_admitted)
+def page_feed_append(clip: dict[str, Any]) -> str:
+    url = str((clip or {}).get("url") or "")
+    kind = str((clip or {}).get("kind") or "")
+    reply = kind == "reply"
+    stream = (clip or {}).get("stream") if isinstance(clip, dict) else None
+    if isinstance(stream, dict) and stream.get("rows") and url and not reply:
+        controller = admission_controller()
+        if controller is not None:
+            try:
+                got = controller.reconcile(media=url)
+                held = None
+                if got.get("occurrence_id"):
+                    held = controller.occurrence(str(got.get("occurrence_id")))
+                if not (held and _admission_fresh(held)):
+                    admission_admit_round(
+                        {"path": url.split("?")[0],
+                         "sig": url.split("?t=")[-1] if "?t=" in url else ""},
+                        list(stream.get("rows") or []),
+                        float(stream.get("length") or 0.0),
+                        producer=_admission_producer(2))
+            except Exception:  # noqa: BLE001
+                pass
+    ticket = admission_ticket(url, "", route="page", reply=reply, kind=kind,
+                              text=str((clip or {}).get("text") or ""),
+                              seconds=float((clip or {}).get("seconds") or 0.0),
+                              producer=_admission_producer(2))
+    if not ticket.get("allow"):
+        return ""
+    delivery = _page_feed_append_admitted(clip)
+    if delivery and ticket.get("occurrence_id") and isinstance(clip, dict):
+        # The page's own rows can now be joined to the committed occurrence
+        # without a wall clock in between.
+        clip["playback_occurrence_id"] = ticket["occurrence_id"]
+        clip["playback_position"] = ticket.get("position")
+    if ticket.get("owner"):
+        # PUBLISHED IS NOT HEARD. The page is a browser that may be muted,
+        # backgrounded, or not there at all; #1239 and the pause rules are
+        # both scars from treating publication as air.
+        admission_delivery(ticket, "accepted" if delivery else "blocked",
+                           {"route": "page", "delivery_id": str(delivery or ""),
+                            "audible_confirmed": None,
+                            "evidence": "published to the page voice feed",
+                            "note": "publication is not audible playback"})
+    return delivery
+
+
+# --- broadcast admission (2026-09-15) --- end
 def page_picture_append(clip: dict[str, Any], at_ms: int = 0) -> dict[str, Any]:
     """#1322: a PICTURE, rung for every surface, with no claim on the air.
 
@@ -28520,6 +29006,13 @@ def dj_state() -> dict[str, Any]:
                       "until": float(r.get("until") or 0)}
                      for r in (_STREAM_NOW.get("rows") or [])],
         } if _STREAM_NOW else None),
+        # # --- broadcast admission (2026-09-15) ---
+        # The committed sequence, for the Script view. The view reads this
+        # instead of reconstructing a position out of estimates: it is what
+        # the controller admitted, in the order it admitted it, with the
+        # exact audio identity and cue sheet of each occurrence.
+        "admission": admission_state(12),
+        # # --- broadcast admission (2026-09-15) --- end
         # How the booth reached the vector DB, most recent first (#595).
         "vector_access": (_RADIO.get("vector_access") or [])[:12],
         # The repair banner (#368, #369): fresh for three minutes after a
@@ -84079,6 +84572,16 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             max(0.0, float(_beat3) * _bscale), 3)
                 except Exception:  # noqa: BLE001
                     pass            # a download never costs the air a beat
+                # # --- broadcast admission (2026-09-15) ---
+                # ADMITTED BEFORE EITHER TRANSPORT IS TOUCHED. The file is
+                # finished, `rows` is its cue sheet after the loudness-pass
+                # correction, and `length` is what the mixer produced - so
+                # this is the first moment the audit's precondition can be
+                # met at all: "verify that its final audio is available and
+                # its ordered line/cue offsets are known" BEFORE committing.
+                admission_admit_round(one, rows, length,
+                                      producer="_speak_turns_floorless")
+                # # --- broadcast admission (2026-09-15) --- end
                 # Deliver the ONE clip on the routing the DJ voice is set to,
                 # mirroring to the page when the box is down (#536).
                 vto = _RADIO.get("voice_to") or "box"
@@ -108038,9 +108541,54 @@ def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict
                    "open": pick(_PULSE.get("open"), ("at", "seconds", "frame")),
                    "stalls": [pick(r, ("at", "seconds", "frame")) for r in stalls[-12:]],
                    "omitted_stalls": max(0, len(stalls) - 12)}
+    # # --- broadcast admission (2026-09-15) ---
+    # Section 5 of the recording note: "Extend the existing incident
+    # capture with references to the relevant script revision, performer
+    # session, accepted cut, assembly and playback occurrence." A reference
+    # the station does not carry is reported ABSENT, never invented.
+    try:
+        _admission_now = admission_controller()
+        out["admission"] = (_admission_now.references() if _admission_now
+                            else {"available": False,
+                                  "why": "the admission controller is off"})
+        if _admission_now is not None:
+            _admission_map = _admission_now.cue_map(limit=12)
+            out["admission"]["mode"] = _admission_map.get("mode")
+            out["admission"]["reader_position"] = _admission_map.get("reader_position")
+            out["admission"]["counts"] = _admission_map.get("counts")
+            out["admission"]["recent_refusals"] = _admission_map.get("refusals")
+    except Exception as _admission_exc:  # noqa: BLE001
+        out["admission"] = {"available": False, "why": "%r" % (_admission_exc,)}
+    # # --- broadcast admission (2026-09-15) --- end
     return out
 
 
+# --- broadcast admission (2026-09-15) ---
+@app.get("/api/admission")
+async def admission_api(limit: int = Query(default=40, ge=1, le=200),
+                        authorization: str | None = Header(default=None)) -> Any:
+    """THE CENSUS THE CALLER MEASURES BEFORE ENFORCING.
+
+    `counts` carries one key per refusal reason and, in observe mode, a
+    `would_refuse:` twin for each. A day of this is what says whether
+    turning a lane on would have silenced anything - and which producer
+    would have been silenced, by name and line."""
+    require_read_auth(authorization)
+    controller = admission_controller()
+    payload = admission_state(limit)
+    payload["mode_file"] = str(_ADMISSION_MODE_FILE)
+    payload["how_to_enforce"] = (
+        "write one line into the mode file: 'observe' (the default), "
+        "'enforce', 'enforce sfx' for a single lane, or "
+        "'enforce sfx,advert order' to add the ordering rule. It is re-read "
+        "within three seconds; no restart.")
+    if controller is not None:
+        payload["stats"] = controller.stats()
+        payload["refusals"] = controller.refusals(limit=limit)
+    return payload
+
+
+# --- broadcast admission (2026-09-15) --- end
 def _view_num(view: dict[str, Any], *keys: str) -> float:
     for k in keys:
         try:

@@ -681,6 +681,27 @@
   }
 
   function paintChrome() {
+    /* #1156 - "When I am in full screen, fade the tabs down to 5%."
+     *
+     * THE TABS ARE NOT IN THIS VIEW. #pineViewRail is rail.js's own fixed
+     * element on the BODY, a sibling of this view's host and above it
+     * (z-index 2147483001 against the host's 2147483000), which is why it
+     * was still at full strength over the clip when everything inside
+     * .pl-face had gone. No selector rooted at the host can reach it.
+     *
+     * So the bare state is published where anything in the document can
+     * see it: one class on <html>. listen-music.css writes the opacity
+     * against #pineViewRail from there, and rail.js is not touched - it
+     * has another pair of hands in it tonight, and a view is not entitled
+     * to reach into the furniture anyway.
+     *
+     * WRITTEN BEFORE THE HOST GUARD, DELIBERATELY. This is a class on an
+     * element outside this view, so it must come off even in the case
+     * where the host has gone - a rail left at five percent with no view
+     * to explain it is furniture the operator cannot find, and this
+     * function is the only writer of it. */
+    const doc = document.documentElement;
+    if (doc && doc.classList) doc.classList.toggle("pine-listen-bare", bare);
     if (!viewHost) return;
     viewHost.classList.toggle("pl-bare", bare);
     viewHost.classList.toggle("pl-idle", idleDim && !bare);

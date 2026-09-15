@@ -142,6 +142,27 @@
   touch-action: none;
   overscroll-behavior: contain;
 }
+/* #1154: "it is a little laggy when I'm drawing the strokes."
+
+   The ink was never the cost - the stroke handler measures 0.055 ms a move
+   - but the panel underneath was still doing 60 ms of style, layout and
+   paint for every frame it produced, all of it into a screen this opaque
+   sheet completely covers. While the sheet is up that work is skipped, and
+   the tablet went from 3.9 fps to 11 fps (median frame gap 167 ms -> 86
+   ms), which is the pacer's own floor.
+
+   ONE CLASS, SET ON <html> BY hot-corners.js, so a single removal puts the
+   whole page back however the sheet went away - a per-element list left a
+   terminal dark once already. content-visibility, not display:none: layout
+   and scroll positions survive, so nothing jumps when it comes back.
+
+   The exceptions are the overlays that must still speak over a modal: the
+   annotator itself, its toast, the corner sheets, and the report pad that
+   filing opens. */
+html.hc-hushed body > *:not(.hc-ink):not(.hc-toast):not(.hc-sheet):not(#pineReportPad) {
+  content-visibility: hidden;
+}
+
 .hc-ink-canvas {
   display: block; position: absolute; left: 0; top: 0;
   touch-action: none;
@@ -172,11 +193,18 @@
    stays exactly where it has always been.
 
    MEASURED ON THE TABLET, not guessed: the waiting line is 38 px tall and
-   the full strip 145 px, both sitting 14 px off the bottom. 172 clears the
+   the full strip 145 px, both sitting 14 px off the bottom. 172 cleared the
    taller one with eight to spare; the first draft said 136 and the toolbar
-   sat ON TOP of the thumbnails. */
+   sat ON TOP of the thumbnails.
+
+   #1155 ADDED TWO ROWS to the strip - the coarse slider that carries the
+   whole ring, and the line that says where the window sits - so the
+   toolbar is lifted again. RE-MEASURED ON THE TABLET, not guessed: the
+   strip is now 214 px tall and sits 14 px up, so its top edge is 228 px
+   off the bottom; 240 clears it with twelve to spare. 226 was the first
+   try and the toolbar overlapped the thumbnails by three pixels. */
 .hc-ink.hc-scrub-wait .hc-ink-bar { bottom: 62px; }
-.hc-ink.hc-scrub .hc-ink-bar { bottom: 172px; }
+.hc-ink.hc-scrub .hc-ink-bar { bottom: 240px; }
 
 .hc-strip {
   position: absolute; left: 50%; bottom: 14px;
@@ -222,9 +250,33 @@
 .hc-strip-at { line-height: 1.2; }
 .hc-strip-slider { width: 100%; margin: 0; touch-action: manipulation; }
 
+/* #1155 THE COARSE SLIDER - the whole recording range. "I would like to go
+   back the whole recording range."
+
+   direction: rtl so that hard RIGHT is now and dragging LEFT walks into the
+   past, the way a timeline reads everywhere else on the station, while the
+   value stays plain seconds-before-now and the script inverts nothing.
+
+   A taller thumb than the fine slider on purpose: this is the one a thumb
+   drags across twenty minutes of ring, and it wants to be found without
+   looking. The rule above it separates the two so they cannot be confused
+   for one control. */
+.hc-strip-far {
+  display: flex; align-items: center; gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line, #35414c);
+}
+.hc-strip-coarse {
+  flex: 1 1 auto; width: 100%; margin: 0;
+  direction: rtl;
+  height: 28px;
+  touch-action: manipulation;
+  accent-color: #65c7da;
+}
+
 @media (max-width: 620px) {
   .hc-strip-thumb img { width: 64px; height: 40px; }
-  .hc-ink.hc-scrub .hc-ink-bar { bottom: 156px; }
+  .hc-ink.hc-scrub .hc-ink-bar { bottom: 224px; }
 }
 
 /* THE TOAST. The same foot-of-screen line the line actions use. */

@@ -1109,3 +1109,57 @@
   .pb-listen .pl-face,
   .pb-listen .pl-shade { transition: none; }
 }
+
+/* ===============================================  THE TABS  ============
+
+   #1156 - "When I am in full screen, fade the tabs down to 5%."
+
+   Full screen is the bare mode #1152 asked for: a double tap on the clip
+   takes .pl-face away and drops the shade. What was left on the glass
+   afterwards was the picture, the talk dot - which the operator asked for
+   by name - and the view rail down the right-hand edge at full strength.
+
+   THE RAIL IS NOT THIS VIEW'S TO REACH DOWN INTO. rail.js builds
+   #pineViewRail on the BODY and gives it z-index 2147483001, one above the
+   view host it floats over, so there is no selector starting at #listen
+   that can find it. listen.js therefore stamps `pine-listen-bare` on
+   <html> whenever bare mode is on and takes it off on every road out -
+   the second double tap, Escape, the tab going hidden, the view being
+   closed - and the rule below is the only thing that reads it. rail.js
+   itself is untouched.
+
+   SPECIFICITY, SINCE TWO STYLESHEETS ARE INVOLVED. RAIL_CSS is injected by
+   rail.js and lands AFTER this file, so a plain `#pineViewRail` here would
+   lose every tie. `html.pine-listen-bare #pineViewRail` is an id and a
+   class, which beats a bare id whatever the source order - and rail.js
+   sets no opacity of its own, so nothing is being fought over.
+
+   FIVE PERCENT, AND STILL A BUTTON. Opacity has never affected hit
+   testing: the tabs take a tap at .05 exactly as they do at 1, and the
+   rail keeps its own scrolling. That is the whole reason the operator's
+   number is safe to obey - he asked for the tabs faded, not disabled, and
+   he must be able to leave the view without guessing where the edge is.
+   Nothing here touches pointer-events, and nothing may.
+
+   A FINGER ON THE RAIL BRINGS IT BACK, AND COSTS NOTHING. :hover, :active
+   and :focus-within are three pseudo-classes and no JavaScript at all - no
+   listener, no timer, no frame, which is the only kind of "while the
+   finger is near it" this tablet should be asked to pay for. On glass
+   Chromium applies :hover on touch and holds it until the next tap
+   somewhere else, so the rail comes up under the thumb, stays up while it
+   is being used, and settles back to five percent once the operator
+   touches the picture again. */
+
+#pineViewRail {
+  /* The same 600ms ease the chrome fades on, so the two halves of one
+     gesture move together rather than one snapping and one gliding. */
+  transition: opacity 600ms ease;
+}
+html.pine-listen-bare #pineViewRail { opacity: .05; }
+html.pine-listen-bare #pineViewRail:hover,
+html.pine-listen-bare #pineViewRail:active,
+html.pine-listen-bare #pineViewRail:focus-within { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  #pineViewRail { transition: none; }
+}

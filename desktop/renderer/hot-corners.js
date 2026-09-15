@@ -67,6 +67,30 @@
                                wobble is still a wobble */
   var STORE = 'pineHotCorners';
   var STEPS = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1200];
+
+  /* #1155 THE SCRUB STRIP'S REACH. "I would like to go back the whole
+   * recording range."
+   *
+   * SCRUB_WINDOW   how many seconds of ring one strip of thumbnails shows.
+   * SCRUB_COUNT    how many thumbnails that is.
+   * SCRUB_STEP     windows are snapped to this many seconds so that sliding
+   *                back and forth lands on the SAME window twice and the
+   *                cache can answer it. Without snapping every pixel of the
+   *                coarse slider would be a fresh mux of the ring.
+   * SCRUB_SETTLE   how long the coarse slider must be still before the ask
+   *                goes out. A drag across 20 minutes crosses hundreds of
+   *                windows and must not ask for any of them on the way.
+   * SCRUB_CACHE    the cap on remembered thumbnails, in BASE64 CHARACTERS.
+   *                5 MB of base64 is about 170 thumbnails at the ~30 kB
+   *                each one measures - 17 windows - and JavaScript holds
+   *                those characters as UTF-16, so the real cost is nearer
+   *                10 MB. That is the ceiling worth paying on this tablet;
+   *                past it the least recently used window is dropped. */
+  var SCRUB_WINDOW = 5;
+  var SCRUB_COUNT = 10;
+  var SCRUB_STEP = 5;
+  var SCRUB_SETTLE = 260;
+  var SCRUB_CACHE = 5 * 1024 * 1024;
   var ACTIONS = ['off', 'shot', 'export', 'inspect', 'sfx', 'report'];
   var ACTION_WORDS = {
     off: 'Off',
@@ -196,6 +220,28 @@
     if (s < 60) return s + ' s';
     var m = s / 60;
     return (m === Math.floor(m) ? m : m.toFixed(1)) + ' min';
+  }
+
+  /* #1155: HOW FAR BACK, IN REAL TIME. "I would like to go back the whole
+   * recording range" means the labels run to twenty minutes, and "-732.4s"
+   * is not a time anybody reads. Under a minute keeps the tenth of a
+   * second the operator was already picking frames by; past it the tenth
+   * is noise and the minute is the thing.
+   *
+   *   0      -> 'now'      12.4 -> '12.4s'
+   *   72     -> '1m 12s'   732  -> '12m 12s'
+   *
+   * Pure, and the one place this wording is decided: the thumbnail labels,
+   * the coarse slider's read-out and the line the report is filed with all
+   * come through here, so they can never disagree with each other. */
+  function fmtBack(sec) {
+    sec = Number(sec);
+    if (!isFinite(sec) || sec <= 0) return 'now';
+    if (sec < 60) return sec.toFixed(1) + 's';
+    var m = Math.floor(sec / 60);
+    var s = Math.round(sec - m * 60);
+    if (s === 60) { m += 1; s = 0; }
+    return m + 'm ' + s + 's';
   }
 
   /* -------------------------------------------------------------- config */
@@ -582,6 +628,10 @@
     wrap.appendChild(bar);
     doc.body.appendChild(wrap);
     if (root.PineDuck) root.PineDuck.hold('hc-ink', root.PineDuck.REPORT, wrap);   /* 2026-09-14 */
+    /* #1154: the sheet covers the screen, so nothing under it needs to be
+     * rendered while it is up. See hush() below for what this buys and
+     * what it deliberately leaves alone. */
+    hush();
 
     var ctx = canvas.getContext('2d');
     var img = new Image();
@@ -601,11 +651,75 @@
     var bgSrc = '';
     var scrubAt = 0;
 
+    /* #1154 - WHY THE INK FELT LATE, AND WHAT ACTUALLY FIXED IT.
+     *
+     * "This is alright. It looks like it's better, but it is a little
+     *  laggy when I'm drawing the strokes."
+     *
+     * The stroke handler was never the cost: 0.055 ms a move. What is
+     * slow is the PAGE. Traced on the tablet with the sheet already up and
+     * nobody drawing, ProxyMain::BeginMainFrame took 2035 ms of 2500 ms
+     * wall across 34 frames - 60 ms of style, layout and paint for every
+     * frame the panel produces - and the ink can never appear sooner than
+     * the frame that carries it. Measured: 3.9 fps while the sheet was up.
+     *
+     * AND NONE OF THAT WORK WAS VISIBLE. This sheet is fixed, inset:0 and
+     * opaque; the feed, the meters, the clocks and the wallpaper under it
+     * are painting into a covered screen. So while it is up they are taken
+     * out of the rendering lifecycle with content-visibility:hidden - not
+     * display:none, which would throw away their layout and their scroll
+     * positions - and put back exactly as they were on close. Measured
+     * again straight afterwards: 11 fps, median frame gap 167 ms -> 86 ms.
+     *
+     * 11 fps is the pacer's own floor (PINE_PACE=4 in app.py is ~67 ms a
+     * group plus a vsync), so this reaches it and cannot pass it. Going
+     * further means changing the pace, and app.py is not ours.
+     *
+     * WHAT IS DELIBERATELY LEFT ALONE: the toast, because it speaks while
+     * the sheet is up; the report pad, because filing opens it; and the
+     * corner sheets. They are named in the rule in hot-corners.css.
+     *
+     * ONE CLASS ON <html>, NOT A LIST OF ELEMENTS, AND THAT IS THE WHOLE
+     * SAFETY ARGUMENT. The first cut walked document.body.children, hid
+     * each one and remembered what to put back. It shipped a terminal that
+     * went dark: the sheet left the DOM by a road that does not run
+     * close() - measured on the tablet, 36 children still hidden with no
+     * sheet up and nothing on screen - and a per-element list can only be
+     * undone by the code that made it. A class cannot leak that way: one
+     * removal restores everything, whatever happened in between, including
+     * elements that arrived while the sheet was up. And the WATCHDOG below
+     * removes it the moment there is no sheet left to justify it, so the
+     * worst case is one second of a covered screen instead of a dead one.
+     *
+     * Rendering only: timers, audio and the broadcast are untouched. */
+    var hushGuard = null;
+    function hush() {
+      if (!doc.documentElement || !doc.documentElement.classList) return;
+      doc.documentElement.classList.add('hc-hushed');
+      if (hushGuard) return;
+      /* THE DEAD MAN'S HANDLE. Nothing may keep the page hidden once the
+       * sheet that asked for it is gone, however it went. */
+      hushGuard = setInterval(function () {
+        if (!doc.querySelector('.hc-ink')) unhush();
+      }, 1000);
+    }
+    function unhush() {
+      if (hushGuard) { clearInterval(hushGuard); hushGuard = null; }
+      try {
+        if (doc.documentElement && doc.documentElement.classList) {
+          doc.documentElement.classList.remove('hc-hushed');
+        }
+      } catch (e) { /* nothing left to restore */ }
+    }
+
     var entry = {box: wrap, body: wrap, close: null};
     var unwatch = null;
     function close() {
       var at = sheets.indexOf(entry);
       if (at >= 0) sheets.splice(at, 1);
+      /* FIRST, and outside everything that can throw: a sheet that went
+       * away leaving the page hidden would be a black terminal. */
+      unhush();
       if (unwatch) { try { unwatch(); } catch (e) { /* gone */ } unwatch = null; }
       root.removeEventListener('resize', fit);
       if (revoke) { try { revoke(); } catch (e) { /* gone */ } revoke = null; }
@@ -706,22 +820,50 @@
       inkId = ev.pointerId;
       try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
       stroke = [{x: ev.clientX, y: ev.clientY}];
+      /* #1154: the ink style is set ONCE per stroke, not once per move.
+       * Every redraw() ends by setting it too, and changing canvas.width
+       * (fit) resets the context and then redraws - so the context is
+       * always carrying the ink's stroke style when a move arrives. */
       inkStyle();
       path(stroke);
       ev.preventDefault();
-    });
+    }, {passive: false});
+
+    /* #1154: "This is alright. It looks like it's better, but it is a
+     *  little laggy when I'm drawing the strokes."
+     *
+     * MEASURED FIRST, AND THE OBVIOUS SUSPECT WAS INNOCENT. This handler
+     * already drew only the NEW segment rather than repainting the world,
+     * and it costs 0.055 ms a move on the tablet (240 moves, p95 0.1 ms,
+     * worst 3.1 ms). The page around it is the cost - see hush() below -
+     * and on top of that the panel paces requestAnimationFrame to one
+     * group every ~67 ms (app.py, PINE_PACE), so pointermove arrives in
+     * clumps rather than one delivery per digitiser sample.
+     *
+     * COALESCED EVENTS are the cure for what that clumping LOOKS like.
+     * The engine keeps every sample taken between two deliveries; without
+     * asking for them a fast stroke is one straight chord across the whole
+     * gap, which reads as angular AND late. With them the line follows the
+     * finger's real path, and the whole batch goes down as ONE path with
+     * one stroke() rather than a beginPath/stroke pair per point. */
     canvas.addEventListener('pointermove', function (ev) {
       if (inkId === null || ev.pointerId !== inkId || !stroke) return;
+      ev.preventDefault();
+      var pts = null;
+      if (typeof ev.getCoalescedEvents === 'function') {
+        try { pts = ev.getCoalescedEvents(); } catch (e) { pts = null; }
+      }
+      if (!pts || !pts.length) pts = [ev];
       var last = stroke[stroke.length - 1];
-      var p = {x: ev.clientX, y: ev.clientY};
-      stroke.push(p);
-      inkStyle();
       ctx.beginPath();
       ctx.moveTo(last.x, last.y);
-      ctx.lineTo(p.x, p.y);
+      for (var i = 0; i < pts.length; i += 1) {
+        var p = {x: pts[i].clientX, y: pts[i].clientY};
+        stroke.push(p);
+        ctx.lineTo(p.x, p.y);
+      }
       ctx.stroke();
-      ev.preventDefault();
-    });
+    }, {passive: false});
     function inkUp(ev) {
       if (inkId === null || ev.pointerId !== inkId) return;
       try { canvas.releasePointerCapture(ev.pointerId); } catch (e) { /* not held */ }
@@ -759,23 +901,90 @@
      * replayFrames, and an empty strip or an error there would be a worse
      * annotator than the one that shipped. So: no bridge road, or ok:false,
      * or no frames, and the whole thing is taken back off the sheet. */
+    /* #1155 - AND IT REACHES THE WHOLE RING.
+     *
+     * "Okay, that is actually much smoother. That is better. Also, I would
+     *  like to go back the whole recording range."
+     *
+     * TWO CONTROLS, because one cannot be both. The COARSE slider carries
+     * the whole of what the ring holds - twenty minutes - and says where
+     * the shown window sits; the FINE slider walks the ten thumbnails
+     * inside that window. On a 1154x690 glass a single slider over 1200
+     * seconds gives a thumb about half a second of ring per pixel, which
+     * is no way to find a frame.
+     *
+     * WINDOWS, NEVER THE WHOLE THING. Twenty minutes of thumbnails would
+     * be 2400 pictures and tens of megabytes; the strip only ever holds
+     * SCRUB_WINDOW seconds of them, and asks for another window when the
+     * coarse slider settles. Asks are snapped to SCRUB_STEP so that going
+     * back to somewhere already visited is answered from the cache rather
+     * than by re-muxing the ring.
+     *
+     * THE FIRST PAINT IS STILL INSTANT. The sheet opens on the live shot,
+     * the nearest window (back = 0) is asked for straight away, and
+     * nothing reaches further back until the operator asks it to. */
     var strip = null;
     var stripThumbs = null;
     var stripSlider = null;
+    var stripCoarse = null;
+    var stripWhen = null;
     var shots = [];
+    var held = 0;                /* what the ring holds, in seconds */
+    var backNow = 0;             /* where the shown window ends, before now */
+    var settleTimer = null;
+    var inFlight = 0;            /* the ask whose answer is still wanted */
+
+    /* The window cache. Keyed by the snapped `back`; value is the frame
+     * list exactly as the bridge gave it. `cacheChars` is the measured
+     * base64 it holds, and the least recently used window goes when that
+     * passes SCRUB_CACHE - see the constant for why 5 MB. */
+    var cache = {};
+    var cacheOrder = [];
+    var cacheChars = 0;
+
+    function cacheKey(back) { return String(Math.round(back / SCRUB_STEP) * SCRUB_STEP); }
+
+    function cacheGet(back) {
+      var k = cacheKey(back);
+      var hit = cache[k];
+      if (!hit) return null;
+      var at = cacheOrder.indexOf(k);            /* freshen it */
+      if (at >= 0) { cacheOrder.splice(at, 1); cacheOrder.push(k); }
+      return hit;
+    }
+
+    function cachePut(back, list) {
+      var k = cacheKey(back);
+      if (cache[k]) return;
+      var chars = 0, i;
+      for (i = 0; i < list.length; i += 1) chars += String(list[i].image || '').length;
+      cache[k] = {list: list, chars: chars};
+      cacheOrder.push(k);
+      cacheChars += chars;
+      while (cacheChars > SCRUB_CACHE && cacheOrder.length > 1) {
+        var old = cacheOrder.shift();
+        if (cache[old]) { cacheChars -= cache[old].chars; delete cache[old]; }
+      }
+    }
 
     function dropStrip() {
+      if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
       if (strip && strip.parentNode) strip.parentNode.removeChild(strip);
       strip = null;
       stripThumbs = null;
       stripSlider = null;
+      stripCoarse = null;
+      stripWhen = null;
       shots = [];
+      cache = {};
+      cacheOrder = [];
+      cacheChars = 0;
       wrap.className = 'hc-ink';
     }
 
-    /* '-1.2s' for the older frames, 'now' for the live shot. */
+    /* '-1m 12s' for the older frames, 'now' for the live shot. */
     function stripLabel(at) {
-      return at > 0 ? '-' + at.toFixed(1) + 's' : 'now';
+      return at > 0 ? '-' + fmtBack(at) : 'now';
     }
 
     function pick(i) {
@@ -796,16 +1005,21 @@
         }
       }
       note.textContent = s.at > 0
-        ? 'the frame from ' + s.at.toFixed(1) + 's before the capture - the ink stays'
+        ? 'the frame from ' + fmtBack(s.at) + ' before the capture - the ink stays'
         : String(opts.note || 'draw on the picture, then file the report');
     }
 
-    function showStrip(got) {
-      if (!strip) return;
-      var list = (got && got.ok && got.frames && got.frames.length) ? got.frames : null;
-      if (!list) { dropStrip(); return; }
-      shots = [];
+    /* Paint the thumbnails for the window now in hand. `list` is the
+     * bridge's frames, oldest first; `atTail` says the window reaches now,
+     * in which case the newest tile is the LIVE SHOT rather than the ring's
+     * last frame - the operator is already drawing on the live shot, and
+     * coming back to "now" has to give back exactly the picture that was
+     * there, to the pixel, or the ink would no longer line up with what is
+     * under it. The ring's own last frame is still that tile's thumbnail:
+     * it is the cheap small one and it looks the same. */
+    function paintWindow(list, atTail) {
       var i;
+      shots = [];
       for (i = 0; i < list.length; i += 1) {
         var f = list[i];
         var at = Number(f && f.at);
@@ -813,19 +1027,13 @@
         var pic = String((f && f.image) || '');
         if (pic) shots.push({at: at, thumb: pic, full: pic, live: false});
       }
-      if (!shots.length) { dropStrip(); return; }
-      /* THE NEWEST TILE IS THE LIVE SHOT, not the ring's last frame. The
-       * operator is already drawing on the live shot; scrubbing back to
-       * "now" has to give back exactly the picture that was there, to the
-       * pixel, or the ink would no longer line up with what is under it.
-       * The ring's own last frame is still used as that tile's THUMBNAIL -
-       * it is the cheap small one, and it looks the same. */
-      shots[shots.length - 1].at = 0;
-      shots[shots.length - 1].live = true;
-
-      strip.className = 'hc-strip';
-      strip.innerHTML = '';
-      stripThumbs = make('div', 'hc-strip-thumbs');
+      if (!shots.length) return false;
+      if (atTail) {
+        shots[shots.length - 1].at = 0;
+        shots[shots.length - 1].live = true;
+      }
+      if (!stripThumbs) return false;
+      stripThumbs.innerHTML = '';
       for (i = 0; i < shots.length; i += 1) {
         (function (idx) {
           var b = make('button', 'hc-strip-thumb');
@@ -839,19 +1047,129 @@
           stripThumbs.appendChild(b);
         }(i));
       }
+      stripSlider.max = String(shots.length - 1);
+      stripSlider.value = String(shots.length - 1);
+      pick(shots.length - 1);
+      return true;
+    }
+
+    function sayWhen(text) { if (stripWhen) stripWhen.textContent = text; }
+
+    /* Ask the bridge for the window ending `back` seconds before now, or
+     * answer it from the cache. Only the LAST ask counts: a drag across
+     * the ring can leave earlier answers in flight and they must not paint
+     * over the window the operator has since moved to. */
+    function loadWindow(back, onFirst) {
+      var snapped = Math.round(back / SCRUB_STEP) * SCRUB_STEP;
+      var hit = cacheGet(snapped);
+      if (hit) {
+        backNow = snapped;
+        paintWindow(hit.list, snapped <= 0);
+        sayWhen(snapped <= 0 ? 'the last ' + SCRUB_WINDOW + ' seconds'
+          : 'the ' + SCRUB_WINDOW + ' seconds ending ' + fmtBack(snapped) + ' ago');
+        return;
+      }
+      var mine = ++inFlight;
+      sayWhen(snapped <= 0 ? 'reading the last five seconds...'
+        : 'reading ' + fmtBack(snapped) + ' back...');
+      var asked;
+      try {
+        asked = bridge().replayFrames({seconds: SCRUB_WINDOW, count: SCRUB_COUNT, back: snapped});
+      } catch (err) { asked = Promise.reject(err); }
+      Promise.resolve(asked).then(function (got) {
+        if (!wrap.parentNode || mine !== inFlight) return;      /* stale */
+        var list = (got && got.ok && got.frames && got.frames.length) ? got.frames : null;
+        if (!list) {
+          if (onFirst) { dropStrip(); return; }
+          sayWhen('nothing readable that far back');
+          return;
+        }
+        /* What the ring holds can only be known once it has answered; the
+         * coarse slider's reach is set from it and grows as the ring does. */
+        var nowHeld = Number(got.held || got.seconds || 0);
+        if (isFinite(nowHeld) && nowHeld > held) {
+          held = nowHeld;
+          if (stripCoarse) stripCoarse.max = String(Math.max(SCRUB_STEP, Math.floor(held)));
+        }
+        cachePut(snapped, list);
+        backNow = snapped;
+        if (onFirst && !buildStrip()) { dropStrip(); return; }
+        if (!paintWindow(list, snapped <= 0)) { if (onFirst) dropStrip(); return; }
+        if (stripCoarse) stripCoarse.value = String(Math.round(snapped));
+        /* The bridge says where the window REALLY landed. Asking further
+         * back than the ring reaches is not an error - it is the oldest
+         * thing there is - but the operator is told rather than shown the
+         * wrong minute without a word. */
+        if (got.clamped) {
+          sayWhen('that is as far back as the ring goes - ' + fmtBack(Number(got.to) || 0) + ' ago');
+        } else {
+          sayWhen(snapped <= 0 ? 'the last ' + SCRUB_WINDOW + ' seconds'
+            : 'the ' + SCRUB_WINDOW + ' seconds ending ' + fmtBack(snapped) + ' ago');
+        }
+      }, function () {
+        if (!wrap.parentNode || mine !== inFlight) return;
+        /* Silence is the contract on the first ask: the annotator is
+         * exactly what it was where there is no ring to read. */
+        if (onFirst) dropStrip(); else sayWhen('that window could not be read');
+      });
+    }
+
+    /* The strip's furniture, built once the first window has answered. */
+    function buildStrip() {
+      if (!strip) return false;
+      strip.className = 'hc-strip';
+      strip.innerHTML = '';
+
+      stripThumbs = make('div', 'hc-strip-thumbs');
+
       stripSlider = doc.createElement('input');
       stripSlider.type = 'range';
       stripSlider.className = 'hc-strip-slider';
       stripSlider.min = '0';
-      stripSlider.max = String(shots.length - 1);
+      stripSlider.max = String(SCRUB_COUNT - 1);
       stripSlider.step = '1';
-      stripSlider.value = String(shots.length - 1);
+      stripSlider.value = String(SCRUB_COUNT - 1);
       stripSlider.addEventListener('input', function () { pick(Number(stripSlider.value)); });
       stripSlider.addEventListener('change', function () { pick(Number(stripSlider.value)); });
+
+      /* THE COARSE SLIDER runs backwards on purpose: hard right is now,
+       * and dragging left walks into the past, which is the direction a
+       * timeline runs everywhere else on this station. It is `direction:
+       * rtl` in the stylesheet, so the VALUE is still plain seconds-back
+       * and no arithmetic has to be inverted here. */
+      var row = make('div', 'hc-strip-far');
+      stripCoarse = doc.createElement('input');
+      stripCoarse.type = 'range';
+      stripCoarse.className = 'hc-strip-coarse';
+      stripCoarse.min = '0';
+      stripCoarse.max = String(Math.max(SCRUB_STEP, Math.floor(held || SCRUB_STEP)));
+      stripCoarse.step = String(SCRUB_STEP);
+      stripCoarse.value = '0';
+      stripWhen = make('div', 'hc-strip-line', 'the last ' + SCRUB_WINDOW + ' seconds');
+
+      function coarseMoved() {
+        var back = Number(stripCoarse.value) || 0;
+        /* The read-out follows the thumb at once; the ASK waits until the
+         * thumb stops. A drag over twenty minutes crosses hundreds of
+         * windows and must not mux the ring for any of them on the way. */
+        sayWhen(back <= 0 ? 'the last ' + SCRUB_WINDOW + ' seconds'
+          : fmtBack(back) + ' ago');
+        if (settleTimer) clearTimeout(settleTimer);
+        settleTimer = setTimeout(function () {
+          settleTimer = null;
+          loadWindow(back, false);
+        }, SCRUB_SETTLE);
+      }
+      stripCoarse.addEventListener('input', coarseMoved);
+      stripCoarse.addEventListener('change', coarseMoved);
+
+      row.appendChild(stripCoarse);
       strip.appendChild(stripThumbs);
       strip.appendChild(stripSlider);
+      strip.appendChild(row);
+      strip.appendChild(stripWhen);
       wrap.className = 'hc-ink hc-scrub';
-      pick(shots.length - 1);
+      return true;
     }
 
     if (opts.scrub && has('replayFrames')) {
@@ -859,25 +1177,29 @@
       strip.appendChild(make('div', 'hc-strip-line', 'reading the last five seconds...'));
       wrap.appendChild(strip);
       wrap.className = 'hc-ink hc-scrub-wait';
-      var asked;
-      try { asked = bridge().replayFrames({seconds: 5, count: 10}); }
-      catch (err) { asked = Promise.reject(err); }
-      Promise.resolve(asked).then(function (got) {
-        if (!wrap.parentNode) return;
-        showStrip(got);
-      }, function () {
-        /* Silence is the contract: the annotator is exactly what it was. */
-        if (!wrap.parentNode) return;
-        dropStrip();
-      });
+      /* What the ring holds, asked for beside the frames rather than
+       * before them - the first window must not wait on a second call.
+       * replayState is only a nicety here; replayFrames reports `held`
+       * itself and that is what actually sets the slider's reach. */
+      if (has('replayState')) {
+        Promise.resolve(bridge().replayState()).then(function (st) {
+          var s = Number(st && st.seconds);
+          if (isFinite(s) && s > held) {
+            held = s;
+            if (stripCoarse) stripCoarse.max = String(Math.max(SCRUB_STEP, Math.floor(held)));
+          }
+        }, function () { /* replayFrames will say */ });
+      }
+      loadWindow(0, true);
     }
 
     /* Which frame this picture is, in the operator's words, or '' for the
      * live one. It becomes the first line of the Pine report so the inbox
-     * item says what the picture alone cannot. */
+     * item says what the picture alone cannot. #1155: the same minutes-and
+     * -seconds wording the strip uses, through the one formatter. */
     function frameNote() {
       if (!(scrubAt > 0)) return '';
-      return '(the frame from ' + scrubAt.toFixed(1) + 's before the capture)';
+      return '(the frame from ' + fmtBack(scrubAt) + ' before the capture)';
     }
 
     /* The default onDone: the report road. */
