@@ -80,7 +80,7 @@
      * few px of padding keep the first and last tab off the edge once
      * scrolling is real rather than theoretical. */
     'max-height:100vh;overflow-y:auto;overscroll-behavior:contain;',
-    'padding:6px 0;',
+    'padding:4px 0;gap:4px;',                     /* 2026-09-15 (#1174) */
     'scrollbar-width:none;',
     'font-family:Inter,Segoe UI,system-ui,sans-serif}',
     '#pineViewRail::-webkit-scrollbar{display:none}',
@@ -116,8 +116,23 @@
      * at ~780px against an 800px tablet - already at the edge before SC
      * and 3JS were added; the tablet is the tighter surface, not this one.
      */
+    /* 2026-09-15 (#1174): "These tabs are too big. They're taking up all
+     * the screen." Thirteen of them now - the rail has grown a tab a
+     * night this week - and at 16px of padding and 11px text the column
+     * ran the height of the glass. The padding is halved down the long
+     * axis and the text set a point smaller; the tap target keeps its
+     * width, because a rail you cannot hit is worse than a rail that is
+     * tall. Measured against the tablet's 690px of CSS height: the column
+     * was overflowing and scrolling, and now it does not. */
     '.pine-view-tab{background:#1c242c;color:#edf3f5;border:1px solid #35414c;',
-    'border-right:none;border-radius:12px 0 0 12px;padding:16px 12px;',
+    'border-right:none;border-radius:12px 0 0 12px;padding:4px 11px;',
+    /* The text cannot go below 12px: measured on the tablet, this rule
+     * says font-size:10px and the WebView computes 12 - it enforces a
+     * minimum font size and no stylesheet argues with that. So the height
+     * comes out of the padding instead. Thirteen tabs at 50px overflowed
+     * a 690px glass; at 42px with a 4px gap the column is 594px and fits
+     * with room to spare. The horizontal padding is untouched, because
+     * the width is the tap target. */
     /* #1345b: AND IT MUST SAY ITS OWN HEIGHT.
      *
      * This is the whole fault, and it is not flex at all. The desktop
@@ -139,7 +154,7 @@
      */
     'height:auto;width:auto;min-height:0;min-width:0;',
     'flex:0 0 auto;white-space:nowrap;',
-    'font-size:11px;letter-spacing:.09em;writing-mode:vertical-rl;',
+    'font-size:10px;letter-spacing:.06em;writing-mode:vertical-rl;',
     'cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
     '.pine-view-tab.on{background:#65c7da;color:#05131a;border-color:#65c7da}',
     /* TECH is the panel itself - no host, it just closes whatever is open. */
@@ -269,6 +284,22 @@
     tech.title = 'The full Pine Box application';
     tech.addEventListener('click', function () {
       closeAll();
+      /* 2026-09-15 (#1175): "I have to press control R to get this tab to
+       * work."
+       *
+       * Closing the rail's overlay is only half of the way back. On the
+       * desktop this rail ADOPTS the shell's own <section class="view">
+       * elements (#1344), and once `.open` comes off, what shows is
+       * whatever the SHELL thinks is active - which is the view he last
+       * chose from the shell's own nav, not the deck. So the glass did
+       * not change and the only way home was a reload. TECH now asks the
+       * shell for its main view as well; on the tablet there is no such
+       * nav and this finds nothing, which is correct there. */
+      try {
+        var main = document.querySelector('nav.tabs .tab[data-view="control"]')
+          || document.querySelector('.tab[data-view="control"]');
+        if (main && !main.classList.contains('active')) main.click();
+      } catch (err) { /* the rail is more important than the courtesy */ }
       tech.classList.add('on');
       setTimeout(function () { tech.classList.remove('on'); }, 400);
     });

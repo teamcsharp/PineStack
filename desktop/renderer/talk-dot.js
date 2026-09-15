@@ -33,7 +33,13 @@
 
   var IDLE = 'idle', LISTENING = 'listening', THINKING = 'thinking';
   var MAX_MS = 12000;          /* a command is a sentence, not a monologue */
-  var SILENCE_MS = 1400;       /* quiet this long and we assume you are done */
+  /* 2026-09-15 (#1174): "dictation is finishing too fast. Like the moment
+   * I take a pause it stops. I actually need double the threshold or
+   * triple the threshold before it." Was 1400 ms, which is inside the
+   * pause a person takes mid-sentence while they think - so a report cut
+   * itself off at the comma. Tripled. The ceiling that ends a runaway
+   * recording is elsewhere and unchanged, so this cannot strand him. */
+  var SILENCE_MS = 4200;       /* quiet this long and we assume you are done */
 
   var state = IDLE;
   var stream = null;
