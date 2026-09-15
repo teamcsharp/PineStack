@@ -433,3 +433,110 @@ test('a clip that came FROM the station is not rung back at it', async () => {
   assert.equal(posts.length, 0, 'a clip already in the ring was rung again');
   tv.stop();
 });
+
+/* #1173 - "So even though the Pine tab is the default device, video seem to
+ *  have a slight lag when it comes to playing out of the Pine tablet. its
+ *  showing a different video on the spark agent than the tablet so they are
+ *  getting out of sync."
+ *
+ * ONE DECISION, TWO SURFACES. The station already stamps every endless clip
+ * with a start (broadcast_ms), and both surfaces are handed the same plan on
+ * the same road. What made them disagree was what each did with a plan it
+ * arrived at late: start the file from zero, and take the next clip when
+ * THIS one ended - so the per-hand-over cost (the CRT collapse, the teardown
+ * rest, the decode) was never given back and the error ratcheted at a rate
+ * set by how fast the machine is. Measured on the tablet on 2026-09-15 that
+ * was about +1.16 s a clip against the station's own stamp, until at eight
+ * seconds the staleness test threw a clip away unplayed and the two surfaces
+ * were on different pictures.
+ *
+ * Both halves of it are the two behaviours below, and both would fail
+ * silently: a set that starts every clip at zero looks perfectly correct on
+ * any one screen, and only the operator standing between two screens can
+ * see it. */
+
+test('#1173: a late endless clip is JOINED where the station is, not restarted',
+     async () => {
+  const {body} = world();
+  /* Rung six seconds ago, with a twenty-second slot: the station is six
+   * seconds into this picture and so is every other surface. */
+  station([aClip({endless: true, seconds: 20,
+                  broadcast_ms: Date.now() - 6000})]);
+  const tv = load();
+  tv.mount({baseUrl: 'http://box:8096'});
+  await wait(60);
+  const tube = findByClass(body, 'sfx-tv-tube')[0];
+  assert.ok(tube, 'the late endless clip was never played');
+  const video = tube.children[0];
+  assert.equal(video.currentTime, 0, 'seeked before it had metadata');
+  /* The browser fires this once it knows the duration; the stub cannot. */
+  video.fire('loadedmetadata', {});
+  assert.ok(video.currentTime > 5 && video.currentTime < 7,
+            'the clip was started at ' + video.currentTime
+            + 's instead of joined at the station\'s six');
+  tv.stop();
+});
+
+test('#1173: a sting still belongs at its own first frame', async () => {
+  const {body} = world();
+  /* Not the endless set - a picture punctuating a line. Six seconds late
+   * is within LATE, so it still plays, and it plays from the top: there is
+   * no shared plan to join, and a sting that starts in the middle of
+   * itself is a sting that was never worth ringing. */
+  station([aClip({seconds: 20, broadcast_ms: Date.now() - 6000})]);
+  const tv = load();
+  tv.mount({baseUrl: 'http://box:8096'});
+  await wait(60);
+  const video = findByClass(body, 'sfx-tv-tube')[0].children[0];
+  video.fire('loadedmetadata', {});
+  assert.equal(video.currentTime, 0, 'a sting was joined in the middle');
+  tv.stop();
+});
+
+test('#1173: the endless set drops a clip when its SLOT is over, not at eight seconds',
+     async () => {
+  /* Twelve seconds into a twenty-second slot: still the picture the other
+   * surfaces are showing, so it is joined. Dropping it here - which is what
+   * the flat eight-second staleness test did - is precisely how the tablet
+   * ended up on a different clip from the desk. */
+  const late = world();
+  station([aClip({endless: true, seconds: 20,
+                  broadcast_ms: Date.now() - 12000})]);
+  let tv = load();
+  tv.mount({baseUrl: 'http://box:8096'});
+  await wait(60);
+  assert.ok(set(late.body), 'a clip still inside its slot was thrown away');
+  tv.stop();
+
+  /* And past the end of the slot it IS dropped: nothing is showing it any
+   * more, so coming on with it now would be the fault the other way. */
+  const gone = world();
+  station([aClip({endless: true, seconds: 6,
+                  broadcast_ms: Date.now() - 12000})]);
+  tv = load();
+  tv.mount({baseUrl: 'http://box:8096'});
+  await wait(60);
+  assert.equal(set(gone.body), null, 'a clip whose slot had run out came on');
+  tv.stop();
+});
+
+test('#1173: the LISTEN wall can ask where the station is inside the clip',
+     async () => {
+  const {body} = world();
+  station([aClip({endless: true, seconds: 20,
+                  broadcast_ms: Date.now() - 6000})]);
+  const tv = load();
+  tv.mount({baseUrl: 'http://box:8096'});
+  await wait(60);
+  assert.ok(set(body), 'no set opened');
+  /* listen.js paints the same clip as the LISTEN view's wallpaper and has
+   * its own <video>. It must not work the position out for itself - one
+   * decision, read off one road. */
+  assert.equal(typeof tv.airInto, 'function', 'the wall has nothing to ask');
+  const into = tv.airInto();
+  assert.ok(into > 5 && into < 7, 'airInto said ' + into);
+  /* A sting carries no shared plan and the wall is told so, rather than
+   * being handed a number it would seek to. */
+  assert.equal(tv.airInto({at: Date.now() - 6000, seconds: 20}), 0);
+  tv.stop();
+});

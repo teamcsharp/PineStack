@@ -47,6 +47,51 @@
    * is airing NOW - which is worse than the clip being missed. */
   var LATE = 8;
 
+  /* #1173 - "So even though the Pine tab is the default device, video seem
+   *  to have a slight lag when it comes to playing out of the Pine tablet.
+   *  its showing a different video on the spark agent than the tablet so
+   *  they are getting out of sync."
+   *
+   * THE CLIP IS JOINED WHERE THE STATION IS, NOT AT ITS START.
+   *
+   * The station already decides which picture is current and when: the
+   * endless cycle stamps every clip with a start, it comes out of
+   * /api/dj/video as broadcast_ms, and poll() below turns it into this
+   * machine's clock as clip.at. Both surfaces are handed the same plan.
+   *
+   * What each surface DID with it was start the file from zero whenever it
+   * got round to it, and then take its next clip when THIS one ended -
+   * so every hand-over spent OFF_MS of CRT collapse, the 120 ms teardown
+   * rest and however long that surface needs to put up a first frame, and
+   * none of it was ever given back. The error ratcheted, at a rate set by
+   * how fast the machine is, and the two machines are not the same speed.
+   *
+   * Measured on the tablet, 2026-09-15, twelve consecutive clips off the
+   * endless set, each one's slip against the station's own stamp:
+   *
+   *   +1.23 +2.44 +3.38 +4.72 +5.71 +7.01 | +4.62 +6.21 +7.66 +7.88 ...
+   *
+   * about +1.16 s a clip - and at the bar, eight seconds of slip, the LATE
+   * test above threw a clip away UNPLAYED and the tablet was on a picture
+   * the desk had already finished. That is both halves of the report in
+   * one mechanism. The desk ratchets the same way and slower: the fixed
+   * 640 ms is identical on both, but src-to-first-frame measured 463-540
+   * ms on the tablet against 90-145 ms for the whole 350 kB file on the
+   * desk's own machine. The DIFFERENCE between the two rates is the drift
+   * he sees. No poll interval, no cache, no token, and /sfx does answer a
+   * Range request (206, accept-ranges: bytes), so a clip is not waiting to
+   * arrive whole before a frame exists.
+   *
+   * So a clip's position becomes a function of the station's clock and
+   * nothing else - the way the two rooms' audio already is. A surface that
+   * arrives late joins the picture in progress instead of running its own
+   * copy of the schedule a second and a half behind, and the error cannot
+   * accumulate because every clip is anchored afresh. */
+  var JOIN_MIN = 0.35;             // below this a seek costs more than it buys
+  var JOIN_TAIL = 0.6;             // this near the end, let it be
+  var SLIP_MAX = 0.75;             // a jump smaller than this is worse than the slip
+  var SLIP_REST = 4000;            // and never two jumps closer than this
+
   var playing = null;              // #1306b: the clip in the tube now
   var host = null;                 // the window, while a clip is in it
   var video = null;
@@ -947,6 +992,46 @@
         try { screen.currentTime = from; } catch (err) { /* whole clip */ }
       }
     }
+    /* #1173: JOIN THE STATION'S POSITION. The long note beside JOIN_MIN at
+     * the top of this file carries the measurements; this is the handful
+     * of lines it asks for. A trimmed clip (#1310 - a sampler pad's own in
+     * and out) is not the station's picture and is left exactly alone. */
+    var joined = false;
+    var joinNow = function () {
+      if (joined || done || video !== screen) return;
+      if (isFinite(from) && from > 0) { joined = true; return; }
+      joined = true;
+      var into = airJoin(clip);
+      if (into <= 0) return;
+      var len = Number(screen.duration);
+      /* Nothing of it left worth a decode - the next clip's moment is
+       * already near and the set takes it on its own. */
+      if (isFinite(len) && len > 0 && into > len - JOIN_TAIL) return;
+      try { screen.currentTime = into; } catch (err) { /* it plays from 0 */ }
+    };
+    screen.addEventListener('loadedmetadata', joinNow);
+    if (screen.readyState >= 1) joinNow();
+    /* AND IT IS HELD THERE. This WebView suspends its JS timers when the
+     * screen sleeps and the decode stalls with them; it comes back where
+     * it left off, with no way to notice it is now behind. The check that
+     * put the picture in the right place puts it back - rested, and never
+     * for a jump smaller than a jump is worth, because a wallpaper that
+     * twitches every two seconds is worse than one a third of a second
+     * out. */
+    var fixedAt = 0;
+    screen.addEventListener('timeupdate', function () {
+      if (done || video !== screen) return;
+      if (isFinite(from) && from > 0) return;
+      var into = airInto(clip);
+      if (into <= 0) return;
+      var off = Number(screen.currentTime) - into;
+      if (!isFinite(off) || Math.abs(off) < SLIP_MAX) return;
+      if (now() - fixedAt < SLIP_REST) return;
+      var span = Number(screen.duration);
+      if (isFinite(span) && span > 0 && into > span - JOIN_TAIL) return;
+      fixedAt = now();
+      try { screen.currentTime = into; } catch (err) { /* it plays on */ }
+    });
     if (isFinite(to) && to > 0) {
       screen.addEventListener('timeupdate', function () {
         if (passed || Number(screen.currentTime) < to) return;
@@ -1383,6 +1468,43 @@
     if (warm && warm.clip !== clip && queue.indexOf(warm.clip) < 0) warmDrop();
   }
 
+  /* #1173: how far into the clip on the tube the STATION is, in seconds,
+   * on this machine's clock. Zero for anything that is not the endless
+   * set's - a sting is punctuation for a line that was spoken, and it
+   * belongs at its own first frame or nowhere. */
+  function airInto(clip) {
+    if (!clip || !clip.endless) return 0;
+    var at = Number(clip.at);
+    if (!isFinite(at) || at <= 0) return 0;
+    var into = (now() - at) / 1000;
+    return (isFinite(into) && into > 0) ? into : 0;
+  }
+
+  /* The same number, but only when it is worth a decode. */
+  function airJoin(clip) {
+    var into = airInto(clip);
+    return into > JOIN_MIN ? into : 0;
+  }
+
+  /* #1173: "TOO LATE" IS NOT THE SAME QUESTION FOR THE TWO KINDS OF CLIP.
+   *
+   * For a sting it is LATE seconds and the comment beside LATE says why: a
+   * picture meant to punctuate a line spoken four minutes ago must not
+   * fire now. An endless clip punctuates nothing - it is wallpaper on a
+   * plan every surface holds - so the only thing that can make it wrong is
+   * that its slot has run out, and until then it is JOINED rather than
+   * skipped. Skipping was how the two surfaces ended up on different
+   * pictures in the first place: the tablet, eight seconds behind, dropped
+   * a clip the desk was in the middle of. */
+  function missed(clip) {
+    if (!clip) return false;
+    var late = (now() - Number(clip.at || now())) / 1000;
+    if (!clip.endless) return late > LATE;
+    var slot = Number(clip.seconds);
+    if (!isFinite(slot) || slot <= 0) slot = LATE;
+    return late >= slot;
+  }
+
   function next() {
     if (showing || !mounted) return;
     /* #1167: nothing new comes out of the tube while a report is up. The
@@ -1395,7 +1517,7 @@
      * where the watch never attached. */
     if (reportUp || reportNow()) return;
     var clip = queue.shift();
-    while (clip && (now() - Number(clip.at || now())) / 1000 > LATE) {
+    while (clip && missed(clip)) {                         /* #1173 */
       clip = queue.shift();
     }
     if (!clip) return;
@@ -1796,7 +1918,16 @@
       try { play(clip); return true; }
       catch (err) { showing = false; return false; }
     },
-    playing: function () { return playing; }
+    playing: function () { return playing; },
+    /* #1173: how far into the clip on the tube the station is, in seconds
+     * on this machine's clock - so the LISTEN view's wallpaper (listen.js,
+     * paintEndless) joins the SAME frame as this set rather than starting
+     * the file from zero up to a second after the set moved on. Measured
+     * before this existed: the wall ran 0.85 s behind the floating set on
+     * the SAME device (median of 419 samples), and was on a different clip
+     * entirely in 6% of them. Takes the clip it is asked about, or the one
+     * in the tube. */
+    airInto: function (clip) { return airInto(clip || playing); }
   };
 
   /* #1306b: AND IT COMES ON BY ITSELF WHERE NOBODY MOUNTS IT.

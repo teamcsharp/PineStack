@@ -576,6 +576,73 @@
    * assigning it on every check would restart the decode once a second -
    * and the element does not loop: when a clip ends its last frame stays
    * up until the set moves on to the next one. */
+  /* #1173 - "So even though the Pine tab is the default device, video seem
+   *  to have a slight lag when it comes to playing out of the Pine tablet.
+   *  its showing a different video on the spark agent than the tablet so
+   *  they are getting out of sync."
+   *
+   * THIS WALL IS A THIRD SURFACE SHOWING THE SAME ENDLESS SET, and it was
+   * out of step with the floating set standing a few inches away on the
+   * SAME device. Measured on the tablet, 2026-09-15, 465 samples over two
+   * minutes: the wall ran a median 0.85 s behind the set (max 1.28 s), and
+   * in 6% of the samples the two were on DIFFERENT clips altogether.
+   *
+   * Nothing exotic in it. paintEndless does its work at most once a second
+   * (ENDLESS_CHECK_MS), so it learns that the set moved on up to a second
+   * after the set did, and then it started the file from zero - and then
+   * spent its own decode on top of that.
+   *
+   * sfx-tv.js now anchors a clip to the station's own stamp instead of to
+   * the file's first frame (airInto: how far into the clip the station is,
+   * from broadcast_ms, carried onto this machine's clock), and this wall
+   * takes the same number off the same road. A poll interval then costs
+   * nothing: however late the wall finds out, it arrives at the frame the
+   * set is already showing.
+   *
+   * IT DEGRADES. Where an older sfx-tv.js is loaded there is no airInto to
+   * call and both helpers below return without touching anything, which is
+   * the behaviour of the day before - the file from zero, a second behind.
+   */
+  var ENDLESS_JOIN_MIN = 0.35;   // below this a seek costs more than it buys
+  var ENDLESS_JOIN_TAIL = 0.6;   // this near the end, let it be
+  var ENDLESS_SLIP_MAX = 0.75;   // a jump smaller than this is worse than the slip
+  var ENDLESS_FIX_MS = 4000;     // and never two jumps closer than this
+  var endlessFixAt = 0;
+
+  /* #1173: put a freshly-sourced clip where the station is. Called on
+   * loadedmetadata, which is before any frame has been committed, so the
+   * first thing this wall shows is already the right one. */
+  function endlessJoin(vid, clip) {
+    var tv = root.PineSfxTv;
+    if (!vid || !tv || typeof tv.airInto !== "function") return;
+    var into = 0;
+    try { into = Number(tv.airInto(clip)) || 0; } catch (err) { return; }
+    if (!(into > ENDLESS_JOIN_MIN)) return;
+    var len = Number(vid.duration);
+    if (isFinite(len) && len > 0 && into > len - ENDLESS_JOIN_TAIL) return;
+    try { vid.currentTime = into; } catch (err) { /* it plays from its start */ }
+  }
+
+  /* #1173: and hold it there, on the once-a-second clock everything else
+   * in here already runs on. The tablet's WebView suspends its JS timers
+   * when the screen sleeps and the decode stalls with them; it comes back
+   * where it left off with no way to notice. Rested, and never for a jump
+   * smaller than a jump is worth. */
+  function endlessHold(vid, clip, at) {
+    var tv = root.PineSfxTv;
+    if (!vid || !tv || typeof tv.airInto !== "function") return;
+    if (at - endlessFixAt < ENDLESS_FIX_MS) return;
+    var into = 0;
+    try { into = Number(tv.airInto(clip)) || 0; } catch (err) { return; }
+    if (!(into > 0)) return;
+    var off = Number(vid.currentTime) - into;
+    if (!isFinite(off) || Math.abs(off) < ENDLESS_SLIP_MAX) return;
+    var len = Number(vid.duration);
+    if (isFinite(len) && len > 0 && into > len - ENDLESS_JOIN_TAIL) return;
+    endlessFixAt = at;
+    try { vid.currentTime = into; } catch (err) { /* it plays on */ }
+  }
+
   function paintEndless(at, force) {
     if (!force && at - endlessAt < ENDLESS_CHECK_MS) return;
     endlessAt = at;
@@ -593,6 +660,11 @@
       && typeof tv.playing === "function" && onScreen());
     const clip = on ? tv.playing() : null;
     const want = clip && clip.url ? absolute(String(clip.url)) : "";
+    /* #1173: the SLOT, not the file. The station's plan can hand the same
+     * clip out twice, and two turns of it are two different pictures with
+     * two different start stamps - which matters now that the seek below
+     * reads that stamp. Keyed on the url as before, plus the moment. */
+    var slot = want ? want + "#" + String((clip && clip.at) || 0) : "";
 
     if (want && vid) {
       if (!endlessBackdrop) {
@@ -605,8 +677,8 @@
         const second = document.getElementById("plBack2");
         if (second) second.style.opacity = "0";
       }
-      if (vid.dataset.endless !== want) {
-        vid.dataset.endless = want;
+      if (vid.dataset.endless !== slot) {
+        vid.dataset.endless = slot;                        /* #1173 */
         /* The gallery's own handler is dropped: it would reveal the frame
          * and dim the still on its own terms, and it belongs to a clip
          * that is no longer in the element. */
@@ -641,10 +713,16 @@
         endlessWaiting = true;
         vid.hidden = true;
         showPlexus(true);
+        /* #1173: the station's position, before the first frame is
+         * committed - see the note above paintEndless. */
+        vid.onloadedmetadata = function () {
+          if (!endlessBackdrop || vid.dataset.endless !== slot) return;
+          endlessJoin(vid, clip);
+        };
         vid.onloadeddata = function () {
           /* A newer clip may have taken the element while this one was
            * still arriving; its frame is not ours to reveal. */
-          if (!endlessBackdrop || vid.dataset.endless !== want) return;
+          if (!endlessBackdrop || vid.dataset.endless !== slot) return;
           endlessWaiting = false;
           vid.hidden = false;
           showPlexus(false);
@@ -667,6 +745,10 @@
         vid.hidden = false;
         showPlexus(false);
       }
+      /* #1173: and while it is running, keep it on the station's clock. */
+      if (!endlessWaiting && !vid.paused && vid.readyState >= 1) {
+        endlessHold(vid, clip, at);
+      }
       if (typeof tv.veil === "function") tv.veil(true);
       return;
     }
@@ -682,6 +764,7 @@
     if (vid) {
       vid.classList.remove("pl-endless");
       delete vid.dataset.endless;
+      vid.onloadedmetadata = null;                         /* #1173 */
       vid.pause();
       vid.hidden = true;
       vid.removeAttribute("src");

@@ -24867,6 +24867,11 @@ def page_picture_append(clip: dict[str, Any], at_ms: int = 0) -> dict[str, Any]:
         seconds = max(0.0, min(600.0, float(clip.get("seconds") or 0)))
     except (TypeError, ValueError):
         seconds = 0.0
+    _rung_length = 0.0                                  # 2026-09-15 (#1173)
+    try:
+        _rung_length = round(max(0.0, min(600.0, float(clip.get("length") or 0))), 2)
+    except (TypeError, ValueError):
+        _rung_length = 0.0
     rung = {
         "url": str(clip.get("url") or ""),
         "text": "",
@@ -24875,6 +24880,11 @@ def page_picture_append(clip: dict[str, Any], at_ms: int = 0) -> dict[str, Any]:
         "video": True,
         "picture_only": True,
         "seconds": round(seconds, 2),
+        # 2026-09-15 (#1173): the clip's own measured length, when the
+        # caller knows it. `seconds` above may be a reserved slot that is
+        # longer. Absent or 0 means "not known", and a surface falls back
+        # to reading the duration off the element as it does today.
+        **({"length": _rung_length} if _rung_length > 0 else {}),
         "ts": stamp,
         # NOW, not a lead ahead of now: the sound is already in the room.
         # #1395: ...unless the caller is planning ahead on purpose.
@@ -68833,12 +68843,24 @@ async def sfx_video_cycle() -> None:
                     await asyncio.sleep(10.0)
                     continue
                 seconds = await asyncio.to_thread(sfx_seconds, pick)
-            seconds = max(SFX_CYCLE_FLOOR, round(float(seconds or 0), 2))
+            # 2026-09-15 (#1173): THE SLOT AND THE CLIP ARE TWO NUMBERS.
+            #
+            # `seconds` is floored to SFX_CYCLE_FLOOR, so it is the SLOT the
+            # clip was given, not how long the clip is - measured on the
+            # live plan, 6 of 17 slots read exactly 6.00 for clips that are
+            # not six seconds long. A surface could not tell the two apart,
+            # so when a short clip ended early the tube went dark for the
+            # rest of its slot and nothing could hold the last frame or
+            # plan around it. The real length rides alongside; `seconds`
+            # keeps its meaning exactly.
+            real = round(float(seconds or 0), 2)
+            seconds = max(SFX_CYCLE_FLOOR, real)
             key = sfx_id(pick)
             start = max(now, last_end + SFX_CYCLE_GAP)
             page_picture_append({
                 "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
                 "sting": pick.stem, "id": key, "seconds": seconds,
+                "length": real,            # 2026-09-15 (#1173)
                 "endless": True},          # 2026-09-14: withdrawable
                 at_ms=int(start * 1000))
             plan.append({"sting": pick.stem, "start": start,
