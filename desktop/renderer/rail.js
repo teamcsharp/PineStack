@@ -79,8 +79,11 @@
      * centred with translateY overflows equally top and bottom, so a
      * few px of padding keep the first and last tab off the edge once
      * scrolling is real rather than theoretical. */
-    'max-height:100vh;overflow-y:auto;overscroll-behavior:contain;',
-    'padding:4px 0;gap:4px;',                     /* 2026-09-15 (#1174) */
+    /* 2026-09-15 (#1181): the two numbers the fit() below writes. The
+     * fallbacks are what the rail looks like before it has measured
+     * anything, and before a display that cannot be measured. */
+    'max-height:var(--pine-rail-max,100vh);overflow-y:auto;overscroll-behavior:contain;',
+    'padding:4px 0;gap:var(--pine-rail-gap,4px);',
     'scrollbar-width:none;',
     'font-family:Inter,Segoe UI,system-ui,sans-serif}',
     '#pineViewRail::-webkit-scrollbar{display:none}',
@@ -125,7 +128,13 @@
      * tall. Measured against the tablet's 690px of CSS height: the column
      * was overflowing and scrolling, and now it does not. */
     '.pine-view-tab{background:#1c242c;color:#edf3f5;border:1px solid #35414c;',
-    'border-right:none;border-radius:12px 0 0 12px;padding:4px 11px;',
+    'border-right:none;border-radius:12px 0 0 12px;',
+    /* 2026-09-15 (#1181): the vertical padding is the tab's HEIGHT -
+     * the text runs down the tab, so padding-top and padding-bottom
+     * are the two ends of the word and the horizontal padding is its
+     * thickness. fit() writes the first and never touches the second,
+     * because the second is the tap target. */
+    'padding:var(--pine-tab-pad,4px) 11px;',
     /* The text cannot go below 12px: measured on the tablet, this rule
      * says font-size:10px and the WebView computes 12 - it enforces a
      * minimum font size and no stylesheet argues with that. So the height
@@ -199,6 +208,184 @@
    * where each publishes a global with a mount(host). The names are tried
    * rather than assumed because these files are maintained separately and a
    * renamed global should degrade to a readable note, not a blank screen. */
+
+  /* ------------------------------------------------- THE RAIL MEASURES
+   * THE RAIL MEASURES THE GLASS IT IS ON (2026-09-15, #1181).
+   *
+   * The operator: "These tabs should be scale appropriate according to
+   * the display that they're on. For example here they have room to be a
+   * little bit bigger, but when they were on the tablet, they were just a
+   * little bit too big. All they needed was to be scaled down by maybe
+   * like ten percent. I want these tabs to be scaled appropriately to fit
+   * the screen, but I just don't want them scaled so big that they also
+   * encompass the corners where we have the hot corners at."
+   *
+   * Every size in this file up to tonight was a constant argued out
+   * against one screen and then found wrong on the other - #1345 raised
+   * the padding for the desktop, #1174 halved it for the tablet, and each
+   * one made the other surface worse. The rail has grown a tab a night
+   * this week, so the constant would have been wrong again by Thursday.
+   * It measures instead.
+   *
+   * WHAT IS MEASURED. Each tab is laid out once at a known padding, and
+   * the height that is left after subtracting that padding is the word
+   * itself - a fixed length, because the text cannot shrink: the tablet's
+   * WebView enforces a minimum font size of 12px and no stylesheet argues
+   * with it (#1174). So the column is
+   *
+   *     sum(words) + 2 * pad * tabs + gap * (tabs - 1) + the rail's own
+   *
+   * and the only free number is the padding. It is solved for arithmetic-
+   * ally from one layout pass rather than by setting-and-remeasuring,
+   * which would reflow fifteen times on a tablet that cannot afford one.
+   *
+   * THE CORNERS. A tab sitting in a corner square swallows the swipe that
+   * starts there - the rail is exempted from corner activation (#1166),
+   * which is exactly why a tab in the corner kills the gesture rather
+   * than passing it on. So the column is capped to the glass MINUS a
+   * corner square at each end, and it is centred, so what is left is
+   * symmetric and both corners stay clear.
+   *
+   * AND WHEN IT WILL NOT FIT. Thirteen tabs of 12px text are about 434px
+   * of words alone; a 690px tablet less two 110px squares leaves 470,
+   * and the rail would be scrolling before the padding reached zero. He
+   * asked for ten percent smaller, not for a scrollbar. So the reserve
+   * gives way before the tabs do: it steps down toward RESERVE_MIN, which
+   * is still a band at the very corner wide enough to start a swipe in -
+   * the gesture only needs its first touch inside the square and then
+   * JUDGE_PX of travel. On the real tablet this lands at pad 3 and a
+   * 556px column, which is the ten percent he asked for, with 56px of
+   * corner left at each end. On the desk it lands near the top of the
+   * range instead, which is the "room to be a little bit bigger".
+   *
+   * If even RESERVE_MIN will not hold it, the cap stays and the rail
+   * scrolls, which is the one honest answer left: better a reachable
+   * corner and a rail you scroll than a corner that does nothing.
+   */
+
+  var PAD_MIN = 2;          /* below this the border swallows the word */
+  var PAD_MAX = 16;         /* #1345's desktop size, the biggest asked for */
+  var GAP_MIN = 3;          /* under 3, two rounded borders read as one shape */
+  var GAP_MAX = 8;
+  var RESERVE_MIN = 56;     /* the corner band that must survive regardless */
+  var PROBE_PAD = 4;        /* the padding the measuring pass is taken at */
+
+  function cornerPx() {
+    try {
+      var n = root.PineHotCorners && root.PineHotCorners.CORNER_PX;
+      if (typeof n === 'number' && n > 0) return n;
+    } catch (err) { /* the rail does not depend on the corners existing */ }
+    return 110;
+  }
+
+  function gapFor(pad) {
+    return Math.max(GAP_MIN, Math.min(GAP_MAX, pad));
+  }
+
+  /* Pure, so it can be checked without a browser: the tallest padding at
+   * which the column still fits, or PAD_MIN if none does. */
+  function padThatFits(words, own, avail) {
+    var n = words.length, i, sum = 0, pad, total;
+    for (i = 0; i < n; i += 1) sum += words[i];
+    for (pad = PAD_MAX; pad > PAD_MIN; pad -= 1) {
+      total = sum + (2 * pad * n) + (gapFor(pad) * (n - 1)) + own;
+      if (total <= avail) return pad;
+    }
+    return PAD_MIN;
+  }
+
+  function fit() {
+    var rail = document.getElementById('pineViewRail');
+    if (!rail) return null;
+    var tabs = rail.querySelectorAll('.pine-view-tab');
+    var n = tabs.length;
+    if (!n) return null;
+
+    /* One layout pass, at a known padding, with no cap in the way. */
+    rail.style.setProperty('--pine-tab-pad', PROBE_PAD + 'px');
+    rail.style.setProperty('--pine-rail-gap', PROBE_PAD + 'px');
+    rail.style.setProperty('--pine-rail-max', 'none');
+
+    var words = [], i, h;
+    for (i = 0; i < n; i += 1) {
+      h = tabs[i].offsetHeight || 0;
+      /* A tab that has not been laid out yet measures 0, and a zero-length
+       * word would make the solver promise room it does not have. Skip the
+       * whole pass and let the observer below call again. */
+      if (h <= 2 * PROBE_PAD) {
+        rail.style.removeProperty('--pine-rail-max');
+        return null;
+      }
+      words.push(h - (2 * PROBE_PAD));
+    }
+
+    /* The rail's own padding, from the stylesheet rather than a copy of
+     * it - this file is not the only thing that has ever styled it. */
+    var own = 8;
+    try {
+      var cs = root.getComputedStyle(rail);
+      own = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    } catch (err) { own = 8; }
+
+    var glass = root.innerHeight || 800;
+    var corner = cornerPx();
+    var reserve = corner, pad = PAD_MIN, avail = 0, step;
+
+    /* Give the reserve away before the tabs, down to RESERVE_MIN. */
+    for (step = 0; step < 40; step += 1) {
+      avail = glass - (2 * reserve);
+      pad = padThatFits(words, own, avail);
+      if (pad > PAD_MIN || reserve <= RESERVE_MIN) break;
+      reserve = Math.max(RESERVE_MIN, reserve - 6);
+    }
+    avail = Math.max(120, glass - (2 * reserve));
+
+    rail.style.setProperty('--pine-tab-pad', pad + 'px');
+    rail.style.setProperty('--pine-rail-gap', gapFor(pad) + 'px');
+    rail.style.setProperty('--pine-rail-max', avail + 'px');
+
+    var said = {tabs: n, glass: glass, reserve: reserve, pad: pad,
+                gap: gapFor(pad), cap: avail,
+                column: rail.scrollHeight, scrolls: rail.scrollHeight > avail + 1};
+    rail.setAttribute('data-fit', pad + '/' + reserve + '/' + n);
+    return said;
+  }
+
+  /* Refit when the glass changes, when the rail grows a tab, and once
+   * after the first paint - the hot-corners and SC tabs are appended by
+   * their own modules, whose evaluation order is not this file's to
+   * decide (the kiosk injects them in its own order). */
+  var fitSoon = null;
+  function scheduleFit() {
+    if (fitSoon) return;
+    fitSoon = root.setTimeout(function () { fitSoon = null; try { fit(); } catch (err) {} }, 60);
+  }
+
+  function watchRail() {
+    var rail = document.getElementById('pineViewRail');
+    if (!rail) return;
+    try {
+      root.addEventListener('resize', scheduleFit);
+      root.addEventListener('orientationchange', scheduleFit);
+    } catch (err) { /* not fatal */ }
+    try {
+      if (root.MutationObserver) {
+        new root.MutationObserver(scheduleFit).observe(rail, {childList: true});
+      }
+    } catch (err) { /* not fatal */ }
+    /* Web fonts land after the first paint and change every word length. */
+    try {
+      if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+        document.fonts.ready.then(scheduleFit);
+      }
+    } catch (err) { /* not fatal */ }
+    scheduleFit();
+  }
+
+  root.PineRailFit = {fit: fit, _padThatFits: padThatFits, _gapFor: gapFor,
+                      PAD_MIN: PAD_MIN, PAD_MAX: PAD_MAX,
+                      RESERVE_MIN: RESERVE_MIN};
+
   function mount(view, host) {
     if (host.dataset.pineMounted === '1') return 'already';
     for (var i = 0; i < (view.mount || []).length; i += 1) {
@@ -499,6 +686,9 @@
      * and two handles on one edge overlap. Hide it, keep it working. */
     var old = document.getElementById('pineSamplerTab');
     if (old) old.style.display = 'none';
+
+    /* 2026-09-15 (#1181): and now it measures the glass it landed on. */
+    try { watchRail(); } catch (err) { /* the rail is more important */ }
 
     return 'rail up with ' + (VIEWS.length + 1) + ' tabs';
   };

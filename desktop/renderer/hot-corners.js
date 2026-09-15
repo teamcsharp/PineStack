@@ -1935,6 +1935,9 @@
     railTab: railTab,
     /* #1140: the red-ink annotator, for any picture - see annotate(). */
     annotate: annotate,
+    /* #1181: the rail keeps clear of the corner squares, and it can only
+     * do that if it knows how big they are. One number, one owner. */
+    CORNER_PX: CORNER_PX,
     ACTIONS: ACTIONS.slice(),
     ACTION_WORDS: merge({}, ACTION_WORDS),
     STEPS: STEPS.slice(),
