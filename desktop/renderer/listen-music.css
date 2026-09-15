@@ -153,6 +153,11 @@
 /* A voice reads as the station speaking; a record reads as the station
    playing. Colour is the only difference, and it is enough. */
 .pl-now.voice .pl-head { color: var(--green); }
+/* 2026-09-15 (#1206): a record holds the headline while somebody speaks.
+   The title stays a title - the marquee below is where the speech is - and
+   the only tell is a quiet mark on the subtitle, so the screen still says
+   the booth is live without shouting a paragraph at him. */
+.pl-now.speaking .pl-sub { color: var(--green); }
 .pl-now.quiet .pl-head { color: var(--muted); font-weight: 400; }
 
 /* THE RECORD UNDERNEATH. When a voice has the headline this is the only

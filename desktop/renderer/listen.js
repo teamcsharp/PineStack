@@ -1249,7 +1249,14 @@
 
     const host = el("plNow");
     if (host) {
-      host.classList.toggle("voice", now.kind === "voice");
+      /* 2026-09-15 (#1206): the green "somebody is speaking" colour belongs
+       * to a headline that IS the spoken line. While a record holds the
+       * headline the kind is still "voice" - the name and the marquee want
+       * to know - but the title is a title and must not be painted as
+       * speech. */
+      host.classList.toggle("voice",
+        now.kind === "voice" && !now.track);
+      host.classList.toggle("speaking", now.kind === "voice" && !!now.track);
       host.classList.toggle("quiet", now.kind === "quiet");
     }
     put("plHead", now.headline);

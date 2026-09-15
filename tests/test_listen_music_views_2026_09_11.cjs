@@ -136,20 +136,45 @@ test('the needle is clamped short of the run-out, as the follower is', () => {
 
 /* -------------------------------------------------------- what is on air */
 
-test('a voice takes the headline; the record stays named underneath', () => {
-  /* Design decision, not a given. A record sits for three minutes and a
-   * spoken line lasts seconds - leading with the record makes the screen
-   * look frozen through every round of banter, which is most of what this
-   * station does. */
+test('the record keeps the headline while somebody speaks (#1206)', () => {
+  /* Design decision, REVERSED on the evidence of a real screen. It used to
+   * read the other way - a record sits for three minutes and a spoken line
+   * lasts seconds, so leading with the record was argued to make the screen
+   * look frozen through every round of banter.
+   *
+   * What that could not know: the spoken line is ALREADY on screen in the
+   * marquee, so the headline was a second copy of it; and a gallery round's
+   * line is a paragraph, which at headline size pushes the record, the
+   * artist and the cover off the top of the view. The operator sent a
+   * picture of exactly that and asked for it "just part of the scrolling
+   * marquee with the text below".
+   *
+   * `kind` stays 'voice' - the speaker's name, the marquee and every other
+   * reader still need to know somebody is talking. Only the headline moved. */
   const speaking = {id: 'ln1', who: 'dj', name: 'Caine',
     text: 'and that was the Pines, live at the fairground'};
   const now = model.nowPlaying(payload(), speaking, T);
-  assert.equal(now.kind, 'voice');
-  assert.equal(now.headline, 'and that was the Pines, live at the fairground');
-  assert.equal(now.sub, 'Caine');
-  /* Not lost - just no longer the headline. */
+  assert.equal(now.kind, 'voice', 'the booth is still reported as live');
+  assert.equal(now.headline, 'Blue Ridge', 'the record holds the headline');
+  assert.notEqual(now.headline, speaking.text,
+    'the spoken line is in the marquee, not shouted over the song');
+  assert.ok(now.sub.includes('The Pines'));
   assert.equal(now.track.title, 'Blue Ridge');
   assert.equal(now.bar.following, true);
+});
+
+test('with no record the voice still takes the headline (#1206)', () => {
+  /* The boundary, and the reason the change is narrow. A screen reading
+   * "quiet" while the pair are plainly talking is a worse lie than the one
+   * being fixed, and the marquee alone is too small to carry the room. */
+  const speaking = {id: 'ln2', who: 'dj', name: 'Caine',
+    text: 'we are between records and still here'};
+  const bare = payload();
+  delete bare.now;
+  const now = model.nowPlaying(bare, speaking, T);
+  assert.equal(now.kind, 'voice');
+  assert.equal(now.headline, 'we are between records and still here');
+  assert.equal(now.sub, 'Caine');
 });
 
 test('with no voice the record is the headline', () => {
@@ -574,8 +599,15 @@ test('lean=1 would blind both views, which is why neither asks for it', () => {
   const playing = rows.filter((r) => r.lcdStatus === 'Playing');
   assert.equal(playing.length, 1);
   const live = model.nowPlaying(full, playing[0], T);
-  assert.equal(live.kind, 'voice');
-  assert.equal(live.headline, 'the first line');
+  /* #1206: this test is about whether the line on air can be FOUND, not
+   * about where it is drawn. It used to prove that by reading the headline,
+   * which was a proxy; since the record now holds the headline it reads the
+   * row it found instead, which is a more direct test of its own claim. */
+  assert.equal(live.kind, 'voice', 'the booth is known to be live');
+  assert.equal(playing[0].text, 'the first line',
+    'and the exact line on air was identified from stream_now');
+  assert.equal(live.voice.text, 'the first line',
+    'it reaches nowPlaying, which is what the marquee and the grab read');
 
   /* Now the same payload as lean=1 would deliver it. */
   const lean = Object.assign({}, full);
