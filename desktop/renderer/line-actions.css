@@ -332,10 +332,14 @@
 }
 .ld-flow canvas { display: block; width: 100%; height: 100%; }
 .ld-flow.flat canvas { display: none; }
+/* The caption was a sentence nothing could touch. Since #1149 it is eight
+   buttons - see the block at the foot of this file, which turns the
+   pointer-events back on rather than leaving a `none` here to contradict
+   it. */
 .ld-flowwhy {
   position: absolute; left: 10px; right: 10px; bottom: 5px;
   text-align: center; font-size: 10px; line-height: 1.5;
-  color: var(--muted, #8fa0ad); pointer-events: none;
+  color: var(--muted, #8fa0ad);
 }
 
 .ld-body {
@@ -783,3 +787,125 @@
 .ld-admin-row.on .ld-admin-dot { background: #54d18b; }
 .ld-admin-row.off .ld-admin-dot { background: #ff5d5d; }
 .ld-admin-row.na { opacity: .65; }
+
+/* ==========================================================================
+   EVERY ROAD ON THE STRIP OPENS (#1149)
+
+   "I want to tap on these and be able to expand each of them to see
+   additional details about what these roads entail and what contributed to
+   each of them."
+
+   The caption under the dots was one sentence with pointer-events: none. It
+   is now eight buttons, one per road, still separated by the same arrows so
+   it reads as the same sentence at a glance - and the dots themselves are
+   live too, cut into one column per road (see canvasTaps in line-deep.js).
+
+   The panel a road opens is the first child of .ld-body, which is the part
+   of the window that scrolls: it hangs off the strip, and however much the
+   record has to say the window stays the height it already was. On the
+   tablet's 1154x690 glass .ld-box is capped at calc(100vh - 48px) and this
+   sheet does not change that.
+
+   Every size, colour and background here is stated outright rather than
+   inherited, for the reason this file already gives at the top: the desk's
+   bare `button { height: 36px; padding: 0 12px; background: #25303a }`
+   lands on anything that does not say otherwise.
+   ========================================================================== */
+
+.ld-flowwhy {
+  pointer-events: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 1px 2px;
+}
+.ld-flowarrow { font-style: normal; opacity: .5; }
+.ld-stagebtn {
+  height: auto;
+  min-height: 20px;
+  padding: 2px 5px;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted, #8fa0ad);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.3;
+  letter-spacing: normal;
+  cursor: pointer;
+}
+/* Filled dot, lit word: the strip's two halves say the same thing, because
+   line-deep.js draws both from the one `got` flag. */
+.ld-stagebtn.got { color: var(--cyan, #65c7da); }
+.ld-stagebtn:hover { border-color: var(--line, #35414c); }
+.ld-stagebtn.open {
+  border-color: var(--cyan, #65c7da);
+  background: rgba(101, 199, 218, .14);
+  color: var(--text, #edf3f5);
+}
+
+.ld-stage-host:empty { display: none; }
+.ld-stage {
+  margin: 0 0 6px;
+  padding: 9px 11px;
+  border: 1px solid var(--cyan, #65c7da);
+  border-radius: 9px;
+  background: rgba(101, 199, 218, .06);
+}
+/* A road that left no mark is drawn as a quiet panel rather than a lit one:
+   it still opens, it still says what the road is, and it says plainly that
+   this line owes it nothing. */
+.ld-stage.none {
+  border-color: var(--line, #35414c);
+  background: rgba(255, 255, 255, .02);
+}
+.ld-stage-head {
+  display: flex; justify-content: space-between; gap: 10px; align-items: baseline;
+}
+.ld-stage-head b { font-size: 12.5px; color: var(--cyan, #65c7da); }
+.ld-stage.none .ld-stage-head b { color: var(--muted, #8fa0ad); }
+.ld-stage-mark {
+  flex: 0 0 auto;
+  font-style: normal; font-size: 10px;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--green, #54d18b);
+}
+.ld-stage.none .ld-stage-mark { color: var(--muted, #8fa0ad); }
+.ld-stage-what { margin: 5px 0 0; }
+.ld-stage-none { margin: 5px 0 0; }
+.ld-stage .ld-facts { margin-top: 7px; }
+.ld-stage .ld-fold { margin: 7px 0 0; }
+.ld-stage .ld-pre { max-height: 180px; }
+
+/* THE NUMBERED STEPS OPEN ON THE SAME RULE. The caret is the only thing
+   added to the row itself, so a shut stepper is the same height it was. */
+.ld-step { grid-template-columns: 26px minmax(0, 1fr) auto auto; }
+.ld-step.tap { cursor: pointer; }
+.ld-step.tap:hover .ld-step-body b { color: var(--cyan, #65c7da); }
+.ld-step.open .ld-step-n { background: rgba(101, 199, 218, .2); }
+.ld-step-caret {
+  padding-top: 7px;
+  width: 14px;
+  color: var(--muted, #8fa0ad);
+  line-height: 0;
+}
+.ld-step-caret svg {
+  width: 12px; height: 12px; fill: currentColor;
+  transition: transform .18s ease;
+}
+.ld-step.open .ld-step-caret { color: var(--cyan, #65c7da); }
+.ld-step.open .ld-step-caret svg { transform: rotate(90deg); }
+.ld-step-more {
+  grid-column: 1 / -1;
+  margin: 7px 0 0 36px;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  background: var(--bg, #101419);
+}
+.ld-step-more[hidden] { display: none; }
+.ld-step-more .ld-facts li { padding: 4px 0; }
+.ld-step-more .ld-fold { margin: 6px 0 0; }
+.ld-step-more .ld-pre { max-height: 160px; }

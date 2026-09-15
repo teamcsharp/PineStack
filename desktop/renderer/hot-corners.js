@@ -40,7 +40,8 @@
  *
  * THE BRIDGE. On the tablet the kiosk's Kotlin side exposes these on
  * pineDesktop: screenShot(), replayState(), replayExport({seconds,
- * upload}), hotCorners(), hotCornersSet({...}); and it calls
+ * upload}), replayFrames({seconds, count}), hotCorners(),
+ * hotCornersSet({...}); and it calls
  * window.PineHotCorners.configure(cfg) on page load and whenever the
  * drawer changes a preference. On the desk (Electron) the preload exposes
  * pineDesktop too, with shotView() for a picture of the window but no
@@ -541,10 +542,18 @@
    *                     the station URL rule; fetched with the station key
    *                     and drawn from a blob URL where the page is file:,
    *                     so the export is never refused for taint)
-   *   opts.onDone(png)  the composed PNG data URL. May answer a promise:
-   *                     the sheet stays up, its button reads opts.busyLabel,
-   *                     until it settles; a rejection is toasted and the
-   *                     ink is kept for another go. Default: PineReport.
+   *   opts.onDone(png, note)
+   *                     the composed PNG data URL, and (#1148) the line
+   *                     saying which frame it is - '' when the picture is
+   *                     the live one, so a caller that does not care may
+   *                     ignore the second argument entirely. May answer a
+   *                     promise: the sheet stays up, its button reads
+   *                     opts.busyLabel, until it settles; a rejection is
+   *                     toasted and the ink is kept for another go.
+   *                     Default: PineReport.
+   *   opts.scrub        (#1148) offer the scrub strip under the toolbar.
+   *                     Only the corner's screenshot road sets it: an
+   *                     inbox picture has no last five seconds behind it.
    *   opts.onCancel()   the back button; nothing changes.
    *   opts.fileLabel    the primary button's words (default 'File the report')
    *   opts.fileIcon     its Carbon icon (default 'c:email')
@@ -581,6 +590,16 @@
     var W = 0, H = 0;
     var revoke = null;
     var busy = false;
+    /* #1148, the scrub strip. `liveSrc` is the picture the annotator
+     * opened with - the live screenshot - which the strip calls "now";
+     * `bgSrc` is whatever the canvas is painted from at this moment;
+     * `scrubAt` is how many seconds before the capture that frame sits,
+     * and 0 means the live one. The INK IS NEVER BAKED IN: strokes stay a
+     * list and redraw() paints them over whatever background is current,
+     * which is the whole reason a frame can be swapped underneath them. */
+    var liveSrc = '';
+    var bgSrc = '';
+    var scrubAt = 0;
 
     var entry = {box: wrap, body: wrap, close: null};
     var unwatch = null;
@@ -637,13 +656,43 @@
       for (var i = 0; i < strokes.length; i += 1) path(strokes[i]);
     }
 
-    img.onload = fit;
-    img.onerror = function () { fit(); toast('the picture could not be decoded; the ink still files', true); };
+    /* #1148: THE BACKGROUND IS SWAPPABLE, AND ONLY THE BACKGROUND.
+     *
+     * "Whenever I access the screen capture to follow report, I also want
+     *  to be able to scrub between the last five seconds of the broadcast
+     *  to find the right frame."
+     *
+     * The new picture is decoded into a SECOND Image and only becomes the
+     * background once it has loaded, so dragging the slider never flashes
+     * black between frames. A pick that lands while an earlier one is
+     * still decoding wins: the late arrival sees bgSrc has moved on and
+     * drops itself. redraw() then repaints the ink on top, untouched. */
+    function setBackground(url, live) {
+      url = String(url || '');
+      if (!url || url === bgSrc) return;
+      bgSrc = url;
+      var next = new Image();
+      next.onload = function () {
+        if (bgSrc !== url) return;          /* a later pick already won */
+        img = next;
+        redraw();
+      };
+      next.onerror = function () {
+        if (bgSrc !== url) return;
+        toast(live
+          ? 'the picture could not be decoded; the ink still files'
+          : 'that frame could not be decoded; the picture is unchanged', true);
+      };
+      next.src = url;
+    }
+
     fit();                                  /* black until the picture lands */
     loadPicture(src).then(function (got) {
       if (!wrap.parentNode) { if (got.revoke) got.revoke(); return; }
       revoke = got.revoke;
-      img.src = got.src;
+      liveSrc = got.src;
+      /* Only if the operator has not already scrubbed away from it. */
+      if (!bgSrc) setBackground(got.src, true);
     }, function (err) {
       toast('the picture could not be fetched: ' + String((err && err.message) || err), true);
     });
@@ -692,12 +741,151 @@
       toast(String(opts.cancelSay || 'nothing filed'));
     });
 
+    /* ------------------------------------------- #1148: the scrub strip */
+
+    /* "Whenever I access the screen capture to follow report, I also want
+     *  to be able to scrub between the last five seconds of the broadcast
+     *  to find the right frame."
+     *
+     * The screenshot is of the screen AS IT IS WHEN THE SWIPE FINISHES,
+     * which is always a beat after the thing the operator meant to point
+     * at. The tablet has already been holding a rolling video of the
+     * screen (replay/ScreenReplay.kt); replayFrames pulls the last five
+     * seconds of it out as ten small JPEGs, and this is the row of them.
+     *
+     * WHAT IT MUST NOT DO. It must not delay the annotator: the sheet is
+     * already up and drawable with the live shot before this is asked for.
+     * It must not appear at all where there is no ring - the desk has no
+     * replayFrames, and an empty strip or an error there would be a worse
+     * annotator than the one that shipped. So: no bridge road, or ok:false,
+     * or no frames, and the whole thing is taken back off the sheet. */
+    var strip = null;
+    var stripThumbs = null;
+    var stripSlider = null;
+    var shots = [];
+
+    function dropStrip() {
+      if (strip && strip.parentNode) strip.parentNode.removeChild(strip);
+      strip = null;
+      stripThumbs = null;
+      stripSlider = null;
+      shots = [];
+      wrap.className = 'hc-ink';
+    }
+
+    /* '-1.2s' for the older frames, 'now' for the live shot. */
+    function stripLabel(at) {
+      return at > 0 ? '-' + at.toFixed(1) + 's' : 'now';
+    }
+
+    function pick(i) {
+      if (busy || !shots.length) return;
+      if (!(i >= 0)) i = 0;
+      if (i >= shots.length) i = shots.length - 1;
+      var s = shots[i];
+      if (!s) return;
+      scrubAt = s.at;
+      setBackground(s.live ? (liveSrc || src) : s.full, !!s.live);
+      if (stripSlider && String(stripSlider.value) !== String(i)) stripSlider.value = String(i);
+      if (stripThumbs) {
+        var kids = stripThumbs.childNodes;
+        for (var k = 0; k < kids.length; k += 1) {
+          if (kids[k] && kids[k].className !== undefined) {
+            kids[k].className = 'hc-strip-thumb' + (k === i ? ' on' : '');
+          }
+        }
+      }
+      note.textContent = s.at > 0
+        ? 'the frame from ' + s.at.toFixed(1) + 's before the capture - the ink stays'
+        : String(opts.note || 'draw on the picture, then file the report');
+    }
+
+    function showStrip(got) {
+      if (!strip) return;
+      var list = (got && got.ok && got.frames && got.frames.length) ? got.frames : null;
+      if (!list) { dropStrip(); return; }
+      shots = [];
+      var i;
+      for (i = 0; i < list.length; i += 1) {
+        var f = list[i];
+        var at = Number(f && f.at);
+        if (!isFinite(at) || at < 0) at = 0;
+        var pic = String((f && f.image) || '');
+        if (pic) shots.push({at: at, thumb: pic, full: pic, live: false});
+      }
+      if (!shots.length) { dropStrip(); return; }
+      /* THE NEWEST TILE IS THE LIVE SHOT, not the ring's last frame. The
+       * operator is already drawing on the live shot; scrubbing back to
+       * "now" has to give back exactly the picture that was there, to the
+       * pixel, or the ink would no longer line up with what is under it.
+       * The ring's own last frame is still used as that tile's THUMBNAIL -
+       * it is the cheap small one, and it looks the same. */
+      shots[shots.length - 1].at = 0;
+      shots[shots.length - 1].live = true;
+
+      strip.className = 'hc-strip';
+      strip.innerHTML = '';
+      stripThumbs = make('div', 'hc-strip-thumbs');
+      for (i = 0; i < shots.length; i += 1) {
+        (function (idx) {
+          var b = make('button', 'hc-strip-thumb');
+          b.type = 'button';
+          var im = doc.createElement('img');
+          im.src = shots[idx].thumb;
+          im.alt = '';
+          b.appendChild(im);
+          b.appendChild(make('span', 'hc-strip-at', stripLabel(shots[idx].at)));
+          b.addEventListener('click', function (ev) { ev.stopPropagation(); pick(idx); });
+          stripThumbs.appendChild(b);
+        }(i));
+      }
+      stripSlider = doc.createElement('input');
+      stripSlider.type = 'range';
+      stripSlider.className = 'hc-strip-slider';
+      stripSlider.min = '0';
+      stripSlider.max = String(shots.length - 1);
+      stripSlider.step = '1';
+      stripSlider.value = String(shots.length - 1);
+      stripSlider.addEventListener('input', function () { pick(Number(stripSlider.value)); });
+      stripSlider.addEventListener('change', function () { pick(Number(stripSlider.value)); });
+      strip.appendChild(stripThumbs);
+      strip.appendChild(stripSlider);
+      wrap.className = 'hc-ink hc-scrub';
+      pick(shots.length - 1);
+    }
+
+    if (opts.scrub && has('replayFrames')) {
+      strip = make('div', 'hc-strip hc-strip-wait');
+      strip.appendChild(make('div', 'hc-strip-line', 'reading the last five seconds...'));
+      wrap.appendChild(strip);
+      wrap.className = 'hc-ink hc-scrub-wait';
+      var asked;
+      try { asked = bridge().replayFrames({seconds: 5, count: 10}); }
+      catch (err) { asked = Promise.reject(err); }
+      Promise.resolve(asked).then(function (got) {
+        if (!wrap.parentNode) return;
+        showStrip(got);
+      }, function () {
+        /* Silence is the contract: the annotator is exactly what it was. */
+        if (!wrap.parentNode) return;
+        dropStrip();
+      });
+    }
+
+    /* Which frame this picture is, in the operator's words, or '' for the
+     * live one. It becomes the first line of the Pine report so the inbox
+     * item says what the picture alone cannot. */
+    function frameNote() {
+      if (!(scrubAt > 0)) return '';
+      return '(the frame from ' + scrubAt.toFixed(1) + 's before the capture)';
+    }
+
     /* The default onDone: the report road. */
     function fileReport(png) {
       if (!root.PineReport || typeof root.PineReport.fromKey !== 'function') {
         throw new Error('the report pad is not loaded on this surface');
       }
-      root.PineReport.fromKey(png);
+      root.PineReport.fromKey(png, frameNote());
     }
 
     file.addEventListener('click', function () {
@@ -714,7 +902,7 @@
       if (opts.busyLabel && file.lastChild) file.lastChild.textContent = String(opts.busyLabel);
       file.disabled = true;
       var out;
-      try { out = done(png); } catch (e) { out = Promise.reject(e); }
+      try { out = done(png, frameNote()); } catch (e) { out = Promise.reject(e); }
       Promise.resolve(out).then(function () {
         busy = false;
         close();
@@ -733,7 +921,9 @@
     toast('taking the picture…');
     shoot().then(function (dataUrl) {
       toast('');
-      annotate(dataUrl, {});               /* the report road, as before */
+      /* #1148: the report road, as before - with the last five seconds
+       * offered underneath it where the tablet can serve them. */
+      annotate(dataUrl, {scrub: true});
     }, function (err) {
       toast(String((err && err.message) || err), true);
     });

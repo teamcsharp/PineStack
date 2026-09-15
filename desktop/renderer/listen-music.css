@@ -82,6 +82,19 @@
   position: relative;
   height: 100%;
   display: grid;
+  /* #1151 - "This bar at the bottom isn't working."
+     ONE COLUMN, AND minmax(0,1fr) RATHER THAN THE IMPLICIT auto. An
+     implicit grid column is `auto`, which sizes to the MAX-CONTENT of its
+     items, and one of the items down there is a canvas - an element with a
+     real intrinsic width that listen.js rewrites from its own clientWidth
+     every frame. That is a loop: the canvas grew by devicePixelRatio a
+     frame, the column grew with it, and on the tablet the whole face was
+     32896px wide inside a 1120px view within about fifteen frames. The
+     spectrogram was the visible casualty, but the progress bar, the NEXT
+     row and the search box were running off the same cliff. minmax(0,1fr)
+     is a column exactly as wide as this grid and no wider, so nothing
+     inside can decide how wide the outside is. */
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto 1fr auto auto auto auto;
   gap: clamp(8px, 1.6vh, 20px);
   padding: clamp(14px, 3vh, 40px) clamp(16px, 4vw, 56px);
@@ -227,6 +240,11 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 10px 16px;
+  /* #1151: a grid item's automatic minimum size is its MIN-CONTENT, and
+     min-content here includes the spectrogram canvas's intrinsic width -
+     which is the other half of the loop the column fixes above. Zero, and
+     the row can be as narrow as the face is. */
+  min-width: 0;
 }
 .pl-vol { display: flex; align-items: center; gap: 8px; }
 .pl-vol span, .pl-sleep span {
@@ -824,8 +842,26 @@
 .pl-hit.asking { opacity: .5; }
 .pl-hit-none { cursor: default; color: var(--muted, #8fa0ad); font-size: 12px; }
 
-/* The plexus behind the show, while a clip is still arriving. */
+/* The plexus behind the show, while a clip is still arriving.
+
+   #1147 - "I don't want this logo to show every time the video changes.
+   Like this play button doesn't look good. I instead want plexus graphics
+   in the background undulating."
+
+   AND IT COULD NOT BE SEEN. This canvas carries `.pl-back` as well, for
+   the position and the object-fit, and `.pl-back` says `opacity:.34` -
+   while `.pl-back:not([src]){opacity:0}` says nothing at all for an
+   element that has no src attribute and never could, which a <canvas> is.
+   So the stand-in that listen.js has been raising over every loading clip
+   since it was written has been drawing at zero opacity the whole time,
+   and what the operator saw instead was the WebView's own play badge
+   underneath it. It is a full-strength picture now, and unsaturated: it is
+   the SUBJECT between clips, not wallpaper behind one.
+
+   Both selectors are two classes, so this one wins on coming later in the
+   file - which is also why it has to stay below .pl-back. */
 .pl-back-fx { display: none; z-index: 0; }
+.pl-back.pl-back-fx { opacity: 1; filter: none; }
 
 /* THE BACKDROP MOVES, AND CHANGES WITHOUT A CUT.
    Two layers cross-fading (see swapStill) and a slow alternating drift, so
@@ -993,6 +1029,11 @@
 .pl-said-spec {
   display: block;
   width: 100%;
+  /* #1151: and the canvas itself never asks for more room than it was
+     given. Its width and height ATTRIBUTES are an intrinsic size that
+     layout is entitled to use; these two lines say it may not. */
+  min-width: 0;
+  max-width: 100%;
   height: 48px;
   border-radius: 6px;
   background: #05080a;
@@ -1005,4 +1046,66 @@
 .pl-said-note:empty { display: none; }
 @media (prefers-reduced-motion: reduce) {
   .pl-marquee-track { animation: none; }
+}
+
+/* =============================================  THE SCREEN ALONE  ======
+
+   #1152 - "When under the Listen tab, in endless video mode, allow me to
+   double tap the background in order to go full screen and hide all of the
+   UI except for the dot."
+
+   #1150 - "Whenever this screen is idle after 10 seconds, fade the UI to
+   20% until I tap the screen to show it again. In endless video mode."
+
+   ONE ELEMENT CARRIES BOTH. Every piece of chrome this view has is inside
+   .pl-face; the gallery layers, the clip, the plexus and the shade are its
+   siblings, and the talk dot is not in this view at all. So a deliberate
+   hide and an idle fade are the same property on the same box, which is
+   the only shape of this that a tablet can afford: one opacity the
+   compositor animates, rather than nine style writes a frame.
+
+   TWO HOSTS, AS EVERYWHERE ELSE IN THIS FILE. `.view.pb-listen.active` is
+   Electron's element and `.pine-view-host.open.pb-listen` is the one
+   rail.js builds on the tablet; neither carries the other's classes. Both
+   are reached here by keying on .pb-listen and the state class together,
+   which is two classes - enough to beat the one-class rules above without
+   needing to be written out twice.
+
+   listen.js is the only thing that writes .pl-bare and .pl-idle, and it
+   takes them both off again whenever this view stops being the open one.
+   Nothing here is remembered between sessions. */
+
+.pb-listen .pl-face,
+.pb-listen .pl-shade {
+  /* #1150 asks for about six hundred milliseconds, and the same curve
+     serves the deliberate hide: a cut to black on a double tap reads as a
+     screen that broke rather than a screen that obeyed. */
+  transition: opacity 600ms ease;
+}
+
+/* #1150: a fifth of itself, and still perfectly tappable - this is a fade,
+   not a hide, and the operator's own number. */
+.pb-listen.pl-idle .pl-face { opacity: .2; }
+
+/* #1152: gone, and nothing under the finger. pointer-events matters as
+   much as the opacity does: an invisible search box that still takes a tap
+   is how a bare screen turns into a keyboard nobody asked for, and it is
+   also what lets the SECOND double tap land on the backdrop and bring
+   everything back. */
+.pb-listen.pl-bare .pl-face {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* "...go full screen." The shade is a gradient that exists to keep the
+   headline readable over a photograph. With no headline on the glass it is
+   just a dark sheet over the operator's video, so it goes too - and the
+   clip comes up off its wallpaper opacity to its own full strength. That
+   is the difference between hiding the UI and being full screen. */
+.pb-listen.pl-bare .pl-shade { opacity: 0; }
+.pb-listen.pl-bare .pl-back-vid.pl-endless { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pb-listen .pl-face,
+  .pb-listen .pl-shade { transition: none; }
 }

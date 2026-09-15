@@ -49,6 +49,20 @@
  *                             still asked, and answers with the scene in
  *                             force now.
  *
+ * EVERY ROAD ON THE STRIP OPENS (#1149). "I want to tap on these and be
+ * able to expand each of them to see additional details about what these
+ * roads entail and what contributed to each of them." The chain of dots is
+ * eight roads, and each is now a button sitting under its own dot: it says
+ * what that road IS, in two plain sentences, and then what it actually put
+ * into THIS line - read off the same answers gather() already holds. A road
+ * the record cannot speak for says so plainly ("the tint left no mark on
+ * this line"), because a panel that invents a contribution is worse than one
+ * that admits a gap. The dots were already drawn filled or empty; filled now
+ * means exactly "this panel has something to show", so the glance and the
+ * panel cannot disagree. The numbered stepper below opens on the same rule -
+ * one at a time, tap it again to shut it - and shows everything the record
+ * holds for that step and nothing it does not.
+ *
  * THE 3D IS THE SHAPE, THE TEXT IS THE RECORD. The flow is drawn because a
  * path with branches is worth seeing as space; every number under it is
  * text, because a bar chart made of cubes is harder to read than a bar
@@ -69,6 +83,20 @@
   var box = null;
   var scene = null;
   var openFor = null;
+  /* #1149: which road on the strip is open. One at a time - "tapping the
+   * open stage again closes it; tapping another switches". Cleared with the
+   * window, because it names a road on a line that is no longer on screen. */
+  var openStage = null;
+
+  /* What a hand-over state means, in the operator's words rather than the
+   * row's. Read by the "handed over" step and by the on-air road. */
+  var ROADS = {
+    stream: 'the stream', box: 'the box', both: 'both outputs',
+    published: 'the page, awaiting playback', page: 'the page',
+    airing: 'on the air now', prepared: 'written, never heard',
+    held: 'held back', analysis: 'analysis only - never for the air',
+    failed: 'the audio failed', withdrawn: 'refused at hand-over'
+  };
 
   function api() {
     return root.pineDesktop || {
@@ -111,12 +139,130 @@
       .replace(/[ ]+/g, ' ').trim();
   }
 
+  /* MILLISECONDS, BOTH WAYS. The station's own numbers are milliseconds and
+   * the operator reads seconds; neither is dropped. */
+  function millis(n) {
+    var v = Number(n);
+    if (!isFinite(v) || v <= 0) return '';
+    if (v < 1000) return Math.round(v) + ' ms';
+    return (v / 1000).toFixed(1) + ' s  \u00b7  ' + Math.round(v) + ' ms';
+  }
+
+  /* A TIME, WHICHEVER SHAPE IT ARRIVED IN. /api/said/why's `flow` rows carry
+   * `at` already struck as a clock ("01:18:04"); the steps built here carry
+   * an epoch. Number('01:18:04') is NaN, which is why the station's own
+   * times were landing blank in the stepper's right-hand column. */
+  function stamp(at) {
+    if (at === null || at === undefined || at === '') return '';
+    if (typeof at === 'string' && /^\d{1,2}:\d{2}(:\d{2})?$/.test(at)) return at;
+    return clock(at);
+  }
+
+  /* THE CHAT ROW, FROM WHICHEVER DOOR THE LINE CAME IN. hot-corners.js hands
+   * the whole row on `line.row` - delivery_id, page_delivery, withdrawn_why,
+   * the render/written trace - while line-actions.js builds its line from a
+   * DOM node and has none of that. The provenance answer carries its own
+   * copy of the row, which has the clip cut and the air time but never the
+   * delivery ids. Both are read, the live row wins where they overlap, and
+   * nothing absent from both is guessed at. */
+  function rowOf(line, all) {
+    var out = {};
+    var mine = (line && line.row) || {};
+    var theirs = ((all && all.prov) || {}).line || {};
+    var k;
+    for (k in theirs) {
+      if (Object.prototype.hasOwnProperty.call(theirs, k)) out[k] = theirs[k];
+    }
+    for (k in mine) {
+      if (Object.prototype.hasOwnProperty.call(mine, k)) out[k] = mine[k];
+    }
+    return out;
+  }
+
+  /* /api/said/why answers with two lists keyed by `name`: `systems` (on/off
+   * with a note) and `properties` (a value and the desk it is set on). Both
+   * are looked up by name, so a name the station stops sending goes quiet
+   * rather than throwing. */
+  function byName(rows) {
+    var map = {};
+    (rows || []).forEach(function (r) {
+      if (r && r.name) map[String(r.name).toLowerCase()] = r;
+    });
+    return map;
+  }
+
+  /* One row of the station's own flow, by its `step` key: called, written,
+   * rendered, handed, heard, ledger. Absent for a line the station has no
+   * flow for, and absent per-step - a board clip has no `written`. */
+  function flowAt(why, step) {
+    var found = null;
+    ((why && why.flow) || []).forEach(function (f) {
+      if (!found && f && String(f.step || '') === step) found = f;
+    });
+    return found;
+  }
+
+  /* A fact, or nothing at all. An empty value is DROPPED rather than shown
+   * as a blank row: "never invent a contribution" cuts both ways, and a
+   * named row with nothing beside it reads as a fact that failed. */
+  function put(list, name, value) {
+    if (value === null || value === undefined) return list;
+    var s = String(value).trim();
+    if (!s || s === '\u00b7') return list;
+    list.push({name: name, value: s});
+    return list;
+  }
+
+  function putFold(list, name, text) {
+    var s = (text === null || text === undefined) ? '' : String(text);
+    if (!s.trim()) return list;
+    list.push({name: name, text: s});
+    return list;
+  }
+
+  /* The two shapes a fact can take, rendered: a name/value row on the
+   * sheet's own list, or - for a prompt, a script, a brief - a fold over the
+   * whole of it verbatim, which is the file's existing idiom. */
+  function factsInto(node, facts) {
+    var list = null;
+    facts.forEach(function (f) {
+      if (f.text) {
+        var d = make('details', 'ld-fold');
+        d.appendChild(make('summary', '', f.name));
+        d.appendChild(make('pre', 'ld-pre', f.text));
+        node.appendChild(d);
+        list = null;
+        return;
+      }
+      if (!list) { list = make('ul', 'ld-facts'); node.appendChild(list); }
+      list.appendChild(fact(f.name, f.value));
+    });
+  }
+
+  /* Every airing of THIS line inside the air log's 48-hour window. Shared by
+   * the "how often" sheet and by the on-air road's panel, so the two can
+   * never quote different counts off the same log. */
+  function airHits(line, all) {
+    var rows = (((all || {}).air || {}).rows || ((all || {}).air || {}).entries || [])
+      .filter(function (r) { return r && (r.text || r.id); });
+    var mine = boiled(line && line.said);
+    var hits = rows.filter(function (r) {
+      if (r.id && line && String(r.id) === line.id) return true;
+      var t = boiled(r.text);
+      return t && mine && (t === mine || (mine.length > 30 && t.indexOf(mine.slice(0, 30)) >= 0));
+    });
+    var whens = hits.map(function (r) { return Number(r.at || r.ts || 0); })
+      .filter(Boolean).sort(function (a, b) { return b - a; });
+    return {read: rows.length, hits: hits, whens: whens};
+  }
+
   /* ------------------------------------------------------------ the shell */
 
   function close() {
     if (scene && scene.stop) { try { scene.stop(); } catch (e) { /* gone */ } }
     scene = null;
     openFor = null;
+    openStage = null;
     if (box) { box.remove(); box = null; }
   }
 
@@ -204,13 +350,20 @@
     var body = box.querySelector('.ld-body');
     body.replaceChildren();
 
-    var steps = stepsOf(all);
-    drawFlow(box.querySelector('.ld-canvas'), steps).then(function (made) {
+    /* #1149: the panel a tapped road opens is the FIRST thing in the
+     * scrolling body, so it hangs directly off the strip above it and still
+     * cannot push the window past the tablet's 1154x690 glass. Empty until a
+     * road is tapped, and emptied again with every repaint. */
+    openStage = null;
+    body.appendChild(make('div', 'ld-stage-host'));
+
+    var stages = stageFacts(line, all);
+    drawFlow(box.querySelector('.ld-canvas'), stages).then(function (made) {
       scene = made;
       if (!made) box.querySelector('.ld-flow').classList.add('flat');
     }, function () { scene = null; });
-    box.querySelector('.ld-flowwhy').textContent =
-      steps.map(function (s) { return s.label; }).join('  →  ');
+    stageBar(line, all, stages);
+    canvasTaps(line, all, stages);
 
     sceneRow(line, all.scene);
 
@@ -296,10 +449,13 @@
     var now = Date.now() / 1000;
 
     if (why && why.flow && why.flow.length) {
+      /* The station's own flow, verbatim - and its `step` key carried
+       * through, because #1149 opens each of these and the key is what says
+       * which half of the record to open it with. */
       return why.flow.map(function (f) {
         f = f || {};
-        return {label: String(f.label || f.step || ''), detail: String(f.detail || ''),
-          at: f.at, known: true};
+        return {key: String(f.step || ''), label: String(f.label || f.step || ''),
+          detail: String(f.detail || ''), at: f.at, known: true};
       });
     }
 
@@ -312,6 +468,7 @@
     var kind = String(sched.kind || row.kind || (why && why.kind) || '');
     var round = String(row.round || (why && why.round) || '');
     steps.push({
+      key: 'called',
       label: 'the round was called',
       detail: join([
         kind ? 'the ' + kind + ' road' : '',
@@ -332,6 +489,7 @@
     }
     var place = ledgerPlace(line, all);
     steps.push({
+      key: 'written',
       label: 'the line was written',
       detail: join([
         model ? 'by ' + model : '',
@@ -352,6 +510,7 @@
     var voice = String(render.voice || row.voice || (why && why.voice) || '');
     var seconds = Number(row.seconds || (line && line.row && line.row.seconds) || 0);
     steps.push({
+      key: 'rendered',
       label: 'rendered',
       detail: join([
         engine ? 'on ' + engine : '',
@@ -366,16 +525,10 @@
 
     /* 4. handed over */
     var aired = String((why && why.aired) || row.aired || (line && line.row && line.row.aired) || '');
-    var roads = {
-      stream: 'the stream', box: 'the box', both: 'both outputs',
-      published: 'the page, awaiting playback', page: 'the page',
-      airing: 'on the air now', prepared: 'written, never heard',
-      held: 'held back', analysis: 'analysis only - never for the air',
-      failed: 'the audio failed'
-    };
     steps.push({
+      key: 'handed',
       label: 'handed over',
-      detail: aired ? 'state ' + aired + ' - ' + (roads[aired] || 'an output the page does not name')
+      detail: aired ? 'state ' + aired + ' - ' + (ROADS[aired] || 'an output the page does not name')
         : 'no hand-over is recorded',
       at: null,
       known: !!aired
@@ -384,6 +537,7 @@
     /* 5. heard at */
     var airAt = Number(row.air_at || (line && line.row && line.row.air_at) || 0);
     steps.push({
+      key: 'heard',
       label: 'heard at',
       detail: airAt ? clock(airAt) + (now > airAt ? '  (' + ago(now - airAt) + ')' : '  (yet to come)')
         : 'no air time is recorded',
@@ -393,6 +547,7 @@
 
     /* 6. the ledger's place */
     steps.push({
+      key: 'ledger',
       label: 'the ledger’s place',
       detail: place ? 'block ' + place.block + ', line ' + place.ord + ' of the script ledger'
         : 'not on the script ledger as far as this page can see - minted outside a round, or opened from a row that carries no place',
@@ -402,19 +557,188 @@
     return steps;
   }
 
+  /* EVERYTHING THE RECORD HOLDS FOR ONE NUMBERED STEP (#1149). "I want to
+   * tap on these and be able to expand each of them to see additional
+   * details about what these roads entail and what contributed to each of
+   * them" - the stepper opens on the same rule as the strip above it.
+   *
+   * Keyed on the station's own step names, so a flow the server writes and a
+   * flow built here open the same drawer. Only fields that are really there
+   * are shown: put() drops an empty value rather than printing a blank row,
+   * and a step with nothing under it says so instead of inventing.
+   *
+   * WHAT IS NOT HERE, and why. /api/said/why answers with no delivery_id, no
+   * page_delivery and no withdrawn_why - the hand-over drawer reads those
+   * off the chat row, which hot-corners.js hands over whole and
+   * line-actions.js (which builds its line from a DOM node) cannot. Opened
+   * from a held line, the hand-over step says the page was not handed the
+   * reason rather than pretending there was none. */
+  function moreFor(key, line, all) {
+    var d = record(line, all);
+    var f = [];
+    var now = Date.now() / 1000;
+
+    if (key === 'called') {
+      put(f, 'the road', propOf(d, 'the road') || d.sched.kind || d.row.kind);
+      put(f, 'the round', d.row.round || (d.why && d.why.round));
+      put(f, 'the brief', d.sched.prompt);
+      put(f, 'how it was made', d.prov.prepared
+        || (d.prov.how === 'live' ? 'made live, while you were listening' : d.prov.how));
+      put(f, 'written in the same pass', Number(d.prov.burst) > 0
+        ? Number(d.prov.burst) + ' lines' : '');
+      put(f, 'the scene it was called into', d.scene
+        ? String(d.scene.label || '') + (d.scene.road ? '  ·  ' + d.scene.road + ' road' : '')
+        : '');
+      return f;
+    }
+    if (key === 'written') {
+      put(f, 'the model', d.written.model || (d.why && d.why.model) || propOf(d, 'the model'));
+      put(f, 'time to write', millis(d.written.ms));
+      put(f, 'what it returned', Number(d.written.chars) > 0
+        ? Number(d.written.chars) + ' characters' : '');
+      put(f, 'temperature', d.written.temp);
+      put(f, 'the room it had', [
+        Number(d.written.budget) > 0 ? Number(d.written.budget) + ' tokens of budget' : '',
+        Number(d.written.num_ctx) > 0 ? Number(d.written.num_ctx) + ' of context' : ''
+      ].filter(function (b) { return !!b; }).join('  ·  '));
+      put(f, 'committed', clock(d.written.at));
+      put(f, 'the brief it answered', d.sched.prompt);
+      put(f, 'the kind of round', d.written.kind);
+      putFold(f, 'the prompt as sent', d.written.prompt);
+      putFold(f, 'what came back', d.written.script);
+      return f;
+    }
+    if (key === 'rendered') {
+      put(f, 'the engine', d.render.engine || d.row.engine || (d.why && d.why.engine));
+      put(f, 'the voice', d.render.voice || d.row.voice || (d.why && d.why.voice)
+        || propOf(d, 'the voice'));
+      put(f, 'the service', d.render.service);
+      put(f, 'time to render', millis(d.render.ms));
+      put(f, 'the audio measured', Number(d.render.seconds) > 0
+        ? Number(d.render.seconds).toFixed(2) + ' s' : (Number(d.row.seconds) > 0
+          ? Number(d.row.seconds).toFixed(2) + ' s (off the row, not the engine)' : ''));
+      put(f, 'how big', Number(d.render.kb) > 0 ? Number(d.render.kb) + ' KB' : '');
+      put(f, 'it fell back', d.render.fallback ? 'from ' + String(d.render.fallback) : '');
+      put(f, 'engines tried first', (d.render.tried || []).join(', '));
+      return f;
+    }
+    if (key === 'handed') {
+      var aired = String((d.why && d.why.aired) || d.row.aired || '');
+      put(f, 'the road', propOf(d, 'the road') || d.row.kind);
+      put(f, 'the row’s state', aired
+        ? aired + ' - ' + (ROADS[aired] || 'an output the page does not name') : '');
+      put(f, 'the page delivery', d.row.page_delivery);
+      put(f, 'the delivery id', d.row.delivery_id);
+      put(f, 'the clip it was cut from', d.row.clip_media
+        ? String(d.row.clip_media) + (Number(d.row.clip_from) >= 0
+          ? ' at ' + Number(d.row.clip_from).toFixed(2) + 's' : '') : '');
+      if (d.row.withdrawn_why) {
+        put(f, 'why it was refused', d.row.withdrawn_why);
+      } else if (aired === 'withdrawn') {
+        put(f, 'why it was refused',
+          'the row was withdrawn but the page was not handed the reason');
+      }
+      return f;
+    }
+    if (key === 'heard') {
+      var airAt = Number(d.row.air_at || 0);
+      put(f, ['withdrawn', 'held', 'failed', 'prepared', 'analysis']
+        .indexOf(String((d.why && d.why.aired) || d.row.aired || '')) >= 0
+        ? 'the slot it would have taken' : 'the air time', airAt
+        ? clock(airAt) + (now > airAt ? '  (' + ago(now - airAt) + ')' : '  (yet to come)') : '');
+      put(f, 'how long it ran', Number(d.row.seconds) > 0
+        ? Number(d.row.seconds).toFixed(1) + ' s' : '');
+      var hits = airHits(line, all);
+      if (hits.read) {
+        put(f, 'times in the 48-hour air log', String(hits.hits.length));
+        if (hits.whens.length) put(f, 'last heard', ago(now - hits.whens[0]));
+      }
+      return f;
+    }
+    if (key === 'ledger') {
+      if (d.place) {
+        put(f, 'the block', d.place.block);
+        put(f, 'the line in that block', d.place.ord);
+      }
+      var led = flowAt(d.why, 'ledger');
+      if (led) {
+        put(f, 'the ledger says', led.label);
+        put(f, 'how it got there', String(led.detail || '') === 'scripted'
+          ? 'scripted - the running order authored it before the round went out'
+          : led.detail);
+      }
+      if (!d.place && !led) {
+        put(f, 'not on the ledger',
+          'this page can see no block and line for it - minted outside a round, '
+          + 'or opened from a row that carries no place');
+      }
+      return f;
+    }
+    return f;
+  }
+
   function flowNode(line, all) {
     var steps = flowSteps(line, all);
     if (!steps.length) return null;
     var wrap = make('div', '');
     var list = make('ol', 'ld-stepper');
+
+    /* One drawer open at a time, the same rule as the strip: tap the open
+     * step to shut it, tap another and it takes over. */
+    var shutAll = function () {
+      Array.prototype.forEach.call(list.querySelectorAll('.ld-step'), function (row) {
+        var pane = row.querySelector('.ld-step-more');
+        if (pane) pane.hidden = true;
+        row.classList.remove('open');
+        row.setAttribute('aria-expanded', 'false');
+      });
+    };
+
     steps.forEach(function (s, i) {
-      var li = make('li', 'ld-step' + (s.known ? '' : ' unknown'));
+      var li = make('li', 'ld-step tap' + (s.known ? '' : ' unknown'));
       li.appendChild(make('i', 'ld-step-n', String(i + 1)));
       var body = make('div', 'ld-step-body');
       body.appendChild(make('b', '', s.label));
       if (s.detail) body.appendChild(make('p', '', s.detail));
       li.appendChild(body);
-      li.appendChild(make('span', 'ld-step-at', clock(s.at)));
+      li.appendChild(make('span', 'ld-step-at', stamp(s.at)));
+      /* Carbon, from the station's own sprite - the caret says the row opens
+       * without spending a word on saying it. */
+      var caret = make('span', 'ld-step-caret');
+      if (typeof root.pineIcon === 'function') {
+        caret.innerHTML = root.pineIcon('c:caret--right');
+      }
+      li.appendChild(caret);
+
+      var pane = make('div', 'ld-step-more');
+      pane.hidden = true;
+      li.appendChild(pane);
+      li.setAttribute('role', 'button');
+      li.setAttribute('tabindex', '0');
+      li.setAttribute('aria-expanded', 'false');
+
+      var toggle = function (e) {
+        if (e) e.stopPropagation();
+        var want = pane.hidden;
+        shutAll();
+        if (!want) return;
+        if (!pane.firstChild) {
+          var more = moreFor(s.key, line, all);
+          if (more.length) factsInto(pane, more);
+          else pane.appendChild(make('p', 'ld-dim',
+            'the record holds nothing further for this step'));
+        }
+        pane.hidden = false;
+        li.classList.add('open');
+        li.setAttribute('aria-expanded', 'true');
+      };
+      li.addEventListener('click', toggle);
+      li.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ' || e.keyCode === 13 || e.keyCode === 32) {
+          e.preventDefault();
+          toggle(e);
+        }
+      });
       list.appendChild(li);
     });
     wrap.appendChild(list);
@@ -575,27 +899,411 @@
     return card;
   }
 
-  /* The path, as stations. Each one knows whether it was REACHED, which is
-   * what makes the diagram worth drawing rather than decorative. */
-  function stepsOf(all) {
+  /* ------------------------------------------------- the roads on the strip */
+
+  /* ONE READING OF THE RECORD, HANDED TO EVERYTHING. stageFacts() and the
+   * stepper's moreFor() both answer "what does the station hold about this
+   * line", and if they read it from different places they will eventually
+   * disagree in front of the operator. They read it from here.
+   *
+   * Two rows are worth naming. `written` and `render` come from the
+   * provenance when the booth still holds the line (its last 240), and from
+   * the chat row's own `trace` when it does not - hot-corners.js hands that
+   * row over, and it carries the same engine/voice/ms/service the booth
+   * would have said. `stages` is the station's CURRENT pipeline, not this
+   * line's: /api/pipeline/detail?kind=voice answers about the last pass
+   * through each room, whoever's line that was, and anything quoted from it
+   * is labelled as the station's rather than this line's. */
+  function record(line, all) {
     var prov = all.prov || {};
-    var road = all.road || {};
-    var stages = road.stages || [];
-    function seen(name) {
-      return stages.some(function (s) {
-        return s.seen && String(s.label || '').toLowerCase().indexOf(name) >= 0;
+    var why = (all.why && all.why.ok) ? all.why : null;
+    var r = rowOf(line, all);
+    var trace = r.trace || {};
+    return {
+      prov: prov,
+      why: why,
+      row: r,
+      trace: trace,
+      written: prov.written || trace.written || {},
+      render: prov.render || trace.render || {},
+      sched: prov.schedule || {},
+      sys: byName(why && why.systems),
+      props: byName(why && why.properties),
+      scene: (all.scene || {}).scenario || null,
+      place: ledgerPlace(line, all),
+      stages: (all.road || {}).stages || []
+    };
+  }
+
+  function propOf(d, name) {
+    var p = d.props[name];
+    return p ? String(p.value || '') : '';
+  }
+
+  /* A room of the station's own pipeline, by a word in its label. Only ever
+   * quoted with "the station, not this line" beside it. */
+  function roomText(stages, word) {
+    var got = '';
+    (stages || []).forEach(function (s) {
+      if (got || !s || !s.seen) return;
+      if (String(s.label || '').toLowerCase().indexOf(word) >= 0) got = String(s.text || '');
+    });
+    return got;
+  }
+
+  /* THE EIGHT ROADS, EACH WITH WHAT IT IS AND WHAT IT PUT INTO THIS LINE.
+   *
+   * #1149: "I want to tap on these and be able to expand each of them to see
+   * additional details about what these roads entail and what contributed to
+   * each of them."
+   *
+   *   `what`  what the road IS, written for the operator, not for me. Two
+   *           sentences at most, and true of the road on every line.
+   *   `facts` what it put into THIS line, every one of them read off an
+   *           answer the window already holds. Nothing here is computed from
+   *           a guess: a value the station did not send is dropped by put().
+   *   `got`   whether the road left a mark. The dot on the strip is drawn
+   *           from this same flag, and the panel below it cannot contradict
+   *           it, because a road with `got` and nothing to show is demoted
+   *           to unmarked at the bottom of this function.
+   *   `none`  what to say when it did not - "the tint left no mark on this
+   *           line" - which is the operator's own phrasing for the answer a
+   *           record cannot give. */
+  function stageFacts(line, all) {
+    var d = record(line, all);
+    var now = Date.now() / 1000;
+    var out = [];
+    var stage = function (key, label, got, what, facts, none) {
+      out.push({key: key, label: label, what: what, facts: facts,
+        none: none, got: !!got && facts.length > 0});
+    };
+
+    /* 1. THE BRIEF - the schedule desk's standing instruction. */
+    var f = [];
+    var road = propOf(d, 'the road') || d.sched.kind || d.row.kind
+      || (d.why && d.why.kind) || '';
+    put(f, 'the road', road);
+    put(f, 'the round', d.row.round || (d.why && d.why.round));
+    put(f, 'what the desk asked for', d.sched.prompt);
+    put(f, 'how it was made', d.prov.prepared
+      || (d.prov.how === 'live' ? 'made live, while you were listening' : d.prov.how));
+    put(f, 'written in the same pass', Number(d.prov.burst) > 0
+      ? Number(d.prov.burst) + ' lines' : '');
+    var called = flowAt(d.why, 'called');
+    if (called) {
+      put(f, 'the desk called it', String(called.label || '')
+        + (stamp(called.at) ? '  \u00b7  ' + stamp(called.at) : ''));
+    }
+    /* The desk has moved on since; that later brief is shown because the
+     * operator asked what the road entails, but it is labelled as a later
+     * round so it is never read as this line's own instruction. */
+    if (d.sched.prompt_now && d.sched.kind_now) {
+      putFold(f, 'what the desk is asking for now (the ' + d.sched.kind_now
+        + ' round, not this one)', d.sched.prompt_now);
+    }
+    stage('brief', 'the brief', !!road,
+      'The brief is the standing instruction the schedule desk hands the '
+      + 'booth before a word is written: which road this round is on, and '
+      + 'what the round is for. Everything downstream is an answer to it.',
+      f,
+      'the schedule desk left no instruction on this line\u2019s record');
+
+    /* 2. THE WRITING ROOM - the model that turned the brief into words. */
+    f = [];
+    put(f, 'the model', d.written.model || (d.why && d.why.model)
+      || propOf(d, 'the model'));
+    put(f, 'time to write', millis(d.written.ms));
+    put(f, 'what it returned', Number(d.written.chars) > 0
+      ? Number(d.written.chars) + ' characters' : '');
+    put(f, 'temperature', d.written.temp);
+    put(f, 'the room it had', [
+      Number(d.written.budget) > 0 ? Number(d.written.budget) + ' tokens of budget' : '',
+      Number(d.written.num_ctx) > 0 ? Number(d.written.num_ctx) + ' of context' : ''
+    ].filter(function (b) { return !!b; }).join('  \u00b7  '));
+    put(f, 'committed', clock(d.written.at));
+    if (d.prov.system && d.prov.system.name) {
+      put(f, 'the armed disposition', String(d.prov.system.name)
+        + (d.prov.system.followed ? ' - followed on this line'
+          : ' - armed, but not followed on this line')
+        + (d.prov.system.text ? ': ' + String(d.prov.system.text) : ''));
+    }
+    if (d.sys['the writing room'] && !d.written.model) {
+      put(f, 'the station says', d.sys['the writing room'].note);
+    }
+    putFold(f, 'the prompt as sent', d.written.prompt);
+    putFold(f, 'what came back', d.written.script);
+    stage('writing', 'the writing room', !!(d.written.model || d.written.prompt),
+      'The writing room is the model that turns the brief into words. It '
+      + 'runs once for the whole round, and the booth keeps its paperwork - '
+      + 'prompt, answer, model, milliseconds - for its last 240 lines.',
+      f,
+      all.prov === null
+        ? 'past the booth\u2019s 240-row ring: the writing room can no longer be '
+          + 'asked about this line'
+        : 'no writing-room paperwork is held for this line - nothing here was '
+          + 'written by the model');
+
+    /* 3. THE CRYSTAL - the passages and searches put in front of the writer. */
+    f = [];
+    var shards = d.prov.crystal || d.prov.shards || [];
+    var docs = d.prov.documents || d.prov.sources || [];
+    var vecs = d.prov.vectors || d.prov.searches || [];
+    if (shards.length) {
+      put(f, 'shards staged', shards.length + ' passage'
+        + (shards.length === 1 ? '' : 's') + ' put in front of the writer');
+    }
+    shards.slice(0, 3).forEach(function (s) {
+      put(f, String(s.crystal || s.name || 'a passage'),
+        String(s.file || '') + (s.in_prompt ? ' - in the prompt' : ' - staged, not used'));
+    });
+    docs.slice(0, 3).forEach(function (doc) {
+      put(f, String(doc.file || doc.title || 'a document'),
+        String(doc.how || '') + (doc.quoted ? ' - quoted' : ' - read, not quoted'));
+    });
+    vecs.slice(0, 3).forEach(function (v) {
+      put(f, 'it searched for', '\u201c' + String(v.query || v.q || '').slice(0, 90)
+        + '\u201d in ' + String(v.file || '')
+        + (Number(v.score) ? ' at ' + Number(v.score).toFixed(3) : ''));
+    });
+    put(f, 'the crystal desk is set to', propOf(d, 'crystals'));
+    if (d.sys['the crystal']) put(f, 'the station says', d.sys['the crystal'].note);
+    if (d.sys['the vector index']) put(f, 'the vector index', d.sys['the vector index'].note);
+    if (d.sys['the speakbox']) put(f, 'the speakbox', d.sys['the speakbox'].note);
+    stage('crystal', 'the crystal', !!(shards.length || docs.length || vecs.length),
+      'The crystal is the station\u2019s shelf of source passages. A shard '
+      + 'staged into the prompt is a passage the writer was made to look at; '
+      + 'the vector index is how it went looking for one.',
+      f,
+      'no shard, document or search is recorded against this line - the '
+      + 'crystal left no mark on it');
+
+    /* 4. THE TINT - the rewrite pass that puts the register on. */
+    f = [];
+    var tintP = d.props['the tint'];
+    var tintS = d.sys['the tint'];
+    var tinted = (d.trace.written && d.trace.written.tinted) || d.written.tinted || '';
+    var tintRound = /tint/.test(String(d.written.kind || d.sched.kind || ''));
+    put(f, 'the tint in force', tintP ? tintP.value : '');
+    if (tintS && String(tintS.note || '') !== String(tintP ? tintP.value : '')) {
+      put(f, tintS.on ? 'it reached this line' : 'it did not reach this line', tintS.note);
+    } else if (tintS) {
+      put(f, tintS.on ? 'it reached this line' : 'it did not reach this line',
+        tintS.on ? 'yes - the setting above is the one it ran with' : 'no');
+    }
+    put(f, 'what it re-wrote', tinted);
+    put(f, 'the road itself', tintRound
+      ? 'a tint round - the tint IS the road this line came down' : '');
+    stage('tint', 'the tint', !!((tintS && tintS.on) || tinted || tintRound),
+      'The tint is the pass that puts the station\u2019s register on a line '
+      + 'after the writing room has answered: the rhyme, the grading, and the '
+      + 'hold on anything it cannot prove.',
+      f,
+      'the tint left no mark on this line');
+
+    /* 5. THE RECORDING ROOM - the engine that made the audio. */
+    f = [];
+    var engine = d.render.engine || d.row.engine || (d.why && d.why.engine) || '';
+    var voice = d.render.voice || d.row.voice || (d.why && d.why.voice)
+      || propOf(d, 'the voice') || '';
+    put(f, 'the engine', engine);
+    put(f, 'the voice', voice);
+    put(f, 'the seat', propOf(d, 'the seat') || d.row.name);
+    put(f, 'the service', d.render.service);
+    put(f, 'time to render', millis(d.render.ms));
+    put(f, 'what came out', [
+      Number(d.render.kb) > 0 ? Number(d.render.kb) + ' KB' : '',
+      Number(d.render.seconds) > 0 ? Number(d.render.seconds).toFixed(2) + ' s of audio' : ''
+    ].filter(function (b) { return !!b; }).join('  \u00b7  '));
+    put(f, 'it fell back', d.render.fallback ? 'from ' + String(d.render.fallback) : '');
+    put(f, 'engines tried first', (d.render.tried || []).join(', '));
+    var rendered = flowAt(d.why, 'rendered');
+    if (rendered) {
+      put(f, 'the station says', String(rendered.label || '')
+        + (rendered.detail ? ' - ' + String(rendered.detail) : ''));
+    }
+    put(f, 'the room\u2019s last pass (the station, not this line)',
+      roomText(d.stages, 'engine') || roomText(d.stages, 'rendered'));
+    stage('recording', 'the recording room', !!(engine || voice),
+      'The recording room is the voice engine. It takes the finished words '
+      + 'and renders the audio the station actually plays, on whichever '
+      + 'service the seat\u2019s voice is cloned on.',
+      f,
+      'no render is recorded for this line - nothing here was voiced');
+
+    /* 6. THE SHELF - where a rendered round waits its turn, if it waits. */
+    f = [];
+    var shelf = d.sys['the shelf'];
+    if (shelf) {
+      put(f, shelf.on ? 'it waited on the shelf' : 'it did not wait on the shelf', shelf.note);
+    }
+    put(f, 'how it reached the air', d.prov.prepared
+      || (d.prov.how === 'live' ? 'made live, while you were listening' : d.prov.how));
+    put(f, 'the shelf\u2019s last row (the station, not this line)',
+      roomText(d.stages, 'shelf'));
+    stage('shelf', 'the shelf', !!((shelf && shelf.on) || d.prov.how === 'shelf'),
+      'The shelf is where a finished round waits for its turn. A round built '
+      + 'ahead of time is taken off the shelf when the hour reaches it; a '
+      + 'round made live never touches it.',
+      f,
+      (d.prov.how === 'live' || /live/.test(String(d.prov.prepared || '')))
+        ? 'this line never sat on the shelf - it was made live, while you were '
+          + 'listening'
+        : 'the shelf holds no row for this line');
+
+    /* 7. THE SCHEDULE - the hour's running order, and the scene it set. */
+    f = [];
+    if (d.scene) {
+      put(f, 'the scene', String(d.scene.label || '')
+        + (d.scene.road ? '  \u00b7  ' + String(d.scene.road) + ' road' : ''));
+      put(f, 'set on', d.scene.where);
+      if (Number(d.scene.since) > 0) {
+        put(f, 'in force since', ago(now - Number(d.scene.since)));
+      }
+      putFold(f, 'the scene\u2019s brief', d.scene.brief);
+    }
+    put(f, 'this round', d.sched.kind);
+    put(f, 'the round on the desk now', d.sched.kind_now
+      ? String(d.sched.kind_now) + ' - a later entry, not this one' : '');
+    if (d.place) {
+      put(f, 'its place on the ledger', 'block ' + d.place.block + ', line ' + d.place.ord);
+    }
+    var led = flowAt(d.why, 'ledger');
+    if (led) {
+      put(f, 'the ledger says', String(led.label || '')
+        + (led.detail ? ' - ' + String(led.detail) : ''));
+    }
+    stage('schedule', 'the schedule', !!(d.sched.kind || d.scene || d.place || led),
+      'The schedule is the hour\u2019s running order: which road gets the next '
+      + 'turn, in what scene, and where the line sits on the script ledger '
+      + 'as block and line number.',
+      f,
+      'no schedule entry can be found for this line - it was minted outside '
+      + 'a round');
+
+    /* 8. ON AIR - the hand-over, and whether it was actually heard. */
+    f = [];
+    var aired = String((d.why && d.why.aired) || d.row.aired || '');
+    var airAt = Number(d.row.air_at || 0);
+    put(f, 'the row\u2019s state', aired
+      ? aired + ' - ' + (ROADS[aired] || 'an output the page does not name') : '');
+    var refused = ['withdrawn', 'held', 'failed', 'prepared', 'analysis']
+      .indexOf(aired) >= 0;
+    put(f, refused ? 'the slot it would have taken' : 'heard at', airAt
+      ? clock(airAt) + (now > airAt ? '  (' + ago(now - airAt) + ')' : '  (yet to come)') : '');
+    put(f, 'how long it ran', Number(d.row.seconds) > 0
+      ? Number(d.row.seconds).toFixed(1) + ' s' : '');
+    put(f, 'the page delivery', d.row.page_delivery);
+    put(f, 'the delivery id', d.row.delivery_id);
+    put(f, 'why it was refused', d.row.withdrawn_why);
+    var hits = airHits(line, all);
+    if (hits.read) {
+      put(f, 'times in the 48-hour air log', String(hits.hits.length));
+      if (hits.whens.length) put(f, 'last heard', ago(now - hits.whens[0]));
+    }
+    put(f, 'the last hand-off (the station, not this line)',
+      roomText(d.stages, 'goes out'));
+    stage('air', 'on air',
+      !refused && !!(airAt
+        || ['stream', 'box', 'both', 'airing', 'page', 'published'].indexOf(aired) >= 0),
+      'On air is the last step: the row handed to an output - the stream, the '
+      + 'box, the page - and the moment it was actually heard. A row can be '
+      + 'refused here, in which case it was written and voiced and never went '
+      + 'out.',
+      f,
+      refused
+        ? 'this line was refused at hand-over and never went out - the row '
+          + 'stands at “' + aired + '”, ' + (ROADS[aired] || 'kept off the air')
+        : 'no air time is recorded for this line');
+
+    return out;
+  }
+
+  /* ------------------------------------------ tapping a road on the strip */
+
+  /* THE CAPTION IS NOW EIGHT BUTTONS, one under each dot. It still reads as
+   * the same sentence - "the brief -> the writing room -> ..." - because the
+   * arrows are kept between them, but every road is its own hit target with
+   * its own name, which a canvas raycast could never give a screen reader or
+   * a keyboard. */
+  function stageBar(line, all, stages) {
+    var bar = box && box.querySelector('.ld-flowwhy');
+    if (!bar) return;
+    bar.replaceChildren();
+    stages.forEach(function (s, i) {
+      if (i) bar.appendChild(make('i', 'ld-flowarrow', '\u2192'));
+      var b = make('button', 'ld-stagebtn' + (s.got ? ' got' : ''), s.label);
+      b.type = 'button';
+      b.setAttribute('data-stage', s.key);
+      b.setAttribute('aria-expanded', 'false');
+      b.title = s.got ? 'what this road put into this line'
+        : 'this road left no mark on this line';
+      b.addEventListener('click', function (e) {
+        e.stopPropagation();
+        pickStage(line, all, stages, s.key);
+      });
+      bar.appendChild(b);
+    });
+  }
+
+  /* "I want to tap on THESE" - the dots themselves, not only their words.
+   * The chain is drawn evenly spaced and centred on the canvas, so the
+   * canvas is cut into one column per road and a tap lands in the column it
+   * is over. The camera sways 1.3 world units out of 23.8, a twentieth of
+   * the width, which is well inside a column half that wide: the dot under
+   * the finger is the road that opens. */
+  function canvasTaps(line, all, stages) {
+    var canvas = box && box.querySelector('.ld-canvas');
+    if (!canvas || !stages.length) return;
+    canvas.style.cursor = 'pointer';
+    canvas.addEventListener('click', function (e) {
+      e.stopPropagation();
+      var r = canvas.getBoundingClientRect();
+      if (!r.width) return;
+      var i = Math.floor(((e.clientX - r.left) / r.width) * stages.length);
+      if (!(i >= 0)) i = 0;
+      if (i >= stages.length) i = stages.length - 1;
+      pickStage(line, all, stages, stages[i].key);
+    });
+  }
+
+  function pickStage(line, all, stages, key) {
+    openStage = (openStage === key) ? null : key;
+    showStage(line, all, stages);
+  }
+
+  /* The panel, at the top of the SCROLLING body rather than in the fixed
+   * strip: it reads as hanging off the chain of dots, it scrolls with
+   * everything else, and the window cannot grow past the tablet's glass
+   * however much the record has to say. */
+  function showStage(line, all, stages) {
+    var host = box && box.querySelector('.ld-stage-host');
+    if (!host) return;
+    host.replaceChildren();
+    var bar = box.querySelector('.ld-flowwhy');
+    if (bar) {
+      Array.prototype.forEach.call(bar.querySelectorAll('.ld-stagebtn'), function (b) {
+        var on = b.getAttribute('data-stage') === openStage;
+        b.classList.toggle('open', on);
+        b.setAttribute('aria-expanded', on ? 'true' : 'false');
       });
     }
-    return [
-      {label: 'the brief', got: !!(prov.brief || prov.segment || prov.schedule)},
-      {label: 'the writing room', got: !!(prov.prompt || prov.script)},
-      {label: 'the crystal', got: !!((prov.shards || prov.crystal || []).length)},
-      {label: 'the tint', got: !!(prov.tinted || prov.script_tinted)},
-      {label: 'the recording room', got: seen('engine') || seen('rendered')},
-      {label: 'the shelf', got: seen('shelf')},
-      {label: 'the schedule', got: !!(prov.schedule || prov.slot)},
-      {label: 'on air', got: true}
-    ];
+    if (!openStage) return;
+    var s = null;
+    stages.forEach(function (x) { if (x.key === openStage) s = x; });
+    if (!s) return;
+
+    var panel = make('div', 'ld-stage' + (s.got ? '' : ' none'));
+    var head = make('div', 'ld-stage-head');
+    head.appendChild(make('b', '', s.label));
+    head.appendChild(make('i', 'ld-stage-mark',
+      s.got ? 'it left a mark on this line' : 'no mark on this line'));
+    panel.appendChild(head);
+    panel.appendChild(make('p', 'ld-stage-what', s.what));
+    if (!s.got) panel.appendChild(make('p', 'ld-dim ld-stage-none', s.none));
+    factsInto(panel, s.facts);
+    host.appendChild(panel);
+    try { panel.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+    catch (e) { /* an older webview scrolls or it does not */ }
   }
 
   /* 2026-09-14: "do a section above for admin options and show how each of
@@ -627,23 +1335,19 @@
   }
 
   function timesNode(line, all) {
-    var rows = ((all.air || {}).rows || (all.air || {}).entries || [])
-      .filter(function (r) { return r && (r.text || r.id); });
-    var mine = boiled(line.said);
-    var hits = rows.filter(function (r) {
-      if (r.id && String(r.id) === line.id) return true;
-      var t = boiled(r.text);
-      return t && mine && (t === mine || (mine.length > 30 && t.indexOf(mine.slice(0, 30)) >= 0));
-    });
+    /* Counted in one place (#1149): the on-air road's panel quotes the same
+     * numbers, and two readings of one log that disagree are worse than no
+     * reading at all. */
+    var got = airHits(line, all);
+    var hits = got.hits;
     var wrap = make('div', '');
-    if (!rows.length) {
+    if (!got.read) {
       wrap.appendChild(make('p', 'ld-wait',
         'the air log could not be read, so how often cannot be counted'));
       return wrap;
     }
     var now = Date.now() / 1000;
-    var whens = hits.map(function (r) { return Number(r.at || r.ts || 0); })
-      .filter(Boolean).sort(function (a, b) { return b - a; });
+    var whens = got.whens;
 
     var list = make('ul', 'ld-facts');
     list.appendChild(fact('times in the last 48 hours', String(hits.length)
@@ -724,13 +1428,16 @@
         + 'Everything else on this page is still true.');
       return gone;
     }
+    var written = prov.written || {};
+    var render = prov.render || {};
+    var sched = prov.schedule || {};
     var wrap = make('div', '');
-    if (prov.brief || prov.segment) {
-      wrap.appendChild(make('p', '', String(prov.brief || prov.segment)));
+    if (prov.brief || prov.segment || sched.prompt) {
+      wrap.appendChild(make('p', '', String(prov.brief || prov.segment || sched.prompt)));
     }
-    [['the prompt as sent', prov.prompt],
-      ['what came back', prov.script || prov.script_plain],
-      ['after the tint', prov.script_tinted]].forEach(function (pair) {
+    [['the prompt as sent', written.prompt || prov.prompt],
+      ['what came back', written.script || prov.script || prov.script_plain],
+      ['after the tint', written.tinted || prov.script_tinted]].forEach(function (pair) {
       if (!pair[1]) return;
       var d = make('details', 'ld-fold');
       d.appendChild(make('summary', '', pair[0]));
@@ -738,8 +1445,9 @@
       wrap.appendChild(d);
     });
     var bits = [];
-    if (prov.model) bits.push(String(prov.model));
-    if (prov.engine) bits.push(String(prov.engine));
+    if (written.model || prov.model) bits.push(String(written.model || prov.model));
+    if (render.engine || prov.engine) bits.push(String(render.engine || prov.engine));
+    if (Number(written.ms) > 0) bits.push(millis(written.ms));
     if (bits.length) wrap.appendChild(make('i', 'ld-dim', bits.join('  ·  ')));
     return wrap.children.length ? wrap : null;
   }

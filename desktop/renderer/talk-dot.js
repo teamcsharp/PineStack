@@ -730,9 +730,23 @@
   }
 
   var padImage = '';
-  function reportOpen(heard, image, dictateNow) {
+  /* 2026-09-15, #1148: `note` is the OPTIONAL fourth argument and it is a
+     line the pad opens with, above whatever was dictated. It exists so the
+     scrub strip can say which frame the operator actually chose:
+
+       "Whenever I access the screen capture to follow report, I also want
+        to be able to scrub between the last five seconds of the broadcast
+        to find the right frame."
+
+     A picture from 2.4 s before the capture is not the picture the report
+     would otherwise claim to be, so the inbox item must say so in words -
+     the image alone cannot. Blank means nothing is added and the pad opens
+     exactly as it did before. */
+  function reportOpen(heard, image, dictateNow, firstLine) {
     padClose();
     padImage = String(image || '');
+    /* Not called `note`: the pad already has a `note` element below. */
+    var padNote = String(firstLine || '').trim();
     pad = document.createElement('div');
     pad.id = 'pineReportPad';
     pad.setAttribute('style', 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);'
@@ -775,8 +789,14 @@
     var dictate = btn('Dictate', '', function () {
       note.textContent = 'listening - speak, then wait a moment';
       capture = function (words) {
-        var had = area.value.trim();
-        area.value = (had ? had + ' ' : '') + String(words || '').trim();
+        /* #1148: a pad opened with a frame note ends in a NEWLINE, and the
+           dictation must land under that line, not beside it - the note is
+           the first line of the report or it is nothing. Anywhere else this
+           behaves exactly as it always did: one space between sentences. */
+        var raw = area.value;
+        var had = raw.replace(/\s+$/, '');
+        var join = had ? (/\n\s*$/.test(raw) ? '\n' : ' ') : '';
+        area.value = had + join + String(words || '').trim();
         note.textContent = 'heard - fix anything on the keyboard, or Dictate more';
         try { area.focus(); } catch (e) {}
       };
@@ -823,7 +843,13 @@
        "make a pine report: the sampler is silent". Keep what follows. */
     var body = String(heard || '').replace(/^.*?\breport\b[\s:,.-]*/i, '').trim();
     if (body.split(/\s+/).length >= 3) area.value = body;
+    /* #1148: the chosen frame goes in as the FIRST LINE, and the dictated
+       words (if any) keep the rest. It is plain text in the report body on
+       purpose: the inbox item then says which frame this is without anyone
+       having to open the picture and guess. */
+    if (padNote) area.value = padNote + (area.value ? '\n' + area.value : '\n');
     note.textContent = body ? 'that is what was heard after "report" - edit it, or Dictate more' : 'press Dictate and say the report';
+    if (padNote && !body) note.textContent = 'the frame is noted above - press Dictate and say the report';
     try { (body ? area : dictate).focus(); } catch (e) {}
     if (dictateNow) {
       /* the chord: the dot comes up listening at once */
@@ -838,7 +864,20 @@
    * Android never hands an app the power key, so the kiosk listens for
    * volume-up pressed TWICE within a moment (MainActivity.onKeyDown),
    * takes the picture with PixelCopy, and calls this with it. */
-  function fromKey(dataUrl) {
+  /* 2026-09-15, #1148: THE SECOND ARGUMENT IS OPTIONAL AND THE OLD CALL
+   * MUST KEEP WORKING. MainActivity.reportShot evaluates
+   * `PineReport.fromKey("data:...")` with one argument and that road does
+   * not change: no note, the pad opens as it always has.
+   *
+   * "Whenever I access the screen capture to follow report, I also want to
+   *  be able to scrub between the last five seconds of the broadcast to
+   *  find the right frame."
+   *
+   * When the annotator's scrub strip has been used, hot-corners.js passes
+   * `note` as the second argument - "(the frame from 2.4s before the
+   * capture)" - and it becomes the first line of the report body, so the
+   * inbox item says which frame the picture actually is. */
+  function fromKey(dataUrl, note) {
     try {
       var flash = document.createElement('div');
       flash.setAttribute('style', 'position:fixed;inset:0;background:#fff;opacity:.92;z-index:2147483045;pointer-events:none;transition:opacity .45s ease-out');
@@ -846,9 +885,12 @@
       setTimeout(function () { flash.style.opacity = '0'; }, 30);
       setTimeout(function () { if (flash.parentNode) flash.parentNode.removeChild(flash); }, 520);
     } catch (e) { /* the pad still opens */ }
-    reportOpen('', String(dataUrl || ''), true);
+    reportOpen('', String(dataUrl || ''), true, String(note || ''));
   }
-  root.PineReport = {fromKey: fromKey, open: function (image) { reportOpen('', image || '', false); }};
+  root.PineReport = {
+    fromKey: fromKey,
+    open: function (image, note) { reportOpen('', image || '', false, String(note || '')); }
+  };
 
   async function act(text) {
     /* 2026-09-14: the pad first. A capture takes the sentence as text;

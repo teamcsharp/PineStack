@@ -161,6 +161,72 @@
 .hc-ink-note { color: var(--muted, #8fa0ad); font-size: 12px; margin-right: 4px; }
 .hc-ink-bar .hc-btn { touch-action: manipulation; }
 
+/* THE SCRUB STRIP (#1148). "Whenever I access the screen capture to follow
+   report, I also want to be able to scrub between the last five seconds of
+   the broadcast to find the right frame."
+
+   It sits UNDER the ink toolbar, so the toolbar is lifted out of its way -
+   two heights, because the waiting line is one text row and the strip
+   proper is a row of thumbnails plus a slider. Where there is no ring
+   (the desk has no replayFrames) neither class is ever set and the toolbar
+   stays exactly where it has always been.
+
+   MEASURED ON THE TABLET, not guessed: the waiting line is 38 px tall and
+   the full strip 145 px, both sitting 14 px off the bottom. 172 clears the
+   taller one with eight to spare; the first draft said 136 and the toolbar
+   sat ON TOP of the thumbnails. */
+.hc-ink.hc-scrub-wait .hc-ink-bar { bottom: 62px; }
+.hc-ink.hc-scrub .hc-ink-bar { bottom: 172px; }
+
+.hc-strip {
+  position: absolute; left: 50%; bottom: 14px;
+  transform: translateX(-50%);
+  max-width: calc(100vw - 20px);
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #35414c); border-radius: 12px;
+  background: rgba(22, 29, 36, .94); color: var(--text, #edf3f5);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  font: 12px/1.35 Inter, "Segoe UI", system-ui, sans-serif;
+  touch-action: manipulation;
+}
+.hc-strip-line { color: var(--muted, #8fa0ad); font-size: 12px; padding: 2px 4px; }
+
+/* Oldest on the left, "now" on the right. It scrolls rather than shrinking
+   the pictures to nothing on a narrow screen. */
+.hc-strip-thumbs {
+  display: flex; align-items: flex-end; gap: 6px;
+  max-width: calc(100vw - 44px);
+  overflow-x: auto; overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 2px;
+}
+.hc-strip-thumb {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 3px; margin: 0;
+  border: 1px solid var(--line, #35414c); border-radius: 8px;
+  background: #0b1116; color: var(--muted, #8fa0ad);
+  font: inherit; font-size: 11px; cursor: pointer;
+  touch-action: manipulation;
+}
+.hc-strip-thumb img {
+  display: block; width: 92px; height: 56px;
+  object-fit: cover; border-radius: 5px; background: #000;
+}
+.hc-strip-thumb.on {
+  border-color: #65c7da;
+  color: var(--text, #edf3f5);
+  box-shadow: 0 0 0 1px #65c7da inset;
+}
+.hc-strip-at { line-height: 1.2; }
+.hc-strip-slider { width: 100%; margin: 0; touch-action: manipulation; }
+
+@media (max-width: 620px) {
+  .hc-strip-thumb img { width: 64px; height: 40px; }
+  .hc-ink.hc-scrub .hc-ink-bar { bottom: 156px; }
+}
+
 /* THE TOAST. The same foot-of-screen line the line actions use. */
 .hc-toast {
   position: fixed; left: 50%; bottom: 22px;

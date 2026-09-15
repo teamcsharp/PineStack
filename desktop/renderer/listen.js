@@ -125,15 +125,55 @@
   const ENDLESS_CHECK_MS = 1000;
   let endlessBackdrop = false;
   let endlessAt = 0;
+  /* #1147: true while a clip has been asked for and has no frame yet -
+   * the window in which the WebView would otherwise paint its own play
+   * badge, and the window the plexus covers. */
+  let endlessWaiting = false;
 
   let config = null;
   let mounted = false;
   let unsubscribe = null;
 
   let stills = [];
+
+  /* 2026-09-15 (#1151): THE PICTURE CARRIES ITS OWN CREDENTIAL.
+   *
+   * An <img> cannot send an Authorization header, and on the desk this
+   * page is a file: URL on another machine, so every one of the 138
+   * stills came back 401 and the strip was a white bar with a broken
+   * icon. The station now hands out one signature per FILE with the
+   * gallery list (app.py list_generations, `sig`), which is the same
+   * "the URL is the access control" contract its media has always used.
+   * On the tablet the panel is same-origin and the signature is simply
+   * redundant. */
+  var stillSig = {};
+
+  function genUrl(name) {
+    var got = absolute("/api/generations/image/" + encodeURIComponent(name));
+    var s = stillSig[name];
+    return s ? got + (got.indexOf("?") < 0 ? "?t=" : "&t=") + encodeURIComponent(s) : got;
+  }
+
   let stillAt = 0;
   let stillTrack = "";
   let stillIndex = -1;
+
+  /* THE SCREEN ALONE - #1152 and #1150. See theScreenAlone() below for
+   * what each of these is for; they live up here with the rest of the
+   * view's state because paint() reads them on the feed's tick. */
+  const IDLE_REST_MS = 10000;   /* #1150: "idle after 10 seconds" */
+  const DOUBLE_TAP_MS = 320;    /* two taps further apart than this are two */
+  const DOUBLE_TAP_PX = 48;     /* ...or further apart than a thumb is wide */
+  const TOGGLE_REST_MS = 400;   /* one gesture, one toggle */
+  let viewHost = null;          /* the section this view was mounted into */
+  let bare = false;             /* #1152: the chrome is hidden on purpose */
+  let idleDim = false;          /* #1150: the chrome is faded, nobody is here */
+  let idleAt = 0;
+  let bareAt = 0;
+  let tapAt = 0;
+  let tapX = 0;
+  let tapY = 0;
+  let chromeWatch = null;
 
   let sleep = null;             /* the plan from model.sleepPlan(), or null */
   let volume = 1;
@@ -263,6 +303,7 @@
        * station is making now without asking for the whole log. */
       const got = await api().get("/api/generations?limit=200");
       stills = model().galleryStills(got);
+      stillSig = (got && got.sig) || {};   /* 2026-09-15 (#1151) */
       /* The same log, kept for the moving ones. galleryStills drops these
        * deliberately - the LCD gallery excludes video and this view reuses
        * its rule - so they are picked out here rather than by changing a
@@ -306,7 +347,7 @@
     /* Occasionally, a moving one. */
     if (clips.length && vid && backdropTurn % CLIP_EVERY === 0) {
       const pick = clips[Math.floor(Math.random() * clips.length)];
-      vid.src = absolute("/api/generations/image/" + encodeURIComponent(pick));
+      vid.src = genUrl(pick);   /* 2026-09-15 (#1151) */
       /* HIDDEN UNTIL IT HAS A FRAME. The plexus covers the download, which
        * is a real wait: that route has no Range support, so the clip comes
        * whole before a single frame exists. */
@@ -349,8 +390,7 @@
      * open to reads. If SPARK_AGENT_LOCK_READS is ever set this backdrop
      * goes dark, which is cosmetic and deliberate: nothing else on this
      * screen depends on it. */
-    swapStill(absolute("/api/generations/image/"
-      + encodeURIComponent(stills[stillIndex])));
+    swapStill(genUrl(stills[stillIndex]));   /* 2026-09-15 (#1151) */
   }
 
   /* A GRACEFUL CHANGE, NOT A CUT.
@@ -375,6 +415,7 @@
   let backLayers = [];
   let backFront = 0;
   let backDrift = 0;
+  let stillMiss = 0;            /* #1151: stills refused in a row */
 
   function swapStill(src) {
     const first = el("plBack");
@@ -399,6 +440,7 @@
 
     const pre = new Image();
     pre.onload = () => {
+      stillMiss = 0;
       /* A still decoded during the wait must not fade in over the endless
        * set's video; the next gallery turn will pick another. */
       if (endlessBackdrop) return;
@@ -410,8 +452,31 @@
       over.style.opacity = "0";
       backFront = 1 - backFront;
     };
-    /* A still that will not load is skipped rather than shown as a hole. */
-    pre.onerror = () => { /* the next turn will try another */ };
+    /* A still that will not load is skipped rather than shown as a hole -
+     * the picture is only ever swapped in AFTER it has decoded, so there
+     * is never a broken-image box on this wall.
+     *
+     * #1151, and this is the honest half of it: skipping silently means a
+     * gallery that can never paint looks exactly like a view that simply
+     * has no wallpaper, while #plNote underneath goes on saying "138
+     * pictures behind the show". MEASURED 2026-09-15 against the station:
+     * GET /api/generations?limit=200 answers 200 with no credential at
+     * all, but GET /api/generations/image/<name> answers 401 to anything
+     * that is not the station's own loopback - require_listen_auth
+     * (app.py:13206) wants a ?t= tune-in token or an Authorization header,
+     * and an <img> can carry neither. So on the TABLET, where the panel is
+     * served from 127.0.0.1:8096 and the pictures are same-origin, every
+     * still decodes (measured: naturalWidth 768); on the DESK, where the
+     * page is file: and the station is another machine, all 138 of them
+     * are refused. Three in a row is not a bad file, it is a shut door,
+     * and the view says so instead of pretending. */
+    pre.onerror = () => {
+      stillMiss += 1;
+      if (stillMiss === 3) {
+        note("the gallery pictures are being refused - " + stills.length
+          + " known, none of them reachable from here", true);
+      }
+    };
     pre.src = src;
   }
 
@@ -451,7 +516,6 @@
     if (want && vid) {
       if (!endlessBackdrop) {
         endlessBackdrop = true;
-        showPlexus(false);
         vid.classList.add("pl-endless");
         /* Both gallery layers go, not just the first: swapStill keeps the
          * picture on whichever of the two it faded in last. */
@@ -468,9 +532,59 @@
         vid.onloadeddata = null;
         vid.loop = false;
         vid.muted = true;
+        /* #1147 - "So I don't want this logo to show every time the video
+         * changes. Like this play button doesn't look good. I instead want
+         * plexus graphics in the background undulating."
+         *
+         * THE LOGO AND THE PLAY BUTTON ARE NOT DRAWN BY THIS APP. They are
+         * the WebView's own poster for a <video> that has a src and no
+         * frame yet - a play badge stretched across the box over Android's
+         * media glyph - and object-fit cannot touch it, because it is
+         * chrome and not content. build() already says so above #plBackFx,
+         * and the GALLERY road already covers that wait with the plexus.
+         * The ENDLESS road never did, and endless mode is the one that
+         * changes clip every ten to thirty seconds - which is exactly
+         * "every time the video changes".
+         *
+         * So the element is emptied of anything the browser could hang a
+         * badge on before the new clip is asked for: hidden first, plexus
+         * up, and revealed only once there is a real frame behind it.
+         *
+         * The plexus is PinePlexus (wall-transition.js) - the same
+         * drifting points and short lines between the near ones that the
+         * boot splash and the talk dot already run, already in the
+         * station's #65c7da, already one canvas, already stopped the
+         * moment it is not wanted. A second particle canvas on a 4 GB
+         * tablet would be the wrong answer to a question about a play
+         * button. */
+        endlessWaiting = true;
+        vid.hidden = true;
+        showPlexus(true);
+        vid.onloadeddata = function () {
+          /* A newer clip may have taken the element while this one was
+           * still arriving; its frame is not ours to reveal. */
+          if (!endlessBackdrop || vid.dataset.endless !== want) return;
+          endlessWaiting = false;
+          vid.hidden = false;
+          showPlexus(false);
+        };
+        /* A clip that will not arrive must not leave this waiting for
+         * ever. The set moves on by itself and the next check takes the
+         * element; until then the wall stays the plexus, which is a better
+         * picture than a black rectangle anyway. */
+        vid.onerror = function () { endlessWaiting = false; };
         vid.src = want;
+        vid.play().catch(() => { /* the plexus is holding the wall */ });
+      }
+      /* A belt for that event's braces. loadeddata is a one-shot, and a
+       * frame that lands while this document is in the background can
+       * arrive with nobody listening - on the tablet that is every screen
+       * sleep mid-clip. Checked on the same once-a-second clock as
+       * everything else in here, never on a timer of its own. */
+      if (endlessWaiting && vid.readyState >= 2) {
+        endlessWaiting = false;
         vid.hidden = false;
-        vid.play().catch(() => { /* the poster frame is still a picture */ });
+        showPlexus(false);
       }
       if (typeof tv.veil === "function") tv.veil(true);
       return;
@@ -479,6 +593,10 @@
     if (!endlessBackdrop) return;
     /* Off, quiet, or off screen: hand the wall back to the gallery. */
     endlessBackdrop = false;
+    /* #1147: the plexus was standing in for a clip that is not coming.
+     * The gallery paints a still over this within the moment. */
+    endlessWaiting = false;
+    showPlexus(false);
     if (tv && typeof tv.veil === "function") tv.veil(false);
     if (vid) {
       vid.classList.remove("pl-endless");
@@ -496,6 +614,207 @@
     if (backLayers.length) backLayers[backFront].style.opacity = "1";
     else if (still) still.style.opacity = "";
     stillAt = 0;
+  }
+
+  /* ======================================================================
+   * THE SCREEN ALONE - #1152 and #1150
+   *
+   * #1152 - "When under the Listen tab, in endless video mode, allow me to
+   * double tap the background in order to go full screen and hide all of
+   * the UI except for the dot."
+   *
+   * #1150 - "Whenever this screen is idle after 10 seconds, fade the UI to
+   * 20% until I tap the screen to show it again. In endless video mode."
+   *
+   * TWO THINGS THAT LOOK ALIKE AND MUST NOT BE CONFUSED. The double tap is
+   * a DECISION: the operator said hide it, and it stays hidden until he
+   * says otherwise - a clip ending, a record changing, ten quiet minutes,
+   * none of them put it back. The idle fade is a COURTESY: the room went
+   * quiet, so the furniture steps back to a fifth of itself, and the first
+   * sign of a hand restores it in full. They cannot both be in force, and
+   * the decision outranks the courtesy - while the chrome is deliberately
+   * hidden there is nothing left for the fade to fade, so it does not run.
+   *
+   * BOTH ARE ONE CLASS ON ONE ELEMENT. Everything the request lists - the
+   * station name and clock, the headline, the cover, the two meters, the
+   * track and its progress bar, NEXT, the search box, the marquee, the
+   * spectrogram, the notes - is inside .pl-face. The backdrop layers, the
+   * clip, the plexus and the shade are its SIBLINGS, and the talk dot is
+   * not in this view at all. So neither of these walks the DOM and neither
+   * hides nine things one at a time: it is a single opacity the compositor
+   * owns. That is not tidiness, it is the tablet - a fade built out of
+   * nine style writes is nine invalidations in every frame of it, on the
+   * one screen whose frame pipeline has already had to be measured twice.
+   *
+   * THE DOT IS NEVER TOUCHED. #pineTalkDot is talk-dot.js's own fixed
+   * element on the body, outside this view's host entirely, so "hide all
+   * of the UI except for the dot" is satisfied by hiding nothing but
+   * .pl-face. This file does not reach for it and does not need to.
+   *
+   * SESSION ONLY, AND NEVER STUCK. Nothing here is written to
+   * localStorage: the operator asked for a gesture, not a setting, and a
+   * remembered bare screen is a tablet that looks dead on the shelf the
+   * next morning. The chrome comes back on a second double tap, on
+   * Escape, when the document goes hidden, and the moment the view stops
+   * being the open one - .open is the tablet rail's word for that and
+   * .active is the desktop shell's, and losing either is enough.
+   *
+   * NO TIMER, AND THE TEN SECONDS ARE STILL HONEST. The header's
+   * single-poller rule is enforced by a test that refuses any setInterval
+   * in this file, so the ten seconds are a clock check inside paint() on
+   * the shared feed's tick - the same shape the endless backdrop already
+   * uses one screen up. It suits the tablet better than a timer would
+   * have anyway: a WebView suspends JS timers when its view is not
+   * showing, so a setTimeout here would have fired late or not at all and
+   * the fade would have been a promise the file could not keep. What
+   * cannot wait for a tick is the RESTORE - #1150 asks for full strength
+   * instantly - so that happens in the event itself, and only the
+   * decision to fade is left to the clock.
+   * ================================================================== */
+
+  /* Is this view the one on the glass? Either host class missing means the
+   * operator has gone somewhere else and the chrome must come back. */
+  function viewOpen() {
+    if (!viewHost || !viewHost.isConnected) return false;
+    const cls = viewHost.classList;
+    return cls.contains("open") || cls.contains("active");
+  }
+
+  function paintChrome() {
+    if (!viewHost) return;
+    viewHost.classList.toggle("pl-bare", bare);
+    viewHost.classList.toggle("pl-idle", idleDim && !bare);
+  }
+
+  /* Everything comes back. Every road out of this view runs through here. */
+  function showChrome() {
+    if (!bare && !idleDim) return;
+    bare = false;
+    idleDim = false;
+    paintChrome();
+  }
+
+  /* A hand, a key, a wheel: the room is not idle any more. */
+  function stir() {
+    idleAt = Date.now();
+    if (!idleDim) return;
+    idleDim = false;
+    paintChrome();
+  }
+
+  /* #1150's clock check. Called from paint() on the feed's 250ms tick. */
+  function paintIdle(at) {
+    if (!viewHost) return;
+    if (!viewOpen() || !onScreen()) {
+      /* Left, closed, or behind another app: nothing is hidden and
+       * nothing is faded on a screen the operator is not looking at, or
+       * he comes back to a black rectangle and no way out of it. */
+      showChrome();
+      idleAt = at;
+      return;
+    }
+    if (bare || !endlessBackdrop) {
+      if (idleDim) { idleDim = false; paintChrome(); }
+      idleAt = at;
+      return;
+    }
+    if (idleDim) return;
+    if (at - idleAt < IDLE_REST_MS) return;
+    idleDim = true;
+    paintChrome();
+  }
+
+  /* #1152's toggle. The HIDE is gated on endless video mode, which is what
+   * was asked for. The SHOW never is: a gate on the way out is how an
+   * operator ends up looking at a video he cannot get the screen back
+   * from, and the set can go quiet while the chrome is down. */
+  function toggleBare() {
+    const at = Date.now();
+    if (at - bareAt < TOGGLE_REST_MS) return;
+    if (!bare && !endlessBackdrop) return;
+    bareAt = at;
+    bare = !bare;
+    idleDim = false;
+    idleAt = at;
+    paintChrome();
+  }
+
+  /* Does this tap belong to the backdrop rather than to a control? While
+   * the chrome is bare .pl-face is pointer-events:none, so the tap that
+   * brings it back lands on the host itself; while it is up, a double tap
+   * on a button or a search box is that control's business and not this. */
+  function onBackdrop(target) {
+    if (!target || !viewHost) return false;
+    if (target === viewHost) return true;
+    const cls = target.classList;
+    if (!cls) return false;
+    return cls.contains("pl-back") || cls.contains("pl-shade")
+      || cls.contains("pl-face") || cls.contains("pl-now");
+  }
+
+  function wireScreenAlone(host) {
+    if (!host) return;
+    viewHost = host;
+    idleAt = Date.now();
+
+    /* THE DOUBLE TAP IS COUNTED HERE RATHER THAN LEFT TO `dblclick`.
+     * A WebView synthesises dblclick from two taps only when it feels like
+     * it - a page doing its own pointer handling routinely gets two
+     * pointerups and no dblclick at all - and this gesture is a TAP, on
+     * glass, on a tablet. So two pointerups inside 320ms and 48px are the
+     * gesture. `dblclick` is taken as well for the mouse on the desk, and
+     * TOGGLE_REST_MS is what stops one physical gesture counting twice
+     * where a WebView sends both. */
+    host.addEventListener("pointerup", function (event) {
+      const at = Date.now();
+      const x = event.clientX || 0;
+      const y = event.clientY || 0;
+      const near = Math.abs(x - tapX) <= DOUBLE_TAP_PX
+        && Math.abs(y - tapY) <= DOUBLE_TAP_PX;
+      if (at - tapAt <= DOUBLE_TAP_MS && near && onBackdrop(event.target)) {
+        toggleBare();
+      }
+      tapAt = at;
+      tapX = x;
+      tapY = y;
+    });
+    host.addEventListener("dblclick", function (event) {
+      if (onBackdrop(event.target)) toggleBare();
+    });
+
+    /* #1150: a tap, a pointermove, a wheel - a hand in the room. Passive
+     * and doing nothing but writing a timestamp, because this runs under
+     * a finger dragging the volume knob. */
+    ["pointerdown", "pointermove", "pointerup", "wheel", "touchstart"]
+      .forEach(function (name) {
+        host.addEventListener(name, stir, {passive: true});
+      });
+
+    /* Keys are the document's, not the host's: the rail and the search box
+     * both take focus, and a key pressed anywhere is still a hand. */
+    document.addEventListener("keydown", function (event) {
+      if (!viewOpen()) return;
+      /* #1152: "Also restore on Escape." */
+      if (event.key === "Escape") { showChrome(); return; }
+      stir();
+    });
+
+    /* LEAVING THE VIEW PUTS IT BACK. rail.js takes .open off this host on
+     * the tablet and the desktop shell takes .active off it; watching the
+     * attribute costs nothing and is not a timer, which matters on the one
+     * screen where timers stop. paintChrome's own class writes retrigger
+     * this, and that is harmless - the view is still open, so it is a
+     * read of two classList flags and nothing else. */
+    if (!chromeWatch && typeof root.MutationObserver === "function") {
+      chromeWatch = new root.MutationObserver(function () {
+        if (viewOpen()) return;
+        showChrome();
+        /* #1147: and the plexus is a requestAnimationFrame loop. A closed
+         * view must not keep one running behind another screen. */
+        showPlexus(false);
+      });
+      chromeWatch.observe(host, {attributes: true, attributeFilter: ["class"]});
+    }
   }
 
   /* --------------------------------------------------------------- paint */
@@ -634,6 +953,8 @@
     /* The set first, so the gallery sees the flag before it paints. */
     paintEndless(at, false);
     paintBackdrop(state, at);
+    /* #1150 last, because it reads the flag paintEndless just set. */
+    paintIdle(at);
   }
 
   function paintSleep(at) {
@@ -935,6 +1256,7 @@
     wireVotes();
     wireSearch();
     startMeters();
+    wireScreenAlone(viewHost);
   }
 
   /* HOLD TO OPEN THE DESK.
@@ -1636,7 +1958,7 @@
   let specLut = null;
   let specColumn = null;
   let specBins = null;
-  let specSaid = false;
+  let specSaid = "";
 
   function specColour(v) {
     if (!specLut) {
@@ -1687,10 +2009,85 @@
     return read ? read.bars : null;
   }
 
+  /* #1151 - "This bar at the bottom isn't working."
+   *
+   * IT WAS WORKING. It was drawing thirty thousand pixels off the right
+   * hand edge of a screen eleven hundred pixels wide. Measured on the
+   * tablet with the view up: canvas.width 41120, canvas.height 60, the
+   * element's CSS box 32896px inside a .pl-face of 1120px. Every column
+   * this function paints goes in at W-1, which by then was x=41119 - so
+   * the bar the operator was looking at was the far LEFT of a picture
+   * whose only content sat at the far right.
+   *
+   * IT IS A FEEDBACK LOOP, and it is the oldest one canvas has. A canvas
+   * has an intrinsic size - its width and height attributes - and that
+   * size is a real input to layout. `.pl-said-spec` is `width:100%`, its
+   * parent `.pl-said` is `flex: 1 1 100%` of `.pl-controls`, and
+   * `.pl-controls` was a grid item of `.pl-face` with the default
+   * `min-width:auto`, so the grid column sized itself to the canvas's
+   * intrinsic width rather than to the box it was in. Frame n wrote
+   * `canvas.width = clientWidth * dpr`; that made the intrinsic width dpr
+   * times bigger; the column grew to match; frame n+1 measured the bigger
+   * box. The multiplier is exactly devicePixelRatio, so:
+   *
+   *   dpr 1    - stable, which is why a plain desk monitor never showed it
+   *   dpr 1.25 - the tablet: x1.25 a frame, past 32000px in ~15 frames
+   *   dpr 2    - a retina desk: past Chromium's maximum canvas dimension
+   *              in six, and a canvas over that limit stops being a canvas
+   *              at all. The browser paints it as a BROKEN-IMAGE ICON on a
+   *              white box, which is the operator's photograph exactly.
+   *
+   * It took the rest of the view with it. The grid column was 32896px
+   * wide, so the progress bar, the NEXT row and the search box were all
+   * stretched thirty thousand pixels off the side of the glass - which is
+   * why the vol, sleep, keep and pictures controls were nowhere on the
+   * screen either.
+   *
+   * CUT IN TWO PLACES ON PURPOSE. The stylesheet cuts it properly
+   * (`grid-template-columns: minmax(0,1fr)` on .pl-face and `min-width:0`
+   * on .pl-controls, listen-music.css), and it is cut AGAIN here, because
+   * a stylesheet is one careless edit away from putting it back and the
+   * failure mode is a canvas that eats the layout of an entire view.
+   * .pl-face is the grid CONTAINER, so its width is a ruler nothing the
+   * canvas does can bend. */
+  /* CAN THIS TERMINAL HEAR THE DJs AT ALL?
+   *
+   * #1151, the half of it that is not a layout bug. Measured on the tablet
+   * with the show plainly on air: both DJ players existed and both were
+   * MUTED - which is the audio law doing its job, because the broadcast
+   * was coming out of somewhere else and this panel is not allowed to play
+   * a second copy of it. voiceSpectrum skips a muted element and falls
+   * back to readLoudest, which answers with sixty-four zeroes rather than
+   * with nothing, so the bar drew sixty-four black columns a second and
+   * said not one word about why. A bar that is black because the room is
+   * quiet and a bar that is black because this window has been gagged look
+   * exactly the same, and only one of them is working.
+   *
+   * Three states, and each gets its own sentence in the strip's own place:
+   * no player in the window yet, a player that is muted here, or a live
+   * one - in which case the bar speaks for itself and the line stays
+   * empty. */
+  function voiceReach() {
+    let found = 0;
+    let live = 0;
+    for (const id of VOICE_IDS) {
+      const node = document.getElementById(id);
+      if (!node) continue;
+      found += 1;
+      if (!node.muted) live += 1;
+    }
+    if (!found) return "none";
+    return live ? "live" : "muted";
+  }
+
   function drawSpectrogram(meters) {
     const canvas = el("plSaidSpec");
     if (!canvas) return;
-    const w = canvas.clientWidth;
+    const face = typeof canvas.closest === "function"
+      ? canvas.closest(".pl-face") : null;
+    const room = (face && face.clientWidth) || root.innerWidth || 0;
+    let w = canvas.clientWidth;
+    if (room && w > room) w = room;
     const h = canvas.clientHeight;
     if (!w || !h) return;
     const g = canvas.getContext("2d");
@@ -1707,15 +2104,22 @@
     }
     const bars = voiceSpectrum(meters);
     const say = el("plSaidNote");
-    if (!bars) {
-      if (!specSaid && say) {
-        specSaid = true;
-        say.textContent = "no voice to draw - this terminal has not been "
-          + "lent an analyser for the DJs";
-      }
-      return;
+    const reach = bars ? voiceReach() : "";
+    const word = !bars
+      ? "no voice to draw - this terminal has not been lent an analyser "
+        + "for the DJs"
+      : reach === "none"
+        ? "no DJ player in this window yet - the bar fills the moment the "
+          + "pair are given one"
+        : reach === "muted"
+          ? "the DJ voices are muted in this window, so there is nothing "
+            + "here to draw - the show is on air somewhere else"
+          : "";
+    if (specSaid !== word) {
+      specSaid = word;
+      if (say) say.textContent = word;
     }
-    if (specSaid && say) { specSaid = false; say.textContent = ""; }
+    if (!bars) return;
     /* Shift left by one device pixel. Drawing a canvas onto itself is
      * defined: the source is snapshotted before the write. */
     g.setTransform(1, 0, 0, 1, 0, 0);
@@ -1741,6 +2145,9 @@
   async function mount(host) {
     if (!host || mounted) return;
     config = await api().readConfig();
+    /* #1152 / #1150: the host is the element both of those hang a class
+     * on, and wire() needs it a moment from now. */
+    viewHost = host;
     build(host);
     wire();
     mounted = true;
@@ -1783,7 +2190,16 @@
    * it within a second, but on the tablet timers stop with the screen and
    * a floating set left veiled is a set that has vanished. */
   document.addEventListener("visibilitychange", () => {
-    if (mounted) paintEndless(Date.now(), true);
+    if (!mounted) return;
+    paintEndless(Date.now(), true);
+    if (!document.hidden) { stir(); return; }
+    /* #1152 / #1150: a screen nobody is in front of gets its chrome back,
+     * so returning to this view is never returning to a black rectangle
+     * with no visible way out. #1147: and the plexus stops - it is a
+     * requestAnimationFrame loop, and on the tablet rAF keeps firing with
+     * the screen off. */
+    showChrome();
+    showPlexus(false);
   });
 
   root.PineListen = {

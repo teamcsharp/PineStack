@@ -14303,6 +14303,9 @@ def _pantry_ready_for_now() -> set[str]:
     return ready
 
 
+_PREPARED_SECONDS_MEMO: dict[str, float] = {"at": 0.0, "value": 0.0}
+
+
 def prepared_seconds() -> float:
     """Seconds of finished audio that is SPOKEN FOR — the honest depth.
 
@@ -14311,6 +14314,15 @@ def prepared_seconds() -> float:
     Reporting that as cover is how the preparer came to stand down with
     a bare shelf. This counts only what a shelf row or a banked round is
     holding."""
+    # 2026-09-15: A GAUGE READ MANY TIMES A TICK. Its own input,
+    # pantry_ready_for(), is memoised for five seconds, but this walk over
+    # the ready keys is not - and the preparer, the panel, the pulse and
+    # five decision points all read it inside one pass of the loop. The
+    # sampler blamed it for 33s of stall over six hours. One second is
+    # shorter than anything that can move the answer.
+    _now = time.time()
+    if _now - float(_PREPARED_SECONDS_MEMO["at"]) < 1.0:
+        return float(_PREPARED_SECONDS_MEMO["value"])
     total = 0.0
     try:
         for key in pantry_ready_for():
@@ -14318,7 +14330,9 @@ def prepared_seconds() -> float:
             total += float((row.get("clip") or {}).get("seconds") or 0)
     except Exception:  # noqa: BLE001
         pass
-    return round(total, 1)
+    total = round(total, 1)
+    _PREPARED_SECONDS_MEMO.update({"at": _now, "value": total})
+    return total
 
 
 def _row_clip_keys(row: Any, depth: int = 0) -> list[str]:
@@ -23246,12 +23260,42 @@ def music_track(track_id: str) -> dict[str, Any] | None:
     return _MUSIC["by_id"].get(track_id)
 
 
+_MUSIC_SEARCH_MEMO: dict[tuple[str, int], list[dict[str, Any]]] = {}
+_MUSIC_SEARCH_AT = [0.0]
+
+
 def music_search(query: str, limit: int = 12) -> list[dict[str, Any]]:
     """Loose match on title, artist, album and filename. An exact title hit
     always wins, so "play Marsh Pipe" lands on the track, not the album."""
+    # 2026-09-15: THE SAME QUESTION, 36,234 TRACKS AT A TIME.
+    #
+    # Measured on the gap log for the six hours to 01:00: 4,999s of dead
+    # air in 48 holes blamed on event-loop stalls, and the sampler caught
+    # this function's scan (app.py:23260) and its sort (23270) holding the
+    # loop for 8.7s across three samples of one ten-minute window. One
+    # search is ~45ms over the 36,234-track index; the cost is that the
+    # "did a listener ask for a record?" check runs per LINE, so a
+    # thirty-line round walks the whole library thirty times for an answer
+    # that cannot have changed.
+    #
+    # The index itself only moves when the scanner thread rebuilds it
+    # (music_index), so the answer is memoised against that stamp and
+    # thrown away whole when it moves. Bounded, because the queries are
+    # lines of dialogue and there is no end to them.
     words = [w for w in re.findall(r"[a-z0-9']+", query.lower()) if len(w) > 1]
     if not words:
         return []
+    _key = (" ".join(words), int(limit))
+    try:
+        _stamp = float(_MUSIC.get("at") or 0)
+        if _stamp != _MUSIC_SEARCH_AT[0]:
+            _MUSIC_SEARCH_MEMO.clear()
+            _MUSIC_SEARCH_AT[0] = _stamp
+        _hit = _MUSIC_SEARCH_MEMO.get(_key)
+        if _hit is not None:
+            return list(_hit)
+    except Exception:  # noqa: BLE001
+        pass
     wanted = query.lower().strip()
 
     scored: list[tuple[float, int, dict[str, Any]]] = []
@@ -23268,7 +23312,14 @@ def music_search(query: str, limit: int = 12) -> list[dict[str, Any]]:
         scored.append((score, -len(track["title"]), track))
 
     scored.sort(key=lambda row: (-row[0], row[1]))
-    return [track for _score, _len, track in scored[:limit]]
+    _out = [track for _score, _len, track in scored[:limit]]
+    try:                                                      # 2026-09-15
+        if len(_MUSIC_SEARCH_MEMO) > 1024:
+            _MUSIC_SEARCH_MEMO.clear()
+        _MUSIC_SEARCH_MEMO[_key] = list(_out)
+    except Exception:  # noqa: BLE001
+        pass
+    return _out
 
 
 def music_artists(least: int = 1) -> list[dict[str, Any]]:
@@ -107821,12 +107872,33 @@ async def said_why_api(
                          "at": ""})
     except Exception:  # noqa: BLE001
         pass
+    # 2026-09-15: WHAT HAPPENED TO THE LINE, NOT ONLY WHAT SET IT.
+    #
+    # The inspector's own reading of this route, measured against a
+    # withdrawn row and a delivered one: no delivery id, no page or box
+    # delivery state, no refusal reason and no length came back, and
+    # `provenance.line` carries none of them either. Opened from the feed
+    # the window could borrow them off the chat row; opened by holding a
+    # line on the page - where there is no row, only a DOM node - it had
+    # nothing, and a refused line could only say that the page was not
+    # told why. They are all on the row this function already holds.
+    delivery = {k: row.get(k) for k in
+                ("air_at", "ts", "seconds", "sid", "turn", "turns",
+                 "delivery_id", "page_delivery", "box_delivery",
+                 "withdrawn_why", "clip_media", "clip_from", "clip_until",
+                 "source", "aired")
+                if row.get(k) not in (None, "")}
     return {"ok": True, "id": want, "said": str(row.get("text") or "")[:400],
             "who": who, "name": row.get("name"), "kind": row.get("kind"),
             "round": row.get("round"), "voice": row.get("voice"),
-            "engine": row.get("engine"), "model": written.get("model"),
+            "engine": row.get("engine") or (
+                ((row.get("trace") or {}).get("render") or {}).get("engine")
+                if isinstance(row.get("trace"), dict) else None),
+            "model": written.get("model"),
             "aired": row.get("aired"), "properties": properties,
-            "flow": flow,
+            "flow": flow, "delivery": delivery,
+            "seconds": row.get("seconds"), "air_at": row.get("air_at"),
+            "withdrawn_why": row.get("withdrawn_why") or "",
             "prompt": prompt, "systems": systems, "provenance_ok": bool(prov),
             "say": "%s on the %s road; %d thing(s) set it"
                    % (row.get("name") or who,
@@ -131897,8 +131969,30 @@ async def list_generations(
     limit: int = 200,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    """2026-09-15 (#1151): AND THE CREDENTIAL FOR EACH PICTURE.
+
+    The listen view puts the gallery behind the show. On the tablet the
+    panel is served from the station itself, so the pictures are
+    same-origin and every one loads; on the desk the page is a file: URL
+    on another machine, an <img> cannot send an Authorization header, and
+    all 138 of them came back 401 - a white bar with a broken-image icon,
+    which is what the operator photographed.
+
+    The picture route has always taken a tune-in token as the credential
+    in the URL. This adds the other credential the station already uses
+    for exactly this reason (media_sign, "the URL is the access
+    control"): one signature per FILE, handed out only with this list,
+    which itself needs the key. Nothing global is minted and nothing is
+    shareable beyond the one picture it names."""
     require_read_auth(authorization)
-    return {"generations": read_generations(limit)}
+    rows = read_generations(limit)
+    sig: dict[str, str] = {}
+    for rec in rows:
+        for name in (rec.get("files") or []):
+            got = str(name or "")
+            if got and got not in sig:
+                sig[got] = media_sign("gen:" + got)
+    return {"generations": rows, "sig": sig}
 
 
 @app.post("/api/generations/reconcile")
@@ -132078,7 +132172,11 @@ async def generation_image(
     the beginning: the URL is the credential, and revoking the link
     closes it. Read-only, one bind-mounted output folder, name-checked
     below."""
-    require_listen_auth(t, authorization)
+    # 2026-09-15 (#1151): a per-file signature is the third credential
+    # here, beside a tune-in token and the key. It is checked before the
+    # name is, because it is a signature OVER the name.
+    if not (t and hmac.compare_digest(t, media_sign("gen:" + str(filename or "")))):
+        require_listen_auth(t, authorization)
     if "/" in filename or ".." in filename or not re.fullmatch(
         r"[\w.\- ()\[\]]{1,200}", filename
     ):
