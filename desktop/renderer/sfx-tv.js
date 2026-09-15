@@ -99,6 +99,19 @@
   var timer = null;                // the poll
   var hold = null;                 // the "not due yet" timer
   var queue = [];
+  /* #1195: WHAT THE STATION HAS RUNG AHEAD, which `queue` above is not.
+   *
+   * `queue` is a holding array: offer() pushes a clip into it and calls
+   * next() in the same breath, so it is empty or holds one almost all the
+   * time. The strip was built from it and therefore drew no "next" tiles at
+   * all - the operator boxed the empty space where they should have been.
+   *
+   * This keeps what is coming, with the moment each is due on THIS
+   * machine's clock (poll() already computes that, because the box and this
+   * machine have no reason to agree). Plain objects, never elements: the
+   * notes in this file record what a spare video element cost here. */
+  var coming = [];                 // {id, url, sting, seconds, at}
+  var COMING_MOST = 6;
   var seen = 0;
   var busy = false;                // a poll in flight
   var showing = false;
@@ -1273,6 +1286,55 @@
    * next two the station has rung ahead. Short of either is simply short
    * - a set that has just come on has nothing behind it and says so by
    * showing fewer tiles rather than by drawing empty boxes. */
+  /* #1195: hold one clip in `coming`, and drop what is no longer coming.
+   *
+   * A clip leaves three ways: it reached the tube, it was withdrawn, or its
+   * moment passed by more than its own length - which is the case that
+   * matters, because a plan that silently failed to arrive must not sit in
+   * the strip for ever calling itself next. */
+  function comingKeep(clip) {
+    if (!clip || !clip.url) return;
+    var key = String(clip.id || clip.url);
+    var i;
+    for (i = coming.length - 1; i >= 0; i -= 1) {
+      if (String(coming[i].id || coming[i].url) === key) coming.splice(i, 1);
+    }
+    coming.push({id: clipId(clip), url: String(clip.url),
+                 sting: String(clip.sting || clip.text || ''),
+                 seconds: Number(clip.seconds) || 0,
+                 at: Number(clip.at) || 0});
+    coming.sort(function (a, b) { return (a.at || 0) - (b.at || 0); });
+    if (coming.length > COMING_MOST) {
+      coming.splice(0, coming.length - COMING_MOST);
+    }
+  }
+
+  function comingDrop(key) {
+    var k = String(key || '');
+    if (!k) return;
+    for (var i = coming.length - 1; i >= 0; i -= 1) {
+      if (String(coming[i].id || coming[i].url) === k) coming.splice(i, 1);
+    }
+  }
+
+  /* What is still ahead of us, soonest first. A clip whose moment has gone
+   * by more than its own length never arrived, and saying so by leaving it
+   * out is better than drawing it as next for the rest of the night. */
+  function comingRows() {
+    var t = now();
+    var here = playing ? clipId(playing) : '';
+    var out = [];
+    for (var i = 0; i < coming.length; i += 1) {
+      var row = coming[i];
+      if (!row || !row.url) continue;
+      if (here && String(row.id) === here) continue;
+      var late = t - (row.at || 0);
+      if (row.at && late > ((row.seconds || 0) * 1000) + 4000) continue;
+      out.push(row);
+    }
+    return out;
+  }
+
   function stripRows() {
     var rows = [];
     var i;
@@ -1285,12 +1347,30 @@
       rows.push({id: clipId(playing), url: String(playing.url),
                  sting: String(playing.sting || playing.text || ''),
                  seconds: Number(playing.seconds) || 0, when: 'now'});
+      comingDrop(clipId(playing));                           /* #1195 */
     }
-    for (i = 0; i < queue.length && i < STRIP_EACH; i += 1) {
-      if (!queue[i] || !queue[i].url) continue;
-      rows.push({id: clipId(queue[i]), url: String(queue[i].url),
-                 sting: String(queue[i].sting || queue[i].text || ''),
-                 seconds: Number(queue[i].seconds) || 0, when: 'next'});
+    /* #1195: from what the station has RUNG AHEAD, not from the holding
+     * array. `queue` is drained by next() in the same breath offer() fills
+     * it, so building the next tiles from it drew nothing at all - which is
+     * exactly what the operator photographed. `queue` is still read as a
+     * fallback, so a build that has one and not the other still shows
+     * something rather than going blank. */
+    var ahead = comingRows();
+    if (!ahead.length) {
+      for (i = 0; i < queue.length; i += 1) {
+        if (!queue[i] || !queue[i].url) continue;
+        ahead.push({id: clipId(queue[i]), url: String(queue[i].url),
+                    sting: String(queue[i].sting || queue[i].text || ''),
+                    seconds: Number(queue[i].seconds) || 0,
+                    at: Number(queue[i].at) || 0});
+      }
+    }
+    var mine = playing ? clipId(playing) : '';
+    for (i = 0; i < ahead.length && rows.length < (STRIP_EACH * 2) + 1; i += 1) {
+      if (mine && String(ahead[i].id) === mine) continue;
+      rows.push({id: ahead[i].id, url: ahead[i].url, sting: ahead[i].sting,
+                 seconds: ahead[i].seconds, at: ahead[i].at, when: 'next'});
+      if (rows.length >= STRIP_EACH + 1 + STRIP_EACH) break;
     }
     return rows;
   }
@@ -1700,8 +1780,15 @@
       shot.appendChild(img);
     }
     var when = document.createElement('i');
+    /* #1195: a "next" tile says HOW SOON, because "next" on four tiles in a
+     * row tells him nothing about the order he is looking at. */
+    var soon = '';
+    if (row.when === 'next' && Number(row.at) > 0) {
+      var wait = Math.round((Number(row.at) - now()) / 1000);
+      if (wait > 0) soon = ' ' + (wait > 99 ? '99+' : String(wait)) + 's';
+    }
     when.textContent = row.when === 'now' ? 'on now'
-      : (row.when === 'next' ? 'next' : 'played');
+      : (row.when === 'next' ? ('next' + soon) : 'played');
     var ws = when.style;
     ws.position = 'absolute'; ws.left = '0'; ws.right = '0'; ws.bottom = '0';
     ws.fontStyle = 'normal'; ws.fontSize = '8.5px'; ws.lineHeight = '12px';
@@ -2309,6 +2396,7 @@
     markOf(clip);
     queue.push(clip);
     if (queue.length > 4) queue.splice(0, queue.length - 4);
+    comingKeep(clip);                                       /* #1195 */
     /* #1411b: a clip that arrives while one is on screen is warmed at
        once if the one on screen already has what it needs. */
     if (!showing || (video && (video.readyState >= 4
@@ -2335,6 +2423,7 @@
         if (!got.endless) {
           /* 2026-09-14: off means off - the rung-ahead copies go */
           for (var qi = queue.length - 1; qi >= 0; qi -= 1) { if (queue[qi].endless) queue.splice(qi, 1); }
+          coming.length = 0;                                 /* #1195 */
           if (warm && warm.clip && warm.clip.endless) warmDrop();
         }
       }
