@@ -1,0 +1,110 @@
+/* PINE REVIVE (pine-revive.js). The sheet that comes up when the operator
+   clicks the words "Pine Box" at the top left.
+
+   Same dark glass as the clip doctor and the talk dot transcript, so it
+   reads as the station explaining itself and not as a browser dialog.
+   Wider than the clip doctor because every rung prints whole sentences
+   about what it found and what it changed, and the whole point of this
+   surface is that the operator can read it rather than decode it. */
+.pr-back {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483007;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 6, 11, .62);
+}
+.pr-back.show { display: flex; }
+.pr-box {
+  width: min(660px, 94vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #35414c;
+  border-radius: 12px;
+  background: rgba(10, 14, 18, .97);
+  color: #edf3f5;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .6);
+  font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+}
+.pr-bar {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid #35414c;
+  font-size: 11px;
+  letter-spacing: .08em;
+  color: #8ea0ad;
+  flex: 0 0 auto;
+}
+.pr-bar b { color: #edf3f5; letter-spacing: 0; font-size: 14px; }
+.pr-x {
+  margin-left: auto;
+  background: none;
+  border: 0;
+  color: #8ea0ad;
+  font: 20px/1 inherit;
+  cursor: pointer;
+  padding: 0 2px;
+  height: auto;
+}
+.pr-x:hover { color: #edf3f5; }
+
+/* The verdict is the first thing on the sheet and the last thing written,
+   so it sits above the rungs and not under them: on a bad night the
+   operator wants the sentence, not the transcript. */
+.pr-verdict {
+  padding: 12px 14px;
+  border-bottom: 1px solid #24323a;
+  color: #8ea0ad;
+  flex: 0 0 auto;
+}
+.pr-say { font-size: 15px; font-weight: 600; color: #e3be63; }
+.pr-verdict.good .pr-say { color: #54d18b; }
+.pr-because { margin-top: 4px; color: #8ea0ad; font-size: 12px; }
+
+.pr-rungs {
+  margin: 0;
+  padding: 8px 14px 8px 32px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+.pr-rung { margin: 0 0 10px; color: #cfe0e6; }
+.pr-rung b { color: #edf3f5; }
+.pr-rung p { margin: 2px 0 0; }
+
+/* A rung that CHANGED something reads differently from one that only
+   looked, because "what it did" and "what it saw" are different claims
+   and this house has been bitten by surfaces that blur them. */
+.pr-why { color: #6c7d89; font-size: 11.5px; }
+.pr-did { color: #65c7da; }
+.pr-found { color: #a8bac6; }
+.pr-proof { color: #8ea0ad; font-size: 11.5px; font-style: italic; }
+.pr-cannot { color: #c99b62; font-size: 11.5px; }
+.pr-changed b::after { content: " - changed something"; color: #65c7da; font-weight: 400; font-size: 11px; }
+.pr-looked b::after { content: " - looked only"; color: #6c7d89; font-weight: 400; font-size: 11px; }
+.pr-proved b::after { content: " - and the sound came back"; color: #54d18b; font-weight: 400; font-size: 11px; }
+.pr-failed b::after { content: " - this rung failed"; color: #e46b6b; font-weight: 400; font-size: 11px; }
+.pr-running b::after { content: " - working..."; color: #8ea0ad; font-weight: 400; font-size: 11px; }
+
+.pr-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-top: 1px solid #24323a;
+  font-size: 11px;
+  color: #8ea0ad;
+  flex: 0 0 auto;
+}
+.pr-again { height: 30px; padding: 0 12px; }
+
+/* THE WORDS ARE A CONTROL NOW, so they have to look like one - but only
+   under the pointer, because a title that shouts for attention on a rail
+   the operator reads all day is noise. The mark beside it is still the
+   rebuild (#1044) and is untouched. */
+.brand h1 { cursor: pointer; }
+.brand h1:hover { color: #65c7da; }
+.brand h1:focus-visible { outline: 1px solid #65c7da; outline-offset: 3px; }

@@ -42,6 +42,8 @@
   <link rel="stylesheet" href="./sfx-tv.css">
   <link rel="stylesheet" href="./pine-cam.css">
   <link rel="stylesheet" href="./clip-doctor.css">
+  <!-- 2026-09-15 (#1178): the ladder behind the words "Pine Box". -->
+  <link rel="stylesheet" href="./pine-revive.css">
   <!-- 2026-09-14: the hot corners - screenshot and draw, export the
        screen video, inspect the last line, replay the last SFX clip. -->
   <link rel="stylesheet" href="./hot-corners.css">
@@ -58,7 +60,17 @@
     <div class="brand">
       <button id="panicBtn" class="mark" title="Deploy the newest app.py to the box, then collapse, rebuild and relaunch this app on the newest source (#1044)"><img src="../assets/pinebox.png" alt="Pine Box"></button>
       <div>
-        <h1>Pine Box</h1>
+        <!-- 2026-09-15 (#1178): THE WORDS ARE THE AUDIO-RECOVERY LADDER.
+             "I just want to be able to click the Pine box text and it does
+              everything on the backend as far as coordinating with the
+              orchestrator to do whatever it takes to get the audio
+              redirected to this application. So it's coming out of the
+              default audio device that I needed to."
+             pine-revive.js wires itself to this id. The MARK beside it is
+             still #1044 - deploy and rebuild - and is untouched: "short of
+             restarting the server, which is what the icon is for". -->
+        <h1 id="brandTitle" role="button" tabindex="0"
+            title="Get the sound back into this application.&#10;Runs the whole audio ladder in order - what is wrong, this app's own audio, the out-loud switch for this device, the air, the delivery, the output device - and stops at the first rung that proves sound.&#10;It does NOT restart the station; that is the mark beside it.">Pine Box</h1>
         <p id="connLine">checking agent...</p>
         <!-- 2026-09-10: whether this app is the newest source on the
              share, so the mark says whether it needs pressing. -->
@@ -857,6 +869,9 @@
   <script src="./tablet-doctor.js"></script>
   <!-- #1361b: the clip doctor opens from the SCRIPT view here as it does on the tablet -->
   <script src="./clip-doctor.js"></script>
+  <!-- 2026-09-15 (#1178): click "Pine Box" and get the sound back. Last,
+       because it drives pineMonitorSay, pineMixer and PineDuck. -->
+  <script src="./pine-revive.js"></script>
   <!-- #1344: PUT THE RAIL UP HERE TOO.
 
        rail.js has always been device-agnostic and byte-identical to the
