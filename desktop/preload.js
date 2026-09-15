@@ -70,6 +70,52 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   replayBegin: (opts) => ipcRenderer.invoke("replay:begin", opts),
   replayStop: (why) => ipcRenderer.invoke("replay:stop", why),
   replayPush: (buffer, meta) => ipcRenderer.invoke("replay:push", buffer, meta),
+  /* #1183: THE NAMES THE DESK'S OWN RENDERER HAS BEEN CALLING AND NOT
+   * GETTING. "So it needs feature parity, so there's nothing left out."
+   *
+   * Every one of these is a name a file in renderer/ already calls and only
+   * the TABLET answered, so the desk has been running the "this terminal
+   * cannot do that" branch of its own code. The shapes are the tablet's
+   * shapes, field for field, because the same renderer file reads both -
+   * see bridge/PineDesktopBridge.kt and the section in main.js.
+   *
+   *   saveText({name, text, where})            -> {ok, where, bytes, detail}
+   *     sampler-kits.js:216. `where` is 'downloads' (Downloads/Pine Box) or
+   *     'recordings' (the folder named in Preferences). The answer's `where`
+   *     is the full path, which is what the exporter prints.
+   *   saveBytes({folder, name, mime, base64})  -> {ok, where, bytes, detail}
+   *     sampler-kits.js:511, seventeen times for one MPC kit. `folder` is
+   *     relative and always under Downloads.
+   *   keepClip({route, said, id, where})       -> {ok, where, bytes, detail}
+   *     line-actions.js:846. The bytes never enter the page: the main
+   *     process fetches the clip from the station and writes it.
+   *   revive()                                 -> {ok, rested, sinceMs, inARow}
+   *   revive({now:true, why})                  -> {ok:false, say} or nothing
+   *     deaf-watch.js:126. The rest period is owned by the main process so a
+   *     wedged page cannot put the app in a relaunch loop - see app:revive.
+   */
+  saveText: (opts) => ipcRenderer.invoke("file:save-text", opts),
+  saveBytes: (opts) => ipcRenderer.invoke("file:save-bytes", opts),
+  keepClip: (opts) => ipcRenderer.invoke("line:keep-clip", opts),
+  revive: (opts) => ipcRenderer.invoke("app:revive", opts),
+  /* #1183: THE MPC OVER USB, which on this machine is a drive letter rather
+   * than an Android document tree. sampler.js:1369-1462 and
+   * sampler-kits.js:678/696. See usb-disk.cjs for what is honestly knowable
+   * about a "USB device" on Windows and what is not.
+   *
+   *   usbState()                 -> {ok, chosen, name, canHost, anyRemovable,
+   *                                  volumes}
+   *   usbPick()                  -> {ok, name, detail}
+   *   usbSend({folder, into?})   -> {ok, files, bytes, where, detail}
+   *   usbList({path})            -> {ok, path, name, folders, files} | {ok:false,
+   *                                  path, detail}
+   *   usbRead({path, offset})    -> {ok, path, offset, bytes, size, eof, base64}
+   */
+  usbState: () => ipcRenderer.invoke("usb:state"),
+  usbPick: () => ipcRenderer.invoke("usb:pick"),
+  usbSend: (opts) => ipcRenderer.invoke("usb:send", opts),
+  usbList: (opts) => ipcRenderer.invoke("usb:list", opts),
+  usbRead: (opts) => ipcRenderer.invoke("usb:read", opts),
   lcdState: () => ipcRenderer.invoke("lcd:state"),
   lcdConfigure: (cfg) => ipcRenderer.invoke("lcd:configure", cfg),
   lcdDiscover: () => ipcRenderer.invoke("lcd:discover"),

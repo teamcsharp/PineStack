@@ -8,6 +8,15 @@ const { LcdFirmware } = require("./lcd-firmware.cjs");
 const { saveLcdSample } = require("./lcd-samples.cjs");
 const { TerminalHost } = require("./terminal-host.cjs");
 const clipMux = require("./clip-mux.cjs");
+/* #1183: THE MPC'S DISK, WHICH ON THIS MACHINE IS A DRIVE LETTER.
+ *
+ * renderer/sampler.js and renderer/sampler-kits.js have been calling
+ * usbState / usbPick / usbSend / usbList / usbRead on this surface for as
+ * long as they have existed and getting "This terminal cannot reach a USB
+ * disk" every time, because only the tablet bridge answered them. The
+ * module says what a "USB device" honestly is here, and what it does not
+ * pretend to know. */
+const { UsbDisk } = require("./usb-disk.cjs");
 /* #1182: THE ROLLING RECORD OF THIS WINDOW.
  *
  * "Only the tablet has a rolling recorder; this window does not, so a local
@@ -2343,6 +2352,476 @@ ipcMain.handle("pick:folder", async (event, opts) => {
   }
 });
 
+
+/* ====================================================================== */
+/* #1183: THE ROADS THE DESK'S OWN RENDERER HAS BEEN CALLING AND NOT       */
+/* GETTING - saving a file, keeping a clip, and bringing itself round.     */
+/* ====================================================================== */
+
+/* "Basically the Pine Box app needs the same feature set as what we have
+ *  going on with the Pine Box tab. So it needs feature parity, so there's
+ *  nothing left out."
+ *
+ * These are not new features. Every one of them is a name that
+ * desktop/renderer/*.js already calls, that only the TABLET's bridge
+ * answered, so the code has been running its "this terminal cannot do that"
+ * branch on the desk for as long as it has existed:
+ *
+ *   saveText  sampler-kits.js:216  - the kit exporter's whole write path
+ *   saveBytes sampler-kits.js:511  - the MPC kit's seventeen files
+ *   keepClip  line-actions.js:846  - "Download it to the recording folder"
+ *   revive    deaf-watch.js:126    - "this build has no way to revive itself"
+ *   usb*      sampler.js:1369      - see usb-disk.cjs
+ *
+ * THE SHAPES ARE THE TABLET'S SHAPES, field for field, because the SAME
+ * renderer file reads both answers - see bridge/PineDesktopBridge.kt. Where
+ * the two machines genuinely differ, the difference is in WHERE a file
+ * lands, never in what an answer looks like.
+ *
+ * AND NOTHING HERE REJECTS. The tablet's rule, followed exactly: a road that
+ * cannot do its job RESOLVES with {ok:false, detail:"..."}. A rejection
+ * arrives in the page as a crashed handler, and the callers above read
+ * `got.detail` to tell the operator what went wrong - a thrown error gives
+ * them nothing to print.
+ */
+
+/* A FILENAME WINDOWS WILL ACTUALLY TAKE.
+ *
+ * Ported from audio/ClipSaver.safeName, with two additions that Android does
+ * not need and Windows does: a name may not end in a dot or a space (the
+ * shell silently trims them, so "line ." and "line" become the same file),
+ * and the reserved device names are refused outright - a file called CON.wav
+ * cannot be created at all, and the failure is an EINVAL nobody can read.
+ *
+ * The cap is on the STEM and the extension is kept, which is a deliberate
+ * difference from ClipSaver: it caps the whole string, so a very long line
+ * of speech could lose its ".mp3" there. On Android that is cosmetic. On
+ * Windows a file with no extension is a file nothing will open. */
+const WINDOWS_DEVICE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+function safeFileName(raw, fallback) {
+  const whole = String(raw == null ? "" : raw);
+  const dot = whole.lastIndexOf(".");
+  /* A "." in the last five characters is an extension; one in the middle of
+   * a spoken line is a full stop and part of the name. */
+  const hasExt = dot > 0 && whole.length - dot <= 5;
+  let stem = hasExt ? whole.slice(0, dot) : whole;
+  let ext = hasExt ? whole.slice(dot) : "";
+  const clean = (text) => String(text)
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  stem = clean(stem).replace(/[. ]+$/, "");
+  ext = clean(ext).replace(/[. ]+$/, "");
+  if (stem.length > 120) stem = stem.slice(0, 120).trim();
+  if (!stem) stem = String(fallback || "pine box clip");
+  if (WINDOWS_DEVICE_NAMES.test(stem)) stem = stem + " file";
+  return stem + ext;
+}
+
+/* THE FILE IS NAMED AFTER WHAT IT SAYS.
+ *
+ * ClipSaver.nameFor, exactly: the first seven words of the line, then six
+ * characters of its id in brackets so two takes of the same words are
+ * different files. The operator searches his recordings folder for words he
+ * remembers hearing, not for a hex id. */
+function clipFileName(said, id, ext) {
+  const words = String(said || "").trim().split(/\s+/).filter(Boolean)
+    .slice(0, 7).join(" ");
+  const stem = words || "pine box line";
+  const tail = String(id || "").slice(0, 6);
+  return safeFileName(stem + " (" + tail + ")." + ext, "pine box line");
+}
+
+/* WHERE A KEPT FILE LANDS.
+ *
+ * The tablet's two destinations, in the desk's terms:
+ *
+ *   'recordings' - "the working folder you extract into", line-actions.js:226.
+ *                  That is cfg.saveDir, the folder the operator named in
+ *                  #1114 and the one the courier already carries to, so this
+ *                  is replayFolder() and not a second opinion about it.
+ *   anything else - Downloads / Pine Box, which is what the tablet's
+ *                  "Download it to the tablet" choice means and what the
+ *                  MPC exporter's folder paths are relative to. */
+function downloadsRoot() {
+  try { return app.getPath("downloads"); } catch (error) { return os.tmpdir(); }
+}
+
+function keepFolder(where) {
+  if (String(where || "") === "recordings") return replayFolder();
+  return path.join(downloadsRoot(), "Pine Box");
+}
+
+/**
+ * Bytes onto disk, answering in ClipSaver.Kept's shape.
+ *
+ * {ok, where, bytes, detail} - `where` is the full path (the tablet shows
+ * "Download/Pine Box/x.wav" for the same reason: it is the thing the
+ * operator can go and look at), `bytes` is a count, `detail` is "" on
+ * success and the reason on failure.
+ */
+function keepBytes(folder, name, bytes) {
+  try {
+    if (!bytes || !bytes.length) {
+      return { ok: false, where: "", bytes: 0, detail: "there was nothing to save" };
+    }
+    fs.mkdirSync(folder, { recursive: true });
+    const full = path.join(folder, name);
+    fs.writeFileSync(full, bytes);
+    return { ok: true, where: full, bytes: bytes.length, detail: "" };
+  } catch (error) {
+    return { ok: false, where: "", bytes: 0,
+      detail: String(error && error.message ? error.message : error) };
+  }
+}
+
+/**
+ * saveText - sampler-kits.js:216, exportKit().
+ *
+ * {name, text, where} in, {ok, where, bytes, detail} out. A sampler preset
+ * carries the AUDIO rather than references (a line id resolves for 48 hours
+ * and the media is then swept, so a kit of references would rot into a grid
+ * of dead pads), which makes a kit large - but it is still JSON, so it comes
+ * through as a string.
+ *
+ * NO SAVE DIALOG, deliberately, and this is the one decision here worth
+ * arguing about. The desk has dialog.showSaveDialog and uses it for cam:save.
+ * But the tablet writes straight to a known folder, sampler-kits.js prints
+ * `got.where` as a statement of fact - "Exported to ..." - and exportMpc
+ * below calls its sibling seventeen times in a row for one kit. A dialog
+ * would make that seventeen dialogs. So both of these land where the
+ * operator was told they land, and openFolder/showInFolder are the roads
+ * that take him there.
+ */
+ipcMain.handle("file:save-text", (_event, opts) => {
+  try {
+    const text = String((opts && opts.text) || "");
+    if (!text) {
+      return { ok: false, where: "", bytes: 0, detail: "there was nothing to write" };
+    }
+    const name = safeFileName(String((opts && opts.name) || "pine-box-kit.json"),
+      "pine-box-kit");
+    return keepBytes(keepFolder(opts && opts.where), name, Buffer.from(text, "utf8"));
+  } catch (error) {
+    return { ok: false, where: "", bytes: 0,
+      detail: String(error && error.message ? error.message : error) };
+  }
+});
+
+/**
+ * saveBytes - sampler-kits.js:511, writeFile() inside exportMpc().
+ *
+ * {folder, name, mime, base64} in, {ok, where, bytes, detail} out. An MPC
+ * kit is a FOLDER of WAVs beside an .xpm program, so the bytes are real
+ * audio and arrive as base64: a WAV put through a JSON string comes out
+ * corrupted, silently, and the MPC would refuse the kit with no clue why.
+ *
+ * `folder` is RELATIVE, always under Downloads - "Pine Box/<kit name>" is
+ * what exportMpc builds - and that is the same root usbSend copies from, so
+ * the two halves of the MPC road agree about where the kit is without either
+ * of them being told.
+ *
+ * `mime` is accepted and ignored. On the tablet it is load-bearing:
+ * MediaStore CORRECTS a filename whose extension does not match the type it
+ * was given, and declaring the program as application/xml had it written as
+ * "<name>.xpm.xml" - a file the MPC will never show, because it browses for
+ * .xpm. That was measured. Nothing on Windows renames a file you write, so
+ * the extension in `name` is the extension on disk, and the guard
+ * sampler-kits.js:618 keeps for that failure can never trip here.
+ */
+ipcMain.handle("file:save-bytes", (_event, opts) => {
+  try {
+    const b64 = String((opts && opts.base64) || "");
+    if (!b64) {
+      return { ok: false, where: "", bytes: 0, detail: "there was nothing to write" };
+    }
+    const asked = String((opts && opts.folder) || "Pine Box");
+    /* A relative folder from the page is still a path, and ".." in it is how
+     * a kit export becomes a write into C:\Windows. Each part is cleaned the
+     * same way a filename is, and a part that tries to climb ends the road. */
+    const parts = asked.split(/[\\/]+/).filter(Boolean);
+    for (const part of parts) {
+      if (part === "." || part === "..") {
+        return { ok: false, where: "", bytes: 0,
+          detail: "that is not a folder this app may write to" };
+      }
+    }
+    const folder = path.join(downloadsRoot(),
+      ...(parts.length ? parts.map((part) => safeFileName(part, "Pine Box")) : ["Pine Box"]));
+    const name = safeFileName(String((opts && opts.name) || "pine-box.bin"),
+      "pine-box");
+    return keepBytes(folder, name, Buffer.from(b64, "base64"));
+  } catch (error) {
+    return { ok: false, where: "", bytes: 0,
+      detail: String(error && error.message ? error.message : error) };
+  }
+});
+
+/**
+ * keepClip - line-actions.js:846, the two "Download it to ..." choices.
+ *
+ * {route, said, id, where} in, {ok, where, bytes, detail} out.
+ *
+ * THE BYTES NEVER ENTER THE PAGE. line-actions.js:842 says so and its
+ * progress bar sweeps rather than counting because of it: this process
+ * fetches the clip and writes it, so there is no Content-Length for the page
+ * to count against. It is audio, the page does not want it, and base64
+ * through the bridge would cost a third more for nothing.
+ *
+ * THE EXTENSION FOLLOWS THE BYTES, from the Content-Type the booth answered
+ * with - the same mapping the tablet uses. A .mp3 that is really a wav is a
+ * file that fails an hour later in whatever opens it.
+ */
+ipcMain.handle("line:keep-clip", async (_event, opts) => {
+  try {
+    const route = String((opts && opts.route) || "");
+    if (!route) {
+      return { ok: false, where: "", bytes: 0, detail: "no clip was named" };
+    }
+    /* The page names the route because the page knows which line it is
+     * looking at - but it may only name a station route, not an arbitrary
+     * URL this process would then fetch with the operator's API key
+     * attached. The same guard cam:save keeps at its own door. */
+    if (!route.startsWith("/api/")) {
+      return { ok: false, where: "", bytes: 0, detail: "that is not a station route" };
+    }
+    const cfg = readConfig();
+    const base = String(cfg.baseUrl || "").replace(/\/+$/, "");
+    const response = await fetch(base + route, { headers: authHeaders(cfg) });
+    if (!response.ok) {
+      return { ok: false, where: "", bytes: 0,
+        detail: "the station said " + response.status + " " + response.statusText };
+    }
+    const kind = String(response.headers.get("content-type") || "");
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length) {
+      return { ok: false, where: "", bytes: 0, detail: "the station sent nothing" };
+    }
+    const ext = kind.includes("mpeg") || kind.includes("mp3") ? "mp3"
+      : kind.includes("wav") ? "wav"
+      : kind.includes("ogg") ? "ogg"
+      : "audio";
+    const name = clipFileName(opts && opts.said, opts && opts.id, ext);
+    return keepBytes(keepFolder(opts && opts.where), name, bytes);
+  } catch (error) {
+    return { ok: false, where: "", bytes: 0,
+      detail: String(error && error.message ? error.message : error) };
+  }
+});
+
+/* ---------------------------------------------------------------------- */
+/* #1183: THE DESK, BRINGING ITSELF ROUND                                  */
+/* ---------------------------------------------------------------------- */
+
+/* renderer/deaf-watch.js:126 has been finding nothing here and writing "(this
+ * build has no way to revive itself)" into its own state. See net/Revive.kt
+ * for what was measured on the tablet: Chromium's network stack inside a
+ * renderer can die while everything else stays up - the bridge still answers,
+ * the feed still updates, every view still paints, and not one fetch,
+ * <audio> or <video> works. A RELOAD does not cure it, because the network
+ * service lives in the process; a fresh process does, on the instant.
+ *
+ * On the desk that means app.relaunch() followed by app.exit().
+ *
+ * THE REST PERIOD IS THE WHOLE POINT OF THIS, AND IT IS OWNED HERE.
+ *
+ * The caller is a page, and the fault this exists for is a page that has
+ * gone wrong. A page that has gone wrong in a slightly different way asks
+ * for a revival every few seconds - deaf-watch looks every 30s, but nothing
+ * stops a wedged timer, or some future caller, from asking far faster than
+ * that. If the page held the rest period, a restart loop would be one bug
+ * away, and a restart loop is strictly worse than a silent window: the
+ * operator can read a silent window.
+ *
+ * So there are four gates, and a page cannot reach past any of them:
+ *
+ *   1. FIVE MINUTES between revivals. Asked sooner, this answers
+ *      {ok:false} and nothing happens.
+ *   2. THREE IN A ROW and it stops trying. A revival that did not help must
+ *      not repeat for ever.
+ *   3. THE RUN IS FORGOTTEN after thirty minutes. Whatever that episode
+ *      was, it is not the same episode any more.
+ *   4. ON DISK, not in a field. A field is born again with the process it
+ *      lives in - so the process that came back would have had a clean
+ *      slate and revived again, and again. The count has to outlive the
+ *      thing it is counting. It goes in the same config store the rest of
+ *      the desk uses, written with writeConfig BEFORE the exit, because
+ *      after the exit there is no us.
+ *
+ * Which caps the damage at three relaunches in half an hour no matter what
+ * the page does, and at zero after that until the episode has aged out.
+ *
+ * Plus an in-process flag, which the tablet does not need and this does: the
+ * desk opens several windows (the mirror, the camera, the editors) and each
+ * is a renderer that could in principle ask. One relaunch is a relaunch;
+ * three at once is a race over who gets the single-instance lock. */
+const REVIVE_REST_MS = 5 * 60 * 1000;
+const REVIVE_GIVE_UP_AFTER = 3;
+const REVIVE_RUN_WINDOW_MS = 30 * 60 * 1000;
+let reviveGoing = false;
+
+function reviveSinceMs() {
+  const at = Number((readConfig() || {}).reviveAt || 0);
+  return at ? Date.now() - at : -1;
+}
+
+function reviveInARow() {
+  const cfg = readConfig() || {};
+  const at = Number(cfg.reviveAt || 0);
+  if (!at) return 0;
+  if (Date.now() - at >= REVIVE_RUN_WINDOW_MS) return 0;
+  return Number(cfg.reviveRun || 0);
+}
+
+function reviveRested() {
+  if (reviveGoing) return false;
+  const since = reviveSinceMs();
+  if (since < 0) return true;
+  if (since < REVIVE_REST_MS) return false;
+  /* Past the window the run is forgotten - whatever it was, it is not the
+   * same episode any more. */
+  if (since >= REVIVE_RUN_WINDOW_MS) return true;
+  return reviveInARow() < REVIVE_GIVE_UP_AFTER;
+}
+
+/**
+ * revive - deaf-watch.js:126 and :133.
+ *
+ * With no argument, or {now:false}, this REPORTS and changes nothing:
+ *   {ok:true, rested, sinceMs, inARow}
+ * `sinceMs` is -1 when there has never been one, which is Revive.sinceMs's
+ * own convention and not a zero dressed up.
+ *
+ * {now:true, why} actually does it. When it declines, the answer is
+ * {ok:false, say:"..."} - and deaf-watch.js:140 reads exactly that: "an
+ * answer at all means it declined - a revival does not return, because the
+ * process is gone".
+ */
+ipcMain.handle("app:revive", (_event, opts) => {
+  try {
+    const why = String((opts && opts.why) || "");
+    if (!opts || !opts.now) {
+      return { ok: true, rested: reviveRested(), sinceMs: reviveSinceMs(),
+        inARow: reviveInARow() };
+    }
+    if (!reviveRested()) {
+      const run = reviveInARow();
+      const say = run >= REVIVE_GIVE_UP_AFTER
+        ? "not reviving: " + run + " in a row already and it did not help"
+        : "too soon since the last one";
+      console.log("[revive] declined - " + say);
+      return { ok: false, say };
+    }
+    reviveGoing = true;
+    try {
+      writeConfig({ reviveAt: Date.now(), reviveRun: reviveInARow() + 1 });
+    } catch (error) {
+      console.log("[revive] could not remember this revival: " + error.message);
+    }
+    console.log("[revive] bringing the desk round (" + reviveInARow()
+      + " in this run): " + why);
+    /* THE LOCK IS LET GO BY HAND.
+     *
+     * #971 put a single-instance lock on this app, and app.relaunch() spawns
+     * the new copy as this one exits. Those two are a race: the replacement
+     * asks for a lock the dying process may not have released yet, sees it
+     * held, hands its arguments to a process that is on its way out, and
+     * quits - leaving nothing running at all. That is the same class of
+     * failure the tablet measured at #1317c, where a launch that landed
+     * inside the old process's teardown came back half dead. Releasing the
+     * lock here closes the window rather than hoping the timing is kind. */
+    try { app.releaseSingleInstanceLock(); } catch (error) { /* never held */ }
+    try {
+      app.relaunch();
+    } catch (error) {
+      /* NOTHING WILL BRING IT BACK, SO IT DOES NOT GO AWAY. A silent window
+       * is bad; a window that is simply gone until somebody walks over to
+       * the machine is worse. Revive.kt refuses to exit for exactly this
+       * reason when no alarm could be armed. */
+      reviveGoing = false;
+      return { ok: false,
+        say: "the app could not arrange to come back: " + error.message };
+    }
+    /* Not reached by the caller - the process is gone before this answer can
+     * be delivered - but deaf-watch reads `say` if it ever were. */
+    app.exit(0);
+    return { ok: true, say: "reviving" };
+  } catch (error) {
+    reviveGoing = false;
+    return { ok: false, say: String(error && error.message ? error.message : error) };
+  }
+});
+
+/* ---------------------------------------------------------------------- */
+/* #1183: THE MPC'S DISK - see usb-disk.cjs for what a "USB device" is on   */
+/* this machine and why this is a real road rather than a pretend one.      */
+/* ---------------------------------------------------------------------- */
+
+const usbDisk = new UsbDisk({
+  read: readConfig,
+  write: writeConfig,
+  /* The root the kit exporter wrote into. file:save-bytes above puts
+   * "Pine Box/<kit>" under this exact folder, so the two halves of the MPC
+   * road agree without either of them being told. */
+  downloads: downloadsRoot
+});
+
+ipcMain.handle("usb:state", async () => {
+  try { return await usbDisk.state(); }
+  catch (error) {
+    return { ok: false, chosen: false, name: "", canHost: true,
+      anyRemovable: false, volumes: [],
+      detail: String(error && error.message ? error.message : error) };
+  }
+});
+
+ipcMain.handle("usb:pick", async (event) => {
+  try {
+    const { dialog } = require("electron");
+    return await usbDisk.pick(async ({ defaultPath }) => {
+      const picked = await dialog.showOpenDialog(
+        BrowserWindow.fromWebContents(event.sender), {
+          title: "Point at the MPC's disk",
+          buttonLabel: "Use this disk",
+          defaultPath: defaultPath || undefined,
+          properties: ["openDirectory", "createDirectory"]
+        });
+      if (picked.canceled || !picked.filePaths || !picked.filePaths[0]) return "";
+      return picked.filePaths[0];
+    });
+  } catch (error) {
+    return { ok: false, name: "",
+      detail: String(error && error.message ? error.message : error) };
+  }
+});
+
+ipcMain.handle("usb:send", (_event, opts) => {
+  try { return usbDisk.send(opts || {}); }
+  catch (error) {
+    return { ok: false, files: 0, bytes: 0, where: "",
+      detail: String(error && error.message ? error.message : error) };
+  }
+});
+
+ipcMain.handle("usb:list", (_event, opts) => {
+  try { return usbDisk.list((opts && opts.path) || ""); }
+  catch (error) {
+    return { ok: false, path: String((opts && opts.path) || ""),
+      detail: String(error && error.message ? error.message : error) };
+  }
+});
+
+ipcMain.handle("usb:read", (_event, opts) => {
+  try {
+    return usbDisk.read((opts && opts.path) || "", (opts && opts.offset) || 0,
+      (opts && opts.length) || 0);
+  } catch (error) {
+    return { ok: false, path: String((opts && opts.path) || ""),
+      offset: Number((opts && opts.offset) || 0),
+      detail: String(error && error.message ? error.message : error) };
+  }
+});
 ipcMain.handle("shot:view", async (event) => {
   try {
     const win = BrowserWindow.fromWebContents(event.sender);
