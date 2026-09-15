@@ -19,7 +19,11 @@
 
 .pine-cam-box {
   position: fixed;
-  z-index: 9200;            /* over the views, under a modal */
+  /* 2026-09-14: ABOVE THE SFX SET (inline 2147483020, full screen on the
+     tablet) - measured over CDP: the box was built, visible, at 9200, and
+     elementFromPoint at its centre returned the set's <video>. Under the
+     hold sheets (...046) and the lock (...050), like the set itself. */
+  z-index: 2147483025;
   background: #0b0f11;
   border: 1px solid #24323a;
   border-radius: 10px;
@@ -290,7 +294,7 @@
 
 .pcl-sheet {
   position: fixed;
-  z-index: 9210;             /* over the picture box, under a modal */
+  z-index: 2147483026;       /* over the picture box, under a modal */
   min-width: 360px;
   max-width: 420px;
   max-height: calc(100vh - 24px);
@@ -480,7 +484,7 @@
 
 .pine-cam-prefs {
   position: fixed;
-  z-index: 9220;
+  z-index: 2147483027;
   width: 380px;
   max-width: calc(100vw - 16px);
   background: #0b0f11;
