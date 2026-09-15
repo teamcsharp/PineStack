@@ -3,6 +3,7 @@ package com.pinebox.kiosk.config
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -42,6 +43,15 @@ class ConfigStore(private val context: Context) {
          * local recording folder where I'm extracting things" has never
          * survived a restart. The same omission as the two above. */
         val recordingFolder = stringPreferencesKey("recordingFolder")
+        /* THE HOT CORNERS - see config/HotCorners.kt. Five keys rather than
+         * one JSON blob, so a corner added later is one line here and not a
+         * migration, and so a bad value in one corner cannot take the other
+         * three with it. */
+        val hotCornersOn = booleanPreferencesKey("hotCornersOn")
+        val hotCornerTl = stringPreferencesKey("hotCornerTl")
+        val hotCornerTr = stringPreferencesKey("hotCornerTr")
+        val hotCornerBl = stringPreferencesKey("hotCornerBl")
+        val hotCornerBr = stringPreferencesKey("hotCornerBr")
     }
 
     val flow: Flow<Config> = context.dataStore.data.map { prefs ->
@@ -59,6 +69,17 @@ class ConfigStore(private val context: Context) {
                 ?: fallback.tailnetName,
             recordingFolder = prefs[Keys.recordingFolder]?.takeIf { it.isNotBlank() }
                 ?: fallback.recordingFolder,
+            hotCorners = HotCornerPrefs(
+                enabled = prefs[Keys.hotCornersOn] ?: fallback.hotCorners.enabled,
+                tl = prefs[Keys.hotCornerTl]?.takeIf { it in HotCornerPrefs.ACTIONS }
+                    ?: fallback.hotCorners.tl,
+                tr = prefs[Keys.hotCornerTr]?.takeIf { it in HotCornerPrefs.ACTIONS }
+                    ?: fallback.hotCorners.tr,
+                bl = prefs[Keys.hotCornerBl]?.takeIf { it in HotCornerPrefs.ACTIONS }
+                    ?: fallback.hotCorners.bl,
+                br = prefs[Keys.hotCornerBr]?.takeIf { it in HotCornerPrefs.ACTIONS }
+                    ?: fallback.hotCorners.br,
+            ),
         )
     }
 
@@ -77,6 +98,11 @@ class ConfigStore(private val context: Context) {
             prefs[Keys.tailnetUrl] = next.tailnetUrl
             prefs[Keys.tailnetName] = next.tailnetName
             prefs[Keys.recordingFolder] = next.recordingFolder
+            prefs[Keys.hotCornersOn] = next.hotCorners.enabled
+            prefs[Keys.hotCornerTl] = next.hotCorners.tl
+            prefs[Keys.hotCornerTr] = next.hotCorners.tr
+            prefs[Keys.hotCornerBl] = next.hotCorners.bl
+            prefs[Keys.hotCornerBr] = next.hotCorners.br
         }
         return next
     }

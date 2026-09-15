@@ -102,6 +102,30 @@
   let backdropTurn = 0;
   let clips = [];
 
+  /* THE ENDLESS SET BEHIND THE SHOW.
+   *
+   * "In endless video mode replace the background of the page instead of
+   * it being comfy UI wallpapers replace it with the video ... just have
+   * the background be the video's loading in endless video mode for the
+   * listen tab."
+   *
+   * The floating SFX set (PineSfxTv) already decodes one clip after
+   * another when its endless switch is on. This view does not decode a
+   * second copy: it asks the set what is in its tube and puts THAT clip
+   * in #plBackVid, then veils the floating set so the same picture is not
+   * on screen twice. While `endlessBackdrop` is true the gallery road
+   * (paintBackdrop / swapStill) skips - it is not fought, it is paused -
+   * and when the set goes quiet or off the veil lifts and the gallery
+   * paints as it always did.
+   *
+   * Checked once a second - as a clock check inside the feed's paint, not
+   * a timer of its own: the single-poller rule in the header is enforced
+   * by a test that refuses any setInterval in this file, and the feed
+   * already ticks at 250 ms. */
+  const ENDLESS_CHECK_MS = 1000;
+  let endlessBackdrop = false;
+  let endlessAt = 0;
+
   let config = null;
   let mounted = false;
   let unsubscribe = null;
@@ -114,7 +138,6 @@
   let sleep = null;             /* the plan from model.sleepPlan(), or null */
   let volume = 1;
   let fadedTo = -1;             /* the last level the fade actually set */
-  let lastGrab = "";
   let lastSpeakId = "";
   let grabBusy = false;
 
@@ -265,6 +288,10 @@
    * discipline (hold the current and at most one more) is the reason it
    * survives. The CSS fades opacity on the single element instead. */
   function paintBackdrop(state, at) {
+    /* The endless set owns the backdrop while it is on - see paintEndless.
+     * Skipping here rather than inside each branch keeps the gallery's own
+     * swap logic exactly as it was. */
+    if (endlessBackdrop) return;
     if (!stills.length) return;
     /* Cycles on its own clock now, not on the track: a record sits for
      * three minutes and the backdrop should not. */
@@ -286,13 +313,19 @@
       vid.hidden = true;
       showPlexus(true);
       vid.onloadeddata = () => {
+        /* The endless set may have taken the element while this clip was
+         * still arriving; its frame is not ours to reveal. */
+        if (endlessBackdrop) return;
         vid.hidden = false;
         showPlexus(false);
         if (still) still.style.opacity = "0";
       };
       vid.play().catch(() => {
         /* Autoplay refused, or the clip will not decode. Fall back to a
-         * still rather than leaving a black rectangle behind the show. */
+         * still rather than leaving a black rectangle behind the show.
+         * A play() interrupted by the endless set changing src rejects
+         * too (AbortError), and that one must not hide the set's clip. */
+        if (endlessBackdrop) return;
         vid.hidden = true;
         showPlexus(false);
         if (still) still.style.opacity = "";
@@ -366,6 +399,9 @@
 
     const pre = new Image();
     pre.onload = () => {
+      /* A still decoded during the wait must not fade in over the endless
+       * set's video; the next gallery turn will pick another. */
+      if (endlessBackdrop) return;
       under.src = src;
       backDrift = (backDrift + 1) % 4;
       under.className = first.className.replace(/ *pl-drift-[0-9]/g, "")
@@ -377,6 +413,89 @@
     /* A still that will not load is skipped rather than shown as a hole. */
     pre.onerror = () => { /* the next turn will try another */ };
     pre.src = src;
+  }
+
+  /* Is this view actually on a screen somebody can see? The section is
+   * display:none behind another tab, and a hidden document (the tablet
+   * asleep, the app minimised) paints nothing. Both the endless veil and
+   * the spectrogram must let go in either case: a veiled floating set on
+   * a tab that is not showing is a set that has simply vanished. */
+  function onScreen() {
+    if (document.hidden) return false;
+    const face = el("plNow");
+    return !!(face && face.isConnected && face.clientWidth > 0);
+  }
+
+  /* THE SET'S CLIP AS THE BACKDROP. Called from paint() on the feed's
+   * tick; does its own work at most once a second.
+   *
+   * The contract with sfx-tv.js: endless() says whether the endless
+   * switch is on, playing() is the clip in the tube ({url, sting, id,
+   * seconds, ...}; url station-relative like /sfx/<id>?t=<sig>, resolved
+   * here the same way a gallery still is), veil(true|false) hides or shows
+   * the floating set. `src` is written only when the clip changes -
+   * assigning it on every check would restart the decode once a second -
+   * and the element does not loop: when a clip ends its last frame stays
+   * up until the set moves on to the next one. */
+  function paintEndless(at, force) {
+    if (!force && at - endlessAt < ENDLESS_CHECK_MS) return;
+    endlessAt = at;
+    const tv = root.PineSfxTv;
+    const vid = el("plBackVid");
+    const still = el("plBack");
+    const on = !!(tv && typeof tv.endless === "function" && tv.endless()
+      && typeof tv.playing === "function" && onScreen());
+    const clip = on ? tv.playing() : null;
+    const want = clip && clip.url ? absolute(String(clip.url)) : "";
+
+    if (want && vid) {
+      if (!endlessBackdrop) {
+        endlessBackdrop = true;
+        showPlexus(false);
+        vid.classList.add("pl-endless");
+        /* Both gallery layers go, not just the first: swapStill keeps the
+         * picture on whichever of the two it faded in last. */
+        if (still) still.style.opacity = "0";
+        /* By id, as swapStill finds it: the layer is cloned, not built. */
+        const second = document.getElementById("plBack2");
+        if (second) second.style.opacity = "0";
+      }
+      if (vid.dataset.endless !== want) {
+        vid.dataset.endless = want;
+        /* The gallery's own handler is dropped: it would reveal the frame
+         * and dim the still on its own terms, and it belongs to a clip
+         * that is no longer in the element. */
+        vid.onloadeddata = null;
+        vid.loop = false;
+        vid.muted = true;
+        vid.src = want;
+        vid.hidden = false;
+        vid.play().catch(() => { /* the poster frame is still a picture */ });
+      }
+      if (typeof tv.veil === "function") tv.veil(true);
+      return;
+    }
+
+    if (!endlessBackdrop) return;
+    /* Off, quiet, or off screen: hand the wall back to the gallery. */
+    endlessBackdrop = false;
+    if (tv && typeof tv.veil === "function") tv.veil(false);
+    if (vid) {
+      vid.classList.remove("pl-endless");
+      delete vid.dataset.endless;
+      vid.pause();
+      vid.hidden = true;
+      vid.removeAttribute("src");
+      vid.loop = true;
+      /* Let go of the decoded frames; this screen runs for hours. */
+      try { vid.load(); } catch (err) { /* nothing to release */ }
+    }
+    /* Show the layer the gallery was showing, and let it take its next
+     * turn at once rather than waiting out the rest it had already
+     * served before the set took over. */
+    if (backLayers.length) backLayers[backFront].style.opacity = "1";
+    else if (still) still.style.opacity = "";
+    stillAt = 0;
   }
 
   /* --------------------------------------------------------------- paint */
@@ -511,6 +630,9 @@
 
     paintSleep(at);
     paintGrab(payload);
+    paintSaid(payload);
+    /* The set first, so the gallery sees the flag before it paints. */
+    paintEndless(at, false);
     paintBackdrop(state, at);
   }
 
@@ -579,7 +701,10 @@
     button.title = target.row
       ? "Keep " + target.why + " - it lands on the next free sampler pad"
       : target.why;
-    put("plGrabWhy", lastGrab || (target.row ? target.why : ""));
+    /* target.why used to be printed beside the button as well. That was
+     * the "dialogue appearing in the section randomly" the operator
+     * asked to lose; the box is the marquee now (paintSaid) and the
+     * reason lives in the button's title, where it always also was. */
   }
 
   async function doGrab(payload, say) {
@@ -593,13 +718,11 @@
       s.takeable, payload.at);
     if (!target.row) { tell(target.why, true); return; }
     grabBusy = true;
-    lastGrab = "";
     const button = el("plGrab");
     if (button) { button.disabled = true; button.classList.add("working"); }
     tell("taking " + target.why + "…");
     try {
       const result = await s.grab(target.row);
-      lastGrab = result.why;
       tell(result.ok
         ? "Kept on " + result.why + " - open the Sampler to play it."
         : result.why, !result.ok);
@@ -691,7 +814,7 @@
       + 'autocomplete="off" spellcheck="false">'
       + '<div id="plHits" class="pl-hits" hidden></div></div>'
       + '<span id="plVote"></span>'
-      + '<button id="plDeskBtn" class="pl-deskbtn" title="Levels and meters">'
+      + '<button id="plDeskBtn" class="pl-deskbtn" title="Levels and meters" aria-label="Levels and meters">'
       + '<svg viewBox="0 0 24 24" aria-hidden="true">'
       + '<path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h13"/>'
       + '<circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/>'
@@ -713,7 +836,13 @@
       + '<i id="plSleepLeft"></i></div>'
       + '<button id="plGrab" class="pl-grab" title="Keep this moment">'
       + 'keep this</button>'
-      + '<i id="plGrabWhy" class="pl-grabwhy"></i>'
+      /* THE LINE ON AIR, and the voice under it - see paintSaid() and
+       * drawSpectrogram(). Ordered last in the row by CSS so it takes the
+       * full width beneath the buttons rather than splitting them. */
+      + '<div id="plSaid" class="pl-said dim">'
+      + '<div class="pl-marquee"><div id="plSaidTrack" class="pl-marquee-track"></div></div>'
+      + '<canvas id="plSaidSpec" class="pl-said-spec"></canvas>'
+      + '<i id="plSaidNote" class="pl-said-note"></i></div>'
       + '<button id="plPics" class="pl-pics" title="Fetch the gallery '
       + 'again. Not a poller: this view asks for pictures once at mount '
       + 'and then only when you press this.">pictures</button>'
@@ -1367,8 +1496,11 @@
 
     const tick = () => {
       meterFrame = requestAnimationFrame(tick);
-      /* A hidden view must not burn a frame drawing nothing. */
+      /* A hidden view must not burn a frame drawing nothing. document.hidden
+       * as well as the box: on the tablet rAF keeps firing with the screen
+       * off, and the spectrogram below would scroll for nobody. */
       const host = el("plMeterMusic");
+      if (document.hidden) return;
       if (!host || !host.isConnected || !host.clientWidth) return;
 
       /* Re-attach every frame is cheap (it returns early once tapped) and
@@ -1378,6 +1510,7 @@
 
       meters.draw(music, meters.read("musicPlayer", "music"), "#54d18b");
       meters.draw(voice, meters.readLoudest(VOICE_IDS, "voice"), "#e3be63");
+      drawSpectrogram(meters);
 
       /* Say plainly when there is nothing to read, rather than showing a
        * flat line that could equally mean silence or a broken meter. */
@@ -1394,6 +1527,213 @@
     /* The audio context starts suspended until a gesture; any touch on the
      * view is a good enough excuse to wake it. */
     document.addEventListener("pointerdown", () => meters.wake(), {once: false});
+  }
+
+  /* ------------------------------------------------------ the line on air
+   *
+   * "Instead of having the dialogue of the station ... appear in the
+   * section ... randomly, let's have a display of a scrolling marquee that
+   * is showing the currently playing dialogue that's being spoken
+   * scrolling through in an endless marquee ... with an audio spectrogram
+   * for the voice dialogue."
+   *
+   * What sat in this box was #plGrabWhy: grabTarget()'s reason for the
+   * "keep this" button - "the line on air", "the last thing said" - which
+   * read as a fragment of dialogue turning up at random. It is gone. The
+   * box carries the line being SPOKEN, off the very payload.now the grab
+   * reads (sampler-feed.js speakingNow(): the stream_now row under the
+   * station clock, or speaking_now), and under it a spectrogram of the
+   * voice audio this terminal is playing.
+   *
+   * THE MARQUEE is one CSS animation on a track holding the text twice,
+   * translated by exactly one copy per cycle, so the loop has no seam.
+   * Its duration is the measured width at ~90 px/s: a long line takes
+   * longer to pass, it does not go faster. The track is rebuilt - and so
+   * the animation restarted - only when the text changes; checked once a
+   * second on the feed's tick, never on a timer of its own (see the
+   * single-poller rule in the header). When nothing is being said the
+   * last line stays up, dimmed. */
+  const MARQUEE_PX_PER_S = 90;
+  const SAID_CHECK_MS = 1000;
+  let saidAt = 0;
+  let saidKey = "";
+  let saidWidth = 0;
+
+  function paintSaid(payload) {
+    const at = payload.at || Date.now();
+    if (at - saidAt < SAID_CHECK_MS) return;
+    saidAt = at;
+    const box = el("plSaid");
+    const track = el("plSaidTrack");
+    if (!box || !track) return;
+    const now = payload.now;
+    const text = now ? String(now.text || "").trim() : "";
+    const who = now ? String(now.name || now.who || "") : "";
+    box.classList.toggle("dim", !text);
+    if (!text) return;
+    /* Not measurable while the view is behind another tab; the next check
+     * on screen catches both a changed line and a changed width. */
+    const width = box.clientWidth;
+    if (!width) return;
+    const key = who + "\n" + text;
+    if (key === saidKey && width === saidWidth) return;
+    saidKey = key;
+    saidWidth = width;
+    buildMarquee(track, who, text, width);
+  }
+
+  function buildMarquee(track, who, text, width) {
+    track.replaceChildren();
+    for (let i = 0; i < 2; i += 1) {
+      const copy = document.createElement("span");
+      copy.className = "pl-said-copy";
+      /* The twin is there for the eye, not the screen reader. */
+      if (i) copy.setAttribute("aria-hidden", "true");
+      if (who) {
+        const name = document.createElement("b");
+        name.textContent = who;
+        copy.appendChild(name);
+      }
+      copy.appendChild(document.createTextNode(text));
+      /* Never narrower than the box, so a short line still leaves by the
+       * left before its twin arrives from the right. */
+      copy.style.minWidth = width + "px";
+      track.appendChild(copy);
+    }
+    /* RESTART, DELIBERATELY. Removing the animation, forcing a layout, and
+     * putting it back is the one way to make CSS start it again; the
+     * width read in between is the measurement the duration needs. The
+     * shorthand clears the duration, so it is written after. */
+    track.style.animation = "none";
+    const one = track.firstElementChild
+      ? track.firstElementChild.offsetWidth : width;
+    track.style.animation = "";
+    track.style.animationDuration =
+      Math.max(4, one / MARQUEE_PX_PER_S).toFixed(2) + "s";
+  }
+
+  /* THE VOICE SPECTROGRAM. Time runs left to right, frequency bottom to
+   * top, loudness as colour on a dark palette. Each frame the picture is
+   * shifted one device pixel left by drawing the canvas onto itself, and
+   * one new column is written at the right edge - one blit and one
+   * 1-px ImageData per frame, whatever the width. It runs inside the
+   * meters' requestAnimationFrame tick, so it stops with them: hidden
+   * tab, hidden document, or the box gone.
+   *
+   * WHERE THE NUMBERS COME FROM. The DJS meter reads the louder of the two
+   * voice players (VOICE_IDS) through PineMeters, and this reads exactly
+   * the same elements. PineMeters.tap(el) hands back the AnalyserNode
+   * itself where the bridge publishes it; where it does not (the module
+   * as shipped keeps its taps private and publishes read / readLoudest)
+   * the folded bars of readLoudest are used - 64 bins of the same
+   * fftSize-256 analyser, which is all a 48 px canvas can show. A
+   * borrowed analyser (the panel's own audioScope, #1305) is never
+   * reconfigured: its fftSize belongs to the panel. When neither road
+   * yields a reading nothing is drawn and the box says so once. */
+  const SPEC_PALETTE = [
+    [0x05, 0x08, 0x0a], [0x1d, 0x4d, 0x5a], [0x65, 0xc7, 0xda], [0xdf, 0xe7, 0xee]
+  ];
+  let specLut = null;
+  let specColumn = null;
+  let specBins = null;
+  let specSaid = false;
+
+  function specColour(v) {
+    if (!specLut) {
+      specLut = new Array(256);
+      for (let i = 0; i < 256; i += 1) {
+        const t = (i / 255) * (SPEC_PALETTE.length - 1);
+        const k = Math.min(SPEC_PALETTE.length - 2, Math.floor(t));
+        const f = t - k;
+        const a = SPEC_PALETTE[k];
+        const b = SPEC_PALETTE[k + 1];
+        specLut[i] = [
+          Math.round(a[0] + (b[0] - a[0]) * f),
+          Math.round(a[1] + (b[1] - a[1]) * f),
+          Math.round(a[2] + (b[2] - a[2]) * f)
+        ];
+      }
+    }
+    return specLut[Math.max(0, Math.min(255, Math.round(v * 255)))];
+  }
+
+  /* One column of magnitudes, 0..1, lowest frequency first - or null when
+   * nothing can be read. */
+  function voiceSpectrum(meters) {
+    if (typeof meters.tap === "function") {
+      let best = null;
+      let bestSum = -1;
+      for (const id of VOICE_IDS) {
+        const node = document.getElementById(id);
+        if (!node || node.paused || node.muted) continue;
+        let analyser = null;
+        try { analyser = meters.tap(node); } catch (err) { analyser = null; }
+        if (!analyser) continue;
+        if (!specBins || specBins.length !== analyser.frequencyBinCount) {
+          specBins = new Uint8Array(analyser.frequencyBinCount);
+        }
+        analyser.getByteFrequencyData(specBins);
+        let sum = 0;
+        for (let i = 0; i < specBins.length; i += 1) sum += specBins[i];
+        /* The louder of the two - the rule readLoudest applies. */
+        if (sum > bestSum) {
+          bestSum = sum;
+          best = Array.from(specBins, (b) => b / 255);
+        }
+      }
+      if (best) return best;
+    }
+    const read = meters.readLoudest(VOICE_IDS, "voice");
+    return read ? read.bars : null;
+  }
+
+  function drawSpectrogram(meters) {
+    const canvas = el("plSaidSpec");
+    if (!canvas) return;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    if (!w || !h) return;
+    const g = canvas.getContext("2d");
+    if (!g) return;
+    const dpr = Math.min(2, root.devicePixelRatio || 1);
+    const W = Math.round(w * dpr);
+    const H = Math.round(h * dpr);
+    if (canvas.width !== W || canvas.height !== H) {
+      canvas.width = W;
+      canvas.height = H;
+      g.fillStyle = "#05080a";
+      g.fillRect(0, 0, W, H);
+      specColumn = null;
+    }
+    const bars = voiceSpectrum(meters);
+    const say = el("plSaidNote");
+    if (!bars) {
+      if (!specSaid && say) {
+        specSaid = true;
+        say.textContent = "no voice to draw - this terminal has not been "
+          + "lent an analyser for the DJs";
+      }
+      return;
+    }
+    if (specSaid && say) { specSaid = false; say.textContent = ""; }
+    /* Shift left by one device pixel. Drawing a canvas onto itself is
+     * defined: the source is snapshotted before the write. */
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.drawImage(canvas, -1, 0);
+    if (!specColumn || specColumn.height !== H) specColumn = g.createImageData(1, H);
+    const px = specColumn.data;
+    const n = bars.length;
+    for (let y = 0; y < H; y += 1) {
+      /* Bottom row is the lowest bin. A gentle curve gives the voice band
+       * - the bottom fifth of a 256-point spectrum at 48 kHz - more rows
+       * than a straight line would. */
+      const frac = 1 - (y + 0.5) / H;
+      const bin = Math.min(n - 1, Math.floor(Math.pow(frac, 1.5) * n));
+      const c = specColour(bars[bin]);
+      const o = y * 4;
+      px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2]; px[o + 3] = 255;
+    }
+    g.putImageData(specColumn, W - 1, 0);
   }
 
   /* --------------------------------------------------------------- mount */
@@ -1438,6 +1778,13 @@
       root.screen.orientation.addEventListener("change", () => fitHead());
     }
   }
+
+  /* THE VEIL LIFTS THE MOMENT THE VIEW GOES. The feed's tick would catch
+   * it within a second, but on the tablet timers stop with the screen and
+   * a floating set left veiled is a set that has vanished. */
+  document.addEventListener("visibilitychange", () => {
+    if (mounted) paintEndless(Date.now(), true);
+  });
 
   root.PineListen = {
     /* Exposed so anything that changes the headline's box can ask for a

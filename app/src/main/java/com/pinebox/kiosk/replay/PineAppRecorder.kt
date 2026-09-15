@@ -131,9 +131,9 @@ class PineAppRecorder : Service() {
     override fun onDestroy() {
         eyes?.let { try { unregisterReceiver(it) } catch (err: Exception) { /* gone */ } }
         eyes = null
-        /* One last write. A service being destroyed is exactly the case the
-         * cache exists for. */
-        try { replay?.flush() } catch (err: Exception) { /* nothing to do */ }
+        /* Stop both encoders and release the loopback policy before caching.
+         * A destroyed service must not leave audio capture or retries alive. */
+        try { replay?.stop() } catch (err: Exception) { Log.w(TAG, "recorder stop: " + err.message) }
         super.onDestroy()
     }
 

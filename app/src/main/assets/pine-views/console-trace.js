@@ -40,7 +40,13 @@
 (function (root) {
   'use strict';
 
-  var THREE_URL = '/vendor/three.min.js';
+  /* Resolved, not assumed: a leading slash is the station on the tablet and
+   * the root of the DISK under file://. See pineThreeUrl in renderer.js. */
+  function threeUrl() {
+    if (window.pineThreeUrl) return window.pineThreeUrl();
+    if (/^https?:$/.test(location.protocol)) return '/vendor/three.min.js';
+    return 'http://127.0.0.1:8096/vendor/three.min.js';
+  }
   var threeLoad = null;
   var box = null;          /* the popup */
   var scene = null;        /* the running simulation, if any */
@@ -100,7 +106,7 @@
     if (threeLoad) return threeLoad;
     threeLoad = new Promise(function (resolve, reject) {
       var tag = document.createElement('script');
-      tag.src = THREE_URL;
+      tag.src = threeUrl();
       tag.onload = function () { resolve(root.THREE); };
       tag.onerror = function () {
         threeLoad = null;

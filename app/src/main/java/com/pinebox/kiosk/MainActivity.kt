@@ -10,6 +10,13 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import android.view.View
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.PixelCopy
+import android.os.Handler
+import android.os.Looper
+import android.util.Base64
+import java.io.ByteArrayOutputStream
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.PermissionRequest
@@ -30,6 +37,7 @@ import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.GravityCompat
 import androidx.drawerlayout.widget.DrawerLayout
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
@@ -40,6 +48,7 @@ import androidx.webkit.WebViewFeature
 import com.pinebox.kiosk.bridge.PineDesktopBridge
 import com.pinebox.kiosk.bridge.SamplerAssets
 import com.pinebox.kiosk.bridge.ViewAssets
+import com.pinebox.kiosk.config.HotCorners
 import com.pinebox.kiosk.kiosk.KioskController
 import com.pinebox.kiosk.net.PineNet
 import com.pinebox.kiosk.net.LoopDoor
@@ -290,6 +299,176 @@ class MainActivity : AppCompatActivity() {
         }
         timerGuard = guard
         webView.postDelayed(guard, TIMER_GUARD_MS)
+    }
+
+    // 2026-09-14: THE KEY CHORD. "if I press the lock button and the volume
+    // up button, I would like to take a picture of the screen and then also
+    // file a Pine report and dictate a message." Android keeps the power key
+    // for itself - an app never sees it - so the chord is volume-up pressed
+    // TWICE within 700 ms. The first press still changes the volume (it is
+    // let through); the second is taken, the window is copied with
+    // PixelCopy, and the page's PineReport.fromKey gets the picture: a flash,
+    // the pad, and the dot listening.
+    private var volumeUpAt = 0L
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP && event != null && event.repeatCount == 0) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - volumeUpAt < 700L) {
+                volumeUpAt = 0L
+                reportShot()
+                return true
+            }
+            volumeUpAt = now
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    private fun reportShot() {
+        shootScreen { shot ->
+            /* An empty string when the copy failed, as before: the page's
+             * fromKey opens the pad without a picture rather than not at
+             * all. */
+            val js = "window.PineReport && PineReport.fromKey(" +
+                com.pinebox.kiosk.bridge.BridgeEnvelope.quote(shot?.dataUrl ?: "") + ")"
+            runOnUiThread { webView.evaluateJavascript(js, null) }
+        }
+    }
+
+    /** One picture of the window, ready for a page: a data URL and its size. */
+    data class Shot(val dataUrl: String, val w: Int, val h: Int)
+
+    /**
+     * THE PICTURE OF THE SCREEN, SHARED BY THE KEY CHORD AND THE CORNER.
+     *
+     * "If I swipe into the tablet from the top left of the screen down to
+     *  the center, I want to take a screenshot of the screen and I want to
+     *  be able to draw on the screen and outline things with my finger in
+     *  red and be able to submit that image along with the report into the
+     *  Pine box inbox."
+     *
+     * The chord above and the bridge's `screenShot` (which the top-left
+     * corner calls, through hot-corners.js) want the same thing, so there is
+     * one road: PixelCopy of the whole window - the WebView, the drawer if
+     * it is open, everything - compressed off the main thread and handed
+     * back as a data URL. Call it on the main thread; [done] arrives ONCE,
+     * on a worker thread, with null when the window could not be copied
+     * (nothing on screen yet, or PixelCopy refused - the reason is in the
+     * log under PineKiosk).
+     */
+    fun shootScreen(done: (Shot?) -> Unit) {
+        try {
+            val w = window
+            val root = w?.decorView
+            if (w == null || root == null || root.width <= 0 || root.height <= 0) {
+                Log.w("PineKiosk", "screen shot: no window to copy yet")
+                done(null)
+                return
+            }
+            val width = root.width
+            val height = root.height
+            val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            PixelCopy.request(w, bmp, { result ->
+                if (result == PixelCopy.SUCCESS) {
+                    Thread {
+                        val out = ByteArrayOutputStream()
+                        // JPEG at 70: a 1340x800 screen is ~120 kB, which evaluateJavascript
+                        // carries without complaint; PNG would be four times that.
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                        bmp.recycle()
+                        val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                        done(Shot("data:image/jpeg;base64," + b64, width, height))
+                    }.start()
+                } else {
+                    Log.w("PineKiosk", "screen shot: PixelCopy result $result")
+                    bmp.recycle()
+                    done(null)
+                }
+            }, Handler(Looper.getMainLooper()))
+        } catch (e: Exception) {
+            Log.w("PineKiosk", "screen shot failed: ${e.message}")
+            done(null)
+        }
+    }
+
+    /* THE CORNER SWIPES, AND THE DRAWER THAT WOULD EAT TWO OF THEM.
+     *
+     * "If I swipe into the tablet from the top left of the screen down to
+     *  the center ... If I swipe from the left corner up to the center ..."
+     *
+     * Both of those start on the LEFT edge, and the left edge belongs to the
+     * DrawerLayout: its drag edge is widened to 40dp (widenDragEdge), and
+     * DrawerLayout.onInterceptTouchEvent runs before the WebView sees a
+     * single event, so a swipe out of the top-left or bottom-left corner
+     * would open the rail and the page would never hear of it.
+     *
+     * So: while hot corners are on, a finger landing inside CORNER_PX of any
+     * corner locks the drawer closed for the length of that one gesture,
+     * and the events fall through to the WebView, where hot-corners.js is
+     * watching. The lock is put back once the finger is up (after the UP
+     * has been dispatched, so the dragger never sees a mode change mid-
+     * gesture), which is what keeps an edge swipe that starts anywhere BUT
+     * a corner opening the rail as before.
+     *
+     * THE EDGE HANDLE TAKES THE OTHER HALF. Measured with the drawer locked:
+     * the right corners reached the page and the left ones still did not,
+     * because the 14dp ribbon down the left bezel (R.id.edgeHandle) is a
+     * clickable View ON TOP of the WebView, and a clickable View consumes
+     * the DOWN it is under - the FrameLayout never offers the gesture to
+     * the WebView beneath. So for a claimed corner gesture the handle is
+     * made unclickable too, and clickable again on the way up; its click
+     * listener is untouched and its tap works everywhere but inside a live
+     * corner, which is where a tap was never going to be meant for it.
+     *
+     * A corner set to "off" is not claimed at all, and nothing is claimed
+     * while the drawer is already open - locking it closed then would slam
+     * it shut under the operator's hand. */
+    private var cornerLockWas = -1
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            cornerLockWas = -1
+            val prefs = HotCorners.live
+            if (prefs.enabled && ::drawer.isInitialized && ::railHost.isInitialized
+                && !drawer.isDrawerOpen(railHost)) {
+                val corner = cornerAt(ev.rawX, ev.rawY)
+                if (corner != null && prefs.of(corner) != "off") {
+                    cornerLockWas = drawer.getDrawerLockMode(GravityCompat.START)
+                    drawer.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED, GravityCompat.START)
+                    findViewById<View?>(R.id.edgeHandle)?.isClickable = false
+                }
+            }
+        }
+        val handled = super.dispatchTouchEvent(ev)
+        if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+            if (cornerLockWas >= 0) {
+                drawer.setDrawerLockMode(cornerLockWas, GravityCompat.START)
+                findViewById<View?>(R.id.edgeHandle)?.isClickable = true
+                cornerLockWas = -1
+            }
+        }
+        return handled
+    }
+
+    /** Which corner a point is in, or null. Raw coordinates are window
+     *  coordinates here: the activity is full screen and the decor sits at
+     *  0,0, and it is the decor's size that says where the corners are. */
+    private fun cornerAt(x: Float, y: Float): String? {
+        val root = window?.decorView ?: return null
+        val w = root.width
+        val h = root.height
+        if (w <= 0 || h <= 0) return null
+        val left = x <= CORNER_PX
+        val right = x >= w - CORNER_PX
+        val top = y <= CORNER_PX
+        val bottom = y >= h - CORNER_PX
+        return when {
+            left && top -> "tl"
+            right && top -> "tr"
+            left && bottom -> "bl"
+            right && bottom -> "br"
+            else -> null
+        }
     }
 
     override fun onResume() {
@@ -675,6 +854,9 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             try {
                 val cfg = app.configStore.read()
+                /* The touch road's copy of the corner preferences, before
+                 * the first finger can land. See config/HotCorners.kt. */
+                HotCorners.read(app.configStore)
                 if (cfg.apiKey.isBlank()) app.client.discoverKey()
             } catch (err: Exception) {
                 Log.i(TAG, "key discovery deferred: ${err.message}")
@@ -697,6 +879,7 @@ class MainActivity : AppCompatActivity() {
             drawer = drawer,
             rail = railHost,
             client = app.client,
+            configStore = app.configStore,
             scope = lifecycleScope,
             navigate = { url -> webView.loadUrl(url) },
             runScript = { script, back -> webView.evaluateJavascript(script, back) },
@@ -809,6 +992,18 @@ class MainActivity : AppCompatActivity() {
             openExternal = ::openExternal,
         )
         webView.addJavascriptInterface(bridge, PineDesktopBridge.NAME)
+        /* THE FIRST RESUME HAS ALREADY HAPPENED. This runs from
+         * standUpTheRest, posted after the first frame - which is after
+         * onResume, whose `bridge.liveActivity = this` is guarded on the
+         * bridge existing and so did nothing on a cold start. Measured:
+         * screenShot answered "the terminal's window is not on screen"
+         * on every fresh launch until something paused and resumed the
+         * activity, and the USB picker had the same hole. So the window
+         * is handed over here as well, when the activity is already up. */
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            bridge.jackWatch = jackWatch
+            bridge.liveActivity = this
+        }
 
         val shim = readAsset("pine-bridge.js")
         val touch = readAsset("pine-touch.js")
@@ -1113,6 +1308,21 @@ class MainActivity : AppCompatActivity() {
              * existing host and edge handle rather than building a second
              * one, so the sampler must already have scaffolded itself. */
             ViewAssets.install(this@MainActivity, webView)
+
+            /* THE HOT CORNERS, TOLD RATHER THAN ASKED. hot-corners.js is in
+             * the bundle above; the moment it is, the page gets the
+             * operator's corner preferences pushed in, so it never has to
+             * ask the bridge and never boots on a stale default. Read from
+             * the store on a coroutine, which also refreshes the copy that
+             * dispatchTouchEvent reads. See config/HotCorners.kt. */
+            lifecycleScope.launch {
+                try {
+                    HotCorners.read(app.configStore)
+                    webView.evaluateJavascript(HotCorners.script(HotCorners.live), null)
+                } catch (err: Exception) {
+                    Log.w(TAG, "hot corners not pushed: ${err.message}")
+                }
+            }
         }
 
         override fun shouldOverrideUrlLoading(
@@ -1317,6 +1527,12 @@ class MainActivity : AppCompatActivity() {
 
         /** See widenDragEdge. 20dp is DrawerLayout's own; 40 is a thumb. */
         private const val EDGE_DP = 40f
+
+        /** THE CORNER SQUARE, in pixels - see dispatchTouchEvent. 110 px at
+         *  this screen's 1.25 px/dp is 88dp, a thumb and a half: big enough
+         *  to land in without looking, small enough that the widened drawer
+         *  edge keeps the whole middle of the left side. */
+        private const val CORNER_PX = 110f
 
         private const val RETRY_MS = 4_000L
 

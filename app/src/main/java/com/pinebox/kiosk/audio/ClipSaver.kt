@@ -6,6 +6,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
 import java.io.File
+import java.io.OutputStream
 
 /**
  * KEEPING A LINE.
@@ -55,7 +56,46 @@ object ClipSaver {
         mime: String,
     ): Kept {
         if (bytes.isEmpty()) return Kept(false, "", 0, "there was nothing to save")
+        return write(context, name, folder, mime, bytes.size.toLong()) { it.write(bytes) }
+    }
 
+    /**
+     * KEEP A FILE, STREAMED - the video sibling of [keep].
+     *
+     * "If I swipe in from the right side, I want to save a recording and
+     *  save it out to the Pine Box recordings folder that I have specified."
+     *
+     * A twenty-minute screen replay is tens of megabytes, and [keep] takes a
+     * ByteArray - reading a file that size into one to hand it over would
+     * put a second copy of the ring on a heap that already carries the ring.
+     * So the file is copied into the MediaStore stream in 64 kB pieces and
+     * never sits in memory whole. The destination is the one every other
+     * keep uses, Download/<folder>, so a screen video lands beside the clips
+     * and presets the operator already looks for there.
+     */
+    fun keepFile(
+        context: Context,
+        file: File,
+        name: String,
+        folder: String,
+        mime: String,
+    ): Kept {
+        val size = if (file.exists()) file.length() else 0L
+        if (size <= 0L) return Kept(false, "", 0, "there was nothing to save")
+        return write(context, name, folder, mime, size) { out ->
+            file.inputStream().use { it.copyTo(out, 64 * 1024) }
+        }
+    }
+
+    /** The one MediaStore road under both keeps: open, fill, publish. */
+    private fun write(
+        context: Context,
+        name: String,
+        folder: String,
+        mime: String,
+        size: Long,
+        fill: (OutputStream) -> Unit,
+    ): Kept {
         val safe = safeName(name)
         val relative = Environment.DIRECTORY_DOWNLOADS +
             (if (folder.isBlank()) "" else File.separator + folder.trim('/'))
@@ -73,7 +113,7 @@ object ClipSaver {
             val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                 ?: return Kept(false, "", 0, "the system would not open a file there")
 
-            resolver.openOutputStream(uri)?.use { it.write(bytes) }
+            resolver.openOutputStream(uri)?.use { fill(it) }
                 ?: return Kept(false, "", 0, "the file opened but could not be written")
 
             values.clear()
@@ -81,8 +121,8 @@ object ClipSaver {
             resolver.update(uri, values, null, null)
 
             val shown = relative + File.separator + safe
-            Log.i(TAG, "kept ${bytes.size} bytes at $shown")
-            Kept(true, shown, bytes.size)
+            Log.i(TAG, "kept $size bytes at $shown")
+            Kept(true, shown, size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
         } catch (err: Exception) {
             Log.w(TAG, "could not keep the clip", err)
             Kept(false, "", 0, err.message ?: err.javaClass.simpleName)

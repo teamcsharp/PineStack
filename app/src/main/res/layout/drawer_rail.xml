@@ -583,6 +583,134 @@
                 android:textSize="11sp" />
         </LinearLayout>
 
+        <!-- THE HOT CORNERS.
+             "I also want preferences in the swipe out on the pine box tablet
+              where I can specify what these behaviors are for the gestures
+              for each of the hot corners ... be able to also change these
+              and set these and disable these if I want in the sidebar that
+              swipes out on the left side for the pine box tablet."
+             The gesture itself lives in the page (pine-views/hot-corners.js).
+             These rows only say what each corner does, through the SAME
+             function the bridge's hotCornersSet uses (config/HotCorners.kt),
+             so a change made here reaches the page exactly as a change made
+             from the page does. The choices are listed in Kotlin, not here,
+             so the drawer and the bridge can never disagree on the words. -->
+        <LinearLayout style="@style/PineCard">
+
+            <TextView style="@style/PineCaption" android:text="@string/rail_corners" />
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/cornersOn"
+                android:layout_width="match_parent"
+                android:layout_height="@dimen/tap"
+                android:text="@string/rail_corners_switch"
+                android:textColor="@color/pine_ink"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/cornersNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="6dp"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp"
+                tools:text="corner swipes toward the centre · the screen ring holds 1200 s" />
+
+            <!-- One row per corner: its name, then what a swipe out of it
+                 toward the centre does. -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/rail_corner_tl"
+                    android:textColor="@color/pine_ink"
+                    android:textSize="13sp" />
+
+                <Spinner
+                    android:id="@+id/corner_tl"
+                    android:layout_width="0dp"
+                    android:layout_height="@dimen/tap"
+                    android:layout_weight="2.4"
+                    android:popupBackground="@color/pine_card"
+                    android:spinnerMode="dropdown" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/rail_corner_tr"
+                    android:textColor="@color/pine_ink"
+                    android:textSize="13sp" />
+
+                <Spinner
+                    android:id="@+id/corner_tr"
+                    android:layout_width="0dp"
+                    android:layout_height="@dimen/tap"
+                    android:layout_weight="2.4"
+                    android:popupBackground="@color/pine_card"
+                    android:spinnerMode="dropdown" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/rail_corner_bl"
+                    android:textColor="@color/pine_ink"
+                    android:textSize="13sp" />
+
+                <Spinner
+                    android:id="@+id/corner_bl"
+                    android:layout_width="0dp"
+                    android:layout_height="@dimen/tap"
+                    android:layout_weight="2.4"
+                    android:popupBackground="@color/pine_card"
+                    android:spinnerMode="dropdown" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/rail_corner_br"
+                    android:textColor="@color/pine_ink"
+                    android:textSize="13sp" />
+
+                <Spinner
+                    android:id="@+id/corner_br"
+                    android:layout_width="0dp"
+                    android:layout_height="@dimen/tap"
+                    android:layout_weight="2.4"
+                    android:popupBackground="@color/pine_card"
+                    android:spinnerMode="dropdown" />
+            </LinearLayout>
+        </LinearLayout>
+
         <!-- The jumps. Filled from QuickJumps.ALL in code rather than listed
              here: every entry is a key the PANEL already knows (pineShow3JS,
              app.py:135073) and keeping the list in Kotlin is what lets a JVM

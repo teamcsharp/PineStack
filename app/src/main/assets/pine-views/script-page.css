@@ -238,6 +238,7 @@
 /* ------------------------------------------------------------------- 5 */
 
 .sp-player {
+  position: relative;                      /* #1419: the dot sits in the corner */
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 10px;
@@ -283,6 +284,34 @@
   color: var(--sp-muted); font-variant-numeric: tabular-nums;
 }
 .sp-transport { display: flex; flex-direction: column; gap: 5px; }
+/* #1419: the mixer dot and its sheet */
+.sp-mixdot {
+  position: absolute; top: 5px; right: 6px; width: 12px; height: 12px;
+  padding: 0; border: 1px solid rgba(255,255,255,.35); border-radius: 50%;
+  background: var(--sp-accent, #65c7da); box-shadow: 0 0 6px var(--sp-accent, #65c7da);
+  cursor: pointer; opacity: .85; z-index: 3;
+}
+.sp-mixdot:hover { opacity: 1; transform: scale(1.15); }
+.sp-mix-back {
+  position: fixed; inset: 0; z-index: 2147483006; display: flex;
+  align-items: center; justify-content: center; background: rgba(0,0,0,.55);
+}
+.sp-mix-box {
+  width: min(360px, 92vw); background: var(--sp-panel, #131c24); color: var(--sp-text, #edf3f5);
+  border: 1px solid var(--sp-line, #35414c); border-radius: 12px; padding: 10px 14px 14px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.7); font-size: 13px;
+}
+.sp-mix-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--sp-line, #35414c); }
+.sp-mix-head b { flex: 1 1 auto; font-size: 15px; }
+.sp-mix-reset, .sp-mix-shut {
+  border: 1px solid var(--sp-line, #35414c); border-radius: 7px; background: var(--sp-panel-2, #0e151b);
+  color: var(--sp-text, #edf3f5); font: inherit; font-size: 12px; padding: 4px 9px; cursor: pointer;
+}
+.sp-mix-row { display: grid; grid-template-columns: 64px 1fr 44px; gap: 10px; align-items: center; padding: 9px 0 0; }
+.sp-mix-name { font-size: 12px; color: var(--sp-muted, #b9c6cf); }
+.sp-mix-range { width: 100%; min-width: 0; }
+.sp-mix-val { font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; color: var(--sp-muted, #b9c6cf); }
+.sp-mix-note { padding-top: 10px; font-size: 10.5px; color: var(--sp-muted, #b9c6cf); }
 .sp-tbtn {
   width: 36px; height: 30px; padding: 0;
   border: 1px solid var(--sp-line); border-radius: 7px;
@@ -426,6 +455,24 @@
    Quiet now: dimmed, and italic on the speech itself. */
 .sp-el.pending { opacity: .58; }
 .sp-el.pending.sp-dialogue { font-style: italic; }
+
+/* #1330: THE RECORD THAT IS TURNING.
+   An action line, so it must stay quieter than the live speech mark -
+   the deck is context, not the thing being read. No left border and no
+   gutter: that column belongs to sp-now alone (#1286), and the whole
+   point of this is to be legible WHILE a line is lit somewhere else. */
+.sp-el.sp-spinning {
+  color: var(--sp-text, #edf3f5);
+  opacity: 1;
+}
+.sp-el.sp-spinning::after {
+  content: ' · on the deck';
+  color: var(--sp-on, #65c7da);
+  font-size: 11px;
+  letter-spacing: .04em;
+}
+.sp-page.sp-look-paper .sp-el.sp-spinning { color: #1d1913; }
+.sp-page.sp-look-paper .sp-el.sp-spinning::after { color: #6b4f2a; }
 
 /* THE LINE BEING SAID, RIGHT NOW.
    One at a time, and unmistakable: the eye should find it without reading.
@@ -820,3 +867,260 @@
 .sp-page.sp-beside .sp-planjump::after { content: ''; }
 .sp-page.sp-beside .sp-crawl { grid-column: 1 / -1; }
 .sp-crawl-go.sp-planway.on { background: #2f5f6f; border-color: #4a9ab0; }
+
+/* #1385: the endless-video button, lit while the set is running, and the
+   word search - an input in the bar and a sheet over the view. */
+.sp-btn.sp-loop.on { border-color: #e46b6b; color: #e46b6b; box-shadow: inset 0 0 0 1px #e46b6b; }
+.sp-find {
+  flex: 1 1 120px; min-width: 90px; max-width: 260px; min-height: 36px;
+  padding: 6px 10px; border: 1px solid #35414c; border-radius: 9px;
+  background: #0b1114; color: #edf3f5; font: inherit;
+}
+.sp-find::placeholder { color: #6f8291; }
+.sp-find-back {
+  position: fixed; inset: 0; z-index: 2147483006; display: flex;
+  align-items: center; justify-content: center; background: rgba(4, 6, 11, .62);
+}
+.sp-find-box {
+  width: min(640px, 94vw); max-height: 86vh; overflow-y: auto;
+  border: 1px solid #35414c; border-radius: 12px; background: rgba(10, 14, 18, .97);
+  color: #edf3f5; font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .6);
+}
+.sp-find-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #35414c; }
+.sp-find-head b { font-size: 15px; }
+.sp-find-x { margin-left: auto; background: none; border: 0; color: #8ea0ad; font: 22px/1 inherit; cursor: pointer; min-width: 40px; min-height: 40px; }
+.sp-find-why { padding: 10px 14px 4px; font-weight: 600; color: #65c7da; }
+.sp-find-facts { padding: 2px 14px 10px; font-size: 11.5px; color: #8ea0ad; border-bottom: 1px solid #24323a; }
+.sp-find-rep { padding: 6px 14px; border-bottom: 1px solid #101823; color: #ffd479; }
+.sp-find-row { display: flex; flex-direction: column; padding: 6px 14px; border-bottom: 1px solid #101823; }
+.sp-find-when { font-size: 11px; color: #8ea0ad; }
+.sp-find-text { color: #cfe0e6; }
+
+/* #1117: the triangle at the front of every row of the word search.
+   A thumb-sized caret (the operator opens this on the tablet) that turns
+   to point down when the row is open; the panel under it is compact -
+   what set the line, the road's system prompt in a folded editor, what
+   contributed with the stood-aside systems dimmed, not hidden. */
+.sp-find-line { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.sp-find-main { display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0; }
+.sp-find-rep .sp-find-main { display: inline; }
+.sp-find-tri {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 30px; min-height: 30px; margin: -3px 0 0 -6px; padding: 0;
+  border: 0; border-radius: 6px; background: none; color: #8ea0ad;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-find-tri .pi-icon { width: 16px; height: 16px; transition: transform .16s ease; }
+.sp-find-tri[aria-expanded="true"] { color: #65c7da; }
+.sp-find-tri[aria-expanded="true"] .pi-icon { transform: rotate(90deg); }
+.sp-find-tri:disabled { opacity: .3; cursor: default; }
+.sp-find-why-panel {
+  margin: 6px 0 2px 24px; padding: 8px 10px;
+  border-left: 2px solid #35414c; border-radius: 0 8px 8px 0;
+  background: rgba(255, 255, 255, .03);
+  color: #cfe0e6; font-size: 12px; line-height: 1.45;
+}
+.sp-why-h { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: #8ea0ad; margin: 6px 0 3px; }
+.sp-why-h:first-child { margin-top: 0; }
+.sp-why-dim { color: #6f8291; font-size: 11.5px; }
+.sp-why-dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; margin: 0; }
+.sp-why-dl dt { color: #8ea0ad; white-space: nowrap; }
+.sp-why-dl dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.sp-why-dl dd i { color: #6f8291; font-style: italic; font-size: 11px; }
+.sp-why-prompt { margin: 6px 0; }
+.sp-why-prompt summary { cursor: pointer; color: #cfe0e6; min-height: 28px; line-height: 28px; }
+.sp-why-ta {
+  display: block; width: 100%; box-sizing: border-box; min-height: 6em; margin: 4px 0;
+  padding: 6px 8px; border: 1px solid #35414c; border-radius: 6px;
+  background: #0b1114; color: #edf3f5; resize: vertical;
+  font: 11.5px/1.4 ui-monospace, Menlo, Consolas, monospace;
+}
+.sp-why-ta:read-only { color: #a8b6bf; }
+.sp-why-save { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sp-why-savebtn { min-height: 32px; font-size: 12px; }
+.sp-why-sys { list-style: none; margin: 0; padding: 0; }
+.sp-why-sys li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; padding: 2px 0; }
+.sp-why-sys li.off { color: #6f8291; }
+.sp-why-sys li.off b { color: #6f8291; font-weight: 500; }
+.sp-why-onoff { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: #54d18b; }
+.sp-why-sys li.off .sp-why-onoff { color: #6f8291; }
+.sp-why-note { flex-basis: 100%; color: #a8b6bf; font-size: 11.5px; }
+.sp-why-sys li.off .sp-why-note { color: #6f8291; }
+.sp-why-noprov { margin-top: 6px; }
+.sp-why-say { margin-top: 6px; color: #8ea0ad; font-style: italic; }
+
+/* #1115: the report button at the top of the script pane, sized like the
+   video cue, and the shutter - a white sheet over the whole view that
+   fades in under half a second, the photography the operator asked for.
+   The host is position:fixed (rail.js), so absolute here is the view. */
+.sp-btn.sp-report { display: inline-flex; align-items: center; justify-content: center; }
+.sp-btn.sp-report .pi-icon { width: 18px; height: 18px; }
+.sp-btn.sp-report.sp-firing { opacity: .55; }
+.sp-btn.sp-report.sp-fired-bad { border-color: #d86b57; color: #e9b5aa; }
+.sp-shutter {
+  position: absolute; inset: 0; z-index: 2147483005;
+  background: #fff; pointer-events: none;
+  animation: sp-shutter 450ms ease-out forwards;
+}
+@keyframes sp-shutter {
+  from { opacity: .9; }
+  to { opacity: 0; }
+}
+
+/* 2026-09-14: the caution button, pinned to the script pane's top-left
+   corner and staying there while the page scrolls. */
+.sp-caution-wrap { position: sticky; top: 6px; height: 0; z-index: 6; overflow: visible; }
+.sp-caution {
+  position: absolute; left: 6px; top: 0;
+  width: 34px; height: 34px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  border: 1px solid #7a5a1a;
+  background: #1a1408;
+  color: #f5b83d;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0,0,0,.45);
+}
+.sp-caution svg, .sp-caution .pi-icon { width: 18px; height: 18px; }
+.sp-caution:hover { background: #2a2010; color: #ffd37a; }
+.sp-caution.sp-firing { opacity: .55; }
+.sp-caution.sp-fired-bad { border-color: #ff5d5d; color: #ff5d5d; }
+
+/* 2026-09-14: WHERE THE CLIPS COME FROM - the folder sheet a hold of the
+   video button opens. The shell is the word search's (.sp-find-back /
+   .sp-find-box); these are the parts it adds. Rows are 44 px on touch so
+   the tri, the box and the name are each a thumb's target (36 px under a
+   mouse); the sample list under an open folder is dense on purpose - it
+   is a preview, not a player. Every colour is written out: the sheet is
+   the same dark on the desk and on the tablet, whatever the platform's
+   theme says. The video button itself refuses the platform's long-press
+   selection and callout, since a hold on it now means something. */
+.sp-btn.sp-reel { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+.sp-folder-box {
+  width: min(720px, 96vw); max-height: 86vh; overflow: hidden;
+  display: flex; flex-direction: column; background: #0b1116; color: #dfe7ee;
+}
+.sp-folder-say { padding: 8px 14px; background: #10202a; color: #65c7da; font-weight: 600; border-bottom: 1px solid #24323a; }
+.sp-folder-top { flex: 0 0 auto; padding: 8px 14px 10px; border-bottom: 1px solid #35414c; display: flex; flex-direction: column; gap: 6px; }
+.sp-folder-hours-row { display: flex; align-items: center; gap: 12px; min-height: 44px; cursor: pointer; }
+.sp-folder-hours-label { flex: 0 0 150px; color: #dfe7ee; font-weight: 600; }
+.sp-folder-hours { flex: 1 1 auto; min-height: 44px; margin: 0; accent-color: #65c7da; cursor: pointer; }
+.sp-folder-pin-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 32px; }
+.sp-folder-pin { flex: 1 1 auto; min-width: 0; color: #8ea0ad; }
+.sp-folder-pin.on { color: #ffd479; }
+.sp-folder-clear {
+  flex: 0 0 auto; min-height: 40px; padding: 0 14px; border: 1px solid #65c7da; border-radius: 9px;
+  background: #0b1116; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-folder-filter {
+  width: 100%; box-sizing: border-box; min-height: 40px; padding: 6px 10px;
+  border: 1px solid #35414c; border-radius: 9px; background: #06090c; color: #dfe7ee; font: inherit;
+}
+.sp-folder-filter::placeholder { color: #6f8291; }
+.sp-folder-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.sp-folder-note { padding: 10px 14px; color: #8ea0ad; }
+.sp-folder-row { border-bottom: 1px solid #101823; }
+.sp-folder-line { display: flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 10px 0 6px; }
+.sp-folder-tri, .sp-folder-check {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 40px; min-height: 40px; padding: 0; border: 0; border-radius: 8px;
+  background: none; color: #8ea0ad; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-folder-tri .pi-icon, .sp-folder-ico .pi-icon { width: 18px; height: 18px; }
+.sp-folder-tri .pi-icon { transition: transform .16s ease; }
+.sp-folder-tri[aria-expanded="true"] { color: #65c7da; }
+.sp-folder-tri[aria-expanded="true"] .pi-icon { transform: rotate(90deg); }
+.sp-folder-tri:disabled { opacity: .3; cursor: default; }
+.sp-folder-check .pi-icon { width: 20px; height: 20px; }
+.sp-folder-check[aria-pressed="true"] { color: #65c7da; }
+.sp-folder-row.under .sp-folder-check { color: #3f7f8c; }
+.sp-folder-ico { display: inline-flex; flex: 0 0 auto; color: #6f8291; }
+.sp-folder-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #dfe7ee; cursor: pointer; }
+.sp-folder-row.pinned .sp-folder-name { color: #65c7da; font-weight: 600; }
+.sp-folder-row.under .sp-folder-name { color: #9fd6e0; }
+.sp-folder-n { flex: 0 0 auto; font-size: 11.5px; color: #8ea0ad; white-space: nowrap; }
+.sp-folder-samples { padding: 2px 10px 8px 52px; background: #080d11; }
+.sp-folder-sample { padding: 4px 0; border-top: 1px solid #101823; }
+.sp-folder-sample-line { display: flex; align-items: center; gap: 6px; min-height: 24px; font-size: 12px; }
+.sp-folder-kind { display: inline-flex; flex: 0 0 auto; color: #6f8291; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+.sp-folder-kind .pi-icon { width: 14px; height: 14px; }
+.sp-folder-sample-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cfe0e6; }
+.sp-folder-sample-len { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; color: #8ea0ad; font-size: 11px; white-space: nowrap; }
+.sp-folder-sample-len .pi-icon { width: 12px; height: 12px; }
+.sp-folder-media { display: block; width: 100%; max-width: 420px; height: 32px; margin: 2px 0 0; }
+video.sp-folder-media { height: auto; max-height: 120px; background: #000000; border-radius: 6px; }
+@media (pointer: fine) {
+  .sp-folder-line { min-height: 36px; }
+  .sp-folder-tri, .sp-folder-check { min-width: 32px; min-height: 32px; }
+}
+
+/* 2026-09-14: THE REASON SHEET (a hold on the caution button) and THE
+   INBOX SHEET (a hold on the report icon). The same shell and the same
+   dark as the folder sheet above: #0b1116 box, #dfe7ee text, #65c7da
+   accent, every colour written out. Reason rows are 44 px, full width,
+   one thumb each; the inbox card is a header, a first line and a caret,
+   and its body is monospace that wraps - a report is read here, not
+   edited. The x that deletes goes red on the first tap and only the
+   second tap, inside three seconds, does the deed. */
+.sp-caution, .sp-btn.sp-report { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+.sp-sheet-say { padding: 8px 14px; background: #10202a; color: #65c7da; font-weight: 600; border-bottom: 1px solid #24323a; }
+.sp-reason-box, .sp-inbox-box {
+  max-height: 86vh; overflow: hidden; display: flex; flex-direction: column;
+  background: #0b1116; color: #dfe7ee;
+}
+.sp-reason-box { width: min(520px, 94vw); }
+.sp-inbox-box { width: min(760px, 96vw); }
+.sp-reason-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 0; }
+.sp-reason-choice {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 0 14px;
+  border: 0; border-bottom: 1px solid #101823; background: none; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-reason-choice.on { color: #65c7da; background: #0e1a21; }
+.sp-reason-mark { display: inline-flex; flex: 0 0 auto; color: #8ea0ad; }
+.sp-reason-choice.on .sp-reason-mark { color: #65c7da; }
+.sp-reason-mark .pi-icon { width: 20px; height: 20px; }
+.sp-reason-text { flex: 1 1 auto; }
+.sp-reason-custom { display: flex; align-items: flex-start; gap: 8px; padding: 8px 14px; background: #080d11; }
+.sp-reason-ta {
+  flex: 1 1 auto; min-width: 0; min-height: 72px; box-sizing: border-box; padding: 8px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee; font: inherit; resize: vertical;
+}
+.sp-reason-ta::placeholder { color: #6f8291; }
+.sp-reason-dictate {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 0 12px;
+  border: 1px solid #35414c; border-radius: 9px; background: #0b1116; color: #dfe7ee; font: inherit; cursor: pointer;
+}
+.sp-reason-dictate .pi-icon { width: 16px; height: 16px; }
+.sp-reason-file {
+  flex: 0 0 auto; margin: 8px 14px 12px; min-height: 44px; border: 1px solid #65c7da; border-radius: 9px;
+  background: #10202a; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-inbox-refresh {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px;
+  margin-left: auto; border: 0; border-radius: 8px; background: none; color: #8ea0ad; font: inherit; cursor: pointer;
+}
+.sp-inbox-refresh + .sp-find-x { margin-left: 0; }
+.sp-inbox-refresh .pi-icon { width: 18px; height: 18px; }
+.sp-inbox-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.sp-inbox-card { border-bottom: 1px solid #101823; }
+.sp-inbox-line { display: flex; align-items: center; gap: 6px; min-height: 44px; padding: 4px 6px; }
+.sp-inbox-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; cursor: pointer; }
+.sp-inbox-head { font-size: 12px; color: #8ea0ad; }
+.sp-inbox-status { color: #ffd479; font-weight: 400; }
+.sp-inbox-first { color: #dfe7ee; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-inbox-x {
+  flex: 0 0 auto; min-width: 40px; min-height: 40px; border: 1px solid transparent; border-radius: 8px;
+  background: none; color: #8ea0ad; font: 20px/1 inherit; cursor: pointer;
+}
+.sp-inbox-x.armed { color: #ffffff; background: #c0392b; border-color: #e46b6b; }
+.sp-inbox-x:disabled { opacity: .4; cursor: default; }
+.sp-inbox-body { padding: 0 14px 10px 46px; }
+.sp-inbox-pre {
+  margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere;
+  font: 12px/1.45 ui-monospace, Consolas, Menlo, monospace; color: #cfe0e6;
+}
+.sp-inbox-details { margin: 6px 0; padding-left: 8px; border-left: 2px solid #35414c; }
+.sp-inbox-details summary { cursor: pointer; min-height: 32px; line-height: 32px; color: #65c7da; }
+.sp-inbox-img { display: block; max-width: 100%; max-height: 260px; margin: 6px 0; border-radius: 6px; background: #000000; }

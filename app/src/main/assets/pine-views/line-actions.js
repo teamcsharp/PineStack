@@ -27,12 +27,15 @@
 
   var HOLD_MS = 600;       /* long enough not to fire on a tap */
   var SLOP = 12;           /* pixels of movement that still counts as still */
+  var OPEN_GUARD_MS = 350; /* a release this soon after opening is the hold's own */
+  var DEDUPE_MS = 400;     /* pointerup and the click that follows it are one press */
 
   var timer = 0;
   var from = null;
   var startX = 0;
   var startY = 0;
   var swallow = false;
+  var openedAt = 0;        /* when the sheet last went up, for the guard above */
 
   function api() {
     return root.pineDesktop || {
@@ -67,6 +70,12 @@
 
   function down(event) {
     clear();
+    /* A NEW PRESS DISARMS THE OLD SWALLOW. The click the flag was armed for
+     * belongs to the hold's release; by the time another finger goes down
+     * that click has either arrived and been eaten, or it is never coming
+     * (see maybeSwallow for how it goes missing). Either way the flag has
+     * no business eating the press that is starting now. */
+    swallow = false;
     var line = lineAt(event.target);
     if (!line) return;
     from = line;
@@ -95,10 +104,33 @@
   }
 
   /* The click that follows a long press belongs to the press, not to the
-   * element - otherwise holding a script line also opens its detail pane. */
+   * element - otherwise holding a script line also opens its detail pane.
+   *
+   * THE DOUBLE CLICK ON THE DESK ("it requires that I click the buttons
+   * twice to do the action") LIVED HERE. This flag was a one-shot with no
+   * expiry and no idea what it was aimed at: armed when the hold fired, and
+   * cleared by the NEXT click, whatever that click was. On the tablet the
+   * next click is the hold's own release, and the flag does its job. On the
+   * desk that click can simply fail to arrive: the Script page reconciles
+   * its lines on a timer and replaces the very node the mouse went down on
+   * (script-page.js, the replaceChildren() in its plan repaint and the
+   * per-line swap in its reconcile), and Chromium does not dispatch a click
+   * whose mousedown target has left the document. So the flag stayed armed,
+   * and the first click on a sheet button - Play it, a pad, Close - was
+   * eaten HERE, in the capture phase, before the button's own listener could
+   * run. The second click worked because the first had spent the flag. The
+   * operator saw a menu that needed telling twice.
+   *
+   * Two rules now, neither of which the old code had: a click INSIDE the
+   * sheet is never the hold's click (the hold started on a line, and the
+   * line is not in the sheet), and a fresh pointerdown disarms the flag (see
+   * down()). Belt and braces beyond that: the sheet's buttons act on
+   * pointerup as well as click, so even a swallowed click cannot cost a
+   * press - see press() below. */
   function maybeSwallow(event) {
     if (!swallow) return;
     swallow = false;
+    if (sheet && event.target && sheet.contains(event.target)) return;
     event.stopPropagation();
     event.preventDefault();
   }
@@ -118,28 +150,58 @@
 
   var sheet = null;
 
-  /* Closing the SHEET. The toast is deliberately not touched: it belongs to
-   * work that is still running, and taking it down with the menu would hide
-   * the answer to the very thing that was just asked for. */
   /* Closing the SHEET. The toast and the orb are deliberately not touched:
    * both belong to work that is still running, and taking them down with the
    * menu would hide the answer to the very thing that was just asked for. */
   function close() {
     stopPlaying();
+    clearTimeout(voteSayGone);
+    voteNow = '';
     if (sheet) { sheet.remove(); sheet = null; }
   }
 
   function open(line) {
     close();
     sheet = make('div', 'la-sheet');
+    sheet.pineLine = line.id;
+    openedAt = Date.now();
 
+    /* THE HEADER: the question on the left, the verdict on the right.
+     *
+     * "At the top just put a up vote and down vote." Two thumbs, Carbon,
+     * 36px each, and nothing else up there. Up is "I liked this": the
+     * station keeps the recording three times longer and adds the words to
+     * the speaker's repertoire - the SFX guy's catchphrases, the host's and
+     * co-host's phrases. Down is "that did not work": never reused, and let
+     * go when its time comes. The same thumb pressed again takes the vote
+     * back. What the station makes of it is said under the header for a
+     * few seconds, in its own words, because "kept" and "remembered" are
+     * its promises to keep, not this file's. */
     var head = make('div', 'la-head');
-    head.appendChild(make('b', '', 'What would you like to do with this?'));
+    var headRow = make('div', 'la-head-row');
+    headRow.appendChild(make('b', '', 'What would you like to do with this?'));
+    var votes = make('div', 'la-votes');
+    votes.appendChild(voteButton(line, 'up', 'c:thumbs-up', 'I liked this'));
+    votes.appendChild(voteButton(line, 'down', 'c:thumbs-down', 'This did not work'));
+    headRow.appendChild(votes);
+    head.appendChild(headRow);
     head.appendChild(make('p', 'la-said', line.said.slice(0, 220)));
+    head.appendChild(make('p', 'la-vote-say', ''));
     sheet.appendChild(head);
 
     var list = make('div', 'la-list');
-    /* PLAY IT FIRST, because it is the only one that answers "which line is
+    /* THE LIKE, IN WORDS, ABOVE EVERYTHING. The thumb in the header says it
+     * in a glyph; this row says it in a sentence, with what it does written
+     * underneath, so the intent is readable and not only recognisable. It
+     * is the same action as the thumb - pressing it on a line already liked
+     * takes the like back, exactly as the thumb would. */
+    choice(list, 'c:thumbs-up', 'I liked this line',
+      'kept three times longer, and they remember it', 'mark', function () {
+        return castVote(line, 'up').then(function (got) {
+          return { then: (got && got.say) || voteWords(voteNow) };
+        });
+      });
+    /* PLAY IT NEXT, because it is the only one that answers "which line is
      * this?" - and on a screen of six near-identical rap couplets that is
      * the question the hand is usually asking. It is also the only choice
      * here that changes nothing. */
@@ -173,11 +235,161 @@
 
     var shut = make('button', 'la-close', 'Close');
     shut.type = 'button';
-    shut.addEventListener('click', function (e) { e.stopPropagation(); close(); });
+    press(shut, function () { close(); });
     sheet.appendChild(shut);
 
     document.body.appendChild(sheet);
     if (root.PineDismiss) root.PineDismiss.watch(sheet, close, []);
+    readVote(line);
+  }
+
+  /* ONE PRESS, HOWEVER THE ENGINE REPORTS IT.
+   *
+   * The sheet's buttons act on whichever arrives first of pointerup and
+   * click, and count the pair as one press. This is the belt under
+   * maybeSwallow's braces: a click can go missing (see there), or be eaten
+   * by a capture listener anywhere on the page, and the button still acts
+   * on the release the operator actually made.
+   *
+   * Three things keep the release honest. The button must have seen the
+   * pointer go DOWN on it - a release on a sheet that appeared under a held
+   * finger is the hold's release, not a choice. A release inside
+   * OPEN_GUARD_MS of the sheet opening is likewise the hold's own. And after
+   * acting, the same button ignores the click that trails the release by a
+   * few hundred milliseconds, or every press would count twice. */
+  function press(node, act) {
+    var downId = null;
+    var actedAt = 0;
+    function fire(event) {
+      var now = Date.now();
+      if (now - actedAt < DEDUPE_MS) return;
+      actedAt = now;
+      act(event);
+    }
+    node.addEventListener('pointerdown', function (event) {
+      downId = event.pointerId;
+    });
+    node.addEventListener('pointerup', function (event) {
+      if (downId === null || event.pointerId !== downId) return;
+      downId = null;
+      if (Date.now() - openedAt < OPEN_GUARD_MS) return;
+      event.stopPropagation();
+      fire(event);
+    });
+    node.addEventListener('pointercancel', function () { downId = null; });
+    node.addEventListener('click', function (event) {
+      event.stopPropagation();
+      if (Date.now() - openedAt < OPEN_GUARD_MS) return;
+      fire(event);
+    });
+  }
+
+  /* ------------------------------------------------------------ the votes */
+
+  /* What the sheet's line is currently voted, as the station last said it:
+   * 'up', 'down' or ''. Read when the sheet opens, rewritten by every
+   * answer, forgotten when the sheet closes. */
+  var voteNow = '';
+  var voteBusy = false;
+  var voteSayGone = 0;
+
+  function voteOf(got) {
+    var v = String((got && got.vote) || '').toLowerCase();
+    return (v === 'up' || v === 'down') ? v : '';
+  }
+
+  /* The station's own `say` is preferred; these are only for an answer that
+   * came back without one. */
+  function voteWords(v) {
+    if (v === 'up') return 'kept three times longer, and they remember it';
+    if (v === 'down') return 'noted: it will not be used again';
+    return 'vote taken back';
+  }
+
+  function paintVotes() {
+    if (!sheet) return;
+    var buttons = sheet.querySelectorAll('.la-vote');
+    for (var i = 0; i < buttons.length; i++) {
+      var on = buttons[i].dataset.vote === voteNow;
+      buttons[i].classList.toggle('on', on);
+      buttons[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+      buttons[i].disabled = voteBusy;
+    }
+  }
+
+  /* Under the header, for four seconds - six for a refusal, which is only
+   * ever said here. */
+  function voteSay(text, bad) {
+    if (!sheet) return;
+    var say = sheet.querySelector('.la-vote-say');
+    if (!say) return;
+    say.textContent = String(text || '');
+    say.classList.toggle('bad', !!bad);
+    say.classList.add('up');
+    clearTimeout(voteSayGone);
+    voteSayGone = setTimeout(function () {
+      if (say.parentNode) say.classList.remove('up');
+    }, bad ? 6000 : 4000);
+  }
+
+  function readVote(line) {
+    Promise.resolve()
+      .then(function () {
+        return api().get('/api/line/vote?id=' + encodeURIComponent(line.id));
+      })
+      .then(function (got) {
+        /* The sheet may be showing a different line by the time this lands. */
+        if (!sheet || sheet.pineLine !== line.id) return;
+        voteNow = voteOf(got);
+        paintVotes();
+      }, function () { /* no vote yet, or no bridge: the thumbs stay plain */ });
+  }
+
+  /* The same thumb again takes the vote back - `none` on the wire. The
+   * answer's own `vote` is what gets painted, not what was asked for, so
+   * the buttons show what the station recorded. */
+  function castVote(line, want) {
+    if (voteBusy) return Promise.reject(new Error('still voting'));
+    var send = (voteNow === want) ? 'none' : want;
+    voteBusy = true;
+    paintVotes();
+    return Promise.resolve()
+      .then(function () {
+        return api().post('/api/line/vote', { id: line.id, vote: send });
+      })
+      .then(function (got) {
+        voteBusy = false;
+        if (got && got.ok === false) {
+          throw new Error(String(got.say || got.why || 'the station would not take that'));
+        }
+        if (sheet && sheet.pineLine === line.id) {
+          voteNow = voteOf(got);
+          paintVotes();
+        }
+        return got || {};
+      }, function (err) {
+        voteBusy = false;
+        paintVotes();
+        throw err;
+      });
+  }
+
+  function voteButton(line, which, mark, label) {
+    var b = make('button', 'la-vote');
+    b.type = 'button';
+    b.dataset.vote = which;
+    b.setAttribute('aria-label', label);
+    b.setAttribute('aria-pressed', 'false');
+    b.title = label;
+    b.appendChild(icon(mark, label));
+    press(b, function () {
+      castVote(line, which).then(function (got) {
+        voteSay((got && got.say) || voteWords(voteNow));
+      }, function (err) {
+        voteSay(String((err && err.message) || err), true);
+      });
+    });
+    return b;
   }
 
   /* WHERE THE WORK REPORTS FROM ONCE THE MENU HAS GONE.
@@ -218,10 +430,10 @@
    * host, a test harness - the data attribute is left for pineIconUpgrade()
    * to fill in later, and until then the row simply has no picture, which is
    * the right way to fail. */
-  function icon(name) {
+  function icon(name, label) {
     var node = document.createElement('span');
     node.className = 'la-ico';
-    if (typeof root.pineIcon === 'function') node.innerHTML = root.pineIcon(name);
+    if (typeof root.pineIcon === 'function') node.innerHTML = root.pineIcon(name, label);
     else node.setAttribute('data-pine-icon', name);
     return node;
   }
@@ -232,6 +444,7 @@
    *   'pad'        a sampler slides in and the clip flies to a pad
    *   'to:<icon>'  a parcel travels to that destination, with a bar
    *   'glass'      the mark becomes a magnifier and the sheet withdraws
+   *   'mark'       the row's own mark swells, for a choice that is a verdict
    *   'sound'      the mark pulses while the line plays
    *
    * `after` runs once the performance has finished and the sheet has gone -
@@ -243,8 +456,7 @@
     row.appendChild(icon(mark));
     row.appendChild(make('b', '', title));
     row.appendChild(make('i', '', why));
-    row.addEventListener('click', function (event) {
-      event.stopPropagation();
+    press(row, function () {
       perform(row, mark, title, kind, run, after);
     });
     into.appendChild(row);
@@ -479,12 +691,15 @@
       return api;
     }
 
-    if (kind === 'glass') {
-      var glass = icon('c:search');
+    if (kind === 'glass' || kind === 'mark') {
+      /* The same swell for both: a magnifier for the examination, and the
+       * row's own thumb for the like, so the verdict is seen being given
+       * rather than reported afterwards. */
+      var glass = icon(kind === 'glass' ? 'c:search' : mark);
       glass.classList.add('la-glass');
       scene.appendChild(glass);
       requestAnimationFrame(function () { scene.classList.add('running'); });
-      api.say('opening the record…');
+      api.say(kind === 'glass' ? 'opening the record…' : 'telling the station…');
       return api;
     }
 

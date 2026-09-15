@@ -33,6 +33,16 @@
     <string name="rail_reply">Replies</string>
     <string name="rail_monitor">Heard in this app</string>
     <string name="rail_monitor_note">The panel player itself. Its level lives in this browser storage, not on the station.</string>
+    <!-- The hot corners: the switch, its caption and the four rows. The
+         choices themselves are listed in config/HotCorners.kt so the drawer
+         and the bridge share one list of words. -->
+    <string name="rail_corners">Hot corners</string>
+    <string name="rail_corners_switch">Hot corners</string>
+    <string name="rail_corners_note">corner swipes toward the centre · the screen ring holds %1$d s</string>
+    <string name="rail_corner_tl">Top left</string>
+    <string name="rail_corner_tr">Top right</string>
+    <string name="rail_corner_bl">Bottom left</string>
+    <string name="rail_corner_br">Bottom right</string>
     <string name="rail_jumps">Jump to</string>
     <string name="rail_logs">Logs</string>
     <string name="rail_logs_full">Full log</string>

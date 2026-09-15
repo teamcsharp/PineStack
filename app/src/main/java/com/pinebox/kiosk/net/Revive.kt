@@ -167,13 +167,58 @@ object Revive {
          * never needed: the difference between a restart at 900ms and
          * one at 1.2s is invisible, and setAndAllowWhileIdle needs no
          * permission anybody can take away. */
-        val whenAt = System.currentTimeMillis() + 900L
+        /* #1317d: AND THE ALARM MUST BE ONE ANDROID WILL ACT ON.
+         *
+         * #1317c below blamed the clock for the panel not coming back.
+         * That was a guess that fitted and it was wrong. The log:
+         *
+         *   ActivityTaskManager: Background activity launch blocked
+         *     ... com.pinebox.kiosk/.MainActivity ... (BAL_BLOCK)
+         *     result code=102
+         *
+         * A process that has just called exit(0) has no foreground
+         * standing, and an ordinary alarm PendingIntent is a background
+         * activity launch, which recent Android refuses. The tablet was
+         * dead for two and a half minutes.
+         *
+         * setAlarmClock() is exempt - it carries the "this will wake the
+         * user" contract, it does not need the SCHEDULE_EXACT_ALARM this
+         * uid was measured to have LOST, and its PendingIntent may start
+         * an activity. It also appears in the system's alarm list, which
+         * is an honest description of what this is.
+         *
+         * #1317c: TWO AND A HALF SECONDS, not nine hundred milliseconds.
+         *
+         * Measured on the tablet: at 900ms the app came back and the
+         * panel NEVER LOADED - no "panel up in" line at all, the page
+         * dead, listeners=0 - while `am force-stop` + `am start` on the
+         * same build loaded it in 4661ms and the station saw
+         * listeners=2 immediately. The difference is the race this
+         * function's own note warned about: exit(0) begins a teardown
+         * that is not instant, and a launch that lands inside it gets a
+         * half-dead process. Android may also be restarting the
+         * foreground activity itself, so there were two launches
+         * fighting.
+         *
+         * Long enough that the old process is genuinely gone, short
+         * enough that nobody watching calls it a crash. */
+        val whenAt = System.currentTimeMillis() + 2500L
         var armed = false
+        /* #1317d: the BAL-exempt road first. */
         try {
-            alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, whenAt, pending)
+            alarm.setAlarmClock(
+                AlarmManager.AlarmClockInfo(whenAt, pending), pending)
             armed = true
         } catch (err: Exception) {
-            Log.w(TAG, "allow-while-idle refused: ${err.message}")
+            Log.w(TAG, "alarm clock refused: ${err.message}")
+        }
+        if (!armed) {
+            try {
+                alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, whenAt, pending)
+                armed = true
+            } catch (err: Exception) {
+                Log.w(TAG, "allow-while-idle refused: ${err.message}")
+            }
         }
         if (!armed) {
             try {

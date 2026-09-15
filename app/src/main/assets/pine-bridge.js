@@ -264,6 +264,30 @@
     replaySave: promised("replaySave"),
     replayChunk: promised("replayChunk"),
 
+    /* THE HOT CORNERS - the native half of pine-views/hot-corners.js.
+     *
+     * screenShot() -> {ok, image: "data:image/jpeg;base64,...", w, h} | {ok:false, detail}
+     *   PixelCopy of the whole window, the same picture the volume-up
+     *   chord takes, for the red-ink annotator.
+     * replayExport({seconds, upload, name?})
+     *   -> {ok, where, bytes, asked, seconds, uploaded, detail}
+     *   The last `seconds` of the screen ring to Download/<recordingFolder>
+     *   as pinetab-screen-YYYYMMDD-HHMMSS-<n>s.mp4; `seconds` is what was
+     *   actually written. With `upload`, the file also goes to the
+     *   station's export courier and `uploaded` is {ok, id?, dest?,
+     *   detail?} - a courier that is not there is uploaded:{ok:false},
+     *   never a failed save. Without it, uploaded is null.
+     * hotCorners() -> {enabled, tl, tr, bl, br, ring}
+     * hotCornersSet({...partial}) -> the merged object, also pushed to
+     *   PineHotCorners.configure(). `ring` is the screen ring's hold in
+     *   seconds, read-only. See config/HotCorners.kt. */
+    screenShot: promised("screenShot"),
+    replayExport: promised("replayExport"),
+    replayEdit: promised("replayEdit"),
+    replayKeepEdited: promised("replayKeepEdited"),
+    hotCorners: promised("hotCorners"),
+    hotCornersSet: promised("hotCornersSet"),
+
     micTake: promised("micTake"),
     micChunk: promised("micChunk"),
     micStart: promised("micStart"),

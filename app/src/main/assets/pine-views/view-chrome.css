@@ -329,3 +329,53 @@
   box-shadow: 0 12px 30px rgba(0, 0, 0, .5);
 }
 .pine-talk-say.bad { border-color: #e46b6b; color: #e46b6b; }
+
+/* #1355: which ear. Right-click the dot.
+
+   It sits where the transcript sits and looks like it, because it is
+   the same object answering a different question about itself - a
+   separate settings panel for one choice would be more chrome than
+   the choice is worth. */
+.pine-talk-mics {
+  position: fixed;
+  right: 46px;
+  bottom: 96px;
+  z-index: 2147483005;
+  min-width: 220px;
+  max-width: min(420px, 74vw);
+  padding: 6px;
+  border: 1px solid #35414c;
+  border-radius: 10px;
+  background: rgba(10, 14, 18, .97);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .5);
+  font: 12px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+}
+.pine-talk-mics-head {
+  padding: 3px 7px 6px;
+  color: #8ea0ad;
+  font-size: 10.5px;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.pine-talk-mic {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #edf3f5;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pine-talk-mic:hover { background: rgba(101, 199, 218, .14); }
+.pine-talk-mic.on { color: #65c7da; }
+.pine-talk-mic.on::after { content: ' \2713'; }
+.pine-talk-mics-none {
+  padding: 6px 8px;
+  color: #e46b6b;
+}

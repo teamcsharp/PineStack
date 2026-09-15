@@ -459,10 +459,149 @@
    * pick the same one. */
   let grabbing = false;
 
+  /* THE SAMPLER COMES TO THE OPERATOR, NOT THE OTHER WAY ROUND.
+   *
+   * "Whenever I choose to send something to the sampler, I want it to show
+   *  the sampler and I want the pads that have something already assigned
+   *  to them to already be shaded in and to animate the sample going to an
+   *  available pad on it with that pad pulsing showing that it's receiving
+   *  the sample."
+   *
+   * Three doors, tried in the order the operator's own finger would use
+   * them. The rail's SAMPLER tab (#pineViewTab-sampler, rail.js) is first
+   * because it is the one door both terminals share: on the tablet it
+   * hands the press to the sampler's own handle (#pineSamplerTab), on the
+   * desk to the shell's nav button (#samplerTabBtn, which selectView
+   * answers), and it closes whatever else was open exactly as a tap does.
+   *
+   * It is a TOGGLE, though: the rail asks the handle whether it is already
+   * `on` and closes the sampler if so. That is why the sampler is never
+   * asked to show when it is already showing - samplerOnScreen reads the
+   * same tells the rail reads (the handle's `on`, the desk's `active`,
+   * the tablet host's `open`) before anything is pressed.
+   *
+   * PineViewChrome.show and the raw handles are the fallbacks for a page
+   * with no rail. A page with none of them is answered false and the grab
+   * goes ahead regardless: the pad still fills, only nobody watched. */
+  function samplerOnScreen() {
+    const host = el("sampler");
+    if (host && (host.classList.contains("active") || host.classList.contains("open"))) {
+      return true;
+    }
+    const handle = el("pineSamplerTab") || el("samplerTabBtn");
+    return !!(handle && (handle.classList.contains("on")
+                         || handle.classList.contains("active")));
+  }
+
+  function showSampler() {
+    try {
+      if (samplerOnScreen()) return true;
+      const railTab = el("pineViewTab-sampler");
+      if (railTab) { railTab.click(); return true; }
+      const chrome = root.PineViewChrome;
+      if (chrome && typeof chrome.show === "function" && chrome.show("sampler")) return true;
+      const handle = el("samplerTabBtn") || el("pineSamplerTab");
+      if (handle) { handle.click(); return true; }
+    } catch (err) {
+      /* A door that will not open is no reason to drop the clip. */
+    }
+    return false;
+  }
+
+  /* THE HAND-OFF, DRAWN.
+   *
+   * The chosen pad pulses - `.receiving`, three rings of about 1.1 s in
+   * sampler.css - from the moment it is chosen, because the fetch behind it
+   * has been measured at anything from 1.1 s to 13.5 s against a busy
+   * station, and a pad that only lit up at the end would spend that whole
+   * time looking like nothing was happening.
+   *
+   * The flight is the clip's name on a chip, thrown from the top-centre of
+   * the sampler to the pad. It is only thrown when the sampler is on
+   * screen: a chip crossing a view nobody can see is work for nothing, and
+   * a pad inside a display:none host measures as a zero rectangle, which
+   * parks the chip in the corner. Two frames are waited before measuring
+   * so a view that was just switched in has been laid out - the grid sizes
+   * itself from its container, and that container was 0x0 a frame ago.
+   * (Frames, not timers: the tablet's WebView suspends timers under a
+   * hidden view but still delivers rAF.)
+   *
+   * The chip is NOT what says the bytes have arrived. It sits on the pad
+   * until the import settles either way, then fades; the pad turning
+   * shaded is the import's own word, written by paintPads. A refusal keeps
+   * the pad for three seconds with the reason on its face, then it goes
+   * hollow again. */
+  const FLIGHT_MS = 600;
+  const REFUSAL_MS = 3000;
+
+  function receive(p, row, shown) {
+    const cell = el("pad-" + p);
+    let chip = null;
+    let flown = false;
+    if (cell) cell.classList.add("receiving");
+    if (shown && cell && typeof root.requestAnimationFrame === "function") {
+      chip = document.createElement("div");
+      chip.className = "pb-flight";
+      chip.textContent = String(row.text || row.name || row.who || "take").slice(0, 48);
+      document.body.appendChild(chip);
+      root.requestAnimationFrame(() => root.requestAnimationFrame(() => {
+        if (!chip || !chip.isConnected) return;
+        const host = el("sampler") || cell.closest(".pb-sampler") || cell;
+        const from = host.getBoundingClientRect();
+        const to = cell.getBoundingClientRect();
+        const own = chip.getBoundingClientRect();
+        if (!to.width || !from.width) { chip.remove(); chip = null; return; }
+        const startX = from.left + (from.width / 2) - (own.width / 2);
+        const startY = from.top + 8;
+        chip.style.transform = "translate(" + Math.round(startX) + "px,"
+          + Math.round(startY) + "px)";
+        chip.classList.add("shown");
+        /* Commit the start position before the transition is armed, or the
+         * browser collapses both writes into one and nothing moves. */
+        chip.getBoundingClientRect();
+        const endX = to.left + (to.width / 2) - (own.width / 2);
+        const endY = to.top + (to.height / 2) - (own.height / 2);
+        chip.classList.add("flying");
+        chip.style.transform = "translate(" + Math.round(endX) + "px,"
+          + Math.round(endY) + "px) scale(.72)";
+        setTimeout(() => { flown = true; if (chip) chip.classList.add("down"); }, FLIGHT_MS);
+      }));
+    }
+    const fade = () => {
+      if (!chip) return;
+      const gone = chip;
+      chip = null;
+      const go = () => {
+        gone.classList.add("gone");
+        setTimeout(() => gone.remove(), 260);
+      };
+      /* Never fade a chip that has not landed: a quick import must still
+       * read as the clip reaching the pad. */
+      if (flown) go(); else setTimeout(go, FLIGHT_MS);
+    };
+    return {
+      land() {
+        if (cell) cell.classList.remove("receiving");
+        fade();
+      },
+      refuse(why) {
+        if (cell) {
+          cell.classList.remove("receiving");
+          cell.classList.add("refused");
+          const sub = cell.querySelector(".pb-pad-sub");
+          if (sub) sub.textContent = String(why || "refused").slice(0, 80);
+          setTimeout(() => { cell.classList.remove("refused"); paintPads(); }, REFUSAL_MS);
+        }
+        fade();
+      }
+    };
+  }
+
   async function grab(row) {
     if (!row) return {ok: false, why: "there is nothing to take."};
     if (grabbing) return {ok: false, why: "still fetching the last one."};
     grabbing = true;
+    let arrival = null;
     try {
       if (!mounted) {
         const host = document.getElementById("sampler");
@@ -481,14 +620,34 @@
         return {ok: false,
           why: "every pad in every bank is full - clear one first."};
       }
+      /* Show the sampler, then show the bank the pad is in. The roll across
+       * banks is firstFreePad's answer; a pad landing on a bank that is not
+       * the one on screen would pulse on the wrong tile (importRow paints
+       * #pad-N, which is whichever bank is showing) and be seen by nobody.
+       * The bank in view follows the placement, as putBytesAnywhere does. */
+      const shown = showSampler();
+      if (free.bank !== bank) {
+        bank = free.bank;
+        paintPads();
+        paintControls();
+        preload(bank).catch(() => { /* a cold pad is still a pad */ });
+      }
+      arrival = receive(free.pad, row, shown);
       const meta = await importRow(row, free.bank, free.pad);
       if (!meta) {
-        return {ok: false, why: lastImportWhy || "the station would not cut it."};
+        const why = lastImportWhy || "the station would not cut it.";
+        arrival.refuse(why);
+        arrival = null;
+        return {ok: false, why};
       }
+      arrival.land();
+      arrival = null;
       return {ok: true, bank: free.bank, pad: free.pad, meta,
         why: "bank " + (free.bank + 1) + ", pad " + (free.pad + 1)};
     } catch (err) {
-      return {ok: false, why: (err && err.message) || String(err)};
+      const why = (err && err.message) || String(err);
+      if (arrival) { arrival.refuse(why); arrival = null; }
+      return {ok: false, why};
     } finally {
       grabbing = false;
     }
@@ -651,7 +810,16 @@
    * halves of it from the one editor that already exists.
    *
    * Silent about failure on purpose: the set not being on this
-   * surface must never stop the pad making its noise. */
+   * surface must never stop the pad making its noise.
+   *
+   * #1322: AND THE OTHER SURFACE SEES IT TOO. This was the one road to
+   * a picture that never touched the station - the clip is already
+   * decoded on the pad, so nothing was asked of it - which meant a pad
+   * pressed on the tablet popped nothing on the app, and a pad pressed
+   * on the app popped nothing on the tablet. `{ring: true}` publishes
+   * the clip into the ring every set polls, with no claim on the air
+   * (page_picture_append), and marks it here so this surface does not
+   * show the same picture twice. */
   function padPicture(meta) {
     if (!meta || !meta.video || !meta.url) return;
     const tv = root.PineSfxTv;
@@ -669,7 +837,8 @@
       const to = Number(meta.trim.end) || 0;
       if (to > clip.from) clip.to = to;
     }
-    try { tv.cut(clip); } catch (err) { /* the pad still sounds */ }
+    try { tv.cut(clip, {ring: true}); }
+    catch (err) { /* the pad still sounds */ }
   }
 
   /* THE BROADCAST COMES BACK WHEN THE LAST VOICE DIES, not when the finger
@@ -1071,6 +1240,13 @@
       const meta = layout[bank][p];
       const loaded = !!meta && engine().loaded(padKey(bank, p));
       element.classList.toggle("filled", !!meta);
+      /* HOLLOW IS THE STANDING LOOK OF AN EMPTY PAD, not something a grab
+       * puts on for a moment. "The other pads that don't have samples
+       * actually appearing hollow. So you can tell that there's available
+       * pads still on the sampler." A filled tile and an empty tile drawn
+       * the same shade were one shade, and the operator was counting free
+       * pads by reading labels. sampler.css draws the two. */
+      element.classList.toggle("hollow", !meta);
       element.classList.toggle("cold", !!meta && !loaded);
       element.classList.toggle("inexact", !!meta && meta.exact === false);
       const label = element.querySelector(".pb-pad-label");
@@ -2913,6 +3089,9 @@
     sourceFor,
     takeable,
     grab,
+    /* Bring the sampler on screen the way the rail's tab does; true when it
+     * is showing (or was already), false on a page with no door to it. */
+    show: showSampler,
     applySettings,
     save: saveLayout,
     repaint: paintPads,

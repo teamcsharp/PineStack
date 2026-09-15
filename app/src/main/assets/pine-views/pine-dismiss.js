@@ -132,3 +132,100 @@
   root.PineDismiss = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);
+
+/* 2026-09-14: EVERY POP-UP MOVES. "Tap and drag allow me to move any pop
+ * up window by tap and drag. And also on the computer by click and drag."
+ *
+ * One delegated pointer listener for the sheets that had no drag of their
+ * own: the line inspector, the word-search sheet, the line-actions sheet,
+ * the clip doctor and the report pad (the camera box, the ladder, the
+ * preference sheet and the SFX set already move). Each is dragged by its
+ * header where it has one, so a finger inside its scrolling body still
+ * scrolls; the report pad, which has no header, moves from anywhere that
+ * is not a control. On the first real movement the box is FROZEN where it
+ * stands - fixed, at its measured left/top and width, transform and
+ * margins cleared - so a sheet centred by flex or by translate(-50%) can
+ * leave its centre without jumping.
+ */
+(function (root) {
+  'use strict';
+  if (!root.document) return;
+  var ROOTS = [
+    {root: '.ld-box', handle: '.ld-head'},
+    {root: '.sp-find-box', handle: '.sp-find-head'},
+    {root: '.la-sheet', handle: ':scope > :first-child'},
+    {root: '.cd-back > *', handle: ':scope > :first-child'},
+    {root: '#pineReportPad', handle: null},
+    {root: '[data-pine-drag]', handle: '[data-pine-drag-handle]'}
+  ];
+  var CONTROLS = 'button, input, select, textarea, a, [contenteditable], label, summary, details';
+  var live = null;
+
+  function findRoot(target) {
+    for (var i = 0; i < ROOTS.length; i += 1) {
+      var r = target.closest ? target.closest(ROOTS[i].root) : null;
+      if (!r) continue;
+      var h = null;
+      if (ROOTS[i].handle) {
+        try { h = r.querySelector(ROOTS[i].handle); } catch (e) { h = null; }
+        if (!h) h = r;
+        if (!h.contains(target)) return null;   /* not on the handle: scroll, select, type */
+      }
+      return {root: r, handle: h || r};
+    }
+    return null;
+  }
+
+  function freeze(box) {
+    var r = box.getBoundingClientRect();
+    box.style.position = 'fixed';
+    box.style.left = Math.round(r.left) + 'px';
+    box.style.top = Math.round(r.top) + 'px';
+    box.style.right = 'auto';
+    box.style.bottom = 'auto';
+    box.style.margin = '0';
+    box.style.transform = 'none';
+    box.style.width = Math.round(r.width) + 'px';
+    box.style.maxWidth = 'none';
+    return {left: r.left, top: r.top};
+  }
+
+  root.document.addEventListener('pointerdown', function (ev) {
+    if (live) return;
+    if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+    var t = ev.target;
+    if (!t || !t.closest) return;
+    if (t.closest(CONTROLS)) return;
+    var got = findRoot(t);
+    if (!got) return;
+    live = {box: got.root, handle: got.handle, id: ev.pointerId,
+      x: ev.clientX, y: ev.clientY, from: null, moved: false};
+    try { got.handle.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+  }, true);
+
+  root.document.addEventListener('pointermove', function (ev) {
+    if (!live || ev.pointerId !== live.id) return;
+    var dx = ev.clientX - live.x, dy = ev.clientY - live.y;
+    if (!live.moved) {
+      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+      live.moved = true;
+      live.from = freeze(live.box);
+    }
+    var w = root.innerWidth || 1280, h = root.innerHeight || 800;
+    live.box.style.left = Math.max(-live.box.offsetWidth + 60, Math.min(w - 60, live.from.left + dx)) + 'px';
+    live.box.style.top = Math.max(0, Math.min(h - 40, live.from.top + dy)) + 'px';
+    ev.preventDefault();
+  }, true);
+
+  function drop(ev) {
+    if (!live || (ev && ev.pointerId !== live.id)) return;
+    try { live.handle.releasePointerCapture(live.id); } catch (e) { /* not held */ }
+    /* A press that never moved is left to whatever it was on - a tap
+       on a header, a click on a card - untouched. */
+    live = null;
+  }
+  root.document.addEventListener('pointerup', drop, true);
+  root.document.addEventListener('pointercancel', drop, true);
+
+  root.PineDrag = {roots: ROOTS, freeze: freeze};
+})(typeof window !== 'undefined' ? window : globalThis);

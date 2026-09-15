@@ -5,6 +5,7 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import java.io.File
 import java.nio.ByteBuffer
+import org.json.JSONObject
 
 /**
  * THE LAST HALF-MINUTE, ALWAYS.
@@ -12,6 +13,11 @@ import java.nio.ByteBuffer
  * "Always have the application saving the last thirty seconds of activity...
  *  I just want it recording the tablet in general with a rolling history that
  *  I'm able to always extract."
+ *
+ * 2026-09-14, and then twenty minutes of it: "I want to save anywhere from
+ * the last five seconds to the last 20 minutes. So the tablet should always
+ * be recording." The ring's shape did not change for that; its size did -
+ * the arithmetic is in ScreenReplay's header and in size() below.
  *
  * A ring of ENCODED frames, not of pictures and not of files.
  *
@@ -60,8 +66,16 @@ class ReplayRing(private val holdSeconds: Int = 60) {
      * land after them, and `based` says whether the first packet of this run
      * has been seen yet - which is what `shift` is worked out from. */
     private var continueAfter = 0L
-    private var shift = 0L
-    private var based = true
+    @Volatile private var shift = 0L
+    @Volatile private var based = true
+    private val audioGate = Any()
+    private val audio = ReplayAudioWindow(24 * 1024 * 1024, holdSeconds * 60)
+    private val pendingAudio = java.util.ArrayDeque<ReplayAudioPacket>()
+    @Volatile private var audioFormat: MediaFormat? = null
+    @Volatile var audioClockError: String? = null
+        private set
+    @Volatile var lastSavedAudio = JSONObject().put("present", false).put("state", "unavailable")
+        private set
 
     private var head = 0          /* where the next packet is written */
     private var first = 0         /* the oldest packet still held */
@@ -85,16 +99,28 @@ class ReplayRing(private val holdSeconds: Int = 60) {
     @Synchronized
     fun size(bitrate: Int) {
         val bytes = (bitrate / 8) * holdSeconds * 5 / 4
-        val want = bytes.coerceIn(2 * 1024 * 1024, 96 * 1024 * 1024)
+        /* THE CEILING IS 100 MB, and it is a ceiling the design numbers
+         * touch: 0.6 Mbit x 1200 s = 90 MB, and the quarter of headroom
+         * would make it 112.5. The heap is largeHeap (512 MB on this
+         * tablet) and this process was measured at 22 MB of Dalvik with
+         * the old 15 MB ring in it, so 100 fits; 100 MB at 75 kB/s is
+         * 1,398 s, which is the twenty minutes with a sixth to spare at
+         * the design ceiling and far more on the mostly-static panel this
+         * actually records. */
+        val want = bytes.coerceIn(2 * 1024 * 1024, 100 * 1024 * 1024)
         if (blob.size == want && marks.isNotEmpty()) {
             /* Already the right shape: keep every packet in it. */
             joinClock()
             return
         }
         blob = ByteArray(want)
-        /* A generous packet count: at 30 fps a minute is 1,800, and running
-         * out of marks would silently drop frames the ring has room for. */
-        marks = Array(holdSeconds * 60) { Mark() }
+        /* A generous packet count: the encoder runs at 12 fps, so thirty a
+         * second is two and a half times what a full hold needs, and
+         * running out of marks would silently drop frames the ring has
+         * room for. (It was sixty a second, sized for 30 fps and a one-
+         * minute hold; at twenty minutes that is 72,000 objects for no
+         * reason.) 36,000 marks is about 1.4 MB. */
+        marks = Array(holdSeconds * 30) { Mark() }
         reset()
     }
 
@@ -115,6 +141,8 @@ class ReplayRing(private val holdSeconds: Int = 60) {
      */
     @Synchronized
     private fun joinClock() {
+        synchronized(audioGate) { pendingAudio.clear() }
+        audioClockError = null
         if (count == 0) { shift = 0L; based = true; return }
         continueAfter = marks[(first + count - 1) % marks.size].timeUs
         based = false
@@ -124,10 +152,41 @@ class ReplayRing(private val holdSeconds: Int = 60) {
     fun reset() {
         head = 0; first = 0; count = 0; wrote = 0
         continueAfter = 0L; shift = 0L; based = true
+        audio.clear()
+        synchronized(audioGate) { pendingAudio.clear() }
+        audioFormat = null
+        audioClockError = null
     }
 
     @Synchronized
     fun remember(fmt: MediaFormat) { format = fmt }
+
+    fun rememberAudio(fmt: MediaFormat) { audioFormat = fmt }
+
+    fun audioSeconds(): Double = audio.seconds()
+
+    fun invalidateAudioClock(why: String) {
+        audioClockError = why
+        synchronized(audioGate) { pendingAudio.clear() }
+    }
+
+    /** Both encoders use CLOCK_MONOTONIC; a resumed session shares ONE shift. */
+    fun addAudio(data: ByteBuffer, info: MediaCodec.BufferInfo, signal: Boolean? = null) {
+        if (info.size <= 0 || info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0 || audioClockError != null) return
+        val bytes = ByteArray(info.size)
+        val copy = data.duplicate()
+        copy.position(info.offset); copy.limit(info.offset + info.size); copy.get(bytes)
+        val packet = ReplayAudioPacket(info.presentationTimeUs, bytes, info.flags, signal = signal)
+        synchronized(audioGate) {
+            if (!based) {
+                // Wait for the video epoch; never independently zero audio.
+                if (pendingAudio.size >= 128) pendingAudio.removeFirst()
+                pendingAudio.addLast(packet)
+            } else {
+                audio.add(packet.copy(timeUs = packet.timeUs + shift))
+            }
+        }
+    }
 
     /** Seconds currently held, which is what the operator is offered. */
     @Synchronized
@@ -166,9 +225,15 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         /* THE FIRST PACKET OF A RUN SETS THE OFFSET. A fresh encoder stamps
          * from near zero; the held packets end at `continueAfter`. The gap
          * stands in for however long the screen was dark. */
-        if (!based) {
-            shift = continueAfter + FRAME_GAP_US - info.presentationTimeUs
-            based = true
+        synchronized(audioGate) {
+            if (!based) {
+                shift = continueAfter + FRAME_GAP_US - info.presentationTimeUs
+                based = true
+                while (pendingAudio.isNotEmpty()) {
+                    val packet = pendingAudio.removeFirst()
+                    audio.add(packet.copy(timeUs = packet.timeUs + shift))
+                }
+            }
         }
 
         val slot = (first + count) % marks.size
@@ -277,7 +342,6 @@ class ReplayRing(private val holdSeconds: Int = 60) {
             /* A truncated cache - a kill partway through the write - is
              * expected occasionally and is not worth losing whatever did
              * come back. */
-            return taken
         } finally {
             try { pull.release() } catch (err: Exception) { /* gone */ }
         }
@@ -288,8 +352,36 @@ class ReplayRing(private val holdSeconds: Int = 60) {
          * the new frames would interleave BEHIND the restored ones, which
          * makes seconds() nonsense and the keyframe walk in save() unable to
          * find a start. */
-        if (taken > 0) joinClock()
+        if (taken > 0) {
+            try { loadAudio(from) } catch (_: Exception) { /* partial audio remains evidence */ }
+            finally { joinClock() }
+        }
         return taken
+    }
+
+    /** Old caches without an audio track remain explicitly video-only. */
+    private fun loadAudio(from: File) {
+        val pull = android.media.MediaExtractor()
+        try {
+            pull.setDataSource(from.absolutePath)
+            val track = (0 until pull.trackCount).firstOrNull {
+                pull.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
+            } ?: return
+            audioFormat = pull.getTrackFormat(track)
+            pull.selectTrack(track)
+            val room = ByteBuffer.allocate(64 * 1024)
+            while (true) {
+                room.clear()
+                val size = pull.readSampleData(room, 0)
+                if (size < 0) break
+                val bytes = ByteArray(size)
+                room.position(0); room.limit(size); room.get(bytes)
+                audio.add(ReplayAudioPacket(pull.sampleTime, bytes))
+                if (!pull.advance()) break
+            }
+        } finally {
+            pull.release()
+        }
     }
 
     /**
@@ -299,8 +391,69 @@ class ReplayRing(private val holdSeconds: Int = 60) {
      *   asked for - the ring holds what it holds, and saying 30 when 11 were
      *   written would be a lie the operator only discovers on playback.
      */
-    @Synchronized
-    fun save(out: File, want: Double): Double {
+    fun save(out: File, want: Double, allowVideoOnly: Boolean = false): Double {
+        lastSavedAudio = JSONObject().put("source", "android-playback-mix").put("present", false)
+            .put("source_scope", "eligible-device-media").put("device_volume_applied", false)
+            .put("complete", false).put("state", "unavailable")
+            .put("detail", "No replay window has been selected yet.")
+        // Copy the selected encoded video under its short lock, then do disk
+        // I/O unlocked. Audio capture uses an independent ring throughout.
+        val snapshot = synchronized(this) { videoSnapshot(want) }
+        val fmt = snapshot.first
+        val video = snapshot.second
+        val zero = video.first().timeUs
+        val newest = video.last().timeUs
+        val capturedAudio = audio.select(zero, newest)
+        val coverage = ReplayAudioCoverage.measure(capturedAudio, zero, newest)
+        val audioFmt = audioFormat
+        val present = audioFmt != null && coverage.present
+        val complete = present && coverage.complete
+        val signalKnown = capturedAudio.count { it.signal != null }
+        val signalNonzero = capturedAudio.count { it.signal == true }
+        val silent = signalKnown == capturedAudio.size && signalKnown > 0 && signalNonzero == 0
+        val detail = if (!present) "This replay window has no captured tablet playback audio. Wait for audio capture or explicitly save video only."
+            else if (!complete) "Tablet playback audio does not cover this whole replay window. Narrow the window or explicitly save the incomplete recording."
+            else if (silent) "Tablet playback samples were captured continuously but contain silence. Real silence or capture-policy restrictions may be responsible."
+            else "Screen and device media playback share monotonic timestamps. No microphone or server soundtrack was substituted."
+        lastSavedAudio = JSONObject().put("source", "android-playback-mix")
+            .put("source_scope", "eligible-device-media").put("device_volume_applied", false)
+            .put("complete", complete)
+            .put("present", present).put("state", if (complete && silent) "captured_silence" else if (complete) "captured" else if (present) "partial" else "unavailable")
+            .put("detail", detail).put("coverage_ratio", coverage.ratio).put("gap_count", coverage.gaps)
+            .put("leading_gap_ms", coverage.leadingUs / 1000.0).put("trailing_gap_ms", coverage.trailingUs / 1000.0)
+            .put("max_gap_ms", coverage.maxGapUs / 1000.0).put("sample_rate", 48000).put("channels", 2)
+            .put("clock", "monotonic").put("audio_packets", capturedAudio.size)
+            .put("signal_packets", signalNonzero).put("signal_known_packets", signalKnown)
+            .put("signal_state", if (signalNonzero > 0) "nonzero_pcm" else if (silent) "zero_pcm" else "unknown")
+            .put("video_only_explicit", allowVideoOnly)
+        check(complete || allowVideoOnly) { detail }
+
+        var muxer: MediaMuxer? = null
+        var success = false
+        try {
+            muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val videoTrack = muxer.addTrack(fmt)
+            val audioTrack = if (present) muxer.addTrack(audioFmt!!) else -1
+            muxer.start()
+            var v = 0; var a = 0
+            val info = MediaCodec.BufferInfo()
+            while (v < video.size || (audioTrack >= 0 && a < capturedAudio.size)) {
+                val chooseAudio = audioTrack >= 0 && a < capturedAudio.size &&
+                    (v >= video.size || capturedAudio[a].timeUs <= video[v].timeUs)
+                val packet = if (chooseAudio) capturedAudio[a++] else video[v++]
+                info.set(0, packet.data.size, packet.timeUs - zero, packet.flags)
+                muxer.writeSampleData(if (chooseAudio) audioTrack else videoTrack, ByteBuffer.wrap(packet.data), info)
+            }
+            muxer.stop()
+            success = true
+        } finally {
+            try { muxer?.release() } catch (_: Exception) { }
+            if (!success) out.delete()
+        }
+        return (newest - zero) / 1_000_000.0
+    }
+
+    private fun videoSnapshot(want: Double): Pair<MediaFormat, List<ReplayAudioPacket>> {
         val fmt = format ?: throw IllegalStateException("the encoder has not started yet")
         if (count < 2) throw IllegalStateException("nothing has been recorded yet")
 
@@ -321,32 +474,11 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         }
         if (start < 0) throw IllegalStateException("no keyframe in the buffer yet")
 
-        val muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        val track = muxer.addTrack(fmt)
-        muxer.start()
-        val info = MediaCodec.BufferInfo()
-        val buffer = ByteBuffer.wrap(blob)
-        val zero = marks[(first + start) % marks.size].timeUs
-        var last = 0L
-        try {
-            for (i in start until count) {
-                val slot = (first + i) % marks.size
-                val mark = marks[slot]
-                buffer.position(mark.at)
-                buffer.limit(mark.at + mark.size)
-                info.offset = mark.at
-                info.size = mark.size
-                info.flags = mark.flags
-                /* Restamped from zero, or every player shows the clip as
-                 * starting several minutes in. */
-                info.presentationTimeUs = mark.timeUs - zero
-                last = info.presentationTimeUs
-                muxer.writeSampleData(track, buffer, info)
-            }
-        } finally {
-            try { muxer.stop() } catch (err: Exception) { /* nothing written */ }
-            muxer.release()
+        val packets = ArrayList<ReplayAudioPacket>(count - start)
+        for (i in start until count) {
+            val mark = marks[(first + i) % marks.size]
+            packets.add(ReplayAudioPacket(mark.timeUs, blob.copyOfRange(mark.at, mark.at + mark.size), mark.flags))
         }
-        return last / 1_000_000.0
+        return Pair(fmt, packets)
     }
 }

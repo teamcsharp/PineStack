@@ -13,14 +13,23 @@ import android.webkit.WebView
 import androidx.core.content.FileProvider
 import com.pinebox.kiosk.BuildConfig
 import com.pinebox.kiosk.config.ConfigStore
+import com.pinebox.kiosk.config.HotCorners
 import com.pinebox.kiosk.net.StationClient
 import com.pinebox.kiosk.net.StationException
+import com.pinebox.kiosk.net.VideoEditorContract
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.coroutines.resume
 
 /**
  * `window.__pineNative` - the Android half of the pineDesktop bridge.
@@ -96,6 +105,10 @@ class PineDesktopBridge(
             "micTake", "micChunk",
             /* The rolling record of the screen - see replay/ScreenReplay. */
             "replayState", "replaySave", "replayChunk",
+            /* THE HOT CORNERS - the shot for the red ink, the screen video
+             * to the operator's folder, and the four corners' preferences.
+             * See config/HotCorners.kt and pine-views/hot-corners.js. */
+            "screenShot", "replayExport", "replayEdit", "replayKeepEdited", "hotCorners", "hotCornersSet",
             /* What the terminal confirmed on its way up - see net/Readiness. */
             "readyReport",
             /* The mix, captured natively - see audio/AirTap.kt. */
@@ -145,6 +158,20 @@ class PineDesktopBridge(
 
     /** The last replay written, parked between replaySave and replayChunk. */
     @Volatile private var heldReplay: ByteArray? = null
+
+    /** Muxing and file reads must never occupy the activity's UI thread.
+     * Reuse save's monitor so metadata belongs to this exact capture even
+     * when a remote replay pull overlaps an editor capture. */
+    private suspend fun captureReplay(
+        replay: com.pinebox.kiosk.replay.ScreenReplay,
+        want: Double,
+        videoOnly: Boolean,
+    ): Triple<File, Double, JSONObject> = withContext(Dispatchers.IO) {
+        synchronized(replay) {
+            val (file, seconds) = replay.save(want, videoOnly)
+            Triple(file, seconds, JSONObject(replay.lastSavedAudio.toString()))
+        }
+    }
 
     /* ----------------------------------------------------------------- */
     /* The asynchronous road                                              */
@@ -692,6 +719,7 @@ class PineDesktopBridge(
                  * is routinely several times this. See ScreenReplay. */
                 .put("atLeast", com.pinebox.kiosk.replay.ScreenReplay.HOLD_SECONDS)
                 .put("bytes", replay?.bytes() ?: 0)
+                .put("audio", replay?.audioStatus() ?: JSONObject.NULL)
                 .put("detail", replay?.lastError ?: JSONObject.NULL).toString())
         }
 
@@ -705,15 +733,18 @@ class PineDesktopBridge(
                 BridgeEnvelope.ok(id, JSONObject()
                     .put("ok", false).put("detail", "no recorder on this terminal").toString())
             } else {
-                val want = args.optJSONObject(0)?.optDouble("seconds", 30.0) ?: 30.0
+                val opts = args.optJSONObject(0) ?: JSONObject()
+                val want = opts.optDouble("seconds", 30.0)
                 try {
-                    val (file, got) = replay.save(want)
-                    heldReplay = file.readBytes()
-                    file.delete()
+                    val (file, got, audio) = captureReplay(replay, want, opts.optBoolean("video_only", false))
+                    heldReplay = withContext(Dispatchers.IO) {
+                        try { file.readBytes() } finally { file.delete() }
+                    }
                     BridgeEnvelope.ok(id, JSONObject()
                         .put("ok", true)
                         .put("bytes", heldReplay?.size ?: 0)
                         .put("asked", want)
+                        .put("audio", audio)
                         /* What was ACTUALLY written, which can be less. */
                         .put("seconds", got).toString())
                 } catch (err: Exception) {
@@ -724,6 +755,202 @@ class PineDesktopBridge(
                 }
             }
         }
+
+        /* ---- the hot corners --------------------------------------- */
+
+        /* THE PICTURE, FOR THE RED INK.
+         *
+         * "If I swipe into the tablet from the top left of the screen down
+         *  to the center, I want to take a screenshot of the screen and I
+         *  want to be able to draw on the screen and outline things with my
+         *  finger in red and be able to submit that image along with the
+         *  report into the Pine box inbox."
+         *
+         * The same PixelCopy the volume-up chord uses - MainActivity.
+         * shootScreen is the one road - awaited here and settled as a data
+         * URL the annotator can paint onto a canvas. It needs the
+         * activity's WINDOW, which this class deliberately does not hold;
+         * `liveActivity` is set while the activity is resumed, which is the
+         * only time there is a window worth copying. */
+        "screenShot" -> {
+            val activity = liveActivity
+            if (activity == null) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false)
+                    .put("detail", "the terminal's window is not on screen").toString())
+            } else {
+                val shot = suspendCancellableCoroutine<com.pinebox.kiosk.MainActivity.Shot?> { cont ->
+                    activity.runOnUiThread {
+                        try {
+                            activity.shootScreen { got -> if (cont.isActive) cont.resume(got) }
+                        } catch (err: Exception) {
+                            Log.w(TAG, "screenShot failed", err)
+                            if (cont.isActive) cont.resume(null)
+                        }
+                    }
+                }
+                val answer = if (shot == null) {
+                    JSONObject().put("ok", false)
+                        .put("detail", "the window could not be copied; see PineKiosk in the log")
+                } else {
+                    JSONObject().put("ok", true)
+                        .put("image", shot.dataUrl)
+                        .put("w", shot.w)
+                        .put("h", shot.h)
+                }
+                BridgeEnvelope.ok(id, answer.toString())
+            }
+        }
+
+        /* THE SCREEN VIDEO, TO THE OPERATOR'S FOLDER - AND UP TO THE BOX.
+         *
+         * "If I swipe in from the right side, I want to save a recording and
+         *  save it out to the Pine Box recordings folder that I have
+         *  specified. And I want to save anywhere from the last five seconds
+         *  to the last 20 minutes. So the tablet should always be
+         *  recording."
+         *
+         * replaySave above parks the bytes for the DESKTOP to pull through
+         * replayChunk. This is the other road: the same ReplayRing.save
+         * writes the last `seconds` to a temp file, ClipSaver streams that
+         * file into Download/<recordingFolder> under a dated name, and then
+         * - when asked - the file goes to the station's export courier. The
+         * bytes never cross the bridge; the page gets the path, the size
+         * and what was actually written.
+         *
+         * THE UPLOAD CANNOT FAIL THE SAVE. The courier route may not exist
+         * yet, the box may be off the LAN, the tailnet may be asleep: every
+         * one of those settles as `uploaded: {ok:false, detail}` beside an
+         * `ok:true` save, because the file on the tablet is the thing the
+         * operator asked for and the upload is the convenience. */
+        "replayExport" -> {
+            val replay = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.replay
+            val opts = args.optJSONObject(0) ?: JSONObject()
+            if (replay == null) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false).put("uploaded", JSONObject.NULL)
+                    .put("detail", "no recorder on this terminal").toString())
+            } else {
+                val want = opts.optDouble("seconds", 30.0)
+                    .coerceIn(1.0, com.pinebox.kiosk.replay.ScreenReplay.HOLD_SECONDS.toDouble())
+                val upload = opts.optBoolean("upload", false)
+                var temp: File? = null
+                try {
+                    val (file, got, audio) = captureReplay(replay, want, opts.optBoolean("video_only", false))
+                    temp = file
+                    val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+                    val asked = opts.optString("name", "").trim()
+                    val name = when {
+                        asked.isBlank() ->
+                            "pinetab-screen-" + stamp + "-" + Math.round(got) + "s.mp4"
+                        asked.lowercase(Locale.US).endsWith(".mp4") -> asked
+                        else -> "$asked.mp4"
+                    }
+                    val cfg = configStore.read()
+                    val kept = withContext(Dispatchers.IO) {
+                        com.pinebox.kiosk.audio.ClipSaver.keepFile(context, file, name, cfg.recordingFolder, "video/mp4")
+                    }
+                    /* Uploaded from the temp file even when MediaStore
+                     * refused the folder: a courier that carried it to the
+                     * box is still a copy the operator can get at. */
+                    val uploaded: JSONObject? =
+                        if (upload) uploadExport(file, name, "screen", got) else null
+                    BridgeEnvelope.ok(id, JSONObject()
+                        .put("ok", kept.ok)
+                        .put("where", kept.where)
+                        .put("bytes", kept.bytes)
+                        .put("asked", want)
+                        /* What was ACTUALLY written, which can be less. */
+                        .put("seconds", got)
+                        .put("audio", audio)
+                        .put("uploaded", uploaded ?: JSONObject.NULL)
+                        .put("detail", kept.detail).toString())
+                } catch (err: Exception) {
+                    BridgeEnvelope.ok(id, JSONObject()
+                        .put("ok", false)
+                        .put("uploaded", JSONObject.NULL)
+                        .put("detail", err.message ?: "the replay could not be written").toString())
+                } finally {
+                    try { temp?.delete() } catch (gone: Exception) { /* fine */ }
+                }
+            }
+        }
+
+        /* Capture an immutable source for editing. No final export is saved
+         * until the editor has rendered the user's chosen result. */
+        "replayEdit" -> {
+            val replay = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.replay
+            val opts = args.optJSONObject(0) ?: JSONObject()
+            if (replay == null) {
+                BridgeEnvelope.ok(id, JSONObject().put("ok", false).put("detail", "no recorder on this terminal").toString())
+            } else {
+                var temp: File? = null
+                try {
+                    val want = opts.optDouble("seconds", 60.0)
+                        .coerceIn(1.0, com.pinebox.kiosk.replay.ScreenReplay.HOLD_SECONDS.toDouble())
+                    val (file, got, audio) = captureReplay(replay, want, opts.optBoolean("video_only", false))
+                    temp = file
+                    val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+                    val name = "pinetab-screen-$stamp-${Math.round(got)}s.mp4"
+                    val result = JSONObject(client.postVideoEditorSource(file, audio, name))
+                    val source = VideoEditorContract.identity(result.optString("source_id", result.optString("id")))
+                    result.put("ok", true).put("source_id", source).put("id", source)
+                        .put("editor_url", VideoEditorContract.editorPath(source))
+                        .put("seconds", got).put("audio", audio)
+                    BridgeEnvelope.ok(id, result.toString())
+                } catch (err: Exception) {
+                    // Preserve the captured moment if the upload failed. This
+                    // is explicitly an original capture, not an edited result.
+                    val kept = runCatching {
+                        withContext(Dispatchers.IO) {
+                            temp?.takeIf { it.isFile && it.length() > 0 }?.let { file ->
+                                val name = "pinetab-original-${System.currentTimeMillis()}.mp4"
+                                com.pinebox.kiosk.audio.ClipSaver.keepFile(context, file, name,
+                                    configStore.read().recordingFolder, "video/mp4")
+                            }
+                        }
+                    }.getOrNull()
+                    BridgeEnvelope.ok(id, JSONObject().put("ok", false)
+                        .put("detail", err.message ?: "the capture could not be opened for editing")
+                        .put("original_saved", kept?.ok ?: false).put("where", kept?.where ?: "")
+                        .put("audio", replay.audioStatus()).toString())
+                } finally { try { temp?.delete() } catch (_: Exception) { } }
+            }
+        }
+
+        "replayKeepEdited" -> {
+            val opts = args.optJSONObject(0) ?: JSONObject()
+            val exportId = opts.optString("export_id")
+            var temp: File? = null
+            try {
+                val info = JSONObject(client.get(VideoEditorContract.exportRoute(exportId)))
+                require(info.optString("status") == "complete") { "the edited video is not ready to save" }
+                val file = withContext(Dispatchers.IO) { File.createTempFile("edited-video-", ".mp4", context.cacheDir) }
+                temp = file
+                client.getVideoEditorExport(exportId, file)
+                val name = opts.optString("name").ifBlank { info.optString("name", "pine-edited-$exportId.mp4") }
+                val folder = configStore.read().recordingFolder
+                val kept = withContext(Dispatchers.IO) {
+                    com.pinebox.kiosk.audio.ClipSaver.keepFile(context, file,
+                        if (name.endsWith(".mp4", true)) name else "$name.mp4", folder, "video/mp4")
+                }
+                BridgeEnvelope.ok(id, JSONObject().put("ok", kept.ok).put("where", kept.where)
+                    .put("bytes", kept.bytes).put("detail", kept.detail).put("export_id", exportId).toString())
+            } catch (err: Exception) {
+                BridgeEnvelope.ok(id, JSONObject().put("ok", false).put("detail", err.message ?: "edited video could not be saved").toString())
+            } finally { try { temp?.delete() } catch (_: Exception) { } }
+        }
+
+        /* THE PREFERENCES. Read, or merge-and-persist; either way the
+         * settled object is {enabled, tl, tr, bl, br, ring}, and a set
+         * pushes that same object into the page. One function for this and
+         * for the drawer's rows: config/HotCorners.kt. */
+        "hotCorners" -> BridgeEnvelope.ok(id, HotCorners.read(configStore).toString())
+
+        "hotCornersSet" -> BridgeEnvelope.ok(id,
+            HotCorners.set(configStore, args.optJSONObject(0)) { script ->
+                webView.post { webView.evaluateJavascript(script, null) }
+            }.toString())
 
         /* One slice of the parked replay, base64 - the same shape micChunk
          * uses, and for the same reason: a multi-megabyte return from a
@@ -822,6 +1049,39 @@ class PineDesktopBridge(
         in TERMINAL_METHODS -> BridgeEnvelope.unsupported(id, method, WHY_TERMINAL)
 
         else -> BridgeEnvelope.error(id, "unrouted bridge method: $method")
+    }
+
+    /**
+     * THE FILE TO THE STATION'S EXPORT COURIER, HONESTLY REPORTED.
+     *
+     * PUT <base>/api/export/upload?name=..&what=..&seconds=.. with the MP4
+     * as the whole body, Content-Type video/mp4, streamed from the file -
+     * the station container has no multipart parser, so nothing here is a
+     * form. The station's answer, {ok:true, id, name, dest}, is passed
+     * through where it has the fields; a refusal, a missing route (404 -
+     * the courier may not be built yet) or no station at all each come
+     * back as {ok:false, detail} rather than as a thrown error, because the
+     * caller has already written the file and must say so whatever
+     * happened here.
+     */
+    private suspend fun uploadExport(file: File, name: String, what: String,
+                                     seconds: Double): JSONObject = try {
+        val route = "/api/export/upload?name=" + URLEncoder.encode(name, "UTF-8") +
+            "&what=" + URLEncoder.encode(what, "UTF-8") +
+            "&seconds=" + Math.round(seconds)
+        val text = client.putFile(route, file, "video/mp4")
+        val answer = try { JSONObject(text) } catch (err: Exception) { JSONObject() }
+        JSONObject()
+            .put("ok", answer.optBoolean("ok", true))
+            .put("id", answer.opt("id") ?: JSONObject.NULL)
+            .put("dest", answer.opt("dest") ?: answer.opt("path") ?: JSONObject.NULL)
+            .put("detail", answer.opt("detail") ?: answer.opt("error") ?: JSONObject.NULL)
+    } catch (err: StationException) {
+        JSONObject().put("ok", false)
+            .put("detail", "the station said " + err.code + ": " + (err.message ?: ""))
+    } catch (err: Exception) {
+        JSONObject().put("ok", false)
+            .put("detail", "no answer from the station: " + (err.message ?: err.javaClass.simpleName))
     }
 
     /** The ear. One instance for the app: the hardware is one microphone

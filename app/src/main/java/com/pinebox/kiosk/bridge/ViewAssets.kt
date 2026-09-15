@@ -46,6 +46,11 @@ object ViewAssets {
         "console-line.js",        // the one-line backend readout, all screens
         "console-trace.js",       // tap that line: where the work came from
         "audio-law.js",           // ONE door to every level and route
+        // THE SHARED DUCK, before anything that speaks over the air:
+        // talk-dot.js, script-page.js, line-deep.js, hot-corners.js and
+        // tablet-doctor.js all reach for it, so it goes in ahead of the
+        // first of them.
+        "pine-duck.js",
         "talk-dot.js",            // the dot you speak commands into
         "vote-arrows.js",         // love it or not, on every player
         "listen-model.js",        // the arithmetic Listen and Music share
@@ -53,6 +58,7 @@ object ViewAssets {
         "script-lineage.js",      // reads one provenance payload
         "script-stage.js",        // the 3D presentation of it
         "script.js",              // the Script view
+        "script-diagnostics.js", // evidence captured by the Script report button
         "script-page.js",         // the Script view built to the sketch
         "listen.js",
         "music.js",
@@ -65,6 +71,8 @@ object ViewAssets {
         "line-deep.js",           // why a line was said, and how often
         "line-actions.js",        // hold a line: pad, keep, or examine
         "sfx-tv.js",              // #1306b: the SFX guy's little CRT set
+        "clip-doctor.js",         // #1361b: why the video button gave nothing
+        "pine-cam.js",            // #1358: the Pine Cam, self-hosted here
         "lock.js",                // the station on a locked tablet
         "spark-overlays.js",      // the backend readouts, in any host
         "slideshow-source.js",    // the slideshow's whole traffic budget
@@ -72,7 +80,15 @@ object ViewAssets {
         // #1317: the terminal noticing its own deafness. Before rail so
         // it is watching whatever else fails to start.
         "deaf-watch.js",
-        "rail.js"                 // last: it looks for the globals above
+        "rail.js",                // it looks for the globals above
+        // THE HOT CORNERS, after everything they reach for: line-deep.js
+        // (the inspector), talk-dot.js and the report pad (the shot),
+        // sfx-tv.js (the last clip) and rail.js (the drawer they mirror).
+        // The native half is config/HotCorners.kt, the bridge's screenShot
+        // / replayEdit / replayKeepEdited / hotCorners*, and MainActivity's
+        // touch road. The editor is a station-served iframe: its own assets
+        // must not be evaluated into the live station document here.
+        "hot-corners.js"
     )
 
     /** Concatenated into one <style>; each keys off its own class prefix. */
@@ -88,10 +104,13 @@ object ViewAssets {
         "vote-arrows.css",        // the up and down arrows
         "line-actions.css",       // the hold sheet and the examination
         "sfx-tv.css",             // #1306b: the set, its glass and its sheet
+        "clip-doctor.css",        // #1361b: the doctor's sheet
+        "pine-cam.css",           // #1358: the box and the flag
         "three-full.css",         // the 3JS lift and the full-screen mode
         "busy.css",               // the working bar
         "slideshow.css",          // the slideshow and its twenty transitions
-        "spark-overlays.css"      // the readouts, over a picture or alone
+        "spark-overlays.css",     // the readouts, over a picture or alone
+        "hot-corners.css"         // the red ink, the export sheet, the inspector
     )
 
     private fun read(context: Context, name: String): String =

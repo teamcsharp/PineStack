@@ -48,6 +48,150 @@
   var quietSince = 0;
   var scene = null;
 
+  /* #1355: WHICH MICROPHONE.
+   *
+   * getUserMedia({audio: true}) asks for 'an' audio input, and what it
+   * hands back is whatever Chromium picked - which on a machine with a
+   * webcam, a headset and a line-in is frequently not the one the
+   * operator has set as their Windows default. It is also silent about
+   * its choice, so a dot that hears nothing and a dot that is listening
+   * to an unplugged jack look identical.
+   *
+   * Three changes, each earning its place:
+   *   - ask for deviceId 'default' explicitly. That is a real device id
+   *     in Chromium, not a synonym for 'any': it FOLLOWS the system
+   *     default, so changing it in Windows changes this without a
+   *     relaunch.
+   *   - say the track's label out loud when listening starts, so the
+   *     answer to 'is it hearing me' includes 'with what'.
+   *   - let it be pinned, because a default is a guess and the operator
+   *     is not. Right-click the dot.
+   *
+   * `ideal`, never `exact`, for the default - an exact constraint on a
+   * device that has gone is an OverconstrainedError and no microphone
+   * at all, which is strictly worse than the wrong one.
+   */
+  var MIC_KEY = 'pineTalkMic';
+  var micLabel = '';
+
+  function micPin() {
+    try { return localStorage.getItem(MIC_KEY) || ''; }
+    catch (err) { return ''; }
+  }
+
+  function micConstraints(pin) {
+    var audio = {
+      /* The room is a room: the operator is talking over a broadcast
+       * coming out of the same machine's speakers. */
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true
+    };
+    if (pin) audio.deviceId = {exact: pin};
+    else audio.deviceId = {ideal: 'default'};
+    return {audio: audio};
+  }
+
+  async function openMic() {
+    var pin = micPin();
+    try {
+      return await navigator.mediaDevices.getUserMedia(micConstraints(pin));
+    } catch (err) {
+      if (!pin) throw err;
+      /* The pinned device has gone - unplugged, or a Bluetooth headset
+       * that wandered off. Forget it and take the default rather than
+       * refusing to listen at all; a pin is a preference, not a
+       * requirement. */
+      try { localStorage.removeItem(MIC_KEY); } catch (e) { /* fine */ }
+      return await navigator.mediaDevices.getUserMedia(micConstraints(''));
+    }
+  }
+
+  function micName(got) {
+    try {
+      var track = got && got.getAudioTracks && got.getAudioTracks()[0];
+      var name = String((track && track.label) || '').trim();
+      /* Chromium prefixes the follow-the-system entry; the prefix is
+       * the useful part of the answer, so keep it and trim the rest. */
+      return name.length > 42 ? name.slice(0, 41) + '\u2026' : name;
+    } catch (err) { return ''; }
+  }
+
+  /* The list, for the picker. Labels are empty until the microphone has
+   * been opened once in this session - that is a browser rule, not a
+   * fault - so an unnamed device is numbered rather than hidden. */
+  async function mics() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      return [];
+    }
+    var all = await navigator.mediaDevices.enumerateDevices();
+    var n = 0;
+    return all.filter(function (d) { return d.kind === 'audioinput'; })
+      .map(function (d) {
+        n += 1;
+        return {id: d.deviceId,
+          label: String(d.label || '').trim() || ('Microphone ' + n)};
+      });
+  }
+
+  function useMic(id) {
+    try {
+      if (id) localStorage.setItem(MIC_KEY, id);
+      else localStorage.removeItem(MIC_KEY);
+    } catch (err) { /* an unremembered choice still works this session */ }
+  }
+
+  /* ---- the picker ----------------------------------------------- */
+
+  function closeMicMenu() {
+    var old = el('pineTalkMics');
+    if (old) old.remove();
+  }
+
+  async function micMenu() {
+    closeMicMenu();
+    var list;
+    try { list = await mics(); } catch (err) { list = []; }
+    var box = document.createElement('div');
+    box.id = 'pineTalkMics';
+    box.className = 'pine-talk-mics';
+    var head = document.createElement('div');
+    head.className = 'pine-talk-mics-head';
+    head.textContent = 'Which microphone';
+    box.appendChild(head);
+    var pin = micPin();
+    var rows = [{id: '', label: 'System default'}].concat(list);
+    rows.forEach(function (m) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'pine-talk-mic' + (m.id === pin ? ' on' : '');
+      b.textContent = m.label;
+      b.addEventListener('click', function () {
+        useMic(m.id);
+        closeMicMenu();
+        announce(m.id ? ('Listening with ' + m.label + ' from now on')
+          : 'Back to whichever microphone the system says is default');
+      });
+      box.appendChild(b);
+    });
+    if (!list.length) {
+      var none = document.createElement('div');
+      none.className = 'pine-talk-mics-none';
+      none.textContent = 'This machine reports no audio input.';
+      box.appendChild(none);
+    }
+    document.body.appendChild(box);
+    /* One dismissal road, attached after this click has finished
+     * bubbling or it would close the menu it just opened. */
+    setTimeout(function () {
+      document.addEventListener('click', function away(ev) {
+        if (box.contains(ev.target)) return;
+        document.removeEventListener('click', away);
+        closeMicMenu();
+      });
+    }, 0);
+  }
+
   function api() {
     return root.pineDesktop || {
       post: function () { return Promise.reject(new Error('no bridge')); }
@@ -69,10 +213,29 @@
     dot.innerHTML = '<canvas id="pineTalkFx" class="pine-talk-fx"></canvas>'
       + '<i class="pine-talk-core"></i>';
     dot.addEventListener('click', toggle);
+    /* 2026-09-14: the canvas is the voice window; a tap on it while
+       listening cancels rather than sends (see cancel()). */
+    var fx = dot.querySelector('#pineTalkFx');
+    if (fx) fx.addEventListener('click', function (ev) {
+      if (state !== LISTENING) return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      cancel();
+    });
+    /* #1355: and the other button picks the ear. A right-click rather
+     * than a second piece of chrome - the dot is deliberately one
+     * object, and this is a setting that is changed once. */
+    dot.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      micMenu();
+    });
+    dot.title = 'Click and speak - the station will hear you. '
+      + 'Right-click to choose which microphone.';
     document.body.appendChild(dot);
 
     var say = document.createElement('div');
     say.id = 'pineTalkSay';
+    say.addEventListener('click', function (ev) { if (state === LISTENING) { ev.stopPropagation(); cancel(); } });   /* 2026-09-14 */
     say.className = 'pine-talk-say';
     say.hidden = true;
     document.body.appendChild(say);
@@ -131,6 +294,15 @@
 
   function duck(on) {
     clearTimeout(duckSafety);
+    /* 2026-09-14: "any time that I'm dealing with dictation, always duck
+       the audio completely or to 2%." PineDuck (pine-duck.js) is the one
+       levelled road every surface shares; the 0.12 below is only the
+       fallback for a page that loaded without it. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      if (on) { root.PineDuck.hold('dictation', root.PineDuck.DICTATION); return 1; }
+      root.PineDuck.release('dictation');
+      return 0;
+    }
     if (on) {
       /* Re-ducking without an intervening release would record 0.12 as the
        * volume to restore, and the sound would never come back. */
@@ -247,6 +419,7 @@
 
   async function listen() {
     mount();
+    cancelled = false;
 
     /* The native ear first, where there is one. */
     if (haveNativeEar()) {
@@ -285,7 +458,7 @@
       return;
     }
     try {
-      stream = await navigator.mediaDevices.getUserMedia({audio: true});
+      stream = await openMic();
     } catch (err) {
       /* The usual cause is the WebView not having been granted RECORD_AUDIO,
        * which is a native permission the page cannot ask for itself. */
@@ -295,7 +468,11 @@
 
     duck(true);
     setState(LISTENING);
-    announce('Listening...');
+    /* #1355: WITH WHAT. A dot that is listening to the wrong jack and a
+     * dot that is listening to a quiet room look the same, and the
+     * operator can only tell them apart if the name is on screen. */
+    micLabel = micName(stream);
+    announce('Listening...' + (micLabel ? ' (' + micLabel + ')' : ''));
     startScene();
 
     ctx = ctx || new (root.AudioContext || root.webkitAudioContext)();
@@ -391,6 +568,30 @@
     frame = requestAnimationFrame(tick);
   }
 
+  /* 2026-09-14: "During dictation if I tap on the voice window, cancel it."
+   * The dot's core still finishes and SENDS (a tap on the dot is how it
+   * has always ended); the WINDOW - the particle canvas that grows while
+   * it listens, and the "Listening..." note - now cancels: the recording
+   * stops and is thrown away, nothing is sent, the show comes back up. */
+  var cancelled = false;
+  function cancel() {
+    if (state !== LISTENING) return;
+    cancelled = true;
+    cancelAnimationFrame(frame);
+    duck(false);
+    try { if (native && root.pineDesktop && root.pineDesktop.micStop) root.pineDesktop.micStop(); } catch (e) { /* the ear closes by itself */ }
+    try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch (e) { /* already stopped */ }
+    if (stream) {
+      stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* gone */ } });
+      stream = null;
+    }
+    chunks = [];
+    capture = null;
+    setState(IDLE);
+    announce('Cancelled - nothing was sent.');
+    release(1500);
+  }
+
   function finish() {
     if (state !== LISTENING) return;
     setState(THINKING);
@@ -405,6 +606,7 @@
    * cost a third more bytes and buy nothing, since nothing here wants the
    * audio, only what was said. */
   async function sendNative() {
+    if (cancelled) { cancelled = false; return; }   /* 2026-09-14: thrown away */
     /* The scene is NOT stopped here any more: it has the words to assemble
      * next. Ducking also holds, because the spoken reply follows. */
     duck(false);
@@ -446,6 +648,7 @@
   }
 
   async function send() {
+    if (cancelled) { cancelled = false; return; }   /* 2026-09-14: thrown away */
     duck(false);
     if (stream) {
       stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* gone */ } });
@@ -496,7 +699,176 @@
    * the station's own voice bench (/v1/audio/speech), and the text stays
    * on screen underneath it.
    */
+  /* 2026-09-14: THE DICTATED PINE REPORT.
+   *
+   * "tap on the dot on the tablet and say I want to make a pine report
+   *  and it converts into a setup of a pop-up window where I can basically
+   *  file a pine report through dictation and then make corrections
+   *  through typing on the keyboard if necessary and then file that
+   *  report ... either confirm or decline sending it through."
+   *
+   * The dot already hears a sentence and hands it to act(). Two things are
+   * added and nothing is bypassed: a sentence that ASKS for a report opens
+   * the pad instead of going to the model, and while the pad is open a
+   * `capture` hook takes the NEXT heard sentence into the pad's text
+   * instead of to the model. Everything typed stays editable; Send posts
+   * to /api/pine-requests like the panel's own box (with the station's
+   * debug block by choice); Cancel throws it away. */
+  var capture = null;
+  var pad = null;
+
+  function wantsReport(text) {
+    var t = String(text || '').toLowerCase();
+    if (!/\breport\b/.test(t)) return false;
+    return /\b(pine|inbox|make|file|new|create|start|write|submit|send)\b/.test(t);
+  }
+
+  function padClose() {
+    capture = null;
+    if (pad && pad.parentNode) pad.parentNode.removeChild(pad);
+    pad = null;
+  }
+
+  var padImage = '';
+  function reportOpen(heard, image, dictateNow) {
+    padClose();
+    padImage = String(image || '');
+    pad = document.createElement('div');
+    pad.id = 'pineReportPad';
+    pad.setAttribute('style', 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);'
+      + 'width:min(92vw,560px);max-height:88vh;display:flex;flex-direction:column;gap:10px;'
+      + 'padding:14px 16px;border:1px solid #2a3a44;border-radius:12px;background:#0b1116;'
+      + 'color:#dfe7ee;font:14px/1.4 system-ui,sans-serif;z-index:2147483040;'
+      + 'box-shadow:0 18px 60px rgba(0,0,0,.6)');
+    var head = document.createElement('b');
+    head.textContent = 'A Pine report';
+    head.style.fontSize = '16px';
+    var hint = document.createElement('div');
+    hint.setAttribute('style', 'color:#9fb3c0;font-size:12px');
+    hint.textContent = 'Dictate it, fix it on the keyboard, then Send it to the inbox - or Cancel.';
+    var area = document.createElement('textarea');
+    area.setAttribute('style', 'width:100%;min-height:160px;resize:vertical;padding:10px;'
+      + 'border:1px solid #2a3a44;border-radius:8px;background:#05080a;color:#dfe7ee;'
+      + 'font:15px/1.45 system-ui,sans-serif;box-sizing:border-box');
+    area.placeholder = 'What should the Pine Box do?';
+    var note = document.createElement('div');
+    note.setAttribute('style', 'color:#65c7da;font-size:12px;min-height:16px');
+    var debugRow = document.createElement('label');
+    debugRow.setAttribute('style', 'display:flex;align-items:center;gap:8px;font-size:12px;color:#9fb3c0');
+    var debug = document.createElement('input');
+    debug.type = 'checkbox';
+    debug.checked = true;
+    debugRow.appendChild(debug);
+    debugRow.appendChild(document.createTextNode("Attach the station's debug information to this report"));
+    var row = document.createElement('div');
+    row.setAttribute('style', 'display:flex;gap:8px;flex-wrap:wrap');
+    function btn(label, style, go) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.setAttribute('style', 'flex:1 1 auto;min-height:40px;padding:8px 12px;border-radius:8px;'
+        + 'border:1px solid #2a3a44;background:#111922;color:#dfe7ee;font-size:14px;' + (style || ''));
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); go(b); });
+      row.appendChild(b);
+      return b;
+    }
+    var dictate = btn('Dictate', '', function () {
+      note.textContent = 'listening - speak, then wait a moment';
+      capture = function (words) {
+        var had = area.value.trim();
+        area.value = (had ? had + ' ' : '') + String(words || '').trim();
+        note.textContent = 'heard - fix anything on the keyboard, or Dictate more';
+        try { area.focus(); } catch (e) {}
+      };
+      try { listen(); } catch (err) { note.textContent = 'could not listen: ' + (err && err.message || err); capture = null; }
+    });
+    btn('Send to the inbox', 'background:#1d4d5a;border-color:#2c7a8c', function (b) {
+      var text = area.value.trim();
+      if (!text) { note.textContent = 'there is nothing to send yet'; return; }
+      b.disabled = true;
+      note.textContent = 'sending...';
+      Promise.resolve(api().post('/api/pine-requests', {text: text, debug: !!debug.checked, images: padImage ? [padImage] : []}))
+        .then(function (got) {
+          var id = got && got.submitted && got.submitted.id;
+          var said = 'Filed as Pine report #' + id + '.';
+          note.textContent = said;
+          announce(said);
+          try { speak(said); } catch (e) {}
+          setTimeout(padClose, 1600);
+        }, function (err) {
+          b.disabled = false;
+          note.textContent = 'the station refused it: ' + ((err && err.message) || err);
+        });
+    });
+    btn('Cancel', '', function () { padClose(); announce('Report cancelled.'); });
+    pad.appendChild(head);
+    pad.appendChild(hint);
+    if (padImage) {
+      /* 2026-09-14: the picture the key chord took rides the report. */
+      var shot = document.createElement('img');
+      shot.src = padImage;
+      shot.alt = 'the screen as it was';
+      shot.setAttribute('style', 'width:100%;max-height:34vh;object-fit:contain;border:1px solid #2a3a44;border-radius:8px;background:#000');
+      pad.appendChild(shot);
+    }
+    pad.appendChild(area);
+    pad.appendChild(debugRow);
+    pad.appendChild(row);
+    pad.appendChild(note);
+    document.body.appendChild(pad);
+    /* 2026-09-14: "Whenever I'm filing a report ... lower the broadcast to
+       10%." The hold is tied to the pad: when the pad leaves, so does it. */
+    if (root.PineDuck) root.PineDuck.hold('report-pad', root.PineDuck.REPORT, pad);
+    /* The sentence that opened the pad may carry the report already:
+       "make a pine report: the sampler is silent". Keep what follows. */
+    var body = String(heard || '').replace(/^.*?\breport\b[\s:,.-]*/i, '').trim();
+    if (body.split(/\s+/).length >= 3) area.value = body;
+    note.textContent = body ? 'that is what was heard after "report" - edit it, or Dictate more' : 'press Dictate and say the report';
+    try { (body ? area : dictate).focus(); } catch (e) {}
+    if (dictateNow) {
+      /* the chord: the dot comes up listening at once */
+      setTimeout(function () { try { dictate.click(); } catch (e) { /* the button is there */ } }, 350);
+    }
+  }
+
+  /* 2026-09-14: THE KEY CHORD ON THE TABLET. "if I press the lock button
+   * and the volume up button ... take a picture of the screen ... flash
+   * like a photograph ... the dot should come up and begin taking my
+   * speech ... then come up showing a notepad with my message on it."
+   * Android never hands an app the power key, so the kiosk listens for
+   * volume-up pressed TWICE within a moment (MainActivity.onKeyDown),
+   * takes the picture with PixelCopy, and calls this with it. */
+  function fromKey(dataUrl) {
+    try {
+      var flash = document.createElement('div');
+      flash.setAttribute('style', 'position:fixed;inset:0;background:#fff;opacity:.92;z-index:2147483045;pointer-events:none;transition:opacity .45s ease-out');
+      document.body.appendChild(flash);
+      setTimeout(function () { flash.style.opacity = '0'; }, 30);
+      setTimeout(function () { if (flash.parentNode) flash.parentNode.removeChild(flash); }, 520);
+    } catch (e) { /* the pad still opens */ }
+    reportOpen('', String(dataUrl || ''), true);
+  }
+  root.PineReport = {fromKey: fromKey, open: function (image) { reportOpen('', image || '', false); }};
+
   async function act(text) {
+    /* 2026-09-14: the pad first. A capture takes the sentence as text;
+     * a request for a report opens the pad; neither reaches the model. */
+    if (capture) {
+      var take = capture;
+      capture = null;
+      setState(IDLE);
+      announce('Heard: "' + text + '"');
+      try { take(text); } catch (err) { /* the pad still stands */ }
+      release(400);
+      return;
+    }
+    if (wantsReport(text)) {
+      setState(IDLE);
+      announce('A Pine report - dictate it, then send it.');
+      reportOpen(text);
+      release(400);
+      return;
+    }
     setState(THINKING);
     /* Tell him it understood BEFORE the thinking starts. The answer can
      * take seconds; being told you were heard should not wait for it. */
@@ -638,6 +1010,38 @@
    * that makes this work on the tablet. Cached, because a reply should not
    * cost a config read every time. */
   var cachedKey = '';
+  /* #1360: WHERE THE STATION IS, FOR THE TWO ROADS THAT BYPASS THE
+   * BRIDGE.
+   *
+   * "Failed to fetch", in the red box over the dot, on the desktop.
+   *
+   * Both of the fetches below were written with a bare '/api/...' path,
+   * and on the tablet that is correct - the panel IS served by the
+   * station there, so a relative URL follows the host it was opened on.
+   * In the Electron chrome the document is file://, so the same string
+   * resolves to file:///api/listen/transcribe, which is a path on the
+   * disk, is not there, and fails with exactly that message.
+   *
+   * So the orb could hear you on the desktop and could never send what
+   * it heard, and could never speak its answer. Everything else in this
+   * file goes through pineDesktop, which builds an absolute URL out in
+   * the shell - which is why only these two broke, and why it broke
+   * silently on the one surface nobody tests the tablet on.
+   *
+   * Same shape as slideshow-source's base() (#1348): empty where the
+   * document is already served over http, so nothing about the tablet
+   * changes.
+   */
+  function where() {
+    try {
+      if (root.location && /^https?:$/.test(root.location.protocol)) {
+        return '';
+      }
+      if (root.pineStationBase) return root.pineStationBase();
+    } catch (err) { /* fall through to the last resort */ }
+    return 'http://127.0.0.1:8096';
+  }
+
   function serverKey() {
     if (cachedKey) return Promise.resolve(cachedKey);
     if (typeof root.SERVER_KEY === 'string' && root.SERVER_KEY) {
@@ -718,7 +1122,7 @@
   function sayIt(words, key, voice) {
     var headers = {'Content-Type': 'application/json'};
     headers.Authorization = 'Bearer ' + key;
-    fetch('/v1/audio/speech', {
+    fetch(where() + '/v1/audio/speech', {   /* #1360 */
       method: 'POST', headers: headers,
       body: JSON.stringify({
         input: String(words).slice(0, 600),
@@ -764,7 +1168,7 @@
       if (!key) {
         throw new Error('no station key on this terminal to authorise the clip');
       }
-      return fetch(url, {
+      return fetch(where() + url, {          /* #1360 */
         method: 'POST',
         headers: {
           'Authorization': 'Bearer ' + key,
@@ -780,7 +1184,28 @@
     });
   }
 
+  /* #1355: a device list that changed under a pinned choice is worth
+   * knowing about before the next press, not during it. */
+  try {
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', function () {
+        var pin = micPin();
+        if (!pin) return;
+        mics().then(function (list) {
+          var still = list.some(function (m) { return m.id === pin; });
+          if (still) return;
+          useMic('');
+          announce('That microphone has gone - back to the system '
+            + 'default');
+        }).catch(function () { /* asked again on the next press */ });
+      });
+    }
+  } catch (err) { /* not every engine has this */ }
+
   root.PineTalkDot = {
+    mics: mics,
+    useMic: useMic,
+    micPin: micPin,
     mount: mount, listen: listen, finish: finish, duck: duck,
     /* `act` is the door for a sentence that arrived some other way - a
      * wake word, a typed command, or a test - and it deliberately does
@@ -788,6 +1213,13 @@
      * assemble, ask, answer, speak. Anything that bypassed it would be a
      * second, quietly different experience. */
     act: act,
+    cancel: cancel,
+    /* 2026-09-14: lend the ear - the next heard sentence goes to `fn`
+       instead of the model (the caution sheet dictates its reason
+       this way). Starts listening at once. */
+    captureNext: function (fn) { capture = typeof fn === 'function' ? fn : null; try { listen(); } catch (e) { capture = null; throw e; } },
+    /* 2026-09-14: the report pad, for a button or a test. */
+    report: reportOpen,
     state: function () { return state; }
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineTalkDot;

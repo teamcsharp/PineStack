@@ -101,6 +101,38 @@
   var PLAN_REST_MS = 30000;           /* a running order is not news */
   var beat = 0;
 
+  /* #1115: THE LAST ERRORS THIS PAGE SAW.
+   *
+   * A report about "the highlighted line is wrong" is worth little
+   * without the throw that may have stranded the highlight - and by the
+   * time the operator taps, the console that printed it is long gone
+   * (on the tablet it was never visible at all: the WebView hides a
+   * cross-origin throw behind "Script error."). So the page keeps its
+   * own short ring, twelve entries, and ships it with every report. */
+  var caught = [];
+
+  function caughtNote(kind, what) {
+    var msg = '';
+    try {
+      if (what && what.message) msg = String(what.message);
+      else if (what && what.reason) {
+        msg = String((what.reason && what.reason.message) || what.reason);
+      } else msg = String(what);
+    } catch (err) { msg = '(unprintable)'; }
+    caught.push({at: Date.now(), kind: kind, msg: msg.slice(0, 200)});
+    if (caught.length > 12) caught.splice(0, caught.length - 12);
+  }
+  try {
+    if (typeof root.addEventListener === 'function') {
+      root.addEventListener('error', function (ev) {
+        caughtNote('error', (ev && ev.error && ev.error.message) ? ev.error : ev);
+      });
+      root.addEventListener('unhandledrejection', function (ev) {
+        caughtNote('rejection', (ev && ev.reason) || ev);
+      });
+    }
+  } catch (err) { /* an engine without listeners has no errors to keep */ }
+
   function api() { return root.pineDesktop || {get: function () { return Promise.reject(new Error('no bridge')); }}; }
   function el(id) { return document.getElementById(id); }
   function make(tag, cls, text) {
@@ -182,13 +214,85 @@
      * videos", so nothing is refused; a sequence number keeps a slow
      * answer from landing on top of a faster one that came after it. */
     reel.addEventListener('click', function () {
+      if (reel.pineHeld) return;  /* 2026-09-14: the hold opened the folder sheet */
       reel.classList.add('sp-firing');
       fireVideo(reel);
     });
+    /* 2026-09-14: HOLD IT (or right-click it) for where the clips come
+     * from - the folder sheet, holdOpen() below. */
+    holdOpen(reel, folderOpen);
+
+    /* #1385 (#1108): THE PLAY BUTTON NEXT TO THE VIDEO BUTTON.
+     *
+     * "Put a play button next to the video button that ... puts the SFX
+     *  guy into video play mode where the videos are being played one
+     *  after another chosen from random from the collection."
+     *
+     * The mode is the station's (#1366, /api/sfx/video/mode) and it is
+     * a held setting, so this button only reports and flips it; the set
+     * keeps running through a restart and this view coming and going. */
+    var loop = make('button', 'sp-btn sp-loop', '');
+    loop.title = 'Endless video: the SFX guy plays clips one after another, at random';
+    loop.setAttribute('aria-label', 'Endless video on or off');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        loop.innerHTML = root.pineIcon('c:renew', 'Endless video');
+      }
+    } catch (err) { /* the title still names it */ }
+    if (!loop.innerHTML) loop.textContent = 'loop';
+    loop.addEventListener('click', function () { loopToggle(loop); });
+    setTimeout(function () { loopRead(loop); }, 900);
+
+    /* #1385 (#1110): find a word that was said on the air. */
+    var find = make('input', 'sp-find', '');
+    find.type = 'search';
+    find.placeholder = 'find a word said on air';
+    find.title = 'Every time this word was said on the air in the last two days, and why it keeps being said';
+    find.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); findOpen(find.value); }
+    });
+
+    /* #1115: THE SCRIPT ICON THAT FILES A REPORT.
+     *
+     * "place an icon here of a script that I can tap whenever the
+     *  script view is not displaying the active line being said
+     *  correctly. Whenever I tap the icon, place a report in the Pine
+     *  inbox, along with capturing advanced diagnostic information of
+     *  the script, the placement of the cursor, the activity happening
+     *  with the server, and why the script display isn't displaying
+     *  the active line being spoken ... capture yourself an image of a
+     *  screenshot of the display of the script or the display that I'm
+     *  looking at so you can see what I'm seeing."
+     *
+     * Everything the page knows about the highlight - the lit node and
+     * whether it is even in the pane, what activeRow() and the read
+     * playhead say, the scroll geometry, the errors it caught - goes to
+     * /api/script/report with a picture where the chrome can take one
+     * and a plain-text print of the visible script where it cannot.
+     * The station adds its own reading and files the inbox report. */
+    var report = make('button', 'sp-btn sp-report', '');
+    report.title = 'The highlighted line is wrong? Tap: a picture of this view and everything the page knows goes to the Pine inbox';
+    report.setAttribute('aria-label', 'Report the script view');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        report.innerHTML = root.pineIcon('c:script', 'Report the script view');
+      }
+    } catch (err) { /* the title still names it */ }
+    if (!report.innerHTML) report.textContent = 'report';
+    report.addEventListener('click', function () {
+      if (report.pineHeld) return;  /* 2026-09-14: the hold opened the inbox */
+      reportFire(report);
+    });
+    /* 2026-09-14: HOLD IT (or right-click it) for the Pine inbox itself -
+     * what has been filed, read here, and deleted here. */
+    holdOpen(report, inboxOpen);
 
     bar.appendChild(back);
     bar.appendChild(pick);
     bar.appendChild(reel);                                   /* #1303 */
+    bar.appendChild(loop);                                   /* #1385 */
+    bar.appendChild(find);                                   /* #1385 */
+    bar.appendChild(report);                                 /* #1115 */
     bar.appendChild(again);
     return bar;
   }
@@ -342,25 +446,51 @@
   var scopeWide = 0;
   var scopeHigh = 0;
 
+  /* #1413: THE SCOPE AT A TABLET'S PACE. Profiled on the PineTab
+     2026-09-14 over the WebView's devtools socket: this loop and the
+     panel's drawScope were a quarter of the page's main thread, at
+     60 fps, and the clientWidth/offsetParent reads here forced a layout
+     of a document the feed keeps dirty - Chromium's own "(program)"
+     was 43% on top. The kiosk sat at 250% CPU with the video set OFF,
+     and the native audio engine shares those cores; that is the
+     stutter. Every 4th frame on Android, every 2nd elsewhere, and the
+     layout reads once a second. */
+  /* #1413d: the panel paces requestAnimationFrame itself on the tablet
+     (window.PINE_PACE > 1), so the view draws on every paced frame there
+     and on every second frame elsewhere. */
+  var SCOPE_EVERY = (Number(root.PINE_PACE) > 1) ? 1 : 2;
+  var scopeTick = 0;
+  var scopeSizeAt = 0;
+  var scopeSeen = false;
   function paintScope() {
     scopeFrame = root.requestAnimationFrame(paintScope);
+    scopeTick = (scopeTick + 1) % SCOPE_EVERY;
+    if (scopeTick) return;
     var canvas = el('spSayingScope');
-    /* #745's lesson, on our own canvas: it costs nothing while it
-       cannot be seen. */
-    if (!canvas || !canvas.offsetParent) return;
+    if (!canvas) return;
+    var dpr = root.devicePixelRatio || 1;
+    var nowMs = Date.now();
+    if (nowMs - scopeSizeAt > 1000) {
+      scopeSizeAt = nowMs;
+      /* #745's lesson, on our own canvas: it costs nothing while it
+         cannot be seen. */
+      scopeSeen = !!canvas.offsetParent;
+      if (scopeSeen) {
+        var wide = Math.round(canvas.clientWidth * dpr);
+        var high = Math.round(canvas.clientHeight * dpr);
+        /* #745 again: writing canvas.width resets the whole 2D context, so
+           it is measured and compared, never assigned every frame. */
+        if (wide && high && (wide !== scopeWide || high !== scopeHigh)) {
+          canvas.width = wide; canvas.height = high;
+          scopeWide = wide; scopeHigh = high;
+        }
+      }
+    }
+    if (!scopeSeen) return;
     var player = soundingPlayer();
     var ctx2d = null;
     try { ctx2d = canvas.getContext('2d'); } catch (err) { return; }
     if (!ctx2d) return;
-    var dpr = root.devicePixelRatio || 1;
-    var wide = Math.round(canvas.clientWidth * dpr);
-    var high = Math.round(canvas.clientHeight * dpr);
-    /* #745 again: writing canvas.width resets the whole 2D context, so
-       it is measured and compared, never assigned every frame. */
-    if (wide && high && (wide !== scopeWide || high !== scopeHigh)) {
-      canvas.width = wide; canvas.height = high;
-      scopeWide = wide; scopeHigh = high;
-    }
     if (!scopeWide || !scopeHigh) return;
     ctx2d.clearRect(0, 0, scopeWide, scopeHigh);
     var scope = null;
@@ -399,6 +529,1478 @@
    * never be silent about whether the air took it. */
   var reelTurn = 0;
 
+  /* ---- #1385: the endless set ----------------------------------- */
+  var loopOn = false;
+
+  function loopPaint(btn) {
+    if (!btn) return;
+    btn.classList.toggle('on', !!loopOn);
+    btn.title = loopOn
+      ? 'Endless video is ON - tap to stop after the clip on the tube'
+      : 'Endless video: the SFX guy plays clips one after another, at random';
+  }
+
+  function loopRead(btn) {
+    if (!api() || !api().get) return;
+    Promise.resolve(api().get('/api/sfx/video/mode')).then(function (got) {
+      loopOn = !!(got && got.on);
+      loopPaint(btn);
+    }, function () { /* asked again next time */ });
+  }
+
+  function loopToggle(btn) {
+    if (!api() || !api().post) return;
+    var want = !loopOn;
+    loopOn = want;
+    loopPaint(btn);
+    Promise.resolve(api().post('/api/sfx/video/mode', {on: want})).then(function (got) {
+      loopOn = !!(got && got.on !== undefined ? got.on : want);
+      loopPaint(btn);
+      say(loopOn ? 'endless video is on - one clip after another'
+                 : 'endless video is off - back to the dial');
+    }, function (err) {
+      loopOn = !want;
+      loopPaint(btn);
+      say('the station did not answer: ' + String((err && err.message) || err).slice(0, 60));
+    });
+  }
+
+  /* ---- 2026-09-14: the folder sheet ------------------------------ */
+
+  /* WHERE THE CLIPS COME FROM, ON A HOLD OF THE VIDEO BUTTON.
+   *
+   * "If I tap and hold on this button, show a dialogue window that
+   *  allows me to specify what folder out of all the folders in the
+   *  SFX collection clips are being taken out of for the next hour. At
+   *  the top of the window, offer a slider for how many hours we're
+   *  sticking with the same folder ... scan all the folders and list
+   *  all of the folders, allowing me to expand it with a tri and
+   *  preview any of the clips inside of it just to see what the folder
+   *  contains. And then I want to be able to check a folder and
+   *  basically have that folder and subfolders possibly be the active
+   *  folder that all clips are used from by the SFX guy for the next
+   *  hour or hours. Also the same thing for videos ... endless video
+   *  ... that is the same folder that they'll refer to."
+   *
+   * The station keeps the pin: GET /api/sfx/folders lists every folder
+   * of the collection, sorted by path, each with its counts and a
+   * handful of samples, plus the pin in force; POST /api/sfx/folder-pin
+   * sets one (its subfolders included) for so many hours, or clears
+   * it. The SFX guy - the random sting, the cue button and the endless
+   * set alike - draws from the pinned folder until the pin runs out.
+   * This sheet only draws what the station said and posts what the
+   * operator chose; nothing about the choice lives in the page, so the
+   * tablet and the desk always show the same pin.
+   *
+   * THE HOLD. A short tap still cues a video exactly as before - the
+   * operator taps that button rapid fire and every tap must count
+   * (#1311b). The sheet opens on a hold of half a second with the
+   * finger still (eight pixels of travel is a scroll, not a hold), or
+   * on a right-click at the desk. The click the platform fires after a
+   * hold is swallowed, once, so the sheet never opens with a clip cued
+   * underneath it; the next pointerdown starts a fresh gesture. The
+   * same hold (holdOpen) serves the caution button and the report icon
+   * below: the held flag rides the button, and the click handler of
+   * each checks it first.
+   *
+   * THE PREVIEWS. A folder's samples are built when its caret opens
+   * and torn down when it closes, and one folder is open at a time -
+   * six media elements at most on a tablet whose WebView has gone deaf
+   * under far less. Media is released (paused, src dropped, load()),
+   * not merely detached: a detached <video> can hold its decoder. */
+  var FOLDER_HOLD_MS = 500;
+  var FOLDER_HOLD_PX = 8;
+  var FOLDER_CAP = 300;             /* rows drawn at once; filter for the rest */
+  var FOLDER_SAMPLES = 6;           /* previews per open folder */
+  var folderData = null;            /* the station's last answer */
+  var folderPin = null;             /* the pin in force, as last told */
+  var folderSayTimer = 0;
+
+  function holdOpen(btn, open) {
+    var timer = 0, x0 = 0, y0 = 0;
+    function cancel() { if (timer) clearTimeout(timer); timer = 0; }
+    btn.addEventListener('pointerdown', function (ev) {
+      btn.pineHeld = false;         /* a new gesture; the last hold is spent */
+      if (ev.button !== undefined && ev.button !== 0) return;   /* the right button has its own road below */
+      cancel();
+      x0 = ev.clientX; y0 = ev.clientY;
+      timer = setTimeout(function () {
+        timer = 0;
+        btn.pineHeld = true;
+        open();
+      }, FOLDER_HOLD_MS);
+    });
+    btn.addEventListener('pointermove', function (ev) {
+      if (!timer) return;
+      if (Math.abs(ev.clientX - x0) > FOLDER_HOLD_PX || Math.abs(ev.clientY - y0) > FOLDER_HOLD_PX) cancel();
+    });
+    btn.addEventListener('pointerup', cancel);
+    btn.addEventListener('pointercancel', cancel);
+    btn.addEventListener('pointerleave', cancel);
+    /* The desk's right-click, and the tablet's own long-press menu,
+       which the WebView raises at about the same half second: either
+       way the sheet is the answer and the platform's menu is not. */
+    btn.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      cancel();
+      if (btn.pineHeld) return;     /* the hold got there first */
+      btn.pineHeld = true;
+      open();
+    });
+  }
+
+  function folderClose() {
+    var old = el('spFolderSheet');
+    if (!old) return;
+    folderMediaDrop(old);
+    old.remove();
+  }
+
+  function folderMediaDrop(node) {
+    var media = node.querySelectorAll('audio, video');
+    for (var i = 0; i < media.length; i += 1) {
+      try { media[i].pause(); media[i].removeAttribute('src'); media[i].load(); } catch (err) { /* already gone */ }
+    }
+  }
+
+  /* The set's rule (#1399): served by the station - the kiosk's
+     loopback door, or any http page - the path is already right; at
+     the desk, in a file: page, the chrome knows the station's base and
+     the loopback is the same fallback the set uses. */
+  function stationUrl(u) {
+    u = String(u || '');
+    if (!u || /^https?:\/\//.test(u)) return u;
+    var proto = '';
+    try { proto = String(root.location && root.location.protocol); } catch (err) { proto = ''; }
+    if (/^https?:$/.test(proto)) return u;
+    var b = '';
+    try { b = root.pineStationBase ? String(root.pineStationBase() || '') : ''; } catch (err) { b = ''; }
+    return (b || 'http://127.0.0.1:8096').replace(/\/$/, '') + u;
+  }
+
+  function folderIcon(name, label) {
+    var out = '';
+    try { if (typeof root.pineIcon === 'function') out = root.pineIcon(name, label); } catch (err) { out = ''; }
+    return out || '';
+  }
+
+  function folderNum(n) {
+    n = Number(n) || 0;
+    try { return n.toLocaleString('en-US'); } catch (err) { return String(n); }
+  }
+
+  function folderLen(s) {
+    s = Math.max(0, Math.round(Number(s) || 0));
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    return (h ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (r < 10 ? '0' : '') + r;
+  }
+
+  function folderLeft(pin) {
+    var mins = 0;
+    if (pin && typeof pin.hours_left === 'number') mins = pin.hours_left * 60;
+    else if (pin && pin.until) mins = (Number(pin.until) * 1000 - (Date.now() + skewMs)) / 60000;
+    mins = Math.max(0, Math.round(mins));
+    if (mins < 90) return mins + ' min';
+    var h = Math.floor(mins / 60), m = mins % 60;
+    return h + ' h' + (m ? ' ' + m + ' min' : '');
+  }
+
+  function folderHoursLabel(n) {
+    n = Number(n) || 1;
+    return 'for the next ' + (n === 1 ? 'hour' : n + ' hours');
+  }
+
+  function folderOpen() {
+    if (!api() || !api().get) return;
+    folderClose();
+    var back = make('div', 'sp-find-back sp-folder-back');
+    back.id = 'spFolderSheet';
+    var box = make('div', 'sp-find-box sp-folder-box');
+    var head = make('div', 'sp-find-head');
+    head.appendChild(make('b', null, 'Where the clips come from'));
+    var x = make('button', 'sp-find-x', '\u00d7');
+    x.type = 'button';
+    x.setAttribute('aria-label', 'Close');
+    x.addEventListener('click', folderClose);
+    head.appendChild(x);
+    box.appendChild(head);
+    var sayLine = make('div', 'sp-folder-say', '');
+    sayLine.id = 'spFolderSay';
+    sayLine.hidden = true;
+    box.appendChild(sayLine);
+
+    /* The top: how long a pin holds, what is pinned now, a way out of
+       it, and a filter for a collection with hundreds of folders. */
+    var top = make('div', 'sp-folder-top');
+    var hoursRow = make('label', 'sp-folder-hours-row');
+    var hoursLabel = make('span', 'sp-folder-hours-label', folderHoursLabel(1));
+    var hours = make('input', 'sp-folder-hours');
+    hours.type = 'range'; hours.min = '1'; hours.max = '12'; hours.step = '1'; hours.value = '1';
+    hours.id = 'spFolderHours';
+    hours.setAttribute('aria-label', 'How many hours a pinned folder holds');
+    hours.addEventListener('input', function () { hoursLabel.textContent = folderHoursLabel(hours.value); });
+    hoursRow.appendChild(hoursLabel);
+    hoursRow.appendChild(hours);
+    top.appendChild(hoursRow);
+    var pinRow = make('div', 'sp-folder-pin-row');
+    var pinLine = make('div', 'sp-folder-pin', 'asking the station\u2026');
+    pinLine.id = 'spFolderPin';
+    pinRow.appendChild(pinLine);
+    var clear = make('button', 'sp-folder-clear', 'Clear the pin');
+    clear.type = 'button';
+    clear.id = 'spFolderClear';
+    clear.hidden = true;
+    clear.addEventListener('click', function () { folderPost({clear: true, path: ''}); });
+    pinRow.appendChild(clear);
+    top.appendChild(pinRow);
+    var filter = make('input', 'sp-folder-filter');
+    filter.type = 'search';
+    filter.id = 'spFolderFilter';
+    filter.placeholder = 'filter folders by name';
+    filter.setAttribute('aria-label', 'Filter folders by name');
+    var filterTimer = 0;
+    filter.addEventListener('input', function () {
+      if (filterTimer) clearTimeout(filterTimer);
+      filterTimer = setTimeout(function () { filterTimer = 0; folderPaint(); }, 150);
+    });
+    top.appendChild(filter);
+    box.appendChild(top);
+
+    var list = make('div', 'sp-folder-list');
+    list.id = 'spFolderList';
+    list.appendChild(make('div', 'sp-folder-note', 'scanning the collection\u2026'));
+    box.appendChild(list);
+    back.appendChild(box);
+    back.addEventListener('click', function (ev) { if (ev.target === back) folderClose(); });
+    document.body.appendChild(back);
+
+    Promise.resolve(api().get('/api/sfx/folders')).then(function (d) {
+      if (!el('spFolderSheet')) return;       /* closed before the answer */
+      if (!d || d.ok === false) {
+        folderData = null;
+        list.textContent = '';
+        list.appendChild(make('div', 'sp-folder-note', 'the station did not answer: ' + String((d && d.say) || 'no folders').slice(0, 120)));
+        folderPinPaint(null);
+        return;
+      }
+      folderData = d;
+      folderPinPaint(d.pin || null);
+      folderPaint();
+    }, function (err) {
+      if (!el('spFolderSheet')) return;
+      list.textContent = '';
+      list.appendChild(make('div', 'sp-folder-note', 'the station did not answer: ' + String((err && err.message) || err).slice(0, 80)));
+    });
+  }
+
+  function folderPinPaint(pin) {
+    folderPin = pin && pin.path ? pin : null;
+    var line = el('spFolderPin'), clear = el('spFolderClear');
+    if (line) {
+      line.textContent = folderPin
+        ? 'all clips come from ' + (folderPin.name || folderPin.path) + ' for another ' + folderLeft(folderPin)
+          + (folderPin.subfolders === false ? '' : ' (subfolders too)')
+        : 'every folder - no pin';
+      line.classList.toggle('on', !!folderPin);
+    }
+    if (clear) clear.hidden = !folderPin;
+    /* The check marks, without redrawing the list: an open folder
+       stays open with its previews. */
+    var list = el('spFolderList');
+    if (!list) return;
+    var rows = list.querySelectorAll('.sp-folder-row');
+    for (var i = 0; i < rows.length; i += 1) folderCheckPaint(rows[i]);
+  }
+
+  function folderCheckPaint(row) {
+    var path = row.pineFolderPath || '';
+    var check = row.querySelector('.sp-folder-check');
+    if (!check) return;
+    var exact = !!(folderPin && folderPin.path === path);
+    var under = !exact && !!(folderPin && folderPin.subfolders !== false && path.indexOf(folderPin.path + '/') === 0);
+    var hours = el('spFolderHours');
+    check.innerHTML = folderIcon(exact ? 'c:checkbox--checked' : 'c:checkbox', exact ? 'Pinned - tap to clear' : 'Pin this folder');
+    if (!check.innerHTML) check.textContent = exact ? '[x]' : '[ ]';
+    check.setAttribute('aria-pressed', exact ? 'true' : 'false');
+    check.title = exact ? 'Pinned - tap to clear the pin'
+      : under ? 'Inside the pinned folder - tap to pin this one instead'
+      : 'Pin this folder ' + folderHoursLabel(hours && hours.value);
+    row.classList.toggle('pinned', exact);
+    row.classList.toggle('under', under);
+  }
+
+  function folderPaint() {
+    var list = el('spFolderList');
+    if (!list || !folderData) return;
+    folderMediaDrop(list);
+    list.textContent = '';
+    var all = folderData.folders || [];
+    var filter = el('spFolderFilter');
+    var q = filter ? String(filter.value || '').trim().toLowerCase() : '';
+    /* Depth is the count of "/" beyond the shallowest folder listed. */
+    var base = -1, i, f, slashes;
+    for (i = 0; i < all.length; i += 1) {
+      slashes = String(all[i].path || '').split('/').length;
+      if (base < 0 || slashes < base) base = slashes;
+    }
+    var shown = 0, matched = 0;
+    for (i = 0; i < all.length; i += 1) {
+      f = all[i] || {};
+      var path = String(f.path || '');
+      var name = String(f.name || path);
+      if (q && name.toLowerCase().indexOf(q) < 0 && path.toLowerCase().indexOf(q) < 0) continue;
+      matched += 1;
+      if (shown >= FOLDER_CAP) continue;
+      shown += 1;
+      /* Sorted by path, so a folder with children is followed by one. */
+      var hasKids = (i + 1 < all.length) && String(all[i + 1].path || '').indexOf(path + '/') === 0;
+      list.appendChild(folderRow(f, path.split('/').length - base, hasKids));
+    }
+    if (!all.length) list.appendChild(make('div', 'sp-folder-note', 'the station listed no folders'));
+    else if (!matched) list.appendChild(make('div', 'sp-folder-note', 'no folder is named like that'));
+    else if (matched > shown) list.appendChild(make('div', 'sp-folder-note', 'showing ' + folderNum(shown) + ' of ' + folderNum(matched) + ' folders - filter by name for the rest'));
+  }
+
+  function folderRow(f, depth, hasKids) {
+    var row = make('div', 'sp-folder-row');
+    row.pineFolderPath = String(f.path || '');
+    row.pineDepth = depth;
+    var line = make('div', 'sp-folder-line');
+    line.style.paddingLeft = (6 + depth * 18) + 'px';
+    var samples = f.samples || [];
+    var tri = make('button', 'sp-folder-tri', '');
+    tri.type = 'button';
+    tri.setAttribute('aria-expanded', 'false');
+    tri.innerHTML = folderIcon('c:caret--right', 'Show what is inside');
+    if (!tri.innerHTML) tri.textContent = '>';
+    if (!samples.length) {
+      tri.disabled = true;
+      tri.title = 'nothing to preview';
+    } else {
+      tri.title = 'Preview a few clips from this folder';
+      tri.addEventListener('click', function (ev) { ev.stopPropagation(); folderToggle(row, samples); });
+    }
+    /* The box pins the folder for the slider's hours; on the folder
+       already pinned it clears the pin, so one row is the whole switch. */
+    var check = make('button', 'sp-folder-check', '');
+    check.type = 'button';
+    check.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var hours = el('spFolderHours');
+      if (folderPin && folderPin.path === row.pineFolderPath) folderPost({clear: true, path: ''});
+      else folderPost({path: row.pineFolderPath, hours: Math.min(12, Math.max(1, Number(hours && hours.value) || 1))});
+    });
+    var ico = make('span', 'sp-folder-ico', '');
+    ico.innerHTML = folderIcon(hasKids ? 'c:folders' : 'c:folder', '');
+    var name = make('span', 'sp-folder-name', String(f.name || f.path || ''));
+    name.title = String(f.path || '');
+    if (samples.length) name.addEventListener('click', function () { folderToggle(row, samples); });
+    var bits = [];
+    if (f.audio) bits.push(folderNum(f.audio) + (Number(f.audio) === 1 ? ' sound' : ' sounds'));
+    if (f.video) bits.push(folderNum(f.video) + (Number(f.video) === 1 ? ' video' : ' videos'));
+    var n = make('span', 'sp-folder-n', bits.join(' \u00b7 ') || 'empty');
+    line.appendChild(tri);
+    line.appendChild(check);
+    line.appendChild(ico);
+    line.appendChild(name);
+    line.appendChild(n);
+    row.appendChild(line);
+    folderCheckPaint(row);
+    return row;
+  }
+
+  function folderToggle(row, samples) {
+    var tri = row.querySelector('.sp-folder-tri');
+    var panel = row.querySelector('.sp-folder-samples');
+    if (row.classList.contains('open')) {
+      if (panel) { folderMediaDrop(panel); panel.remove(); }
+      row.classList.remove('open');
+      if (tri) tri.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    /* One folder open at a time: however many the operator looks
+       into, the page holds one folder's previews. */
+    var list = el('spFolderList');
+    if (list) {
+      var opened = list.querySelectorAll('.sp-folder-row.open');
+      for (var i = 0; i < opened.length; i += 1) folderToggle(opened[i], []);
+    }
+    panel = make('div', 'sp-folder-samples');
+    panel.style.paddingLeft = (52 + (row.pineDepth || 0) * 18) + 'px';
+    for (var j = 0; j < samples.length && j < FOLDER_SAMPLES; j += 1) panel.appendChild(folderSample(samples[j]));
+    row.appendChild(panel);
+    row.classList.add('open');
+    if (tri) tri.setAttribute('aria-expanded', 'true');
+  }
+
+  function folderSample(s) {
+    s = s || {};
+    var item = make('div', 'sp-folder-sample');
+    var top = make('div', 'sp-folder-sample-line');
+    var kind = make('span', 'sp-folder-kind', '');
+    if (s.video) kind.textContent = 'video';
+    else {
+      kind.innerHTML = folderIcon('c:music', 'sound');
+      if (!kind.innerHTML) kind.textContent = 'sound';
+    }
+    top.appendChild(kind);
+    top.appendChild(make('span', 'sp-folder-sample-name', String(s.name || s.id || '')));
+    var len = make('span', 'sp-folder-sample-len', '');
+    len.innerHTML = folderIcon('c:time', '');
+    len.appendChild(document.createTextNode(folderLen(s.seconds)));
+    top.appendChild(len);
+    item.appendChild(top);
+    var media;
+    if (s.video) {
+      media = document.createElement('video');
+      media.setAttribute('playsinline', '');
+      media.muted = true;
+      media.setAttribute('muted', '');
+      media.style.maxHeight = '120px';
+    } else {
+      media = document.createElement('audio');
+    }
+    media.controls = true;
+    media.preload = 'none';
+    media.className = 'sp-folder-media';
+    media.src = stationUrl(s.url);
+    item.appendChild(media);
+    return item;
+  }
+
+  function folderPost(body) {
+    if (!api() || !api().post) { folderSay('no bridge to the station'); return; }
+    folderSay('asking the station\u2026', true);
+    Promise.resolve(api().post('/api/sfx/folder-pin', body)).then(function (got) {
+      if (!el('spFolderSheet')) return;
+      if (!got || got.ok === false) { folderSay(String((got && got.say) || 'the station refused')); return; }
+      folderPinPaint(got.pin || null);
+      folderSay(String(got.say || (got.pin && got.pin.path ? 'pinned ' + (got.pin.name || got.pin.path) : 'the pin is cleared')));
+    }, function (err) {
+      folderSay('the station did not answer: ' + String((err && err.message) || err).slice(0, 80));
+    });
+  }
+
+  /* `say` from the station, under the header, for four seconds. */
+  function folderSay(text, hold) {
+    var line = el('spFolderSay');
+    if (!line) return;
+    if (folderSayTimer) clearTimeout(folderSayTimer);
+    folderSayTimer = 0;
+    line.textContent = String(text || '');
+    line.hidden = !line.textContent;
+    if (!hold) folderSayTimer = setTimeout(function () { folderSayTimer = 0; line.hidden = true; }, 4000);
+  }
+
+  /* ---- 2026-09-14: the reason sheet and the inbox sheet ------------ */
+
+  /* One shell for every sheet this page opens over the view: the
+     backdrop that closes on a tap beside the box, the box, the header
+     with its title and its x, and a line under the header for what the
+     station said (four seconds, unless held). The word search drew the
+     first one and the folder sheet above wears the same classes; the
+     two sheets below are built from this. */
+  function sheetShell(id, cls, title) {
+    var old = el(id);
+    if (old) old.remove();
+    var back = make('div', 'sp-find-back ' + cls + '-back');
+    back.id = id;
+    /* 2026-09-14: "if I'm interacting with one of the systems that's a
+       diagnostic, then duck the broadcast audio" - the reason sheet and
+       the inbox are; the SFX folder sheet is a preference and is not. */
+    if (root.PineDuck && (id === 'spReasonSheet' || id === 'spInboxSheet')) {
+      root.PineDuck.hold('sp-' + id, root.PineDuck.REPORT, back);
+    }
+    var box = make('div', 'sp-find-box ' + cls + '-box');
+    var head = make('div', 'sp-find-head');
+    head.appendChild(make('b', null, title));
+    var x = make('button', 'sp-find-x', '\u00d7');
+    x.type = 'button';
+    x.setAttribute('aria-label', 'Close');
+    head.appendChild(x);
+    box.appendChild(head);
+    var sayLine = make('div', 'sp-sheet-say', '');
+    sayLine.hidden = true;
+    box.appendChild(sayLine);
+    back.appendChild(box);
+    document.body.appendChild(back);
+    function close() { var n = el(id); if (n) n.remove(); }
+    x.addEventListener('click', close);
+    back.addEventListener('click', function (ev) { if (ev.target === back) close(); });
+    var sayTimer = 0;
+    return {
+      back: back, box: box, head: head, x: x, close: close,
+      say: function (text, hold) {
+        if (sayTimer) clearTimeout(sayTimer);
+        sayTimer = 0;
+        sayLine.textContent = String(text || '');
+        sayLine.hidden = !sayLine.textContent;
+        if (!hold && sayLine.textContent) {
+          sayTimer = setTimeout(function () { sayTimer = 0; sayLine.hidden = true; }, 4000);
+        }
+      }
+    };
+  }
+
+  /* A. WHY ARE YOU FILING THIS?  A hold (or a right-click) on the
+   * caution button. A short tap still files the report on the spot,
+   * as it did; the hold first asks what the operator saw, in the
+   * operator's own list of complaints, with a place to write or say
+   * more. The choices toggle and several may be on; the sentence they
+   * make ("The lines are out of order; This is not sequential; custom:
+   * ...") rides the same report road as `reason`, and the station
+   * leads the inbox summary with it. Dictation borrows the dot's ear
+   * (PineTalkDot.captureNext): the dot shows that it is listening, the
+   * words land in the box, and a surface without a microphone says so
+   * rather than pretending. */
+  var REASON_CHOICES = [
+    'This was unnatural',
+    'Why was the script this way?',
+    'This didn\'t flow correctly',
+    'The lines are out of order',
+    'Why did this jump like this?',
+    'This is not sequential'
+  ];
+
+  function reasonClose() { var n = el('spReasonSheet'); if (n) n.remove(); }
+
+  function reasonOpen(btn) {
+    var sheet = sheetShell('spReasonSheet', 'sp-reason', 'Why are you filing this?');
+    var list = make('div', 'sp-reason-list');
+    function choice(text) {
+      var b = make('button', 'sp-reason-choice', '');
+      b.type = 'button';
+      b.pineText = text;
+      var mark = make('span', 'sp-reason-mark', '');
+      b.appendChild(mark);
+      b.appendChild(make('span', 'sp-reason-text', text));
+      function paint(on) {
+        mark.innerHTML = folderIcon(on ? 'c:checkbox--checked' : 'c:checkbox', '');
+        if (!mark.innerHTML) mark.textContent = on ? '[x]' : '[ ]';
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        b.classList.toggle('on', on);
+      }
+      paint(false);
+      b.addEventListener('click', function () { paint(b.getAttribute('aria-pressed') !== 'true'); });
+      return b;
+    }
+    for (var i = 0; i < REASON_CHOICES.length; i += 1) list.appendChild(choice(REASON_CHOICES[i]));
+
+    /* Custom: a row like the others, which reveals the writing box. */
+    var custom = choice('Custom');
+    var customBox = make('div', 'sp-reason-custom');
+    customBox.hidden = true;
+    var ta = make('textarea', 'sp-reason-ta', '');
+    ta.placeholder = 'in your own words';
+    ta.rows = 3;
+    ta.setAttribute('aria-label', 'Your own reason');
+    var dictate = make('button', 'sp-reason-dictate', '');
+    dictate.type = 'button';
+    dictate.innerHTML = folderIcon('c:microphone', '');
+    dictate.appendChild(document.createTextNode('Dictate'));
+    dictate.title = 'Say it: the dot lends its ear and the words land in the box';
+    dictate.addEventListener('click', function () {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') { sheet.say('no microphone on this surface'); return; }
+      try {
+        dot.captureNext(function (words) {
+          words = String(words || '').trim();
+          if (!words) { sheet.say('nothing was heard'); return; }
+          ta.value = (ta.value ? String(ta.value).replace(/\s+$/, '') + ' ' : '') + words;
+          sheet.say('heard: ' + words.slice(0, 80));
+        });
+        sheet.say('listening\u2026', true);
+      } catch (err) {
+        sheet.say('the dot could not listen: ' + String((err && err.message) || err).slice(0, 80));
+      }
+    });
+    customBox.appendChild(ta);
+    customBox.appendChild(dictate);
+    custom.addEventListener('click', function () {
+      customBox.hidden = custom.getAttribute('aria-pressed') !== 'true';
+      if (!customBox.hidden) { try { ta.focus(); } catch (err) { /* no focus on this surface */ } }
+    });
+    list.appendChild(custom);
+    list.appendChild(customBox);
+    sheet.box.appendChild(list);
+
+    var file = make('button', 'sp-reason-file', 'File the report');
+    file.type = 'button';
+    file.addEventListener('click', function () {
+      var parts = [];
+      var rows = list.querySelectorAll('.sp-reason-choice');
+      for (var j = 0; j < rows.length; j += 1) {
+        if (rows[j] === custom || rows[j].getAttribute('aria-pressed') !== 'true') continue;
+        parts.push(rows[j].pineText);
+      }
+      var own = String(ta.value || '').replace(/\s+/g, ' ').trim();
+      if (own && !customBox.hidden) parts.push('custom: ' + own);
+      if (!parts.length) { sheet.say('choose a reason, or write one'); return; }
+      sheet.close();
+      reportKind = 'caution';
+      try { reportFire(btn, parts.join('; ')); }
+      finally { setTimeout(function () { reportKind = 'report'; }, 100); }
+    });
+    sheet.box.appendChild(file);
+  }
+
+  /* B. THE PINE INBOX, ON A HOLD OF THE REPORT ICON. The requests the
+   * station holds (GET /api/pine-requests), newest first, one card
+   * each: the header, the first line, and under the caret the whole
+   * text - with the "### Station at the time" block folded away as
+   * debug information, every data/script_reports/script_*.md the text
+   * names folded under its own name and read from the station only
+   * when opened (GET /api/script-reports/<name>), and a pasted picture
+   * ([img:<name>]) shown from /api/pine-uploads/<name>. A card's x
+   * arms first and deletes on the second tap within three seconds:
+   * an inbox is not a place for a stray thumb to lose a report. The
+   * delete goes through the bridge's del() where it has one, else a
+   * DELETE with the station key the way talk-dot's serverKey() finds
+   * it - and says so when no key is reachable. */
+  function inboxClose() { var n = el('spInboxSheet'); if (n) n.remove(); }
+
+  function inboxOpen() {
+    if (!api() || !api().get) return;
+    var sheet = sheetShell('spInboxSheet', 'sp-inbox', 'The Pine inbox');
+    var again = make('button', 'sp-inbox-refresh', '');
+    again.type = 'button';
+    again.innerHTML = folderIcon('c:renew', 'Refresh');
+    if (!again.innerHTML) again.textContent = 'refresh';
+    again.title = 'Read the inbox again';
+    again.setAttribute('aria-label', 'Refresh the inbox');
+    sheet.head.insertBefore(again, sheet.x);
+    var list = make('div', 'sp-inbox-list');
+    sheet.box.appendChild(list);
+    again.addEventListener('click', function () { inboxLoad(sheet, list); });
+    inboxLoad(sheet, list);
+  }
+
+  /* Newest first: by id where the ids count, else by date. */
+  function inboxOrder(r) {
+    var n = Number(r && r.id);
+    if (r && String(r.id).trim() !== '' && isFinite(n)) return n;
+    var t = Date.parse(String((r && r.when) || ''));
+    return isFinite(t) ? t / 1000 : 0;
+  }
+
+  function inboxLoad(sheet, list) {
+    list.textContent = '';
+    list.appendChild(make('div', 'sp-folder-note', 'reading the inbox\u2026'));
+    Promise.resolve(api().get('/api/pine-requests')).then(function (d) {
+      if (!el('spInboxSheet')) return;
+      list.textContent = '';
+      var rows = ((d && d.requests) || []).slice();
+      if (!rows.length) { list.appendChild(make('div', 'sp-folder-note', 'Inbox empty')); return; }
+      rows.sort(function (a, b) { return inboxOrder(b) - inboxOrder(a); });
+      for (var i = 0; i < rows.length; i += 1) list.appendChild(inboxCard(sheet, list, rows[i]));
+    }, function (err) {
+      if (!el('spInboxSheet')) return;
+      list.textContent = '';
+      list.appendChild(make('div', 'sp-folder-note', 'the station did not answer: ' + String((err && err.message) || err).slice(0, 80)));
+    });
+  }
+
+  function inboxFirstLine(text) {
+    var lines = String(text || '').split('\n');
+    for (var i = 0; i < lines.length; i += 1) {
+      var t = lines[i].replace(/^#+\s*/, '').trim();
+      if (t) return t.length > 140 ? t.slice(0, 139) + '\u2026' : t;
+    }
+    return '(empty)';
+  }
+
+  function inboxCard(sheet, list, r) {
+    var card = make('div', 'sp-inbox-card');
+    var id = String((r && r.id) || '');
+    var text = String((r && r.text) || '');
+    card.pineReports = {};                 /* name -> text, read once */
+    /* #1140: the card carries its own id and text, so a kept picture can
+       re-render it from the station's `edited` row (inboxRepaint). */
+    card.pineId = id;
+    card.pineText = text;
+    var line = make('div', 'sp-inbox-line');
+    var tri = make('button', 'sp-folder-tri sp-inbox-tri', '');
+    tri.type = 'button';
+    tri.setAttribute('aria-expanded', 'false');
+    tri.innerHTML = folderIcon('c:caret--right', 'Open');
+    if (!tri.innerHTML) tri.textContent = '>';
+    var main = make('div', 'sp-inbox-main');
+    var head = make('b', 'sp-inbox-head', '#' + id + ' \u00b7 ' + String((r && r.when) || ''));
+    if (r && r.status) head.appendChild(make('span', 'sp-inbox-status', ' \u00b7 ' + String(r.status)));
+    main.appendChild(head);
+    main.appendChild(make('span', 'sp-inbox-first', inboxFirstLine(text)));
+    function toggle() {
+      var open = card.classList.contains('open');
+      var body = card.querySelector('.sp-inbox-body');
+      if (open) {
+        if (body) body.remove();
+        card.classList.remove('open');
+        tri.setAttribute('aria-expanded', 'false');
+        return;
+      }
+      card.appendChild(inboxBody(card, card.pineText));
+      card.classList.add('open');
+      tri.setAttribute('aria-expanded', 'true');
+    }
+    tri.addEventListener('click', function (ev) { ev.stopPropagation(); toggle(); });
+    main.addEventListener('click', toggle);
+
+    var x = make('button', 'sp-inbox-x', '\u00d7');
+    x.type = 'button';
+    x.title = 'Delete this request (tap twice)';
+    x.setAttribute('aria-label', 'Delete request ' + id);
+    var armTimer = 0;
+    x.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (!x.classList.contains('armed')) {
+        x.classList.add('armed');
+        sheet.say('tap again to delete #' + id);
+        armTimer = setTimeout(function () { armTimer = 0; x.classList.remove('armed'); }, 3000);
+        return;
+      }
+      if (armTimer) clearTimeout(armTimer);
+      armTimer = 0;
+      x.classList.remove('armed');
+      x.disabled = true;
+      inboxDelete(id).then(function (got) {
+        if (got && got.ok === false) { x.disabled = false; sheet.say(String(got.say || 'the station refused')); return; }
+        card.remove();
+        sheet.say('#' + id + ' deleted');
+        if (!list.querySelector('.sp-inbox-card')) list.appendChild(make('div', 'sp-folder-note', 'Inbox empty'));
+      }, function (err) {
+        x.disabled = false;
+        sheet.say('not deleted: ' + String((err && err.message) || err).slice(0, 80));
+      });
+    });
+    line.appendChild(tri);
+    line.appendChild(main);
+    line.appendChild(x);
+    card.appendChild(line);
+    return card;
+  }
+
+  /* The "### Station at the time" block, from that heading to the next
+     heading of its level or shallower (deeper ones are its own). */
+  function inboxSplit(text) {
+    var at = text.indexOf('### Station at the time');
+    if (at < 0) return {main: text, debug: ''};
+    var rest = text.slice(at);
+    var next = rest.search(/\n#{1,3} /);
+    if (next < 0) return {main: text.slice(0, at), debug: rest};
+    return {main: text.slice(0, at) + rest.slice(next + 1), debug: rest.slice(0, next)};
+  }
+
+  function inboxReportNames(text) {
+    var re = /data\/script_reports\/(script_[\w.-]+\.md)/g, m, seen = {}, out = [];
+    while ((m = re.exec(text))) {
+      if (!seen[m[1]]) { seen[m[1]] = true; out.push(m[1]); }
+    }
+    return out;
+  }
+
+  /* Text as <pre> that wraps; a [img:<name>] token becomes the picture.
+   *
+   * #1140: "When following reports allow me to tap the image to full
+   * screen it and basically use my finger as a cursor to draw on it in
+   * red and then go back." A tap on the picture opens the hot corners'
+   * red-ink annotator (PineHotCorners.annotate) full screen on THAT
+   * picture, with Undo / Clear / Back / Keep. Back changes nothing; Keep
+   * PUTs the drawn-on copy to the station (inboxKeep), which saves it as
+   * a new upload, rewrites the card's [img:] token to it, and answers the
+   * edited row - the card is repainted from that. */
+  function inboxRender(into, text, card) {
+    var re = /\[img:([^\]\s]+)\]/g, last = 0, m;
+    while ((m = re.exec(text))) {
+      if (m.index > last) into.appendChild(make('pre', 'sp-inbox-pre', text.slice(last, m.index)));
+      var img = document.createElement('img');
+      img.className = 'sp-inbox-img';
+      img.alt = m[1];
+      img.loading = 'lazy';
+      img.src = stationUrl('/api/pine-uploads/' + encodeURIComponent(m[1]));
+      if (card) inboxInk(img, m[1], card);
+      into.appendChild(img);
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) into.appendChild(make('pre', 'sp-inbox-pre', text.slice(last)));
+  }
+
+  function inboxInk(img, name, card) {
+    img.title = 'Tap to draw on this picture';
+    img.style.cursor = 'zoom-in';
+    img.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var hc = root.PineHotCorners;
+      if (!hc || typeof hc.annotate !== 'function') {
+        inboxSay('the annotator is not loaded on this surface');
+        return;
+      }
+      hc.annotate('/api/pine-uploads/' + encodeURIComponent(name), {
+        fileLabel: 'Keep', fileIcon: 'c:save', busyLabel: 'keeping…',
+        backLabel: 'Back', cancelSay: 'nothing changed',
+        note: 'draw on the picture in red, then Keep it - or go Back',
+        onDone: function (png) {
+          return inboxKeep(card.pineId, png, name).then(function (got) {
+            if (!got || got.ok === false) throw new Error(String((got && (got.say || got.detail)) || 'the station refused'));
+            inboxRepaint(card, got, img);
+            inboxSay('picture kept');
+          });
+        }
+      });
+    });
+  }
+
+  /* The inbox sheet's own say-line (sheetShell's .sp-sheet-say), for a
+     word after the annotator has closed. Nothing if the sheet is gone. */
+  function inboxSay(words) {
+    var sheet = el('spInboxSheet');
+    var say = sheet && sheet.querySelector('.sp-sheet-say');
+    if (!say) return;
+    words = String(words || '');
+    say.textContent = words;
+    say.hidden = !words;
+    if (words) setTimeout(function () { if (say.textContent === words) say.hidden = true; }, 4000);
+  }
+
+  /* After Keep: the <img> in the card goes to the new upload and the
+     card's text is re-rendered from the station's `edited` row - the
+     [img:] token now names the drawn-on copy. */
+  function inboxRepaint(card, got, img) {
+    var edited = (got && got.edited) || {};
+    var url = String((got && got.url) || '');
+    if (url && img) img.src = stationUrl(url) + (url.indexOf('?') < 0 ? '?v=' + Date.now() : '');
+    if (edited && typeof edited.text === 'string') {
+      card.pineText = String(edited.text);
+      var first = card.querySelector('.sp-inbox-first');
+      if (first) first.textContent = inboxFirstLine(card.pineText);
+      var body = card.querySelector('.sp-inbox-body');
+      if (body) {
+        body.remove();
+        card.appendChild(inboxBody(card, card.pineText));
+      }
+    }
+  }
+
+  function inboxBody(card, text) {
+    var body = make('div', 'sp-inbox-body');
+    var cut = inboxSplit(text);
+    inboxRender(body, cut.main, card);
+    if (cut.debug) {
+      var dbg = make('details', 'sp-inbox-details');
+      dbg.appendChild(make('summary', null, 'debug information'));
+      dbg.appendChild(make('pre', 'sp-inbox-pre', cut.debug));
+      body.appendChild(dbg);
+    }
+    var names = inboxReportNames(text);
+    for (var i = 0; i < names.length; i += 1) body.appendChild(inboxReport(card, names[i]));
+    return body;
+  }
+
+  function inboxReport(card, name) {
+    var d = make('details', 'sp-inbox-details sp-inbox-report');
+    d.appendChild(make('summary', null, name));
+    var pre = make('pre', 'sp-inbox-pre', '');
+    d.appendChild(pre);
+    d.addEventListener('toggle', function () {
+      if (!d.open) return;
+      if (card.pineReports[name] !== undefined) { pre.textContent = card.pineReports[name]; return; }
+      if (d.pineAsking) return;
+      d.pineAsking = true;
+      pre.textContent = 'reading\u2026';
+      Promise.resolve(api().get('/api/script-reports/' + encodeURIComponent(name))).then(function (got) {
+        d.pineAsking = false;
+        var t = String((got && got.text) || (got && got.say) || '(empty)');
+        if (!got || got.status !== 'awaiting_post') card.pineReports[name] = t;
+        pre.textContent = t;
+      }, function (err) {
+        d.pineAsking = false;             /* asked again on the next open */
+        pre.textContent = 'not read: ' + String((err && err.message) || err).slice(0, 80);
+      });
+    });
+    return d;
+  }
+
+  /* The station key the way talk-dot's serverKey() finds it: the page's
+     SERVER_KEY, else the bridge's config. */
+  function inboxKey() {
+    try { if (typeof root.SERVER_KEY === 'string' && root.SERVER_KEY) return Promise.resolve(root.SERVER_KEY); }
+    catch (err) { /* no such global */ }
+    var bridge = api();
+    if (!bridge || typeof bridge.readConfig !== 'function') return Promise.resolve('');
+    return Promise.resolve(bridge.readConfig()).then(function (cfg) {
+      return String((cfg && (cfg.apiKey || cfg.api_key)) || '');
+    }, function () { return ''; });
+  }
+
+  function inboxDelete(id) {
+    var path = '/api/pine-requests/' + encodeURIComponent(id);
+    var bridge = api();
+    if (bridge && typeof bridge.del === 'function') return Promise.resolve(bridge.del(path));
+    if (typeof root.fetch !== 'function') return Promise.reject(new Error('no road to delete through'));
+    return inboxKey().then(function (key) {
+      if (!key) throw new Error('no station key reachable on this surface');
+      return root.fetch(stationUrl(path), {method: 'DELETE', headers: {Authorization: 'Bearer ' + key}}).then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json().then(null, function () { return {ok: true}; });
+      });
+    });
+  }
+
+  /* #1140: the drawn-on copy goes back to the station. PUT
+     /api/pine-requests/<id> with {image: <png data url>, replace: <the
+     tapped picture's file name>}; the station saves the image as a new
+     upload, rewrites the [img:] token, and answers {ok, edited, image,
+     url}. Through the bridge's put() where it has one (the Electron
+     preload and the kiosk both do), else a PUT with the station key the
+     way inboxDelete does. */
+  function inboxKeep(id, png, replaceName) {
+    var path = '/api/pine-requests/' + encodeURIComponent(id);
+    var body = {image: String(png || ''), replace: String(replaceName || '')};
+    var bridge = api();
+    if (bridge && typeof bridge.put === 'function') return Promise.resolve(bridge.put(path, body));
+    if (typeof root.fetch !== 'function') return Promise.reject(new Error('no road to keep it through'));
+    return inboxKey().then(function (key) {
+      if (!key) throw new Error('no station key reachable on this surface');
+      return root.fetch(stationUrl(path), {
+        method: 'PUT',
+        headers: {Authorization: 'Bearer ' + key, 'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+      }).then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      });
+    });
+  }
+
+  /* ---- #1385: the word search ------------------------------------ */
+
+  /* The station does the counting (/api/said/search, #1380); this only
+   * draws what it said. A sheet over the view, tap away to close, the
+   * same shape as the clip doctor's - the operator asked for it on the
+   * tablet, so every control is a thumb's size. */
+  function findClose() {
+    var old = el('spFindSheet');
+    if (old) old.remove();
+  }
+
+  function findOpen(q) {
+    q = String(q || '').trim();
+    if (q.length < 2 || !api() || !api().get) return;
+    findClose();
+    var back = make('div', 'sp-find-back');
+    back.id = 'spFindSheet';
+    var box = make('div', 'sp-find-box');
+    var head = make('div', 'sp-find-head');
+    head.appendChild(make('b', null, '\u201c' + q + '\u201d on the air'));
+    var x = make('button', 'sp-find-x', '\u00d7');
+    x.type = 'button';
+    x.addEventListener('click', findClose);
+    head.appendChild(x);
+    box.appendChild(head);
+    var why = make('div', 'sp-find-why', 'asking the station\u2026');
+    box.appendChild(why);
+    var facts = make('div', 'sp-find-facts');
+    box.appendChild(facts);
+    var list = make('div', 'sp-find-list');
+    box.appendChild(list);
+    back.appendChild(box);
+    back.addEventListener('click', function (ev) { if (ev.target === back) findClose(); });
+    document.body.appendChild(back);
+    Promise.resolve(api().get('/api/said/search?q=' + encodeURIComponent(q) + '&hours=48&limit=120')).then(function (d) {
+      if (!d) { why.textContent = 'the station did not answer'; return; }
+      why.textContent = d.why || d.say || '';
+      var bits = [String(d.total || 0) + ' airing(s) in ' + (d.hours || 48) + 'h, ' + String(d.distinct || 0) + ' distinct line(s)'];
+      (d.by_round || []).slice(0, 4).forEach(function (r) { bits.push(r.name + ' \u00d7' + r.n); });
+      (d.by_who || []).slice(0, 3).forEach(function (r) { bits.push(r.name + ' \u00d7' + r.n); });
+      facts.textContent = bits.join('  \u00b7  ');
+      var dated = d.rows || [];
+      /* #1117: a repeated row is a tally, not a line, so it has no id
+         of its own. It borrows the first dated row that says the same
+         words - the station's paperwork is per line, and any one of
+         the airings is the same line. */
+      function idFor(text) {
+        var want = findNorm(text);
+        if (!want) return '';
+        var i, have;
+        for (i = 0; i < dated.length; i += 1) {
+          if (dated[i] && dated[i].id && findNorm(dated[i].text) === want) return String(dated[i].id);
+        }
+        /* The tally may quote a cut of the line; a prefix either way
+           is still the same line. */
+        for (i = 0; i < dated.length; i += 1) {
+          have = dated[i] && dated[i].id ? findNorm(dated[i].text) : '';
+          if (have && (have.indexOf(want) === 0 || want.indexOf(have) === 0)) return String(dated[i].id);
+        }
+        return '';
+      }
+      (d.repeated || []).slice(0, 5).forEach(function (t) {
+        if (t.n < 2) return;
+        var row = make('div', 'sp-find-rep');
+        var line = make('div', 'sp-find-line');
+        line.appendChild(findTri(row, idFor(t.text)));               /* #1117 */
+        var main = make('span', 'sp-find-main');
+        main.appendChild(make('b', null, '\u00d7' + t.n + ' '));
+        main.appendChild(make('span', null, (t.who ? t.who + ': ' : '') + t.text));
+        line.appendChild(main);
+        row.appendChild(line);
+        list.appendChild(row);
+      });
+      dated.forEach(function (r) {
+        var row = make('div', 'sp-find-row');
+        var line = make('div', 'sp-find-line');
+        line.appendChild(findTri(row, r.id ? String(r.id) : ''));    /* #1117 */
+        var main = make('div', 'sp-find-main');
+        var ago = r.ago >= 3600 ? Math.round(r.ago / 3600) + 'h ago' : Math.round(r.ago / 60) + 'm ago';
+        main.appendChild(make('span', 'sp-find-when', ago + ' \u00b7 ' + (r.who || '?') + ' \u00b7 ' + (r.round || r.kind || '')));
+        main.appendChild(make('span', 'sp-find-text', r.text || ''));
+        line.appendChild(main);
+        row.appendChild(line);
+        list.appendChild(row);
+      });
+      if (!(d.rows || []).length) list.appendChild(make('div', 'sp-find-row', 'not said on the air in the last two days'));
+    }, function (err) {
+      why.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 80);
+    });
+  }
+
+  /* ---- #1117: the triangle at the front of every row ------------- */
+
+  /* "I want an expandable triangle at the beginning of all of these
+   *  that allows me to see what property set this and allow me to
+   *  change or manage those or adjust them in the system prompt or see
+   *  what systems contributed to making them the way that they are,
+   *  whatever I search for them."
+   *
+   * The station answers GET /api/said/why/{id} with three lists: what
+   * SET the line (only the properties in force), the per-road system
+   * prompt (saved back through POST /api/said/prompt, in force from
+   * the next round), and what contributed, on or off. This draws them
+   * under the row and nothing more. The answer is cached on the row
+   * node, so a second tap costs the station nothing. */
+  function findNorm(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  }
+
+  function findTri(row, id) {
+    var tri = make('button', 'sp-find-tri', '');
+    tri.type = 'button';
+    tri.setAttribute('aria-expanded', 'false');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        tri.innerHTML = root.pineIcon('c:caret--right', 'What set this line');
+      }
+    } catch (err) { /* the text below stands in */ }
+    if (!tri.innerHTML) tri.textContent = '>';
+    if (!id) {
+      tri.disabled = true;
+      tri.title = 'no line id to ask about';
+      return tri;
+    }
+    tri.title = 'What set this line, the system prompt for its road, and what contributed';
+    tri.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var open = tri.getAttribute('aria-expanded') === 'true';
+      tri.setAttribute('aria-expanded', open ? 'false' : 'true');
+      row.classList.toggle('open', !open);
+      var panel = row.querySelector('.sp-find-why-panel');
+      if (open) { if (panel) panel.hidden = true; return; }
+      if (!panel) {
+        panel = make('div', 'sp-find-why-panel', 'asking the station…');
+        row.appendChild(panel);
+      }
+      panel.hidden = false;
+      if (row.pineWhy || row.pineWhyAsking) return;   /* held, or in flight */
+      if (!api() || !api().get) { panel.textContent = 'no bridge to ask through'; return; }
+      row.pineWhyAsking = true;
+      Promise.resolve(api().get('/api/said/why/' + encodeURIComponent(id))).then(function (d) {
+        row.pineWhyAsking = false;
+        if (!d || d.ok === false) {
+          panel.textContent = 'the station did not answer'
+            + (d && d.say ? ': ' + String(d.say).slice(0, 120) : '');
+          return;
+        }
+        row.pineWhy = d;
+        findWhyPaint(panel, d);
+      }, function (err) {
+        row.pineWhyAsking = false;
+        panel.textContent = 'the station did not answer: '
+          + String((err && err.message) || err).slice(0, 80);
+      });
+    });
+    return tri;
+  }
+
+  function findWhyPaint(panel, d) {
+    panel.replaceChildren();
+    var i;
+
+    /* (1) what set this - the properties in force, name -> value, and
+       the desk each one lives on in a dim aside. */
+    panel.appendChild(make('div', 'sp-why-h', 'what set this'));
+    var props = d.properties || [];
+    if (!props.length) {
+      panel.appendChild(make('div', 'sp-why-dim', 'nothing on record set this line'));
+    } else {
+      var dl = make('dl', 'sp-why-dl');
+      for (i = 0; i < props.length; i += 1) {
+        var p = props[i] || {};
+        dl.appendChild(make('dt', null, String(p.name || '')));
+        var dd = make('dd', null, (p.value === undefined || p.value === null) ? '' : String(p.value));
+        if (p.where) {
+          dd.appendChild(document.createTextNode(' '));
+          dd.appendChild(make('i', null, String(p.where)));
+        }
+        dl.appendChild(dd);
+      }
+      panel.appendChild(dl);
+    }
+
+    /* (2) the system prompt for this road - folded, because it is the
+       long one; editable where the station says so. */
+    var prompt = d.prompt || {};
+    var det = make('details', 'sp-why-prompt');
+    det.appendChild(make('summary', null, 'the system prompt for this road'
+      + (prompt.kind ? ' (' + String(prompt.kind) + ')' : '')));
+    var ta = make('textarea', 'sp-why-ta', '');
+    ta.rows = 6;
+    ta.spellcheck = false;
+    ta.value = String(prompt.text || '');
+    ta.readOnly = !prompt.editable;
+    det.appendChild(ta);
+    if (prompt.editable) {
+      var saveRow = make('div', 'sp-why-save');
+      var save = make('button', 'sp-btn sp-why-savebtn', 'Save to the prompt book');
+      save.type = 'button';
+      var said = make('span', 'sp-why-dim', '');
+      save.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        if (!api() || !api().post) { said.textContent = 'no bridge to save through'; return; }
+        save.disabled = true;
+        said.textContent = 'saving…';
+        Promise.resolve(api().post('/api/said/prompt', {kind: prompt.kind, text: ta.value})).then(function (got) {
+          save.disabled = false;
+          if (got && got.ok === false) {
+            said.textContent = 'not saved' + (got.say ? ': ' + String(got.say).slice(0, 120) : '');
+            return;
+          }
+          said.textContent = String((got && got.say)
+            || 'saved - it takes effect on the next round');
+        }, function (err) {
+          save.disabled = false;
+          said.textContent = 'not saved: ' + String((err && err.message) || err).slice(0, 80);
+        });
+      });
+      saveRow.appendChild(save);
+      saveRow.appendChild(said);
+      det.appendChild(saveRow);
+    } else {
+      det.appendChild(make('div', 'sp-why-dim',
+        String(prompt.why || prompt.say || 'this prompt cannot be changed from here')
+        + (prompt.where ? ' - it lives in ' + String(prompt.where) : '')));
+    }
+    panel.appendChild(det);
+
+    /* (3) what contributed - each system on or off, with its note;
+       the ones that stood aside are dimmed, not hidden, because "the
+       crystal was off" is itself part of the answer. */
+    panel.appendChild(make('div', 'sp-why-h', 'what contributed'));
+    var systems = d.systems || [];
+    if (!systems.length) {
+      panel.appendChild(make('div', 'sp-why-dim', 'no system is on record for this line'));
+    } else {
+      var ul = make('ul', 'sp-why-sys');
+      for (i = 0; i < systems.length; i += 1) {
+        var s = systems[i] || {};
+        var li = make('li', s.on ? 'on' : 'off');
+        li.appendChild(make('b', null, String(s.name || '')));
+        li.appendChild(make('span', 'sp-why-onoff', s.on ? 'on' : 'off'));
+        if (s.note) li.appendChild(make('span', 'sp-why-note', String(s.note)));
+        ul.appendChild(li);
+      }
+      panel.appendChild(ul);
+    }
+
+    /* (4) the honesty line: without the booth's ring the properties
+       above are the air log's word alone. */
+    if (d.provenance_ok === false) {
+      panel.appendChild(make('div', 'sp-why-dim sp-why-noprov',
+        'the booth no longer holds this line’s paperwork - only the air log speaks for it'));
+    }
+    if (d.say) panel.appendChild(make('div', 'sp-why-say', String(d.say)));
+  }
+
+  /* ---- #1115: the report of a wrong highlight -------------------- */
+
+  /* Everything is gathered BEFORE the picture is asked for, so the
+   * numbers describe the moment of the tap and not the moment the
+   * chrome got round to it. Every reading is guarded: a report about
+   * a fault must not be the thing the fault breaks. */
+  var reportTurn = 0;
+
+  function jsonSafe(v) {
+    try { return JSON.parse(JSON.stringify(v === undefined ? null : v)); }
+    catch (err) { try { return String(v); } catch (e2) { return null; } }
+  }
+
+  function attempt(fn) {
+    try { return jsonSafe(fn()); }
+    catch (err) { return {error: String((err && err.message) || err).slice(0, 200)}; }
+  }
+
+  /* Passive rolling diagnostics: the previous minute of observed changes,
+   * full line identities and audio coordinates. The tap submits immediately;
+   * a screenshot and ten seconds of subsequent evidence finish the report.
+   * Recording never scrolls the view or changes playback. */
+  var MOTION_MS = 250;
+  var motionTimer = 0;
+  var diagnosticRecorder = null;
+  var diagnosticNodes = [];
+  var diagnosticIndices = new Map();
+  var diagnosticLines = Object.create(null);
+  var diagnosticRevision = '';
+  var diagnosticSnapshot = null;
+  function recorder() {
+    if (!diagnosticRecorder && root.PineScriptDiagnostics) diagnosticRecorder = root.PineScriptDiagnostics.createRecorder();
+    return diagnosticRecorder;
+  }
+  function diagnosticDocument(box) {
+    diagnosticNodes = Array.prototype.slice.call(box.querySelectorAll('.sp-el'));
+    diagnosticIndices = new Map();
+    diagnosticLines = Object.create(null);
+    diagnosticNodes.forEach(function (n, i) {
+      diagnosticIndices.set(n, i);
+      if (n.pineItem && n.pineItem.line) diagnosticLines[String(n.pineItem.line)] = {item: n.pineItem, index: i};
+    });
+    if (root.PineScriptDiagnostics) diagnosticRevision = root.PineScriptDiagnostics.revision(elements);
+  }
+
+  function sampleMotion() {
+    var pane = el('spScript');
+    var rec = recorder();
+    if (!pane || !rec) return;
+    var lit = pane.querySelector('.sp-el.sp-now');
+    var idx = diagnosticIndices.has(lit) ? diagnosticIndices.get(lit) : -1;
+    var audio = root.PineScriptDiagnostics.readAudio(bridgeHead(), soundingPlayer(), streamAt());
+    var active = attempt(activeRow) || {};
+    var feed = [];
+    try { feed = root.PineStationFeed.rows() || []; } catch (e) { /* no feed */ }
+    var records = [], nearby = [], mapping = [], byId = Object.create(null);
+    feed.forEach(function (r) { if (r.id) byId[String(r.id)] = r; });
+    var rect = pane.getBoundingClientRect(), visible = -1;
+    var knownActive = diagnosticLines[String(active.id || '')];
+    if (idx < 0 && !knownActive) {
+      for (var v = 0; v < diagnosticNodes.length; v += 1) {
+        var box = diagnosticNodes[v].getBoundingClientRect();
+        if (box.height > 0 && box.bottom > rect.top && box.top < rect.bottom) { visible = v; break; }
+      }
+    }
+    var contextAt = root.PineScriptDiagnostics.contextIndex(idx, knownActive ? knownActive.index : -1, visible, diagnosticNodes.length);
+    var from = contextAt < 0 ? 0 : Math.max(0, contextAt - 20);
+    var to = contextAt < 0 ? -1 : Math.min(diagnosticNodes.length - 1, contextAt + 10);
+    for (var i = from; i <= to; i += 1) {
+      var n = diagnosticNodes[i], item = n.pineItem || {};
+      var id = String(item.line || (item.id ? 'element:' + item.id : ''));
+      nearby.push({id: id, element_id: String(item.id || ''), index: i, block: item.block, ord: item.ord});
+      if (id) {
+        var source = byId[id] || {};
+        records.push({id: id, element_id: item.id, block: item.block, ord: item.ord,
+          kind: item.type, who: source.who || source.name || '', text: item.text,
+          media: rowFile(source), from_s: rowFrom(source), until_s: rowUntil(source), document_index: i});
+      }
+    }
+    // Keep a small cue neighborhood and both claimed identities. Copying the
+    // whole file can evict the very rows needed to explain a long burst.
+    var candidates = root.PineScriptDiagnostics.selectMappings(feed, audio, String(active.id || ''), lit ? String(lit.dataset.line || '') : '');
+    candidates.rows.forEach(function (r) {
+        mapping.push(String(r.id || ''));
+        if (!records.some(function (held) { return held.id === String(r.id || ''); })) {
+          var known = diagnosticLines[String(r.id || '')] || {}, item = known.item || {};
+          records.push({id: r.id, kind: r.kind, who: r.who || r.name, text: r.text,
+            media: rowFile(r), from_s: rowFrom(r), until_s: rowUntil(r),
+            element_id: item.id, block: item.block, ord: item.ord, document_index: known.index});
+        }
+    });
+    var top = lit ? Math.round(lit.getBoundingClientRect().top - rect.top) : null;
+    diagnosticSnapshot = {
+      recorder_version: 2, capture_source: 'script-page',
+      highlight_id: lit ? String(lit.dataset.line || '') : '', active_id: String(active.id || ''),
+      document_revision: diagnosticRevision, script_age_ms: fetchedAt ? Date.now() - fetchedAt : null,
+      speaking_id: String((speakingNow && speakingNow.id) || ''), audio: audio,
+      nearby: nearby, context_index: contextAt,
+      context_source: idx >= 0 ? 'highlight' : knownActive ? 'active' : visible >= 0 ? 'viewport' : 'unavailable',
+      mapping_rows: mapping, mapping_rows_total: candidates.total,
+      mapping_rows_omitted: candidates.omitted, matching_file_rows_total: candidates.matching_file_total,
+      stream: liveStream ? {at: liveStream.at, length: liveStream.length, row_count: (liveStream.rows || []).length,
+        rows: (liveStream.rows || []).filter(function (r) { return String(r.id || '') === String(active.id || '') || String(r.id || '') === nowLineId; }).map(function (r) { return {id: r.id, from: r.from, until: r.until}; })} : null,
+      viewport: {scroll_top_px: Math.round(pane.scrollTop), height_px: pane.clientHeight, width_px: pane.clientWidth, content_height_px: pane.scrollHeight, lit_top_px: top},
+      paused: stationPaused, follow: follow, visibility: String(document.visibilityState || ''),
+      errors: caught.slice(-6)
+    };
+    rec.observe({at_ms: Date.now(), highlight_id: diagnosticSnapshot.highlight_id, active_id: diagnosticSnapshot.active_id,
+      document_revision: diagnosticRevision, element_index: idx, block: lit && lit.dataset.block,
+      ord: lit && lit.dataset.ord, scroll_top_px: Math.round(pane.scrollTop), lit_top_px: top,
+      audio: audio, follow: follow, paused: stationPaused, snapshot: diagnosticSnapshot}, records);
+  }
+  var reportKind = 'report';
+  function ensureCaution() {
+    var pane = el('spScript');
+    if (!pane) return;
+    var wrap = document.getElementById('spCautionWrap');
+    if (wrap && wrap.parentNode === pane && pane.firstChild === wrap) return;
+    if (!wrap) {
+      wrap = make('div', 'sp-caution-wrap', '');
+      wrap.id = 'spCautionWrap';
+      var b = make('button', 'sp-caution', '');
+      b.type = 'button';
+      b.title = 'Report a script jump: keep the previous minute, this moment, and the next 10 seconds in the Pine inbox';
+      b.setAttribute('aria-label', 'Report the script as erratic');
+      try { if (typeof root.pineIcon === 'function') b.innerHTML = root.pineIcon('c:warning--alt', 'Report the script as erratic'); } catch (e) { /* text */ }
+      if (!b.innerHTML) b.textContent = '!';
+      b.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        if (b.pineHeld) return;   /* 2026-09-14: the hold opened the reason sheet */
+        reportKind = 'caution';
+        b.classList.add('sp-firing');
+        try { reportFire(b); } finally { setTimeout(function () { reportKind = 'report'; }, 100); }
+      });
+      /* 2026-09-14: HOLD IT (or right-click it) to say why first -
+         the reason sheet, reasonOpen(). A tap still files at once. */
+      holdOpen(b, function () { reasonOpen(b); });
+      wrap.appendChild(b);
+    }
+    pane.insertBefore(wrap, pane.firstChild);
+  }
+
+  function reportGather(phase, incident, since) {
+    sampleMotion();
+    var rec = recorder();
+    if (!rec) throw new Error('script diagnostics did not load');
+    return rec.capture(Date.now(), phase || 'tap', incident || '', since, diagnosticSnapshot);
+  }
+
+  /* The picture. On the desktop the chrome can take one
+     (pineDesktop.shotView); on the tablet the kiosk may offer
+     screenshot(); either may be missing, slow or broken, and none of
+     that may hold the report - five seconds and it goes without. */
+  function reportImage() {
+    var bridge = api(), ask = null, source = 'unavailable', requested = Date.now();
+    try {
+      if (bridge && typeof bridge.shotView === 'function') { source = 'shotView'; ask = bridge.shotView(); }
+      else if (bridge && typeof bridge.screenshot === 'function') { source = 'screenshot'; ask = bridge.screenshot(); }
+    } catch (err) { return Promise.resolve({image: null, screenshot_source: source, screenshot_at_ms: requested, screenshot_error: String(err.message || err).slice(0, 160)}); }
+    if (!ask) return Promise.resolve({image: null, screenshot_source: source, screenshot_at_ms: requested, screenshot_error: 'screenshot unavailable'});
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(image, error) {
+        if (settled) return;
+        settled = true; clearTimeout(late);
+        resolve({image: image, screenshot_source: source, screenshot_at_ms: Date.now(),
+          screenshot_requested_at_ms: requested, screenshot_error: error || null});
+      }
+      var late = setTimeout(function () { finish(null, 'screenshot timed out after 5 seconds'); }, 5000);
+      Promise.resolve(ask).then(function (got) {
+        var url = (got && typeof got === 'object') ? (got.dataUrl || got.data_url || got.image || got.png || '') : got;
+        if (typeof url === 'string' && /^data:image\//.test(url)) { finish(url); return; }
+        if (typeof url === 'string' && /^[A-Za-z0-9+\/=\s]+$/.test(url) && url.length > 64) {
+          finish('data:image/png;base64,' + url.replace(/\s+/g, '')); return;
+        }
+        finish(null, 'screenshot returned no image');
+      }, function (err) { finish(null, String((err && err.message) || err).slice(0, 160)); });
+    });
+  }
+
+  /* THE PHOTOGRAPHY EFFECT. A white flash over the whole view, the
+     word "captured" on the strip. It fires AFTER the picture has been
+     asked for - a real shutter is heard after the exposure, and a
+     flash painted before the chrome grabbed the frame would put a
+     white sheet in the report - with a 400 ms cap so a slow capture
+     never leaves the tap feeling dead. */
+  function reportShutter() {
+    var into = host || document.body;
+    var flash = make('div', 'sp-shutter');
+    into.appendChild(flash);
+    setTimeout(function () { try { flash.remove(); } catch (err) { /* gone */ } }, 520);
+  }
+
+  /* 2026-09-14: `reason` is the operator's own why, from the reason
+     sheet (a hold on the caution button); a plain tap files without
+     one. The station stores it and leads the inbox summary with it. */
+  var REPORT_PENDING_KEY = 'pine-script-report-finishes-v2';
+  function pendingReports() {
+    try { return JSON.parse(root.localStorage.getItem(REPORT_PENDING_KEY) || '[]').slice(-3); }
+    catch (e) { return []; }
+  }
+  function keepPending(name, body) {
+    try {
+      var saved = pendingReports().filter(function (r) { return r.name !== name; });
+      if (body) {
+        var small = Object.assign({}, body, {image: null});
+        if (body.image) small.screenshot_error = 'image was not retained for retry; original upload failed';
+        saved.push({name: name, body: small});
+      }
+      root.localStorage.setItem(REPORT_PENDING_KEY, JSON.stringify(saved.slice(-3)));
+    } catch (e) { caughtNote('report-persistence', e); }
+  }
+  function finishReport(name, body) {
+    keepPending(name, body);
+    return Promise.resolve(api().post('/api/script/report/' + encodeURIComponent(name) + '/finish', body)).then(function (got) {
+      if (got && got.ok === false) throw new Error(got.say || 'the station refused the attachment');
+      keepPending(name, null);
+      return got;
+    });
+  }
+  function retryReports() {
+    pendingReports().forEach(function (held) {
+      if (!/^script_[A-Za-z0-9_-]+\.md$/.test(held.name || '')) return;
+      finishReport(held.name, held.body).catch(function (err) { caughtNote('report-retry', err); });
+    });
+  }
+  function reportFire(btn, reason) {
+    var mine = (reportTurn += 1), tapped = Date.now();
+    if (!api() || !api().post) { say('no bridge to file the report through'); return; }
+    btn.classList.add('sp-firing');
+    function done(text, bad) {
+      if (mine !== reportTurn) return;
+      btn.classList.remove('sp-firing'); btn.classList.toggle('sp-fired-bad', !!bad); say(text);
+      setTimeout(function () { btn.classList.remove('sp-fired-bad'); }, 2600);
+    }
+    var incident = (root.crypto && root.crypto.randomUUID) ? root.crypto.randomUUID()
+      : ('script-' + tapped + '-' + Math.random().toString(16).slice(2));
+    var view;
+    try { view = reportGather('tap', incident); }
+    catch (err) { done('not filed: ' + String(err.message || err).slice(0, 80), true); return; }
+    tapped = view.captured_at_ms;
+    // Submit the tap immediately. Screenshot latency cannot move the server's
+    // initial observation or erase the evidence already collected.
+    var initial;
+    try { initial = Promise.resolve(api().post('/api/script/report', {view: view,
+      reason: reason ? String(reason).slice(0, 1200) : null, incident_id: incident})); }
+    catch (err) { done('not filed: ' + String(err.message || err).slice(0, 80), true); return; }
+    var shot = reportImage(), flashed = false;
+    function flash() { if (flashed) return; flashed = true; reportShutter(); }
+    setTimeout(flash, 400); shot.then(flash, flash);
+    var after = new Promise(function (resolve) {
+      setTimeout(function () {
+        try { resolve(reportGather('post', incident, tapped + 1)); }
+        catch (err) { resolve({schema_version: 2, phase: 'post', incident_id: incident,
+          captured_at_ms: Date.now(), events: [], rows: {}, snapshot: {errors: [{at: Date.now(),
+            kind: 'post-capture', msg: String(err.message || err).slice(0, 200)}]}}); }
+      }, 10000);
+    });
+    initial = initial.then(function (got) {
+      if (!got || got.ok === false || !got.file) throw new Error((got && got.say) || 'the report was not acknowledged');
+      if (mine === reportTurn) say('filed as #' + got.id + ' - capturing 10 seconds after the tap');
+      return got;
+    });
+    Promise.all([initial, after, shot]).then(function (all) {
+      var got = all[0], name = String(got.file).split('/').pop();
+      var body = Object.assign({view: all[1], incident_id: incident}, all[2]);
+      return finishReport(name, body).then(function () {
+        done('filed as #' + got.id + ' - capture complete' + (body.screenshot_error ? ' (without a picture)' : ''));
+      }, function (err) { done('report #' + got.id + ' kept; attachment pending: ' + String(err.message || err).slice(0, 65), true); });
+    }).catch(function (err) { done('not filed: ' + String((err && err.message) || err).slice(0, 80), true); });
+  }
+
   function fireVideo(btn) {
     var mine = (reelTurn += 1);
     function done(text, bad) {
@@ -416,7 +2018,17 @@
        out its own 2.5s poll. Rapid taps therefore cycle. */
     api().post('/api/sfx/video/cue', {who: 'operator'}).then(function (got) {
       var clip = got && got.clip;
-      if (!clip) { done(String((got && got.say) || 'no clip'), true); return; }
+      if (!clip) {
+        done(String((got && got.say) || 'no clip'), true);
+        /* #1361b: A MISS IS A QUESTION, NOT A VERDICT. Four different
+           faults have printed the same four words on this strip, and
+           only one of them is cured by tapping again. The doctor
+           names which one this is and puts the cure under a thumb. */
+        try {
+          if (root.PineClipDoctor) root.PineClipDoctor.open(String((got && got.say) || ''));
+        } catch (err) { /* the strip already said it */ }
+        return;
+      }
       /* #1311b: an answer that has been overtaken is dropped rather
          than cutting the picture backwards. */
       if (mine !== reelTurn) return;
@@ -531,9 +2143,11 @@
       + '<input id="spSeek" class="sp-seek" type="range" min="0" max="1000" value="0">'
       + '<i id="spLen" class="sp-time"></i>'
       + '</div></div>'
+      + '<button id="spMixDot" class="sp-mixdot" type="button" '
+      + 'title="Levels: voices, music, SFX, videos" aria-label="Levels"></button>'
       + '<div class="sp-transport">'
-      + '<button id="spPrev" class="sp-tbtn" title="The station’s previous track">⏮</button>'
-      + '<button id="spNext" class="sp-tbtn" title="Skip to the next track">⏭</button>'
+      + '<button id="spPrev" class="sp-tbtn" title="The station’s previous track" aria-label="The station’s previous track">⏮</button>'
+      + '<button id="spNext" class="sp-tbtn" title="Skip to the next track" aria-label="Skip to the next track">⏭</button>'
       + '</div>';
     return box;
   }
@@ -564,6 +2178,8 @@
       });
     }
     seek && (seek.dataset.dragging = '');
+    var dot = el('spMixDot');                                    /* #1419 */
+    if (dot) dot.addEventListener('click', function (ev) { ev.stopPropagation(); mixerOpen(); });
     var prev = el('spPrev');
     var next = el('spNext');
     if (prev) prev.addEventListener('click', function () { api().post('/api/dj/prev', {}); });
@@ -572,10 +2188,22 @@
     /* The meters and the playhead ride requestAnimationFrame - numbers the
      * browser already has, no request of any kind. */
     var frame = 0;
+    var tickN = 0;                    /* #1413c: the meters at the scope's pace */
+    var specAt = 0;
+    var specOk = false;
     var tick = function () {
       frame = requestAnimationFrame(tick);
+      tickN = (tickN + 1) % SCOPE_EVERY;
+      if (tickN) return;
       var spectrum = el('spSpectrum');
-      if (!spectrum || !spectrum.isConnected || !spectrum.clientWidth) return;
+      /* #1413c: the layout read once a second - clientWidth forces a
+         layout of a document the feed keeps dirty, every frame. */
+      var nowMs = Date.now();
+      if (nowMs - specAt > 1000) {
+        specAt = nowMs;
+        specOk = !!(spectrum && spectrum.isConnected && spectrum.clientWidth);
+      }
+      if (!spectrum || !specOk) return;
       var meters = root.PineMeters;
       if (meters) {
         meters.attach(['musicPlayer', 'djVoiceAudio0', 'djVoiceAudio1']);
@@ -597,6 +2225,93 @@
       if (root.PineMeters) root.PineMeters.wake();
     });
   }
+
+  /* #1419: THE MIXER DOT.
+   *
+   * "Put a dot here that whenever I click it or tap it it brings up a
+   *  pop-up that shows volume sliders for the voices, the music, the SFX,
+   *  and the videos, and it allows me to adjust the volume levels of each
+   *  of them individually and have it retain these settings and remember
+   *  it next time."
+   *
+   * The levels are multipliers (0-100%) on top of whatever the station and
+   * the shell already set, kept in this device's localStorage under
+   * `pineMixer` and applied through window.pineMixer - the panel's on the
+   * tablet (the view is injected into that page), the shell's on the
+   * desktop (the view runs in the shell there and the panel is a webview
+   * the shell levels). Either way one call, one name. */
+  var MIXER_ROWS = [
+    ['voice', 'Voices'], ['music', 'Music'], ['sfx', 'SFX'], ['video', 'Videos']
+  ];
+  function mixerRead() {
+    var m = null;
+    try { if (root.pineMixer && root.pineMixer.get) m = root.pineMixer.get(); } catch (err) { m = null; }
+    if (!m) { try { m = JSON.parse(root.localStorage.getItem('pineMixer') || '{}'); } catch (err) { m = {}; } }
+    var out = {};
+    MIXER_ROWS.forEach(function (row) {
+      var v = Number(m && m[row[0]]);
+      out[row[0]] = isFinite(v) ? Math.max(0, Math.min(1.5, v)) : 1;
+    });
+    return out;
+  }
+  function mixerWrite(values) {
+    try { root.localStorage.setItem('pineMixer', JSON.stringify(values)); } catch (err) { /* private mode */ }
+    try { if (root.pineMixer && root.pineMixer.set) root.pineMixer.set(values); } catch (err) { /* applied next time */ }
+  }
+  function mixerOpen() {
+    var old = document.getElementById('spMixBack');
+    if (old) { old.remove(); return; }
+    var levels = mixerRead();
+    var back = make('div', 'sp-mix-back');
+    back.id = 'spMixBack';
+    var box = make('div', 'sp-mix-box');
+    var head = make('div', 'sp-mix-head');
+    head.appendChild(make('b', '', 'Levels'));
+    var reset = make('button', 'sp-mix-reset', 'Reset');
+    reset.type = 'button';
+    var shut = make('button', 'sp-mix-shut', '\u2715');
+    shut.type = 'button';
+    head.appendChild(reset);
+    head.appendChild(shut);
+    box.appendChild(head);
+    var inputs = {};
+    MIXER_ROWS.forEach(function (row) {
+      var line = make('label', 'sp-mix-row');
+      line.appendChild(make('span', 'sp-mix-name', row[1]));
+      var range = document.createElement('input');
+      range.type = 'range'; range.min = '0'; range.max = '100'; range.step = '1';
+      range.value = String(Math.round(levels[row[0]] * 100));
+      range.className = 'sp-mix-range';
+      var val = make('span', 'sp-mix-val', range.value + '%');
+      range.addEventListener('input', function () {
+        val.textContent = range.value + '%';
+        levels[row[0]] = Number(range.value) / 100;
+        mixerWrite(levels);
+      });
+      inputs[row[0]] = {range: range, val: val};
+      line.appendChild(range);
+      line.appendChild(val);
+      box.appendChild(line);
+    });
+    box.appendChild(make('div', 'sp-mix-note',
+      'Remembered on this device. On top of the station\u2019s own levels.'));
+    reset.addEventListener('click', function () {
+      MIXER_ROWS.forEach(function (row) {
+        levels[row[0]] = 1;
+        inputs[row[0]].range.value = '100';
+        inputs[row[0]].val.textContent = '100%';
+      });
+      mixerWrite(levels);
+    });
+    shut.addEventListener('click', function () { back.remove(); });
+    back.addEventListener('click', function (ev) { if (ev.target === back) back.remove(); });
+    box.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    back.appendChild(box);
+    document.body.appendChild(back);
+  }
+  /* Applied once at load too, so a remembered level is heard before the
+     dot is ever touched. */
+  try { if (root.pineMixer && root.pineMixer.apply) root.pineMixer.apply(); } catch (err) { /* later */ }
 
   function clock(v) {
     var t = Math.max(0, Math.round(Number(v) || 0));
@@ -952,7 +2667,7 @@
         var picked = node.classList.contains('picked');
         node.textContent = String(item.text || '');
         node.className = 'sp-el sp-' + String(item.type || 'action')
-          + (item.aired === 'prepared' ? ' pending' : '')
+          + ((item.aired === 'prepared' || item.aired === 'withdrawn')   /* 2026-09-14: refused at hand-over - never aired */ ? ' pending' : '')
           + (item.tinted ? ' tinted' : '')
           + (lit ? ' sp-now' : '') + (picked ? ' picked' : '');
         node.pinePrint = print;
@@ -968,6 +2683,11 @@
          reading the node later - the strip's hold, for one - should get
          what this line says now. */
       node.pineItem = item;
+      // Keep evidence attributes in step with a keyed node's current item.
+      ['line', 'seg', 'block', 'ord'].forEach(function (field) {
+        if (item[field] !== undefined && item[field] !== null) node.dataset[field] = String(item[field]);
+        else delete node.dataset[field];
+      });
       order.push(node);
     }
     scriptNodes.forEach(function (held, key) {
@@ -977,6 +2697,8 @@
     });
     stitchScript(box, order);
     scriptRestore(box, anchor);
+    diagnosticDocument(box);
+    ensureCaution();
     /* FOLLOWING BEATS STICKING TO THE END.
      * The live line sits wherever the conversation has got to, and the end
      * of the hour is usually well past it; scrolling to the bottom after
@@ -1012,7 +2734,9 @@
     if (!box || box.scrollTop <= 4) return {pinned: true};
     var lip = box.getBoundingClientRect();
     for (var i = 0; i < box.children.length; i += 1) {
+      if (!box.children[i].classList.contains('sp-el')) continue;
       var seat = box.children[i].getBoundingClientRect();
+      if (seat.height <= 0) continue;
       if (seat.bottom <= lip.top + 1) continue;      /* scrolled off the top */
       return {node: box.children[i], was: seat.top};
     }
@@ -1036,6 +2760,7 @@
      else is one insertBefore. */
   function stitchScript(box, order) {
     var cursor = box.firstChild;
+    if (cursor && cursor.id === 'spCautionWrap') cursor = cursor.nextSibling;
     for (var i = 0; i < order.length; i += 1) {
       if (order[i] === cursor) { cursor = cursor.nextSibling; continue; }
       box.insertBefore(order[i], cursor);
@@ -1046,6 +2771,7 @@
     while (cursor) {
       var next = cursor.nextSibling;
       if (cursor.id === 'spPlan') { plan = cursor; }
+      else if (cursor.id === 'spCautionWrap') { /* retained control */ }
       else { cursor.remove(); }
       cursor = next;
     }
@@ -1465,8 +3191,22 @@
     /* A line that has not aired yet is the interesting one - it can still
      * be changed before the room hears it. ONLY 'prepared' is that line;
      * 'published' and 'stream' have both already been heard. */
-    if (item.aired === 'prepared') node.classList.add('pending');
+    if ((item.aired === 'prepared' || item.aired === 'withdrawn')   /* 2026-09-14: refused at hand-over - never aired */) node.classList.add('pending');
     if (item.tinted) node.classList.add('tinted');
+    /* #1330: the record that is on the deck RIGHT NOW, not one that
+     * finished an hour ago. The two read identically before this, so a
+     * script that had just caught up with a track change looked exactly
+     * like one that had skipped it - which is how "the script jumped
+     * over changing the track" is what a forty second lag looks like
+     * from the outside. The server says which; this shows it. */
+    if (item.playing) node.classList.add('sp-spinning');
+    /* #1330: where the SCRIPT put this line. Carried so a reader can
+     * follow the running order without re-deriving it, and so the mark
+     * can tell a scripted line from one nothing wrote. */
+    if (item.block) node.dataset.block = String(item.block);
+    if (item.ord !== undefined && item.ord !== null) {
+      node.dataset.ord = String(item.ord);
+    }
     if (type === 'dialogue' || type === 'action') {
       node.addEventListener('click', function () { openLine(item, node); });
     }
@@ -1483,6 +3223,33 @@
    * The DJ voice rides one of a small set of <audio> elements. The one
    * that matters is the one that is actually playing - unpaused, not
    * ended, and past its first frame. */
+  /* #1330: THE PANEL'S PLAYHEAD, ACROSS THE WEBVIEW BOUNDARY.
+   *
+   * soundingPlayer() below scans THIS document. On the desktop chrome
+   * that document holds one <audio> (desktopRadioPlayer); djVoiceAudio0/1
+   * are created by the panel, which runs inside <webview id="radioFrame">
+   * and is a DOM this one cannot reach. So on the chrome the scan
+   * returned null every single time - not intermittently - and #1278's
+   * read position, #1287's file guard and #1294's named-row preference
+   * were all silently dead there, leaving the view on the clock estimate
+   * the whole lot was written to replace.
+   *
+   * webview-preload.js posts the position out; renderer.js stamps it on
+   * arrival and hands back null once it is stale. Stale has to mean
+   * absent: a frozen mark reads as a working one, which is worse than
+   * falling back to the clock and is how this fault survived so long. */
+  function bridgeHead() {
+    try { return (root.pinePlayhead && root.pinePlayhead()) || null; }
+    catch (e) { return null; }
+  }
+
+  /* True when the position is READ off the sound, false when it is
+   * estimated. The searches below are only trustworthy in the first
+   * case, and they had no way to ask. */
+  function headIsRead() {
+    return !!(bridgeHead() || soundingPlayer());
+  }
+
   function soundingPlayer() {
     var all = document.querySelectorAll('audio');
     for (var i = 0; i < all.length; i += 1) {
@@ -1517,6 +3284,8 @@
    * The clock remains for the one case with nothing to read: no player
    * sounding. */
   function streamAt() {
+    var head = bridgeHead();                              /* #1330 */
+    if (head) return Number(head.t) || 0;
     var player = soundingPlayer();
     if (player) return Number(player.currentTime) || 0;
     if (!liveStream || !liveStream.at) return -1;
@@ -1533,6 +3302,8 @@
      the file is how a row 99 seconds away wins - 23 of the 24
      wrong-line samples were exactly that. */
   function soundingFile() {
+    var head = bridgeHead();                              /* #1330 */
+    if (head) return String(head.file || '');
     var a = soundingPlayer();
     if (!a) return '';
     var src = String(a.currentSrc || a.src || '').split('?')[0];
@@ -1564,6 +3335,28 @@
     var t = streamAt();
     var rows = (liveStream && liveStream.rows) || [];
     var file = soundingFile();
+    /* #1330: A BURST THAT HAS RUN OUT IS NOT A TABLE TO SEARCH.
+     *
+     * With an estimated position there is no filename to hold a row to,
+     * so #1287's guard cannot fire and a finished burst's windows still
+     * bracket the estimate - lighting a row that stopped sounding some
+     * time ago and holding it lit. #1294 measured that shape: 12 of 19
+     * wrong samples were more than two seconds in.
+     *
+     * The station's own reader already refuses this - it accepts an
+     * offset only inside [0, length + 4] before falling back to
+     * speaking_now - and the view should refuse it on the same terms.
+     * Where the position is READ this cannot arise, because the file
+     * guard settles it; this is only for where we are guessing. */
+    if (!headIsRead() && liveStream && liveStream.at) {
+      var span = Number(liveStream.length || 0) + 4;
+      if (!(t >= 0 && t <= span)) {
+        return (speakingNow && speakingNow.id)
+          ? {id: String(speakingNow.id), from: 0, until: 0, at: t,
+             index: -1, of: rows.length}
+          : null;
+      }
+    }
     function within(list, of) {
       var lone = null, loneAt = -1;
       for (var i = 0; i < list.length; i += 1) {
@@ -1800,10 +3593,22 @@
        * scroll cancelled itself, which is the very fault the guard
        * exists to prevent. `scrollend` says when it is really over. */
       selfScrollUntil = Date.now() + 2400;        /* backstop only */
+      /* #1330: ON THE BOX THAT ACTUALLY SCROLLS.
+       *
+       * This said `script`, which is declared in build() and in
+       * planLayout() and in neither case is in scope here. Under 'use
+       * strict' it resolved through named access on the global object to
+       * <section id="script"> - the view HOST, which is overflow:hidden
+       * and never scrolls. So 'scrollend' never fired, selfScrollUntil
+       * never cleared early, and the 2400ms backstop governed every
+       * move: for 2.4s after each highlight the handler below returned
+       * at its first line and the operator's own scroll was discarded,
+       * which is the precise opposite of what the guard is for. */
+      var box = el('spScript');
       try {
-        if ('onscrollend' in script) {
-          script.addEventListener('scrollend', function done() {
-            script.removeEventListener('scrollend', done);
+        if (box && 'onscrollend' in box) {
+          box.addEventListener('scrollend', function done() {
+            box.removeEventListener('scrollend', done);
             selfScrollUntil = 0;
           }, {once: true});
         }
@@ -2379,8 +4184,10 @@
   }
 
   function mount(node) {
+    if (!motionTimer) motionTimer = setInterval(function () { try { sampleMotion(); } catch (e) { /* the ring is a courtesy */ } }, MOTION_MS);   /* 2026-09-14 */
     if (mounted) return Promise.resolve(true);
     build(node);
+    retryReports();
     wirePlayer();
     mounted = true;
     foldLoad();                                              /* #1294 */
@@ -2429,6 +4236,9 @@
     mount: mount,
     isMounted: function () { return mounted; },
     close: function () {
+      folderClose();                                  /* 2026-09-14 */
+      reasonClose();
+      inboxClose();
       if (stop) stop();
       stop = null;
       if (beat) clearInterval(beat);

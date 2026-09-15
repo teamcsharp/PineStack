@@ -10,9 +10,11 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
@@ -111,6 +113,16 @@ class StationClient(private val configStore: ConfigStore) {
         .callTimeout(180, TimeUnit.SECONDS)
         .build()
 
+    /* THE UPLOAD ROAD GETS ITS OWN PATIENCE. A twenty-minute screen replay
+     * is tens of megabytes, and the patient client's sixty-second write
+     * budget was set for a spoken sentence. Over the tailnet this tablet
+     * has been measured well under a megabyte a second; five minutes of
+     * writing is room for the worst of those without being forever. */
+    private val upload: OkHttpClient = patient.newBuilder()
+        .writeTimeout(300, TimeUnit.SECONDS)
+        .callTimeout(600, TimeUnit.SECONDS)
+        .build()
+
     private fun clientFor(route: String): OkHttpClient {
         val r = route.lowercase()
         val slow = r.contains("/v1/chat/completions")
@@ -185,6 +197,85 @@ class StationClient(private val configStore: ConfigStore) {
         val (code, text) = call(builder.build(), clientFor(url))
         if (code !in 200..299) throw StationException(code, detailOf(text, code))
         return text
+    }
+
+    /**
+     * PUT one FILE as the whole request body, streamed from disk.
+     *
+     * The export courier's shape. NOT multipart: the station container has
+     * no multipart parser, so the file IS the body - Content-Type is the
+     * file's own, and anything the station needs to know about it (its
+     * name, what it is, how long it runs) rides in the query string. Same
+     * base, same bearer, same error extraction as [request]; the body is
+     * the difference - `asRequestBody` reads the file as OkHttp writes it,
+     * so the bytes are never held on the heap, which is the whole reason a
+     * replay is written to a file first.
+     *
+     * @throws StationException on any non-2xx (a 404 included - the route
+     *   may not be built yet), IOException when the box is not there at
+     *   all. The caller decides what to tell the operator; see the
+     *   bridge's replayExport, where neither may fail the save.
+     */
+    suspend fun putFile(route: String, file: File, mime: String): String {
+        val cfg = configStore.read()
+        val url = if (route.startsWith("http")) route else {
+            Reach.base(cfg) + (if (route.startsWith("/")) route else "/" + route)
+        }
+        val builder = Request.Builder().url(url)
+            .put(file.asRequestBody(mime.toMediaType()))
+        builder.header("Accept", "application/json")
+        if (cfg.apiKey.isNotBlank()) builder.header("Authorization", "Bearer " + cfg.apiKey)
+        val (code, text) = call(builder.build(), upload)
+        if (code !in 200..299) throw StationException(code, detailOf(text, code))
+        return text
+    }
+
+    /** Stream an editor source without materializing a second copy in the WebView. */
+    suspend fun postVideoEditorSource(file: File, audio: JSONObject, name: String): String {
+        require(file.length() in 1..VideoEditorContract.SOURCE_LIMIT) { "capture must be between 1 byte and 256 MiB" }
+        val cfg = configStore.read()
+        val builder = Request.Builder().url(Reach.base(cfg) + VideoEditorContract.SOURCE_ROUTE)
+            .post(file.asRequestBody("video/mp4".toMediaType()))
+            .header("Accept", "application/json")
+            .header("X-Capture-Audio", VideoEditorContract.audioHeader(audio))
+            .header("X-Capture-Name", name.replace(Regex("[^ -~]"), " ").take(120))
+        if (cfg.apiKey.isNotBlank()) builder.header("Authorization", "Bearer " + cfg.apiKey)
+        val (code, text) = call(builder.build(), upload)
+        if (code !in 200..299) throw StationException(code, detailOf(text, code))
+        return text
+    }
+
+    /** Download only a completed editor export, streaming to an owned temporary file. */
+    suspend fun getVideoEditorExport(exportId: String, target: File): Long {
+        val route = VideoEditorContract.exportFileRoute(exportId)
+        val cfg = configStore.read()
+        val builder = Request.Builder().url(Reach.base(cfg) + route).get()
+        if (cfg.apiKey.isNotBlank()) builder.header("Authorization", "Bearer " + cfg.apiKey)
+        return withContext(Dispatchers.IO) {
+            upload.newCall(builder.build()).execute().use { answer ->
+                if (!answer.isSuccessful) throw StationException(answer.code, "the station said " + answer.code)
+                val body = answer.body ?: throw StationException(502, "no edited video came back")
+                val limit = 512L * 1024 * 1024
+                if (body.contentLength() > limit) throw StationException(413, "edited video exceeds the tablet's 512 MiB download limit")
+                var written = 0L
+                try {
+                    body.byteStream().use { input -> target.outputStream().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            written += count
+                            if (written > limit) throw StationException(413, "edited video exceeds the tablet's download limit")
+                            output.write(buffer, 0, count)
+                        }
+                    } }
+                    if (written == 0L || (body.contentLength() >= 0 && written != body.contentLength())) {
+                        throw StationException(502, "the edited video download was incomplete")
+                    }
+                    written
+                } catch (err: Exception) { target.delete(); throw err }
+            }
+        }
     }
 
     /**

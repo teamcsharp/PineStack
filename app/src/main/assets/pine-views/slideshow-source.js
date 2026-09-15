@@ -250,6 +250,18 @@
 
     /* The bytes doors. Built here so no caller assembles a URL by hand and
      * so the thumbnail width is the one the station actually caches. */
+    /* #1348: absolute when the document is not served by the station.
+     * On the tablet the panel IS served by it, so a bare path is
+     * right and nothing changes there; in the Electron chrome the
+     * document is file:// and a bare path is a dead image. */
+    base: function () {
+      try {
+        if (root.location && root.location.protocol !== 'file:') return '';
+        if (root.pineStationBase) return root.pineStationBase();
+      } catch (e) { /* fall through */ }
+      return root.location && root.location.protocol === 'file:'
+        ? 'http://127.0.0.1:8096' : '';
+    },
     url: function (file, width) {
       /* ASK FOR THE SIZE THE SCREEN CAN ACTUALLY SHOW.
        *
@@ -267,11 +279,13 @@
        * for 1341 on one device and 1343 on another would fill the cache with
        * near-identical copies and hit it on neither. Rounding to a step
        * keeps every terminal of a given size sharing one cached image. */
-      return '/api/slideshow/media/' + encodeURIComponent(file)
+      return this.base() + '/api/slideshow/media/'
+        + encodeURIComponent(file)
         + '?w=' + (width || screenWidth());
     },
     thumb: function (file, width) {
-      return '/api/slideshow/media/' + encodeURIComponent(file)
+      return this.base() + '/api/slideshow/media/'
+        + encodeURIComponent(file)
         + '?w=' + (width || 128);
     },
 

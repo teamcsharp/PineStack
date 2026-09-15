@@ -69,18 +69,76 @@
 
   var RAIL_CSS = [
     '#pineViewRail{position:fixed;right:0;top:50%;transform:translateY(-50%);',
-    'z-index:2147483001;display:flex;flex-direction:column;gap:4px;',
+    'z-index:2147483001;display:flex;flex-direction:column;gap:7px;',
     /* THE RAIL MUST NOT RUN OFF THE GLASS. Eight tabs of vertical text
      * measure about 780px; this tablet is 800px tall in landscape, so the
      * ninth one added would have put a tab somewhere no thumb can reach -
      * silently, because a rail centred with translateY overflows equally
      * at both ends. It scrolls instead, with no visible scrollbar. */
+    /* #1345: and it must be able to scroll to its own ends. A rail
+     * centred with translateY overflows equally top and bottom, so a
+     * few px of padding keep the first and last tab off the edge once
+     * scrolling is real rather than theoretical. */
     'max-height:100vh;overflow-y:auto;overscroll-behavior:contain;',
+    'padding:6px 0;',
     'scrollbar-width:none;',
     'font-family:Inter,Segoe UI,system-ui,sans-serif}',
     '#pineViewRail::-webkit-scrollbar{display:none}',
+    /* #1345: A FLEX CHILD SQUASHES BEFORE ITS PARENT SCROLLS.
+     *
+     * The rail is a flex column with max-height:100vh and
+     * overflow-y:auto, and the note above assumes that a rail too tall
+     * for the glass will scroll. It will not. Flex items default to
+     * flex-shrink:1, so nine tabs in a container that cannot hold them
+     * SHRINK - each one giving up height until they fit - and the
+     * overflow the scroll depends on never happens.
+     *
+     * Because the text is vertical, losing height means losing letters:
+     * measured on a resized desktop window the labels read TEC, SAM,
+     * SCRI, LIST, MUS, PRES, SLID. And a squashed tab keeps its 1px
+     * border and its 10px radius, so the corners of neighbours run
+     * together and the rail reads as overlapping rather than as too
+     * small - which is what it was reported as.
+     *
+     * flex-shrink:0 is the whole fix: a tab is now the size of its own
+     * word, and when nine of them will not fit the rail finally does
+     * the scrolling it was already written to do.
+     *
+     * The padding went UP, not down. The first cut of this reduced it,
+     * which is the opposite of what was asked for - the complaint was
+     * that the tabs are TOO SMALL beside the tablet's. Nine tabs at
+     * 16px measure 758px, which the desktop window clears comfortably;
+     * measured at 1100, 900, 760 and 640px, nothing clips and nothing
+     * overlaps. The gap went 4px to 7px for the same reason: at 4px two
+     * rounded borders an inch long read as one shape.
+     *
+     * The old note measured eight tabs
+     * at ~780px against an 800px tablet - already at the edge before SC
+     * and 3JS were added; the tablet is the tighter surface, not this one.
+     */
     '.pine-view-tab{background:#1c242c;color:#edf3f5;border:1px solid #35414c;',
-    'border-right:none;border-radius:10px 0 0 10px;padding:14px 9px;',
+    'border-right:none;border-radius:12px 0 0 12px;padding:16px 12px;',
+    /* #1345b: AND IT MUST SAY ITS OWN HEIGHT.
+     *
+     * This is the whole fault, and it is not flex at all. The desktop
+     * shell's styles.css carries a bare element rule -
+     *
+     *     button { height: 36px; padding: 0 12px; }
+     *
+     * - and this rule never declared a height, so there was nothing to
+     * override: specificity does not enter into it when only one rule
+     * declares the property. Every tab was pinned to a 36px square, and
+     * vertical text in a 36px box loses its word. Measured on the real
+     * document: all nine tabs exactly 40x36, seven of them clipped -
+     * SAMPLER needed 69px and was given 36.
+     *
+     * The tablet has no such element rule, which is precisely why the
+     * rail looks right there and cramped here off the same stylesheet.
+     * A rail that can be dropped into any document has to state the
+     * dimensions it depends on rather than inherit them.
+     */
+    'height:auto;width:auto;min-height:0;min-width:0;',
+    'flex:0 0 auto;white-space:nowrap;',
     'font-size:11px;letter-spacing:.09em;writing-mode:vertical-rl;',
     'cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
     '.pine-view-tab.on{background:#65c7da;color:#05131a;border-color:#65c7da}',
@@ -221,8 +279,28 @@
         /* The sampler already built its own host and handle before this
          * ran. Adopt it rather than building a second one. */
         if (!view.external) {
-          var host = make('section', view.id, 'pine-view-host ' + view.cls);
-          document.body.appendChild(host);
+          /* #1344: ADOPT A HOST THAT IS ALREADY THERE.
+           *
+           * The desktop shell owns #script, #listen, #music,
+           * #presentation and #sampler as its own <section class="view">
+           * elements. Building a second element with the same id gives
+           * getElementById the DESKTOP one - first in document order -
+           * which has no `pine-view-host` class, so `.open` matches
+           * nothing and the tab looks broken rather than missing.
+           *
+           * On the tablet nothing owns these ids, so this still builds
+           * exactly what it always did. */
+          var host = document.getElementById(view.id);
+          if (host) {
+            host.classList.add('pine-view-host');
+            var bits = String(view.cls || '').split(/\s+/);
+            for (var c = 0; c < bits.length; c += 1) {
+              if (bits[c]) host.classList.add(bits[c]);
+            }
+          } else {
+            host = make('section', view.id, 'pine-view-host ' + view.cls);
+            document.body.appendChild(host);
+          }
         }
         var tab = make('button', 'pineViewTab-' + view.id, 'pine-view-tab');
         tab.textContent = view.label;
@@ -230,7 +308,10 @@
           if (view.external) {
             /* Hand the sampler's own handle the press, so its repaint and
              * its `on` state keep working exactly as they did. */
-            var handle = document.getElementById('pineSamplerTab');
+            /* #1344: the tablet builds #pineSamplerTab; the desktop has
+             * its own nav button instead. Either is a handle. */
+            var handle = document.getElementById('pineSamplerTab')
+              || document.getElementById('samplerTabBtn');
             var wasOpen = handle && handle.classList.contains('on');
             closeAll();
             if (handle && !wasOpen) handle.click();
@@ -334,6 +415,18 @@
         });
         rail.appendChild(stack);
       } catch (err) { /* the rail is more important than the handle */ }
+    }
+
+    /* HOT CORNERS (2026-09-14). "I also want preferences ... for each of
+     * the hot corners ... change these and set these and disable these."
+     *
+     * A tab on the same edge, opening the preference sheet as a pop-up
+     * over whatever is showing: a master switch and one select per corner
+     * (hot-corners.js). Built through the module's own railTab() so the
+     * kiosk, whose injection order is its own, gets the same tab whether
+     * this file or that one is evaluated first - both check the id. */
+    if (root.PineHotCorners && typeof root.PineHotCorners.railTab === 'function') {
+      try { root.PineHotCorners.railTab(); } catch (err) { /* the rail is more important than the handle */ }
     }
 
     /* The talk dot, on every screen - the operator asked for it on all of

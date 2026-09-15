@@ -5,12 +5,19 @@ import android.view.View
 import android.view.ViewGroup
 import android.content.Intent
 import android.provider.Settings
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.TextView
+import androidx.appcompat.widget.SwitchCompat
 import androidx.drawerlayout.widget.DrawerLayout
 import com.pinebox.kiosk.R
+import com.pinebox.kiosk.config.ConfigStore
+import com.pinebox.kiosk.config.HotCorners
+import com.pinebox.kiosk.replay.ScreenReplay
 import com.pinebox.kiosk.net.StationClient
 import com.pinebox.kiosk.power.PowerWatch
 import kotlinx.coroutines.CoroutineScope
@@ -39,6 +46,8 @@ class RailController(
     private val drawer: DrawerLayout,
     private val rail: View,
     private val client: StationClient,
+    /** The terminal's own config - the hot corners live in it. */
+    private val configStore: ConfigStore,
     private val scope: CoroutineScope,
     /** Load a URL in the terminal's one WebView. */
     private val navigate: (String) -> Unit,
@@ -56,6 +65,19 @@ class RailController(
     private val logsFull: Button = rail.findViewById(R.id.logsFull)
     private val playerList: ViewGroup = rail.findViewById(R.id.playerList)
     private val playerNote: TextView = rail.findViewById(R.id.playerNote)
+
+    /* ---- the hot corners - see config/HotCorners.kt ---- */
+    private val cornersOn: SwitchCompat = rail.findViewById(R.id.cornersOn)
+    private val cornersNote: TextView = rail.findViewById(R.id.cornersNote)
+    private val cornerSpinners: Map<String, Spinner> = mapOf(
+        "tl" to rail.findViewById(R.id.corner_tl),
+        "tr" to rail.findViewById(R.id.corner_tr),
+        "bl" to rail.findViewById(R.id.corner_bl),
+        "br" to rail.findViewById(R.id.corner_br),
+    )
+    /** True while paintCorners() moves the controls, so their listeners
+     *  know a change came from the store and not from a finger. */
+    private var cornersSyncing = false
 
     /* ---- #1212/#1213: the reinitialise card ---- */
     private val fixGo: Button = rail.findViewById(R.id.fixGo)
@@ -273,9 +295,15 @@ class RailController(
 
         wirePower()
 
+        wireCorners()
+
         drawer.addDrawerListener(object : DrawerLayout.SimpleDrawerListener() {
             override fun onDrawerOpened(drawerView: View) {
                 if (dirty) paint()
+                /* The page can change the corners too (hotCornersSet), and
+                 * HotCorners.live already holds the result; the rows only
+                 * need to catch up when they come into view. */
+                paintCorners()
                 /* banked_seconds is on /api/radio/pause and nowhere else - one
                  * request, on the open, never on a clock. */
                 call(null) { JSONObject(client.get("/api/radio/pause")) }
@@ -713,13 +741,30 @@ class RailController(
                     "}catch(e){}return 'nothing to clear';})()"
                 ) { got -> say("  " + got.trim('"')) }
 
-                say("3 dropping what the page was stuck on")
+                /* #1318: A DUCK THAT NEVER LIFTED SOUNDS EXACTLY LIKE A
+                 * DEAD STATION. Pads duck the broadcast and release it
+                 * when nothing is sounding; if that release is missed,
+                 * every element reports "playing" at volume 1 and the
+                 * room is silent. Cheap to undo, and free when there was
+                 * nothing to undo. */
+                say("3 lifting any duck left on the broadcast")
+                runScript(
+                    "(function(){try{" +
+                        "var a=window.PineAir;if(!a)return 'no mixer here';" +
+                        "if(a.releaseAll)a.releaseAll();" +
+                        "else if(a.release){a.release('pad');a.release('clip');}" +
+                        "var d=a.duckState?a.duckState():null;" +
+                        "return d?('music gain '+d.musicGain):'lifted';" +
+                    "}catch(e){return 'mixer would not answer';}})()"
+                ) { got -> say("  " + got.trim('"')) }
+
+                say("4 dropping what the page was stuck on")
                 client.post("/api/broadcast/fix/flush", "{}")
 
                 health = JSONObject(client.get("/api/broadcast/health"))
                 if (health.optBoolean("gagged", false)
                     || health.optString("holding_the_air").isBlank()) {
-                    say("4 releasing the exclusive")
+                    say("5 releasing the exclusive")
                     client.post("/api/broadcast/fix/release", "{}")
                 }
 
@@ -731,16 +776,87 @@ class RailController(
                     return@launch
                 }
 
-                say("5 reloading this page")
-                runScript("location.reload()") { }
-                delay(9000)
+                /* #1318: IS THIS TERMINAL DEAF?
+                 *
+                 * Chromium's network stack inside the WebView can die
+                 * while everything else stays up - the bridge answers,
+                 * the feed updates, every view paints, and not one
+                 * fetch, <audio> or <video> works. The panel looks alive
+                 * and the station is inaudible.
+                 *
+                 * A RELOAD DOES NOT CURE IT, measured: the network
+                 * service lives in the app process, so the same dead
+                 * stack is handed to the new page. Only a fresh process
+                 * brings it back.
+                 *
+                 * This button arrived here over the BRIDGE, which is the
+                 * app's own HTTP client. So if the page cannot do what
+                 * the app just did, the page is the broken half - and no
+                 * amount of ordinary dead air can produce that. */
+                say("6 can this page still reach the station?")
+                runScript(
+                    "(function(){try{" +
+                        "window.__pineFixProbe='asking';" +
+                        "var t=setTimeout(function(){" +
+                            "if(window.__pineFixProbe==='asking')" +
+                                "window.__pineFixProbe='web-timeout';},12000);" +
+                        "fetch('/api/dj/sections',{cache:'no-store'}).then(" +
+                            "function(r){clearTimeout(t);" +
+                                "window.__pineFixProbe=r.status>0?'web-ok':'web-bad';}," +
+                            "function(){clearTimeout(t);" +
+                                "window.__pineFixProbe='web-dead';});" +
+                        "return 'asked';" +
+                    "}catch(e){window.__pineFixProbe='web-threw';return 'threw';}})()"
+                ) { }
+                delay(13000)
+                var verdict = "unknown"
+                runScript("(function(){return window.__pineFixProbe||'unknown';})()") {
+                    got -> verdict = got.trim('"')
+                }
+                delay(400)
+
+                if (verdict == "web-dead" || verdict == "web-timeout"
+                    || verdict == "web-threw") {
+                    say("  no - the app can reach it and this page cannot")
+                    say("7 bringing the terminal round; it comes back by itself")
+                    val went = com.pinebox.kiosk.net.Revive.now(
+                        rail.context, "the repair button: the page is deaf")
+                    if (!went) {
+                        say("  too soon since the last one - reloading instead")
+                        runScript("location.reload()") { }
+                        delay(9000)
+                    }
+                } else {
+                    say("  yes (" + verdict + ") - reloading this page")
+                    runScript("location.reload()") { }
+                    delay(9000)
+                }
+
                 health = JSONObject(client.get("/api/broadcast/health"))
                 if (heardWithin(health, 15.0)) {
-                    say("sound is back after the reload")
+                    say("sound is back")
                     return@launch
                 }
 
-                say("6 restarting the station - about twenty seconds")
+                /* #1318: AND THE CABLE. The wired-device announcement
+                 * outlives the app, so a stale one points the whole
+                 * broadcast at a socket with nothing in it - silence that
+                 * every other check here would call healthy. */
+                say("8 checking the audio is pointed at something")
+                try {
+                    runScript(
+                        "(function(){try{" +
+                            "if(window.pineDesktop&&pineDesktop.jack){" +
+                                "pineDesktop.jack();return 'asked the jack to report';}" +
+                            "return 'no jack door on this build';" +
+                        "}catch(e){return 'the jack would not answer';}})()"
+                    ) { got -> say("  " + got.trim('"')) }
+                    delay(1200)
+                } catch (err: Exception) {
+                    say("  could not ask: " + (err.message ?: ""))
+                }
+
+                say("9 restarting the station - about twenty seconds")
                 client.post("/api/broadcast/fix/restart", "{}")
             } catch (err: Exception) {
                 Log.w(TAG, "reinitialise failed", err)
@@ -987,6 +1103,100 @@ class RailController(
      *  overwrite it on the next change. */
     private val logsShowingPipeline: Boolean
         get() = logsFull.isActivated
+
+    /* ---- the hot corners ------------------------------------------ */
+
+    /**
+     * THE FOUR ROWS AND THE SWITCH.
+     *
+     * "I also want preferences in the swipe out on the pine box tablet
+     *  where I can specify what these behaviors are for the gestures for
+     *  each of the hot corners ... be able to also change these and set
+     *  these and disable these if I want in the sidebar that swipes out on
+     *  the left side for the pine box tablet."
+     *
+     * Every change goes through HotCorners.set - the same function the
+     * bridge's hotCornersSet calls - so the store, the touch road's copy
+     * and the page are told in one place. The spinners' words come from
+     * HotCorners.CHOICES rather than a string-array, so the drawer can
+     * never offer a corner something the page does not understand.
+     */
+    private fun wireCorners() {
+        val words = HotCorners.CHOICES.map { it.second }
+        for ((corner, spinner) in cornerSpinners) {
+            spinner.adapter = ArrayAdapter(rail.context, R.layout.rail_spinner_item, words)
+                .apply { setDropDownViewResource(R.layout.rail_spinner_drop) }
+            spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?,
+                                            position: Int, id: Long) {
+                    if (cornersSyncing) return
+                    val action = HotCorners.CHOICES.getOrNull(position)?.first ?: return
+                    /* A Spinner reports its selection once on layout as well
+                     * as on a tap; only a real change is worth a write. */
+                    if (action == HotCorners.live.of(corner)) return
+                    setCorners(JSONObject().put(corner, action),
+                        cornerName(corner) + " → " + HotCorners.labelOf(action))
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) { /* nothing */ }
+            }
+        }
+        cornersOn.setOnCheckedChangeListener { _, on ->
+            if (cornersSyncing || on == HotCorners.live.enabled) return@setOnCheckedChangeListener
+            setCorners(JSONObject().put("enabled", on),
+                if (on) "hot corners on" else "hot corners off")
+        }
+        cornersNote.text = rail.resources.getString(R.string.rail_corners_note,
+            ScreenReplay.HOLD_SECONDS)
+        /* From the store once, so the rows show what was saved rather than
+         * the defaults, and so HotCorners.live is right before the first
+         * finger lands. */
+        scope.launch {
+            try { HotCorners.read(configStore) } catch (err: Exception) {
+                Log.w(TAG, "hot corners could not be read: " + err.message)
+            }
+            paintCorners()
+        }
+    }
+
+    private fun setCorners(patch: JSONObject, note: String) {
+        scope.launch {
+            try {
+                HotCorners.set(configStore, patch) { script -> runScript(script) { } }
+                paintCorners()
+                cornersNote.text = note + " · saved"
+                cornersNote.setTextColor(rail.resources.getColor(R.color.pine_dim, null))
+            } catch (err: Exception) {
+                Log.w(TAG, "hot corners could not be saved", err)
+                cornersNote.text = "could not save: " + (err.message ?: err.javaClass.simpleName)
+                cornersNote.setTextColor(rail.resources.getColor(R.color.pine_bad, null))
+            }
+        }
+    }
+
+    /** The controls to HotCorners.live, without the listeners hearing it. */
+    private fun paintCorners() {
+        val prefs = HotCorners.live
+        cornersSyncing = true
+        try {
+            if (cornersOn.isChecked != prefs.enabled) cornersOn.isChecked = prefs.enabled
+            for ((corner, spinner) in cornerSpinners) {
+                val at = HotCorners.indexOf(prefs.of(corner))
+                if (spinner.selectedItemPosition != at) spinner.setSelection(at, false)
+                spinner.isEnabled = prefs.enabled
+                spinner.alpha = if (prefs.enabled) 1f else 0.45f
+            }
+        } finally {
+            cornersSyncing = false
+        }
+    }
+
+    private fun cornerName(corner: String): String = when (corner) {
+        "tl" -> "top left"
+        "tr" -> "top right"
+        "bl" -> "bottom left"
+        "br" -> "bottom right"
+        else -> corner
+    }
 
     private fun label(value: String): String = when (value) {
         "here" -> "the app"

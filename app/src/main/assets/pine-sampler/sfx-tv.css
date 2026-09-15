@@ -13,7 +13,13 @@
  */
 .sfx-tv {
   position: fixed;
-  z-index: 900;                 /* over every view, under a modal shade */
+  /* #1322: THE FALLBACK, NOT THE ANSWER. Both surfaces carry layers in
+     the 2147483000 band - the kiosk floats every injected view there,
+     and the shell has view-chrome, the hold sheets and a <webview> of
+     its own - so build() sets the real z-index inline (2147483020). 900
+     is what is left if an inline style is ever refused: over every
+     view, under a modal shade. */
+  z-index: 900;
   display: flex;
   flex-direction: column;
   overflow: hidden;
