@@ -28770,6 +28770,52 @@ OWNER_DEAF_REST = 300.0
 _OWNER_DEAF: dict[str, float] = {}
 
 
+def _owner_deaf_key(who: str) -> str:
+    """#1337: the rest #1332c bought, keyed by the DEVICE.
+
+    A listener id is minted fresh on every page load - #1185's own
+    docstring says exactly that - and _OWNER_DEAF was keyed by it.
+    Measured live 2026-09-15, 06:04 to 06:08: one machine at 10.89.1.13
+    was judged deaf as desktop-9uy6icva, as pbat44oait, as
+    desktop-oed1c5ap and as pbwud8244k inside four and a half minutes.
+    Four keys, one device, and no rest that could ever apply to the page
+    that earned it. The terminal row is keyed by address and survives a
+    reload, which is the whole reason #1185 reads that table."""
+    try:
+        row = terminal_for_listener(who)
+        addr = str((row or {}).get("addr") or "")
+        if addr:
+            return "addr:" + addr
+    except Exception:  # noqa: BLE001
+        pass
+    return str(who or "")
+
+
+def _owner_resting(who: str) -> bool:
+    """#1337: was this device just dropped for taking nothing?
+
+    #1332c wrote the rest and only POST /api/radio/solo ever read it -
+    the hand-over an operator makes by hand. The automatic road in
+    audio_owner() never asked, so every #1332 drop was undone by the
+    #1185 fallback on the next clock poll, one second later, measured
+    four times running while the house sat gagged. Publication went on
+    the whole time: this is why "the station is not broadcasting" and
+    every server reading green are the same night."""
+    if not _OWNER_DEAF:
+        return False
+    try:
+        key = _owner_deaf_key(who)
+        until = float(_OWNER_DEAF.get(key) or 0)
+        if not until:
+            return False
+        if time.time() >= until:
+            _OWNER_DEAF.pop(key, None)      # it clears itself
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _owner_takes_nothing(who: str) -> bool:
     """#1332: does this owner hold the air and never take a clip?
 
@@ -28845,7 +28891,8 @@ def _owner_takes_nothing(who: str) -> bool:
         others = [w for w in (_listeners_live() or []) if w != who]
         if others:
             _OWNER_RUN.update({"who": "", "since": 0.0})   # the run ends here
-            _OWNER_DEAF[who] = time.time() + OWNER_DEAF_REST     # #1332c
+            _deaf_key = _owner_deaf_key(who)              # #1332c/#1337
+            _OWNER_DEAF[_deaf_key] = time.time() + OWNER_DEAF_REST
             return True
         return False
     except Exception:  # noqa: BLE001
@@ -28880,7 +28927,11 @@ def audio_owner() -> str:
                 _row_now = terminal_for_listener(who)
                 if _row_now and _row_now.get("play"):
                     _back = _listener_for_terminal(_row_now)
-                    if _back and _back != who:
+                    # #1337: ...unless this device was just
+                    # dropped for taking nothing. A new id is
+                    # not a new device.
+                    if (_back and _back != who
+                            and not _owner_resting(_back)):
                         _AUDIO_OWNER.update({"who": _back, "at": time.time()})
                         pipeline_log(
                             "air", "the device holding the air came back as "
@@ -28915,7 +28966,9 @@ def audio_owner() -> str:
                         "air", f"{who} held the air for "
                         f"{OWNER_DEAF_SECONDS:.0f}s without taking a "
                         "single clip - every player is unmuted again so "
-                        "the house can hear something (#1332)")
+                        "the house can hear something, and its device "
+                        f"may not take the air back for "
+                        f"{OWNER_DEAF_REST:.0f}s (#1332/#1337)")
                     return ""
                 return who
             pipeline_log("air", f"{who} holds the air but its row is set "
@@ -28933,6 +28986,8 @@ def audio_owner() -> str:
             _again_row = terminal_for_listener(who)
             again = ("" if (_again_row and not _again_row.get("play"))
                      else _listener_for_terminal(_again_row))
+            if again and _owner_resting(again):          # #1337
+                again = ""
             if again:
                 _AUDIO_OWNER.update({"who": again, "at": time.time()})
                 pipeline_log("air", f"the device holding the air came back "
@@ -28949,6 +29004,18 @@ def audio_owner() -> str:
                 if bool((row or {}).get("fallback")) != want_fallback:
                     continue
                 got = _listener_for_terminal(row)
+                # #1337: ...and not a device this road just
+                # dropped for taking nothing. Without this the
+                # #1332 cure is undone HERE, on the next clock
+                # poll, and the whole house is gagged again for
+                # another OWNER_DEAF_SECONDS. Measured four
+                # times in four and a half minutes, 2026-09-15.
+                # Nobody left to nominate means audio_owner()
+                # returns "" and every player sounds, which is
+                # #1008's contract - this can never mute the
+                # house.
+                if got and _owner_resting(got):
+                    continue
                 if got:
                     if got != who:
                         _AUDIO_OWNER.clear()
@@ -104170,7 +104237,7 @@ async def radio_solo_api(
     # again on its very next poll and the house was silent for another
     # seventy-five seconds, repeatedly. It clears itself: the entry
     # expires, and any page that is actually taking clips never gets one.
-    _deaf_until = float(_OWNER_DEAF.get(who) or 0)
+    _deaf_until = float(_OWNER_DEAF.get(_owner_deaf_key(who)) or 0)
     if _deaf_until and time.time() < _deaf_until:
         pipeline_log("air", f"{who} asked for the air again after holding "
                      "it without taking a single clip - refused for "
@@ -104180,7 +104247,7 @@ async def radio_solo_api(
                 "why": f"{who} held the air without playing anything; it "
                        "may ask again shortly"}
     if _deaf_until:
-        _OWNER_DEAF.pop(who, None)
+        _OWNER_DEAF.pop(_owner_deaf_key(who), None)
 
     _row = terminal_for_listener(who)
     if _row and not _row.get("play"):
