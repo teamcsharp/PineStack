@@ -40307,6 +40307,61 @@ _JUDGMENT_ROAD_VERBS = {
 }
 
 
+# #1187: THE DEDUPE ITS SIBLING ALREADY HAS.
+#
+# data/judgment_ledger.json is at its 400-row cap and truncating, which
+# takes about 2.4 days.  MEASURED tonight: 220 of those 400 rows are ONE
+# repeated automated row - `drive:record`, written by lessons_apply on a
+# 900-second clock inside dead_air_watch.  Every pass writes it again,
+# because lessons_apply is a thermostat and the road it is confident
+# about does not change.
+#
+# orch_raise, which is the same shape of thing - the station putting
+# something on the record by itself - has had a dedupe since it was
+# written: every caller goes through _orch_recent(topic), "a question the
+# operator has already answered must not come straight back with the same
+# evidence".  The book never got one.
+#
+# What it costs: the 220 repeats evict the reasks and the operator's own
+# rows, so the evidence for the ratchet above is being destroyed by this.
+# Seven rows in the whole 400-row book are genuinely the operator's.  And
+# because judgment_note MOVES THE ROAD'S FACTOR as well as writing the
+# row, 220 identical rows is 220 multiplies - which is how `record`, a
+# road nobody has ever dialled, has a seat in the book at all.
+#
+# So an IDENTICAL row the station wrote by itself inside the same
+# half-day window orch_raise uses is not written again, and does not move
+# the factor again.  Nothing is lost: the row is identical, topic, verb
+# and face.  A row the OPERATOR wrote is never a repeat, whatever it
+# says, because a person saying the same thing twice means it twice.
+JUDGMENT_SAME_WITHIN = 43200.0
+
+
+def _judgment_repeat(row: dict[str, Any]) -> bool:
+    """Has the station already written THIS EXACT automated row lately?
+
+    The rows are newest-first, so walking until one is older than the
+    window is the whole scan."""
+    try:
+        if not row.get("alone"):
+            return False                # a person's row is never a repeat
+        topic = str(row.get("topic") or "")
+        does = str(row.get("does") or "")
+        face = str(row.get("face") or "")
+        now = float(row.get("at") or time.time())
+        for old in (_JUDGMENT.get("rows") or []):
+            if now - float(old.get("at") or 0) > JUDGMENT_SAME_WITHIN:
+                break                   # newest-first: everything after
+            if (bool(old.get("alone"))
+                    and str(old.get("topic") or "") == topic
+                    and str(old.get("does") or "") == does
+                    and str(old.get("face") or "") == face):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False                    # never lose a row to a bad scan
+
+
 def judgment_note(topic: str, ask: str, face: str, does: str, why: str,
                   alone: bool) -> None:
     """One answered question into the book, and its road weight moved.
@@ -40330,6 +40385,13 @@ def judgment_note(topic: str, ask: str, face: str, does: str, why: str,
                         "short": hour_short_kinds()[:6]},
         }
         with _JUDGMENT_LOCK:
+            # #1187::note-dedupe:: 220 of the 400 rows in the live book
+            # are this same automated row written again every 900s. It
+            # is not written again, and - because writing it also MOVES
+            # the road's factor - it does not ratchet the factor again
+            # either. See _judgment_repeat above.
+            if _judgment_repeat(row):
+                return
             _JUDGMENT["rows"].insert(0, row)
             move = _JUDGMENT_ROAD_VERBS.get(verb)
             if move and road and road not in ("keep", "none"):
@@ -40351,7 +40413,8 @@ def judgment_note(topic: str, ask: str, face: str, does: str, why: str,
         pass
 
 
-def judgment_move(road: str, move: str, who: str = "operator") -> str:
+def judgment_move(road: str, move: str, who: str = "operator",
+                  alone: bool = False) -> str:  # #1187::move-alone::
     """#1150: the graph's dial - value a road more, less, or let it go.
     Direct operator judgment, same bounded weight, written in the book."""
     _judgment_load()
@@ -40377,13 +40440,31 @@ def judgment_move(road: str, move: str, who: str = "operator") -> str:
                 said = f"{SHELF_LABEL.get(road, road)} returns to level"
             seat["factor"] = round(factor, 3)
             seat["at"] = time.time()
-            seat["alone"] = False
+            # #1187: A DECISION THE STATION TOOK ALONE MUST SAY SO.
+            #
+            # These three fields were hard-coded to "the operator did
+            # this", and orch_apply - the path the station's OWN
+            # unanswered-question machinery takes - called this function
+            # with the default who. MEASURED in
+            # data/judgment_ledger.json: all seventeen `dial` rows are
+            # marked "by": "operator", and every one of them was written
+            # a fraction of a second after a `judgment_*` reask row that
+            # is itself marked "alone": true, "by": "station". The
+            # station dialled itself and then signed the operator's name
+            # to it, seventeen times. Seven rows in the whole 400-row
+            # book are genuinely his.
+            #
+            # #1027 built the book's `by` field for exactly this reason -
+            # "said outright, so a report never attributes the machine's
+            # defaults to the human" - and this one site went on lying.
+            seat["alone"] = bool(alone)
             _JUDGMENT["rows"].insert(0, {
                 "at": time.time(), "topic": "dial",
                 "ask": f"the {who} turned the dial on {road}",
                 "face": said, "does": f"judgment:{move}:{road}",
-                "why": "", "alone": False,
-                "by": str(who or "operator"),          # #1027
+                "why": "", "alone": bool(alone),
+                "by": ("station" if alone
+                       else str(who or "operator")),   # #1027/#1187
                 "context": {"paused": radio_paused(),
                             "short": hour_short_kinds()[:6]}})
         _judgment_save()
@@ -40409,6 +40490,70 @@ def judgment_hour_close(road: str, met: bool, attainment: float) -> None:
         _judgment_save()
     except Exception:  # noqa: BLE001
         pass
+
+
+def _judgment_reask_options(road: str) -> list[dict[str, Any]]:
+    """#1187: WHICH ANSWER THE STATION GIVES ITSELF WHEN NOBODY ANSWERS.
+
+    judgment_reask below raises a question because THE HOUR HAS JUST
+    DISPROVED A JUDGMENT: the factor is above 1.15 and the road still
+    closed its hour under 60%.  If nobody answers in half an hour,
+    orch_decide_alone answers it - and orch_decide_alone always takes
+    option[0], on a contract it states in its own docstring: "every
+    questionnaire in this file is written with the recommended answer
+    first - the safest, most reversible action, the one that keeps the
+    show on air".
+
+    option[0] here was "Keep pushing it", a multiply by 1.2.  That is
+    neither safe nor reversible, because it is a RATCHET: the only thing
+    on this station that lowers a judgment factor is judgment_hour_close,
+    which requires met == True - and a road being reasked is by
+    construction a road that is not meeting.  So the factor can only ever
+    go up.
+
+    MEASURED, in data/judgment_ledger.json, over three days: eighteen
+    reasks.  Fifteen resolved to "Keep pushing it" and every one of those
+    fifteen was the station answering itself.  Three eased, and all three
+    of those were the human.  The result is a judgment factor pinned at
+    its 2.0 cap for ad, banter and caller while those three roads close
+    their hours at 21, 32 and 38 per cent - a number at its ceiling for a
+    week, which carries no information at all, on a plan that multiplies
+    by it.
+
+    SO WHEN NOBODY ANSWERS, THE STATION EASES.  Not because easing is
+    nicer, but because it is the option that actually satisfies
+    orch_decide_alone's own stated contract:
+
+      * it is EVIDENCE-LED.  The hour is the witness that has been
+        measured; the judgment is the claim that has not.
+      * it is REVERSIBLE.  "ease" moves the factor halfway to level and
+        nothing else; the operator can dial it straight back up at
+        /api/orchestrator/judgment, and the reask comes round again in
+        twelve hours if the hour still disagrees.  Three unanswered
+        reasks take 2.00x to 1.125x, at which point the reask stops
+        firing on its own - it converges instead of ratcheting.
+      * it DOES NOT DELETE THE OPERATOR'S INSTRUCTION.  "Drop the
+        judgment" is still on the list, and it is still third: a machine
+        answering itself may RELAX a human's standing order, never
+        discard it.
+
+    The operator's own choices are untouched - all three options are
+    offered exactly as before, in a different order, and easing only
+    becomes the recommendation while #1187 is at `air`.  Off, this is the
+    template exactly as it stands tonight."""
+    keep = _opt("Keep pushing it", f"judgment:more:{road}",
+                "the shortfall is the reason to push harder")
+    ease = _opt("Ease it toward level", f"judgment:ease:{road}",
+                "let the deadlines speak for themselves - and an "
+                "unanswered push can only ever ratchet up")
+    drop = _opt("Drop the judgment", f"judgment:drop:{road}",
+                "the hour is the better witness")
+    try:
+        if pantry_orders_mode() == track_talk_segment.MODE_AIR:
+            return [ease, keep, drop]
+    except Exception:  # noqa: BLE001
+        pass
+    return [keep, ease, drop]
 
 
 def judgment_reask(roads: dict[str, Any]) -> None:
@@ -40437,14 +40582,11 @@ def judgment_reask(roads: dict[str, Any]) -> None:
                 "disagree; which one gives?",
                 "soon",
                 [{"ask": f"Hold the {label} judgment?",
-                  "options": [
-                      _opt("Keep pushing it", f"judgment:more:{road}",
-                           "the shortfall is the reason to push harder"),
-                      _opt("Ease it toward level", f"judgment:ease:{road}",
-                           "let the deadlines speak for themselves"),
-                      _opt("Drop the judgment", f"judgment:drop:{road}",
-                           "the hour is the better witness"),
-                  ]}])
+                  # #1187::reask-options:: see _judgment_reask_options:
+                  # option[0] is what orch_decide_alone takes when nobody
+                  # answers, and "Keep pushing it" first made an
+                  # unanswerable road push harder for ever.
+                  "options": _judgment_reask_options(road)}])
             break                       # one at a time, like the asking
     except Exception:  # noqa: BLE001
         pass
@@ -41325,7 +41467,12 @@ def orch_verbs() -> tuple[str, ...]:
             "piperok", "thin", "judgment")
 
 
-def orch_apply(does: str) -> str:
+def orch_apply(does: str, alone: bool = False) -> str:
+    # #1187::apply-alone:: `alone` is whether the STATION is answering
+    # its own unanswered question (orch_decide_alone) rather than the
+    # operator. Only the judgment branch reads it, and only to stop the
+    # book crediting a person with a decision the machine made. Every
+    # other caller keeps the old signature and the old behaviour.
     """#1056: do what the answer said, and say what was done.
 
     Small vocabulary on purpose - every action here is something the
@@ -41493,7 +41640,9 @@ def orch_apply(does: str) -> str:
             # ease, less, drop. Raised by the evidence re-ask and by the
             # logic graph's controls.
             move, _, road = str(arg).partition(":")
-            said = judgment_move(str(road), str(move))
+            said = judgment_move(str(road), str(move),
+                                 who=("station" if alone else "operator"),
+                                 alone=bool(alone))
         orch_save()
     except Exception:  # noqa: BLE001
         said = said or "noted"
@@ -41522,7 +41671,11 @@ def orch_answer(ask_id: str, picks: dict[str, Any],
                     break
             if not opt:
                 continue
-            did = orch_apply(str(opt.get("does") or ""))
+            # #1187::answer-alone:: orch_answer already KNOWS whether
+            # this is the operator or the station answering itself - it
+            # is about to write exactly that into the book on the next
+            # line - and it was throwing the fact away one call earlier.
+            did = orch_apply(str(opt.get("does") or ""), alone=bool(alone))
             chosen.append({"ask": q.get("ask"), "face": opt.get("face"),
                            "does": opt.get("does"), "did": did})
             out["did"].append(did)
@@ -46216,12 +46369,545 @@ async def coord_fill_gap() -> bool:
 
 
 def coord_order() -> list[str]:
-    """The roads the coordinator wants worked, in its order."""
+    """The roads the coordinator wants worked, in its order.
+
+    #1187: an ORDERING, and only an ordering. The plan beside it computes
+    a per-road shortfall in SECONDS and this throws the seconds away -
+    see coord_work_order below, which does not.
+    """  # #1187::orders-desk::
     try:
         return [str(t.get("road")) for t in (_COORD_PLAN.get("tasks") or [])
                 if t.get("road")]
     except Exception:  # noqa: BLE001
         return []
+
+
+# --- #1187: THE PLAN'S NUMBERS BECOME ORDERS, AND THE ORDERS FIT ------
+#
+# The operator: "make sure that the orchestrator has the means at his
+# disposal to manage the pantry... everything we need on the back end to
+# have a steady and stable broadcast on the front end."
+#
+# WHAT WAS BROKEN.  coord_plan above computes, every 120 seconds, a
+# per-road shortfall IN SECONDS and publishes it on two routes.  The one
+# consumer that produces anything is pantry_keeper, which reads
+# coord_order() as an ORDERING of road names and then makes exactly ONE
+# item per pass.  So the orchestrator computed a QUANTITY and handed a
+# thermostat a SORTED LIST, and the quantity was thrown away.
+#
+# Meanwhile POST /api/pantry/commission has taken a kind and a count of
+# one to eight since #893 and genuinely makes that many rounds through
+# alt_generate_job - same window, same prep_* roads, same shelf, same
+# spare engine slot.  Its path string appears exactly once in the whole
+# tree: its own decorator.  Nothing on the station has ever called it.
+#
+# WHY IT CANNOT BE WIRED NAIVELY.  The plan has no ceiling.  It
+# multiplies the shortfall by the hour learning factor (capped 3.0, and
+# pinned AT 3.0 for six of seven roads) and then by the operator's
+# judgment factor (capped 2.0, and pinned at 2.0 for ad, banter and
+# caller) and asks for the product.  Measured tonight it ordered 50,920
+# seconds of caller for the next half hour.  The task ledger knows what
+# that is worth: caller has failed 5,290 of 6,273 attempts, so it buys
+# 0.023 seconds of air per second of work and ONE FINISHED phone call
+# costs 6,385 seconds of single-lane room.  50,920s of caller is 342
+# finished calls is twenty-five DAYS of work, ordered for a thirty-minute
+# book.  And the commission road is the least-braked producer on the box:
+# it skips the concurrent-ticket cap its sibling at
+# /api/schedule/segment/generate enforces, and it never checks
+# shelf_full.  Wired naively, a saturated plan floods the engine.
+#
+# SO THE WIRE CARRIES THE CLAMP.  coord_work_order answers the plan's
+# seconds in ITEMS THE ROAD CAN ACTUALLY FINISH, priced at its measured
+# cost and discounted by its measured odds, and the total must fit the
+# room that exists.  Every number it uses is one the station already
+# computes - task_cost (the p90 of the last sixty attempts), task_gain
+# (the air one finished item has actually been worth), task_odds (#1067,
+# written since task_note was written and read by exactly one caller
+# before this one), shelf_full, and ALT_GEN_MOST / ALT_GEN_LIVE, the two
+# caps the commission route's own sibling already obeys.
+#
+# room per FINISHED item = task_cost(road) / task_odds(road).  That is
+# the reciprocal of task_rate(), per item: a road that finishes a sixth
+# of the time costs six attempts per item, and pricing it as though it
+# finished every time is precisely how twenty-five days of work fitted
+# inside a half-hour book on paper.
+PANTRY_ORDER_DIR = data_path("pantry_orders")
+PANTRY_ORDER_ENV = "SPARK_AGENT_PANTRY_ORDERS"
+# The same switch class and the same STRICT one-token parse the record
+# talk desk uses (#1179): a file holding a sentence is OFF, however
+# promising a word inside it looks, because an operator must not be able
+# to commission a pantry by leaving himself a note.  Missing, empty,
+# unreadable or half-written: off, every time.  The env slot is remapped
+# so this switch cannot be thrown by the record talk one - the same
+# remap track_talk_segment does for its own follow switch.
+PANTRY_ORDER_SWITCH = track_talk_segment.TalkSwitch(
+    PANTRY_ORDER_DIR,
+    env={track_talk_segment.ENV_NAME:
+         os.environ.get(PANTRY_ORDER_ENV, "")},
+    clock=time.time)
+_PANTRY_ORDER_SAID: dict[str, Any] = {"mode": None}
+# The half hour coord_plan plans for, and the share of it a work order
+# may claim.  HALF, because pantry_keeper is already working the same
+# single lane and the commission takes the spare engine slot BEHIND it -
+# an order that claimed the whole half hour would be ordering the
+# keeper's own room a second time.
+PANTRY_ORDER_HALF = 1800.0
+PANTRY_ORDER_SHARE = 0.5
+# ...except for the single most urgent road the plan named (bare first,
+# then soonest deadline), which may stretch to the whole half hour for
+# ONE item.  This is prep_deadline_pick's own documented rule - "the
+# budget exists to stop long work crowding out short work, and it has no
+# business refusing the one piece of work the clock has already ordered"
+# - bounded here to one item of one road, so that a road with GOOD odds
+# which merely misses the share is not starved for ever, while a road
+# with terrible odds is still correctly refused (caller prices at 6,385s,
+# which is 3.5x this stretch: it is refused either way, out loud).
+PANTRY_ORDER_HEAD_MOST = 1800.0
+PANTRY_ORDER_ROADS = 3                  # roads carrying a ticket at once
+PANTRY_ORDER_EVERY = 120.0              # the plan's own refresh clock
+PANTRY_ORDER_ODDS_FLOOR = 0.05          # task_odds' own floor, restated
+
+
+def pantry_orders_mode() -> str:
+    """off | trace | air.  Never raises; an unreadable switch is off.
+
+    Says so in the log when it CHANGES and only then - the rule #1179's
+    switch keeps, and for its reason: a line every three seconds saying
+    the switch is still off is not a log."""
+    mode = track_talk_segment.MODE_OFF
+    try:
+        mode = PANTRY_ORDER_SWITCH.mode()
+    except Exception:  # noqa: BLE001
+        return track_talk_segment.MODE_OFF
+    was = _PANTRY_ORDER_SAID["mode"]
+    if mode != was:
+        _PANTRY_ORDER_SAID["mode"] = mode
+        if was is not None:
+            try:
+                pipeline_log("lookahead",
+                             "#1187: " + pantry_orders_say(mode))
+            except Exception:  # noqa: BLE001
+                pass
+    return mode
+
+
+def pantry_orders_on() -> bool:
+    """Is the work order being COSTED at all?  trace and air both are."""
+    return pantry_orders_mode() != track_talk_segment.MODE_OFF
+
+
+def pantry_orders_air() -> bool:
+    """May the work order actually COMMISSION anything?  air alone."""
+    return pantry_orders_mode() == track_talk_segment.MODE_AIR
+
+
+def pantry_orders_say(mode: str, order: dict[str, Any] | None = None) -> str:
+    """One sentence for the board, so the operator can read which of the
+    three positions this is in from the same panel he is looking at.
+    #1128's lesson: an instrument nothing reads is a dead wire."""
+    if mode == track_talk_segment.MODE_OFF:
+        return ("The pantry takes no orders: the coordinator's work order "
+                "is a list of road NAMES, the keeper makes one item a "
+                "pass, and the seconds the plan computed are thrown away "
+                "(#1187 is off).")
+    said = str((order or {}).get("say") or "")
+    if mode == track_talk_segment.MODE_TRACE:
+        return ("The pantry's orders are being COSTED but not placed: the "
+                "plan's seconds become items priced at each road's "
+                "measured cost and odds, the total is clamped to the room "
+                "that exists, and nothing at all is commissioned. "
+                + said)
+    return ("The pantry takes its orders from the plan: the plan's "
+            "seconds become items, priced at each road's measured cost "
+            "and discounted by its measured odds, clamped to the room "
+            "that exists and to the engine's own ticket caps. " + said)
+
+
+def pantry_order_budget() -> float:
+    """The room a work order may claim in one half hour, in seconds."""
+    return round(PANTRY_ORDER_HALF * PANTRY_ORDER_SHARE, 1)
+
+
+def _order_items(want: float, gain: float) -> int:
+    """ceil(want / gain), in whole items, without importing a library for
+    it.  `gain` is what ONE finished item of this road has actually been
+    worth in seconds of air, so this is "how many of these would cover
+    what the plan asked for" - and it is the first place the plan's
+    seconds ever become a countable thing."""
+    try:
+        gain = max(0.1, float(gain or 0))
+        want = max(0.0, float(want or 0))
+    except (TypeError, ValueError):
+        return 0
+    whole = int(want // gain)
+    return whole + (1 if want - (whole * gain) > 0.001 else 0)
+
+
+def coord_work_order(plan: dict[str, Any] | None = None,
+                     budget: float | None = None,
+                     price: Any = None,
+                     covers: Any = None,
+                     chance: Any = None,
+                     full: Any = None,
+                     label: Any = None) -> dict[str, Any]:
+    """#1187: THE WORK ORDER, IN ITEMS THAT FIT.
+
+    Takes coord_plan's tasks IN THE PLAN'S OWN ORDER - which is bare
+    first, then soonest deadline, and that ordering is the orchestrator's
+    own judgment and is NOT one of the saturated numbers - and answers
+    with a countable order that the box can finish inside the half hour.
+
+    Every road gets three questions asked of it, in this order, and each
+    refusal is kept with the arithmetic that caused it, because "what did
+    you decide not to do instead" is half of what the operator asked for:
+
+      1. is its shelf already full?          shelf_full(road)
+      2. how many items is the plan asking?  ceil(want / task_gain)
+      3. what does one FINISHED item cost?   task_cost / task_odds
+
+    and then the budget decides.  Never raises: a planner that can take
+    the station off air is worse than no planner (coord_tick's own rule).
+
+    The four callables are injected so the harness can drive this against
+    made-up ledgers; unset, they are the station's own."""
+    price = price if price is not None else task_cost
+    covers = covers if covers is not None else task_gain
+    chance = chance if chance is not None else task_odds
+    full = full if full is not None else shelf_full
+    if label is None:
+        def label(road: str) -> str:
+            return str(SHELF_LABEL.get(road, road))
+    room = float(pantry_order_budget() if budget is None else budget)
+    # THE HEAD ROAD'S STRETCH IS SPENT ONCE, on the first road that
+    # actually reaches the budget question - not on "the first road
+    # anything was ordered for". Those two readings differ exactly when
+    # the most urgent road is refused, which is the live case: caller is
+    # first and unaffordable, and under the looser reading the stretch
+    # simply fell through to banter (1,277s a finished round at 14.5%
+    # odds) and then to whatever was behind that, until something took
+    # it. One road, once, whether it takes the offer or not.
+    head = True
+    out: dict[str, Any] = {
+        "at": time.time(),
+        "half": str((plan or {}).get("half") or ""),
+        "budget_seconds": round(room, 1),
+        "head_most_seconds": round(float(PANTRY_ORDER_HEAD_MOST), 1),
+        "roads_most": int(PANTRY_ORDER_ROADS),
+        "items_most": int(ALT_GEN_MOST),
+        "orders": [], "stood_down": [],
+        "asked_seconds": 0.0, "asked_items": 0,
+        "items": 0, "covers_seconds": 0.0,
+        "spent_seconds": 0.0, "left_seconds": round(room, 1),
+        "say": ""}
+    left = room
+    try:
+        for task in list((plan or {}).get("tasks") or []):
+            road = str((task or {}).get("road") or "")
+            if not road:
+                continue
+            want = max(0.0, float(task.get("want_seconds") or 0))
+            cost, gain, odds = 1.0, 0.1, 1.0
+            try:
+                cost = max(1.0, float(price(road) or 0))
+            except Exception:  # noqa: BLE001
+                cost = 1.0
+            try:
+                gain = max(0.1, float(covers(road) or 0))
+            except Exception:  # noqa: BLE001
+                gain = 0.1
+            try:
+                odds = min(1.0, max(PANTRY_ORDER_ODDS_FLOOR,
+                                    float(chance(road) or 0)))
+            except Exception:  # noqa: BLE001
+                odds = 1.0
+            each = round(cost / odds, 1)
+            raw = _order_items(want, gain)
+            out["asked_seconds"] = round(
+                float(out["asked_seconds"]) + want, 1)
+            out["asked_items"] = int(out["asked_items"]) + raw
+            row: dict[str, Any] = {
+                "road": road, "label": str(label(road)),
+                "want_seconds": round(want, 1),
+                "wanted_items": raw,
+                "cost_seconds": round(cost, 1),
+                "gain_seconds": round(gain, 1),
+                "odds": round(odds, 3),
+                "each_seconds": each,
+                # The two saturated multipliers, carried through so the
+                # surface can SHOW that the want it is clamping was
+                # inflated - a factor pinned at its cap for a week
+                # carries no information, and this is where that becomes
+                # visible instead of merely true.
+                "learning_factor": round(
+                    float(task.get("learning_factor") or 1.0), 3),
+                "judgment_factor": round(
+                    float(task.get("judgment_factor") or 1.0), 3),
+                "inflation": round(
+                    float(task.get("learning_factor") or 1.0)
+                    * float(task.get("judgment_factor") or 1.0), 2),
+                "due_in": round(float(task.get("due_in") or 1e9), 1),
+                "bare": bool(task.get("bare")),
+                "plan_why": str(task.get("why") or "")[:300],
+                "items": 0, "room_seconds": 0.0, "covers_seconds": 0.0,
+            }
+            try:
+                shut = bool(full(road))
+            except Exception:  # noqa: BLE001
+                shut = False
+            if shut:
+                row["why"] = ("the shelf for %s is already full - ordering "
+                              "more of it is a loop" % row["label"])
+                out["stood_down"].append(row)
+                continue
+            if raw <= 0:
+                row["why"] = ("the plan asks nothing of %s this half hour"
+                              % row["label"])
+                out["stood_down"].append(row)
+                continue
+            if len(out["orders"]) >= int(PANTRY_ORDER_ROADS):
+                row["why"] = (
+                    "%d road(s) already carry this half hour's order, "
+                    "which is every ticket the writing room may hold at "
+                    "once (ALT_GEN_LIVE)" % int(PANTRY_ORDER_ROADS))
+                out["stood_down"].append(row)
+                continue
+            # THE HEAD ROAD'S STRETCH.  The plan's own most urgent road -
+            # bare before deadline before everything else - and only ever
+            # for ONE item.  Everything behind it lives inside the share.
+            reach = left
+            stretched = False
+            if (head and each > left
+                    and float(PANTRY_ORDER_HEAD_MOST) > left):
+                reach = float(PANTRY_ORDER_HEAD_MOST)
+                stretched = True
+            fits = int(reach // each) if each > 0 else 0
+            items = max(0, min(raw, fits, int(ALT_GEN_MOST)))
+            if stretched:
+                items = min(items, 1)   # the stretch buys ONE, never more
+            head = False                # spent, taken or not
+            if items <= 0:
+                row["why"] = (
+                    "one finished %s measures %ds of room (%ds a try at "
+                    "%d%% odds, measured) and %ds is left of the %ds this "
+                    "half hour may spend%s"
+                    % (row["label"], int(each), int(cost),
+                       int(round(odds * 100)), int(left), int(room),
+                       " - even stretched to the whole half hour"
+                       if stretched else ""))
+                out["stood_down"].append(row)
+                continue
+            spend = round(items * each, 1)
+            row["items"] = items
+            row["room_seconds"] = spend
+            row["covers_seconds"] = round(items * gain, 1)
+            row["stretched"] = bool(stretched)
+            row["why"] = (
+                "%d of %s - the plan asks %ds of it and one finished one "
+                "buys %ds of air, so %d cover%s that; priced at %ds of "
+                "room each (%ds a try at %d%% odds) it is %ds of the %ds "
+                "this half hour may spend%s"
+                % (items, row["label"], int(want), int(gain), raw,
+                   "" if raw == 1 else "s", int(each), int(cost),
+                   int(round(odds * 100)), int(spend), int(room),
+                   "; it is the plan's most urgent road, so it may take "
+                   "the whole half hour for one item" if row["stretched"]
+                   else ""))
+            out["orders"].append(row)
+            left = max(0.0, round(left - spend, 1))
+        out["spent_seconds"] = round(sum(
+            float(r.get("room_seconds") or 0) for r in out["orders"]), 1)
+        out["covers_seconds"] = round(sum(
+            float(r.get("covers_seconds") or 0) for r in out["orders"]), 1)
+        out["items"] = sum(int(r.get("items") or 0) for r in out["orders"])
+        out["left_seconds"] = round(
+            max(0.0, room - float(out["spent_seconds"])), 1)
+        out["say"] = coord_work_order_say(out)
+    except Exception:  # noqa: BLE001
+        out["say"] = "the work order could not be costed"
+    return out
+
+
+def coord_work_order_say(order: dict[str, Any]) -> str:
+    """The order in one sentence, with the numbers in it.
+
+    This is the sentence that answers the operator's question - "this
+    half hour you ordered N of road X: how long will that take, what did
+    you decide not to do instead, and why that road" - so it names the
+    order, its room, the air it buys, and the first two things that were
+    stood down WITH their arithmetic."""
+    try:
+        rows = list((order or {}).get("orders") or [])
+        held = list((order or {}).get("stood_down") or [])
+        if not rows:
+            return ("nothing can be ordered this half hour"
+                    + ("; " + str(held[0].get("why") or "") if held else ""))
+        made = ", ".join(
+            "%d x %s (%ds of room)"
+            % (int(r.get("items") or 0), r.get("label"),
+               int(float(r.get("room_seconds") or 0)))
+            for r in rows)
+        out = ("this half hour: " + made + " - %ds of the %ds room, "
+               "buying %ds of air"
+               % (int(float(order.get("spent_seconds") or 0)),
+                  int(float(order.get("budget_seconds") or 0)),
+                  int(float(order.get("covers_seconds") or 0))))
+        if held:
+            out += ("; NOT: " + "; ".join(
+                "%s, because %s" % (h.get("label"), h.get("why"))
+                for h in held[:2]))
+        return out
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_PANTRY_ORDER_AT = [0.0]
+_PANTRY_ORDER_LAST: dict[str, Any] = {}
+
+
+def pantry_orders_state() -> dict[str, Any]:
+    """#1187: everything the orders desk knows, for the glass.
+
+    Answers, with numbers: what was ordered this half hour, how long it
+    will take, what was decided against instead, and why that road."""
+    out: dict[str, Any] = {"mode": track_talk_segment.MODE_OFF,
+                           "on": False, "commissioning": False,
+                           "order": {}, "say": ""}
+    try:
+        mode = pantry_orders_mode()
+        order = dict(_PANTRY_ORDER_LAST)
+        out = {
+            "mode": mode,
+            "on": mode != track_talk_segment.MODE_OFF,
+            "commissioning": mode == track_talk_segment.MODE_AIR,
+            "switch": str(PANTRY_ORDER_DIR / "mode"),
+            "positions": list(track_talk_segment.MODES),
+            "budget_seconds": pantry_order_budget(),
+            "every_seconds": float(PANTRY_ORDER_EVERY),
+            "at": float(order.get("at") or 0),
+            "order": order,
+            "ordered": [
+                {"road": r.get("road"), "label": r.get("label"),
+                 "items": r.get("items"),
+                 "room_seconds": r.get("room_seconds"),
+                 "covers_seconds": r.get("covers_seconds"),
+                 "each_seconds": r.get("each_seconds"),
+                 "cost_seconds": r.get("cost_seconds"),
+                 "odds": r.get("odds"), "inflation": r.get("inflation"),
+                 "job": r.get("job"), "held": r.get("held"),
+                 "why": r.get("why")}
+                for r in (order.get("orders") or [])],
+            "instead": [
+                {"road": r.get("road"), "label": r.get("label"),
+                 "want_seconds": r.get("want_seconds"),
+                 "wanted_items": r.get("wanted_items"),
+                 "each_seconds": r.get("each_seconds"),
+                 "odds": r.get("odds"), "why": r.get("why")}
+                for r in (order.get("stood_down") or [])],
+            "plan_why": str(_COORD_PLAN.get("why") or ""),
+            "say": pantry_orders_say(mode, order),
+        }
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+async def pantry_orders_tick() -> dict[str, Any]:
+    """#1187: the plan's numbers, become orders, on the plan's own clock.
+
+    Off, this returns at once and the station is exactly as it was.  In
+    trace it costs the order, publishes it and dispatches NOTHING - which
+    is the position to read before turning it up.  In air it places the
+    tickets, and it places them through the SAME door the operator's own
+    /api/pantry/commission uses, with the two brakes that door skips put
+    back on: the concurrent-ticket cap ALT_GEN_LIVE, and shelf_full.
+
+    Never raises.  A work order that can take the station off air is
+    worse than no work order."""
+    out: dict[str, Any] = {}
+    try:
+        mode = pantry_orders_mode()
+        if mode == track_talk_segment.MODE_OFF:
+            return out
+        now = time.time()
+        if now - float(_PANTRY_ORDER_AT[0] or 0) < float(PANTRY_ORDER_EVERY):
+            return out
+        _PANTRY_ORDER_AT[0] = now
+        order = coord_work_order(dict(_COORD_PLAN))
+        order["mode"] = mode
+        order["placed"] = 0
+        out = order
+        if mode != track_talk_segment.MODE_AIR:
+            _PANTRY_ORDER_LAST.clear()
+            _PANTRY_ORDER_LAST.update(order)
+            pipeline_log(
+                "lookahead",
+                "#1187 TRACE - costed, not placed: "
+                + str(order.get("say") or "")[:400],
+                extra=("WHAT THE ORDER WOULD HAVE BEEN (#1187, trace)\n\n"
+                       + str(order.get("say") or "")
+                       + "\n\nTHE PLAN IT WAS READ FROM:\n"
+                       + str(_COORD_PLAN.get("why") or "")))
+            return out
+        # The brake the commission route skips and its sibling enforces.
+        live = 0
+        try:
+            live = sum(1 for j in _ALT_JOBS.values()
+                       if str(j.get("state") or "")
+                       in ("queued", "waiting", "writing"))
+        except Exception:  # noqa: BLE001
+            live = 0
+        window = ""
+        try:
+            window = alt_window()
+        except Exception:  # noqa: BLE001
+            window = ""
+        order["window"] = window
+        for row in (order.get("orders") or []):
+            road = str(row.get("road") or "")
+            items = max(1, min(int(ALT_GEN_MOST),
+                               int(row.get("items") or 1)))
+            if live >= ALT_GEN_LIVE:
+                row["held"] = ("%d lot(s) of alternates are already being "
+                               "written - this road takes its turn at the "
+                               "next pass rather than queueing behind "
+                               "them" % live)
+                continue
+            if road not in ALT_PREP_KINDS:
+                row["held"] = ("nothing on the board writes %s ahead"
+                               % str(row.get("label") or road))
+                continue
+            job = "ord" + uuid.uuid4().hex[:9]
+            alt_job_put(job, kind=road, count=items, state="queued",
+                        made=0, refused=0, new=[],
+                        label=SHELF_LABEL.get(road, road),
+                        ordered="#1187",
+                        why=str(row.get("why") or "")[:200],
+                        window=window)
+            fire_and_forget(alt_generate_job(job, road, items))
+            row["job"] = job
+            live += 1
+            order["placed"] = int(order.get("placed") or 0) + 1
+        _PANTRY_ORDER_LAST.clear()
+        _PANTRY_ORDER_LAST.update(order)
+        if order.get("placed"):
+            note_action("the orchestrator commissioned the pantry - "
+                        + str(order.get("say") or "")[:200])
+        pipeline_log(
+            "lookahead",
+            "#1187 the pantry was commissioned from the plan: "
+            + str(order.get("say") or "")[:400],
+            extra=("WHAT WAS ORDERED, AND WHAT WAS NOT (#1187)\n\n"
+                   + str(order.get("say") or "")
+                   + "\n\nTHE PLAN IT WAS READ FROM:\n"
+                   + str(_COORD_PLAN.get("why") or "")))
+    except Exception as exc:  # noqa: BLE001
+        try:
+            pipeline_log("lookahead",
+                         "#1187 the work order fell over: %s: %s"
+                         % (type(exc).__name__, exc))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 def coordinator_state() -> dict[str, Any]:
@@ -46345,6 +47031,22 @@ async def coordinator() -> None:
             # about it is a report, not a coordinator.
             try:
                 await coord_fill_gap()
+            except Exception:  # noqa: BLE001
+                pass
+            # #1187::loop-hook:: THE PLAN'S NUMBERS BECOME ORDERS HERE.
+            #
+            # This is the wire that did not exist. coord_plan below
+            # computes the shortfall in seconds; pantry_orders_tick turns
+            # those seconds into a countable, clamped order and - at
+            # `air` - places it through the same door
+            # /api/pantry/commission uses, with the two brakes that door
+            # skips put back on. Off (the default) it returns at once.
+            #
+            # Not awaited, for #1119's reason exactly: the coordinator is
+            # a fifteen-second clock and anything that can take minutes
+            # must not be allowed to become the coordinator.
+            try:
+                fire_and_forget(pantry_orders_tick())
             except Exception:  # noqa: BLE001
                 pass
             here = _half_key()
@@ -117989,6 +118691,18 @@ async def api_orch_logic(
         "workshop": {"last": _WORKSHOP_LAST[0],
                      "paused_for": round(radio_paused_for(), 1)},
         "plan_why": str(_COORD_PLAN.get("why") or ""),
+        # #1187::logic-surface:: WHAT WAS ORDERED, AND WHAT INSTEAD.
+        #
+        # `order` above is the plan as a list of road NAMES - which is
+        # all any consumer has ever been given. This is the plan as a
+        # countable, priced, clamped WORK ORDER, and between them
+        # `ordered` and `instead` answer the question the operator asked
+        # for: this half hour you ordered N of road X - how long will
+        # that take (room_seconds, and each_seconds per finished item),
+        # what did you decide not to do instead (`instead`, with the
+        # arithmetic that refused it), and why that road (`why`, and the
+        # plan's own `due_in`/`bare` ordering that put it first).
+        "commission": pantry_orders_state(),
         "pipeline": orchestrator_pipeline_state(),
     }
 
