@@ -73373,8 +73373,21 @@ def _sfx_cadence_pick() -> Path | None:
             and sfx_id(Path(p)) not in banned
             and not sfx_is_video(Path(p))
             and weights.get(sfx_id(Path(p)), 1.0) > 0.05]
-    last = str(_SFX_CADENCE_STATUS.get("last_sample") or "")
-    fresh = [p for p in pool if str(p) != last]
+    # 2026-09-16 (#1224): BOARD1224_RING - a memory, not a single name.
+    #
+    # This held `last` - ONE clip - so it refused only what it had just played
+    # and a sample could return on the very next-but-one punctuation. Measured
+    # on the air log: this road played 57 of the last 70 stings, landing on 5
+    # distinct source files across 42 plays. #1221 and #1223 fixed the other
+    # roads' rotation and memory; this is the one that does most of the
+    # playing, and it was still choosing from a pool of "anything but one".
+    #
+    # The keep is taken from the pool BEFORE filtering and the filter is
+    # skipped when it would leave nothing, so a deep ring can never starve the
+    # draw - it degrades to the full pool, exactly as before.
+    recent = _RADIO.setdefault("recent", {}).setdefault("sfx-cadence", [])
+    keep = sting_keep(len(pool))
+    fresh = [p for p in pool if str(p) not in recent]
     if fresh:
         pool = fresh
     # Never walk the share or probe its entire catalogue on the microphone.
@@ -73382,7 +73395,12 @@ def _sfx_cadence_pick() -> Path | None:
         path = random.choices(pool, weights=[weights.get(sfx_id(p), 1.0) for p in pool], k=1)[0]
         pool.remove(path)
         if path.is_file() and 0 < sfx_seconds(path) <= sfx_cap_seconds():
+            # Still written: other readers report what went out last. It is
+            # simply no longer the thing that decides what may go out next.
             _SFX_CADENCE_STATUS["last_sample"] = str(path)
+            recent.append(str(path))
+            if keep:
+                del recent[:-keep]
             return path
     return None
 
