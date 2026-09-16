@@ -4786,6 +4786,51 @@ def format_library_context(hits: list[dict[str, Any]]) -> str:
     )
 
 
+# 2026-09-16 (#1219): POOL1219_WIDER - how many threads the station may use.
+#
+# Python's default is min(32, nproc + 4) = 24 here, and that default is sized
+# for CPU-bound work. Nearly everything this station hands to a thread is I/O
+# against a CIFS share, where a thread spends its life BLOCKED and costs a
+# stack rather than a core. Measured three separate times tonight, with three
+# different culprits, all 24 workers occupied and ~95 GET routes dead behind
+# them - the SFX walk, then the same walk stampeding, then the music library's
+# tag reader (20 of 24 inside mutagen's get_size).
+POOL_MOST = int(os.getenv("PINE_POOL_MOST", "128"))
+
+
+@app.on_event("startup")
+async def _startup_pool() -> None:
+    """#1219: WIDEN THE ONE POOL THE WHOLE STATION SHARES.
+
+    `run_in_executor` appears exactly once in this file, so all ~478
+    `asyncio.to_thread` sites share the default executor. One slow road on a
+    remote share therefore takes every other road with it, and the operator
+    hears it as "I'm not hearing the broadcast" while /healthz and /api/pulse
+    answer in milliseconds and say everything is fine.
+
+    This is DEPTH, not the whole answer. The right long cure is a dedicated
+    bounded executor for library work so it cannot compete for these threads
+    at all; that touches hundreds of call sites and is not a thing to do to a
+    live station at one in the morning. This makes the slow road unable to
+    take the fast ones down with it.
+    """
+    try:
+        import asyncio as _asyncio
+        from concurrent.futures import ThreadPoolExecutor as _Pool
+        _asyncio.get_running_loop().set_default_executor(
+            _Pool(max_workers=POOL_MOST, thread_name_prefix="pine-pool"))
+        pipeline_log("air", "#1219: the shared thread pool is %d wide - the "
+                            "default 24 was three times tonight the reason "
+                            "music could not be served" % POOL_MOST)
+    except Exception as exc:  # noqa: BLE001
+        # A station that cannot widen its pool still runs on the default one.
+        try:
+            pipeline_log("air", "#1219: could not widen the thread pool: %s"
+                         % type(exc).__name__)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @app.on_event("startup")
 async def _startup_library() -> None:
     """#1158: the shelf assimilates on its own.
