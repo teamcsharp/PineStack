@@ -138683,6 +138683,11 @@ async def air_relieve_hold(seconds: float = 60.0) -> None:
         await asyncio.sleep(7.0)
 
 
+# #1216: the longest a diagnostic may spend measuring how slow things
+# are, while the station it is diagnosing is silent.
+PROBE_READ_MOST = 5.0
+
+
 async def media_speed_probe() -> dict[str, Any]:
     """#1215: how fast is a voice clip actually served, and why not.
 
@@ -138703,11 +138708,35 @@ async def media_speed_probe() -> dict[str, Any]:
             return out
         path = VOICE_MEDIA_DIR / pick
         began = time.time()
-        blob = await asyncio.to_thread(path.read_bytes)
+        # 2026-09-15 (#1216): PROBE1216_BOUND. This read was unbounded, and it
+        # runs ON THE DEAD-AIR LADDER - the road taken when nobody has been
+        # heard. VOICE_MEDIA_DIR is on the share, so when the share is slow
+        # (exactly the condition that makes the air go quiet) the probe was
+        # slow too: measured on today's ladder rows the process sat between
+        # 2.9 and 567.3 SECONDS before reaching the rung it was climbing
+        # towards. A diagnostic inside a cure must never outlast the fault it
+        # is diagnosing.
+        #
+        # Five seconds is generous for what is being measured: a voice clip
+        # that takes longer than that to read IS the answer, and saying so is
+        # worth more than the exact figure.
+        #
+        # wait_for cannot stop the worker thread, so a wedged read still holds
+        # one pool worker until the filesystem returns. What it stops is the
+        # LADDER waiting on it, which is the harm. Since #1215 freed the pool
+        # there are workers to spare; a held ladder there never were.
+        blob = await asyncio.wait_for(
+            asyncio.to_thread(path.read_bytes), PROBE_READ_MOST)
         took = max(0.001, time.time() - began)
         out.update(clip=pick[:12], kb=round(len(blob) / 1024.0, 1),
                    ms=int(took * 1000),
                    kbps=int(len(blob) / 1024.0 / took))
+    except asyncio.TimeoutError:                                   # #1216
+        out["say"] = ("a voice clip did not finish reading in %.0fs - the "
+                      "share is the slow thing, and that is the answer"
+                      % PROBE_READ_MOST)
+        out["ms"] = int(PROBE_READ_MOST * 1000)
+        return out
     except Exception as exc:  # noqa: BLE001
         out["say"] = "could not time a clip: " + type(exc).__name__
         return out
