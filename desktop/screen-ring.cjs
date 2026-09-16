@@ -192,6 +192,10 @@ const clipMux = require('./clip-mux.cjs');
 const SEGMENT_MS = 2000;
 const HOLD_DEFAULT_S = 30;
 const HOLD_MIN_S = 5;
+/* #1211: the ring keeps this much MORE than it offers, so the oldest piece of
+ * a full-length window is not standing on the edge of its own eviction while
+ * an export reads it. Two segments. */
+const HOLD_GRACE_S = 4;
 const HOLD_MAX_S = 600;           /* ten minutes */
 const HOLD_MAX_BYTES = 900 * 1024 * 1024;
 
@@ -255,6 +259,11 @@ class ScreenRing {
      * own clocks and a merged list could not say which ring a hole was in. */
     this.sound = [];
     this.holdSeconds = HOLD_DEFAULT_S;
+    /* #1211: A CUT PINS WHAT IT IS READING.
+     * pins: file -> how many exports are currently reading it. doomed: files
+     * the ring has already let go of but which an export still needs. */
+    this.pins = new Map();
+    this.doomed = new Set();
     this.running = false;
     this.detail = 'not started';
     this.startedAt = 0;
@@ -402,7 +411,8 @@ class ScreenRing {
 
   /* Old pieces go, by time first and by weight second. */
   prune() {
-    const keepFrom = nowMs() - (this.holdSeconds * 1000);
+    const keepFrom = nowMs()
+      - ((this.holdSeconds + HOLD_GRACE_S) * 1000);          /* #1211 */
     while (this.pieces.length > 1) {
       const first = this.pieces[0];
       if (first.at + first.ms >= keepFrom) break;
@@ -425,13 +435,44 @@ class ScreenRing {
   drop(piece) {
     this.pieces.shift();
     this.dropped += 1;
-    try { fs.unlinkSync(piece.file); } catch (e) { /* already gone */ }
+    this.erase(piece.file);
   }
 
   dropSound(piece) {
     this.sound.shift();
     this.soundDropped += 1;
-    try { fs.unlinkSync(piece.file); } catch (e) { /* already gone */ }
+    this.erase(piece.file);
+  }
+
+  /* #1211: the one road that removes bytes. A file an export is reading is
+   * recorded as doomed and unlinked when that export lets go - the piece
+   * still leaves the ring at the right moment, it is only the bytes that
+   * outlive it, and only for as long as somebody is actually reading them. */
+  erase(file) {
+    if (this.pins.has(file)) { this.doomed.add(file); return; }
+    try { fs.unlinkSync(file); } catch (e) { /* already gone */ }
+  }
+
+  /* Refcounted, not a flag: two exports may want the same piece, and the
+   * second one letting go must not delete what the first is still reading. */
+  pinPieces(pieces) {
+    const held = [];
+    for (const piece of pieces || []) {
+      this.pins.set(piece.file, (this.pins.get(piece.file) || 0) + 1);
+      held.push(piece.file);
+    }
+    return held;
+  }
+
+  releasePieces(files) {
+    for (const file of files || []) {
+      const left = (this.pins.get(file) || 0) - 1;
+      if (left > 0) { this.pins.set(file, left); continue; }
+      this.pins.delete(file);
+      if (!this.doomed.has(file)) continue;
+      this.doomed.delete(file);
+      try { fs.unlinkSync(file); } catch (e) { /* already gone */ }
+    }
   }
 
   forget() {
@@ -440,6 +481,8 @@ class ScreenRing {
     for (const p of this.sound) { try { fs.unlinkSync(p.file); } catch (e) {} }
     this.pieces = [];
     this.sound = [];
+    this.pins.clear();                                          /* #1211 */
+    this.doomed.clear();
     if (this.dir) { try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch (e) {} }
     this.dir = null;
   }
@@ -733,16 +776,30 @@ class ScreenRing {
    * cannot accumulate over a ten-minute cut. The last piece has no next, so
    * it declares what it measured. */
   listFile(dir, pieces, name) {
+    /* #1211: NEVER NAME A FILE THAT IS NOT THERE. One stale name fails the
+     * whole concat, which costs the operator the entire recording instead of
+     * the single moment that went missing. The durations are worked out AFTER
+     * this filter, so every surviving piece still begins at exactly
+     * (at_k - at_0) and the piece before a hole holds its last frame across
+     * it - a freeze over the gap, rather than everything after it sliding
+     * early. */
+    const here = [];
+    let missing = 0;
+    for (const piece of pieces) {
+      let there = false;
+      try { there = fs.existsSync(piece.file); } catch (e) { there = false; }
+      if (there) here.push(piece); else missing += 1;
+    }
     const lines = [];
-    for (let i = 0; i < pieces.length; i += 1) {
-      const p = pieces[i];
+    for (let i = 0; i < here.length; i += 1) {
+      const p = here[i];
       lines.push("file '" + p.file.replace(/\\/g, '/').replace(/'/g, "'\\''") + "'");
-      const next = (i + 1 < pieces.length) ? (pieces[i + 1].at - p.at) : p.ms;
+      const next = (i + 1 < here.length) ? (here[i + 1].at - p.at) : p.ms;
       lines.push('duration ' + (Math.max(1, next) / 1000).toFixed(3));
     }
     const list = path.join(dir, name || 'pieces.txt');
     fs.writeFileSync(list, lines.join('\n') + '\n', 'utf8');
-    return list;
+    return { path: list, missing, count: here.length };
   }
 
   /* An mp4 of the window, written to `out`. Output-side -ss and -t, which
@@ -814,9 +871,29 @@ class ScreenRing {
       ? (got.pieces[0].at - heard.pieces[0].at) : null;
     const dir = clipMux.stash();
     const audio = this.soundFor(got, want.video_only, heard, shift);
+    /* #1211: hold the bytes for as long as ffmpeg is reading them. This is
+     * the cure for the operator's "Impossible to open ... No such file or
+     * directory": the ring goes on recording throughout the encode, and
+     * without this the oldest piece in the list is unlinked mid-read. */
+    const held = this.pinPieces(got.pieces)
+      .concat(audio.present && heard ? this.pinPieces(heard.pieces) : []);
     try {
-      const list = this.listFile(dir, got.pieces);
-      const soundList = audio.present ? this.listFile(dir, heard.pieces, 'sound.txt') : '';
+      const shown = this.listFile(dir, got.pieces);
+      const list = shown.path;
+      if (!shown.count) {
+        throw new Error('every piece of that window had already been swept');
+      }
+      if (shown.missing) {
+        audio.pieces_missing = shown.missing;
+      }
+      const soundCut = (audio.present && heard)
+        ? this.listFile(dir, heard.pieces, 'sound.txt') : null;
+      const soundList = soundCut ? soundCut.path : '';
+      if (soundCut && !soundCut.count) {
+        audio.present = false;
+        audio.state = 'unavailable';
+        audio.detail = 'the sound for that window had already been swept';
+      }
       const out = want.out || path.join(dir, 'screen.mp4');
       const build = (withSound) => ['-hide_banner', '-nostdin', '-y',
         '-f', 'concat', '-safe', '0', '-i', list,
@@ -855,6 +932,8 @@ class ScreenRing {
     } catch (error) {
       clipMux.forget(dir);
       return { ok: false, detail: error.message, held: got.held, audio };
+    } finally {
+      this.releasePieces(held);                                 /* #1211 */
     }
   }
 
