@@ -111,6 +111,39 @@
   var dragging = false;
   var sayAt = 0;                /* which of Glyphy's lines is showing */
   var pressed = false;          /* a pointer is down: do not repaint under it */
+  /* 2026-09-16 (#1220): HELD WHILE HE READS.
+   *
+   * `pressed` alone was never enough: it is true only while a pointer is
+   * physically down, so it covers a drag and misses momentum scrolling, plain
+   * reading, and a focused control - and paint() opens with innerHTML = '',
+   * which destroys whatever had focus. That is what he felt as the cursor
+   * moving. These stamp every sign of a person and hold the rebuild off. */
+  var touchedAt = 0;            /* when a person last did anything in here */
+  var waiting = false;          /* a payload arrived while he was reading */
+  var READ_QUIET_MS = 12000;    /* how long he gets after his last touch */
+  var restTimer = null;
+
+  function touched() { touchedAt = Date.now(); }
+
+  function reading() {
+    if (pressed) return true;
+    return (Date.now() - touchedAt) < READ_QUIET_MS;
+  }
+
+  /* Every road a person's attention arrives by. Passive where it can be, so
+     watching for them can never itself make the list feel heavy. */
+  function watchReading(node) {
+    if (!node) return;
+    var names = ['pointerdown', 'pointerup', 'wheel', 'scroll', 'touchstart',
+                 'touchmove', 'keydown', 'focusin'];
+    for (var i = 0; i < names.length; i += 1) {
+      try {
+        node.addEventListener(names[i], touched,
+          names[i] === 'keydown' || names[i] === 'focusin'
+            ? false : {passive: true, capture: true});
+      } catch (err) { /* older host: the ones that took are enough */ }
+    }
+  }
 
   /* ------------------------------------------------------------ plumbing */
 
@@ -1422,6 +1455,14 @@
     var main = box.querySelector('.og-main');
     if (!main) return;
     var scroll = main.scrollTop;
+    /* #1220: innerHTML = '' destroys whatever had focus, which he reported as
+       the cursor moving. Remember it by id so it can be handed back. */
+    var hadFocus = '';
+    try {
+      var act = root.document.activeElement;
+      if (act && act.id && main.contains(act)) hadFocus = act.id;
+    } catch (err) { hadFocus = ''; }
+    waiting = false;
     main.innerHTML = '';
 
     var cover = (last.coverage || {});
@@ -1580,6 +1621,19 @@
       }, 'og-blindfold'));
 
     main.scrollTop = scroll;
+    /* #1220: ...and again after layout. Assigning scrollTop immediately after
+       innerHTML='' is CLAMPED to whatever height the box has at that instant,
+       so a restore to 900px can land at 200 and stay there. One frame later
+       the content is measured and the same assignment takes. */
+    try {
+      root.requestAnimationFrame(function () {
+        if (!box || !main || !main.isConnected) return;
+        if (Math.abs(main.scrollTop - scroll) > 2) main.scrollTop = scroll;
+        if (!hadFocus) return;
+        var back = main.querySelector('#' + hadFocus);
+        if (back && back.focus) { try { back.focus({preventScroll: true}); } catch (err) { back.focus(); } }
+      });
+    } catch (err) { /* no rAF: the assignment above is what there is */ }
     paintSay();
     paintHeader();
   }
@@ -1609,7 +1663,11 @@
       lastMs = Date.now() - began;
       if (!got) { trouble('the station did not answer'); return; }
       last = got;
-      if (!pressed) paint();
+      /* #1220: the data is fresh either way; the BODY waits until he is
+         done. The face and header still move - one line each, and neither
+         touches his place in the list. */
+      if (reading()) { waiting = true; paintSay(); paintHeader(); }
+      else { paint(); }
     })['catch'](function () {
       if (!box) return;
       lastMs = Date.now() - began;
@@ -1778,6 +1836,15 @@
     faceTimer = root.setInterval(paintFace, FACE_MS);
     pull();
     timer = root.setInterval(pull, EVERY_MS);
+    /* #1220: he stopped reading - catch the view up, once. Checked often
+       enough to feel prompt and doing nothing at all unless something is
+       actually waiting. */
+    restTimer = root.setInterval(function () {
+      if (!box || !waiting || reading()) return;
+      paint();
+    }, 1000);
+    touchedAt = 0;
+    watchReading(box);
     duck();
     return box;
   }
@@ -1789,6 +1856,9 @@
        panel before. */
     if (timer) { root.clearInterval(timer); timer = null; }
     if (faceTimer) { root.clearInterval(faceTimer); faceTimer = null; }
+    if (restTimer) { root.clearInterval(restTimer); restTimer = null; }  /* #1220 */
+    waiting = false;
+    touchedAt = 0;
     try {
       if (holding && root.PineDuck) root.PineDuck.release('orchestrator-glass');
     } catch (err) { /* the sweep gives it back anyway */ }
