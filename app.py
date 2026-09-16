@@ -74269,7 +74269,7 @@ def sting_due() -> Path | None:
     if _unheard and random.random() < SFX_UNHEARD_SHARE:
         _pool = [n for n in names_pool if n in _unheard] or sorted(_unheard)
         _pick = unrepeated(_pool, "sting",
-                           keep=min(12, max(1, len(set(_pool)) - 1)))
+                           keep=sting_keep(len(set(_pool))))   # #1223
         if _pick:
             pipeline_log("air", "(#1251) a clip nobody has ever heard: %s "
                          "(%d of %d in the pool still unheard)"
@@ -74278,14 +74278,14 @@ def sting_due() -> Path | None:
     if fresh and random.random() < SFX_FRESH_SHARE:
         fresh_pool = [n for n in names_pool if n in fresh] or sorted(fresh)
         names = unrepeated(fresh_pool, "sting",
-                           keep=min(12, max(1, len(set(fresh_pool)) - 1)))
+                           keep=sting_keep(len(set(fresh_pool))))  # #1223
         if names:
             pipeline_log("air", f"(#1062) a fresh sample drawn ahead of "
                          f"the rotation: {Path(names).name} "
                          f"({len(fresh)} fresh of {len(pool)} in the pool)")
             return Path(names)
     names = unrepeated(names_pool, "sting",
-                       keep=min(12, max(1, len(set(names_pool)) - 1)))
+                       keep=sting_keep(len(set(names_pool))))      # #1223
     return Path(names) if names else None
 
 
@@ -74344,6 +74344,27 @@ async def _sfx_verdict(about: str) -> None:
         pass
 
 
+# 2026-09-16 (#1223): STING1223_KEEP - how many recent stings to hold back.
+#
+# It was a flat 12, against a pool measured at 15,833 files. Measured on air:
+# 87 plays in twenty minutes landing on 17 distinct clips, one of them twelve
+# times. A clip became eligible again after eleven others, so at four plays a
+# minute it could return inside three minutes, for ever.
+#
+# An eighth of the pool: floored at 24 so a small library still never repeats
+# back to back, ceilinged so the ring cannot grow without bound. unrepeated()
+# already clamps this to len(pool) - 2 (#1176's "leave two"), so a generous
+# number here can never empty the pool - it degrades to "all but two".
+STING_KEEP_MOST = int(os.getenv("PINE_STING_KEEP", "600"))
+
+
+def sting_keep(count: int) -> int:
+    try:
+        return max(24, min(STING_KEEP_MOST, int(count) // 8))
+    except Exception:  # noqa: BLE001
+        return 24
+
+
 def _sfx_any() -> Path | None:
     """A short unbanned sample, ignoring the rate/gap gate (#464) — for
     places that WANT a sound effect every time, like a custom ad."""
@@ -74380,7 +74401,7 @@ def _sfx_any() -> Path | None:
     if not pool:
         return None
     names = unrepeated([str(p) for p in pool], "sting",
-                       keep=min(12, max(1, len(pool) - 1)))
+                       keep=sting_keep(len(pool)))                 # #1223
     return Path(names) if names else None
 
 
@@ -74617,7 +74638,7 @@ def _sfx_any_video() -> Path | None:
     if not pool:
         return None
     got = unrepeated([str(p) for p in pool], "sting",
-                     keep=min(12, max(1, len(pool) - 1)))
+                     keep=sting_keep(len(pool)))                   # #1223
     return Path(got) if got else None
 
 
