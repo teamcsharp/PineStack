@@ -51319,7 +51319,28 @@ DEAD_AIR_RESCUE_REST = 45.0
 # caller third and dead_air_rescue already promotes the road the sheet
 # is ON, so this changes which roads may be reached and nothing about
 # which is preferred.
-RESCUE_ROADS_OPEN = ("manager", "gallery", "news", "caller")
+# 2026-09-15 (#1212): AD1212_OPEN - and the adverts, and the idents.
+#
+# The station went quiet for twenty minutes with 53 finished adverts and 44
+# minutes of recorded audio on a road that could not play them. Measured from
+# /api/cupboard/unheard that night: every road on this list was down to one
+# ready round or none, so the standing consumer walked 22 times, aired nothing,
+# and answered "nothing unheard is past the dial and airable" - correctly. It
+# had nothing it was ALLOWED to use.
+#
+# The operator, asked which roads may play out of turn: banter, ad, station ID.
+#
+# ad and station_id are added here and not banter, because of the note above:
+# both of those live on the shelf and both have a literal shelf_take, so the
+# door finds their rows as soon as this list lets it ask. Banter's material is
+# in the LARDER and `_SHELF["banter"]` is a vestigial empty key - counted here
+# it would be asked for and never arrive, exactly as this comment warns. It
+# gets a transport of its own, the way #1238 gave caller one.
+#
+# Recap stays shut and the operator agreed: no shelf_take("recap") exists
+# anywhere, and its rows' audio has already been swept.
+RESCUE_ROADS_OPEN = ("manager", "gallery", "news", "caller",
+                     "ad", "station_id")
 # #1221: THE ARREARS BOOK IS WIDER THAN THE RESCUE.
 #
 # RESCUE_ROADS_OPEN answers "what may interrupt a silence". This answers
@@ -70744,11 +70765,44 @@ def sfx_folders() -> list[Path]:
 
 
 def sfx_list(folder: Path) -> list[Path]:
-    """The samples in one folder. Not recursive: you name the folder you mean,
-    and the pack tree above it holds 23,000 files."""
+    """The samples in one folder. Not recursive: you name the folder you mean.
+
+    2026-09-15 (#1215): SFX1215_SCANDIR. This used to read
+
+        [p for p in folder.iterdir() if p.is_file() and ...]
+
+    which is one stat() per entry over a read-only CIFS mount. Measured in the
+    container on /samples/samples_grabbed/mwc, 2,438 files, cache warmed
+    equally for both roads:
+
+        iterdir + is_file :  413.775 s
+        os.scandir        :    5.007 s      ->  82.6x
+
+    The tree is no longer the 23,000 files this docstring used to claim: 43
+    folders, 240,245 files. At the old rate a full walk took about ELEVEN
+    HOURS against a 45-second cache, so it never finished before it was asked
+    for again and the default thread pool was permanently full - 77 of ~104
+    worker samples sat in stat(). That is why GET /music returned nothing for
+    90 seconds with the record on the local shelf: music_file() wants a worker
+    from that same pool and there was never one free.
+
+    The extension is tested FIRST, on a name already in hand, so only a real
+    candidate is ever asked whether it is a file - and scandir answers that
+    from the directory entry it already read instead of a fresh stat."""
     try:
-        found = [p for p in folder.iterdir()
-                 if p.is_file() and p.suffix.lower() in SFX_TYPES]
+        found: list[Path] = []
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                name = entry.name
+                dot = name.rfind(".")
+                if dot < 0 or name[dot:].lower() not in SFX_TYPES:
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue            # a name that vanished mid-walk
+                found.append(folder / name)
     except OSError:
         return []                       # the share went away; carry on
     if len(found) <= SFX_MAX_FILES:
@@ -71112,7 +71166,11 @@ def sfx_short(path: Path) -> bool:
 # set, so the self-check at the foot of this file - which swaps
 # sfx_folders between calls - misses the index rather than reading a stale
 # answer.
-SFX_ALL_TTL = float(os.getenv("SFX_ALL_TTL", "45"))
+# 2026-09-15 (#1215): 45 -> 1800. Even with scandir a full walk of the
+# 240,245 files on this station is minutes, not milliseconds, and a
+# forty-five second cache asked for one continuously. The price is that
+# a newly added sample takes up to half an hour to enter the pool.
+SFX_ALL_TTL = float(os.getenv("SFX_ALL_TTL", "1800"))
 _SFX_ALL_MEMO: dict[str, Any] = {"at": 0.0, "key": None, "value": None}
 
 
@@ -137857,6 +137915,8 @@ AIR_FIXES_PATH = data_path("air_fixes.jsonl")
 AIR_WATCH_EVERY = 20.0                # how often to look
 AIR_WATCH_SETTLE = 45.0               # how long a rung is given to work
 AIR_RESTART_REST = 3600.0             # at most one process restart an hour
+# #1215: on disk, because the rung this guards ends in os._exit(3).
+AIR_RESTART_STAMP = data_path("air_last_restart")
 # The ladder: (quiet seconds before it fires, step, what to call it).
 AIR_LADDER: list[tuple[float, str, str]] = [
     # #1217: FIRST, because it is the only rung that touches a congested
@@ -138421,14 +138481,34 @@ async def air_watch() -> None:
                 continue
             after, step, said = AIR_LADDER[due]
             if step == "restart":
-                if (time.time() - float(_AIR_WATCH.get("last_restart") or 0)
-                        < AIR_RESTART_REST):
+                # 2026-09-15 (#1215): THE GUARD MUST OUTLIVE THE PROCESS.
+                #
+                # This rung ends in os._exit(3), and "last_restart" lived only
+                # in the module-level dict above - so the process that recorded
+                # the restart was the process that died, and its replacement
+                # started at 0.0 with the hourly rest void across exactly the
+                # event it exists to rate-limit. Measured in air_fixes.jsonl:
+                # 23 of 36 consecutive gaps shorter than the 3600s rest, the
+                # tightest 370.0s - the 360s rung plus one 20s poll.
+                _rest_at = float(_AIR_WATCH.get("last_restart") or 0)
+                try:
+                    _rest_at = max(_rest_at, float(
+                        AIR_RESTART_STAMP.read_text(encoding="utf-8").strip()
+                        or 0))
+                except Exception:  # noqa: BLE001
+                    pass             # no stamp yet, or an unreadable one
+                if time.time() - _rest_at < AIR_RESTART_REST:
                     _AIR_WATCH["say"] = (
                         "quiet %ds and the ladder is spent - a restart ran "
                         "less than an hour ago, so this one needs hands"
                         % int(quiet))
                     continue
                 _AIR_WATCH["last_restart"] = time.time()
+                try:                                          # #1215
+                    AIR_RESTART_STAMP.write_text(
+                        str(time.time()), encoding="utf-8")
+                except Exception:  # noqa: BLE001
+                    pass         # an unwritable stamp must not stop the cure
             # #1186: and WHY, in numbers, on the durable row. A person
             # asking tomorrow why the station was quiet for seventeen
             # minutes gets an answer with figures in it rather than the
