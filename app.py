@@ -70809,7 +70809,7 @@ def sfx_folders() -> list[Path]:
     return out
 
 
-def sfx_list(folder: Path) -> list[Path]:
+def sfx_list(folder: Path, cap: bool = True) -> list[Path]:
     """The samples in one folder. Not recursive: you name the folder you mean.
 
     2026-09-15 (#1215): SFX1215_SCANDIR. This used to read
@@ -70850,7 +70850,11 @@ def sfx_list(folder: Path) -> list[Path]:
                 found.append(folder / name)
     except OSError:
         return []                       # the share went away; carry on
-    if len(found) <= SFX_MAX_FILES:
+    # 2026-09-16 (#1221): SFX1221_DRAW_PER_CALL. `cap=False` hands back the
+    # WHOLE folder so the caller can draw its own sample per call. See
+    # sfx_all(): the cap below used to rotate only because the walk ran
+    # constantly, and #1215's 30-minute cache took that away.
+    if not cap or len(found) <= SFX_MAX_FILES:
         return sorted(found)
     # #817: a folder past the cap ROTATES instead of freezing on the
     # first four hundred names — the operator dropped 3,447 grabs into
@@ -71253,9 +71257,42 @@ def sfx_id_map() -> dict[str, Path]:
         return {}
 
 
-def _sfx_all_walk() -> list[Path]:
+def _sfx_all_groups() -> list[list[Path]]:
+    """#1221: every folder's FULL contents, KEPT APART.
+
+    The cap is a per-folder rule, so the pool has to remember which files came
+    from which folder if the cap is to be applied fresh on each draw rather
+    than baked into the cache. The first group is the scratch stock this box
+    makes for itself, which is never capped - it is small and it is ours."""
     made = scratch_stock() if dj_settings()["sfx_make"] else []
-    return made + [p for folder in sfx_folders() for p in sfx_list(folder)]
+    groups: list[list[Path]] = [list(made)] if made else []
+    for folder in sfx_folders():
+        rows = sfx_list(folder, cap=False)
+        if rows:
+            groups.append(rows)
+    return groups
+
+
+def _sfx_draw(groups: list[list[Path]], keep_first: bool = True) -> list[Path]:
+    """#1221: apply the per-folder cap NOW, with a fresh sample each time.
+
+    This is #817's sentence - "a fresh sample each draw puts the WHOLE library
+    in play" - done on purpose instead of as a side effect of walking often.
+    The first group is the uncapped scratch stock when there is one."""
+    out: list[Path] = []
+    for index, rows in enumerate(groups):
+        if (keep_first and index == 0 and rows
+                and not str(rows[0]).startswith(str(SFX_ROOT))):
+            out.extend(rows)                    # the scratches, uncapped
+        elif len(rows) <= SFX_MAX_FILES:
+            out.extend(rows)
+        else:
+            out.extend(random.sample(rows, SFX_MAX_FILES))
+    return out
+
+
+def _sfx_all_walk() -> list[Path]:
+    return _sfx_draw(_sfx_all_groups())
 
 
 # --- 2026-09-14: THE FOLDER PIN --------------------------------------------
@@ -71405,6 +71442,18 @@ async def sfx_folder_pin_api(
                    % (("%g" % got.get("hours", 1)), pin["name"] if pin else path)}
 
 
+def _sfx_pinned(rows: list[Path]) -> list[Path]:
+    """#1221: the folder pin, applied after the draw rather than inside the
+    cache, because the draw is now the thing that happens per call. An empty
+    pinned folder still falls back to everything - a pin that silenced the
+    station would be worse than a pin that was ignored."""
+    prefix = sfx_pin_prefix()
+    if not prefix:
+        return rows
+    kept = [p for p in rows if str(p).replace("\\", "/").startswith(prefix)]
+    return kept if kept else rows
+
+
 def sfx_all() -> list[Path]:
     """Every sample they may reach for: the packs you named, plus the
     scratches this box makes for itself (#211).
@@ -71419,7 +71468,11 @@ def sfx_all() -> list[Path]:
         if (_SFX_ALL_MEMO["value"] is not None
                 and _SFX_ALL_MEMO["key"] == key
                 and now - float(_SFX_ALL_MEMO["at"]) < SFX_ALL_TTL):
-            return list(_SFX_ALL_MEMO["value"])
+            # #1221b: THE MEMO HOLDS GROUPS NOW, and this lock-free road has
+            # to read it the same way the one inside the lock does. It used to
+            # say `list(...)`, which after #1221 handed back 44 LIST OBJECTS -
+            # the folder count - instead of thousands of Paths.
+            return _sfx_pinned(_sfx_draw(_SFX_ALL_MEMO["value"]))
         # #1217: ONE WALKER, AND THE REST WAIT FOR ITS ANSWER.
         #
         # The warm road above takes no lock, so the common case costs nothing.
@@ -71435,21 +71488,15 @@ def sfx_all() -> list[Path]:
             if (_SFX_ALL_MEMO["value"] is not None
                     and _SFX_ALL_MEMO["key"] == key
                     and now - float(_SFX_ALL_MEMO["at"]) < SFX_ALL_TTL):
-                return list(_SFX_ALL_MEMO["value"])
-            got = _sfx_all_walk()
-            _pin = sfx_pin_prefix()
-            if _pin:
-                _kept = [p for p in got
-                         if str(p).replace("\\", "/").startswith(_pin)]
-                if _kept:
-                    got = _kept      # an empty pinned folder falls back to all
-            _SFX_ALL_MEMO.update({"at": now, "key": key, "value": list(got)})
-            return list(got)
+                return _sfx_pinned(_sfx_draw(_SFX_ALL_MEMO["value"]))
+            groups = _sfx_all_groups()
+            _SFX_ALL_MEMO.update({"at": now, "key": key, "value": groups})
+            return _sfx_pinned(_sfx_draw(groups))
     except Exception:  # noqa: BLE001
         # An index is an optimisation. Anything going wrong with it means
         # answer the question the slow way, never answer it wrongly: a
         # station with no samples is worse than a slow walk.
-        return _sfx_all_walk()
+        return _sfx_pinned(_sfx_all_walk())          # #1221: flat, and pinned
 
 
 # Samples are mastered hot — a pack is meant to be mixed, not played raw next
