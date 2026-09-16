@@ -19,7 +19,8 @@
     <section class="viewer" id="viewer" aria-label="Video preview">
       <video id="video" playsinline preload="auto"></video>
       <canvas id="preview" aria-label="Video preview and drawing surface"></canvas>
-      <div id="loading" class="loading">Loading video…</div>
+      <div id="loading" class="loading"><span id="loadingText">Opening the recording…</span><span id="loadingBar" class="loading-bar" hidden><i id="loadingFill"></i></span></div>
+      <span id="decodingNote" class="viewer-note decoding" hidden>Decoding the first frame…</span>
       <span id="cropHint" class="viewer-note" hidden>Drag the corners or move the box</span>
     </section>
     <div class="playback">

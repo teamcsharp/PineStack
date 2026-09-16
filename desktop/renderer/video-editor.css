@@ -3,3 +3,13 @@
 .audio-notice{margin:0;padding:5px 10px;border-radius:7px;background:#4a351a;color:#ffdfa4;font-size:12px;text-align:center}
 @media(max-height:700px) and (min-width:850px){.editor{gap:4px;min-height:520px}.topbar{min-height:55px}.timeline{height:86px}.frames,.frames img,.frames .sprite{height:48px}.wave,.spectrogram{height:35px}.controls{min-height:56px}.tabs button{min-height:42px}.viewer-note{bottom:7px}.timeline-labels{min-height:24px}}
 @media(max-width:760px){.editor{padding-left:7px;padding-right:7px;gap:6px;min-height:690px}.topbar{gap:2px}.topbar button{padding:8px 10px}.topbar #redo{display:none}.heading h1{font-size:16px}.heading span{max-width:34vw}.viewer{min-height:180px}.playback{gap:8px}.playback>span{font-size:11px}.audio-toggle{font-size:12px}.tabs{gap:0}.tabs button{min-width:0;flex:1;padding:7px 10px;font-size:13px}.controls{min-height:108px}.panel{gap:7px}.panel button{padding:8px 12px;font-size:13px}.panel label{font-size:12px}.panel input[type=number]{width:80px}.adjustments{width:100%;display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;padding:0 12px}.adjustments label{width:100%}.adjustments button{min-height:40px;align-self:end}.timeline-section{padding:0 13px}.timeline{height:102px}.frames,.frames img,.frames .sprite{height:60px}footer{min-height:38px;text-align:center}.stroke-label input{width:76px}}
+
+/* 2026-09-15 (#1213): the load surface. The operator: "it's just stuck loading
+   video." It was not stuck - it was a 3.9 MB fetch with an indefinite message
+   and no progress, which cannot be told from broken. */
+.loading{display:flex;flex-direction:column;align-items:center;gap:9px;text-align:center}
+.loading-bar{display:block;width:190px;height:4px;border-radius:3px;background:#2b2e34;overflow:hidden}
+.loading-bar i{display:block;height:100%;width:0;background:#8cd4c0;transition:width .18s linear}
+.viewer-note.decoding{left:12px;right:auto;bottom:12px}
+/* A measured level is not a warning, so it must not wear the amber warning box. */
+.audio-notice.level{background:#1d2a28;color:#bfe6da}

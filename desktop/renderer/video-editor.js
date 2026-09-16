@@ -7,6 +7,9 @@
   var source = null, edit = null, past = [], future = [], tab = 'trim', tool = 'pen';
   var frameRect = {x: 0, y: 0, w: 1, h: 1}, gesture = null, raf = 0, busy = false, disposed = false;
   var loadedUrl = '', pendingSeek = null, showFrequencies = false, retryAction = null, sourcePoll = 0, sourceFailed = false, audioChosen = false;
+  /* 2026-09-15 (#1213) */
+  var frameRing = [], FRAME_RING = 48, spriteImage = null, spriteUrl = '';
+  var seekWatch = 0, loadWatch = 0, decodeWatch = 0, loadPhase = '';
   var sourceId = new URLSearchParams(location.search).get('source') || '';
   var host = window;
   try { if (window.parent !== window && window.parent.location.origin === location.origin) host = window.parent; } catch (_) { /* standalone */ }
@@ -101,11 +104,24 @@
     ctx.save(); ctx.beginPath(); ctx.rect(frameRect.x, frameRect.y, frameRect.w, frameRect.h); ctx.clip();
     ctx.translate(frameRect.x + frameRect.w / 2, frameRect.y + frameRect.h / 2); ctx.rotate(edit.rotation * Math.PI / 180); ctx.scale(scale, scale);
     ctx.translate(-(crop.x + crop.w / 2) * source.width, -(crop.y + crop.h / 2) * source.height);
-    if (video.readyState >= 2) {
+    if (video.readyState >= 2 && !video.seeking) {
       if (lastFrame.width !== source.width || lastFrame.height !== source.height) { lastFrame.width = source.width; lastFrame.height = source.height; }
       frameContext.drawImage(video, 0, 0, source.width, source.height); hasFrame = true;
+      harvestFrame();                                            /* #1213 */
+      $('decodingNote').hidden = true;
     }
-    if (hasFrame) { ctx.filter = M.filter(edit); ctx.drawImage(lastFrame, 0, 0, source.width, source.height); ctx.filter = 'none'; }
+    /* #1213: the stand-in goes through the SAME crop/rotate/filter transform
+     * as the real frame, so the picture does not jump geometry when the
+     * decoder lands, and it is dimmed slightly so approximate never passes
+     * for exact. */
+    var wantAt = pendingSeek !== null ? pendingSeek : (video.currentTime || 0);
+    var proxy = ((video.seeking && pendingSeek !== null) || !hasFrame) ? proxyAt(wantAt) : null;
+    if (proxy) {
+      ctx.filter = M.filter(edit); ctx.globalAlpha = .88;
+      ctx.drawImage(proxy.image, proxy.sx, proxy.sy, proxy.sw, proxy.sh,
+        0, 0, source.width, source.height);
+      ctx.globalAlpha = 1; ctx.filter = 'none';
+    } else if (hasFrame) { ctx.filter = M.filter(edit); ctx.drawImage(lastFrame, 0, 0, source.width, source.height); ctx.filter = 'none'; }
     drawMarks(ctx, edit.marks, source.width, source.height); ctx.restore();
     if (tab === 'crop') drawCrop();
   }
@@ -123,13 +139,168 @@
     pendingSeek = M.clamp(at, 0, source.duration);
     paintHead(pendingSeek);
     if (!video.seeking) { try { video.currentTime = pendingSeek; } catch (_) { /* metadata is arriving */ } }
+    armSeekWatchdog();
+    /* 2026-09-15 (#1213): THE WHOLE OF "UNRESPONSIVE" WAS THIS MISSING LINE.
+     *
+     * The operator: "wherever I place the playhead or I click around the video
+     * instantly updates to show that so it's responsive while I'm editing."
+     *
+     * repaint() is reachable while paused ONLY from the 'seeked' handler
+     * below, and seek() never called it - so between seeks there was no path
+     * to the screen AT ALL. The picture could not change until the decoder
+     * finished, and the desk cuts at 25 fps with x264's default keyframe
+     * interval, which is exactly TEN SECONDS between keyframes. A scrub could
+     * be waiting on ten seconds of forward decode with nothing drawn. */
+    repaint();
+  }
+  /* pendingSeek had no timeout and no escape. If one seek never completed,
+   * video.seeking stayed true, the gate above silently dropped every later
+   * scrub, and the playhead glided over a frozen picture saying nothing -
+   * which reads to the operator exactly like the complaint he already made. */
+  function armSeekWatchdog() {
+    clearTimeout(seekWatch);
+    if (pendingSeek === null) return;
+    seekWatch = setTimeout(function () {
+      if (disposed || pendingSeek === null) return;
+      try { video.currentTime = pendingSeek; } catch (_) { /* gone */ }
+      seekWatch = setTimeout(function () {
+        if (disposed || pendingSeek === null) return;
+        pendingSeek = null;
+        status('The preview stopped following the playhead. Try again to reopen it.',
+          true, reloadMedia);
+      }, 4000);
+    }, 4000);
+  }
+  /* #1213: a stand-in while the decoder works. draw() already blits every real
+   * frame, so keeping a 160 px copy costs nothing and makes a re-scrub over
+   * ground already visited both instant AND exact - and editing is
+   * back-and-forth over the same few seconds. */
+  function harvestFrame() {
+    if (!source || video.seeking || !hasFrame || !(source.width > 0)) return;
+    var at = video.currentTime, i;
+    for (i = 0; i < frameRing.length; i += 1) if (Math.abs(frameRing[i].t - at) < .2) return;
+    var w = 160, h = Math.max(1, Math.round(160 * source.height / source.width));
+    var c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').drawImage(lastFrame, 0, 0, w, h);
+    frameRing.push({t: at, canvas: c});
+    if (frameRing.length > FRAME_RING) frameRing.shift();
+  }
+  /* In preference order: a real decoded frame within 0.75 s, else the
+   * filmstrip sprite tile - already fetched by filmstrip(), so this is a cache
+   * hit rather than a download. Coarse on purpose; it is a stand-in, not a
+   * claim. */
+  function proxyAt(at) {
+    var best = null, distance = .75, i, d;
+    for (i = 0; i < frameRing.length; i += 1) {
+      d = Math.abs(frameRing[i].t - at);
+      if (d < distance) { distance = d; best = frameRing[i].canvas; }
+    }
+    if (best) return {image: best, sx: 0, sy: 0, sw: best.width, sh: best.height};
+    var sprite = source && source.thumbnail_sprite;
+    if (!spriteImage || !spriteImage.complete || !spriteImage.naturalWidth
+        || !sprite || !sprite.count) return null;
+    var columns = sprite.columns || sprite.count;
+    var index = M.clamp(Math.round(at / Math.max(.001, source.duration) * (sprite.count - 1)),
+      0, sprite.count - 1);
+    return {image: spriteImage, sx: index % columns * sprite.width,
+      sy: Math.floor(index / columns) * sprite.height,
+      sw: sprite.width, sh: sprite.height};
   }
   video.addEventListener('seeked', function () {
     if (pendingSeek !== null && Math.abs(video.currentTime - pendingSeek) > .035) { video.currentTime = pendingSeek; return; }
-    pendingSeek = null; repaint();
+    pendingSeek = null; clearTimeout(seekWatch); repaint();   /* #1213 */
   });
-  video.addEventListener('loadeddata', function () { $('loading').hidden = true; repaint(); });
-  video.addEventListener('error', function () { $('loading').hidden = false; $('loading').textContent = 'The preview could not load.'; status('Try opening the recording again.', true, loadSource); });
+  /* 2026-09-15 (#1213): THE LOAD SURFACE COULD NOT TELL SLOW FROM BROKEN.
+   *
+   * "for some reason it's just stuck loading video." It was not stuck: the
+   * file is valid and the route answers 200 with a correct 206 to a Range
+   * request. It was a 3.9 MB fetch behind an indefinite message. The browser
+   * fires 'progress' with real byte counts and 'stalled' when it gives up,
+   * and every one of those was discarded. Same fault as the flat meter: a
+   * surface that cannot say why it is empty. */
+  function showLoading(text, fraction) {
+    $('loading').hidden = false;
+    $('loadingText').textContent = text;
+    var determinate = typeof fraction === 'number' && fraction >= 0;
+    $('loadingBar').hidden = !determinate;
+    if (determinate) $('loadingFill').style.width = M.clamp(fraction, 0, 1) * 100 + '%';
+  }
+  /* #1213: and the retry button could never retry the VIDEO. loadedUrl is
+   * assigned only in hydrate() and reset nowhere, and the server always writes
+   * the identical url string - so "Try again" re-fetched the JSON, found
+   * loadedUrl === source.url, and never reassigned video.src or called load(). */
+  function reloadMedia() {
+    loadedUrl = ''; hasFrame = false; pendingSeek = null; frameRing.length = 0;
+    clearTimeout(seekWatch); clearTimeout(decodeWatch);
+    loadPhase = 'opening'; showLoading('Opening the recording…', -1);
+    $('decodingNote').hidden = true;
+    loadSource();
+  }
+  function armLoadWatchdog() {
+    clearTimeout(loadWatch);
+    loadWatch = setTimeout(function () {
+      if (disposed || loadPhase === 'decoding' || loadPhase === 'ready') return;
+      showLoading('Still waiting for the recording - nothing has arrived yet.', -1);
+      status('The recording has not started arriving. Try again.', true, reloadMedia);
+      loadWatch = setTimeout(function () {
+        if (disposed || loadPhase === 'decoding' || loadPhase === 'ready') return;
+        showLoading('The recording could not be opened.', -1);
+        status('The recording could not be opened. Try again.', true, reloadMedia);
+      }, 17000);
+    }, 8000);
+  }
+  function armDecodeWatchdog() {
+    clearTimeout(decodeWatch);
+    decodeWatch = setTimeout(function () {
+      if (disposed || hasFrame) return;
+      $('decodingNote').textContent = 'The picture has not decoded yet.';
+      status('The recording arrived but the picture has not decoded. Try again.',
+        true, reloadMedia);
+    }, 10000);
+  }
+  video.addEventListener('loadstart', function () {
+    loadPhase = 'opening'; showLoading('Opening the recording…', -1); armLoadWatchdog();
+  });
+  video.addEventListener('progress', function () {
+    if (loadPhase !== 'opening' && loadPhase !== 'bytes') return;
+    var end = video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0;
+    var whole = video.duration || (source && source.duration) || 0;
+    if (!(whole > 0)) return;
+    loadPhase = 'bytes'; armLoadWatchdog();
+    showLoading('Loading the recording… '
+      + Math.round(M.clamp(end / whole, 0, 1) * 100) + '%', end / whole);
+  });
+  /* The overlay lifts one event earlier - at metadata rather than at first
+   * frame - so the timeline goes live as soon as duration and dimensions are
+   * known. What remains is DECODE, not download, and it gets its own named
+   * state instead of a byte bar sitting at 100% explaining nothing. */
+  video.addEventListener('loadedmetadata', function () {
+    loadPhase = 'decoding'; clearTimeout(loadWatch);
+    $('loading').hidden = true;
+    $('decodingNote').textContent = 'Decoding the first frame…';
+    $('decodingNote').hidden = hasFrame;
+    if (!hasFrame) armDecodeWatchdog();
+    paintControls(); repaint();
+  });
+  video.addEventListener('loadeddata', function () {
+    loadPhase = 'ready'; clearTimeout(loadWatch); clearTimeout(decodeWatch);
+    $('loading').hidden = true; $('decodingNote').hidden = true; repaint();
+  });
+  ['stalled', 'waiting'].forEach(function (name) {
+    video.addEventListener(name, function () {
+      if (loadPhase === 'ready' || hasFrame) return;
+      showLoading('The recording stopped arriving.', -1);
+      status('The recording stopped arriving. Try again.', true, reloadMedia);
+    });
+  });
+  /* The error road used to slam the overlay back over the canvas
+   * unconditionally, destroying a live editing session for a fault that may be
+   * transient. After the first frame it writes a footer line only. */
+  video.addEventListener('error', function () {
+    if (hasFrame) { status('The preview dropped out. Try again to reload it.', true, reloadMedia); return; }
+    showLoading('The preview could not load.', -1);
+    status('Try opening the recording again.', true, reloadMedia);
+  });
   ['play', 'pause', 'timeupdate', 'ended'].forEach(function (name) { video.addEventListener(name, function () { $('play').textContent = video.paused ? '▶' : 'Ⅱ'; $('play').setAttribute('aria-label', video.paused ? 'Play selection' : 'Pause preview'); repaint(); }); });
   function play() {
     if (!source || busy) return;
@@ -173,7 +344,20 @@
   $('timeline').addEventListener('pointermove', function (event) { if (gesture && gesture.type === 'scrub' && gesture.id === event.pointerId) seek(timelineAt(event)); });
   ['pointerup', 'pointercancel'].forEach(function (name) { $('timeline').addEventListener(name, function () { if (gesture && gesture.type === 'scrub') gesture = null; }); });
 
+  function previewAt(event) {
+    var r = canvas.getBoundingClientRect(), x = event.clientX - r.left;
+    return M.clamp((x - frameRect.x) / Math.max(1, frameRect.w), 0, 1) * source.duration;
+  }
   canvas.addEventListener('pointerdown', function (event) {
+    /* 2026-09-15 (#1213): "or I click around the video". Clicking the picture
+     * had NEVER done anything - this handler returned early unless the tab was
+     * draw or crop. That was not slowness, it was absence. */
+    if (source && !busy && !gesture && tab === 'trim' && insideFrame(eventPoint(event))) {
+      event.preventDefault(); video.pause(); canvas.setPointerCapture(event.pointerId);
+      gesture = {type: 'preview-scrub', id: event.pointerId};
+      seek(previewAt(event));
+      return;
+    }
     if (!source || busy || gesture || !['draw', 'crop'].includes(tab)) return;
     var screen = eventPoint(event); if (!insideFrame(screen)) return;
     event.preventDefault(); video.pause(); remember(); canvas.setPointerCapture(event.pointerId);
@@ -193,6 +377,7 @@
   });
   canvas.addEventListener('pointermove', function (event) {
     if (!gesture || gesture.id !== event.pointerId) return;
+    if (gesture.type === 'preview-scrub') { seek(previewAt(event)); return; }  /* #1213 */
     var p = originalPoint(eventPoint(event));
     if (gesture.type === 'draw') {
       var mark = gesture.mark, last = mark.points[mark.points.length - 1];
@@ -226,6 +411,71 @@
   document.addEventListener('keydown', function (event) { if (/INPUT|TEXTAREA/.test(event.target.tagName)) return; if (event.key === ' ') { event.preventDefault(); play(); } if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); event.shiftKey ? redo() : undo(); } });
   $('soundView').addEventListener('click', function () { showFrequencies = !showFrequencies; $('spectrogram').hidden = !showFrequencies; $('wave').hidden = showFrequencies; this.textContent = showFrequencies ? 'Show waveform' : 'Show frequencies'; });
 
+  /* 2026-09-15 (#1213): A dB RULER, NOT A LINEAR SMEAR.
+   *
+   * The operator: "the audio visualizer appeared a little flat indicating that
+   * maybe it did not pick up the broadcast audio of the station. But I need to
+   * always see the audio spectrograph of the station's high points and low
+   * points when it comes to broadcasting signal strength."
+   *
+   * It DID pick it up. ffmpeg on that very recording: mean -42.4 dB, max
+   * -24.3 dB. What failed is this drawing. It painted LINEAR amplitude with no
+   * reference, so the loudest column in the whole file stood 7.54% of the
+   * strip tall and the median 2.38%; and the old floor, Math.max(.5, height),
+   * was in DEVICE pixels against an already-scaled canvas, so 1684 of 2048
+   * columns collapsed onto one identical line. The strip was not flat because
+   * the audio was flat.
+   *
+   * The floor is ABSOLUTE and never the clip's own maximum. He is asking about
+   * signal strength, and under peak-normalisation a -6 dB show and a -40 dB
+   * show draw identically - which destroys the one comparison he is making.
+   *
+   * NOT A MASTERING METER: these peaks come from the server's analyze_audio,
+   * where the mono fold sits after the filter chain and is power-preserving,
+   * so they read about 3 dB hot by an amount that varies with the material.
+   * The labels say dB, never dBFS, and the readout prints the tolerance. */
+  var LEVEL_FLOOR_DB = -60, LEVEL_MARKS = [-6, -12, -24, -40];
+  function levelDb(amplitude) {
+    return amplitude > 0 ? 20 * Math.log10(amplitude) : LEVEL_FLOOR_DB;
+  }
+  function levelUnit(amplitude) {
+    return M.clamp((levelDb(amplitude) - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB, 0, 1);
+  }
+  function levelColour(db) {
+    if (db <= LEVEL_FLOOR_DB) return '#3b4048';
+    if (db < -39) return '#4e7f72';
+    if (db < -12) return '#8cd4c0';
+    if (db < -3) return '#ffd60a';
+    return '#ff453a';
+  }
+  /* The ruler is what makes the shape mean anything: without it a tall bar is
+   * just a tall bar, and he cannot tell a loud night from a quiet one. */
+  function levelRuler(context, c, dpr) {
+    var middle = c.height / 2, room = middle - dpr;
+    context.lineWidth = Math.max(1, Math.round(dpr));
+    LEVEL_MARKS.forEach(function (mark) {
+      var offset = (mark - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB * room;
+      context.strokeStyle = '#ffffff14';
+      context.beginPath();
+      context.moveTo(0, middle - offset); context.lineTo(c.width, middle - offset);
+      context.moveTo(0, middle + offset); context.lineTo(c.width, middle + offset);
+      context.stroke();
+      if (mark !== -12 && mark !== -40) return;
+      context.fillStyle = '#8b8f97'; context.textAlign = 'left';
+      context.font = Math.round(9 * dpr) + 'px ui-monospace, system-ui';
+      context.fillText(mark + ' dB', 3 * dpr, middle - offset - 2 * dpr);
+    });
+  }
+  /* The numbers were already on the wire and nothing printed them. */
+  function levelReadout(src) {
+    if (!src || !src.has_audio) return '';
+    var peak = Number(src.audio_peak), rms = Number(src.audio_rms);
+    if (!(peak > 0)) return 'Broadcast level: silent - the audio track carried no signal.';
+    var peakDb = Math.round(levelDb(peak));
+    var rmsDb = rms > 0 ? Math.round(levelDb(rms)) : LEVEL_FLOOR_DB;
+    return 'Broadcast level: peak ' + peakDb + ' dB, average ' + rmsDb
+      + ' dB (approx, +/- 3 dB).' + (peakDb < -30 ? ' Quiet, but present.' : '');
+  }
   function waveform() {
     var c = $('wave'), r = c.getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
     c.width = Math.max(1, Math.round(r.width * dpr)); c.height = Math.max(1, Math.round(42 * dpr));
@@ -233,13 +483,49 @@
     if (peaks && !Array.isArray(peaks)) peaks = peaks.peaks || peaks.values;
     context.fillStyle = '#1a1c21'; context.fillRect(0, 0, c.width, c.height);
     if (!source || !source.has_audio) { context.fillStyle = '#9a9da5'; context.font = 12 * dpr + 'px system-ui'; context.textAlign = 'center'; context.fillText('No audio', c.width / 2, c.height / 2 + 4 * dpr); return; }
-    if (!Array.isArray(peaks) || !peaks.length) { context.fillStyle = '#9a9da5'; context.font = 12 * dpr + 'px system-ui'; context.textAlign = 'center'; context.fillText(source.status === 'ready' ? 'Audio waveform unavailable' : 'Reading audio…', c.width / 2, c.height / 2 + 4 * dpr); return; }
-    context.strokeStyle = '#8cd4c0'; context.lineWidth = Math.max(1, dpr);
-    for (var x = 0; x < c.width; x += Math.max(1, Math.round(dpr * 2))) {
-      var index = Math.min(peaks.length - 1, Math.floor(x / c.width * peaks.length)), raw = peaks[index];
-      var amplitude = Array.isArray(raw) ? Math.max.apply(null, raw.map(Math.abs)) : Math.abs(Number(raw) || 0);
-      var height = Math.min(1, amplitude) * c.height * .44;
-      context.beginPath(); context.moveTo(x, c.height / 2 - Math.max(.5, height)); context.lineTo(x, c.height / 2 + Math.max(.5, height)); context.stroke();
+    context.font = 12 * dpr + 'px system-ui'; context.textAlign = 'center';
+    /* #1213: FOUR STATES, TOLD APART AT A GLANCE. No track at all gets no
+     * ruler, because there is nothing to measure - that is how "no audio"
+     * reads differently from "silence" and from "quiet". */
+    if (!source || !source.has_audio) {
+      context.fillStyle = '#9a9da5';
+      context.fillText('No audio in this recording', c.width / 2, c.height / 2 + 4 * dpr);
+      return;
+    }
+    if (!Array.isArray(peaks) || !peaks.length) {
+      context.fillStyle = '#9a9da5';
+      context.fillText(source.status === 'ready' ? 'Audio waveform unavailable' : 'Reading audio…',
+        c.width / 2, c.height / 2 + 4 * dpr);
+      return;
+    }
+    levelRuler(context, c, dpr);
+    var middle = c.height / 2, room = middle - dpr;
+    var step = Math.max(1, Math.round(dpr * 2)), columns = Math.ceil(c.width / step);
+    context.lineWidth = Math.max(1, dpr);
+    for (var i = 0; i < columns; i += 1) {
+      /* #1213: the old draw point-sampled ONE peak per column and threw the
+       * rest away, so transients - the "high points" he asked for - were the
+       * first thing lost. Max-over-column keeps them. */
+      var lo = Math.floor(i * peaks.length / columns);
+      var hi = Math.max(lo + 1, Math.floor((i + 1) * peaks.length / columns));
+      var amplitude = 0, k, raw, one;
+      for (k = lo; k < hi && k < peaks.length; k += 1) {
+        raw = peaks[k];
+        one = Array.isArray(raw) ? Math.max.apply(null, raw.map(Math.abs)) : Math.abs(Number(raw) || 0);
+        if (one > amplitude) amplitude = one;
+      }
+      amplitude = Math.min(1, amplitude);
+      var db = levelDb(amplitude), half = levelUnit(amplitude) * room;
+      /* The floor is one CSS pixel, not one device pixel: the old device-pixel
+       * floor made the strip literally differ between his two monitors. And a
+       * column that carries signal must never share a pixel with one that
+       * does not. */
+      half = Math.max(amplitude > 0 ? dpr : dpr * 0.5, half);
+      context.strokeStyle = levelColour(db);
+      context.beginPath();
+      context.moveTo(i * step, middle - half);
+      context.lineTo(i * step, middle + half);
+      context.stroke();
     }
   }
   function filmstrip() {
@@ -257,9 +543,22 @@
     if (!audioChosen && source.status === 'ready') edit.include_audio = !!source.has_audio;
     if (!source.has_audio) edit.include_audio = false;
     $('sourceName').textContent = source.name || 'Captured video';
-    if (loadedUrl !== source.url) { loadedUrl = source.url; hasFrame = false; video.src = source.url; video.load(); }
+    if (loadedUrl !== source.url) {
+      loadedUrl = source.url; hasFrame = false;
+      loadPhase = 'opening'; showLoading('Opening the recording…', -1);
+      video.src = source.url; video.load(); armLoadWatchdog();     /* #1213 */
+    }
+    var sprite = source.thumbnail_sprite;                          /* #1213 */
+    if (sprite && sprite.url && sprite.url !== spriteUrl) {
+      spriteUrl = sprite.url; spriteImage = new Image(); spriteImage.src = sprite.url;
+    }
     var spectrum = source.spectrogram_url; if (spectrum) { $('spectrogram').src = spectrum; $('soundView').disabled = false; }
-    var notice = M.audioNotice(source); $('audioNotice').textContent = notice; $('audioNotice').hidden = !notice;
+    /* #1213: he got no text at all to contradict what his eyes told him.
+     * audio_peak and audio_rms were already on the wire and nothing printed
+     * them, so a quiet broadcast and a failed capture read identically. */
+    var notice = M.audioNotice(source), readout = notice || levelReadout(source);
+    $('audioNotice').textContent = readout; $('audioNotice').hidden = !readout;
+    $('audioNotice').classList.toggle('level', !notice && !!readout);
     filmstrip(); waveform(); changed();
   }
   async function retrySource() {
