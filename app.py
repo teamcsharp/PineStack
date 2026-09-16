@@ -66448,6 +66448,54 @@ def looks_english(text: str) -> bool:
     return en / len(words) >= 0.05 or len(words) < 14
 
 
+# 2026-09-16 (#1225): RECENT1225_PERSISTS - the draw history outlives the
+# process.
+#
+# Every unrepeated() key lives in _RADIO["recent"], which was never written
+# anywhere, so each restart handed the station a blank memory and it began
+# repeating from the top. This station restarted eight times on the night the
+# operator was complaining about repeats - five of them deploying the fixes for
+# that very complaint - and each one emptied the ring that had just been
+# deepened.
+RECENT_PATH = data_path("recent_picks.json")
+RECENT_SAVE_EVERY = int(os.getenv("PINE_RECENT_SAVE_EVERY", "40"))
+RECENT_MOST = 800                 # per key, on disk, whatever the dials say
+_RECENT_DIRTY = [0]
+_RECENT_LOADED = [False]
+_RECENT_LOCK = RLock()
+
+
+def _recent_load() -> None:
+    """Read the book once. A missing or broken file is simply the blank
+    memory the station has always started with - never a refused draw."""
+    if _RECENT_LOADED[0]:
+        return
+    _RECENT_LOADED[0] = True
+    try:
+        got = json.loads(RECENT_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(got, dict):
+        return
+    book = _RADIO.setdefault("recent", {})
+    for key, rows in got.items():
+        if isinstance(rows, list):
+            book[str(key)] = [str(r) for r in rows[-RECENT_MOST:]]
+
+
+def _recent_save() -> None:
+    try:
+        book = _RADIO.get("recent") or {}
+        thin = {str(k): list(v)[-RECENT_MOST:]
+                for k, v in book.items() if isinstance(v, list)}
+        tmp = RECENT_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(thin), encoding="utf-8")
+        tmp.replace(RECENT_PATH)
+        _RECENT_DIRTY[0] = 0
+    except Exception:  # noqa: BLE001
+        pass                          # a cache that will not write is a cache
+
+
 def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
     """Draw from a pool without landing on what has just been used.
 
@@ -66464,6 +66512,7 @@ def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
     # state, most of them verbatim spoken copy. Two candidates costs
     # nothing: a pool of three still never repeats back to back.
     keep = min(keep, max(0, len(pool) - 2))
+    _recent_load()                                            # #1225
     recent = _RADIO.setdefault("recent", {}).setdefault(key, [])
     pick = random.choice([p for p in pool if p not in recent] or pool)
     recent.append(pick)
@@ -66471,6 +66520,14 @@ def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
         del recent[:-keep]
     else:
         recent.clear()                  # a one-item pool has no history
+    # #1225: written on a counter, not on every draw. This is a hot road -
+    # the cadence alone fires every two units - and the book is a couple of
+    # hundred kilobytes, so serialising it per pick would put a write on
+    # roads that run from the event loop.
+    with _RECENT_LOCK:
+        _RECENT_DIRTY[0] += 1
+        if _RECENT_DIRTY[0] >= RECENT_SAVE_EVERY:
+            _recent_save()
     return pick
 
 
@@ -73385,6 +73442,7 @@ def _sfx_cadence_pick() -> Path | None:
     # The keep is taken from the pool BEFORE filtering and the filter is
     # skipped when it would leave nothing, so a deep ring can never starve the
     # draw - it degrades to the full pool, exactly as before.
+    _recent_load()                                            # #1225
     recent = _RADIO.setdefault("recent", {}).setdefault("sfx-cadence", [])
     keep = sting_keep(len(pool))
     fresh = [p for p in pool if str(p) not in recent]
@@ -73401,6 +73459,14 @@ def _sfx_cadence_pick() -> Path | None:
             recent.append(str(path))
             if keep:
                 del recent[:-keep]
+            # #1225: this road appends to the book WITHOUT going through
+            # unrepeated(), so it marks it dirty itself. A ring that is
+            # written by two roads and saved by one would lose whichever
+            # road happened to be quieter.
+            with _RECENT_LOCK:
+                _RECENT_DIRTY[0] += 1
+                if _RECENT_DIRTY[0] >= RECENT_SAVE_EVERY:
+                    _recent_save()
             return path
     return None
 
