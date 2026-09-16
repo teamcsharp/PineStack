@@ -1914,4 +1914,61 @@
     _rowsOf: rowsOf,
     UNREAD: UNREAD
   };
+
+  /* 2026-09-16 (#1218): A SURFACE SUPPLIES ITS OWN WAY IN.
+   *
+   * "on the Pine tab, make sure that I'm able to access the Orchestrator icon
+   *  on every tab and window. I want to be connected with the orchestrator at
+   *  all times."
+   *
+   * dot() was called from exactly one place in the tree - index.html:894, the
+   * DESK SHELL. The tablet never loads index.html; the kiosk injects these
+   * same files into the panel document from the APK. So on the tablet nothing
+   * ever called it and the orchestrator had no launcher at all - not hidden on
+   * some tabs, absent from every one.
+   *
+   * Safe beside the desk's existing call: dot() opens with
+   * `if (dotNode) return dotNode;`, so whichever runs second does nothing. The
+   * dismiss flag still wins - dot() returns null when pineOrchDotShut is set,
+   * and undot() is still the way back.
+   *
+   * THE RE-ASSERT, and why it does not break this file's no-polling rule: on
+   * the tablet a tab change can tear the view down and take the dot's node
+   * with it, and a launcher that survives only until he changes tab is not
+   * "every tab". The rule above - "a closed pop-up must ask for nothing at
+   * all" - is about asking the STATION. This touches the DOM and never the
+   * network, so a closed dot still costs the station nothing. */
+  function planted() {
+    try {
+      return !!(dotNode && root.document && root.document.body
+                && root.document.body.contains(dotNode));
+    } catch (err) { return false; }
+  }
+
+  function plant() {
+    try {
+      if (planted()) return;
+      if (!root.document || !root.document.body) return;
+      /* A node that was torn out with its view is not a mounted dot, and the
+         cached handle would stop dot() ever building another one. */
+      if (dotNode && !planted()) dotNode = null;
+      dot();
+    } catch (err) { /* a missing launcher must never cost the view */ }
+  }
+
+  try {
+    if (root.document && root.document.readyState === 'loading') {
+      root.document.addEventListener('DOMContentLoaded', plant);
+    } else {
+      plant();
+    }
+    /* #1218: UNREF'D. In a browser this is an ordinary repeating timer. Under
+       node - which is where the tests run this file - an un-unref'd interval
+       keeps the process alive for ever, so the suite would hang rather than
+       fail, which is the worse of the two. Browsers have no unref and ignore
+       this entirely. */
+    var beat = root.setInterval(plant, 4000);
+    try { if (beat && typeof beat.unref === 'function') beat.unref(); }
+    catch (err) { /* a browser timer: nothing to unref */ }
+  } catch (err) { /* older host: the desk's own call still mounts it */ }
 })(typeof window !== 'undefined' ? window : globalThis);
