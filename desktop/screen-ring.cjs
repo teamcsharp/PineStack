@@ -949,8 +949,21 @@ class ScreenRing {
     const got = this.window(seconds, back);
     if (!got.ok) return { ok: false, held: got.held, detail: got.detail };
     const dir = clipMux.stash();
+    /* #1214: EVERY READER OF THE RING PINS WHAT IT IS READING.
+     *
+     * #1211 pinned the pieces a cut reads and left this road alone, and the
+     * operator hit the identical "Impossible to open ... No such file or
+     * directory" again from a desk running that fix. The strip is built the
+     * moment the sheet opens, so this is the reader he meets FIRST - and it
+     * ran its own ffmpeg over the same pieces while the ring went on dropping
+     * one every two seconds underneath it. */
+    const held = this.pinPieces(got.pieces);
     try {
-      const list = this.listFile(dir, got.pieces);
+      const shown = this.listFile(dir, got.pieces);
+      const list = shown.path;
+      if (!shown.count) {
+        throw new Error('every piece of that window had already been swept');
+      }
       const span = Math.max(0.2, got.seconds);
       /* fps chosen so `count` frames land across the window. The half-frame
        * offset puts the first sample inside the window rather than exactly
@@ -991,6 +1004,7 @@ class ScreenRing {
     } catch (error) {
       return { ok: false, held: got.held, detail: error.message };
     } finally {
+      this.releasePieces(held);                                  /* #1214 */
       clipMux.forget(dir);
     }
   }
