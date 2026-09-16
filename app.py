@@ -71172,6 +71172,13 @@ def sfx_short(path: Path) -> bool:
 # a newly added sample takes up to half an hour to enter the pool.
 SFX_ALL_TTL = float(os.getenv("SFX_ALL_TTL", "1800"))
 _SFX_ALL_MEMO: dict[str, Any] = {"at": 0.0, "key": None, "value": None}
+# 2026-09-15 (#1217): SFX1217_SINGLE_FLIGHT. One walker at a time.
+#
+# There was never a lock here, so every concurrent miss started its own full
+# walk of the share. py-spy found all 24 default-executor threads inside
+# sfx_list at the same instant, twice, nine minutes apart - not queued behind
+# one walk, each running a separate copy of it.
+_SFX_ALL_LOCK = RLock()
 
 
 _SFX_BY_ID: dict[str, Any] = {"key": None, "map": {}}
@@ -71368,14 +71375,31 @@ def sfx_all() -> list[Path]:
                 and _SFX_ALL_MEMO["key"] == key
                 and now - float(_SFX_ALL_MEMO["at"]) < SFX_ALL_TTL):
             return list(_SFX_ALL_MEMO["value"])
-        got = _sfx_all_walk()
-        _pin = sfx_pin_prefix()
-        if _pin:
-            _kept = [p for p in got if str(p).replace("\\", "/").startswith(_pin)]
-            if _kept:
-                got = _kept          # an empty pinned folder falls back to all
-        _SFX_ALL_MEMO.update({"at": now, "key": key, "value": list(got)})
-        return list(got)
+        # #1217: ONE WALKER, AND THE REST WAIT FOR ITS ANSWER.
+        #
+        # The warm road above takes no lock, so the common case costs nothing.
+        # Only a miss comes here, and only one thread at a time walks - the
+        # others queue, and then find the memo already filled by the one that
+        # went in front of them, which is why the check is repeated inside.
+        #
+        # A TTL alone could never fix this: it spaces the misses out but does
+        # nothing about what happens AT one, and every expiry was still a
+        # moment when all 24 pool threads walked the same share together.
+        with _SFX_ALL_LOCK:
+            now = time.time()
+            if (_SFX_ALL_MEMO["value"] is not None
+                    and _SFX_ALL_MEMO["key"] == key
+                    and now - float(_SFX_ALL_MEMO["at"]) < SFX_ALL_TTL):
+                return list(_SFX_ALL_MEMO["value"])
+            got = _sfx_all_walk()
+            _pin = sfx_pin_prefix()
+            if _pin:
+                _kept = [p for p in got
+                         if str(p).replace("\\", "/").startswith(_pin)]
+                if _kept:
+                    got = _kept      # an empty pinned folder falls back to all
+            _SFX_ALL_MEMO.update({"at": now, "key": key, "value": list(got)})
+            return list(got)
     except Exception:  # noqa: BLE001
         # An index is an optimisation. Anything going wrong with it means
         # answer the question the slow way, never answer it wrongly: a
