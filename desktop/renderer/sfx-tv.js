@@ -980,6 +980,10 @@
   /* ---- one clip ------------------------------------------------------ */
 
   function play(clip) {
+    /* #1426: an endless clip belongs to the native surface while it is
+       running. Checked here as well as at the poll because a clip can
+       reach this through cut() and the replay road too. */
+    if (clip && clip.endless && wallRunning()) return;
     /* #1184: whatever was in the tube is now the past, whichever road
        took it out - the clip ending, a seamless hand-over, the operator
        cutting, a run stepping on. One line here covers every one of
@@ -3226,6 +3230,86 @@
     next();
   }
 
+  /* #1426: ON THIS DEVICE THE PICTURE IS NOT THE PAGE'S.
+   *
+   * Measured on the tablet, with #1421's pre-fetch already deployed and
+   * the bytes arriving 9.5 SECONDS early: the picture still dropped
+   * 21-40% of its frames. The delivery was never the fault. This WebView
+   * renders at 8-12 fps WHATEVER IS IN IT - with the entire panel hidden,
+   * 28 top-level elements gone, every decorative decoder released and one
+   * 427x240 video alone on the document, it was still 12 - so no
+   * arrangement of HTML gets a smooth picture out of it.
+   *
+   * PineVideoWall plays the same ring on a SurfaceView that
+   * SurfaceFlinger composites directly from its own buffer queue, which
+   * the page's compositor cannot slow down. The page's job becomes only
+   * to say WHETHER it should be running.
+   *
+   * The yield is the shape this module already uses for the desktop
+   * shell: no bridge, an older build with no wall, or a refusal, and
+   * nothing at all changes - the page keeps its tube and behaves exactly
+   * as it did. A picture that depends on a new native class existing is
+   * a picture that disappears on the first tablet that has not updated. */
+  var wallWant = null;               /* what we last asked for; null = never */
+  var wallHas = false;               /* what the wall says it is doing */
+
+  function wallState(got) {
+    if (!got) return null;
+    if (typeof got === 'string') {
+      try { return JSON.parse(got); } catch (err) { return null; }
+    }
+    return got;
+  }
+
+  /* The endless clips the page has queued are the wall's now - playing
+     them here as well is the same picture twice, out of step with itself. */
+  function wallTakesOver() {
+    for (var i = queue.length - 1; i >= 0; i -= 1) {
+      if (queue[i].endless) queue.splice(i, 1);
+    }
+    coming.length = 0;
+    if (warm && warm.clip && warm.clip.endless) warmDrop();
+  }
+
+  /* #1426b: WHERE the picture goes. The geometry the operator dragged the
+     set to, which readBox() knows whether or not a tube is built right
+     now, converted to DEVICE pixels because a native view has never heard
+     of a CSS pixel (devicePixelRatio is 1.25 on this tablet).
+
+     NOT called wallBox(): that name is taken, by the listen wall's
+     hit-test rectangle a few hundred lines below, and a second one would
+     simply have won. */
+  function nativeWallRect() {
+    try {
+      var b = readBox();
+      var d = Number(root.devicePixelRatio) || 1;
+      if (!b || !(b.width > 0) || !(b.height > 0)) return null;
+      return {x: Math.round(b.left * d), y: Math.round(b.top * d),
+              w: Math.round(b.width * d), h: Math.round(b.height * d)};
+    } catch (err) { return null; }   /* full screen beats no picture */
+  }
+
+  function nativeWall(want) {
+    var bridge = api();
+    if (!bridge || typeof bridge.videoWall !== 'function') return false;
+    want = !!want;
+    if (wallWant === want) return wallHas;
+    wallWant = want;
+    bridge.videoWall(want ? 'on' : 'off', nativeWallRect()).then(function (got) {
+      var state = wallState(got);
+      wallHas = !!(state && state.on);
+      if (wallHas) wallTakesOver();
+    })['catch'](function () {
+      /* The bridge refused or the method is not on this build. Forget the
+         ask so a later poll tries again, and keep the page's own tube. */
+      wallWant = null;
+      wallHas = false;
+    });
+    return wallHas;
+  }
+
+  function wallRunning() { return wallHas; }
+
   async function poll() {
     wireDuck();                                            /* #1167 */
     wireWall();                                            /* #1184 */
@@ -3242,6 +3326,8 @@
       if (got && typeof got.seamless === 'boolean') seamOn = !!got.seamless;
       if (got && typeof got.endless === 'boolean') {
         endlessPaint(got.endless);
+        /* #1426: hand the set to the native surface where there is one. */
+        if (nativeWall(got.endless) && got.endless) wallTakesOver();
         if (!got.endless) {
           /* 2026-09-14: off means off - the rung-ahead copies go */
           for (var qi = queue.length - 1; qi >= 0; qi -= 1) { if (queue[qi].endless) queue.splice(qi, 1); }
