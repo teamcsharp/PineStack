@@ -87,37 +87,12 @@ class PineVideoWall(
 
     private data class Clip(val id: String, val url: String, val file: File)
 
-    /** One half of the leapfrog: a surface, a player, and what is on it. */
-    private inner class Deck(val view: SurfaceView) {
+    /** #1431: one half of the leapfrog - a player and what is on it. The
+     * SURFACE is shared; see the class note on why there is only one. */
+    private inner class Deck {
         var player: MediaPlayer? = null
         var clip: Clip? = null
         var ready = false
-        var surface: SurfaceHolder? = null
-
-        init {
-            /* MEDIA OVERLAY, not ON_TOP. setZOrderOnTop puts the surface
-             * above the whole window including the drawer and the status
-             * panel; media-overlay puts it above the WebView and below the
-             * app's own chrome, which is where a picture belongs. */
-            view.setZOrderMediaOverlay(true)
-            view.holder.addCallback(object : SurfaceHolder.Callback {
-                override fun surfaceCreated(holder: SurfaceHolder) {
-                    surface = holder
-                    player?.setDisplay(holder)
-                }
-
-                override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) = Unit
-
-                override fun surfaceDestroyed(holder: SurfaceHolder) {
-                    /* The surface can go while a player still holds it -
-                     * rotation, the drawer, the activity stopping. Letting
-                     * a player keep a dead surface is the one way this
-                     * crashes rather than merely going blank. */
-                    surface = null
-                    try { player?.setDisplay(null) } catch (err: Throwable) { }
-                }
-            })
-        }
 
         fun release() {
             try { player?.setOnCompletionListener(null) } catch (err: Throwable) { }
@@ -129,8 +104,13 @@ class PineVideoWall(
         }
     }
 
-    private val deckA = Deck(SurfaceView(context))
-    private val deckB = Deck(SurfaceView(context))
+    /* #1431: THE one surface. Media-overlay so it sits over the WebView
+     * and under this app's own chrome. */
+    private val screen = SurfaceView(context).apply { setZOrderMediaOverlay(true) }
+    private var held: SurfaceHolder? = null
+
+    private val deckA = Deck()
+    private val deckB = Deck()
     private var live: Deck = deckA
     private val running = AtomicBoolean(false)
     private var pump: Job? = null
@@ -146,22 +126,35 @@ class PineVideoWall(
     }
 
     init {
-        addView(deckA.view, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        addView(deckB.view, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        /* #1429: deckB rides on top for ever and its ALPHA SAYS WHICH ONE
-         * YOU SEE. The first cut called bringToFront() at the swap, which
-         * re-orders a SurfaceFlinger layer - expensive, and it can blank
-         * while it happens. Alpha is a compositor property: nothing is
-         * re-rastered and no layer moves. */
-        deckB.view.alpha = 0f
+        addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        screen.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                held = holder
+                try { live.player?.setDisplay(holder) } catch (err: Throwable) { }
+            }
+
+            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) = Unit
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                /* A player left holding a dead surface is the one way this
+                 * crashes rather than merely going blank. */
+                held = null
+                try { deckA.player?.setDisplay(null) } catch (err: Throwable) { }
+                try { deckB.player?.setDisplay(null) } catch (err: Throwable) { }
+            }
+        })
+        /* #1431: AND IT MUST NOT EAT TOUCHES. This lies over the WebView,
+         * and while it is up the operator reaches the panel through it. */
+        isClickable = false
+        isFocusable = false
+        isFocusableInTouchMode = false
         visibility = View.GONE
     }
 
-    /** Show this deck by alpha alone - no re-ordering, no re-raster. */
-    private fun reveal(deck: Deck) {
-        val want = if (deck === deckB) 1f else 0f
-        if (deckB.view.alpha != want) deckB.view.alpha = want
-    }
+    @Suppress("ClickableViewAccessibility")
+    override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
+
+    override fun onInterceptTouchEvent(event: android.view.MotionEvent?): Boolean = false
 
     // ---------------------------------------------------------------- api
 
@@ -276,7 +269,32 @@ class PineVideoWall(
             if (file == null) continue
             return@withContext Clip(id, url, file)
         }
-        null
+        /* #1431c: THE RING IS EMPTY, THE LARDER IS NOT. */
+        fromLarder()
+    }
+
+    /**
+     * A clip we already hold, when the station has nothing new.
+     *
+     * The station rings in real time and the wall plays in real time, so
+     * they run level and the wall is regularly a second ahead of the
+     * plan - at which point it used to replay the clip on screen, which
+     * is the one repeat nobody can miss. An endless set repeats by
+     * definition; it just must not repeat what you are looking at.
+     */
+    private fun fromLarder(): Clip? {
+        val now = live.clip?.file?.name
+        val held = try {
+            den.listFiles()?.filter {
+                it.isFile && it.length() > MIN_BYTES
+                    && it.name.endsWith(".mp4") && it.name != now
+            }
+        } catch (err: Throwable) {
+            null
+        } ?: return null
+        if (held.isEmpty()) return null
+        val pick = held[(Math.random() * held.size).toInt().coerceIn(0, held.size - 1)]
+        return Clip(pick.nameWithoutExtension, "", pick)
     }
 
     /** This id is spent - played, or refused - and is not asked for again. */
@@ -344,7 +362,10 @@ class PineVideoWall(
         deck.player = mp
         try {
             mp.setDataSource(clip.file.absolutePath)
-            deck.surface?.let { mp.setDisplay(it) }
+            /* Only the LIVE deck may hold the surface; the warm one takes
+               it at the hand-over. Two players on one surface at once is
+               the two-pictures fault all over again. */
+            if (deck === live) held?.let { mp.setDisplay(it) }
             mp.setOnPreparedListener {
                 deck.ready = true
                 if (andPlay) show(deck)
@@ -373,9 +394,14 @@ class PineVideoWall(
     private fun handOver(from: Deck) {
         val next = other()
         if (next.player != null && next.ready) {
-            show(next)
-            /* And the deck that just finished becomes the warm one. */
+            /* #1431b: THE OUTGOING LETS GO FIRST. On one surface, starting
+             * the incoming player before releasing the outgoing one leaves
+             * both holding the same SurfaceHolder for an instant, and the
+             * second setDisplay lands while the first still owns it -
+             * MediaPlayer answers -38, INVALID_OPERATION, and the picture
+             * stops. The gap this opens is two statements wide. */
             from.release()
+            show(next)
         } else {
             /* Nothing warm behind it. Replaying beats a black tube, but a
              * set that quietly plays one clip for ever looks exactly like
@@ -390,16 +416,24 @@ class PineVideoWall(
         live = deck
         val swap = Runnable {
             try {
-                deck.surface?.let { deck.player?.setDisplay(it) }
+                /* #1431b: no surface yet means no picture. The wall is GONE
+                 * until it is started and a GONE SurfaceView has none, so on
+                 * the first clip this can still be null - and starting here
+                 * would be exactly "the audio plays and nothing is shown".
+                 * surfaceCreated hands the surface to whatever is live. */
+                val holder = held
+                if (holder == null) {
+                    Log.i(TAG, "show: no surface yet, waiting for it")
+                    return@Runnable
+                }
+                deck.player?.setDisplay(holder)
                 deck.player?.start()
-                reveal(deck)
                 /* The operator's report was "the audio for the next video
                  * will play, but the video doesn't update" - which is this
                  * line being wrong, so it says what it did. */
-                Log.i(TAG, "handover: showing deck "
+                Log.i(TAG, "handover: deck "
                     + (if (deck === deckB) "B" else "A")
-                    + " (" + (deck.clip?.id ?: "?") + "), deckB alpha now "
-                    + deckB.view.alpha)
+                    + " has the surface (" + (deck.clip?.id ?: "?") + ")")
             } catch (err: Throwable) {
                 Log.w(TAG, "show: ${err.message}")
             }
