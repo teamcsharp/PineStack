@@ -26776,9 +26776,22 @@ def page_clip_seconds(clip: dict[str, Any]) -> float:
 
 
 def page_recovery_read() -> list[dict[str, Any]]:
+    # #1342: ...AND WHOSE AUDIO IS STILL THERE. /media is pruned, so a
+    # preserved delivery can outlive its own file; this road then replayed
+    # it on every restart, the browser 404ed, and nobody heard anything.
+    # The gate's own resolver is the test, so what can be replayed and what
+    # the gate can name cannot disagree - and a row it refuses is dropped
+    # quietly at startup rather than becoming a refused dispatch.
+    def _still_there(row: Any) -> bool:
+        try:
+            return _admission_resolve(str((row or {}).get("url") or "")) is not None
+        except Exception:  # noqa: BLE001
+            return False
+
     try:
         return [r for r in json.loads(PAGE_RECOVERY_PATH.read_text(encoding="utf-8")).get("clips", [])
-                if isinstance(r, dict) and r.get("delivery_id") and r.get("url")][:120]
+                if isinstance(r, dict) and r.get("delivery_id") and r.get("url")
+                and _still_there(r)][:120]
     except (OSError, ValueError, TypeError):
         return []
 

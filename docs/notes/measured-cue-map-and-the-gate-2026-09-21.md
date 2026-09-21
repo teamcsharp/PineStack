@@ -279,8 +279,13 @@ delivery accepted
 and the audio it names is exact — `sha256-full`, 233,774 bytes, 5.3 s: the
 levelled copy, which is the file the box is handed.
 
-Across the watched windows: every admission `origin: producer`, every
-delivery `accepted`, and **no enforced refusal of any kind**.
+Across the watched windows — 25 minutes of live air — 59 admissions, every
+one `origin: producer`, across the speech, sfx, advert and station lanes;
+54 deliveries, all `accepted`; five withdrawals, each with its reason named
+(two stranded by a restart, two rounds that would not fit their entry, one
+hand-off the caller's own check refused); and **no enforced refusal of any
+kind**. In the two minutes after the last deploy: 19 admissions, 18
+deliveries, and not one refusal of any sort.
 
 ### What is NOT ready, and why
 
@@ -294,11 +299,23 @@ wait, or the reader learns that a round waiting on its own slot is not a
 blocker. Neither is a one-word change, and the evidence for choosing
 between them is not in yet.
 
-**The speech lane.** Everything that produces speech now commits first and
-the watched windows are clean, so `enforce sfx,speech` is the next word —
-but it is the whole of the show's audio, and the two faults above say that
-this class of bug only shows itself under enforcement. Add it while
-somebody is watching, and read the census afterwards.
+**The speech lane** is the next word, and it is ready. Everything that
+produces speech commits first, the watched windows are clean, and the last
+thing that would have been refused on it is gone: `page_recovery_start`
+restores the page's FIFO after a deploy and never asked whether the audio
+was still there. `/media` is pruned, so it often is not — and this
+station's FIFO held exactly one row, `/media/test.wav`, "The host's full
+opening.", a fixture whose file has never existed, replayed on every
+restart for as long as the ledger goes back. 82 of the gate's 4,991
+historical "the final audio is not available" refusals are that one row.
+`page_recovery_read` now uses the gate's own resolver (#1342), so what can
+be replayed and what the gate can name cannot disagree, and a dead row is
+dropped quietly at startup instead of becoming a refused dispatch and a
+404 in somebody's browser.
+
+Even so: `enforce sfx,speech` is the whole of the show's audio, and the two
+faults above say this class of bug only shows itself under enforcement. Add
+it while somebody is watching, and read the census afterwards.
 
 **An exception between the admit and the transports** still leaves an
 occurrence standing until the next restart, where

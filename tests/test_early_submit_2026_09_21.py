@@ -122,6 +122,18 @@ class EarlySubmitTests(unittest.TestCase):
                 self.assertIn('"', call,
                               "%s withdraws without saying why" % producer)
 
+    def test_a_preserved_delivery_must_still_have_its_audio(self):
+        """#1342. /media is pruned, so a preserved page delivery can
+        outlive its own file. This station's FIFO held exactly one row -
+        /media/test.wav, a fixture whose file has never existed - replayed
+        on every restart since the ledger begins, and it was the last thing
+        standing between the speech lane and clean enforcement.
+
+        The gate's own resolver is the test, so what can be replayed and
+        what the gate can name cannot disagree."""
+        body = body_of(self.text, "def page_recovery_read(")
+        self.assertIn("_admission_resolve(", body)
+
     def test_the_resolver_knows_every_route_a_producer_uses(self):
         """A producer that commits audio the gate cannot NAME is refused at
         `verify`, which is where 4,991 admissions died. Each of these route
