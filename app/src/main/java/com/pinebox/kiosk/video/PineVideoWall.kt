@@ -102,6 +102,38 @@ class PineVideoWall(
     @Volatile private var showing: String = ""
     @Volatile private var made: Int = 0
 
+    /* #1440: THE WATCHDOG. 2026-09-21 15:31 the operator: "the clips are
+     * frozen on the pine tab". Measured: the wall's SurfaceView had posted
+     * no frame for ~12 minutes, `playing` never changed, and `queued` sat
+     * at exactly KEEP_AHEAD - the pump had filled the playlist and the
+     * player was not consuming it. No error had been raised, so nothing
+     * in this class could notice: the only state it watched was the
+     * error callback. An off/on through the bridge cured it at once.
+     *
+     * So the wall now measures its own progress once a second on the main
+     * thread (index, position, playbackState) and acts on a still player
+     * by state: ENDED with clips queued -> seek to the next; IDLE -> prepare;
+     * BUFFERING past a bound -> step past the clip; READY-but-frozen ->
+     * re-attach the surface, then on the third strike rebuild the player.
+     * Everything it sees is cached in volatile fields so `state()` can
+     * report it from the bridge thread without touching the player. */
+    @Volatile private var playback: String = "idle"
+    @Volatile private var playWhenReady: Boolean = true
+    @Volatile private var atIndex: Int = -1
+    @Volatile private var atCount: Int = 0
+    @Volatile private var atPos: Long = -1L
+    @Volatile private var atDuration: Long = -1L
+    @Volatile private var stillSince: Long = 0L
+    @Volatile private var kicks: Int = 0
+    @Volatile private var lastKick: String = ""
+    @Volatile private var lastError: String = ""
+    private val watchdog = object : Runnable {
+        override fun run() {
+            try { watch() } catch (err: Throwable) { Log.w(TAG, "watch: ${err.message}") }
+            if (running.get()) postDelayed(this, WATCH_MS)
+        }
+    }
+
     private val den: File by lazy {
         File(context.cacheDir, CACHE_DIR).apply { mkdirs() }
     }
@@ -138,10 +170,13 @@ class PineVideoWall(
         pump?.cancel()
         pump = null
         onMain {
+            removeCallbacks(watchdog)  // #1440
             try { player?.release() } catch (err: Throwable) { }
             player = null
             listed.clear()
             showing = ""
+            playback = "off"
+            atIndex = -1; atCount = 0; atPos = -1L; atDuration = -1L
             visibility = View.GONE
         }
     }
@@ -191,6 +226,108 @@ class PineVideoWall(
         .put("playing", showing)
         .put("made", made)
         .put("cached", den.listFiles()?.size ?: 0)
+        /* #1440: what the watchdog saw on its last tick - readable from any
+         * thread, and the only honest answer to "is it frozen?". */
+        .put("playback", playback)
+        .put("play_when_ready", playWhenReady)
+        .put("index", atIndex)
+        .put("count", atCount)
+        .put("position_ms", atPos)
+        .put("duration_ms", atDuration)
+        .put("still_s", if (stillSince > 0L) (android.os.SystemClock.elapsedRealtime() - stillSince) / 1000.0 else 0.0)
+        .put("kicks", kicks)
+        .put("last_kick", lastKick)
+        .put("last_error", lastError)
+
+    // ------------------------------------------------------- the watchdog
+
+    private fun stateName(st: Int): String = when (st) {
+        Player.STATE_IDLE -> "idle"
+        Player.STATE_BUFFERING -> "buffering"
+        Player.STATE_READY -> "ready"
+        Player.STATE_ENDED -> "ended"
+        else -> "state-$st"
+    }
+
+    private fun stamp(): String {
+        val c = java.util.Calendar.getInstance()
+        return String.format(java.util.Locale.US, "%02d:%02d:%02d",
+            c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE), c.get(java.util.Calendar.SECOND))
+    }
+
+    private fun kick(why: String, act: () -> Unit) {
+        kicks += 1
+        lastKick = "${stamp()} $why"
+        Log.w(TAG, "kick #$kicks: $why")
+        try { act() } catch (err: Throwable) { Log.w(TAG, "kick failed: ${err.message}") }
+        stillSince = android.os.SystemClock.elapsedRealtime()
+    }
+
+    /** Main thread, once a second: is the picture moving, and if not, why not. */
+    private fun watch() {
+        val p = player ?: return
+        if (!running.get()) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        val idx = p.currentMediaItemIndex
+        val pos = p.currentPosition
+        val st = p.playbackState
+        playback = stateName(st)
+        playWhenReady = p.playWhenReady
+        atCount = p.mediaItemCount
+        atDuration = p.duration
+        val moved = idx != atIndex || pos != atPos
+        atIndex = idx
+        atPos = pos
+        if (moved || stillSince == 0L) { stillSince = now; return }
+        val still = now - stillSince
+        val ahead = (p.mediaItemCount - idx - 1).coerceAtLeast(0)
+        when {
+            st == Player.STATE_ENDED && ahead > 0 && still > 800L ->
+                kick("ended with $ahead queued") {
+                    p.seekTo(idx + 1, 0L)
+                    p.playWhenReady = true
+                    if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                }
+            st == Player.STATE_IDLE && p.mediaItemCount > 0 && still > 2_000L ->
+                kick("idle with ${p.mediaItemCount} listed") { p.playWhenReady = true; p.prepare() }
+            st == Player.STATE_BUFFERING && still > BUFFER_STUCK_MS ->
+                kick("buffering ${still / 1000}s on $showing") {
+                    if (ahead > 0) p.seekTo(idx + 1, 0L) else p.prepare()
+                }
+            st == Player.STATE_READY && !p.playWhenReady && still > 1_500L ->
+                kick("play flag dropped") { p.playWhenReady = true }
+            st == Player.STATE_READY && p.playWhenReady && still > READY_STUCK_MS ->
+                if (kicks % 3 == 2) kick("ready but frozen ${still / 1000}s - rebuilding the player") { rebuild() }
+                else kick("ready but frozen ${still / 1000}s - surface re-attached") {
+                    p.setVideoSurfaceView(screen)
+                    if (ahead > 0) p.seekTo(idx + 1, 0L)
+                }
+        }
+    }
+
+    /** Throw the player away and start a new one on the same playlist. */
+    private fun rebuild() {
+        val old = player ?: return
+        val keep = ArrayList(listed)
+        val from = atIndex.coerceAtLeast(0)
+        try { old.release() } catch (err: Throwable) { }
+        player = null
+        listed.clear()
+        showing = ""
+        build()
+        val p = player ?: return
+        for ((i, clip) in keep.withIndex()) {
+            if (i < from) continue
+            try {
+                p.addMediaItem(MediaItem.fromUri(Uri.fromFile(clip.file)))
+                listed.add(clip)
+            } catch (err: Throwable) { }
+        }
+        if (listed.isNotEmpty()) {
+            showing = listed[0].id
+            try { p.seekTo(0, 0L) } catch (err: Throwable) { }
+        }
+    }
 
     // -------------------------------------------------------- the player
 
@@ -214,12 +351,18 @@ class PineVideoWall(
                 trimBehind(p)
             }
 
+            override fun onPlaybackStateChanged(state: Int) {
+                playback = stateName(state)  // #1440
+                Log.i(TAG, "state ${stateName(state)} at item ${p.currentMediaItemIndex} of ${p.mediaItemCount}")
+            }
+
             override fun onPlayerError(error: PlaybackException) {
                 /* A clip this device cannot decode must not stop the set.
                  * ExoPlayer has already halted on it, so it is thrown away
                  * and the playlist resumed past it. */
                 val at = p.currentMediaItemIndex
                 val bad = listed.getOrNull(at)
+                lastError = "${stamp()} ${error.errorCodeName} on ${bad?.id}"  // #1440
                 Log.w(TAG, "player: ${error.errorCodeName} on ${bad?.id}")
                 try { bad?.file?.delete() } catch (err: Throwable) { }
                 try {
@@ -232,6 +375,11 @@ class PineVideoWall(
         })
         player = p
         p.prepare()
+        /* #1440: the watchdog rides the main thread's Handler, which is
+         * exactly the thread that stays alive when ExoPlayer stops. */
+        removeCallbacks(watchdog)
+        stillSince = 0L
+        postDelayed(watchdog, WATCH_MS)
     }
 
     /**
@@ -262,6 +410,12 @@ class PineVideoWall(
                     showing = listed.getOrNull(p.currentMediaItemIndex)?.id ?: clip.id
                 }
                 if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                /* #1440: a playlist that had ENDED does not start again just
+                 * because an item was appended - it has to be sought. */
+                if (p.playbackState == Player.STATE_ENDED) {
+                    p.seekTo(p.mediaItemCount - 1, 0L)
+                    p.playWhenReady = true
+                }
             } catch (err: Throwable) {
                 Log.w(TAG, "offer ${clip.id}: ${err.message}")
             }
@@ -408,5 +562,9 @@ class PineVideoWall(
         private const val MIN_BYTES = 4096
         private const val CACHE_MOST = 240
         private const val CACHE_BYTES = 768L * 1024L * 1024L
+        /* #1440: the watchdog's tick and its two patience bounds. */
+        private const val WATCH_MS = 1_000L
+        private const val BUFFER_STUCK_MS = 8_000L
+        private const val READY_STUCK_MS = 5_000L
     }
 }
