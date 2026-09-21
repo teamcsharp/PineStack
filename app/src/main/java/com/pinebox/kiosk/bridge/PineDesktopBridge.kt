@@ -1292,8 +1292,12 @@ class PineDesktopBridge(
                         box.optInt("w"), box.optInt("h"))
                 }
                 when (want) {
-                    "on" -> wall.start()
+                    "on" -> { wall.veil(false); wall.start() }
                     "off" -> wall.stop()
+                    /* #1434: veiling is not stopping - the playlist keeps
+                     * running and only the surface leaves the screen. */
+                    "hide" -> wall.veil(true)
+                    "show" -> wall.veil(false)
                     else -> Unit
                 }
                 BridgeEnvelope.ok(id, wall.state().toString())

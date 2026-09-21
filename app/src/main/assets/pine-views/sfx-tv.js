@@ -3871,6 +3871,24 @@
     veil: function (on) {
       veiled = !!on;
       try { if (host) host.style.visibility = veiled ? 'hidden' : ''; } catch (err) { /* no set up */ }
+      /* #1434: AND THE NATIVE SURFACE, which has no `host` to hide. The
+         listen view veils whoever is showing the endless clip so it is
+         not on screen twice (#1184); with the wall running there was no
+         page set to veil, so it veiled nothing and the native picture
+         carried on over the listen backdrop. Hidden, not stopped - the
+         playlist keeps running underneath. */
+      try {
+        var bridge = api();
+        /* #1434b: NOT guarded on wallHas. That flag is only set once the
+           page's own poll has turned the wall on, so a wall started by
+           any other road - the bridge directly, a previous session -
+           went on showing its picture through the veil. The bridge
+           answers harmlessly when there is no wall, which is a better
+           test than a flag this file happens to have set. */
+        if (bridge && typeof bridge.videoWall === 'function') {
+          bridge.videoWall(veiled ? 'hide' : 'show')['catch'](function () {});
+        }
+      } catch (err) { /* no bridge: the page set is the only one there is */ }
     },
     mount: function (opts) {
       if (mounted) return;

@@ -90,6 +90,7 @@ class PineVideoWall(
 
     private var player: ExoPlayer? = null
     private val running = AtomicBoolean(false)
+    @Volatile private var veiled = false
     private var pump: Job? = null
 
     /** What is in the playlist, in the player's own index order. */
@@ -125,7 +126,7 @@ class PineVideoWall(
     fun start() {
         if (!running.compareAndSet(false, true)) return
         onMain {
-            visibility = View.VISIBLE
+            if (!veiled) visibility = View.VISIBLE
             build()
         }
         pump = scope.launch { feed() }
@@ -146,6 +147,22 @@ class PineVideoWall(
     }
 
     fun isRunning(): Boolean = running.get()
+
+    /**
+     * #1434: take the picture off screen WITHOUT stopping the set.
+     *
+     * The listen view shows the same clip as its own backdrop and veils
+     * whoever else is showing it (#1184). Veiling is not stopping: the
+     * playlist keeps running, the clip does not restart and the queue is
+     * not torn down, so coming back is a change of visibility and not a
+     * rebuild.
+     */
+    fun veil(on: Boolean) {
+        veiled = on
+        onMain {
+            visibility = if (running.get() && !veiled) View.VISIBLE else View.GONE
+        }
+    }
 
     /** Put the wall where the operator dragged the set to, in DEVICE pixels. */
     fun setBox(left: Int, top: Int, width: Int, height: Int) {
@@ -169,6 +186,7 @@ class PineVideoWall(
 
     fun state(): JSONObject = JSONObject()
         .put("on", running.get())
+        .put("veiled", veiled)
         .put("queued", aheadCount())
         .put("playing", showing)
         .put("made", made)
