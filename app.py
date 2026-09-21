@@ -169627,6 +169627,92 @@ function isVideoFile(f) { return /\.(mp4|webm)$/i.test(f || ""); }
 
 // <img> or autoplaying <video>, matching the file. Both take .src, so
 // fetchImageInto works on either.
+/* #1425: DECORATION DOES NOT GET A DECODER WHEN NOBODY IS LOOKING.
+ *
+ * The long note in the commit carries the measurements. The short of it:
+ * four looping gallery <video>s held four hardware decoders on the tablet
+ * while scrolled off-screen, and the endless set's own picture was
+ * dropping a third of its frames because the page could not be
+ * composited. `autoplay`+`loop` means "play whenever you exist"; this
+ * makes it "play while on screen", which is what was always meant.
+ *
+ * Every part of it degrades to the old behaviour: no IntersectionObserver
+ * in this runtime and the tiles simply autoplay as before. A gallery that
+ * stops animating is a cosmetic loss; a station whose picture stutters is
+ * not, and on a desktop none of this ever triggers because nothing is
+ * ever off-screen for long. */
+const PineDecor = (function () {
+  const WATCH = ".film video, #galleryGrid video";
+  let tiles = null;
+  let strip = null;
+
+  function has() { return typeof IntersectionObserver === "function"; }
+
+  /* Held, not stopped: `pineDecorHeld` records that WE paused it, so a
+     tile the operator paused by hand is not started again behind him. */
+  function show(vid, on) {
+    if (!vid) return;
+    try {
+      if (on) {
+        if (vid.paused && vid.dataset.pineDecorHeld === "1") {
+          vid.dataset.pineDecorHeld = "";
+          const go = vid.play();
+          if (go && go.catch) go.catch(() => {});
+        }
+      } else if (!vid.paused) {
+        vid.dataset.pineDecorHeld = "1";
+        vid.pause();
+      }
+    } catch (err) { /* torn down mid-scroll */ }
+  }
+
+  function tileWatcher() {
+    if (tiles || !has()) return tiles;
+    tiles = new IntersectionObserver((rows) => {
+      rows.forEach((row) => show(row.target, row.isIntersecting));
+    }, {rootMargin: "120px"});
+    return tiles;
+  }
+
+  /* The marquee is a 17,674 px layer whose transform animates forever,
+     and it kept animating with the strip scrolled out of sight. Paused
+     rather than cleared, so it resumes where it was instead of jumping. */
+  function stripWatcher() {
+    if (strip || !has()) return;
+    const film = document.querySelector(".film");
+    const track = document.getElementById("filmTrack");
+    if (!film || !track) return;
+    strip = new IntersectionObserver((rows) => {
+      rows.forEach((row) => {
+        try {
+          track.style.animationPlayState = row.isIntersecting
+            ? "running" : "paused";
+        } catch (err) { /* the strip was rebuilt under us */ }
+      });
+    }, {rootMargin: "80px"});
+    strip.observe(film);
+  }
+
+  function watch(vid) {
+    const eye = tileWatcher();
+    if (!eye || !vid || vid.dataset.pineDecorSeen === "1") return;
+    vid.dataset.pineDecorSeen = "1";
+    eye.observe(vid);
+  }
+
+  /* Called after anything rebuilds the strip or the grid - both replace
+     their children wholesale, so the elements are always new ones. */
+  function sweep() {
+    if (!has()) return;
+    try {
+      document.querySelectorAll(WATCH).forEach(watch);
+      stripWatcher();
+    } catch (err) { /* nothing built yet */ }
+  }
+
+  return {watch, sweep};
+})();
+
 function mediaElement(filename) {
   if (isVideoFile(filename)) {
     const vid = document.createElement("video");
@@ -169634,6 +169720,8 @@ function mediaElement(filename) {
     vid.loop = true;
     vid.autoplay = true;
     vid.playsInline = true;
+    vid.preload = "metadata";      // #1425: not the whole file, for a tile
+    PineDecor.watch(vid);          // #1425
     return vid;
   }
   const img = document.createElement("img");
@@ -216130,6 +216218,7 @@ function buildFilmstrip() {
   prevFilmFiles = new Set(entries.map((e) => e.face.f));
   filmItemCount = entries.length;
   track.style.animation = "scroll-film 60s linear infinite";
+  PineDecor.sweep();               // #1425: the cells are all new elements
   applyFilmScale(currentFilmScale());
 }
 
