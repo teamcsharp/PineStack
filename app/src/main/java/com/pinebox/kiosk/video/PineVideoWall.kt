@@ -148,7 +148,19 @@ class PineVideoWall(
     init {
         addView(deckA.view, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         addView(deckB.view, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        /* #1429: deckB rides on top for ever and its ALPHA SAYS WHICH ONE
+         * YOU SEE. The first cut called bringToFront() at the swap, which
+         * re-orders a SurfaceFlinger layer - expensive, and it can blank
+         * while it happens. Alpha is a compositor property: nothing is
+         * re-rastered and no layer moves. */
+        deckB.view.alpha = 0f
         visibility = View.GONE
+    }
+
+    /** Show this deck by alpha alone - no re-ordering, no re-raster. */
+    private fun reveal(deck: Deck) {
+        val want = if (deck === deckB) 1f else 0f
+        if (deckB.view.alpha != want) deckB.view.alpha = want
     }
 
     // ---------------------------------------------------------------- api
@@ -376,14 +388,32 @@ class PineVideoWall(
 
     private fun show(deck: Deck) {
         live = deck
-        post {
+        val swap = Runnable {
             try {
-                deck.view.bringToFront()
                 deck.surface?.let { deck.player?.setDisplay(it) }
                 deck.player?.start()
+                reveal(deck)
+                /* The operator's report was "the audio for the next video
+                 * will play, but the video doesn't update" - which is this
+                 * line being wrong, so it says what it did. */
+                Log.i(TAG, "handover: showing deck "
+                    + (if (deck === deckB) "B" else "A")
+                    + " (" + (deck.clip?.id ?: "?") + "), deckB alpha now "
+                    + deckB.view.alpha)
             } catch (err: Throwable) {
                 Log.w(TAG, "show: ${err.message}")
             }
+        }
+        /* #1429: MediaPlayer delivers onCompletion on the MAIN looper when
+         * the player was built on a thread without one - which is how the
+         * pump builds them - so we are already where we need to be. post()
+         * bought another trip through a message queue measured at 100-250
+         * ms of latency on this device, and that is the size of the gap he
+         * was seeing. Only hop threads when we genuinely are not on it. */
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            swap.run()
+        } else {
+            post(swap)
         }
     }
 
