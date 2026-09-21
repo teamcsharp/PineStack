@@ -168361,7 +168361,23 @@ if (PINE_TABLET) {
   paceStyle.textContent = [
     ".rhet-word, .rhet-word > i { animation: none !important; transition: none !important;",
     "  filter: none !important; text-shadow: none !important; will-change: auto !important; }",
-    ".pending::before, .pending::after { animation: none !important; }"
+    ".pending::before, .pending::after { animation: none !important; }",
+    /* #1413h: THE RIPPLES. A box-shadow cannot be composited, so each
+       frame of one repaints the layer it lives in - and these live in
+       the top bar and the tray. The colour and the ring stay; only the
+       breathing stops. */
+    "#onAirLamp, .live-dot, #scriptsBtn.waiting {",
+    "  animation: none !important; }",
+    /* #1413h: THE SWIRL'S FILTER. Its transform is rewritten by script
+       every frame while will-change names only transform and opacity, so
+       the filtered pixels are rastered again on each one. The tiles keep
+       drifting; they just stop being re-developed to do it. */
+    ".cf-swirl-tile {",
+    "  filter: none !important; transition: none !important;",
+    "  box-shadow: none !important; }",
+    /* #1413h: and the profile ticker, a 1,733 px wide layer scrolling
+       for ever behind everything else. */
+    "#phProfile { animation: none !important; }"
   ].join(" ");   /* a space: this script lives in a Python string, where 
  is a newline */
   (document.head || document.documentElement).appendChild(paceStyle);
