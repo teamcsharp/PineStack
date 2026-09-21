@@ -74662,6 +74662,115 @@ def _sfx_cycle_note(sample: Path, seconds: float, start: float, who: str) -> Non
         pass
 SFX_CYCLE_GAP = 0.0              # back to back; the set fades one into the next
 
+# --- #1433: AN HOUR BEFORE A CLIP MAY COME ROUND AGAIN --------------------
+#
+# See the note on sfx_video_fresh_pick for why a uniformly random pick is
+# not an unrepeating one, and why the cycle had nothing written down to
+# consult even if it had wanted to.
+SFX_VIDEO_COOLDOWN = float(os.getenv("SFX_VIDEO_COOLDOWN", "3600"))
+SFX_VIDEO_PLAYED_PATH = data_path("sfx_video_played.json")
+# An hour of short clips is a few hundred; this is room for a day of them
+# and is pruned by age on every save, so it cannot grow without end.
+SFX_VIDEO_PLAYED_KEEP = 20000
+_SFX_VIDEO_PLAYED: dict[str, float] = {}
+_SFX_VIDEO_PLAYED_READY = [False]
+_SFX_VIDEO_PLAYED_DIRTY = [0]
+
+
+def _sfx_video_played_load() -> None:
+    if _SFX_VIDEO_PLAYED_READY[0]:
+        return
+    _SFX_VIDEO_PLAYED_READY[0] = True
+    try:
+        got = json.loads(SFX_VIDEO_PLAYED_PATH.read_text())
+        if isinstance(got, dict):
+            for key, at in got.items():
+                try:
+                    _SFX_VIDEO_PLAYED[str(key)] = float(at)
+                except (TypeError, ValueError):
+                    continue
+    except Exception:  # noqa: BLE001
+        pass                      # a first run, or a file somebody broke
+
+
+def _sfx_video_played_save() -> None:
+    """Written on a count rather than on every clip - this is a ledger,
+    and a ledger must never be what makes a picture late."""
+    try:
+        old = time.time() - max(SFX_VIDEO_COOLDOWN * 4, 3600.0)
+        keep = {k: v for k, v in _SFX_VIDEO_PLAYED.items() if v >= old}
+        if len(keep) > SFX_VIDEO_PLAYED_KEEP:
+            newest = sorted(keep.items(), key=lambda kv: kv[1], reverse=True)
+            keep = dict(newest[:SFX_VIDEO_PLAYED_KEEP])
+        _SFX_VIDEO_PLAYED.clear()
+        _SFX_VIDEO_PLAYED.update(keep)
+        SFX_VIDEO_PLAYED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SFX_VIDEO_PLAYED_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(keep))
+        tmp.replace(SFX_VIDEO_PLAYED_PATH)
+        _SFX_VIDEO_PLAYED_DIRTY[0] = 0
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def sfx_video_on_cooldown(key: str) -> bool:
+    """Has this clip been on the tube inside the cooldown?"""
+    if not key or SFX_VIDEO_COOLDOWN <= 0:
+        return False
+    _sfx_video_played_load()
+    at = _SFX_VIDEO_PLAYED.get(str(key))
+    return at is not None and (time.time() - float(at)) < SFX_VIDEO_COOLDOWN
+
+
+def sfx_video_note_played(key: str) -> None:
+    """This clip is on the air now; it may not come back for an hour."""
+    if not key:
+        return
+    _sfx_video_played_load()
+    _SFX_VIDEO_PLAYED[str(key)] = time.time()
+    _SFX_VIDEO_PLAYED_DIRTY[0] += 1
+    if _SFX_VIDEO_PLAYED_DIRTY[0] >= 10:
+        _sfx_video_played_save()
+
+
+def sfx_video_cooldown_state() -> dict[str, Any]:
+    _sfx_video_played_load()
+    now = time.time()
+    warm = sum(1 for at in _SFX_VIDEO_PLAYED.values()
+               if now - at < SFX_VIDEO_COOLDOWN)
+    return {"cooldown_s": SFX_VIDEO_COOLDOWN, "held": len(_SFX_VIDEO_PLAYED),
+            "on_cooldown": warm, "rejected": int(_SFX_CYCLE.get("stale") or 0)}
+
+
+async def sfx_video_fresh_pick(tries: int = 40) -> Any:
+    """A clip out of the book that has NOT been on this tube for an hour.
+
+    `_sfx_db_pick_any` is uniformly random over the whole book, and
+    uniform is not unrepeating: collisions over a few hundred picks are
+    ordinary, and the pool is narrower than the book whenever the length
+    dial or the folder pin is set, because both are AND-ed into the same
+    query. So the pick is drawn again when it lands on something recent.
+
+    It gives up rather than starving: if every draw is on cooldown - a
+    library smaller than the cooldown, or a pin onto a handful of clips -
+    the FIRST clip it saw is used. A repeat is better than a dark tube,
+    and that is the trade this makes on purpose.
+    """
+    first = None
+    for _ in range(max(1, tries)):
+        got = await sfx_db_pick_row_async(True)
+        if got is None:
+            continue
+        if first is None:
+            first = got
+        try:
+            if not sfx_video_on_cooldown(sfx_id(got[0])):
+                return got
+        except Exception:  # noqa: BLE001
+            return got
+        _SFX_CYCLE["stale"] = int(_SFX_CYCLE.get("stale") or 0) + 1
+    return first
+
 
 async def sfx_video_cycle() -> None:
     """Keep the set's queue topped up for as long as the mode is on."""
@@ -74692,8 +74801,10 @@ async def sfx_video_cycle() -> None:
                 pick, asked_who = asked.pop(0)
                 seconds = await asyncio.to_thread(sfx_seconds, pick)
             else:
-                # The book first - instant, and full the moment the process is up.
-                got = await sfx_db_pick_row_async(True)
+                # The book first - instant, and full the moment the process
+                # is up - and #1433: not a clip that has been on this tube
+                # inside the hour.
+                got = await sfx_video_fresh_pick()
                 pick = got[0] if got else None
                 seconds = float(got[1]) if got else 0.0
             if pick is None:
@@ -74761,6 +74872,11 @@ async def sfx_video_cycle() -> None:
                 at_ms=int(start * 1000))
             plan.append({"sting": pick.stem, "start": start,
                          "end": start + seconds})
+            # #1433: EVERY clip the cycle rings, not only the SFX guy's.
+            # _sfx_cycle_note below runs `if asked_who`, so the set's own
+            # picks - almost all of them - were going out unrecorded, and a
+            # cooldown with nothing written down to read is not a cooldown.
+            sfx_video_note_played(key)
             if asked_who:
                 _sfx_cycle_note(pick, seconds, start, asked_who)      # #1417
             _SFX_CYCLE.update({"at": now, "until": plan[-1]["end"],
@@ -74787,6 +74903,7 @@ def sfx_video_mode_state() -> dict[str, Any]:
             "book": sfx_db_counts().get("video_playable", 0),
             "queued": int(cycle.get("queued") or 0),
             "asked": len(cycle.get("requests") or []),        # #1417: the SFX guy's clips waiting their turn
+            "cooldown": sfx_video_cooldown_state(),           # #1433
             # #1420: and what the leveller has done, so "some of them are
             # too quiet" is a reading and not an impression.
             "levelled": {"target_db": round(SFX_VIDEO_MEAN_DB, 1),
