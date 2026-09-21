@@ -23919,6 +23919,40 @@ def _admission_resolve(path: str) -> Path | None:
             guess = room / key
             if guess.is_file():
                 return guess
+        # #1338: THE ROUTES THAT NAME AUDIO BY SOMETHING OTHER THAN A FILE.
+        #
+        # `/sfx/{key}` is a sample named by its id, and it is the whole of
+        # the sfx lane's traffic: 4,512 of the gate's 4,991 refusals in
+        # nineteen hours were "the final audio is not available" about a
+        # sting that played perfectly well. `/ads-audio/` and
+        # `/upstairs-audio/` are durable mp3s kept outside /media.
+        #
+        # ONLY THE FREE WAY BACK. `sfx_by_id`'s other roads end in a walk
+        # of the CIFS share and this runs on the event loop; #1307 already
+        # keeps id -> path as a dict, written at the moment the id is
+        # minted, so an id that exists can always be looked up here.
+        if raw.startswith("/sfx/") and re.fullmatch(r"[a-f0-9]{16}", key):
+            known = str(_SFX_ID_REVERSE.get(key) or "")
+            if not known:
+                return None
+            sample = Path(known)
+            # WHAT THE BOX IS ACTUALLY HANDED. `/sfx/{key}` serves the
+            # levelled copy when there is one, not the sample as it sits
+            # on the share - so that is the file whose bytes this names.
+            # Cache-only: making one here would put a wave decode on the
+            # event loop for every sting the station plays.
+            try:
+                levelled = sfx_levelled_name(sample)
+            except Exception:  # noqa: BLE001
+                levelled = None
+            if levelled is not None and levelled.is_file():
+                return levelled
+            return sample if sample.is_file() else None
+        for prefix, room in (("/ads-audio/", PRODUCED_ADS_DIR),
+                             ("/upstairs-audio/", UPSTAIRS_AUDIO_DIR)):
+            if raw.startswith(prefix):
+                guess = room / raw.removeprefix(prefix)
+                return guess if guess.is_file() else None
         return None
     except Exception:  # noqa: BLE001
         return None
@@ -24192,6 +24226,82 @@ def admission_admit_round(clip: Any, rows: Any, length: float,
         return ""
 
 
+def admission_admit_line(clip: Any, *, who: str = "", kind: str = "",
+                         text: str = "", name: str = "", line_id: str = "",
+                         rows: Any = None, length: float = 0.0,
+                         producer: str = "") -> str:
+    """ADMIT ONE SPOKEN LINE, with its cue sheet, BEFORE either transport
+    is touched. Returns the occurrence id, or "" - and never raises.
+
+    `_dj_speak_floorless` is this station's busiest producer of broadcast
+    audio and it had no submission of its own: 9,137 of its dispatches in
+    nineteen hours reached the gate as `unadmitted` and were written into
+    the census after the fact. A census of what happened is not a committed
+    sequence, and that difference is the whole reason the gate could not be
+    enforced on the speech lane.
+
+    A line with SFX welded into it already HAS a cue sheet - the stream's
+    own rows, the very numbers the booth marker is driven off - and it is
+    used as it stands. A plain line is one cue covering the whole file,
+    which is the honest shape: there is nothing inside it to point at."""
+    controller = admission_controller()
+    if controller is None or _admission_module is None or not clip:
+        return ""
+    try:
+        path = str((clip or {}).get("path") or "")
+        if not path:
+            return ""
+        seconds = float(length or 0.0)
+        if seconds <= 0:
+            seconds = float((clip or {}).get("seconds") or 0.0)
+        if seconds <= 0:
+            # Off the wav header itself - 64 bytes, no ffprobe, no decode.
+            seconds = float(_admission_module.audio_seconds_hint(
+                path, _admission_resolve) or 0.0)
+        cues = [row for row in (rows or []) if isinstance(row, dict)]
+        if not cues:
+            cues = [{"id": str(line_id or ""), "who": str(who or ""),
+                     "name": str(name or ""), "kind": str(kind or ""),
+                     "text": str(text or ""), "from": 0.0,
+                     "until": max(0.05, seconds)}]
+        candidate = _admission_module.welded_round_candidate(
+            path=path, sig=str((clip or {}).get("sig") or ""),
+            rows=cues, length=max(0.05, seconds),
+            producer=producer or _admission_producer(2),
+            lane=_admission_lane(path, kind),
+            label=str((clip or {}).get("label") or "")[:120])
+        record = controller.admit(candidate)
+        return str(record.get("occurrence_id") or "")
+    except Exception as exc:  # noqa: BLE001
+        # A line that cannot be admitted is NOT stopped here: in observe
+        # mode the transports record it as an unadmitted dispatch, which is
+        # exactly the measurement this road exists to move.
+        try:
+            pipeline_log("air", "a line could not be admitted",
+                         extra="%r" % (exc,))
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+
+def admission_withdraw(occurrence_id: str, why: str) -> bool:
+    """Take back a committed occurrence that is not going to air after all.
+
+    Its POSITION stands and the script keeps the hole, marked. An admitted
+    occurrence that is never dispatched and never withdrawn is worse than
+    either: with ordering enforced it stands in front of every line behind
+    it for ever."""
+    if not occurrence_id:
+        return False
+    controller = admission_controller()
+    if controller is None:
+        return False
+    try:
+        return bool(controller.withdraw(str(occurrence_id), str(why)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def admission_state(limit: int = 40) -> dict[str, Any]:
     """The committed sequence, for the Script view and for /api/admission."""
     controller = admission_controller()
@@ -24437,6 +24547,142 @@ async def script_production_round(entry: dict[str, Any], plan: Any,
             pass
 
 
+# --- the measured cue map, on air (#1337) ---
+#
+# Section 4 of `docs/notes/speaker-recording-and-script-assembly.md`:
+# "Replace that approximation with cue positions derived from actual edited
+# sample counts." The approximation is `scale = _made / _ours` in
+# `_speak_turns_floorless`, and what is wrong with it is not its tuning:
+# the errors it corrects are a CONSTANT 120-frame limiter delay and a
+# loudness-pass residual inside +/-3 frames, measured in every one of the
+# 915 shadow-produced rounds this station has recorded. A constant
+# multiplied by a scale factor is wrong at the head and wrong at the tail.
+#
+# `conversation_assembly.assemble_conversation` renders each strip through
+# this mixer's own leg and reads the frame count off the result, so its cue
+# positions are integer sample counts of audio that was actually produced.
+# When a round carries such a map, these three functions are how it reaches
+# the air - and how it is refused when it does not describe the file that
+# was actually built.
+CUE_MAP_BODY_TOLERANCE = 0.03     # seconds; the loudness pass's own residual
+
+
+def production_cue_map(ready_meta: Any) -> dict[str, Any]:
+    """The MEASURED cue map this round was assembled with, or {}.
+
+    Present only on a round the producer made with the switch at `on`. In
+    `off` and `shadow` there is no such key and every road below this one
+    is untouched, which is the whole point of the switch."""
+    try:
+        got = dict((ready_meta or {}).get("cue_map") or {})
+    except Exception:  # noqa: BLE001
+        return {}
+    if not got.get("cues"):
+        return {}
+    # "`derivation` is `measured`. Any other value must be treated as an
+    # estimate" - and an estimate is what this road already has.
+    if str(got.get("derivation") or "") != "measured":
+        return {}
+    return got
+
+
+def production_cue_beats(ready_meta: Any, seg_ix: Any,
+                         count: int) -> list[float] | None:
+    """The seam beats the assembler MEASURED this round with, laid onto
+    `seg`; None when this round was not assembled.
+
+    #778 one step earlier: the mixer and the timeline must be built out of
+    the same numbers. The assembler already mixed these strips with these
+    beats and wrote down where every line lands; drawing fresh ones here
+    would build a different file, and `production_cue_windows` would then
+    correctly refuse to describe it.
+
+    Laid BY `seg_ix` - a turn's index in `seg` - because a burst can carry
+    a ring at the head, a hang-up at the tail and a sting in the middle,
+    and none of those is a line in anybody's script. They keep the beat
+    they were drawn."""
+    cue_map = production_cue_map(ready_meta)
+    if not cue_map:
+        return None
+    drawn = [float(b) for b in ((cue_map.get("mix") or {}).get("beats") or [])]
+    if not drawn:
+        return None
+    out = concat_beats(int(count))
+    for row, index in enumerate(list(seg_ix or [])):
+        try:
+            slot = int(index)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= slot < len(out) and row < len(drawn):
+            out[slot] = float(drawn[row])
+    return out
+
+
+def production_cue_windows(ready_meta: Any, rows: Any, made_seconds: float,
+                           start_at: float = 0.0) -> tuple[Any, str]:
+    """This burst's windows, from measured sample counts - or (None, why).
+
+    Returns one dict per row, in the burst's own order, carrying `from`,
+    `until`, the separate `speech_end_s`, and the map's own `clip_tail`.
+
+    EVERY GUARD HAS TO HOLD, and a map that does not prove out is not
+    half-used - the round falls back whole:
+
+      * the map says it was MEASURED, and it has cues;
+      * every turn in the burst carries a frozen occurrence id;
+      * the burst's occurrence ids ARE the map's `sequence`, in order.
+        That is the note's own acceptance line - "The final cue sequence
+        must equal the frozen script sequence" - and it is also #1330's
+        lesson, that two lists of the same shape wrongly paired is a
+        silent fault which lights one line and sounds another;
+      * the body the map describes is the body the mixer just produced,
+        inside the loudness pass's own residual. A ring and a hang-up are
+        in the finished file and not in the map, which is why this compares
+        `body_frames` and not the whole duration."""
+    cue_map = production_cue_map(ready_meta)
+    if not cue_map:
+        return None, ""
+    try:
+        rows = list(rows or [])
+        if not rows:
+            return None, "the burst carries no turns"
+        cues = {str(cue.get("occurrence_id") or ""): cue
+                for cue in (cue_map.get("cues") or [])}
+        wanted = [str(dict((row or {}).get("production") or {}).get(
+            "occurrence_id") or "") for row in rows]
+        if not all(wanted):
+            return None, "a turn in this burst carries no frozen occurrence id"
+        sequence = [str(name) for name in (cue_map.get("sequence") or [])]
+        if wanted != sequence:
+            return None, ("the burst's %d line(s) are not the map's sequence "
+                          "of %d" % (len(wanted), len(sequence)))
+        if any(name not in cues for name in wanted):
+            return None, "an occurrence in the sequence has no cue"
+        rate = float(cue_map.get("sample_rate") or 0.0)
+        body = (float(cue_map.get("body_frames") or 0.0) / rate) if rate else 0.0
+        if body <= 0.0:
+            return None, "the map does not say how long its body is"
+        made = float(made_seconds or 0.0)
+        if abs(body - made) > CUE_MAP_BODY_TOLERANCE:
+            return None, ("the map's body is %.3fs and the mixer produced "
+                          "%.3fs" % (body, made))
+        out: list[dict[str, Any]] = []
+        for name in wanted:
+            cue = cues[name]
+            out.append({
+                "from": float(start_at) + float(cue.get("start_seconds") or 0.0),
+                "until": float(start_at) + float(cue.get("cue_end_seconds") or 0.0),
+                # "Retain separate speech-end and cue-end positions so an
+                # inserted pause does not falsely start the next line."
+                "speech_end_s": (float(start_at)
+                                 + float(cue.get("speech_end_seconds") or 0.0)),
+                "clip_tail": float(cue.get("pause_seconds") or 0.0)})
+        return out, ""
+    except Exception as exc:  # noqa: BLE001
+        return None, "the map could not be read (%s)" % type(exc).__name__
+
+
+# --- the measured cue map, on air (#1337) --- end
 def _production_remember(references: Any) -> None:
     """Bounded: the last twelve reference sets, for the incident capture."""
     try:
@@ -26593,6 +26839,32 @@ async def page_recovery_start() -> None:
             clip["ts"] = max(int(time.time() * 1000), int(_RADIO.get("voice_cut_ms") or 0) + 1)
             clip["delivery_state"] = "published"
             clip["recovered_after_restart"] = True
+            # #1339: a preserved delivery is being broadcast again, and
+            # it is a NEW occurrence - the audit's reusable-sample rule.
+            # A clip whose media did not survive the restart cannot be
+            # named and is not admitted; the append below still runs, and
+            # the census records it as it always did.
+            _rec_url = str(clip.get("url") or "")
+            _rec_rows = ((clip.get("stream") or {}).get("rows") or None)
+            _rec_len = float((clip.get("stream") or {}).get("length") or 0.0)
+            if _rec_rows and _rec_len <= 0:
+                # A preserved burst knows where its turns are even when
+                # nobody wrote down how long the whole file was; the last
+                # cue's end IS that length, and a cue sheet running past
+                # the end of its audio is refused rather than trimmed.
+                _rec_len = max((float(r.get("until") or 0.0)
+                                for r in _rec_rows if isinstance(r, dict)),
+                               default=0.0)
+            admission_admit_line(
+                {"path": _rec_url.split("?")[0],
+                 "sig": (_rec_url.split("?t=", 1)[1].split("&")[0]
+                         if "?t=" in _rec_url else "")},
+                who=str(clip.get("who") or ""),
+                kind=str(clip.get("kind") or ""),
+                text=str(clip.get("text") or ""),
+                line_id=str(clip.get("row_id") or clip.get("delivery_id") or ""),
+                rows=_rec_rows, length=_rec_len,
+                producer="page_recovery_start")
             delivery = page_feed_append(clip)
             for source in (clip.get("stream") or {}).get("rows") or []:
                 row = dict(source, ts=int(time.time()), aired="published", recovery=True)
@@ -30219,7 +30491,22 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # not silence the browser (audit — both-mode was page-silent when
             # the box was stuck). Carry it to the page live, still held for
             # the box.
+            # #1339: THE SECOND DOOR OUT OF THIS FUNCTION. #1338 commits
+            # the line on the ordinary road; this is the road taken when
+            # the box was answering someone, and in `both` mode the page
+            # carries the line live while the box keeps its copy on the
+            # hold shelf. It is a broadcast, so it is committed too - and
+            # the held copy's own replay later is a second dispatch and
+            # gets a second occurrence, which is the audit's rule for the
+            # same audio played twice.
             if voice_to == "both":
+                _line_occurrence = admission_admit_line(
+                    clip, who=who, kind=kind, text=spoken, name=name,
+                    line_id=line_id,
+                    rows=((_sfx_stream.get("rows") or [])
+                          if _sfx_stream else None),
+                    length=float(_sfx_stream.get("length") or 0),
+                    producer="_dj_speak_floorless")
                 page_delivery = page_feed_append({
                     "url": f"{clip['path']}?t={clip['sig']}",
                     "text": spoken, "engine": voice_engine_for(forced or ""),
@@ -30383,6 +30670,23 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             "clip_from": _punct["from"], "clip_until": _punct["until"]}
         _RADIO["chat"].append(_punct_entry)
         _sfx_entries.append(_punct_entry)
+    # --- broadcast admission (#1338) ---
+    # ADMITTED BEFORE EITHER TRANSPORT IS TOUCHED. Every veto is above this
+    # line - the repeat check, the tint gate, the render itself - so this is
+    # the first moment the audit's precondition holds: the final audio
+    # exists and its cue offsets are known, before anything is committed.
+    #
+    # When a sting is welded into the line, the stream's rows ARE the cue
+    # sheet; the marker in the booth is already driven off them.
+    _line_occurrence = ""
+    if clip:
+        _line_occurrence = admission_admit_line(
+            clip, who=who, kind=kind, text=spoken, name=name,
+            line_id=line_id,
+            rows=((_sfx_stream.get("rows") or []) if _sfx_stream else None),
+            length=float((_sfx_stream or {}).get("length") or 0.0),
+            producer="_dj_speak_floorless")
+    # --- broadcast admission (#1338) --- end
     paged = False
     if page_carries_live(voice_to, to_box, box_down):          # #1118
         if clip:
@@ -30402,6 +30706,18 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # silently while SFX keep playing (audit #4/#13).
             note_drop(who, spoken,
                       "DJ voice rendered to nothing for the page feed")
+
+    # --- broadcast admission (#1338) ---
+    # AND TAKEN BACK IF NOBODY IS GOING TO CARRY IT. The page declined to
+    # take it and the box is not being asked, so this line is not going to
+    # air; leaving it committed would stand it in front of every line
+    # behind it once ordering is enforced. The position stays, marked,
+    # which is #1339's rule for a withdrawn round applied to one line.
+    if _line_occurrence and not paged and not to_box:
+        admission_withdraw(_line_occurrence,
+                           "neither transport carried the line")
+        _line_occurrence = ""
+    # --- broadcast admission (#1338) --- end
 
     # #776: this used to sleep for the length of the clip so the browser
     # could not fall behind. It did that, and it cost far more than it was
@@ -63605,6 +63921,15 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
         "page_audio": name, "page_sig": sig,
     })
     del _RADIO["chat"][:-240]
+    # #1339: committed before (c). Whichever way `voice_to` is set, one
+    # of the two roads below carries it, so there is no withdrawal here -
+    # the only way this one does not air is an exception, and an
+    # exception leaves the occurrence admitted and visible, which is the
+    # honest record of what happened.
+    admission_admit_line({"path": path, "sig": sig}, who="board",
+                         kind="upstairs", text=str(made.get("text") or ""),
+                         name="upstairs", line_id=str(made.get("id") or ""),
+                         producer="dj_upstairs_page")
     # (c) PLAY IT — the point of the whole request is that you hear him.
     to = _RADIO.get("voice_to") or "box"
     if to in ("box", "both"):
@@ -64656,6 +64981,15 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
     # credit a temporary label identity and then credit the row again later.
     page_delivery = ""
     box_played = False
+    # --- broadcast admission (#1339) ---
+    # The spot is one finished audio object and it exists on disk - that
+    # was checked at the top of this function - so the gate can name it
+    # before either road is asked to carry it.
+    _ad_occurrence = admission_admit_line(
+        {"path": path, "sig": sig}, who="dj", kind="ad",
+        text=str(entry.get("text") or label), name=label,
+        line_id=str(booth_row.get("id") or ""), producer="_air_produced_ad")
+    # --- broadcast admission (#1339) --- end
     try:
         if page_carries_live(ad_to, ad_to in ("box", "both"), box_down):
             page_delivery = page_feed_append({
@@ -64671,6 +65005,12 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
             if box_played and not page_delivery and callable(on_handoff):
                 on_handoff()
     finally:
+        # #1339: nobody carried it. The break did not happen, and the
+        # committed sequence has to say so rather than hold a position
+        # open for a spot that is not coming.
+        if not (page_delivery or box_played):
+            admission_withdraw(_ad_occurrence,
+                               "neither transport carried the spot")
         if not (page_delivery or box_played) and _RADIO.get("ad_now") is this_ad_now:
             if old_ad_now is None:
                 _RADIO.pop("ad_now", None)
@@ -70958,6 +71298,47 @@ def _sfx_level_save() -> None:
         pass
 
 
+_SFX_LEVEL_MISS = object()
+
+
+def _sfx_level_parts(got: Any) -> tuple[Any, Any]:
+    """The cache has held two shapes since #1420: a bare peak in dBFS (or
+    null, meaning "nothing on this box could measure it"), and
+    {"p": peak, "m": mean}. Both are read here, so an existing
+    sfx_levels.json keeps every measurement already in it and only the
+    clips that actually need a mean pay for a second look."""
+    if isinstance(got, dict):
+        peak, mean = got.get("p"), got.get("m")
+        return ((None if peak is None else float(peak)),
+                (None if mean is None else float(mean)))
+    return (None if got is None else float(got)), None
+
+
+def sfx_mean_db(path: Path, measure: bool = True) -> Any:
+    """#1420: the clip's MEAN level in dBFS — the number that answers "can
+    I hear what they are saying". None = no answer.
+
+    A pre-#1420 entry holds only a peak; that is not a refusal, it is an
+    older measurement, so it is re-taken once (and then holds both)."""
+    try:
+        key = "%s:%s" % (path, path.stat().st_mtime_ns)
+    except OSError:
+        return None
+    _sfx_level_load()
+    got = _SFX_LEVEL.get(key, _SFX_LEVEL_MISS)
+    if got is None:
+        return None                 # unmeasurable, and sfx_level agrees
+    if isinstance(got, dict):
+        return _sfx_level_parts(got)[1]     # measured under #1420: trust it
+    if not measure:
+        return None
+    # A bare float (peak only) or nothing at all. Drop it and measure
+    # again — this time volumedetect's mean is kept instead of discarded.
+    _SFX_LEVEL.pop(key, None)
+    sfx_level(path, measure=True)
+    return _sfx_level_parts(_SFX_LEVEL.get(key))[1]
+
+
 def sfx_level(path: Path, measure: bool = True) -> Any:
     """#1199: the loudest this sample gets, in dBFS. None = not measured.
 
@@ -70972,11 +71353,11 @@ def sfx_level(path: Path, measure: bool = True) -> Any:
         return None
     _sfx_level_load()
     if key in _SFX_LEVEL:
-        got = _SFX_LEVEL[key]
-        return None if got is None else float(got)
+        return _sfx_level_parts(_SFX_LEVEL[key])[0]
     if not measure:
         return None
     peak: Any = None
+    mean: Any = None
     try:
         if path.suffix.lower() == ".wav":
             import wave
@@ -70985,9 +71366,14 @@ def sfx_level(path: Path, measure: bool = True) -> Any:
                 width = handle.getsampwidth()
                 frames = handle.readframes(min(handle.getnframes(), 4_000_000))
             if frames and width:
-                top = float(audioop.max(frames, width))
                 full = float(1 << (8 * width - 1))
+                top = float(audioop.max(frames, width))
                 peak = (20.0 * math.log10(top / full)) if top > 0 else -120.0
+                # #1420: and the MEAN, which is the question a clip of
+                # SPEECH actually poses. Free on this read, and free from
+                # volumedetect below — it prints both and we kept one.
+                body = float(audioop.rms(frames, width))
+                mean = (20.0 * math.log10(body / full)) if body > 0 else -120.0
         else:
             import imageio_ffmpeg
             exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -70996,12 +71382,16 @@ def sfx_level(path: Path, measure: bool = True) -> Any:
                  "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-"],
                 capture_output=True, timeout=20, text=True, errors="replace")
             for line in (out.stderr or "").splitlines():
-                if "max_volume:" in line:
+                if "max_volume:" in line and peak is None:
                     peak = float(line.split("max_volume:")[1].split("dB")[0])
-                    break
+                elif "mean_volume:" in line and mean is None:
+                    mean = float(line.split("mean_volume:")[1].split("dB")[0])
     except Exception:  # noqa: BLE001
-        peak = None
-    _SFX_LEVEL[key] = peak
+        peak = mean = None
+    # #1420: two numbers under the one key now. None still means "could
+    # not be measured at all", which is NOT the same as silent, and is
+    # still never retried.
+    _SFX_LEVEL[key] = None if peak is None else {"p": peak, "m": mean}
     _SFX_LEVEL_DIRTY[0] += 1
     if _SFX_LEVEL_DIRTY[0] >= 25:
         _sfx_level_save()
@@ -72261,6 +72651,373 @@ def _as_wav(path: Path) -> Path:
     return out
 
 
+# --- #1420: A CLIP WITH A PICTURE ARRIVES AT THE SAME LOUDNESS AS THE REST -
+#
+# "Normalize the audio level of video clips that play in endless video
+#  mode... I'm hearing some videos that are so low I can't hear anything
+#  that they're saying."
+#
+# #1263 made sfx_levelled hand a video back UNTOUCHED, and its reason was
+# sound: levelling DECODES TO WAV, and handing the page a wav where it
+# asked for a picture is a CRT set with nothing in it. But "do not decode
+# it" was read as "do not level it", and so the one kind of clip whose
+# sound is SPEECH — where three dB is the difference between a line you
+# hear and a line you do not — became the only kind that went out at
+# whatever level it happened to be shot at. The endless set (#1395) then
+# rings those clips back to back, so the swing between them is what the
+# operator hears, every six seconds, all evening.
+#
+# The cure is the audio stings' own rule applied WITHOUT decoding:
+# measure the clip's mean level and remux it with that gain baked into
+# the audio track while THE PICTURE IS COPIED. `-c:v copy` is the whole
+# reason this is affordable — not one frame is re-encoded, so a ten
+# second sting is levelled in well under a second, once, ever.
+#
+# WHERE it goes in matters more than the arithmetic. It goes in at
+# sfx_levelled, which `/sfx/{key}` calls — the one door every surface
+# fetches a clip through: the shell's floating set, the panel's own
+# djVideoTv, the tune-in page's gallery stage, the tablet. Four surfaces
+# fixed by one change and not a line of client code touched. The
+# alternative — send a gain down the wire and let the page apply it —
+# needs a WebAudio graph on each of the four, cannot lift above 1.0
+# through `video.volume` at all (which is the direction the complaint
+# points), and `createMediaElementSource` on a CROSS-ORIGIN clip yields
+# SILENCE: the exact failure being fixed, delivered everywhere at once.
+#
+# WHAT THE NUMBERS ARE.
+#   * The target is the MEAN (RMS), not the peak. sfx_level has always
+#     measured max_volume, and a peak is precisely the wrong question
+#     here: one door slam gives a whispered clip a healthy peak and says
+#     nothing about whether the words are audible. volumedetect prints
+#     mean_volume on the very same run — we were throwing it away.
+#   * SFX_VIDEO_MEAN_DB defaults to the audio stings' own target written
+#     in dB, 20*log10(SFX_RMS/32767), so a video sting and an audio sting
+#     are aimed at the same place by construction rather than by luck.
+#   * The peak is held by a LIMITER, not by refusing the boost. A hard
+#     cap and an RMS target disagree about the loud-transient / quiet-
+#     speech clip, and the cap wins — which would have made some clips
+#     QUIETER than they are today. alimiter at -1 dBFS lets the boost
+#     through and catches only the transient that would have clipped.
+#   * box_gain() is deliberately NOT baked in, unlike the audio road.
+#     Baking the slider into the file means every nudge of it re-encodes
+#     the library; the element's own `volume` already carries the master
+#     level and PineDuck, live, for nothing.
+#
+# And it is NEVER made on the request path. The route asks cache-only
+# (`make=False`) and serves the clip as it is on a miss, because a tube
+# waiting on an ffmpeg is a tube that is dark. sfx_video_cycle makes it
+# inside the twelve seconds of lead it already holds, and whatever the
+# cycle did not reach is drained by sfx_levels_keeper.
+def _sfx_video_default_target() -> float:
+    """The audio stings' own loudness target, written in dB.
+
+    sfx_levelled aims a sting's RMS at SFX_RMS on a 32767 scale; the same
+    place in decibels is what a clip with a picture is aimed at, so the
+    two arrive together by construction rather than by a number somebody
+    typed twice. In a function because `import math` is 80,000 lines
+    below this and a module-level constant is evaluated where it is
+    written, not where it is read."""
+    import math
+    return 20.0 * math.log10(SFX_RMS / 32767.0)
+
+
+SFX_VIDEO_MEAN_DB = float(os.getenv("SFX_VIDEO_MEAN_DB",
+                                    "%.2f" % _sfx_video_default_target()))
+SFX_VIDEO_PEAK_DB = float(os.getenv("SFX_VIDEO_PEAK_DB", "-1.0"))
+# A rail, not the working bound — the peak guard below is what actually
+# decides how far a quiet clip may be lifted. Measured: the clips the
+# operator could not hear sit 30-35 dB under the target, so a bound of 15
+# was a bound that declined to fix the complaint.
+SFX_VIDEO_BOOST_DB = float(os.getenv("SFX_VIDEO_BOOST_DB", "40.0"))
+SFX_VIDEO_CUT_DB = float(os.getenv("SFX_VIDEO_CUT_DB", "-20.0"))
+# How far a boost may push the PEAK past the ceiling before the limiter
+# stops catching transients and starts flattening the clip. Six decibels
+# of limiting is inaudible on speech; twenty is a different recording.
+SFX_VIDEO_SQUASH_DB = float(os.getenv("SFX_VIDEO_SQUASH_DB", "6.0"))
+# Below this the clip is already where we want it and re-encoding it buys
+# a tenth of a decibel nobody can hear, at the price of a second copy of
+# every clip in the library.
+SFX_VIDEO_DEADBAND_DB = float(os.getenv("SFX_VIDEO_DEADBAND_DB", "1.0"))
+SFX_VIDEO_LEVEL_SECS = float(os.getenv("SFX_VIDEO_LEVEL_SECS", "90"))
+SFX_VIDEO_LEVEL_KEEP = int(os.getenv("SFX_VIDEO_LEVEL_KEEP", "400"))
+SFX_VIDEO_LEVEL_MB = float(os.getenv("SFX_VIDEO_LEVEL_MB", "4096"))
+# Bump this to invalidate every levelled copy at once — the same job the
+# "-v2" in the audio cache name does.
+SFX_VIDEO_LEVEL_MARK = "lvl1"
+SFX_VIDEO_ASIS_KEEP = 5000
+
+_SFX_VIDEO_LEVEL: dict[str, Any] = {"made": 0, "as_is": 0, "failed": 0,
+                                    "want": [], "why": ""}
+
+
+def sfx_video_gain_db(mean_db: Any, peak_db: Any = None) -> float:
+    """How far to lift or drop a clip, given where its mean sits and —
+    for a lift — where its peak sits.
+
+    Arithmetic on two numbers and nothing else, so the rule can be
+    checked without an ffmpeg anywhere near it.
+
+    THE MEAN SAYS HOW FAR, THE PEAK SAYS WHETHER. Aiming the mean at the
+    target is the whole job, and for a clip that is merely printed quiet
+    that is all this needs to do — thirty decibels of lift on a clip with
+    a normal crest is correct and safe, and refusing it (this had a flat
+    15 dB rail, and the clips the operator cannot hear are 30-35 dB down)
+    is refusing to fix the complaint.
+
+    What must NOT be lifted is a clip with nothing in it: silence with a
+    hiss under it has a mean 50 dB down too, and it reads identically
+    from the mean alone. The peak tells them apart, and it does it twice
+    over — a clip whose loudest moment is under the station's own
+    silence line (#1199) is not quiet, it is empty, and gets nothing; and
+    no lift may push the peak more than SFX_VIDEO_SQUASH_DB past the
+    ceiling, because past that the limiter has stopped catching the odd
+    transient and started flattening the clip. That second guard is also
+    what handles the mostly-silent clip with three loud moments in it:
+    its mean begs for 30 dB, its peak allows 8, and 8 is the right
+    answer."""
+    try:
+        want = SFX_VIDEO_MEAN_DB - float(mean_db)
+    except (TypeError, ValueError):
+        return 0.0
+    want = max(SFX_VIDEO_CUT_DB, min(SFX_VIDEO_BOOST_DB, want))
+    if want <= 0.0 or peak_db is None:
+        return want                      # a cut needs no headroom argument
+    try:
+        peak = float(peak_db)
+    except (TypeError, ValueError):
+        return want
+    if peak <= SFX_SILENT_DB:
+        return 0.0                       # #1199: there is nothing in there
+    room = (SFX_VIDEO_PEAK_DB + SFX_VIDEO_SQUASH_DB) - peak
+    return max(0.0, min(want, room))
+
+
+def _sfx_video_level_want(path: Path) -> None:
+    """A clip that went out unlevelled because its copy was not made yet.
+
+    sfx_levels_keeper drains this. Bounded, because a soundboard held
+    down would otherwise grow it without end."""
+    want = _SFX_VIDEO_LEVEL.setdefault("want", [])
+    key = str(path)
+    if key not in want:
+        want.append(key)
+        del want[:-60]
+
+
+def _sfx_video_level_flag(flat: Path, why: str) -> None:
+    """Why this clip is served exactly as it was shot — written beside the
+    copy that was NOT made, so the decision survives a restart, costs no
+    second volumedetect on the next airing, and can be read by a human
+    who wants to know why one clip is still quiet."""
+    try:
+        SFX_LEVELLED.mkdir(parents=True, exist_ok=True)
+        flat.write_text(why)
+    except OSError:
+        pass
+
+
+def _sfx_video_level_prune() -> None:
+    """Keep the levelled copies bounded, by count AND by bytes.
+
+    Nothing prunes VOICE_MEDIA_DIR/sfx — _media_prune globs
+    VOICE_MEDIA_DIR("*.*") non-recursively, which never sees inside this
+    directory, and the levelled WAVs have been accumulating in it since
+    #220. A wav is tens of kilobytes; a levelled clip is a whole video
+    file, so this one cannot be left to accumulate the same way. Two
+    bounds because clip sizes are not uniform: four hundred stings is a
+    different number of gigabytes depending on which four hundred."""
+    try:
+        made, flags = [], []
+        with os.scandir(SFX_LEVELLED) as listing:
+            for entry in listing:
+                if ("-%s-" % SFX_VIDEO_LEVEL_MARK) not in entry.name:
+                    continue
+                try:
+                    stat = entry.stat()
+                except OSError:
+                    continue
+                (flags if entry.name.endswith(".asis") else made).append(
+                    (stat.st_mtime, stat.st_size, entry.path))
+    except OSError:
+        return
+    # A part file left behind by a process that died mid-encode. It is
+    # not a levelled copy and must not be counted as one, but it must not
+    # be left forever either.
+    stale = [row for row in made if "-part" in Path(row[2]).stem]
+    made = [row for row in made if "-part" not in Path(row[2]).stem]
+    cutoff = time.time() - SFX_VIDEO_LEVEL_SECS * 4
+    for when, _size, where in stale:
+        if when < cutoff:
+            try:
+                os.unlink(where)
+            except OSError:
+                pass
+    made.sort(reverse=True)                     # newest first; the tail goes
+    flags.sort(reverse=True)
+    budget, used, kept = SFX_VIDEO_LEVEL_MB * 1024 * 1024, 0.0, 0
+    for at, (_when, size, where) in enumerate(made):
+        used += size
+        if at < SFX_VIDEO_LEVEL_KEEP and used <= budget:
+            kept += 1
+            continue
+        try:
+            os.unlink(where)
+        except OSError:
+            kept += 1
+    for _when, _size, where in flags[SFX_VIDEO_ASIS_KEEP:]:
+        try:
+            os.unlink(where)
+        except OSError:
+            pass
+    _SFX_VIDEO_LEVEL["kept"] = kept
+
+
+def sfx_video_levelled(path: Path, make: bool = False) -> Path:
+    """#1420: the same clip, PICTURE COPIED, sound brought to the level
+    every other clip arrives at. The original, untouched, on any miss.
+
+    `make=False` is the request path — a cache hit or the file as it is,
+    never a subprocess somebody is waiting on. `make=True` is the cycle
+    and the keeper, both of which have lead time to spend."""
+    if not sfx_is_video(path):
+        return path
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return path
+    suffix = path.suffix.lower()
+    out = SFX_LEVELLED / ("%s-%s-%s%s" % (sfx_id(path), SFX_VIDEO_LEVEL_MARK,
+                                          stamp, suffix))
+    if out.exists():
+        return out
+    flat = out.with_name(out.name + ".asis")    # looked at, left alone
+    if flat.exists():
+        return path
+    if not make:
+        _sfx_video_level_want(path)
+        return path
+
+    mean = sfx_mean_db(path, measure=True)
+    if mean is None:
+        # No audio track at all, or nothing on this box could measure it.
+        # Either way there is no gain to apply; record that so the next
+        # airing does not pay for the same answer.
+        _sfx_video_level_flag(flat, "no measurable sound in it")
+        _SFX_VIDEO_LEVEL["as_is"] = int(_SFX_VIDEO_LEVEL.get("as_is") or 0) + 1
+        return path
+    # The peak is in the cache already — sfx_mean_db has just measured
+    # both of them off the one volumedetect run.
+    peak = sfx_level(path, measure=False)
+    gain = sfx_video_gain_db(mean, peak)
+    if abs(gain) < SFX_VIDEO_DEADBAND_DB:
+        # WHICH rule refused it. Two very different clips arrive here with
+        # a gain of zero — one that is already where we want it, and one
+        # that has nothing in it to lift — and writing the first
+        # sentence for the second case reports the opposite of what
+        # happened to the one clip whose operator most wants to know.
+        if peak is not None and float(peak) <= SFX_SILENT_DB:
+            why = ("nothing in it rises above the station's silence line "
+                   "(#1199): peak %.1f dB, mean %.1f dB" % (peak, mean))
+        else:
+            why = ("already at level: mean %.1f dB, %+.1f dB from target"
+                   % (mean, gain))
+        _sfx_video_level_flag(flat, why)
+        _SFX_VIDEO_LEVEL["as_is"] = int(_SFX_VIDEO_LEVEL.get("as_is") or 0) + 1
+        return path
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return path                          # no encoder; play it as it is
+    limit = min(1.0, 10.0 ** (SFX_VIDEO_PEAK_DB / 20.0))
+    chain = ("volume=%.2fdB,alimiter=limit=%.4f:attack=5:release=50"
+             ":level=disabled" % (gain, limit))
+    # webm and ogv cannot carry AAC. The second name is a fallback, not a
+    # preference: if this ffmpeg build was compiled without libopus the
+    # encode fails, and a clip served raw is better than a clip refused.
+    codecs = (["libopus", "libvorbis"] if suffix in (".webm", ".ogv")
+              else ["aac"])
+    SFX_LEVELLED.mkdir(parents=True, exist_ok=True)
+    # The half-written file KEEPS THE EXTENSION. ffmpeg picks its muxer
+    # from the output name, so "...-lvl1-123.mp4.part47" is not a
+    # half-written mp4 to it, it is a container it has never heard of,
+    # and every single clip failed to level with the road's tidy "serve
+    # the original and flag it" catching every one. The station would
+    # have gone on sounding exactly as it did.
+    tmp = out.with_name("%s-part%d%s" % (out.stem, os.getpid(), suffix))
+    trouble = ""
+    for codec in codecs:
+        args = [exe, "-nostdin", "-loglevel", "error", "-y", "-i", str(path),
+                "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy",
+                "-af", chain, "-c:a", codec, "-b:a", "160k"]
+        if suffix in (".mp4", ".m4v", ".mov"):
+            args += ["-movflags", "+faststart"]
+        args.append(str(tmp))
+        try:
+            subprocess.run(args, check=True, timeout=SFX_VIDEO_LEVEL_SECS,
+                           capture_output=True)
+            os.replace(tmp, out)
+            _SFX_VIDEO_LEVEL["made"] = int(_SFX_VIDEO_LEVEL.get("made") or 0) + 1
+            _sfx_video_level_prune()
+            return out
+        except Exception as exc:  # noqa: BLE001
+            trouble = "%s: %s" % (type(exc).__name__, str(exc)[:80])
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    _SFX_VIDEO_LEVEL["failed"] = int(_SFX_VIDEO_LEVEL.get("failed") or 0) + 1
+    _SFX_VIDEO_LEVEL["why"] = "%s — %s" % (path.name, trouble)
+    # Flagged so one bad container does not spawn an ffmpeg per airing
+    # for the rest of the evening. Delete the .asis file to try again.
+    _sfx_video_level_flag(flat, "could not be levelled — %s" % trouble)
+    return path
+
+
+def _sfx_video_level_say() -> str:
+    """What the leveller has done, in the one line the operator already
+    reads about the set (#1420)."""
+    made = int(_SFX_VIDEO_LEVEL.get("made") or 0)
+    as_is = int(_SFX_VIDEO_LEVEL.get("as_is") or 0)
+    failed = int(_SFX_VIDEO_LEVEL.get("failed") or 0)
+    waiting = len(_SFX_VIDEO_LEVEL.get("want") or [])
+    if not (made or as_is or failed or waiting):
+        return " — sound levelled to %.0f dB: nothing measured yet" % (
+            SFX_VIDEO_MEAN_DB,)
+    bits = ["%d levelled" % made]
+    if as_is:
+        bits.append("%d already at level" % as_is)
+    if waiting:
+        bits.append("%d waiting" % waiting)
+    if failed:
+        bits.append("%d refused (%s)" % (failed, _SFX_VIDEO_LEVEL.get("why")
+                                         or "no reason recorded"))
+    return " — sound levelled to %.0f dB: %s" % (SFX_VIDEO_MEAN_DB,
+                                                 ", ".join(bits))
+
+
+def sfx_levelled_name(path: Path, vol: float | None = None) -> Path | None:
+    """WHERE this sample's levelled copy lives - or would, if it were made.
+
+    Never makes one, never reads the sample, and never decides whether the
+    clip should be levelled at all: that is `sfx_levelled`'s judgement and
+    this is only its arithmetic. None means even the name cannot be
+    answered, because the sample is not on the share any more.
+
+    Split out (#1338) because the admission gate has to identify the bytes
+    the box is ABOUT TO BE HANDED, on the event loop, without doing the
+    levelling itself. It is one function rather than two spellings of the
+    same filename for the reason #1420 was written: the levels had lived
+    in two places and the two had drifted."""
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    if vol is None:
+        vol = box_gain()
+    return SFX_LEVELLED / f"{sfx_id(path)}-v2-v{int(round(vol * 20))}-{stamp}.wav"
+
+
 def sfx_levelled(path: Path) -> Path:
     """The same sample, EQUALIZED to a common loudness under the DJ voice —
     decoding it first if it is an mp3. Peak-capping alone let dense samples
@@ -72273,18 +73030,19 @@ def sfx_levelled(path: Path) -> Path:
     import audioop
     import wave
 
-    # #1263: a clip with a picture is served as it was shot. Levelling
-    # DECODES TO WAV, and handing the page a wav where it asked for a
-    # picture is how you get a CRT set with nothing in it. The page holds
-    # its volume the same way it holds every other live element (#789).
+    # #1263: a clip with a picture must not be DECODED here — handing the
+    # page a wav where it asked for a picture is how you get a CRT set
+    # with nothing in it. #1420: that is a rule about decoding, and for
+    # two weeks it was obeyed as a rule about levelling, which is why the
+    # endless set swings twenty decibels between one clip and the next.
+    # sfx_video_levelled keeps the picture and levels only the sound; it
+    # is cache-only here, because this is the request path.
     if sfx_is_video(path):
-        return path
-    try:
-        stamp = path.stat().st_mtime_ns
-    except OSError:
-        return path
+        return sfx_video_levelled(path, make=False)
     vol = box_gain()             # stings track the box-volume slider too (#573)
-    out = SFX_LEVELLED / f"{sfx_id(path)}-v2-v{int(round(vol * 20))}-{stamp}.wav"
+    out = sfx_levelled_name(path, vol)
+    if out is None:
+        return path
     if out.exists():
         return out
     source = _as_wav(path)
@@ -73100,6 +73858,20 @@ async def sfx_levels_keeper() -> None:
                             done += 1
                     except Exception:  # noqa: BLE001
                         continue
+                # #1420: and the clips that went out before their
+                # levelled copy existed — a sting down the voice feed, a
+                # sampler pad, anything the cycle never picked. One
+                # ffmpeg each, so two a round and no more.
+                for raw in list(_SFX_VIDEO_LEVEL.get("want") or [])[:2]:
+                    try:
+                        _SFX_VIDEO_LEVEL["want"].remove(raw)
+                    except ValueError:
+                        pass
+                    try:
+                        sfx_video_levelled(Path(raw), make=True)
+                        done += 1
+                    except Exception:  # noqa: BLE001
+                        continue
                 if done:
                     _sfx_level_save()
                 return done
@@ -73713,14 +74485,21 @@ def sfx_video_seam_on() -> bool:
     act on it: every part of the behaviour is in the tube, and this is
     only where the answer is kept.
 
-    Default OFF. The CRT collapse is a thing the operator asked for by
-    name and liked; seamless is the other choice, not the correction of a
-    fault, so it is not turned on for anybody who has not asked.
+    2026-09-15 (#1184) defaulted this OFF, reasoning that "the CRT
+    collapse is a thing the operator asked for by name and liked;
+    seamless is the other choice, not the correction of a fault". That
+    was true when it was written. 2026-09-21 (#1422) it is not: "I want
+    the videos to be back to back to back without any break in between...
+    I don't even want to see an intermission between them." So the
+    DEFAULT IS ON, and the switch still turns it off for anyone who wants
+    the collapse back — an operator who has explicitly set it either way
+    keeps what he set, because only an ABSENT setting takes the default.
     """
     try:
-        return bool(dj_settings().get("sfx_video_seam"))
+        got = dj_settings().get("sfx_video_seam")
+        return True if got is None else bool(got)
     except Exception:  # noqa: BLE001
-        return False
+        return True
 
 
 # --- #1366: THE ENDLESS SET --------------------------------------------------
@@ -73746,7 +74525,13 @@ def sfx_video_seam_on() -> bool:
 # Paced off each clip's own measured length with a second of overlap, so
 # the set is handed the next picture just before the tube would go dark.
 # A clip whose length is unknown gets the floor below rather than a guess.
-SFX_CYCLE_FLOOR = 6.0            # never busier than this, whatever a clip says
+SFX_CYCLE_FLOOR = 6.0            # a slot for a clip whose length nobody knows
+# #1422: the shortest slot a MEASURED clip may be given. The floor above
+# is no longer the answer for a clip we have a real length for — it was
+# making a 2.02 s clip sit in six seconds of slot and calling the other
+# four seconds air. This is only a guard against a bad measurement
+# stacking the whole queue onto one instant.
+SFX_CYCLE_SHORTEST = 0.8
 SFX_CYCLE_LEAD = 1.0             # hand the set the next one this early
 _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
                               "clip": "", "why": ""}
@@ -73868,7 +74653,29 @@ async def sfx_video_cycle() -> None:
             # plan around it. The real length rides alongside; `seconds`
             # keeps its meaning exactly.
             real = round(float(seconds or 0), 2)
-            seconds = max(SFX_CYCLE_FLOOR, real)
+            # #1422: THE SLOT IS THE CLIP. "back to back to back without
+            # any break in between... I don't even want to see an
+            # intermission." A measured clip gets exactly its own length,
+            # so the next one's moment is the frame this one ends; only a
+            # clip whose length we could not read falls back to the floor,
+            # because planning zero seconds of air would stack the queue
+            # onto one instant. The note above about the two numbers still
+            # holds, and now they agree wherever we have both.
+            seconds = real if real >= SFX_CYCLE_SHORTEST else SFX_CYCLE_FLOOR
+            # #1420: make the levelled copy NOW, inside the twelve seconds
+            # of lead this loop already holds, so /sfx serves it rather
+            # than the raw clip. Off the loop and bounded; if the share is
+            # slow enough that it does not finish, the clip simply goes
+            # out at its own level this once and the keeper catches it —
+            # a dark tube would be the worse trade.
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(sfx_video_levelled, pick, True),
+                    timeout=SFX_CYCLE_AHEAD)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                _sfx_video_level_want(pick)
             key = sfx_id(pick)
             start = max(now, last_end + SFX_CYCLE_GAP)
             page_picture_append({
@@ -73905,6 +74712,17 @@ def sfx_video_mode_state() -> dict[str, Any]:
             "book": sfx_db_counts().get("video_playable", 0),
             "queued": int(cycle.get("queued") or 0),
             "asked": len(cycle.get("requests") or []),        # #1417: the SFX guy's clips waiting their turn
+            # #1420: and what the leveller has done, so "some of them are
+            # too quiet" is a reading and not an impression.
+            "levelled": {"target_db": round(SFX_VIDEO_MEAN_DB, 1),
+                         "peak_db": SFX_VIDEO_PEAK_DB,
+                         "boost_db": SFX_VIDEO_BOOST_DB,
+                         "made": int(_SFX_VIDEO_LEVEL.get("made") or 0),
+                         "as_is": int(_SFX_VIDEO_LEVEL.get("as_is") or 0),
+                         "failed": int(_SFX_VIDEO_LEVEL.get("failed") or 0),
+                         "kept": int(_SFX_VIDEO_LEVEL.get("kept") or 0),
+                         "waiting": len(_SFX_VIDEO_LEVEL.get("want") or []),
+                         "why": str(_SFX_VIDEO_LEVEL.get("why") or "")},
             "soundboard": sfx_soundboard_state(),          # #1185: the singular-track rule
             "ahead_s": max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1)),
             # 2026-09-15 (#1184): AND WHAT SEAMLESS IS DOING, in the same
@@ -73920,9 +74738,9 @@ def sfx_video_mode_state() -> dict[str, Any]:
             # here costs one clause and saves an evening of wondering why
             # the wall still blinks.
             "say": ("the endless set is on - %d clip(s) rung, %s is on the "
-                    "tube with %.0fs left%s"
+                    "tube with %.0fs left%s%s"
                     % (cycle.get("rung") or 0, cycle.get("clip") or "nothing",
-                       cycle.get("left") or 0,
+                       cycle.get("left") or 0, _sfx_video_level_say(),
                        (" - seamless: the tube cuts on the frame, the "
                         "listen wall still fades") if sfx_video_seam_on()
                        else " - seamless off: the tube collapses between clips"))
@@ -75569,6 +76387,22 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # night's recording is a far worse trade than losing one sting off it.
     if not is_video:
         _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}", src_path=sample)
+    # --- broadcast admission (#1339) ---
+    # COMMITTED BEFORE EITHER TRANSPORT. Every veto - the cadence, the
+    # rest between clips, the pick itself - is above this line, and the
+    # sample is chosen, so this is the first moment the gate can be told
+    # what is about to go out. 4,505 stings reached it the other way
+    # round in nineteen hours, and `enforce sfx` would have refused every
+    # one of them.
+    #
+    # `seconds` is deliberately not measured here: the sample lives on
+    # the share and the gate reads the length off the header of the file
+    # it resolves, which is the levelled copy on local disk.
+    _sting_occurrence = admission_admit_line(
+        {"path": f"/sfx/{key}", "sig": signature},
+        who=who, kind="sfx", text=sample.stem, name=sample.stem,
+        line_id=key, producer="dj_sting")
+    # --- broadcast admission (#1339) --- end
     _sting_started = time.monotonic()
     # Only where the line itself went. Queued for a browser in box-only mode
     # it would arrive as a scratch with no DJ in front of it, because the
@@ -75634,6 +76468,11 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         except Exception:  # noqa: BLE001
             pass
     else:
+        # #1339: and it was committed a moment ago, so take it back. The
+        # position stands and the script keeps the hole, marked "never
+        # sounded" - which is the same thing #738 says in the log, said
+        # where the committed sequence can see it.
+        admission_withdraw(_sting_occurrence, "the sting never sounded")
         pipeline_log("drop", f"sting {sample.stem} never sounded (#738)")
         try:                                   # #903/#905 (#848)
             # "never" is the word the glass tests for; "never sounded"
@@ -89992,6 +90831,26 @@ def _burst_withdraw(entries: list[dict[str, Any]], why: str) -> None:
     on the row - and records the reason where the shelf's own verdict
     ("the booth did not put it out") picks it up, so the station can say
     which it was instead of that it happened."""
+    # #1340: THE COMMITTED SEQUENCE HEARS IT TOO.
+    #
+    # Everything below takes the round back out of the FEED. The admission
+    # gate had been told about it a few lines before the hand-over and was
+    # never told it had been refused, so it went on holding a position for
+    # a round that was not coming - 674 of them when this was written, and
+    # every out-of-order refusal on the station traced to one.
+    #
+    # The position stands and the script keeps the hole, marked, which is
+    # exactly what this function does to the rows.
+    try:
+        _held = ""
+        for e in entries or []:
+            if isinstance(e, dict) and e.get("admission_occurrence"):
+                _held = str(e["admission_occurrence"])
+                break
+        if _held:
+            admission_withdraw(_held, why)
+    except Exception:  # noqa: BLE001
+        pass                    # a refusal is never worth an exception
     n = 0
     sid = ""
     kind = ""
@@ -91109,7 +91968,12 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # booth's per-turn windows below are built from the very numbers
             # the audio was built with instead of from the clips as they sat
             # on disk.
-            beats = concat_beats(len(seg))
+            # #1337: WHEN THE ROUND WAS ASSEMBLED, THESE ARE ITS BEATS.
+            # The assembler measured this round with them and wrote down
+            # where every line lands; drawing fresh ones here would build a
+            # different file, and the cue map below would refuse it.
+            beats = (production_cue_beats(ready_meta, seg_ix, len(seg))
+                     or concat_beats(len(seg)))
             try:
                 mixed = (await asyncio.to_thread(
                             _call_concat_blocking, seg,
@@ -91163,7 +92027,12 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     line_ids = [line_ids[index] for index in original_rows
                                 if index < len(line_ids)]
                     _sfx_meta = {}
-                    beats = concat_beats(len(seg))
+                    # #1337: the SFX rows have just been taken back out, so
+                    # this re-mix is the one that can actually match an
+                    # assembled map - the round is its scripted lines and
+                    # nothing else.
+                    beats = (production_cue_beats(ready_meta, seg_ix, len(seg))
+                             or concat_beats(len(seg)))
                     mixed = (await asyncio.to_thread(_call_concat_blocking, seg,
                                 bool(dj_settings().get("stream_texture")), beats)
                              if len(seg) >= 2 else Path(seg[0]).read_bytes())
@@ -91451,7 +92320,39 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 _made = (length - _ring_real - _hang_real
                          - (box_tail_seconds() if _welded else 0.0))
                 _ours = offset - _ring_real
-                if rows and _ours > 0.5 and _made > 0.5:
+                # #1337: THE MEASURED TIMELINE, WHEN THERE IS ONE.
+                #
+                # Everything above this line is an ESTIMATE: each clip was
+                # measured as it sits on disk and `seg_real_seconds` guessed
+                # what the mixer's silenceremove leg would take off the end
+                # of it. The rescale below then stretches the whole span to
+                # fit, because the sum never lands - and what it corrects is
+                # a CONSTANT 120-frame limiter delay plus a residual inside
+                # +/-3 frames, neither of which is a scale.
+                #
+                # A round the producer assembled carries integer sample
+                # counts of audio that was actually produced. Adopted only
+                # when it proves out, whole, or not at all.
+                _cue_exact = False
+                _cue_windows, _cue_why = production_cue_windows(
+                    ready_meta, rows, _made, _ring_real)
+                if _cue_windows:
+                    for _rw, _cw in zip(rows, _cue_windows):
+                        _rw.update(_cw)
+                    _cue_exact = True
+                    # #830: the page-routed estimate must agree with the
+                    # timeline that is actually airing, measured or scaled.
+                    for _r2, _e2 in zip(rows, _entries):
+                        air_at_set(_e2, _est0 + float(_r2.get("from") or 0))
+                    pipeline_log(
+                        "voice", "the round aired on its own assembled cue "
+                        "map - %d measured windows, no rescale (#1337)"
+                        % len(rows))
+                elif _cue_why:
+                    pipeline_log(
+                        "drop", "a supplied cue map was not used: %s - the "
+                        "estimated windows stand (#1337)" % _cue_why)
+                if rows and not _cue_exact and _ours > 0.5 and _made > 0.5:
                     scale = _made / _ours
                     for r in rows:
                         r["from"] = _ring_real + (r["from"] - _ring_real) * scale
@@ -91481,13 +92382,19 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # the run-up to the next speaker, not this line. It
                     # rides along so the cut can leave it off, scaled by
                     # the same loudness-pass correction the windows got.
+                    # #1337: nothing was scaled when the windows came off
+                    # a measured cue map, so the download's cut point is not
+                    # scaled either - it is the map's own pause.
                     _bscale = ((_made / _ours)
-                               if (rows and _ours > 0.5 and _made > 0.5)
+                               if (rows and not _cue_exact
+                                   and _ours > 0.5 and _made > 0.5)
                                else 1.0)
                     for _ri, (_r3, _e3) in enumerate(zip(rows, _entries)):
                         _sx3 = seg_ix[_ri] if _ri < len(seg_ix) else -1
                         _beat3 = (beats[_sx3] if 0 <= _sx3 < len(beats)
                                   else 0.0)
+                        if _cue_exact:
+                            _beat3 = float(_r3.get("clip_tail") or 0.0)
                         _e3["clip_media"] = _burst_key
                         _e3["clip_sig"] = str(one.get("sig") or "")
                         _e3["clip_from"] = round(
@@ -91505,8 +92412,18 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # this is the first moment the audit's precondition can be
                 # met at all: "verify that its final audio is available and
                 # its ordered line/cue offsets are known" BEFORE committing.
-                admission_admit_round(one, rows, length,
-                                      producer="_speak_turns_floorless")
+                _round_occurrence = admission_admit_round(
+                    one, rows, length, producer="_speak_turns_floorless")
+                # #1340: AND ON EVERY ROW OF THE ROUND, so a refusal one
+                # layer up can find what it has to take back - and so the
+                # feed row, the booth and the incident capture can all name
+                # the playback occurrence this line belongs to, which is
+                # the reference the script report was missing.
+                for _e4 in _entries:
+                    try:
+                        _e4["admission_occurrence"] = _round_occurrence
+                    except Exception:  # noqa: BLE001
+                        pass
                 # # --- broadcast admission (2026-09-15) --- end
                 # Deliver the ONE clip on the routing the DJ voice is set to,
                 # mirroring to the page when the box is down (#536).
@@ -136491,6 +137408,7 @@ async def sfx_file(
         return Response(status_code=404)
     # Levelled on the way out, so a hot sample does not out-shout the DJ who
     # set it up (#220). Both outputs fetch through here, so both get it.
+    raw = path
     path = await asyncio.to_thread(sfx_levelled, path)
     # #1263: SFX_TYPES, not MUSIC_TYPES - a video served as
     # application/octet-stream under the nosniff header below is a clip
@@ -136506,6 +137424,12 @@ async def sfx_file(
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
     }
+    if path == raw and sfx_is_video(raw):
+        # #1420: this clip is going out at its own level because its
+        # levelled copy is not made yet. An hour in the browser's cache
+        # would outlive the copy the keeper is about to write, and the
+        # next airing would sound exactly as wrong for no reason at all.
+        headers["Cache-Control"] = "private, max-age=60"
     window = _range_slice(str(request.headers.get("range") or ""), size)
     if window == (-1, -1):
         headers["Content-Range"] = f"bytes */{size}"
@@ -136579,6 +137503,10 @@ async def dj_sfx_play(
         raise HTTPException(status_code=404, detail="No such sample")
     key = sfx_id(path)
     signature = media_sign(key)
+    # #1339: the button that proves the wiring proves this part of it too.
+    admission_admit_line({"path": f"/sfx/{key}", "sig": signature},
+                         who="board", kind="sfx", text=path.stem,
+                         name=path.stem, line_id=key, producer="dj_sfx_play")
     page_feed_append({                  # #1147: honest broadcast stamp
         "url": f"/sfx/{key}?t={signature}",
         "text": "", "sting": path.stem,
@@ -140705,6 +141633,13 @@ async def sfx_video_cue_api(
         # #1306: NOW, not a lead ahead of now.
         "broadcast_ms": stamp,
     }
+    # #1339: a clip with a picture goes out on the set, and the set is
+    # broadcast. `seconds` is already known here - the book pick carries
+    # it - so the cue covers the real length rather than a guess.
+    admission_admit_line({"path": f"/sfx/{key}", "sig": signature},
+                         who="board", kind="sfx", text=pick.stem,
+                         name=pick.stem, line_id=key, length=float(seconds),
+                         producer="sfx_video_cue_api")
     try:
         page_feed_append(dict(clip))
     except Exception as exc:  # noqa: BLE001
@@ -222452,6 +223387,63 @@ if __name__ == "__main__":
         assert 0.0 < _mp <= SFX_PEAK + 0.02, _mp
     assert sfx_levelled(Path("/tmp/not-a-wav-at-all.mp3")) == Path(
         "/tmp/not-a-wav-at-all.mp3")            # unreadable plays as it is
+
+    # #1420: a clip with a PICTURE is levelled too. The gain rule is
+    # arithmetic on one number, so it is checked with no ffmpeg in sight.
+    assert abs(sfx_video_gain_db(SFX_VIDEO_MEAN_DB)) < 1e-6
+    assert abs(sfx_video_gain_db(SFX_VIDEO_MEAN_DB - 6.0) - 6.0) < 1e-6
+    assert abs(sfx_video_gain_db(SFX_VIDEO_MEAN_DB + 6.0) + 6.0) < 1e-6
+    # Railed in both directions.
+    assert sfx_video_gain_db(-90.0) == SFX_VIDEO_BOOST_DB
+    assert sfx_video_gain_db(0.0) == SFX_VIDEO_CUT_DB
+    assert sfx_video_gain_db(None) == 0.0
+    # The peak is what says whether a lift is allowed at all. A clip
+    # printed 30 dB quiet with a normal crest gets the whole lift - that
+    # is the complaint this exists to answer.
+    assert abs(sfx_video_gain_db(SFX_VIDEO_MEAN_DB - 30.0,
+                                 SFX_VIDEO_MEAN_DB - 30.0 + 14.0) - 30.0) < 1e-6
+    # Silence with a hiss under it reads the same from the mean and gets
+    # nothing, because there is nothing in it to make louder (#1199).
+    assert sfx_video_gain_db(-70.0, SFX_SILENT_DB - 1.0) == 0.0
+    # And a clip that is mostly silence with three loud moments is lifted
+    # by what its PEAK allows, not by what its mean begs for.
+    assert abs(sfx_video_gain_db(-60.0, -8.0)
+               - ((SFX_VIDEO_PEAK_DB + SFX_VIDEO_SQUASH_DB) + 8.0)) < 1e-6
+    # A cut never consults the peak - there is no headroom question when
+    # the clip is coming down.
+    assert sfx_video_gain_db(0.0, -0.1) == SFX_VIDEO_CUT_DB
+    # The deadband is what stops a clip already at level being re-encoded
+    # for a fifth of a decibel.
+    assert abs(sfx_video_gain_db(SFX_VIDEO_MEAN_DB - 0.2)) < SFX_VIDEO_DEADBAND_DB
+    assert abs(sfx_video_gain_db(SFX_VIDEO_MEAN_DB - 4.0)) >= SFX_VIDEO_DEADBAND_DB
+    # And the two cache shapes, because an existing sfx_levels.json is
+    # full of the old one and must not be thrown away or misread.
+    assert _sfx_level_parts(-6.5) == (-6.5, None)
+    assert _sfx_level_parts(None) == (None, None)
+    assert _sfx_level_parts({"p": -6.5, "m": -22.0}) == (-6.5, -22.0)
+    assert _sfx_level_parts({"p": -6.5, "m": None}) == (-6.5, None)
+    # On the request path a clip whose copy is not made yet plays as it
+    # is AND asks for one — the half that was missing would have meant a
+    # clip nothing ever levelled.
+    globals()["SFX_LEVELLED"] = Path("/tmp/sfx-level-selfcheck")
+    _clip = Path("/tmp/sfx-level-selfcheck.mp4")
+    _clip.write_bytes(b"not really an mp4, and it does not need to be")
+    _SFX_VIDEO_LEVEL["want"] = []
+    assert sfx_levelled(_clip) == _clip, "the picture must survive the request"
+    assert str(_clip) in _SFX_VIDEO_LEVEL["want"], "and it must be asked for"
+    assert sfx_levelled(_clip) == _clip
+    assert _SFX_VIDEO_LEVEL["want"].count(str(_clip)) == 1   # asked once
+    # A clip we have already decided to leave alone is not re-asked.
+    _flat = (SFX_LEVELLED / ("%s-%s-%s.mp4.asis"
+                             % (sfx_id(_clip), SFX_VIDEO_LEVEL_MARK,
+                                _clip.stat().st_mtime_ns)))
+    _sfx_video_level_flag(_flat, "already at level")
+    _SFX_VIDEO_LEVEL["want"] = []
+    assert sfx_levelled(_clip) == _clip
+    assert not _SFX_VIDEO_LEVEL["want"], "a settled clip must not be re-asked"
+    _flat.unlink()
+    _clip.unlink()
+    assert "levelled" in _sfx_video_level_say()
     for _leftover in SFX_LEVELLED.iterdir():
         _leftover.unlink()
     SFX_LEVELLED.rmdir()

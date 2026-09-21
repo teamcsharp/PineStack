@@ -787,9 +787,24 @@ class MirrorTests(unittest.TestCase):
         # The anchors the orchestrator patch is built on.
         for anchor in ("def _round_chunks(", "async def larder_prepare(",
                        "def reconcile_round_takes(",
-                       "async def _speak_turns_floorless(",
-                       "def admission_admit_round("):
+                       "async def _speak_turns_floorless("):
             self.assertEqual(self.text.count(anchor), 1, anchor)
+
+    def test_admit_round_is_rebound_not_edited(self):
+        """`admission_admit_round` is DEFINED TWICE ON PURPOSE.
+
+        The gate's own patch owns the first one; the production glue rebinds
+        it by name so the burst road's single call site carries the frozen
+        references without that patch's text being touched (and without
+        breaking its revert). Two definitions is the contract, not a
+        duplicate - but the second one must be the rebind, and it must still
+        fall through to the first."""
+        self.assertEqual(self.text.count("def admission_admit_round("), 2)
+        self.assertIn('if "admission_admit_round" in globals():', self.text)
+        self.assertIn("_admission_admit_round_before_production = "
+                      "admission_admit_round", self.text)
+        self.assertIn("return _admission_admit_round_before_production(",
+                      self.text)
 
 
 # --------------------------------------------------------------------------

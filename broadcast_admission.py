@@ -52,6 +52,12 @@ DISPATCHING = "dispatching"    # handed to a transport, no verdict yet
 FINISHED = "finished"          # a terminal outcome has been recorded
 WITHDRAWN = "withdrawn"        # never dispatched; the POSITION still stands
 
+# The reason `resume` writes on an occurrence that was committed and never
+# handed to a transport. It is not a failure of the gate: it is the honest
+# record of a round that ended with the process that was making it.
+STRANDED_WHY = ("the process restarted before this occurrence was handed "
+                "to a transport")
+
 # Terminal outcomes. `delivered` is the only one that claims a listener
 # heard it, and it must carry evidence that says how that was established.
 DELIVERED = "delivered"        # audible evidence exists
@@ -577,7 +583,10 @@ class PlayoutController:
 
         A restart is exactly such a change: whatever was in flight when the
         process died belongs to the player that died with it. Its receipts
-        are refused from here on, by name, and counted."""
+        are refused from here on, by name, and counted.
+
+        2026-09-21: and so does whatever was COMMITTED and never handed
+        over. See `STRANDED_WHY`."""
         state, events = self.store.load()
         with self.lock:
             self._apply_state(state)
@@ -585,6 +594,25 @@ class PlayoutController:
                 self._apply_event(event)
             in_flight = [oid for oid in self._order
                          if (self._occurrences.get(oid) or {}).get("state") == DISPATCHING]
+            # THE ONES THAT WERE COMMITTED AND NEVER HANDED OVER.
+            #
+            # An occurrence still ADMITTED when the process died was never
+            # dispatched and never will be: the round it belonged to ended
+            # with the player that died, and its audio may not even be on
+            # disk any more. Left standing it is `_earlier_unfinished` for
+            # every position behind it, for ever.
+            #
+            # Measured on this station 2026-09-21, before this existed: 674
+            # occurrences standing admitted, every one of them from
+            # `_speak_turns_floorless`, the oldest at position 16 and four
+            # days old - and they were the whole of the gate's 2,584
+            # out-of-order refusals. Ordering could never have been enforced
+            # while they stood there.
+            #
+            # Their POSITIONS stand. The script keeps the holes, marked,
+            # which is what withdrawal means here.
+            stranded = [oid for oid in self._order
+                        if (self._occurrences.get(oid) or {}).get("state") == ADMITTED]
             self._generation += 1
             for oid in in_flight:
                 # It was handed to a transport by a player that no longer
@@ -594,9 +622,17 @@ class PlayoutController:
                               "note": "the process restarted while this occurrence "
                                       "was in flight; no receipt survived it"},
                              record=True)
+            for oid in stranded:
+                row = self._occurrences.get(oid) or {}
+                row["state"] = WITHDRAWN
+                row["withdrawn_why"] = STRANDED_WHY
+                self._count("withdrawn:stranded")
+                self._record({"type": "withdrawn", "at": self.clock(),
+                              "occurrence_id": oid, "reason": STRANDED_WHY})
             self._record({"type": "resumed", "at": self.clock(),
                           "generation": self._generation,
-                          "recovered": len(events), "in_flight": in_flight})
+                          "recovered": len(events), "in_flight": in_flight,
+                          "stranded": len(stranded)})
             self.checkpoint()
             return self.stats()
 

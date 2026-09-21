@@ -603,16 +603,62 @@ class RecoveryTests(AdmissionBase):
             self.assertTrue(row["occurrence_id"])
             self.assertIn("position", row)
 
-    def test_a_crash_between_admission_and_handoff_replays_the_admission(self):
+    def test_a_crash_between_admission_and_handoff_withdraws_the_admission(self):
+        """2026-09-21: THE CONTRACT CHANGED, AND THE MEASUREMENT IS WHY.
+
+        This test used to assert the opposite - that a commitment survives
+        the restart and is claimed by the dispatch that follows it. On the
+        live station that never happened once. 674 occurrences stood
+        `admitted` and never dispatched, every one of them from the burst
+        road, the oldest at position 16 and four days old, and together
+        they were the whole of the gate's 2,584 out-of-order refusals.
+
+        They could not have been claimed: a burst's mix is content-
+        addressed, and the re-mix after a restart is drawn with fresh seam
+        beats, so it is a different file with a different key. The claim
+        had nothing to match.
+
+        Nothing is lost by taking the stranded one back, because every
+        producer now commits its own occurrence before it dispatches: the
+        road that airs after the restart brings its own commitment with
+        it. The POSITION stands and the script keeps the hole, marked."""
         record = self.controller.admit(self.fix.round("r1.wav", ["a"]))
         controller = self.fix.reopen()          # died before the transport call
-        self.assertEqual(controller.occurrence(record["occurrence_id"])["state"],
-                         ba.ADMITTED)
-        verdict = controller.gate(lane="speech", path=record["audio"]["path"],
-                                  sig=record["audio"]["sig"], producer="burst")
+        held = controller.occurrence(record["occurrence_id"])
+        self.assertEqual(held["state"], ba.WITHDRAWN)
+        self.assertEqual(held["withdrawn_why"], ba.STRANDED_WHY)
+        self.assertEqual(held["position"], record["position"])
+
+    def test_a_stranded_occurrence_stops_blocking_the_line_behind_it(self):
+        """The reason it matters at all: with ordering enforced, one
+        stranded commitment is silence for everything behind it."""
+        stranded = self.controller.admit(self.fix.round("r1.wav", ["a"]))
+        controller = self.fix.reopen()
+        controller.mode = ba.MODE_ENFORCE
+        controller.enforce_order = True
+        after = controller.admit(self.fix.round("r2.wav", ["b"]))
+        self.assertGreater(after["position"], stranded["position"])
+        verdict = controller.gate(lane="speech", path=after["audio"]["path"],
+                                  sig=after["audio"]["sig"], producer="burst")
         self.assertTrue(verdict.allow)
-        self.assertFalse(verdict.would_refuse)
-        self.assertEqual(verdict.occurrence_id, record["occurrence_id"])
+        self.assertEqual(verdict.reason, "admitted")
+
+    def test_a_restart_says_how_many_it_took_back(self):
+        """A withdrawal nobody can count is a withdrawal nobody can audit."""
+        self.controller.admit(self.fix.round("r1.wav", ["a"]))
+        self.controller.admit(self.fix.round("r2.wav", ["b"]))
+        controller = self.fix.reopen()
+        self.assertEqual(controller.stats()["counts"].get("withdrawn:stranded"),
+                         2)
+
+    def test_an_occurrence_already_delivered_is_not_withdrawn_by_a_restart(self):
+        record = self.controller.admit(self.fix.round("r1.wav", ["a"]))
+        self.controller.begin(record["occurrence_id"])
+        self.controller.record_delivery(record["occurrence_id"], ba.ACCEPTED)
+        controller = self.fix.reopen()
+        held = controller.occurrence(record["occurrence_id"])
+        self.assertEqual(held["state"], ba.FINISHED)
+        self.assertEqual(held["outcome"], ba.ACCEPTED)
 
     def test_an_hour_rollover_changes_nothing_about_the_sequence(self):
         # The hour is a formatting boundary in the script, not a playback
