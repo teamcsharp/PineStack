@@ -140,6 +140,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.androidx.webkit)
+    implementation(libs.androidx.media3.exoplayer)   // #1432: the endless set's player
     implementation(libs.androidx.drawerlayout)
     implementation(libs.androidx.documentfile)
     implementation(libs.kotlinx.coroutines.android)
