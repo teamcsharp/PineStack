@@ -4163,6 +4163,16 @@
       if (!settled) {
         var cursor = box.firstChild;
         for (var w = 0; w < want.length; w += 1) {
+          /* #1428d: STEP OVER THE EVENT ROWS, exactly as the settled
+             test above does. They are appended as they happen and take
+             no part in air-time order; walking onto one made
+             `want[w] === cursor` false for a row already in its right
+             place, and insertBefore on an attached node is a detach and
+             an attach. Measured: 240 such moves in eight seconds on a
+             feed whose order was already perfect. */
+          while (cursor && /sp-msg-ev/.test(String(cursor.className || ''))) {
+            cursor = cursor.nextSibling;
+          }
           if (want[w] === cursor) { cursor = cursor.nextSibling; continue; }
           box.insertBefore(want[w], cursor);
         }
@@ -4741,15 +4751,22 @@
            without opening it. On an attribute and shown through
            ::after - the reconciler re-dresses a changed element with
            textContent and would wipe a child span every repaint. */
+        /* #1428: WRITTEN ONLY WHEN IT CHANGES. Measured on the
+           tablet, this wrote data-inside 177 times in eight seconds and
+           3 of them were a change. Blink invalidates an element's style
+           on the write, not on a difference, so the other 174 bought a
+           style recalc each and nothing else. */
+        var inside = '';
         if (shut) {
           var got = segCount(seg);
-          node.setAttribute('data-inside', got
+          inside = got
             ? ('  ▸ ' + got.lines + (got.lines === 1 ? ' line' : ' lines')
                + (got.seconds >= 1
                   ? '  ·  ' + Math.round(got.seconds) + 's' : ''))
-            : '  ▸');
-        } else {
-          node.setAttribute('data-inside', '');
+            : '  ▸';
+        }
+        if (node.getAttribute('data-inside') !== inside) {
+          node.setAttribute('data-inside', inside);
         }
       }
     }
@@ -5984,12 +6001,23 @@
       node.removeAttribute('data-left');
       return;
     }
+    /* #1428: and the same here - 52 writes of data-left in eight
+       seconds, 10 of them a change. The countdown moves once a second;
+       tick does not. --sp-run was a percentage to ONE DECIMAL, so it
+       differed on paper every tick even when the bar could not move a
+       pixel; whole percent is finer than it can render. */
     var run = Math.max(0, Math.min(1, gone / span));
-    node.style.setProperty('--sp-run', (run * 100).toFixed(1) + '%');
+    var runPct = Math.round(run * 100) + '%';
+    if (node.style.getPropertyValue('--sp-run') !== runPct) {
+      node.style.setProperty('--sp-run', runPct);
+    }
     var left = Math.max(0, Math.round(span - gone));
-    node.setAttribute('data-left', left >= 60
+    var leftText = left >= 60
       ? (Math.floor(left / 60) + ':' + ('0' + (left % 60)).slice(-2))
-      : (left + 's'));
+      : (left + 's');
+    if (node.getAttribute('data-left') !== leftText) {
+      node.setAttribute('data-left', leftText);
+    }
   }
 
   function tick() {

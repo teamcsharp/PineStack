@@ -177298,9 +177298,22 @@ function swirlStart(host) {
       tile.turn += tile.spin * delta;
       const fade = Math.min(1, tile.life / (tile.ttl * 0.18),
                             (tile.ttl - tile.life) / (tile.ttl * 0.24));
-      tile.node.style.opacity = String(tile.peak * fade);
-      tile.node.style.transform = "translate3d(" + Math.round(tile.x) + "px,"
+      /* #1428b: WRITTEN ONLY WHEN IT CHANGES. These tiles drift slowly
+         and both values are rounded, so between most frames the strings
+         are byte-identical to what is already on the element - measured
+         1,081 such writes in ten seconds, every one of them buying a
+         style invalidation and nothing else. */
+      const wantFade = (tile.peak * fade).toFixed(3);
+      if (tile.fadeWas !== wantFade) {
+        tile.fadeWas = wantFade;
+        tile.node.style.opacity = wantFade;
+      }
+      const wantTurn = "translate3d(" + Math.round(tile.x) + "px,"
         + Math.round(tile.y) + "px,0) rotate(" + tile.turn.toFixed(1) + "deg)";
+      if (tile.turnWas !== wantTurn) {
+        tile.turnWas = wantTurn;
+        tile.node.style.transform = wantTurn;
+      }
     });
   }
 
@@ -177308,7 +177321,8 @@ function swirlStart(host) {
   const count = Math.max(5, Math.min(13, Math.round(width / 105)));
   for (let i = 0; i < count; i += 1) {
     const node = el("div", "cf-swirl-tile", "");
-    const tile = {node, album: null, life: 0, ttl: 1};
+    const tile = {node, album: null, life: 0, ttl: 1,
+                  fadeWas: "", turnWas: ""};   /* #1428c */
     node.onclick = () => { if (tile.album) albumFocus(host, tile.album); };
     layer.appendChild(node);
     tiles.push(tile);
