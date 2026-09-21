@@ -74617,7 +74617,14 @@ _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
 # changes nothing on the screen, because the screen already has what it
 # needs. The picture door's own rule still holds - no lead, no reservation,
 # no claim on the air - so an endless set cannot mortgage the show.
-SFX_CYCLE_AHEAD = 12.0           # keep this much picture rung ahead of now (#1417: was 20)
+SFX_CYCLE_AHEAD = 28.0           # keep this much picture rung ahead of now
+# #1429: was 12 (#1417 had it from 20). Twelve seconds is one clip on
+# this library, so a surface playing back to back in real time drains
+# the ring and then sits at its head with NOTHING WARM behind what it
+# is showing - measured on the tablet as queued:0 on every look, and a
+# 258 ms hole at each join. The picture door reserves no air and makes
+# no claim (see page_picture_append), so a longer lead costs nothing but
+# a little more of the book being decided early.
 # #1423: a CAP on the queue, not the control of it. SFX_CYCLE_AHEAD is
 # and always was what decides how much runway the set holds; this number
 # only stops the queue growing without bound when the clips are very
