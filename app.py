@@ -74558,6 +74558,31 @@ SFX_CYCLE_FLOOR = 6.0            # a slot for a clip whose length nobody knows
 # four seconds air. This is only a guard against a bad measurement
 # stacking the whole queue onto one instant.
 SFX_CYCLE_SHORTEST = 0.8
+
+
+def sfx_cycle_slot(real: Any) -> float:
+    """How much air one clip is given, from its measured length (#1423).
+
+    A function, and not three inline terms, because this is the whole of
+    "no intermission" and it was wrong twice inside one day — once by
+    flooring every clip at six seconds, and once by treating a correctly
+    measured 0.72 s clip as if its length were unknown. It is arithmetic
+    on one number, so it can be checked without a station.
+
+    THE SLOT IS THE CLIP. A length we have is the answer, whatever it is.
+    Only a length we do NOT have falls back to SFX_CYCLE_FLOOR, because
+    planning zero seconds of air would stack the whole queue onto one
+    instant. SFX_CYCLE_SHORTEST is not a view about how long a clip ought
+    to be — it is the cycle's own pacing floor, and it costs at most a
+    frame or two of black at the end of a sub-second clip.
+    """
+    try:
+        got = float(real or 0)
+    except (TypeError, ValueError):
+        return SFX_CYCLE_FLOOR
+    if not (got > 0):
+        return SFX_CYCLE_FLOOR              # no length: the floor, as before
+    return max(SFX_CYCLE_SHORTEST, round(got, 2))
 SFX_CYCLE_LEAD = 1.0             # hand the set the next one this early
 _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
                               "clip": "", "why": ""}
@@ -74593,7 +74618,14 @@ _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
 # needs. The picture door's own rule still holds - no lead, no reservation,
 # no claim on the air - so an endless set cannot mortgage the show.
 SFX_CYCLE_AHEAD = 12.0           # keep this much picture rung ahead of now (#1417: was 20)
-SFX_CYCLE_QUEUE = 2              # the one on the tube and the next (#1417: was 3)
+# #1423: a CAP on the queue, not the control of it. SFX_CYCLE_AHEAD is
+# and always was what decides how much runway the set holds; this number
+# only stops the queue growing without bound when the clips are very
+# short. At 2 it was silently governing instead - fine while every slot
+# was six seconds (2 x 6 = the twelve above), a dry tube once #1422 let a
+# slot be 0.72 s and two of them bought 1.5 s against a loop that sleeps
+# a whole second between top-ups.
+SFX_CYCLE_QUEUE = 16             # (#1417: was 3, #1422 made 2 too few)
 
 
 def sfx_cycle_request(sample: Path, who: str = "") -> bool:
@@ -74687,17 +74719,27 @@ async def sfx_video_cycle() -> None:
             # because planning zero seconds of air would stack the queue
             # onto one instant. The note above about the two numbers still
             # holds, and now they agree wherever we have both.
-            seconds = real if real >= SFX_CYCLE_SHORTEST else SFX_CYCLE_FLOOR
+            seconds = sfx_cycle_slot(real)              # #1423
             # #1420: make the levelled copy NOW, inside the twelve seconds
             # of lead this loop already holds, so /sfx serves it rather
             # than the raw clip. Off the loop and bounded; if the share is
             # slow enough that it does not finish, the clip simply goes
             # out at its own level this once and the keeper catches it —
             # a dark tube would be the worse trade.
+            #
+            # #1423: AND IT MAY ONLY SPEND THE RUNWAY IT ACTUALLY HAS.
+            # This was given SFX_CYCLE_AHEAD - twelve seconds - on the
+            # assumption that the loop always holds twelve seconds of
+            # lead. On short clips it does not, and a twelve second wait
+            # against 1.5 s of queue is a dark tube caused by the road
+            # that was supposed to improve the sound. Never more than the
+            # runway less a second; never so little that a clip which
+            # would have levelled in time is rung raw anyway.
+            room = max(0.0, last_end - time.time()) - 1.0
             try:
                 await asyncio.wait_for(
                     asyncio.to_thread(sfx_video_levelled, pick, True),
-                    timeout=SFX_CYCLE_AHEAD)
+                    timeout=max(1.5, min(SFX_CYCLE_AHEAD, room)))
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -223424,6 +223466,20 @@ if __name__ == "__main__":
         assert 0.0 < _mp <= SFX_PEAK + 0.02, _mp
     assert sfx_levelled(Path("/tmp/not-a-wav-at-all.mp3")) == Path(
         "/tmp/not-a-wav-at-all.mp3")            # unreadable plays as it is
+
+    # #1423: the slot a clip is given. "No intermission" is this line.
+    assert sfx_cycle_slot(18.28) == 18.28       # a long clip: its own length
+    assert sfx_cycle_slot(2.02) == 2.02         # and a short one
+    assert sfx_cycle_slot(0.72) == SFX_CYCLE_SHORTEST   # the pacing floor only
+    assert sfx_cycle_slot(0.72) < 1.0, "0.72s must not buy a six second slot"
+    assert sfx_cycle_slot(0) == SFX_CYCLE_FLOOR         # unmeasured: the floor
+    assert sfx_cycle_slot(None) == SFX_CYCLE_FLOOR
+    assert sfx_cycle_slot("nonsense") == SFX_CYCLE_FLOOR
+    assert sfx_cycle_slot(-3) == SFX_CYCLE_FLOOR
+    # The runway is counted in SECONDS, so the clip cap must be loose
+    # enough that short clips can still reach SFX_CYCLE_AHEAD.
+    assert (SFX_CYCLE_QUEUE * SFX_CYCLE_SHORTEST) >= SFX_CYCLE_AHEAD, \
+        "the queue cap governs the runway again - that is a dry tube"
 
     # #1420: a clip with a PICTURE is levelled too. The gain rule is
     # arithmetic on one number, so it is checked with no ffmpeg in sight.

@@ -74,13 +74,20 @@ ns: dict[str, Any] = {
     "sfx_is_video": lambda p: Path(p).suffix.lower() in (
         ".mp4", ".m4v", ".webm", ".mov", ".mkv", ".ogv"),
 }
-for name in ("SFX_RMS", "SFX_VIDEO_MEAN_DB", "SFX_VIDEO_PEAK_DB",
+# SFX_VIDEO_MEAN_DB is derived from SFX_RMS by a function, because
+# `import math` is 80,000 lines below where the constant is written
+# (#1420e), so that function has to be in here before the constants are.
+exec(fn("_sfx_video_default_target"), ns)
+for name in ("SFX_CYCLE_FLOOR", "SFX_CYCLE_SHORTEST", "SFX_CYCLE_QUEUE",
+             "SFX_CYCLE_AHEAD",
+             "SFX_RMS", "SFX_VIDEO_MEAN_DB", "SFX_VIDEO_PEAK_DB",
              "SFX_VIDEO_BOOST_DB", "SFX_VIDEO_CUT_DB", "SFX_VIDEO_DEADBAND_DB",
              "SFX_VIDEO_LEVEL_SECS", "SFX_VIDEO_LEVEL_KEEP",
              "SFX_VIDEO_LEVEL_MB", "SFX_VIDEO_LEVEL_MARK",
              "SFX_VIDEO_ASIS_KEEP", "SFX_VIDEO_SQUASH_DB", "_SFX_VIDEO_LEVEL"):
     exec(const(name), ns)
-for name in ("_sfx_level_load", "_sfx_level_save", "_sfx_level_parts",
+for name in ("sfx_cycle_slot",
+             "_sfx_level_load", "_sfx_level_save", "_sfx_level_parts",
              "sfx_mean_db", "sfx_level", "sfx_video_gain_db",
              "_sfx_video_level_want", "_sfx_video_level_flag",
              "_sfx_video_level_prune", "sfx_video_levelled",
@@ -181,7 +188,31 @@ def measured(path):
 
 
 try:
-    print("--- the rule, which is arithmetic on one number ---")
+    print("--- the slot a clip is given: 'no intermission' is this ---")
+    slot = ns["sfx_cycle_slot"]
+    FLOOR = ns["SFX_CYCLE_FLOOR"]
+    SHORT = ns["SFX_CYCLE_SHORTEST"]
+    check("a long clip gets exactly its own length", slot(18.28), 18.28)
+    check("and so does a short one", slot(2.02), 2.02)
+    # The live ring said `slot 6.00  clip 0.72` after the first deploy:
+    # the guard meant for an UNMEASURED clip was firing on a correctly
+    # measured very short one and handing it 5.28 s of dark tube - the
+    # intermission back again, on the clips where it is proportionally
+    # worst.
+    check("0.72s is a measurement, not a missing one", slot(0.72), SHORT)
+    check("so it must not buy a six second slot", slot(0.72) < 1.0, True)
+    # A length we genuinely do not have is the only thing the floor is
+    # for; planning zero seconds would stack the queue onto one instant.
+    for nothing in (0, None, -3, "nonsense", float("nan")):
+        check("no length -> the floor (%r)" % (nothing,), slot(nothing), FLOOR)
+    # And the runway is spent in SECONDS while the queue is counted in
+    # CLIPS, so the cap has to be loose enough for short clips to reach
+    # SFX_CYCLE_AHEAD - at 2 it governed instead, and 2 x 0.72s is 1.5s
+    # of runway against a loop that sleeps a whole second.
+    check("the clip cap cannot govern the runway any more",
+          ns["SFX_CYCLE_QUEUE"] * SHORT >= ns["SFX_CYCLE_AHEAD"], True)
+
+    print("\n--- the rule, which is arithmetic on one number ---")
     check("a clip already at the target is not moved",
           round(gain_db(TARGET), 6), 0.0)
     check("six dB under the target is lifted six",
