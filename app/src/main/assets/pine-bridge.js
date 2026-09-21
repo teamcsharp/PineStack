@@ -144,6 +144,9 @@
     /* --- shell ------------------------------------------------------- */
     openExternal: promised("openExternal"),
     buildInfo: promised("buildInfo"),
+    /* #1426: the native endless-video surface. A build without it
+       answers {on:false} and the page keeps its own <video>. */
+    videoWall: promised("videoWall"),
 
     /* --- backend lifecycle: no-ops by design -------------------------
      * The station is not on the tablet. It runs on the box at
@@ -277,6 +280,31 @@
      *   station's export courier and `uploaded` is {ok, id?, dest?,
      *   detail?} - a courier that is not there is uploaded:{ok:false},
      *   never a failed save. Without it, uploaded is null.
+     * replayFrames({seconds, count, back?, edge?})
+     *   -> {ok, seconds, held, from, to, asked_back, clamped,
+     *       frames:[{at, image}], bytes, edge, detail}
+     *      | {ok:false, held, detail}
+     *   #1148: "Whenever I access the screen capture to follow report, I
+     *   also want to be able to scrub between the last five seconds of the
+     *   broadcast to find the right frame." `seconds` (default 5, 1..30) of
+     *   the screen ring, pulled out as `count` (default 10, 2..24) evenly
+     *   spaced JPEGs, oldest first, each about `edge` px on its long side.
+     *   `at` is how many seconds before NOW that frame sits, one decimal -
+     *   so the newest of a tail window is 0.0, which the strip labels
+     *   "now". A TEMPORARY mp4 in the cache dir, deleted as soon as the
+     *   frames are out; nothing reaches the recordings folder. `bytes` is
+     *   the measured base64 this answer carries.
+     *   #1155: "I would like to go back the whole recording range." `back`
+     *   (default 0) is how many seconds before now the shown window ENDS,
+     *   so {back:240, seconds:10} is the ten seconds ending four minutes
+     *   ago. Default 0 is the tail, exactly as before. Clamped to `held` -
+     *   what the ring actually has right now, which is the range the strip
+     *   may travel over and is routinely far more than the design floor
+     *   replayState() calls `atLeast`. `from` and `to` say where the window
+     *   really landed (seconds before now, oldest and newest edge) and
+     *   `clamped` is true when the ask ran off the old end. A far-back ask
+     *   muxes everything from now to that point, so it costs more the
+     *   further back it goes: cache what you are given.
      * hotCorners() -> {enabled, tl, tr, bl, br, ring}
      * hotCornersSet({...partial}) -> the merged object, also pushed to
      *   PineHotCorners.configure(). `ring` is the screen ring's hold in
@@ -285,6 +313,7 @@
     replayExport: promised("replayExport"),
     replayEdit: promised("replayEdit"),
     replayKeepEdited: promised("replayKeepEdited"),
+    replayFrames: promised("replayFrames"),
     hotCorners: promised("hotCorners"),
     hotCornersSet: promised("hotCornersSet"),
 

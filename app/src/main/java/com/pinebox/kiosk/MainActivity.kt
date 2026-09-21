@@ -90,6 +90,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var monitorValue: TextView
 
     private lateinit var bridge: PineDesktopBridge
+    private var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null  // #1426
 
     /** Null until the deferred build has run. */
     private var rail: RailController? = null
@@ -1057,6 +1058,40 @@ class MainActivity : AppCompatActivity() {
     /* The bridge                                                          */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * #1426: THE ENDLESS SET GETS ITS OWN SURFACE.
+     *
+     * Added to R.id.root AFTER the WebView, so it is above it in the
+     * FrameLayout; PineVideoWall's own surfaces are media-overlay, which
+     * puts them over the panel and under this app's chrome. It starts
+     * GONE and costs nothing until the page asks for it.
+     */
+    private fun installVideoWall() {
+        val found = findViewById<android.view.View>(R.id.root)
+        android.util.Log.i("PineVideoWall", "install: root=" + (found?.javaClass?.simpleName ?: "NULL"))
+        val root = found as? android.widget.FrameLayout
+        if (root == null) {
+            android.util.Log.w("PineVideoWall", "install: no FrameLayout at R.id.root - no wall")
+            return
+        }
+        val wall = try {
+            com.pinebox.kiosk.video.PineVideoWall(this, app.client, lifecycleScope)
+        } catch (err: Throwable) {
+            android.util.Log.e("PineVideoWall", "install: build failed", err)
+            return
+        }
+        root.addView(
+            wall,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        videoWall = wall
+        bridge.videoWall = wall
+        android.util.Log.i("PineVideoWall", "install: wall handed to the bridge")
+    }
+
     private fun installBridge() {
         bridge = PineDesktopBridge(
             context = applicationContext,
@@ -1070,6 +1105,7 @@ class MainActivity : AppCompatActivity() {
             openExternal = ::openExternal,
         )
         webView.addJavascriptInterface(bridge, PineDesktopBridge.NAME)
+        installVideoWall()                                    // #1426
         /* THE FIRST RESUME HAS ALREADY HAPPENED. This runs from
          * standUpTheRest, posted after the first frame - which is after
          * onResume, whose `bridge.liveActivity = this` is guarded on the

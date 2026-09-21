@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.util.Base64
@@ -109,6 +110,12 @@ class PineDesktopBridge(
              * to the operator's folder, and the four corners' preferences.
              * See config/HotCorners.kt and pine-views/hot-corners.js. */
             "screenShot", "replayExport", "replayEdit", "replayKeepEdited", "hotCorners", "hotCornersSet",
+            /* #1426: the native endless-video surface. */
+            "videoWall",
+            /* #1148: "Whenever I access the screen capture to follow
+             * report, I also want to be able to scrub between the last
+             * five seconds of the broadcast to find the right frame." */
+            "replayFrames",
             /* What the terminal confirmed on its way up - see net/Readiness. */
             "readyReport",
             /* The mix, captured natively - see audio/AirTap.kt. */
@@ -149,6 +156,22 @@ class PineDesktopBridge(
          * 1048575 = 3 x 349525: the same size to within a byte, and every
          * chunk but the last now encodes with no padding at all. */
         private const val TAKE_CHUNK = 1048575
+
+        /* #1148, THE SCRUB STRIP: the long edge a strip thumbnail is
+         * scaled to before it is compressed.
+         *
+         * "Whenever I access the screen capture to follow report, I also
+         *  want to be able to scrub between the last five seconds of the
+         *  broadcast to find the right frame."
+         *
+         * 640 is picked so that ten frames off this terminal's 1340x800
+         * screen fit comfortably inside ONE evaluateJavascript settlement:
+         * the screenshot road already carries a single ~117 kB picture
+         * that way. The measured total is handed back as `bytes` so nobody
+         * has to guess. If the answer ever grows past a couple of
+         * megabytes the cure is a SMALLER EDGE, not fewer frames - the
+         * operator asked to scrub, and a strip of four is not a scrub. */
+        private const val SCRUB_EDGE = 640
     }
 
     /* The last take, parked between micTake and the micChunk calls that read
@@ -166,10 +189,192 @@ class PineDesktopBridge(
         replay: com.pinebox.kiosk.replay.ScreenReplay,
         want: Double,
         videoOnly: Boolean,
+        /** #1155: seconds before now where the written clip ends. 0 is the
+         *  tail - what replaySave, replayExport and replayEdit all want. */
+        back: Double = 0.0,
     ): Triple<File, Double, JSONObject> = withContext(Dispatchers.IO) {
         synchronized(replay) {
-            val (file, seconds) = replay.save(want, videoOnly)
+            val (file, seconds) = replay.save(want, videoOnly, back)
             Triple(file, seconds, JSONObject(replay.lastSavedAudio.toString()))
+        }
+    }
+
+    /**
+     * #1148 - THE PICTURES BEHIND THE SCREENSHOT.
+     *
+     * "Whenever I access the screen capture to follow report, I also want
+     *  to be able to scrub between the last five seconds of the broadcast
+     *  to find the right frame."
+     *
+     * [clip] is the temporary mp4 captureReplay has just written, [held]
+     * what it actually holds in seconds. Pulls [count] frames EVENLY
+     * SPACED across it, oldest first, each scaled so its long edge is
+     * about [edge] px and compressed as JPEG at 70 - the same quality the
+     * screen shot already uses.
+     *
+     * `at` is what the page labels a thumbnail with: SECONDS BEFORE THE
+     * END OF THE CLIP, which is as near "before now" as this can honestly
+     * be - the clip was written a moment ago. The last frame is 0.0 and
+     * the page calls that one "now".
+     *
+     * A frame that comes back null is SKIPPED, not fatal. The tail of the
+     * ring can end mid-GOP and some retrievers refuse the very last
+     * microsecond; a strip of nine is still a scrub, and throwing here
+     * would take the whole strip away for nothing.
+     *
+     * IO thread only - MediaMetadataRetriever decodes, and that must never
+     * happen on the thread the WebView paints from.
+     */
+    private fun frameStrip(
+        clip: File,
+        held: Double,
+        count: Int,
+        edge: Int,
+        /** #1155: how far behind NOW the clip's own END sits, as the ring
+         *  reported after writing it. 0 is the tail. Every `at` is measured
+         *  from now, so this is simply added to each frame's distance from
+         *  the end of the clip. */
+        endBack: Double,
+        /** #1155: what the RING holds, in seconds - the whole range the
+         *  strip may travel over. Not the clip's length, which is only the
+         *  window: reporting the clip here told the page the ring was six
+         *  seconds long and pinned the coarse slider to nothing. */
+        ringHeld: Double,
+    ): JSONObject {
+        val mmr = MediaMetadataRetriever()
+        var frames = 0
+        var bytes = 0L
+        val list = JSONArray()
+        /* Hoisted out of the try because the answer below reports where the
+         * window actually landed, and that is read after the finally. */
+        var lastUs = 0L
+        var spanFrom = 0L
+        var spanTo = 0L
+        try {
+            mmr.setDataSource(clip.absolutePath)
+            /* The container's own duration is the truth about what can be
+             * seeked to; [held] is what the ring believed it wrote. Take
+             * the smaller of the two so a seek never runs off the end. */
+            val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            val heldMs = Math.round(held * 1000.0)
+            val spanMs = when {
+                durMs > 0L && heldMs > 0L -> Math.min(durMs, heldMs)
+                durMs > 0L -> durMs
+                else -> heldMs
+            }
+            require(spanMs > 0L) { "the ring wrote nothing to read frames from" }
+
+            val srcW = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                ?.toIntOrNull() ?: 0
+            val srcH = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                ?.toIntOrNull() ?: 0
+            /* Scaled by the LONG edge, so a portrait terminal is not blown
+             * up to 640 tall by 1070 wide and back out through base64. */
+            val longest = Math.max(srcW, srcH)
+            val wantW: Int
+            val wantH: Int
+            if (longest > edge && srcW > 0 && srcH > 0) {
+                val k = edge.toDouble() / longest.toDouble()
+                wantW = Math.max(2, Math.round(srcW * k).toInt())
+                wantH = Math.max(2, Math.round(srcH * k).toInt())
+            } else {
+                wantW = srcW
+                wantH = srcH
+            }
+
+            /* The newest frame sits a hair inside the end: asking for the
+             * exact duration is the one seek that reliably answers null. */
+            lastUs = Math.max(0L, (spanMs * 1000L) - 40000L)
+
+            /* #1155 - THE CLIP IS THE WINDOW.
+             *
+             * "Okay, that is actually much smoother. That is better. Also,
+             *  I would like to go back the whole recording range."
+             *
+             * The first cut of this asked the ring for everything from now
+             * back to the far edge and sliced the wanted part out of it.
+             * That is correct and it does not scale: measured on the
+             * tablet, 200 seconds back took 11.1 s and the whole 1200-second
+             * ring extrapolated to about 50 s - one mux of everything in
+             * between, for ten thumbnails. ReplayRing.save now cuts the
+             * window itself, so the clip handed here IS the window and its
+             * cost is its own length whatever its distance.
+             *
+             * Frames are spread across the whole of it, and `at` stays what
+             * it always was - seconds before NOW - by adding where the clip
+             * ends. */
+            spanFrom = 0L
+            spanTo = lastUs
+            for (i in 0 until count) {
+                val us = if (count <= 1) spanTo
+                    else spanFrom + Math.round((spanTo - spanFrom) * (i.toDouble() / (count - 1).toDouble()))
+                val bmp: android.graphics.Bitmap? = try {
+                    if (Build.VERSION.SDK_INT >= 28 && wantW > 0 && wantH > 0) {
+                        mmr.getScaledFrameAtTime(
+                            us, MediaMetadataRetriever.OPTION_CLOSEST, wantW, wantH)
+                    } else {
+                        mmr.getFrameAtTime(us, MediaMetadataRetriever.OPTION_CLOSEST)
+                    }
+                } catch (err: Exception) {
+                    Log.w(TAG, "replayFrames: no frame at " + us + "us", err)
+                    null
+                }
+                if (bmp == null) continue
+                val out = java.io.ByteArrayOutputStream()
+                bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, out)
+                bmp.recycle()
+                val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                bytes += b64.length.toLong()
+                frames += 1
+                /* Seconds BEFORE NOW, one decimal - the page turns this
+                 * into "-1.2s" or "-4m 12s", and into the line the report
+                 * pad is opened with. The clip's own end may sit well
+                 * behind now (#1155), so that distance is added here and
+                 * the page never has to know a window from a tail. */
+                val before = Math.round((endBack + (lastUs - us) / 1000000.0) * 10.0) / 10.0
+                list.put(JSONObject()
+                    .put("at", before)
+                    .put("image", "data:image/jpeg;base64," + b64))
+            }
+        } finally {
+            try {
+                if (Build.VERSION.SDK_INT >= 29) mmr.close() else mmr.release()
+            } catch (gone: Exception) { /* fine */ }
+        }
+        /* #1155: where the window ACTUALLY landed, in the same units the
+         * frames use - seconds before now. `from` is the oldest edge and
+         * `to` the newest, so a page that asked to start further back than
+         * the ring reaches can see that it did not get what it asked for
+         * and tell the operator, rather than silently showing him the
+         * wrong minute. The caller decides `clamped`: only it knows what
+         * was originally asked for before the clamp to what is held. */
+        val gotFrom = Math.round((endBack + (lastUs - spanFrom) / 1000000.0) * 10.0) / 10.0
+        val gotTo = Math.round((endBack + (lastUs - spanTo) / 1000000.0) * 10.0) / 10.0
+        return if (frames == 0) {
+            JSONObject().put("ok", false)
+                .put("held", ringHeld)
+                .put("detail", "nothing readable that far back; the ring holds "
+                    + (Math.round(ringHeld * 10.0) / 10.0) + "s")
+        } else {
+            JSONObject()
+                .put("ok", true)
+                /* The CLIP's length - the window - kept for the callers
+                 * that have always read it. */
+                .put("seconds", held)
+                /* What the RING holds right now, which is the whole range
+                 * the strip may travel over. */
+                .put("held", ringHeld)
+                .put("from", gotFrom)
+                .put("to", gotTo)
+                .put("frames", list)
+                /* MEASURED, not estimated: the base64 this settlement is
+                 * about to carry through evaluateJavascript. */
+                .put("bytes", bytes)
+                .put("edge", edge)
+                .put("detail", frames.toString() + " frames across the last "
+                    + (Math.round(held * 10.0) / 10.0) + "s, "
+                    + (bytes / 1024L) + " kB of base64")
         }
     }
 
@@ -876,6 +1081,98 @@ class PineDesktopBridge(
             }
         }
 
+        /* THE LAST FIVE SECONDS, AS PICTURES - THE SCRUB STRIP (#1148).
+         *
+         * "Whenever I access the screen capture to follow report, I also
+         *  want to be able to scrub between the last five seconds of the
+         *  broadcast to find the right frame."
+         *
+         * The annotator opens on a PixelCopy of the screen AS IT IS NOW,
+         * which is a moment later than the thing the operator meant to
+         * point at. This hands the page the seconds just behind that shot
+         * so the strip under the ink toolbar can walk back through them and
+         * swap the canvas background - see pine-views/hot-corners.js.
+         *
+         * THE SAME MACHINERY AS replayExport, AND NOT A SECOND COPY OF IT.
+         * captureReplay -> ScreenReplay.save writes the tail of the ring to
+         * a temp mp4 in the app's CACHE dir; the frames are pulled out of
+         * that file with MediaMetadataRetriever and the file is deleted in
+         * `finally`. It never goes near the operator's recordings folder:
+         * this is a scrub strip, not an export.
+         *
+         * video_only is forced true. The strip wants pictures; an audio
+         * track that has gone missing (the capture asleep, a permission
+         * withdrawn) must not be able to fail the pull.
+         *
+         * SIZE. Each frame is scaled so the long edge is about SCRUB_EDGE
+         * px and compressed as JPEG at 70 - the same quality the screen
+         * shot uses. Ten of those off a 1340x800 terminal measure a few
+         * hundred kB of base64 in one settlement, the same order as the
+         * screenshot road's single picture; `bytes` in the answer is the
+         * measured total so the page (and the next person to read this)
+         * never has to guess.
+         *
+         * #1155 - AND IT REACHES THE WHOLE RING, NOT ONLY THE TAIL.
+         *
+         * "Okay, that is actually much smoother. That is better. Also, I
+         *  would like to go back the whole recording range."
+         *
+         * `back` is seconds before NOW where the shown window ENDS, and it
+         * defaults to 0, so every call written before this one asks for and
+         * gets exactly what it always did. The ring can only ever write a
+         * clip ending NOW, so a window further back is cut out of a LONGER
+         * write: back + seconds is muxed and frameStrip slices the part
+         * that was asked for. That costs a longer mux the further back the
+         * ask goes - the whole ring at the far end - which is precisely why
+         * the page caches the windows it has already been given rather than
+         * asking twice.
+         *
+         * Clamped to what the ring HOLDS, not to HOLD_SECONDS, which is a
+         * design floor and not a promise: `held` in the answer is the only
+         * honest figure and the page draws its range from it. */
+        "replayFrames" -> {
+            val replay = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.replay
+            val opts = args.optJSONObject(0) ?: JSONObject()
+            if (replay == null) {
+                BridgeEnvelope.ok(id, JSONObject()
+                    .put("ok", false)
+                    .put("held", 0.0)
+                    .put("detail", "no recorder on this terminal").toString())
+            } else {
+                val held = replay.seconds()
+                val want = opts.optDouble("seconds", 5.0).coerceIn(1.0, 30.0)
+                val count = opts.optInt("count", 10).coerceIn(2, 24)
+                val edge = opts.optInt("edge", SCRUB_EDGE).coerceIn(160, 1280)
+                /* Never past the oldest frame there is; never negative. The
+                 * UNCLAMPED ask is kept so the answer can say honestly that
+                 * it could not go as far back as it was asked to. */
+                val askedBack = opts.optDouble("back", 0.0)
+                val back = askedBack.coerceIn(0.0, Math.max(0.0, held - want))
+                var temp: File? = null
+                try {
+                    /* The ring cuts the window itself, so this writes the
+                     * window and nothing else - see ReplayRing.save(back). */
+                    val written = captureReplay(replay, want, true, back)
+                    temp = written.first
+                    val endBack = replay.lastSavedEndBack()
+                    val answer = withContext(Dispatchers.IO) {
+                        frameStrip(written.first, written.second, count, edge, endBack, held)
+                    }
+                    answer.put("asked_back", askedBack)
+                    /* True when the ask ran past the oldest thing there is. */
+                    answer.put("clamped", askedBack - back > 0.6)
+                    BridgeEnvelope.ok(id, answer.toString())
+                } catch (err: Exception) {
+                    Log.w(TAG, "replayFrames failed", err)
+                    BridgeEnvelope.ok(id, JSONObject()
+                        .put("ok", false)
+                        .put("detail", err.message ?: "the last seconds could not be read").toString())
+                } finally {
+                    try { temp?.delete() } catch (gone: Exception) { /* fine */ }
+                }
+            }
+        }
+
         /* Capture an immutable source for editing. No final export is saved
          * until the editor has rendered the user's chosen result. */
         "replayEdit" -> {
@@ -945,6 +1242,34 @@ class PineDesktopBridge(
          * settled object is {enabled, tl, tr, bl, br, ring}, and a set
          * pushes that same object into the page. One function for this and
          * for the drawer's rows: config/HotCorners.kt. */
+        /* #1426: the native endless-video surface. `on` starts it and
+         * shows it, anything else stops and hides it; the answer is
+         * always the wall's own state, so the page can tell whether it
+         * should be drawing a picture itself. A build with no wall (no
+         * activity yet) answers on:false and the page keeps its <video>,
+         * which is exactly the old behaviour. */
+        "videoWall" -> {
+            val wall = videoWall
+            val want = args.optString(0, "state")
+            if (wall == null) {
+                BridgeEnvelope.ok(id, org.json.JSONObject().put("on", false)
+                    .put("why", "no wall on this build").toString())
+            } else {
+                /* #1426b: the rect the page reports, in device pixels.
+                 * Sent on every ask, so dragging the set moves the wall. */
+                args.optJSONObject(1)?.let { box ->
+                    wall.setBox(box.optInt("x"), box.optInt("y"),
+                        box.optInt("w"), box.optInt("h"))
+                }
+                when (want) {
+                    "on" -> wall.start()
+                    "off" -> wall.stop()
+                    else -> Unit
+                }
+                BridgeEnvelope.ok(id, wall.state().toString())
+            }
+        }
+
         "hotCorners" -> BridgeEnvelope.ok(id, HotCorners.read(configStore).toString())
 
         "hotCornersSet" -> BridgeEnvelope.ok(id,
@@ -1096,6 +1421,15 @@ class PineDesktopBridge(
      * activity is resumed and cleared when it is not, so a picker can never
      * be launched into a window that has gone. */
     @Volatile var liveActivity: com.pinebox.kiosk.MainActivity? = null
+
+    /* #1426: THE PICTURE IS NOT THE PAGE'S ANY MORE.
+     *
+     * The endless set's clips are played by a SurfaceView that
+     * SurfaceFlinger composites directly, because this WebView renders at
+     * 8-12 fps whatever is in it - measured with the whole panel hidden
+     * and one 427x240 video alone on the document. See PineVideoWall for
+     * the numbers. The page's job is now only to say WHERE and WHETHER. */
+    @Volatile var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null
 
     /**
      * HOW LOUD IT IS RIGHT NOW, 0..1.
