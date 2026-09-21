@@ -91,6 +91,33 @@
   var JOIN_TAIL = 0.6;             // this near the end, let it be
   var SLIP_MAX = 0.75;             // a jump smaller than this is worse than the slip
   var SLIP_REST = 4000;            // and never two jumps closer than this
+  /* #1421: ...AND NEVER MORE OF THE CLIP THAN THIS.
+   *
+   * The three numbers above ask only "is this drift big enough to be
+   * worth correcting". On the wallpaper clip the rule was written
+   * against - tens of seconds long - that is the whole question. The
+   * endless set does not play those: its clips are 2-3.5 s (see #1422),
+   * and on a 2 s clip an 0.8 s correction, which is simply how late a
+   * clip starts once it has been fetched and decoded, threw away forty
+   * per cent of the clip and flushed the decoder to do it - every
+   * SLIP_REST, on every clip. That is the choking.
+   *
+   * So a jump must also be small AGAINST THE CLIP IT LANDS IN. A quarter
+   * of it, at most. Long wallpaper keeps its correction (a quarter of a
+   * minute is fifteen seconds of allowance, so #1173's woke-from-sleep
+   * case still fires); a short clip is left to play, because there is no
+   * position inside it worth a decode flush. */
+  var SLIP_SHARE = 0.25;
+
+  /* Is this jump worth making, in a clip THIS long? A clip whose
+     duration is not known yet is never seeked - not knowing is a reason
+     to leave the decoder alone, not a reason to guess. */
+  function worthSeeking(off, span, floor) {
+    var drift = Math.abs(Number(off));
+    if (!isFinite(drift) || drift < floor) return false;
+    if (!isFinite(span) || span <= 0) return false;
+    return drift <= span * SLIP_SHARE;
+  }
 
   var playing = null;              // #1306b: the clip in the tube now
   var host = null;                 // the window, while a clip is in it
@@ -1203,7 +1230,8 @@
     /* #1411: a warmed tube already has its source; assigning the same
        src again runs the load algorithm from scratch and throws the
        buffer away, which is the whole thing being avoided. */
-    if (!ready) screen.src = srcOf(clip);
+    /* #1421: the held bytes if we have them, the station if we do not. */
+    if (!ready) screen.src = heldSrc(clip);
     screen.addEventListener('canplaythrough', function () { warmUp(); });
     screen.volume = level;
     /* #1310: THE PAD'S IN AND OUT, ON THE PICTURE TOO.
@@ -1239,6 +1267,10 @@
       /* Nothing of it left worth a decode - the next clip's moment is
        * already near and the set takes it on its own. */
       if (isFinite(len) && len > 0 && into > len - JOIN_TAIL) return;
+      /* #1421b: NO share bound here. This seek happens once, before a
+         frame has been shown, and it is the whole of #1173 - see the
+         measurements beside JOIN_MIN. The bound belongs on the HOLD
+         below, which is the one that flushes a decoder mid-picture. */
       try { screen.currentTime = into; } catch (err) { /* it plays from 0 */ }
     };
     screen.addEventListener('loadedmetadata', joinNow);
@@ -1257,9 +1289,9 @@
       var into = airInto(clip);
       if (into <= 0) return;
       var off = Number(screen.currentTime) - into;
-      if (!isFinite(off) || Math.abs(off) < SLIP_MAX) return;
-      if (now() - fixedAt < SLIP_REST) return;
       var span = Number(screen.duration);
+      if (!worthSeeking(off, span, SLIP_MAX)) return;          /* #1421 */
+      if (now() - fixedAt < SLIP_REST) return;
       if (isFinite(span) && span > 0 && into > span - JOIN_TAIL) return;
       fixedAt = now();
       try { screen.currentTime = into; } catch (err) { /* it plays on */ }
@@ -2899,6 +2931,100 @@
     return base.replace(/\/+$/, '') + String((clip && clip.url) || '');
   }
 
+  /* #1421: THE CLIP IS IN MEMORY BEFORE IT IS ON THE TUBE.
+   *
+   * Measured: median clip 0.60 MB, largest 5.35 MB of 3,626. The whole
+   * file is smaller than what a browser will buffer ahead on a stream,
+   * so there is nothing for streaming to buy and a range request per
+   * buffer to lose. Fetched whole, once, held as a blob; the element
+   * plays an object URL and never touches the network again.
+   *
+   * Every part of this is an optimisation that is allowed to fail: on no
+   * fetch, a refused fetch, a cross-origin shell without CORS or a clip
+   * too big to hold, srcOf() is handed back and the set behaves exactly
+   * as it did before. An optimisation that can fail the picture is not
+   * one. */
+  var CACHE_MOST = 10;                  // clips held at once
+  var CACHE_BYTES_MOST = 48 * 1048576;  // and never more memory than this
+  var CACHE_FILE_MOST = 24 * 1048576;   // a clip past this streams, as before
+  var cache = [];                       // [{url, href, bytes, at}]
+  var fetching = Object.create(null);   // url -> promise; asked once only
+
+  function cacheFind(url) {
+    var i;
+    for (i = 0; i < cache.length; i += 1) {
+      if (cache[i].url === url) { cache[i].at = now(); return cache[i]; }
+    }
+    return null;
+  }
+
+  /* The clip in the tube and the one warmed behind it are never let go,
+     whatever the budget says - revoking either is a black tube. */
+  function cacheHeld() {
+    var keep = Object.create(null);
+    try { if (video && video.src) keep[video.src] = 1; } catch (err) {}
+    try { if (warm && warm.el && warm.el.src) keep[warm.el.src] = 1; }
+    catch (err) {}
+    return keep;
+  }
+
+  function cacheTrim() {
+    var keep = cacheHeld();
+    var bytes = 0, i;
+    for (i = 0; i < cache.length; i += 1) bytes += cache[i].bytes;
+    cache.sort(function (a, b) { return a.at - b.at; });   // oldest first
+    i = 0;
+    while (i < cache.length
+           && (cache.length - i > CACHE_MOST || bytes > CACHE_BYTES_MOST)) {
+      if (keep[cache[i].href]) { i += 1; continue; }
+      bytes -= cache[i].bytes;
+      try { URL.revokeObjectURL(cache[i].href); } catch (err) {}
+      cache.splice(i, 1);
+    }
+  }
+
+  function canHold() {
+    return (typeof fetch === 'function' && typeof URL !== 'undefined'
+            && !!URL.createObjectURL && !!URL.revokeObjectURL);
+  }
+
+  /* Pull the whole clip down. Resolves either way - the value is an
+     object URL, or null meaning "play it off the station". */
+  function preFetch(clip) {
+    var url = srcOf(clip);
+    if (!url || !canHold()) return null;
+    var got = cacheFind(url);
+    if (got) return Promise.resolve(got.href);
+    if (fetching[url]) return fetching[url];
+    var job = fetch(url, {credentials: 'omit'}).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      var len = Number(res.headers.get('content-length'));
+      if (isFinite(len) && len > CACHE_FILE_MOST) throw new Error('too big');
+      return res.blob();
+    }).then(function (blob) {
+      if (!blob || !blob.size) throw new Error('empty');
+      if (blob.size > CACHE_FILE_MOST) throw new Error('too big');
+      var href = URL.createObjectURL(blob);
+      cache.push({url: url, href: href, bytes: blob.size, at: now()});
+      cacheTrim();
+      delete fetching[url];
+      return href;
+    })['catch'](function () {
+      delete fetching[url];
+      return null;                      /* the station's URL still works */
+    });
+    fetching[url] = job;
+    return job;
+  }
+
+  /* What to point an element at: the bytes we are holding, or the
+     station, and never a stale object URL. */
+  function heldSrc(clip) {
+    var url = srcOf(clip);
+    var got = cacheFind(url);
+    return (got && got.href) || url;
+  }
+
   function warmDrop() {
     if (!warm) return;
     var el = warm.el;
@@ -2907,10 +3033,8 @@
     catch (err) { /* already gone */ }
   }
 
-  function warmUp() {
-    if (!mounted) return;
-    var head = queue[0];
-    if (!head || !head.url) return;
+  function warmElement(head) {
+    if (!mounted || !head || !head.url) return;
     if (warm && warm.clip === head) return;
     warmDrop();
     var el;
@@ -2919,10 +3043,32 @@
       el.preload = 'auto';
       el.playsInline = true;
       el.controls = false;
-      el.src = srcOf(head);
+      el.src = heldSrc(head);                              /* #1421 */
       el.load();
     } catch (err) { return; }
     warm = {clip: head, el: el};
+  }
+
+  function warmUp() {
+    if (!mounted) return;
+    var head = queue[0];
+    if (!head || !head.url) return;
+    if (warm && warm.clip === head) return;
+    /* #1421: THE BYTES FIRST, THEN THE ELEMENT. A warm element pointed
+       at the station is still an element that can stall halfway through
+       a clip; one pointed at a blob cannot. The element is built when
+       the bytes are here - or straight away if we cannot hold them, in
+       which case this is exactly the old behaviour. */
+    var job = preFetch(head);
+    if (job && job.then) {
+      job.then(function () {
+        if (mounted && queue[0] === head) warmElement(head);
+      });
+      /* And the one after it, so a seam never waits on a fetch. */
+      if (queue[1]) preFetch(queue[1]);
+      return;
+    }
+    warmElement(head);
   }
 
   /* The warm element for this clip, if it is the one that was warmed
