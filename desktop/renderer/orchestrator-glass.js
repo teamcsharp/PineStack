@@ -1548,6 +1548,30 @@
       }));
 
     /* 6. THE KEEPERS AND THEIR COUNTS. */
+    /* 2026-09-21 (#1226): SEGMENTS1226 - THE PLACE TO WORK, not to read.
+     *
+     * "I want a section for segments and I want to expand it and be able to
+     *  see every segment that's being scheduled... click on it and modify the
+     *  system prompts and add different system prompts and try different
+     *  system prompts for each section."
+     *
+     * Drawn by pine-segments.js, which owns the prompt shelves, the topic
+     * bank and the dropped-story window. It is placed here, below what the
+     * orchestrator is DOING, because the order of these panes is a claim
+     * about what matters and a workbench should not stand in front of the
+     * instruments. */
+    main.appendChild(fold('segments',
+      'the segments, and the words behind them',
+      'prompts, topics, stories', function (body) {
+        if (root.PineSegments && typeof root.PineSegments.pane === 'function') {
+          root.PineSegments.pane(body);
+          return;
+        }
+        body.appendChild(el('div', 'og-quiet',
+          'the segments view is not loaded on this terminal. On the tablet it '
+          + 'arrives with the app; on the desk it is a renderer file.'));
+      }));
+
     main.appendChild(fold('keepers', 'the keepers, and how often each has acted',
       keepers.length ? keepers.length + ' stamped' : 'none stamped yet',
       function (body) {
@@ -1821,6 +1845,15 @@
     root.document.body.appendChild(node);
     drag(node, head);
     place(node);
+    /* #1226: a markdown dropped ANYWHERE on this window becomes a plotline.
+       Registered on the whole box rather than on the fold, because he
+       described dropping it "onto the orchestrator" - not onto a strip of
+       it he has to find first. */
+    try {
+      if (root.PineSegments && root.PineSegments.acceptDrops) {
+        root.PineSegments.acceptDrops(node);
+      }
+    } catch (err) { /* a window that cannot take a drop is still a window */ }
     return node;
   }
 
