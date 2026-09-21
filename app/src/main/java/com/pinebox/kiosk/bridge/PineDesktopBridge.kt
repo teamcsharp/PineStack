@@ -106,6 +106,8 @@ class PineDesktopBridge(
             "micTake", "micChunk",
             /* The rolling record of the screen - see replay/ScreenReplay. */
             "replayState", "replaySave", "replayChunk",
+            /* #1427: the rolling recorder's own switch. */
+            "replayRun",
             /* THE HOT CORNERS - the shot for the red ink, the screen video
              * to the operator's folder, and the four corners' preferences.
              * See config/HotCorners.kt and pine-views/hot-corners.js. */
@@ -913,6 +915,34 @@ class PineDesktopBridge(
          * ceiling for the first minute after a start and after the screen has
          * been dark. Offering "the last 30" when 11 are held would be a lie
          * the operator only finds out on playback. */
+        /* #1427: START OR STOP THE ROLLING RECORDER.
+         *
+         * It mirrors the display into an encoder through a VirtualDisplay,
+         * so the screen is composited twice every frame for as long as it
+         * runs - a cost the whole panel pays, and the reason this needed
+         * to be measurable rather than argued about. Answers the same
+         * shape replayState does, so one road reads the result. */
+        "replayRun" -> {
+            val replay = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.replay
+            if (replay == null) {
+                BridgeEnvelope.ok(id, org.json.JSONObject()
+                    .put("ok", false).put("detail", "no recorder on this build").toString())
+            } else {
+                val want = args.optString(0, "state")
+                val why = when (want) {
+                    "on" -> replay.start()
+                    "off" -> { replay.stop(); null }
+                    else -> null
+                }
+                BridgeEnvelope.ok(id, org.json.JSONObject()
+                    .put("ok", why == null)
+                    .put("running", replay.seconds() >= 0 && want != "off")
+                    .put("seconds", replay.seconds())
+                    .put("bytes", replay.bytes())
+                    .put("detail", why).toString())
+            }
+        }
+
         "replayState" -> {
             val replay = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.replay
             BridgeEnvelope.ok(id, JSONObject()

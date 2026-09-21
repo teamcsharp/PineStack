@@ -101,6 +101,34 @@
   var PLAN_REST_MS = 30000;           /* a running order is not news */
   var beat = 0;
 
+  /* ------------------------------------------- THE ADMITTED CUE MAP
+   *
+   * "Render the committed sequence directly. Keep existing positions
+   *  stable as new material is appended. Use the selected player's
+   *  actual file and offset, mapped through its cue sheet, to identify
+   *  the active occurrence."
+   *
+   * `admitMap` is the station's committed sequence as last polled - the
+   * playout controller's own record, not a reconstruction from feed rows
+   * and not the server's wall clock. `lastGood` is the last position this
+   * view could TRUST, kept so a gap in the evidence shows the last true
+   * mark rather than a guess or a blank.
+   *
+   * And `syncState` is published, because the audit is explicit that
+   * hiding this would be the wrong cure: "Merely preventing a backward
+   * visual movement would hide an audio fault; it would not enforce
+   * playback order." */
+  var admitMap = null;
+  var lastGood = null;
+  var syncState = 'held';
+  var syncWhy = 'no playback evidence yet';
+  var syncSince = 0;
+  var syncRing = [];                  /* bounded: what the mark did, and why */
+  var SYNC_RING_MAX = 240;
+  var headWas = -1;                   /* the last READ position */
+  var headMovedAt = 0;                /* and when it last actually moved */
+  var STALL_MS = 8000;                /* read but motionless for this long */
+
   /* #1115: THE LAST ERRORS THIS PAGE SAW.
    *
    * A report about "the highlighted line is wrong" is worth little
@@ -1471,6 +1499,1678 @@
     });
   }
 
+  /* ---- #1164: the drop-down under the script's name --------------- */
+
+  /* C. HOLD THE NAME OF THE SCRIPT AND SAY WHAT IS WRONG WITH IT.
+   *
+   * Inbox #1164, in the operator's own words:
+   *
+   *   "I want to be able to tap and hold on the name of the script as
+   *    being run for that particular session and I want a drop-down menu
+   *    that comes down that lets me pick options like complain, mark
+   *    issue and report missing segment. I am noticing some of the
+   *    scripts missing entire segments, for example the manager is
+   *    supposed to call during the manager's segment."
+   *
+   * THE GESTURE IS THE ONE THIS FILE ALREADY HAS. holdOpen() above -
+   * half a second, eight pixels of travel cancels it, the trailing
+   * synthetic click is swallowed by `pineHeld`, and the desk's
+   * right-click and the WebView's own long-press menu are both turned
+   * into the same answer. The SFX button, the caution button and the
+   * report icon are already on it; the heading is the fourth, and it
+   * cannot fight the other three because none of them is inside it -
+   * the caution button lives in #spScript and the report icon in the
+   * bar on the other half of the screen.
+   *
+   * IT COMES DOWN, it does not arrive. sheetShell() builds a modal with
+   * a backdrop in the middle of the glass, which is right for the reason
+   * sheet and the inbox and wrong here: the operator asked for "a
+   * drop-down menu that comes down", so this hangs off the heading
+   * inside .sp-right (already position: relative) and is placed from the
+   * heading's own offsets. Its `say` line copies sheetShell's four-second
+   * rule so a message on this surface behaves like a message on that one.
+   *
+   * WHAT IT FILES, AND WHERE THAT LANDS. Every choice goes down the
+   * caution button's road and no other: reportGather() for the window,
+   * the motion ring and the view snapshot, then POST /api/script/report
+   * through reportFire(), then the ten-second post-capture and the
+   * picture. Nothing new is invented and nothing is asked of the station
+   * that it does not already answer.
+   *
+   * AND THE CONTEXT IS WRITTEN INTO `reason`, DELIBERATELY. It would
+   * read better as its own field on the view - it is structured, and a
+   * field is easier to query than a sentence. It would also be thrown
+   * away: normalize_view() in script_diagnostics.py says so in its own
+   * docstring - "Unknown fields are excluded by schema" - and the report
+   * store encodes only what that function returns, so a new key stamped
+   * on the view or on its snapshot never reaches the .json or the .md.
+   * `reason` is the one thing that survives whole: app.py leads the
+   * inbox item with it ("Script diagnostic capture: " + reason) and
+   * render_report() prints it under "## Operator report". A field that
+   * is silently discarded looks, from in here, exactly like one that
+   * arrived - so the hour, the script's name, the two scene headings and
+   * the visible block.ord range are written where they will be read.
+   * 1200 characters is the store's cap on it; the sentence below runs to
+   * about three hundred.
+   */
+  var HEADER_MENU_ID = 'spHeadMenu';
+  var HEADER_TEXT_CAP = 160;        /* a scene heading, not a scene */
+  var headerUnwatch = null;         /* PineDismiss's handle on the open menu */
+
+  /* The three the operator named, and Cancel. `ask` is the one that
+     stops to let him say WHAT is missing before anything is filed -
+     "the manager is supposed to call during the manager's segment" is a
+     fact no diagnostic on this page could work out for itself.
+     Icons are Carbon out of the vendored set through folderIcon(), and
+     all four are in pine-icons.js: that is the house rule, and the set
+     is checked before choosing rather than after. */
+  var HEADER_CHOICES = [
+    {kind: 'complain', label: 'Complain', icon: 'c:bullhorn',
+     why: 'Something about this hour is wrong and you want it on the record'},
+    {kind: 'mark issue', label: 'Mark issue', icon: 'c:warning--alt',
+     why: 'Mark this moment: keep the ledger around it for the station to read'},
+    {kind: 'report missing segment', label: 'Report missing segment', icon: 'c:misuse',
+     why: 'A whole segment never happened - say which one', ask: true}
+  ];
+
+  function headerClose() {
+    var menu = el(HEADER_MENU_ID);
+    if (menu) menu.remove();
+    if (headerUnwatch) {
+      try { headerUnwatch(); } catch (err) { /* already gone */ }
+      headerUnwatch = null;
+    }
+    var name = el('spScriptName');
+    if (name) name.setAttribute('aria-expanded', 'false');
+  }
+
+  /* One heading, on one line. */
+  function headerText(node) {
+    return String((node && node.textContent) || '')
+      .replace(/\s+/g, ' ').trim().slice(0, HEADER_TEXT_CAP);
+  }
+
+  /* Where the SCRIPT put this element, as the node already carries it -
+     #1330 writes data-block and data-ord onto every one. Absent on a
+     plan row or a spacer, and absent is said as absent. */
+  function headerOrd(node) {
+    if (!node || !node.getAttribute) return '';
+    var block = node.getAttribute('data-block');
+    var ord = node.getAttribute('data-ord');
+    if (!block && !ord) return '';
+    return String(block || '?') + '.' + String(ord || '?');
+  }
+
+  function headerSeat(node) {
+    try { return node.getBoundingClientRect(); }
+    catch (err) { return {top: 0, bottom: 0, height: 0}; }
+  }
+
+  /* WHICH SEGMENT THE VIEW IS SHOWING, by the segment's own words.
+   *
+   * Two answers, because they are two different questions and on this
+   * page they disagree all the time: the reader scrolls away from the
+   * air (follow stands down, #1282) and then the top of the pane and the
+   * lit line are in different segments. A report that named only one of
+   * them would be answering the wrong one half the time.
+   *
+   *   top_scene   the scene heading the READER is under - the last one
+   *               walked past before the first element the pane is
+   *               actually showing, so a heading scrolled off the top
+   *               still names the segment on screen
+   *   mark_scene  the scene heading above the line that is SOUNDING
+   *               (.sp-now), or nothing when nothing is lit
+   *
+   * DOM order is script order here - the reconciler (#1273) stitches the
+   * canonical list flat - so one walk down the pane answers both, and
+   * the first and last visible block.ord are the range without sorting
+   * anything.
+   */
+  function headerWhere() {
+    var out = {title: '', hour: hourKey, before: beforeKey, top_scene: '',
+      mark_scene: '', block_from: '', block_to: '', visible: 0};
+    var line = el('spScriptHead');
+    if (line) out.title = headerText(line);
+    var pane = el('spScript');
+    if (!pane || !pane.querySelectorAll) return out;
+    var lip = headerSeat(pane);
+    var all = pane.querySelectorAll('.sp-el');
+    var scene = '';
+    for (var i = 0; i < all.length; i += 1) {
+      var node = all[i];
+      var cls = String(node.className || '');
+      if (/(^|\s)sp-scene(\s|$)/.test(cls)) scene = headerText(node);
+      var seat = headerSeat(node);
+      var shown = seat.height > 0 && seat.bottom > lip.top && seat.top < lip.bottom;
+      if (/(^|\s)sp-now(\s|$)/.test(cls)) out.mark_scene = scene;
+      if (!shown) continue;
+      if (!out.top_scene) out.top_scene = scene || '(no scene heading above it)';
+      out.visible += 1;
+      var at = headerOrd(node);
+      if (at) {
+        if (!out.block_from) out.block_from = at;
+        out.block_to = at;
+      }
+    }
+    return out;
+  }
+
+  /* The sentence the inbox leads with. The operator's chosen kind comes
+     FIRST and alone, so "Script diagnostic capture: complain" reads as
+     what it is before anything else is said; his own words about what is
+     missing come second; the evidence follows, semicolon-separated the
+     way the reason sheet already writes its list. */
+  function headerReason(kind, note) {
+    var where = headerWhere();
+    var parts = [String(kind || 'complain')];
+    if (note) parts.push('missing: ' + String(note).slice(0, 400));
+    if (where.title) parts.push('the script: ' + where.title);
+    if (where.hour) {
+      parts.push('hour: ' + where.hour
+        + (where.before ? ' (with ' + where.before + ' before it on the page)' : ''));
+    }
+    parts.push('at the top of the pane: ' + (where.top_scene || 'nothing on screen'));
+    parts.push('at the mark: ' + (where.mark_scene || 'nothing is lit'));
+    parts.push('visible: ' + (where.block_from
+      ? 'block.ord ' + where.block_from + ' to ' + where.block_to
+        + ', ' + where.visible + ' elements'
+      : where.visible + ' elements, none carrying a block.ord'));
+    return parts.join('; ');
+  }
+
+  function headerOpen(name) {
+    var into = name && name.parentNode;
+    if (!into) return null;
+    headerClose();
+
+    var menu = make('div', 'sp-headmenu');
+    menu.id = HEADER_MENU_ID;
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', 'File a report about this script');
+
+    /* sheetShell's say line: same four seconds, same hold. */
+    var sayLine = make('div', 'sp-headmenu-say', '');
+    sayLine.hidden = true;
+    menu.appendChild(sayLine);
+    var sayTimer = 0;
+    function menuSay(text, hold) {
+      if (sayTimer) clearTimeout(sayTimer);
+      sayTimer = 0;
+      sayLine.textContent = String(text || '');
+      sayLine.hidden = !sayLine.textContent;
+      if (!hold && sayLine.textContent) {
+        sayTimer = setTimeout(function () { sayTimer = 0; sayLine.hidden = true; }, 4000);
+      }
+    }
+
+    /* The context is read BEFORE the menu goes, so the report describes
+       the view the operator was looking at when he chose - not the one
+       left behind once the drop-down was taken off it. */
+    function fire(kind, note) {
+      var reason = headerReason(kind, note);
+      headerClose();
+      reportFire(name, reason);
+    }
+
+    function row(cls, icon, label, why) {
+      var b = make('button', 'sp-headmenu-item' + (cls ? ' ' + cls : ''), '');
+      b.type = 'button';
+      b.setAttribute('role', 'menuitem');
+      var mark = make('span', 'sp-headmenu-mark', '');
+      mark.innerHTML = folderIcon(icon, '');
+      if (!mark.innerHTML) mark.textContent = '\u00b7';
+      b.appendChild(mark);
+      b.appendChild(make('span', 'sp-headmenu-text', label));
+      if (why) b.title = why;
+      return b;
+    }
+
+    /* SAY WHAT IS MISSING. The reason sheet's custom row, in the same
+       shape: a box that is revealed rather than always open, a Dictate
+       button that borrows the dot's ear (PineTalkDot.captureNext), and
+       an honest answer on a surface that has no microphone instead of a
+       button that pretends. Nothing is prefilled - the words have to be
+       his, because "the manager is supposed to call during the manager's
+       segment" is not a thing this page could have guessed. */
+    var ask = make('div', 'sp-headmenu-ask');
+    ask.hidden = true;
+    var ta = make('textarea', 'sp-headmenu-ta', '');
+    ta.placeholder = 'what is missing from this hour?';
+    ta.rows = 3;
+    ta.setAttribute('aria-label', 'What is missing from this script');
+    var tools = make('div', 'sp-headmenu-row');
+    var dictate = make('button', 'sp-headmenu-dictate', '');
+    dictate.type = 'button';
+    dictate.innerHTML = folderIcon('c:microphone', '');
+    dictate.appendChild(document.createTextNode('Dictate'));
+    dictate.title = 'Say it: the dot lends its ear and the words land in the box';
+    dictate.addEventListener('click', function () {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') { menuSay('no microphone on this surface'); return; }
+      try {
+        dot.captureNext(function (words) {
+          words = String(words || '').trim();
+          if (!words) { menuSay('nothing was heard'); return; }
+          ta.value = (ta.value ? String(ta.value).replace(/\s+$/, '') + ' ' : '') + words;
+          menuSay('heard: ' + words.slice(0, 80));
+        });
+        menuSay('listening\u2026', true);
+      } catch (err) {
+        menuSay('the dot could not listen: ' + String((err && err.message) || err).slice(0, 80));
+      }
+    });
+    var file = make('button', 'sp-headmenu-file', 'File the report');
+    file.type = 'button';
+    file.addEventListener('click', function () {
+      var own = String(ta.value || '').replace(/\s+/g, ' ').trim();
+      if (!own) { menuSay('say what is missing, or dictate it'); return; }
+      fire('report missing segment', own);
+    });
+    tools.appendChild(dictate);
+    tools.appendChild(file);
+    ask.appendChild(ta);
+    ask.appendChild(tools);
+
+    for (var i = 0; i < HEADER_CHOICES.length; i += 1) {
+      (function (choice) {
+        var b = row('', choice.icon, choice.label, choice.why);
+        b.addEventListener('click', function () {
+          if (!choice.ask) { fire(choice.kind, ''); return; }
+          var open = ask.hidden;
+          ask.hidden = !open;
+          b.setAttribute('aria-expanded', open ? 'true' : 'false');
+          b.classList.toggle('on', open);
+          if (open) { try { ta.focus(); } catch (err) { /* no focus on this surface */ } }
+        });
+        menu.appendChild(b);
+        if (choice.ask) menu.appendChild(ask);
+      })(HEADER_CHOICES[i]);
+    }
+
+    var cancel = row('sp-headmenu-cancel', 'c:close--filled', 'Cancel',
+                     'Close this menu and file nothing');
+    cancel.addEventListener('click', headerClose);
+    menu.appendChild(cancel);
+
+    into.appendChild(menu);
+    /* Under the name, from the name's own offsets: .sp-right is the
+       positioned ancestor, and the heading's height moves with the type
+       setting (#1272's paper and big-type looks both change it). */
+    try {
+      menu.style.top = ((name.offsetTop || 0) + (name.offsetHeight || 0) + 2) + 'px';
+      menu.style.left = (name.offsetLeft || 0) + 'px';
+    } catch (err) { /* no geometry on this surface; the CSS stands */ }
+    name.setAttribute('aria-expanded', 'true');
+
+    /* "if I'm interacting with one of the systems that's a diagnostic,
+       then duck the broadcast audio" - this menu files reports, so it is
+       one. The hold is tied to the menu element, so PineDuck's sweep
+       gives the radio back by itself the moment the menu leaves the
+       page: no close path in here, and no route that tears this view
+       down from outside, can leave the station quiet. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-' + HEADER_MENU_ID, root.PineDuck.REPORT, menu);
+    }
+    /* Tap away and Escape, through the one rule every other pop-up on
+       this page is on. The heading is spared so its own hold re-opens
+       rather than close-then-open, and `open` is answered by the menu's
+       presence rather than by its measured box - a drop-down that has
+       not been laid out yet is still open. */
+    if (root.PineDismiss && typeof root.PineDismiss.watch === 'function') {
+      headerUnwatch = root.PineDismiss.watch(menu, headerClose, [name], function () {
+        return !!el(HEADER_MENU_ID);
+      });
+    }
+    return menu;
+  }
+
+  /* ---- #1168: the menu on a segment's header ---------------------- */
+
+  /* D. HOLD A SEGMENT'S HEADER.
+   *
+   * Inbox #1168, in the operator's own words:
+   *
+   *   "whenever i tap and hold on a segment's header, I want a right
+   *    click menu offering:
+   *    - inspect segment (view popup going over every aspect of how the
+   *      segment was composed)
+   *    - report segment (pop up report window for reporting segment,
+   *      extracts script and playback records for report and allows me
+   *      to dictate / type a report to file)
+   *    - examine system prompt (show system prompt in pop up window
+   *      allowing for edit and saving as default or new preset for
+   *      segment prompt. Allow me to modify system prompts for
+   *      segments)
+   *
+   *    Whenever I'm looking at a segment, I also want a sidebar showing
+   *    a vertical infographic showing guided arrows going from path to
+   *    path, from person to person representing the conversation
+   *    transaction taking place and how everyone participated and
+   *    coalesced in the making of the conversation going down the
+   *    screen in a sidebar to the right of the pop-up."
+   *
+   * THE GESTURE IS ALREADY IN THIS FILE. holdOpen() - half a second,
+   * eight pixels of travel cancels it, the trailing synthetic click is
+   * swallowed by `pineHeld`, and the desk's right-click and the
+   * WebView's own long-press are both turned into the same answer. The
+   * SFX button, the caution button, the report icon and the script's
+   * name (#1164) are on it; the scene heading is the fifth. The heading
+   * already has a click of its own - it is the fold's handle (#1285) -
+   * so that click asks `pineHeld` first, exactly the way the caution
+   * button does, and a hold therefore never also folds the segment away
+   * underneath its own menu.
+   *
+   * HOW A SEGMENT IS NAMED. By its BLOCK, which is the station's own
+   * name for one conversation (#1330). The heading itself does not
+   * carry one: the screenplay pushes a scene with a round and a seg id
+   * and keeps `scene_block` to itself, and #1330 stamps data-block on
+   * the LINES. So the block is read off the first line under the
+   * heading, walked in DOM order - which the reconciler (#1273) keeps
+   * as script order. A heading with no numbered line under it has no
+   * block, and that is said rather than guessed.
+   *
+   * WHERE THE MENU GOES. Fixed, at the heading's own measured corner
+   * and clamped to the glass, rather than absolute inside #spScript:
+   * that pane scrolls and clips, and a drop-down that can be scrolled
+   * half out of its own parent is worse than one that simply stays put
+   * until it is answered. PineDismiss closes it on a tap away or
+   * Escape, the one rule every pop-up on this page is on.
+   */
+  var SEG_MENU_ID = 'spSegMenu';
+  var segMenuUnwatch = null;
+  var segAsked = Object.create(null);   /* block -> {at, data}, briefly held */
+
+  /* The seats the station has, each with a stable colour, so the same
+     person is the same colour in the legend, in the arrows and in the
+     line list - and on the next segment, and tomorrow. `board` and
+     `drop` are not people but they take part, so they are drawn.
+     Measured over 24 hours of air (2026-09-15): dj 5,038, cohost 3,707,
+     board 3,166, drop 1,367, caller 695, host 89, third 3, manager 0 -
+     so `host` is a real ninth seat and belongs in the table rather than
+     falling through to "someone else", and `manager` is here waiting
+     for its road to be switched on. */
+  var SEG_SEATS = [
+    {seat: 'dj', label: 'DJ', colour: '#65c7da'},
+    {seat: 'cohost', label: 'Co-host', colour: '#54d18b'},
+    {seat: 'host', label: 'Host', colour: '#4fb0a6'},
+    {seat: 'third', label: 'Third seat', colour: '#b98cf0'},
+    {seat: 'caller', label: 'Caller', colour: '#e3be63'},
+    {seat: 'caller2', label: 'Second caller', colour: '#ef8f5e'},
+    {seat: 'board', label: 'The board', colour: '#8fa0ad'},
+    {seat: 'drop', label: 'Drop', colour: '#e06c9f'},
+    {seat: 'manager', label: 'The manager', colour: '#e05c5c'}
+  ];
+  var SEG_SEAT_ELSE = {seat: '', label: 'someone else', colour: '#6f8291'};
+  /* The tablet's frame pipeline is sensitive (2026-09-14): a segment of
+     a few hundred hand-offs must not put a few hundred more nodes on
+     the glass. Beyond this the sidebar says how many it did not draw. */
+  var SEG_FLOW_MOST = 60;
+
+  function segSeatLook(seat) {
+    var want = String(seat || '').toLowerCase();
+    for (var i = 0; i < SEG_SEATS.length; i += 1) {
+      if (SEG_SEATS[i].seat === want) return SEG_SEATS[i];
+    }
+    return {seat: want, label: want || SEG_SEAT_ELSE.label,
+      colour: SEG_SEAT_ELSE.colour};
+  }
+
+  /* "a field the station does not have is null with a sentence beside
+     it, never invented" - so this page has to be able to tell nothing
+     from zero, and print the difference. */
+  function segHas(v) {
+    return v !== undefined && v !== null && v !== '';
+  }
+
+  function segWord(v, missing) {
+    return segHas(v) ? String(v) : String(missing || 'the station did not say');
+  }
+
+  /* One decimal, always - a hole of 16.7 s and one of 17 s are the same
+     hole, but the station measured the first and this page must not
+     print the second as though it had. The trailing .0 goes. */
+  function segSecs(v) {
+    if (!segHas(v) || !isFinite(Number(v))) return '';
+    var n = Math.round(Number(v) * 10) / 10;
+    return n + 's';
+  }
+
+  /* One fact, as a row: what it is, what the station said, and - when
+     the station said nothing - the sentence it sent instead. */
+  function segRow(into, key, value, why) {
+    var row = make('div', 'sp-segrow');
+    row.appendChild(make('span', 'sp-segrow-k', String(key)));
+    var v = make('span', 'sp-segrow-v', segHas(value) ? String(value) : '—');
+    if (!segHas(value)) v.classList.add('sp-segrow-none');
+    row.appendChild(v);
+    if (why) row.appendChild(make('span', 'sp-segrow-why', String(why)));
+    into.appendChild(row);
+    return row;
+  }
+
+  function segSection(into, title) {
+    var box = make('div', 'sp-segsec');
+    box.appendChild(make('div', 'sp-segsec-h', String(title)));
+    into.appendChild(box);
+    return box;
+  }
+
+  /* WHICH SEGMENT THIS HEADING IS. Everything the three pop-ups need,
+     read off the DOM before anything is opened over it. */
+  function segIdentity(node) {
+    var out = {node: node, heading: '', seg: '', block: '', round: '',
+      hour: hourKey, at: ''};
+    if (!node || !node.getAttribute) return out;
+    out.heading = headerText(node);
+    out.seg = String(node.getAttribute('data-seg') || '');
+    /* #1303b keeps the current item on the node, so the round the
+       screenplay wrote this scene for is here without asking. */
+    var item = node.pineItem || null;
+    if (item) {
+      out.round = String(item.round || '');
+      if (item.hour) out.hour = String(item.hour);
+      if (segHas(item.at)) out.at = String(item.at);
+    }
+    var walk = node.nextSibling;
+    while (walk) {
+      if (walk.className !== undefined
+          && /(^|\s)sp-el(\s|$)/.test(String(walk.className || ''))) {
+        if (/(^|\s)sp-scene(\s|$)/.test(String(walk.className || ''))) break;
+        var mark = walk.getAttribute ? String(walk.getAttribute('data-seg') || '') : '';
+        if (out.seg && mark && mark !== out.seg) break;
+        var blk = walk.getAttribute ? String(walk.getAttribute('data-block') || '') : '';
+        if (blk) { out.block = blk; break; }
+      }
+      walk = walk.nextSibling;
+    }
+    return out;
+  }
+
+  /* THE STATION'S RECORD OF ONE SEGMENT.
+   *
+   * GET /api/segment/inspect?block=<n> answers with the round, every
+   * line in ledger order, who took part, the brief against what was
+   * actually said, the timing with its holes, and the `transaction`
+   * array the sidebar draws.
+   *
+   * Never rejects. A 404 is a real answer here - the route may still be
+   * deploying, and the pop-up says so rather than failing - and so is
+   * `available: false`, which is what a block older than the ledger's
+   * forty-eight hours gets. Both come back in the same shape as a good
+   * answer so nothing downstream has to ask which kind it got.
+   *
+   * AND IT IS ASKED ONCE. Inspecting a segment and then reporting it is
+   * the same block twice inside a few seconds, and this file's traffic
+   * rule is not decorative - 38 concurrent requests were measured
+   * starving this tablet's audio for 46 seconds. A good answer is held
+   * for the screenplay's own rest (twenty seconds); a refusal is never
+   * held, because the route may be deploying as he reads. */
+  function segInspect(block) {
+    block = String(block || '');
+    var held = segAsked[block];
+    if (held && (Date.now() - held.at) < SCREENPLAY_REST_MS) {
+      return Promise.resolve(held.data);
+    }
+    if (!block) {
+      return Promise.resolve({available: false, block: '', why: 'No line under'
+        + ' this heading carries a block number, so there is nothing for the'
+        + ' station to look up. A segment is named by its block (#1330).'});
+    }
+    if (!api() || !api().get) {
+      return Promise.resolve({available: false, block: block,
+        why: 'There is no bridge to the station from this surface.'});
+    }
+    return Promise.resolve(api().get('/api/segment/inspect?block='
+        + encodeURIComponent(block))).then(function (d) {
+      if (!d || typeof d !== 'object') {
+        return {available: false, block: block,
+          why: 'The station answered, but with nothing in it.'};
+      }
+      segAsked[block] = {at: Date.now(), data: d};
+      return d;
+    }, function (err) {
+      var msg = String((err && err.message) || err);
+      var missing = /\b404\b|not\s*found/i.test(msg);
+      return {available: false, block: block, unreachable: true,
+        why: missing
+          ? 'This station has no /api/segment/inspect yet - it may still be'
+            + ' deploying. Nothing else on this menu depends on it.'
+          : 'The station did not answer: ' + msg.slice(0, 140)};
+    });
+  }
+
+  /* ---- #1168-1: inspect segment ----------------------------------- */
+
+  /* "a view popup going over every aspect of how the segment was
+   * composed" - the round and when it was committed, every line in
+   * ledger order with its seat, voice, engine, model, length, air time
+   * and aired state, who took part and for how long, the brief this
+   * road was supposed to fill against what it actually contained, the
+   * timing with any hole inside it, and the hand-offs.
+   *
+   * `heard` is the truthful one and `aired` is the raw state, so they
+   * are shown as two different things: a line can be `published`
+   * (handed over) and never acknowledged, or `withdrawn` (refused at
+   * hand-over, with the check that refused it beside it), and a written
+   * line that was never heard is common enough tonight that hiding it
+   * would make this pop-up lie. */
+  function segInspectClose() { var n = el('spSegInspect'); if (n) n.remove(); }
+
+  function segInspectOpen(ident) {
+    var sheet = sheetShell('spSegInspect', 'sp-segins',
+      'Segment ' + (ident.block ? ident.block : '(unnumbered)'));
+    /* A diagnostic surface: the broadcast ducks while it is open and
+       lets go by itself when the sheet leaves the page. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-spSegInspect', root.PineDuck.REPORT, sheet.back);
+    }
+    var split = make('div', 'sp-segins-split');
+    var body = make('div', 'sp-segins-body');
+    var side = make('div', 'sp-segins-side');
+    split.appendChild(body);
+    split.appendChild(side);
+    sheet.box.appendChild(split);
+
+    var head = segSection(body, 'The heading');
+    segRow(head, 'scene', ident.heading);
+    segRow(head, 'block', ident.block, ident.block ? '' : 'no numbered line under it');
+    segRow(head, 'hour', ident.hour);
+    segRow(head, 'segment id', ident.seg);
+
+    body.appendChild(make('div', 'sp-segins-wait', 'asking the station…'));
+    side.appendChild(make('div', 'sp-segflow-note', 'the hand-offs will be drawn here'));
+
+    segInspect(ident.block).then(function (d) {
+      if (!el('spSegInspect')) return;          /* closed while asking */
+      var wait = body.querySelector('.sp-segins-wait');
+      if (wait) wait.remove();
+      segFactsPaint(body, d, ident);
+      side.textContent = '';
+      segFlowPaint(side, d);
+      if (d && d.available === false) {
+        sheet.say(String(d.why || 'the station has no record of this segment'), true);
+      }
+    });
+    return sheet;
+  }
+
+  /* Everything but the sidebar. Every field may be absent; absent is
+     printed as absent, with the station's own sentence where it sent
+     one. */
+  function segFactsPaint(body, d, ident) {
+    d = d || {};
+    if (d.available === false) {
+      var gone = segSection(body, 'The station has no record');
+      gone.appendChild(make('div', 'sp-segrow-why', String(d.why
+        || 'the ledger holds forty-eight hours, and this segment is older than that')));
+      return;
+    }
+
+    var rnd = d.round || null;
+    var round = segSection(body, 'The round');
+    if (rnd) {
+      segRow(round, 'road', segWord(rnd.road, ident.round || ''));
+      segRow(round, 'conversation', rnd.sid);
+      segRow(round, 'committed', rnd.committed);
+      segRow(round, 'lines', segHas(rnd.lines) ? rnd.lines : null);
+      segRow(round, 'scripted', segHas(rnd.scripted) ? rnd.scripted : null,
+        'written into the running order before it was said');
+      segRow(round, 'welded', segHas(rnd.welded) ? rnd.welded : null,
+        'joined on afterwards, not scripted');
+    } else {
+      round.appendChild(make('div', 'sp-segrow-why',
+        'The station carries no round record for this block.'));
+    }
+
+    var brief = d.brief || null;
+    var bs = segSection(body, 'What this road was supposed to contain');
+    if (brief) {
+      segRow(bs, 'road', brief.road);
+      segRow(bs, 'wants', brief.wants);
+      segRow(bs, 'looked for', (brief.looked_for || []).join(', '));
+      segRow(bs, 'found', (brief.found || []).join(', '));
+      /* met is null when the road has no brief at all; false means the
+         station looked for its own words and found none. Those are two
+         different answers and must not print the same. */
+      segRow(bs, 'met', brief.met === true ? 'yes'
+        : (brief.met === false ? 'no' : null),
+        (brief.met === null || brief.met === undefined)
+          ? 'this road has no brief to meet'
+          : (brief.met === false
+            ? 'the station looked for its own words and found none'
+            : ''));
+      if (brief.say) bs.appendChild(make('div', 'sp-segrow-why', String(brief.say)));
+    } else {
+      bs.appendChild(make('div', 'sp-segrow-why',
+        'The station sent no brief for this road.'));
+    }
+
+    var t = d.timing || null;
+    var ts = segSection(body, 'The timing');
+    if (t) {
+      segRow(ts, 'first heard', t.first_heard || t.from);
+      segRow(ts, 'last heard', t.last_heard || t.to);
+      segRow(ts, 'span', segSecs(t.span_s));
+      segRow(ts, 'heard', (segHas(t.heard) && segHas(t.of))
+        ? (t.heard + ' of ' + t.of) : null);
+    } else {
+      ts.appendChild(make('div', 'sp-segrow-why', String(d.why
+        || 'Not one line of this segment was ever heard, so there is no timing.')));
+    }
+    var holes = d.holes || [];
+    if (holes.length) {
+      for (var h = 0; h < holes.length; h += 1) {
+        var hole = holes[h] || {};
+        var hr = segRow(ts, 'hole', segWord(hole.from, '?') + ' → '
+          + segWord(hole.to, '?'), segSecs(hole.seconds));
+        hr.classList.add('sp-seghole');
+      }
+    } else if (t) {
+      ts.appendChild(make('div', 'sp-segrow-why',
+        'No gap over twelve seconds between consecutive heard lines inside it.'));
+    }
+
+    /* WHICH ENTRY ON THE SHEET THIS ROAD IS.
+     *
+     * Usually not one entry, and that is the truth rather than a gap:
+     * the ledger records the ROAD a round was written for and when it
+     * was committed, but never the slot it was reserved against - only
+     * the live _ready_slot window knew that, and it is gone by the time
+     * anybody inspects. So `candidates` is every entry of this road in
+     * the running order, `on_air_now` marks the one the clock is
+     * standing on, and `slot_id` is filled only when there is exactly
+     * one of them. The station's own sentence is printed rather than
+     * summarised, here and beside the prompt buttons, because an
+     * operator who thinks he has edited ONE entry when he has edited a
+     * road will not find out until it is on air. */
+    var slot = d.slot || null;
+    if (slot) {
+      var sl = segSection(body, 'Which entry on the sheet');
+      segRow(sl, 'the hour’s sheet', slot.preset);
+      segRow(sl, 'this one entry', slot.slot_id,
+        segHas(slot.slot_id) ? '' : 'the ledger does not record it');
+      var cands = slot.candidates || [];
+      for (var c = 0; c < cands.length; c += 1) {
+        var cand = cands[c] || {};
+        var cr = segRow(sl, cand.on_air_now ? 'on air now' : 'candidate',
+          segWord(cand.label, cand.kind) + ' (' + segWord(cand.id, '?') + ')',
+          segHas(cand.minutes) ? cand.minutes + ' min' : '');
+        if (cand.on_air_now) cr.classList.add('sp-segcand-now');
+      }
+      if (!cands.length) {
+        sl.appendChild(make('div', 'sp-segrow-why',
+          'No entry on the running order runs this road.'));
+      }
+      if (slot.say) sl.appendChild(make('div', 'sp-segrow-why', String(slot.say)));
+    }
+
+    /* THE ADMITTED PLAYBACK OCCURRENCE, LINKED BY EVIDENCE.
+     *
+     * The gate matches a block to an occurrence by the line ids that
+     * occurrence admitted (falling back to the words for a welded round
+     * whose cue carries no row id), and `lines_matched` says how many
+     * landed. One it cannot link it does not claim - so an empty array
+     * is not "none", it is the bounded window having moved past this
+     * segment, and the station's own sentence says which. */
+    var adm = d.admission || null;
+    var ps = segSection(body, 'The admitted playback occurrence');
+    var occs = (adm && adm.occurrences) || [];
+    for (var o = 0; o < occs.length; o += 1) {
+      var occ = occs[o] || {};
+      var card = make('div', 'sp-segocc');
+      segRow(card, 'occurrence', occ.occurrence_id);
+      segRow(card, 'position', segHas(occ.position) ? occ.position : null);
+      segRow(card, 'state', segWord(occ.state, null) + (segHas(occ.outcome)
+        ? '  ·  ' + occ.outcome : ''));
+      segRow(card, 'lane', occ.lane);
+      segRow(card, 'producer', occ.producer, segHas(occ.origin)
+        ? 'origin: ' + occ.origin : '');
+      segRow(card, 'lines matched', segHas(occ.lines_matched) ? occ.lines_matched : null,
+        'how this occurrence was linked to this block - by its line ids,'
+        + ' not by assertion');
+      var au = occ.audio || null;
+      segRow(card, 'audio', au ? (segWord(au.media, 'no media named')
+        + (segHas(au.seconds) ? '  ·  ' + segSecs(au.seconds) : '')
+        + (segHas(au.bytes) ? '  ·  ' + au.bytes + ' bytes' : '')) : null,
+        au && au.hash_method ? 'hashed by ' + au.hash_method : '');
+      segRow(card, 'script revision', occ.script_revision);
+      segRow(card, 'performer session', occ.performer_session);
+      ps.appendChild(card);
+    }
+    if (adm && adm.say) ps.appendChild(make('div', 'sp-segrow-why', String(adm.say)));
+    else if (!occs.length) {
+      ps.appendChild(make('div', 'sp-segrow-why', 'The station did not send'
+        + ' one. The per-line air times below are what it does hold.'));
+    }
+
+    var seats = d.seats || [];
+    var ss = segSection(body, 'Who took part');
+    if (seats.length) {
+      for (var i = 0; i < seats.length; i += 1) {
+        var s = seats[i] || {};
+        var look = segSeatLook(s.seat);
+        var row = make('div', 'sp-segseat');
+        var dot = make('span', 'sp-segflow-dot', '');
+        dot.style.background = look.colour;
+        row.appendChild(dot);
+        row.appendChild(make('b', 'sp-segseat-name', segWord(s.name, look.label)));
+        row.appendChild(make('span', 'sp-segseat-seat', look.label));
+        row.appendChild(make('span', 'sp-segseat-n',
+          (segHas(s.lines)
+            ? s.lines + ' line' + (Number(s.lines) === 1 ? '' : 's')
+            : 'lines unsaid')
+          + (segHas(s.seconds) ? '  ·  ' + segSecs(s.seconds) : '')
+          + (segHas(s.heard) ? '  ·  ' + s.heard + ' heard' : '')));
+        ss.appendChild(row);
+      }
+    } else {
+      ss.appendChild(make('div', 'sp-segrow-why',
+        'The station recorded nobody taking part in this block.'));
+    }
+
+    var lines = d.lines || [];
+    var ls = segSection(body, 'Every line, in ledger order');
+    if (!lines.length) {
+      ls.appendChild(make('div', 'sp-segrow-why', 'The station sent no lines.'));
+      return;
+    }
+    for (var j = 0; j < lines.length; j += 1) {
+      ls.appendChild(segLineCard(lines[j] || {}));
+    }
+  }
+
+  /* One line as the station holds it. A line that was written and never
+     heard is drawn differently rather than hidden - that is the whole
+     reason to be reading this pop-up. */
+  function segLineCard(l) {
+    var look = segSeatLook(l.who);
+    var card = make('div', 'sp-segline');
+    if (l.heard === false) card.classList.add('sp-unheard');
+    if (String(l.aired || '') === 'withdrawn') card.classList.add('sp-withdrawn');
+    card.style.borderLeftColor = look.colour;
+    var top = make('div', 'sp-segline-top');
+    top.appendChild(make('b', 'sp-segline-who', segWord(l.name, look.label)));
+    var tags = [];
+    if (segHas(l.ord)) tags.push('#' + l.ord);
+    if (segHas(l.kind)) tags.push(String(l.kind));
+    if (segHas(l.at)) tags.push(String(l.at));
+    if (segHas(l.seconds)) tags.push(segSecs(l.seconds));
+    tags.push(l.heard === true ? 'heard'
+      : (l.heard === false ? 'never heard' : 'heard: not said'));
+    tags.push('aired: ' + segWord(l.aired, 'nothing'));
+    if (l.scripted === false) tags.push('not scripted');
+    top.appendChild(make('span', 'sp-segline-tag', tags.join('  ·  ')));
+    card.appendChild(top);
+    card.appendChild(make('div', 'sp-segline-text', segWord(l.text, '(no text)')));
+    var made = [];
+    if (segHas(l.voice)) made.push('voice ' + l.voice);
+    if (segHas(l.engine)) made.push('engine ' + l.engine);
+    if (segHas(l.model)) made.push('model ' + l.model);
+    if (segHas(l.source)) made.push('source ' + l.source);
+    if (segHas(l.air_at)) made.push('air_at ' + l.air_at);
+    if (segHas(l.line_id)) made.push('line ' + l.line_id);
+    card.appendChild(make('div', 'sp-segline-made',
+      made.length ? made.join('  ·  ')
+        : 'the station recorded nothing about how this line was made'));
+    if (segHas(l.withdrawn_why)) {
+      card.appendChild(make('div', 'sp-segline-why',
+        'refused at hand-over: ' + String(l.withdrawn_why)));
+    }
+    return card;
+  }
+
+  /* ---- #1168: the sidebar infographic ----------------------------- */
+
+  /* "a vertical infographic showing guided arrows going from path to
+   * path, from person to person representing the conversation
+   * transaction taking place and how everyone participated and
+   * coalesced ... going down the screen in a sidebar to the right of
+   * the pop-up".
+   *
+   * Drawn with plain elements and no canvas, no animation and no rAF:
+   * the tablet's frame pipeline is sensitive (2026-09-14 measured a
+   * re-dressed list holding BeginMainFrame at every vsync), and a
+   * column of divs costs one layout and then nothing at all. It lives
+   * inside the pop-up's own scroller, so it scrolls with it and cannot
+   * make the window taller than the glass.
+   *
+   * `transaction` is the station's ordered hand-offs. The chain is
+   * WALKED rather than assumed: where one hand-off's `to` is not the
+   * next one's `from`, the break is drawn as a break instead of being
+   * quietly stitched over.
+   *
+   * AND A SEGMENT WITH ONE SPEAKER DRAWS HONESTLY. An empty
+   * `transaction` is a real answer - nobody answered anybody - so the
+   * sidebar says that and shows who was there, rather than inventing an
+   * exchange out of one voice. */
+  function segFlowSteps(rows) {
+    var steps = [], last = '', i;
+    for (i = 0; i < rows.length; i += 1) {
+      var from = String((rows[i] && rows[i].from) || '');
+      var to = String((rows[i] && rows[i].to) || '');
+      if (last === '') steps.push({node: from});
+      else if (last !== from) { steps.push({gap: true}); steps.push({node: from}); }
+      steps.push({arrow: rows[i] || {}});
+      steps.push({node: to});
+      last = to;
+    }
+    return steps;
+  }
+
+  function segFlowChip(seat) {
+    var look = segSeatLook(seat);
+    var chip = make('div', 'sp-segflow-node', '');
+    var dot = make('span', 'sp-segflow-dot', '');
+    dot.style.background = look.colour;
+    chip.appendChild(dot);
+    chip.appendChild(make('span', 'sp-segflow-name', look.label));
+    chip.style.borderColor = look.colour;
+    return chip;
+  }
+
+  function segFlowArrow(t) {
+    var wrap = make('div', 'sp-segflow-arrow');
+    if (t && t.heard === false) wrap.classList.add('sp-segflow-unheard');
+    var stem = make('div', 'sp-segflow-stem', '');
+    stem.style.background = segSeatLook(t && t.from).colour;
+    wrap.appendChild(stem);
+    var head = make('div', 'sp-segflow-head', '');
+    head.style.borderTopColor = segSeatLook(t && t.to).colour;
+    wrap.appendChild(head);
+    var bits = [];
+    if (segHas(t && t.kind)) bits.push(String(t.kind));
+    if (segHas(t && t.seconds)) bits.push(segSecs(t.seconds));
+    if (segHas(t && t.at)) bits.push(String(t.at));
+    if (t && t.heard === false) bits.push('never heard');
+    var label = make('div', 'sp-segflow-label', bits.join('  ·  ')
+      || 'the station said nothing about what passed');
+    if (segHas(t && t.text)) label.title = String(t.text).slice(0, 300);
+    wrap.appendChild(label);
+    return wrap;
+  }
+
+  function segFlowPaint(side, d) {
+    d = d || {};
+    side.appendChild(make('div', 'sp-segflow-h', 'How it was passed around'));
+    if (d.available === false) {
+      side.appendChild(make('div', 'sp-segflow-note', String(d.why
+        || 'the station has no record of this segment, so there is nothing to draw')));
+      return;
+    }
+    var rows = d.transaction || [];
+    var seats = d.seats || [];
+
+    /* The legend, from whoever the station says was actually there -
+       not from the eight seats in the abstract. */
+    var legend = make('div', 'sp-segflow-legend');
+    var shown = Object.create(null), k;
+    for (k = 0; k < seats.length; k += 1) {
+      var look = segSeatLook(seats[k] && seats[k].seat);
+      if (shown[look.label]) continue;
+      shown[look.label] = 1;
+      var key = make('div', 'sp-segflow-key', '');
+      var dot = make('span', 'sp-segflow-dot', '');
+      dot.style.background = look.colour;
+      key.appendChild(dot);
+      key.appendChild(make('span', 'sp-segflow-name', look.label));
+      if (segHas(seats[k] && seats[k].lines)) {
+        key.appendChild(make('span', 'sp-segflow-n', '×' + seats[k].lines));
+      }
+      legend.appendChild(key);
+    }
+    if (legend.children.length) side.appendChild(legend);
+
+    if (!rows.length) {
+      /* One speaker, or none. Said plainly. */
+      if (seats.length === 1) {
+        side.appendChild(segFlowChip(seats[0] && seats[0].seat));
+        side.appendChild(make('div', 'sp-segflow-note', 'One voice and no'
+          + ' hand-off: nobody answered inside this segment, so there is no'
+          + ' exchange to draw.'));
+      } else if (seats.length > 1) {
+        for (var s = 0; s < seats.length && s < SEG_FLOW_MOST; s += 1) {
+          side.appendChild(segFlowChip(seats[s] && seats[s].seat));
+        }
+        side.appendChild(make('div', 'sp-segflow-note', 'The station recorded'
+          + ' these seats but no hand-off between them.'));
+      } else {
+        side.appendChild(make('div', 'sp-segflow-note',
+          'The station recorded no hand-offs and nobody taking part.'));
+      }
+      return;
+    }
+
+    var drawn = rows.length > SEG_FLOW_MOST ? rows.slice(0, SEG_FLOW_MOST) : rows;
+    var steps = segFlowSteps(drawn);
+    for (var i = 0; i < steps.length; i += 1) {
+      if (steps[i].node !== undefined) side.appendChild(segFlowChip(steps[i].node));
+      else if (steps[i].arrow) side.appendChild(segFlowArrow(steps[i].arrow));
+      else if (steps[i].gap) {
+        side.appendChild(make('div', 'sp-segflow-gap',
+          'nothing was recorded between these two'));
+      }
+    }
+    if (rows.length > drawn.length) {
+      side.appendChild(make('div', 'sp-segflow-note',
+        (rows.length - drawn.length) + ' more hand-off(s) are not drawn:'
+        + ' this tablet is kept cheap on purpose.'));
+    }
+  }
+
+  /* ---- #1168-2: report segment ------------------------------------ */
+
+  /* "pop up report window for reporting segment, extracts script and
+   * playback records for report and allows me to dictate / type a
+   * report to file".
+   *
+   * It files down the road the caution button and the #1164 menu
+   * already use and no other: reportFire() -> reportGather() for the
+   * window, the motion ring and the view snapshot, then POST
+   * /api/script/report, then the ten-second post-capture and the
+   * picture. So the evidence the caution road gathers rides along
+   * without this sheet gathering any of it a second time.
+   *
+   * THE EXTRACT RIDES IN `reason`, AND ONLY IN `reason`. #1164 wrote
+   * down why and it has not changed: normalize_view() excludes unknown
+   * fields by schema, so a new key stamped on the view never reaches
+   * the .json or the .md, while `reason` is what app.py leads the inbox
+   * item with. The station caps it at 1200 characters, so the identity
+   * and the operator's own words are written FIRST and the line-by-line
+   * digest is appended only while there is room - the part that gets
+   * cut is the part he can still read in full in the inspect pop-up. */
+  function segReportClose() { var n = el('spSegReport'); if (n) n.remove(); }
+
+  function segReportReason(ident, d, own) {
+    d = d || {};
+    var parts = ['report segment'];
+    if (own) parts.push('what he says: ' + String(own).slice(0, 400));
+    if (ident.heading) parts.push('scene: ' + ident.heading);
+    parts.push('block: ' + (ident.block || 'none under this heading'));
+    var rnd = d.round || null;
+    if (rnd) {
+      parts.push('round: ' + segWord(rnd.road, ident.round || '?')
+        + (segHas(rnd.sid) ? ' (' + rnd.sid + ')' : '')
+        + (segHas(rnd.committed) ? ', committed ' + rnd.committed : ''));
+    } else {
+      parts.push('round: ' + (ident.round || 'unknown')
+        + ' (the station sent no round record)');
+    }
+    /* The inspect route's hour is derived from the round's commit time -
+       the hour the segment was WRITTEN in - so it outranks the hour the
+       element happened to be painted under. */
+    parts.push('hour: ' + (segHas(d.hour) ? d.hour : (ident.hour || 'unknown')));
+    if (d.available === false) {
+      parts.push('the station has no record of this block: '
+        + String(d.why || '').slice(0, 160));
+    }
+    var t = d.timing || null;
+    if (t) {
+      parts.push('timing: ' + segWord(t.first_heard || t.from, '?') + ' to '
+        + segWord(t.last_heard || t.to, '?') + ', ' + segSecs(t.span_s)
+        + ', heard ' + segWord(t.heard, '?') + ' of ' + segWord(t.of, '?'));
+    } else if (d.available !== false) {
+      parts.push('timing: none - not one line of this segment was heard');
+    }
+    var holes = d.holes || [];
+    if (holes.length) {
+      var hs = [];
+      for (var h = 0; h < holes.length && h < 6; h += 1) {
+        hs.push(segWord(holes[h].from, '?') + '-' + segWord(holes[h].to, '?')
+          + ' ' + segSecs(holes[h].seconds));
+      }
+      parts.push('holes: ' + hs.join(', '));
+    }
+    /* The occurrence the gate LINKED to this block, by the line ids it
+       admitted. It is the one thing in the report that points at the
+       audio rather than at the words, so it is named before the digest
+       that may be cut. */
+    var occs = (d.admission && d.admission.occurrences) || [];
+    for (var a = 0; a < occs.length && a < 3; a += 1) {
+      var occ = occs[a] || {};
+      parts.push('occurrence: ' + segWord(occ.occurrence_id, '?')
+        + ' at ' + segWord(occ.position, '?')
+        + ', ' + segWord(occ.state, '?') + '/' + segWord(occ.outcome, '?')
+        + ', ' + segWord(occ.lines_matched, '?') + ' line(s) matched'
+        + (occ.audio && segHas(occ.audio.seconds)
+          ? ', ' + segSecs(occ.audio.seconds) + ' of audio' : ''));
+    }
+    if (!occs.length && d.admission && d.admission.say) {
+      parts.push('occurrence: ' + String(d.admission.say).slice(0, 160));
+    }
+    /* The script and playback extract, appended line by line only while
+       it still fits under the station's own cap. */
+    var out = parts.join('; ');
+    var lines = d.lines || [];
+    for (var i = 0; i < lines.length; i += 1) {
+      var l = lines[i] || {};
+      var sep = (i === 0 ? '; script and playback: ' : ' | ');
+      var one = '#' + segWord(l.ord, '?') + ' ' + segWord(l.who, '?')
+        + ' ' + segWord(l.kind, '?') + ' ' + segSecs(l.seconds)
+        + ' ' + segWord(l.at, 'no air time')
+        + ' ' + (l.heard === true ? 'heard'
+          : (l.heard === false ? 'NOT heard' : 'heard?'))
+        + (segHas(l.withdrawn_why) ? ' withdrawn:' + l.withdrawn_why : '')
+        + ' "' + String(l.text || '').replace(/\s+/g, ' ').slice(0, 60) + '"';
+      if ((out + sep + one).length > 1180) {
+        out += ' | (' + (lines.length - i) + ' more line(s): read them in the'
+          + ' inspect pop-up)';
+        break;
+      }
+      out += sep + one;
+    }
+    return out;
+  }
+
+  function segReportOpen(ident) {
+    var sheet = sheetShell('spSegReport', 'sp-segrep', 'Report this segment');
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-spSegReport', root.PineDuck.REPORT, sheet.back);
+    }
+    var who = make('div', 'sp-segrep-who');
+    segRow(who, 'scene', ident.heading);
+    segRow(who, 'block', ident.block, ident.block ? '' : 'no numbered line under it');
+    segRow(who, 'hour', ident.hour);
+    sheet.box.appendChild(who);
+
+    var extract = make('div', 'sp-segrep-extract');
+    extract.appendChild(make('div', 'sp-segrow-why', 'reading the script and'
+      + ' playback records for this segment…'));
+    sheet.box.appendChild(extract);
+
+    var ta = make('textarea', 'sp-segrep-ta', '');
+    ta.placeholder = 'what is wrong with this segment?';
+    ta.rows = 3;
+    ta.setAttribute('aria-label', 'Your report about this segment');
+    sheet.box.appendChild(ta);
+
+    var tools = make('div', 'sp-segrep-row');
+    var dictate = make('button', 'sp-segrep-dictate', '');
+    dictate.type = 'button';
+    dictate.innerHTML = folderIcon('c:microphone', '');
+    dictate.appendChild(document.createTextNode('Dictate'));
+    dictate.title = 'Say it: the dot lends its ear and the words land in the box';
+    /* The dot's ear, exactly as the reason sheet borrows it - and a
+       surface with no microphone says so rather than pretending. */
+    dictate.addEventListener('click', function () {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') {
+        sheet.say('no microphone on this surface');
+        return;
+      }
+      try {
+        dot.captureNext(function (words) {
+          words = String(words || '').trim();
+          if (!words) { sheet.say('nothing was heard'); return; }
+          ta.value = (ta.value ? String(ta.value).replace(/\s+$/, '') + ' ' : '') + words;
+          sheet.say('heard: ' + words.slice(0, 80));
+        });
+        sheet.say('listening…', true);
+      } catch (err) {
+        sheet.say('the dot could not listen: '
+          + String((err && err.message) || err).slice(0, 80));
+      }
+    });
+    var file = make('button', 'sp-segrep-file', 'File the report');
+    file.type = 'button';
+    tools.appendChild(dictate);
+    tools.appendChild(file);
+    sheet.box.appendChild(tools);
+    sheet.box.appendChild(make('div', 'sp-segrow-why', 'The window, the motion'
+      + ' ring, the view snapshot and the picture the caution button already'
+      + ' gathers ride along with it.'));
+
+    var held = null;                    /* the station's record, once read */
+    segInspect(ident.block).then(function (d) {
+      held = d;
+      if (!el('spSegReport')) return;
+      extract.textContent = '';
+      var lines = (d && d.lines) || [];
+      if (d && d.available === false) {
+        extract.appendChild(make('div', 'sp-segrow-why', String(d.why
+          || 'the station has no record of this segment')));
+      } else if (!lines.length) {
+        extract.appendChild(make('div', 'sp-segrow-why',
+          'The station sent no lines for this block.'));
+      } else {
+        extract.appendChild(make('div', 'sp-segsec-h', lines.length
+          + ' line(s) will be extracted into the report'));
+        for (var i = 0; i < lines.length; i += 1) {
+          extract.appendChild(segLineCard(lines[i] || {}));
+        }
+      }
+    });
+
+    file.addEventListener('click', function () {
+      var own = String(ta.value || '').replace(/\s+/g, ' ').trim();
+      if (!own) { sheet.say('say what is wrong, or dictate it'); return; }
+      var reason = segReportReason(ident, held, own);
+      sheet.close();
+      /* The caution road, and the kind the station files it under. */
+      reportKind = 'caution';
+      try { reportFire(ident.node || el('spScriptName') || document.body, reason); }
+      finally { setTimeout(function () { reportKind = 'report'; }, 100); }
+    });
+    return sheet;
+  }
+
+  /* ---- #1168-3: examine system prompt ----------------------------- */
+
+  /* "show system prompt in pop up window allowing for edit and saving
+   * as default or new preset for segment prompt. Allow me to modify
+   * system prompts for segments."
+   *
+   * THE STATION ALREADY HAS ALL OF THIS AND NONE OF IT IS REBUILT HERE:
+   *
+   *   GET  /api/schedule/segment/prompt?hour=&slot=&kind=   what this
+   *        entry actually writes with, where those words came from, the
+   *        variant shelf, the book that suits it and the dressed clause
+   *   GET  /api/schedule/promptbook?kind=                   the book,
+   *        newest first
+   *   POST /api/schedule/promptbook                         save one
+   *        under a name; send an `id` to rewrite one, leave it out to
+   *        mint a new one. SAVING CHANGES NOTHING ON AIR.
+   *   POST /api/schedule/promptbook/apply                   put one to
+   *        work. Its contract, read out of app.py rather than assumed:
+   *        {text | id, scope, hour, slot, kind, minutes, name}, scope
+   *        one of default | next_segment | next_30 | next_hour.
+   *        `default` writes the words onto the kind as a named variant
+   *        and pins the entry in the RUNNING ORDER to it - a permanent
+   *        change to the plan; name no entry and it arms the variant
+   *        for every entry of that kind instead. The three timed scopes
+   *        change nothing in the running order at all: they are a note
+   *        held beside it, so there is never anything to undo.
+   *
+   * WHICH IS WHY THERE ARE TWO BUTTONS AND NOT ONE. The station itself
+   * keeps saving and applying apart, and the operator has to be able to
+   * tell which he is doing: "Save as a new preset" writes to the book
+   * and stops - nothing on air moves - and "Save and use for this
+   * segment" saves and THEN applies, at a scope he picks, printed in
+   * the station's own words for what that scope means. Nothing here
+   * ever applies silently on a save.
+   *
+   * WHICH ENTRY, AND THE SENTENCE THAT SAYS IT IS USUALLY NOT ONE.
+   *
+   * The entry is named by its KIND, which is what `prompt_kind` off the
+   * inspect route is for, and the route answers for that kind in
+   * general when no entry is named. The inspect route also sends
+   * `slot`, and its `slot_id` is EMPTY most of the time on purpose: the
+   * ledger records the road a round was written for and never the slot
+   * it was reserved against, because only the live _ready_slot window
+   * knew that and it is gone by the time anyone inspects. Several
+   * entries usually run one road.
+   *
+   * So `slot` is sent to the apply road ONLY when `slot_id` is
+   * non-empty, and the station's own sentence about it is printed above
+   * the two buttons, not paraphrased. A prompt saved "for this segment"
+   * reaches the ROAD, and an operator who believes he has edited one
+   * entry when he has edited every entry of that road will not find out
+   * until he can hear it. Saying so costs one line; not saying so costs
+   * an hour of air.
+   *
+   * The hour is the inspect route's own, which it derives from the
+   * round's commit time - the hour the segment was WRITTEN in, which is
+   * the one the prompt routes want. Until that answer arrives the
+   * element's hour stands in, and either is sent only when it really
+   * looks like an hour key; anything else and the station's own default
+   * (the hour on air) is the right answer rather than a guess of ours. */
+  var SEG_HOUR_RE = /^\d{4}-\d{2}-\d{2}T\d{2}$/;
+  var SEG_SCOPE_WHY = {
+    'default': 'from now on - it goes into the running order itself and'
+      + ' survives a restart',
+    'next_segment': 'the next segment of this kind, then it lets go',
+    'next_30': 'the next thirty minutes',
+    'next_hour': 'the next hour - both thirty-minute halves'
+  };
+
+  function segPromptClose() { var n = el('spSegPrompt'); if (n) n.remove(); }
+
+  function segPromptOpen(ident) {
+    var sheet = sheetShell('spSegPrompt', 'sp-segpr',
+      'The system prompt behind this segment');
+    /* NOT ducked. The reason sheet and the inbox duck the broadcast
+       because they are diagnostics; this is a preference, the way the
+       SFX folder sheet is, and the operator is usually listening to the
+       very segment he is rewriting the instruction for. */
+    var kind = String(ident.round || '');
+    var hour = SEG_HOUR_RE.test(String(ident.hour || '')) ? String(ident.hour) : '';
+    var slotId = '';                     /* only when exactly one entry runs this road */
+    var picked = null;                   /* the preset loaded into the box */
+
+    var facts = make('div', 'sp-segpr-facts');
+    sheet.box.appendChild(facts);
+    var ta = make('textarea', 'sp-segpr-ta', '');
+    ta.rows = 10;
+    ta.placeholder = 'the system prompt this kind of segment writes with';
+    ta.setAttribute('aria-label', 'The system prompt for this segment');
+    sheet.box.appendChild(ta);
+
+    var namely = make('div', 'sp-segpr-row');
+    var nameIn = make('input', 'sp-segpr-in', '');
+    nameIn.type = 'text';
+    nameIn.placeholder = 'a name for this preset';
+    nameIn.setAttribute('aria-label', 'The preset name');
+    var scenIn = make('input', 'sp-segpr-in', '');
+    scenIn.type = 'text';
+    scenIn.placeholder = 'when to use it';
+    scenIn.setAttribute('aria-label', 'When to use this preset');
+    namely.appendChild(nameIn);
+    namely.appendChild(scenIn);
+    sheet.box.appendChild(namely);
+
+    /* Rewriting the preset he opened is a different act from minting a
+       new one, and the route draws that line with `id`. So does this,
+       and it is off until he says otherwise. */
+    var overRow = make('div', 'sp-segpr-row sp-segpr-over');
+    overRow.hidden = true;
+    var over = make('button', 'sp-segpr-tick', '');
+    over.type = 'button';
+    over.setAttribute('aria-pressed', 'false');
+    var overMark = make('span', 'sp-segpr-tickmark', '');
+    over.appendChild(overMark);
+    over.appendChild(make('span', 'sp-segpr-tickt',
+      'rewrite the preset I opened instead of minting a new one'));
+    overRow.appendChild(over);
+    sheet.box.appendChild(overRow);
+    function overPaint() {
+      var on = over.getAttribute('aria-pressed') === 'true';
+      overMark.innerHTML = folderIcon(on ? 'c:checkbox--checked' : 'c:checkbox', '');
+      if (!overMark.innerHTML) overMark.textContent = on ? '[x]' : '[ ]';
+      over.classList.toggle('on', on);
+    }
+    over.addEventListener('click', function () {
+      over.setAttribute('aria-pressed',
+        over.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+      overPaint();
+    });
+    overPaint();
+
+    var scopeRow = make('div', 'sp-segpr-row');
+    scopeRow.appendChild(make('span', 'sp-segrow-k', 'and use it for'));
+    var scope = make('select', 'sp-segpr-scope');
+    scope.setAttribute('aria-label', 'How long the applied prompt holds');
+    scopeRow.appendChild(scope);
+    sheet.box.appendChild(scopeRow);
+    var scopeWhy = make('div', 'sp-segrow-why', '');
+    sheet.box.appendChild(scopeWhy);
+
+    /* WHO THIS REACHES, IN THE STATION'S OWN WORDS, ABOVE THE BUTTONS.
+       Filled from the inspect route's `slot.say` - "3 entries on the
+       sheet run this road; ... a prompt saved for this segment reaches
+       the road rather than one entry" - because that is the one thing
+       about these two buttons an operator could get wrong. */
+    var reach = make('div', 'sp-segpr-reach', '');
+    reach.hidden = true;
+    sheet.box.appendChild(reach);
+
+    var buttons = make('div', 'sp-segpr-row');
+    var save = make('button', 'sp-segpr-save', 'Save as a new preset');
+    save.type = 'button';
+    save.title = 'Writes it into the prompt book. Nothing on air changes.';
+    var apply = make('button', 'sp-segpr-apply', 'Save and use for this segment');
+    apply.type = 'button';
+    apply.title = 'Saves it AND puts it to work, at the scope chosen above';
+    buttons.appendChild(save);
+    buttons.appendChild(apply);
+    sheet.box.appendChild(buttons);
+
+    var book = make('div', 'sp-segpr-book');
+    sheet.box.appendChild(book);
+
+    function scopeSay() {
+      var opt = scope.options[scope.selectedIndex];
+      scopeWhy.textContent = (opt && opt.pineWhy)
+        || SEG_SCOPE_WHY[scope.value] || '';
+    }
+    function scopePaint(scopes) {
+      scope.textContent = '';
+      var order = ['next_segment', 'next_30', 'next_hour', 'default'], i;
+      for (i = 0; i < order.length; i += 1) {
+        var id = order[i];
+        var said = (scopes && scopes[id]) || SEG_SCOPE_WHY[id] || id;
+        var opt = make('option', '',
+          id === 'default' ? 'the standing instruction' : said);
+        opt.value = id;
+        opt.pineWhy = said;
+        scope.appendChild(opt);
+      }
+      scope.value = 'next_segment';
+      scopeSay();
+    }
+    scope.addEventListener('change', scopeSay);
+    scopePaint(null);
+
+    function bookPaint(rows) {
+      book.textContent = '';
+      var h = make('div', 'sp-segsec-h', 'The prompt book'
+        + (kind ? ', for ' + kind : '') + ' — newest first');
+      var again = make('button', 'sp-segpr-again', '');
+      again.type = 'button';
+      again.innerHTML = folderIcon('c:renew', 'Read the book again');
+      if (!again.innerHTML) again.textContent = 'refresh';
+      again.title = 'Read the prompt book again';
+      again.addEventListener('click', bookLoad);
+      h.appendChild(again);
+      book.appendChild(h);
+      if (!rows || !rows.length) {
+        book.appendChild(make('div', 'sp-segrow-why',
+          'Nothing saved for this kind yet.'));
+        return;
+      }
+      for (var i = 0; i < rows.length && i < 40; i += 1) {
+        (function (row) {
+          var b = make('button', 'sp-segpr-preset', '');
+          b.type = 'button';
+          b.appendChild(make('b', '', String(row.name || row.id || 'unnamed')));
+          b.appendChild(make('span', 'sp-segpr-presetwhy',
+            (row.kind ? String(row.kind) : 'suits anything')
+            + (row.scenario ? '  ·  ' + String(row.scenario) : '')));
+          b.addEventListener('click', function () {
+            ta.value = String(row.text || '');
+            nameIn.value = String(row.name || '');
+            scenIn.value = String(row.scenario || '');
+            picked = row;
+            overRow.hidden = false;
+            sheet.say('opened “' + String(row.name || row.id) + '”'
+              + ' — nothing has been saved or applied');
+          });
+          book.appendChild(b);
+        })(rows[i] || {});
+      }
+    }
+
+    function bookLoad() {
+      if (!api() || !api().get) { sheet.say('no bridge to the station'); return; }
+      Promise.resolve(api().get('/api/schedule/promptbook'
+          + (kind ? '?kind=' + encodeURIComponent(kind) : ''))).then(function (d) {
+        if (!el('spSegPrompt')) return;
+        bookPaint((d && d.prompts) || []);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        book.textContent = '';
+        book.appendChild(make('div', 'sp-segrow-why', 'the book could not be'
+          + ' read: ' + String((err && err.message) || err).slice(0, 90)));
+      });
+    }
+
+    function promptLoad() {
+      if (!api() || !api().get) {
+        facts.textContent = '';
+        facts.appendChild(make('div', 'sp-segrow-why',
+          'There is no bridge to the station from this surface.'));
+        return;
+      }
+      facts.textContent = '';
+      facts.appendChild(make('div', 'sp-segrow-why', 'asking the station…'));
+      var q = '/api/schedule/segment/prompt?kind=' + encodeURIComponent(kind);
+      if (hour) q += '&hour=' + encodeURIComponent(hour);
+      Promise.resolve(api().get(q)).then(function (d) {
+        if (!el('spSegPrompt')) return;
+        d = d || {};
+        facts.textContent = '';
+        segRow(facts, 'segment', segWord(d.label, kind || ident.heading));
+        segRow(facts, 'kind', segWord(d.kind, kind));
+        segRow(facts, 'hour', segWord(d.hour, hour || 'the hour on air'));
+        segRow(facts, 'these words came from', d.source);
+        if (d.variant) segRow(facts, 'variant', d.variant.name || d.variant.id);
+        if (d.window) {
+          var w = segRow(facts, 'a timed prompt owns this kind',
+            String(d.window.name || ''), String(d.window.says || ''));
+          w.classList.add('sp-seghole');
+        }
+        if (d.why) facts.appendChild(make('div', 'sp-segrow-why', String(d.why)));
+        if (d.blurb) facts.appendChild(make('div', 'sp-segrow-why', String(d.blurb)));
+        ta.value = String(d.text || '');
+        if (!String(d.text || '').trim() && d.seed) {
+          ta.value = String(d.seed);
+          sheet.say('there is nothing on the shelf for this kind; the'
+            + ' station’s own seed is in the box', true);
+        }
+        if (!nameIn.value) {
+          nameIn.value = String(d.label || d.kind || kind || 'segment')
+            + (ident.block ? ' · block ' + ident.block : '');
+        }
+        if (d.scopes) scopePaint(d.scopes);
+        if (d.clause) {
+          var cl = make('details', 'sp-segpr-clause');
+          cl.appendChild(make('summary', '',
+            'the dressed clause, as the writing room receives it'));
+          cl.appendChild(make('pre', 'sp-segpr-pre', String(d.clause)));
+          facts.appendChild(cl);
+        }
+        bookPaint(d.book || []);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        facts.textContent = '';
+        facts.appendChild(make('div', 'sp-segrow-why', 'the station did not'
+          + ' answer: ' + String((err && err.message) || err).slice(0, 110)));
+      });
+    }
+
+    /* SAVE. The book, and only the book. */
+    function saveIt() {
+      var text = String(ta.value || '');
+      if (!text.trim()) { sheet.say('there is nothing in the box to save'); return null; }
+      if (!api() || !api().post) { sheet.say('no bridge to the station'); return null; }
+      var body = {name: String(nameIn.value || '').slice(0, 80), kind: kind,
+        scenario: String(scenIn.value || '').slice(0, 200), text: text};
+      /* An `id` rewrites that one; without it the station mints a new
+         one. The tick above is the only thing that sends an id. */
+      if (picked && picked.id && over.getAttribute('aria-pressed') === 'true') {
+        body.id = String(picked.id);
+      }
+      return Promise.resolve(api().post('/api/schedule/promptbook', body));
+    }
+
+    save.addEventListener('click', function () {
+      var ask = saveIt();
+      if (!ask) return;
+      sheet.say('saving…', true);
+      ask.then(function (got) {
+        if (!el('spSegPrompt')) return;
+        var row = (got && got.prompt) || {};
+        if (row.id) { picked = row; overRow.hidden = false; }
+        bookPaint((got && got.book && got.book.prompts) || []);
+        sheet.say('saved to the book as “'
+          + String(row.name || nameIn.value || 'it')
+          + '”. Nothing on air has changed.', true);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        sheet.say('the station refused the save: '
+          + String((err && err.message) || err).slice(0, 90));
+      });
+    });
+
+    /* SAVE AND USE. Two acts, in that order, and the second one is
+       named out loud in the station's own words when it lands. */
+    apply.addEventListener('click', function () {
+      var ask = saveIt();
+      if (!ask) return;
+      var want = String(scope.value || 'next_segment');
+      sheet.say('saving, then applying…', true);
+      ask.then(function (got) {
+        var row = (got && got.prompt) || {};
+        if (el('spSegPrompt')) {
+          if (row.id) { picked = row; overRow.hidden = false; }
+          bookPaint((got && got.book && got.book.prompts) || []);
+        }
+        var body = {scope: want, kind: kind, text: String(ta.value || ''),
+          name: String(nameIn.value || '').slice(0, 80)};
+        /* The id makes `default` rewrite this preset's own variant
+           rather than piling up a new one every time it is applied. */
+        if (row.id) body.id = String(row.id);
+        if (hour) body.hour = hour;
+        /* ONLY when the station said exactly one entry runs this road.
+           Naming a slot it did not name would pin a prompt to an entry
+           on a guess, and the apply road 404s an entry that is not in
+           that hour - both worse than letting it reach the road, which
+           is what the sentence above the buttons already says it will
+           do. */
+        if (slotId) body.slot = slotId;
+        if (want === 'next_30') body.minutes = 30;
+        if (want === 'next_hour') body.minutes = 60;
+        return Promise.resolve(api().post('/api/schedule/promptbook/apply', body));
+      }).then(function (got) {
+        if (!el('spSegPrompt')) return;
+        if (!got || got.ok === false) {
+          sheet.say('saved, but not applied: '
+            + String((got && got.say) || 'the station refused it'), true);
+          return;
+        }
+        sheet.say('saved, and now in force: ' + String(got.says || want)
+          + (segHas(got.entries) ? ' (' + got.entries + ' entry/entries)' : ''), true);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        sheet.say('the station refused it: '
+          + String((err && err.message) || err).slice(0, 110));
+      });
+    });
+
+    /* The scene's own round and hour paint the window at once, because
+       a window that waits on a second read is a window that looks
+       broken for a beat. The inspect route is then asked for the three
+       things only it knows for certain - the road (`prompt_kind`), the
+       hour the segment was WRITTEN in, and which entry, if any, this
+       reaches - and the window is read again only if one of them
+       actually differs. segInspect holds its answer for twenty seconds,
+       so inspecting and then opening this costs one question, not
+       two. */
+    promptLoad();
+    segInspect(ident.block).then(function (d) {
+      if (!el('spSegPrompt')) return;
+      d = d || {};
+      var again = false;
+      var road = String(d.prompt_kind || '');
+      if (road && road !== kind) { kind = road; again = true; }
+      if (SEG_HOUR_RE.test(String(d.hour || '')) && String(d.hour) !== hour) {
+        hour = String(d.hour);
+        again = true;
+      }
+      var slot = d.slot || null;
+      slotId = String((slot && slot.slot_id) || '');
+      if (slot && slot.say) {
+        reach.textContent = String(slot.say);
+        reach.hidden = false;
+        /* One entry is the quiet case; a road with several entries on
+           the sheet is the one he has to read, so it is marked. */
+        reach.classList.toggle('sp-segpr-wide', !slotId);
+      }
+      if (again) promptLoad();
+    });
+    return sheet;
+  }
+
+  /* ---- #1168: the menu itself ------------------------------------- */
+
+  var SEG_CHOICES = [
+    {id: 'inspect', label: 'Inspect segment', icon: 'c:microscope',
+     why: 'Every aspect of how this segment was composed, with the'
+        + ' conversation drawn down the side'},
+    {id: 'report', label: 'Report segment', icon: 'c:receipt',
+     why: 'File a report about this segment - its script and playback'
+        + ' records ride along'},
+    {id: 'prompt', label: 'Examine system prompt', icon: 'c:book',
+     why: 'The system prompt this kind of segment writes with: read it,'
+        + ' edit it, save it, or put it to work'}
+  ];
+
+  function segMenuClose() {
+    var menu = el(SEG_MENU_ID);
+    if (menu) menu.remove();
+    if (segMenuUnwatch) {
+      try { segMenuUnwatch(); } catch (err) { /* already gone */ }
+      segMenuUnwatch = null;
+    }
+  }
+
+  function segMenuOpen(node) {
+    if (!node) return null;
+    segMenuClose();
+    var ident = segIdentity(node);
+
+    var menu = make('div', 'sp-segmenu');
+    menu.id = SEG_MENU_ID;
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', 'This segment');
+
+    /* No say line of its own: this menu says nothing, it only opens
+       three windows that each have one. A message that could never
+       appear is a message the reader has to work out is dead. */
+    menu.appendChild(make('div', 'sp-segmenu-where',
+      (ident.block ? 'block ' + ident.block : 'no block number under this heading')
+      + (ident.round ? '  ·  ' + ident.round : '')));
+
+    function row(choice) {
+      var b = make('button', 'sp-segmenu-item', '');
+      b.type = 'button';
+      b.setAttribute('role', 'menuitem');
+      b.dataset.seg = choice.id;
+      var mark = make('span', 'sp-segmenu-mark', '');
+      mark.innerHTML = folderIcon(choice.icon, '');
+      if (!mark.innerHTML) mark.textContent = '·';
+      b.appendChild(mark);
+      b.appendChild(make('span', 'sp-segmenu-text', choice.label));
+      b.title = choice.why;
+      b.addEventListener('click', function () {
+        segMenuClose();
+        try {
+          if (choice.id === 'inspect') segInspectOpen(ident);
+          else if (choice.id === 'report') segReportOpen(ident);
+          else segPromptOpen(ident);
+        } catch (err) {
+          caughtNote('seg:' + choice.id, err);
+          say('that window could not be opened: '
+            + String((err && err.message) || err).slice(0, 80));
+        }
+      });
+      return b;
+    }
+    for (var i = 0; i < SEG_CHOICES.length; i += 1) menu.appendChild(row(SEG_CHOICES[i]));
+
+    var cancel = make('button', 'sp-segmenu-item sp-segmenu-cancel', '');
+    cancel.type = 'button';
+    cancel.setAttribute('role', 'menuitem');
+    var cmark = make('span', 'sp-segmenu-mark', '');
+    cmark.innerHTML = folderIcon('c:close--filled', '');
+    if (!cmark.innerHTML) cmark.textContent = '·';
+    cancel.appendChild(cmark);
+    cancel.appendChild(make('span', 'sp-segmenu-text', 'Cancel'));
+    cancel.title = 'Close this menu and do nothing';
+    cancel.addEventListener('click', segMenuClose);
+    menu.appendChild(cancel);
+
+    document.body.appendChild(menu);
+    /* Fixed, at the heading's own corner, clamped inside the glass -
+       the tablet's is 1154x690 CSS px, and a menu hanging off the
+       bottom of it is a menu with an item the thumb cannot reach. */
+    try {
+      var seat = headerSeat(node);
+      var gw = (root.innerWidth || 1154), gh = (root.innerHeight || 690);
+      var mw = menu.offsetWidth || 300, mh = menu.offsetHeight || 220;
+      var left = Math.max(6, Math.min(gw - mw - 6, (seat.left || 0)));
+      var top = (seat.bottom || 0) + 4;
+      if (top + mh > gh - 6) top = Math.max(6, (seat.top || 0) - mh - 4);
+      if (top + mh > gh - 6) top = Math.max(6, gh - mh - 6);
+      menu.style.left = Math.round(left) + 'px';
+      menu.style.top = Math.round(top) + 'px';
+    } catch (err) { /* no geometry on this surface; the CSS stands */ }
+
+    /* It opens two diagnostics and files reports, so it ducks - and the
+       hold is tied to the menu, so PineDuck gives the radio back by
+       itself the moment the menu leaves the page. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-' + SEG_MENU_ID, root.PineDuck.REPORT, menu);
+    }
+    /* Tap away and Escape, through the one rule every other pop-up on
+       this page is on. The heading is spared so its own hold re-opens
+       rather than close-then-open. */
+    if (root.PineDismiss && typeof root.PineDismiss.watch === 'function') {
+      segMenuUnwatch = root.PineDismiss.watch(menu, segMenuClose, [node], function () {
+        return !!el(SEG_MENU_ID);
+      });
+    }
+    return menu;
+  }
+
   /* ---- #1385: the word search ------------------------------------ */
 
   /* The station does the counting (/api/said/search, #1380); this only
@@ -1773,6 +3473,54 @@
     if (root.PineScriptDiagnostics) diagnosticRevision = root.PineScriptDiagnostics.revision(elements);
   }
 
+  /* The references, resolved against the admitted map. `available: false`
+     with a reason is a legitimate answer and the only honest one when the
+     station has not been patched to carry the field yet. */
+  function admissionReferences() {
+    var out = {available: false, why: 'the station is not sending an admitted cue map',
+      generation: null, mode: '', reader_position: null,
+      playback_occurrence_id: null, position: null, media: null,
+      script_revision: null, performer_session: null, assembly_id: null,
+      cue_map_revision: null, take_id: null, audio_hash: null,
+      accepted_cuts: null, origin: null};
+    if (!admitMap || !admitMap.ok) return out;
+    out.generation = admitMap.generation;
+    out.mode = admitMap.mode;
+    out.reader_position = admitMap.reader;
+    var want = (lastGood && lastGood.occurrence_id)
+      || (admitMap.current && admitMap.current.occurrence_id) || '';
+    var found = null;
+    for (var i = 0; i < admitMap.order.length; i += 1) {
+      if (admitMap.order[i].occurrence_id === want) { found = admitMap.order[i]; break; }
+    }
+    if (!found) {
+      out.why = want
+        ? 'the admitted map no longer carries occurrence ' + want
+        : 'no occurrence has been dispatched yet';
+      return out;
+    }
+    out.available = true;
+    out.why = '';
+    out.playback_occurrence_id = found.occurrence_id;
+    out.position = found.position;
+    out.media = found.media;
+    out.origin = found.origin;
+    /* Absent, not blank: an empty string from the server means the record
+       exists and the field is unset, and saying `null` says exactly that. */
+    out.script_revision = found.script_revision || null;
+    out.performer_session = found.performer_session || null;
+    out.assembly_id = found.assembly_id || null;
+    out.cue_map_revision = found.cue_map_revision || null;
+    out.take_id = found.take_id || null;
+    out.audio_hash = found.hash || null;
+    var cuts = [];
+    for (var c = 0; c < found.cues.length; c += 1) {
+      if (found.cues[c].cut_id) cuts.push(found.cues[c].cut_id);
+    }
+    out.accepted_cuts = cuts.length ? cuts.slice(0, 24) : null;
+    return out;
+  }
+
   function sampleMotion() {
     var pane = el('spScript');
     var rec = recorder();
@@ -1833,6 +3581,18 @@
         rows: (liveStream.rows || []).filter(function (r) { return String(r.id || '') === String(active.id || '') || String(r.id || '') === nowLineId; }).map(function (r) { return {id: r.id, from: r.from, until: r.until}; })} : null,
       viewport: {scroll_top_px: Math.round(pane.scrollTop), height_px: pane.clientHeight, width_px: pane.clientWidth, content_height_px: pane.scrollHeight, lit_top_px: top},
       paused: stationPaused, follow: follow, visibility: String(document.visibilityState || ''),
+      /* THE INCIDENT REFERENCES section 5 of the recording note asks
+         for: script revision, performer session, accepted cut, assembly
+         and playback occurrence. Every one of them is taken from what the
+         STATION actually returned. A reference the station does not carry
+         is absent here; it is never filled in with something plausible. */
+      admission: admissionReferences(),
+      sync: {state: syncState, why: syncWhy, since_ms: syncSince,
+        motion: syncRing.slice(-60),
+        last_trustworthy: lastGood ? {line_id: lastGood.line_id,
+          occurrence_id: lastGood.occurrence_id, position: lastGood.position,
+          media: lastGood.media, at_ms: lastGood.at} : null},
+      scroll: {owner: scrollOwner, at_ms: scrollAt, moves: scrollLog.slice(-12)},
       errors: caught.slice(-6)
     };
     rec.observe({at_ms: Date.now(), highlight_id: diagnosticSnapshot.highlight_id, active_id: diagnosticSnapshot.active_id,
@@ -2403,6 +4163,16 @@
       if (!settled) {
         var cursor = box.firstChild;
         for (var w = 0; w < want.length; w += 1) {
+          /* #1428d: STEP OVER THE EVENT ROWS, exactly as the settled
+             test above does. They are appended as they happen and take
+             no part in air-time order; walking onto one made
+             `want[w] === cursor` false for a row already in its right
+             place, and insertBefore on an attached node is a detach and
+             an attach. Measured: 240 such moves in eight seconds on a
+             feed whose order was already perfect. */
+          while (cursor && /sp-msg-ev/.test(String(cursor.className || ''))) {
+            cursor = cursor.nextSibling;
+          }
           if (want[w] === cursor) { cursor = cursor.nextSibling; continue; }
           box.insertBefore(want[w], cursor);
         }
@@ -2704,7 +4474,9 @@
      * of the hour is usually well past it; scrolling to the bottom after
      * every repaint would drag the operator away from the line being said
      * twenty seconds after it arrived. */
-    if (stick && atEnd && !(follow && nowLineId)) box.scrollTop = box.scrollHeight;
+    if (stick && atEnd && !(follow && nowLineId)) {
+      moveScript('end', function (pane) { pane.scrollTop = pane.scrollHeight; });
+    }
     /* #1273: THE MARK IS RE-ASSERTED, NOT MERELY REMEMBERED.
        #1269 asked whether a node with this id existed - not whether it
        still CARRIED the mark. A rebuilt node exists without .sp-now, so
@@ -2722,6 +4494,59 @@
        segment arrives folded rather than springing it open. */
     segApply();
     tick();
+  }
+
+  /* ONE SCROLL CONTROLLER.
+   *
+   * "Use one scroll controller."
+   *
+   * There were four movers of this pane and only one of them declared
+   * itself: the follow scroll in markNow stamped `selfScrollUntil`, while
+   * the stick-to-end after a repaint, the reader's-place restore and the
+   * tap-to-line jump all moved the box silently. Each of those fires the
+   * pane's own scroll handler, which reads "the operator has scrolled by
+   * hand" and switches following OFF - the page cancelling its own
+   * following, which is the exact fault #1282 was fixed for once already.
+   *
+   * So every movement goes through here, declares a reason, and is
+   * recorded for the incident report. A follow may not overrule a restore
+   * in the same frame: the operator's place beats an automatic move. */
+  var scrollOwner = '';
+  var scrollAt = 0;
+  var scrollLog = [];
+
+  function moveScript(reason, apply) {
+    var box = el('spScript');
+    if (!box) return false;
+    var now = Date.now();
+    /* 2026-09-15 (#1183): this is one HALF of the rule, and the other
+       half is in scriptRestore. A follow is held off while a restore is
+       fresh, which stops a follow undoing a place-hold. The reverse -
+       a restore landing in the middle of a follow's smooth animation -
+       is what produced the operator's 3,407 px jump, and it cannot be
+       caught here, because by the time a restore asks for the pane its
+       drift has already been measured against a moving layout. It is
+       refused where it is measured. */
+    if (reason === 'follow' && scrollOwner === 'restore' && now - scrollAt < 80) {
+      return false;
+    }
+    scrollOwner = reason;
+    scrollAt = now;
+    scrollLog.push({at: now, why: reason, top: Math.round(box.scrollTop)});
+    if (scrollLog.length > 40) scrollLog.shift();
+    selfScrollUntil = now + 2400;          /* backstop only */
+    /* #1330: on the box that actually scrolls - `scrollend` clears the
+       backstop early, and the backstop governs when it is unavailable. */
+    try {
+      if ('onscrollend' in box) {
+        box.addEventListener('scrollend', function done() {
+          box.removeEventListener('scrollend', done);
+          selfScrollUntil = 0;
+        }, {once: true});
+      }
+    } catch (err) { /* the backstop still covers it */ }
+    try { apply(box); } catch (err) { caughtNote('scroll:' + reason, err); }
+    return true;
   }
 
   /* #1273: HOLD THE READER'S PLACE ACROSS A REPAINT. Measure one row
@@ -2749,9 +4574,55 @@
     /* It left the page while it was being read. Leave the scroll alone:
        the browser's own anchoring has already chosen a neighbour. */
     if (!node || node.parentNode !== box) return;
+
+    /* 2026-09-15 (#1183): THE PLACE-HOLDER MEASURED THE FOLLOW'S OWN
+       ANIMATION AND ADDED IT TO THE SCROLL.
+
+       The operator filed a capture asking "Why did this jump like this?"
+       and the 26 transitions in it show the same shape twice. The
+       highlight lands off screen, the smooth follow starts, and one
+       sample later the scroll takes a single 3,407 px step past the line
+       it was chasing - lit_top_px 278, then -422, then -3829 - before
+       walking all the way back to 715 three and a half seconds later.
+       The second time, after the document jumped 34 revisions under the
+       reader, it was 941 px and four seconds.
+
+       The guard in moveScript is one-directional: a follow is held off
+       while a restore is fresh, and a restore is never held off while a
+       follow is in flight. A follow is a SMOOTH scroll, and the note
+       above it already measured that 21.9% of them are still running two
+       samples later. So the anchor is taken part-way through the
+       animation and read again a moment later, and the difference it
+       calls `drift` is mostly the animation's own travel. Adding that to
+       scrollTop puts the pane where the animation was going to end up
+       ANYWAY, and the animation then goes there again from the new
+       place.
+
+       #1273 is right about reader-driven scroll and keeps every bit of
+       its reach here. It is wrong only while the pane is scrolling
+       itself, and in that case there is no reader's place to hold: the
+       follow exists to put the lit line on screen. So the drift is
+       dropped and the follow is re-issued instead, against the layout
+       that exists now rather than the one it started from. */
+    if (Date.now() < selfScrollUntil && scrollOwner === 'follow') {
+      var lit = box.querySelector('.sp-el.sp-now');
+      scrollLog.push({at: Date.now(), why: 'restore:skipped-mid-follow',
+                      top: Math.round(box.scrollTop)});
+      if (scrollLog.length > 40) scrollLog.shift();
+      if (lit) {
+        moveScript('follow', function () {
+          try { lit.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+          catch (err) { lit.scrollIntoView(false); }
+        });
+      }
+      return;
+    }
+
     var drift = node.getBoundingClientRect().top - anchor.was;
     if (Math.abs(drift) > 0.5) {
-      box.scrollTop = Math.max(0, box.scrollTop + drift);
+      moveScript('restore', function (pane) {
+        pane.scrollTop = Math.max(0, pane.scrollTop + drift);
+      });
     }
   }
 
@@ -2880,15 +4751,22 @@
            without opening it. On an attribute and shown through
            ::after - the reconciler re-dresses a changed element with
            textContent and would wipe a child span every repaint. */
+        /* #1428: WRITTEN ONLY WHEN IT CHANGES. Measured on the
+           tablet, this wrote data-inside 177 times in eight seconds and
+           3 of them were a change. Blink invalidates an element's style
+           on the write, not on a difference, so the other 174 bought a
+           style recalc each and nothing else. */
+        var inside = '';
         if (shut) {
           var got = segCount(seg);
-          node.setAttribute('data-inside', got
+          inside = got
             ? ('  ▸ ' + got.lines + (got.lines === 1 ? ' line' : ' lines')
                + (got.seconds >= 1
                   ? '  ·  ' + Math.round(got.seconds) + 's' : ''))
-            : '  ▸');
-        } else {
-          node.setAttribute('data-inside', '');
+            : '  ▸';
+        }
+        if (node.getAttribute('data-inside') !== inside) {
+          node.setAttribute('data-inside', inside);
         }
       }
     }
@@ -3185,8 +5063,25 @@
       node.classList.add('sp-fold');
       node.addEventListener('click', function (ev) {
         ev.stopPropagation();        /* not a pane gesture (#1272) */
+        /* #1168: "whenever i tap and hold on a segment's header, I want
+           a right click menu". The hold has already answered, so this
+           click is the synthetic one the platform fires after it -
+           swallowing it is what stops a hold also folding the segment
+           away underneath its own menu. The same question the caution
+           button asks of its own hold. */
+        if (node.pineHeld) return;
         segToggle(String(item.seg || item.id || ''));
       });
+      /* #1168: the fifth thing in this file on holdOpen() - half a
+         second, eight pixels of travel cancels it, and the desk's
+         right-click and the WebView's own long-press are both turned
+         into the same answer. Nodes are KEPT and re-dressed across a
+         repaint (#1273), so this is attached once per heading and never
+         stacked up by a poll. */
+      node.setAttribute('aria-haspopup', 'menu');
+      node.title = 'Hold this heading (or right-click it): inspect the'
+        + ' segment, report it, or examine its system prompt';
+      holdOpen(node, function () { segMenuOpen(node); });
     }
     /* A line that has not aired yet is the interesting one - it can still
      * be changed before the room hears it. ONLY 'prepared' is that line;
@@ -3238,6 +5133,275 @@
    * arrival and hands back null once it is stale. Stale has to mean
    * absent: a frozen mark reads as a working one, which is worse than
    * falling back to the clock and is how this fault survived so long. */
+  /* ============================================ THE CUE MAP, PURELY
+   *
+   * Handed the admission payload and one reading, this says which
+   * occurrence and which line the room is in - or says, by name, that it
+   * cannot tell. No DOM, no clock, no fetch, so the cases the audit named
+   * can be held to it in node without a browser.
+   *
+   * The eight answers it can give are the synchronization state. Seven of
+   * them are not "on air", and the view SHOWS each of them rather than
+   * smoothing them into a stationary cursor. */
+  var PineScriptCues = (function () {
+    var SYNC = {
+      READ: 'read',                /* read off the sound and mapped to a cue */
+      GAP: 'read-gap',             /* read, inside the file, between cues */
+      UNMAPPED: 'read-unmapped',   /* read, but nothing admitted this file */
+      OUTSIDE: 'read-outside',     /* read, admitted file, offset off its map */
+      ESTIMATED: 'estimated',      /* a clock, not a playhead */
+      HELD: 'held',                /* no evidence; the last trustworthy mark */
+      PAUSED: 'paused',
+      STALL: 'stalled'             /* read, mapped, and no longer moving */
+    };
+    var TRUSTED = {};
+    TRUSTED[SYNC.READ] = true;
+    TRUSTED[SYNC.GAP] = true;
+
+    function key(url) {
+      var raw = String(url || '').split('?')[0].replace(/\\/g, '/');
+      var parts = raw.split('/');
+      return parts[parts.length - 1] || '';
+    }
+
+    /* NULL IS NOT ZERO, and this is where that matters most.
+     *
+     * `Number(null)` is 0 and `isFinite(0)` is true, so an absent playhead
+     * arrived here as an offset of exactly zero seconds - which lands
+     * inside the first cue of whatever file was named and lights its first
+     * line with no evidence whatever behind it. A cue whose window the
+     * assembler could not supply did the same in reverse: it became the
+     * window 0..0 and sat in the sheet as a line that can never be
+     * reached. Absent means absent. */
+    function num(value) {
+      if (value === null || value === undefined || value === '') return null;
+      var got = Number(value);
+      return isFinite(got) ? got : null;
+    }
+
+    /* The station's payload, turned into something that can be searched by
+       the one thing the player can tell us: the name of the file it is
+       sounding. Occurrences keep their COMMITTED order; nothing here sorts
+       by arrival, by air time or by anything that can be rewritten. */
+    function read(payload) {
+      var out = {ok: false, generation: null, mode: '', enforceOrder: false,
+        reader: null, current: null, order: [], byMedia: {}, count: 0,
+        why: 'the station is not sending an admitted cue map'};
+      if (!payload || typeof payload !== 'object') return out;
+      out.ok = true;
+      out.generation = num(payload.generation);
+      out.mode = String(payload.mode || '');
+      out.enforceOrder = !!payload.enforce_order;
+      out.reader = num(payload.reader_position);
+      var rows = payload.occurrences;
+      if (!rows || !rows.length) {
+        out.why = 'the admitted sequence is empty';
+        return out;
+      }
+      var kept = [];
+      for (var i = 0; i < rows.length; i += 1) {
+        var row = rows[i];
+        if (!row || !row.occurrence_id) continue;
+        var audio = row.audio || {};
+        var occurrence = {
+          occurrence_id: String(row.occurrence_id),
+          position: num(row.position),
+          state: String(row.state || ''),
+          outcome: String(row.outcome || ''),
+          lane: String(row.lane || ''),
+          producer: String(row.producer || ''),
+          origin: String(row.origin || ''),
+          media: key(audio.media || audio.path || ''),
+          sig: String(audio.sig || ''),
+          seconds: num(audio.seconds),
+          hash: String(audio.hash || ''),
+          dispatched_at: num(row.dispatched_at),
+          script_revision: String(row.script_revision || ''),
+          assembly_id: String(row.assembly_id || ''),
+          cue_map_revision: String(row.cue_map_revision || ''),
+          performer_session: String(row.performer_session || ''),
+          take_id: String(row.take_id || ''),
+          cues: []
+        };
+        var cues = row.cues || [];
+        for (var c = 0; c < cues.length; c += 1) {
+          var cue = cues[c];
+          if (!cue) continue;
+          var from = num(cue.start_s), until = num(cue.end_s);
+          if (from === null || until === null) continue;
+          occurrence.cues.push({
+            line_id: String(cue.line_id || cue.occurrence_id || ''),
+            position: num(cue.position),
+            ordinal: num(cue.ordinal),
+            from: from, until: until,
+            speechEnd: num(cue.speech_end_s) === null ? until : num(cue.speech_end_s),
+            who: String(cue.who || ''), name: String(cue.name || ''),
+            kind: String(cue.kind || ''), text: String(cue.text || '')
+          });
+        }
+        kept.push(occurrence);
+      }
+      kept.sort(function (a, b) {
+        return (a.position === null ? 0 : a.position)
+          - (b.position === null ? 0 : b.position);
+      });
+      out.order = kept;
+      out.count = kept.length;
+      for (var k = 0; k < kept.length; k += 1) {
+        var name = kept[k].media;
+        if (!name) continue;
+        if (!out.byMedia[name]) out.byMedia[name] = [];
+        out.byMedia[name].push(kept[k]);
+      }
+      var now = payload.current;
+      if (now && now.occurrence_id) {
+        out.current = {occurrence_id: String(now.occurrence_id),
+          position: num(now.position), media: key(now.media || ''),
+          started_at: num(now.started_at), seconds: num(now.seconds)};
+      }
+      if (!out.why || out.count) out.why = '';
+      return out;
+    }
+
+    /* WHICH ONE OF SEVERAL PLAYS OF THE SAME FILE.
+     *
+     * "A reusable sample's content ID is not its playback occurrence ID.
+     *  Playing the same sting twice produces two distinct occurrences in
+     *  the script."
+     *
+     * So a file name alone does not settle it. The occurrence the
+     * controller says is in flight wins; failing that, the most recently
+     * dispatched; failing that, the first still waiting. Picking the last
+     * in the list unconditionally is exactly the bug that lit an old
+     * burst's line while a new file was playing. */
+    function choose(list, current) {
+      if (!list || !list.length) return null;
+      var i;
+      if (current && current.occurrence_id) {
+        for (i = 0; i < list.length; i += 1) {
+          if (list[i].occurrence_id === current.occurrence_id) return list[i];
+        }
+      }
+      var best = null;
+      for (i = 0; i < list.length; i += 1) {
+        if (list[i].state !== 'dispatching') continue;
+        if (!best || (list[i].position || 0) > (best.position || 0)) best = list[i];
+      }
+      if (best) return best;
+      for (i = list.length - 1; i >= 0; i -= 1) {
+        if (list[i].dispatched_at !== null) return list[i];
+      }
+      return list[0];
+    }
+
+    function blank(sync, why, last) {
+      var out = {sync: sync, why: why, trustworthy: !!TRUSTED[sync],
+        line_id: '', occurrence_id: '', position: null, from: null,
+        until: null, speechEnd: null, index: -1, of: 0, media: '',
+        origin: '', carried: false};
+      if (last && last.line_id) {
+        /* PRESERVE THE LAST TRUSTWORTHY POSITION - and say it is being
+           preserved. A mark with no evidence behind it that looks exactly
+           like a mark with evidence behind it is the fault, not the cure. */
+        out.line_id = last.line_id;
+        out.occurrence_id = last.occurrence_id || '';
+        out.position = last.position === undefined ? null : last.position;
+        out.media = last.media || '';
+        out.origin = last.origin || '';
+        out.carried = true;
+      }
+      return out;
+    }
+
+    /* `look`:
+         file          what the player says it is sounding
+         position_s    its OWN offset into that file, never a wall clock
+         source        'bridge' | 'local' | 'estimated' | 'unavailable'
+         paused        the air is paused
+         stalledMs     how long the read position has been motionless
+         stallLimitMs  beyond which motionless is a fault (default 8000)
+         last          the last trustworthy answer, to carry */
+    function locate(map, look) {
+      look = look || {};
+      var last = look.last || null;
+      if (look.paused) return blank(SYNC.PAUSED, 'the air is paused', last);
+      var source = String(look.source || 'unavailable');
+      var at = num(look.position_s);
+      if (source === 'unavailable' || at === null || at < 0) {
+        return blank(SYNC.HELD, 'no playback evidence is available', last);
+      }
+      if (source === 'estimated') {
+        return blank(SYNC.ESTIMATED,
+          'the position is the station clock, not a playhead', last);
+      }
+      var file = key(look.file);
+      if (!file) {
+        return blank(SYNC.UNMAPPED, 'the player did not name its file', last);
+      }
+      if (!map || !map.ok || !map.count) {
+        return blank(SYNC.UNMAPPED,
+          'no admitted cue map to read ' + file + ' against', last);
+      }
+      var list = map.byMedia[file];
+      if (!list || !list.length) {
+        return blank(SYNC.UNMAPPED,
+          'nothing admitted names ' + file, last);
+      }
+      var occurrence = choose(list, map.current);
+      var got = {sync: SYNC.READ, why: '', trustworthy: true, line_id: '',
+        occurrence_id: occurrence.occurrence_id, position: occurrence.position,
+        from: null, until: null, speechEnd: null, index: -1,
+        of: occurrence.cues.length, media: file, origin: occurrence.origin,
+        carried: false, at: at};
+      for (var i = 0; i < occurrence.cues.length; i += 1) {
+        var cue = occurrence.cues[i];
+        if (at >= cue.from && at < cue.until) {
+          got.line_id = cue.line_id;
+          got.position = cue.position === null ? occurrence.position : cue.position;
+          got.from = cue.from; got.until = cue.until;
+          got.speechEnd = cue.speechEnd;
+          got.index = i;
+          var stall = num(look.stalledMs);
+          var limit = num(look.stallLimitMs);
+          if (limit === null) limit = 8000;
+          if (stall !== null && stall > limit) {
+            got.sync = SYNC.STALL;
+            got.trustworthy = false;
+            got.why = 'the playhead has not moved for '
+              + Math.round(stall / 1000) + 's';
+          }
+          return got;
+        }
+      }
+      var span = occurrence.seconds;
+      if (span !== null && at > span + 1.5) {
+        got.sync = SYNC.OUTSIDE;
+        got.trustworthy = false;
+        got.why = 'the player is past the end of the cue sheet for ' + file;
+        return got;
+      }
+      got.sync = SYNC.GAP;
+      got.why = 'inside ' + file + ', between two committed lines';
+      return got;
+    }
+
+    /* One short sentence for the operator, per state. */
+    function say(got) {
+      if (!got) return '';
+      if (got.sync === SYNC.READ) return 'in step with the sound';
+      if (got.sync === SYNC.GAP) return 'in step - a pause between lines';
+      if (got.sync === SYNC.PAUSED) return 'air paused';
+      if (got.sync === SYNC.STALL) return 'the sound stopped moving';
+      if (got.sync === SYNC.OUTSIDE) return 'the sound is off the cue sheet';
+      if (got.sync === SYNC.UNMAPPED) return 'sounding something unadmitted';
+      if (got.sync === SYNC.ESTIMATED) return 'estimated - no playhead';
+      return 'holding the last known line';
+    }
+
+    return {SYNC: SYNC, read: read, locate: locate, choose: choose,
+            key: key, say: say};
+  }());
+
   function bridgeHead() {
     try { return (root.pinePlayhead && root.pinePlayhead()) || null; }
     catch (e) { return null; }
@@ -3331,9 +5495,85 @@
     return isFinite(v) ? v : Number(row.clip_until);
   }
 
+  /* THE ADMITTED OCCURRENCE, from the player's own file and offset.
+   *
+   * This runs BEFORE every reconstruction below it. Where the station has
+   * committed a cue sheet for the file that is actually sounding, there is
+   * nothing left to infer: the answer is read, not searched for.
+   *
+   * Where it cannot, it returns null and the older roads have their go -
+   * and `syncState` already says which of the eight answers this was, so
+   * a fallback is visible rather than silent. */
+  function admittedRow() {
+    /* NO MAP AT ALL IS NOT A FAULT IN THE SOUND.
+     *
+     * A station that has not been patched to carry `admission` sends
+     * nothing, and treating that as "the player is sounding something
+     * unadmitted" would dash an outline round every line of the script,
+     * all day, for ever. The file already knows what that costs: "A
+     * readout that says the same worried thing all day teaches the
+     * operator to ignore it."
+     *
+     * So this is reported as ESTIMATED - which is exactly what the older
+     * roads below are doing - with the reason said once, and the per-line
+     * mark is left alone. */
+    if (!admitMap || !admitMap.ok || !admitMap.count) {
+      if (syncState !== 'estimated') {
+        syncState = 'estimated';
+        syncSince = Date.now();
+      }
+      syncWhy = (admitMap && admitMap.why)
+        || 'the station is not sending an admitted cue map';
+      return null;
+    }
+    var head = bridgeHead();
+    var player = head ? null : soundingPlayer();
+    var source = head ? 'bridge' : (player ? 'local' : 'unavailable');
+    var at = null, file = '';
+    if (head) { at = Number(head.t); file = String(head.file || ''); }
+    else if (player) {
+      at = Number(player.currentTime);
+      file = String(player.currentSrc || player.src || '');
+    } else if (liveStream && liveStream.at) {
+      source = 'estimated';
+      at = ((Date.now() + skewMs) / 1000) - Number(liveStream.at || 0);
+    }
+    var moved = 0;
+    if (source === 'bridge' || source === 'local') {
+      var now = Date.now();
+      if (headWas < 0 || Math.abs(Number(at) - headWas) > 0.05) {
+        headWas = Number(at); headMovedAt = now;
+      }
+      moved = headMovedAt ? now - headMovedAt : 0;
+    } else { headWas = -1; headMovedAt = 0; }
+    var got = PineScriptCues.locate(admitMap, {
+      file: file, position_s: at, source: source, paused: stationPaused,
+      stalledMs: moved, stallLimitMs: STALL_MS, last: lastGood});
+    if (syncState !== got.sync) { syncState = got.sync; syncSince = Date.now(); }
+    syncWhy = got.why || PineScriptCues.say(got);
+    if (got.trustworthy && got.line_id) {
+      lastGood = {line_id: got.line_id, occurrence_id: got.occurrence_id,
+        position: got.position, media: got.media, origin: got.origin,
+        at: Date.now()};
+    }
+    if (!got.line_id) return null;
+    return {id: got.line_id,
+      from: got.carried ? 0 : Number(got.from || 0),
+      until: got.carried ? 0 : Number(got.until || 0),
+      at: got.carried ? 0 : Number(got.at || 0),
+      index: got.index, of: got.of,
+      occurrence_id: got.occurrence_id, position: got.position,
+      sync: got.sync, carried: !!got.carried, admitted: true};
+  }
+
   function activeRow() {
-    var t = streamAt();
-    var rows = (liveStream && liveStream.rows) || [];
+    /* #1336 / the sequential-playout audit: the ADMITTED map first. Every
+       road below this line reconstructs a position from something that can
+       be rewritten - estimates, feed rows, a four-second poll. The cue
+       sheet the controller committed cannot be. */
+    var admitted = admittedRow();
+    if (admitted) return admitted;
+    var t = streamAt();    var rows = (liveStream && liveStream.rows) || [];
     var file = soundingFile();
     /* #1330: A BURST THAT HAS RUN OUT IS NOT A TABLE TO SEARCH.
      *
@@ -3592,29 +5832,13 @@
        * geometry that had not settled and switched following off. The
        * scroll cancelled itself, which is the very fault the guard
        * exists to prevent. `scrollend` says when it is really over. */
-      selfScrollUntil = Date.now() + 2400;        /* backstop only */
-      /* #1330: ON THE BOX THAT ACTUALLY SCROLLS.
-       *
-       * This said `script`, which is declared in build() and in
-       * planLayout() and in neither case is in scope here. Under 'use
-       * strict' it resolved through named access on the global object to
-       * <section id="script"> - the view HOST, which is overflow:hidden
-       * and never scrolls. So 'scrollend' never fired, selfScrollUntil
-       * never cleared early, and the 2400ms backstop governed every
-       * move: for 2.4s after each highlight the handler below returned
-       * at its first line and the operator's own scroll was discarded,
-       * which is the precise opposite of what the guard is for. */
-      var box = el('spScript');
-      try {
-        if (box && 'onscrollend' in box) {
-          box.addEventListener('scrollend', function done() {
-            box.removeEventListener('scrollend', done);
-            selfScrollUntil = 0;
-          }, {once: true});
-        }
-      } catch (err) { /* the backstop still covers it */ }
-      try { node.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
-      catch (err) { node.scrollIntoView(false); }
+      /* #1330 lives in moveScript() now, with the other three movers of
+         this pane: the backstop, the `scrollend` early clear and the box
+         that actually scrolls are declared in ONE place. */
+      moveScript('follow', function () {
+        try { node.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+        catch (err) { node.scrollIntoView(false); }
+      });
     }
   }
 
@@ -3635,6 +5859,13 @@
   function status() {
     var row = activeRow();
     if (stationPaused) return {state: 'paused', text: 'air paused — nothing is going out'};
+
+    /* A CARRIED MARK IS NOT "ON AIR". It is the last line this view could
+       prove, held up while the evidence is missing, and saying "4.2s left"
+       over it would be inventing a countdown for audio nobody can see. */
+    if (row && row.carried) {
+      return {state: 'wait', text: 'holding the last read line — ' + syncWhy};
+    }
 
     if (row && row.until > row.from) {
       var left = row.until - row.at;
@@ -3694,6 +5925,44 @@
     return {state: 'idle', text: rest};
   }
 
+  /* WHAT THE MARK IS STANDING ON, in two words and a reason.
+   *
+   * The audit's warning, kept literally: "Preserve the last trustworthy
+   * position when playback evidence is unavailable and expose the
+   * synchronization state. Merely preventing a backward visual movement
+   * would hide an audio fault." So a carried mark is drawn differently
+   * from a live one and says how old it is. */
+  function paintSync(row) {
+    var node = el('spSync');
+    if (!node) return;
+    var carried = !!(row && row.carried);
+    var state = String(syncState || 'held');
+    var name = PineScriptCues.say({sync: state});
+    var why = String(syncWhy || '');
+    if (carried && lastGood && lastGood.at) {
+      var age = Math.max(0, Math.round((Date.now() - lastGood.at) / 1000));
+      why = (why ? why + ' - ' : '') + 'holding the last read line for ' + age + 's';
+    }
+    if (admitMap && admitMap.ok && !admitMap.count && state !== 'paused') {
+      why = why || admitMap.why;
+    }
+    if (node.dataset.sync !== state) node.dataset.sync = state;
+    node.classList.toggle('sp-sync-carried', carried);
+    /* AND ON THE MARK ITSELF. A highlight held up without evidence must
+       not be drawn identically to one the sound is standing behind - that
+       is precisely the "hide an audio fault" the audit refuses. */
+    try {
+      var mapped = !!(admitMap && admitMap.ok && admitMap.count);
+      if (host) {
+        host.classList.toggle('sp-unsynced',
+          mapped && !(state === 'read' || state === 'read-gap'));
+      }
+    } catch (err) { /* the strip still says it */ }
+    var b = node.firstChild, i = node.lastChild;
+    if (b && b.__text !== name) { b.__text = name; b.textContent = name; }
+    if (i && i.__text !== why) { i.__text = why; i.textContent = why; }
+  }
+
   function paintStatus() {
     var line = el('spNow');
     if (!line) return;
@@ -3732,16 +6001,41 @@
       node.removeAttribute('data-left');
       return;
     }
+    /* #1428: and the same here - 52 writes of data-left in eight
+       seconds, 10 of them a change. The countdown moves once a second;
+       tick does not. --sp-run was a percentage to ONE DECIMAL, so it
+       differed on paper every tick even when the bar could not move a
+       pixel; whole percent is finer than it can render. */
     var run = Math.max(0, Math.min(1, gone / span));
-    node.style.setProperty('--sp-run', (run * 100).toFixed(1) + '%');
+    var runPct = Math.round(run * 100) + '%';
+    if (node.style.getPropertyValue('--sp-run') !== runPct) {
+      node.style.setProperty('--sp-run', runPct);
+    }
     var left = Math.max(0, Math.round(span - gone));
-    node.setAttribute('data-left', left >= 60
+    var leftText = left >= 60
       ? (Math.floor(left / 60) + ':' + ('0' + (left % 60)).slice(-2))
-      : (left + 's'));
+      : (left + 's');
+    if (node.getAttribute('data-left') !== leftText) {
+      node.setAttribute('data-left', leftText);
+    }
   }
 
   function tick() {
     var row = activeRow();
+    /* The bounded ring of what the mark did and why - the incident report
+       carries it, so a backward movement can be told apart from a document
+       reflow and from a gap in the evidence. */
+    var seen = syncRing[syncRing.length - 1];
+    var mine = {at: Date.now(), sync: syncState,
+      line: row ? String(row.id || '') : '',
+      occurrence: row ? String(row.occurrence_id || '') : '',
+      position: row && row.position !== undefined ? row.position : null,
+      carried: !!(row && row.carried)};
+    if (!seen || seen.sync !== mine.sync || seen.line !== mine.line
+        || seen.occurrence !== mine.occurrence) {
+      syncRing.push(mine);
+      if (syncRing.length > SYNC_RING_MAX) syncRing.shift();
+    }
     markNow(row ? row.id : '');
     markRun(row);                                            /* #1295 */
     paintSaying(row);                                        /* #1298 */
@@ -3758,6 +6052,7 @@
       host.classList.toggle('sp-quiet', !soundingPlayer() && !(row && row.id));
     } catch (err) { /* the mark still stands on its own */ }
     paintStatus();
+    paintSync(row);
   }
 
   /* #1303b: the row the sampler's own sourceFor() expects. A clip line
@@ -3813,7 +6108,9 @@
     if (!id) return;
     var node = document.querySelector('.sp-el[data-line="' + id + '"]');
     if (!node) return;
-    node.scrollIntoView({block: 'center'});
+    moveScript('jump', function () {
+      node.scrollIntoView({block: 'center'});
+    });
     node.classList.add('flash');
     setTimeout(function () { node.classList.remove('flash'); }, 1200);
   }
@@ -3955,9 +6252,35 @@
 
     var right = make('div', 'sp-right');     /* 7 */
     var head = make('div', 'sp-scripthead');
+    head.id = 'spScriptName';
     head.appendChild(make('b', '', 'The script'));
     head.appendChild(make('i', 'sp-scriptwhy', ''));
     head.lastChild.id = 'spScriptHead';
+    /* #1164: "I want to be able to tap and hold on the name of the
+       script as being run for that particular session and I want a
+       drop-down menu that comes down". The same holdOpen() the SFX
+       button, the caution button and the report icon are already on -
+       one hold gesture in this file, not four of them drifting apart.
+       A short tap never opens it; a short tap while it IS open puts it
+       away, which is the toggle a menu on a name ought to have. */
+    head.setAttribute('role', 'button');
+    head.setAttribute('tabindex', '0');
+    head.setAttribute('aria-haspopup', 'menu');
+    head.setAttribute('aria-expanded', 'false');
+    head.title = 'Hold this name (or right-click it): complain, mark an issue, report a missing segment';
+    holdOpen(head, function () { headerOpen(head); });
+    head.addEventListener('click', function () {
+      if (head.pineHeld) return;              /* the hold has just answered */
+      if (el(HEADER_MENU_ID)) headerClose();
+    });
+    /* At the desk there is a keyboard, and a role="button" that cannot
+       be worked from it is a button in name only. */
+    head.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+      ev.preventDefault();
+      if (el(HEADER_MENU_ID)) headerClose();
+      else headerOpen(head);
+    });
     right.appendChild(head);
     /* One line, console-shaped, directly under the heading: what is
        happening with the line that is being said. */
@@ -3965,6 +6288,14 @@
     now.id = 'spNow';
     now.dataset.state = 'idle';
     right.appendChild(now);
+    /* THE SYNCHRONIZATION STATE, said out loud.
+       A held mark and a live mark must not look the same. */
+    var sync = make('div', 'sp-sync');
+    sync.id = 'spSync';
+    sync.dataset.sync = 'held';
+    sync.appendChild(make('b', 'sp-sync-name', ''));
+    sync.appendChild(make('i', 'sp-sync-why', ''));
+    right.appendChild(sync);
 
     var script = make('div', 'sp-script');
     script.id = 'spScript';
@@ -4208,6 +6539,12 @@
           flow.talk_next_in = state.talk_next_in;
         }
         stationPaused = !!state.paused;
+        /* #1336: THE COMMITTED SEQUENCE. `admission` is the playout
+           controller's own record of what it admitted, in the order it
+           admitted it. Absent on a station that has not been patched yet,
+           in which case admitMap.ok stays false and every road below
+           falls back exactly as before. */
+        admitMap = PineScriptCues.read(state.admission);
         /* Cancel the clock difference between this tablet and the station
            rather than assuming they agree; four seconds of drift would
            point the highlight at the wrong line. */
@@ -4234,11 +6571,37 @@
 
   root.PineScriptPage = {
     mount: mount,
+    /* The cue-map arithmetic, exported for
+       tests/test_script_admission_view_2026_09_15.cjs. It is pure, so the
+       test holds the real code rather than a copy of it. */
+    cues: PineScriptCues,
+    /* #1168: the segment menu's own roads, exported the same way and
+       for the same reason - a stub-DOM smoke test can then hold the
+       REAL hold, the real three windows and the real sidebar rather
+       than a copy of them that drifts. */
+    segments: {
+      identity: segIdentity,
+      open: segMenuOpen,
+      close: segMenuClose,
+      inspect: segInspectOpen,
+      report: segReportOpen,
+      prompt: segPromptOpen,
+      reason: segReportReason,
+      steps: segFlowSteps,
+      flow: segFlowPaint,
+      seat: segSeatLook,
+      block: scriptBlock
+    },
     isMounted: function () { return mounted; },
     close: function () {
       folderClose();                                  /* 2026-09-14 */
       reasonClose();
       inboxClose();
+      headerClose();                                  /* #1164 */
+      segMenuClose();                                 /* #1168 */
+      segInspectClose();
+      segReportClose();
+      segPromptClose();
       if (stop) stop();
       stop = null;
       if (beat) clearInterval(beat);

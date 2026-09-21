@@ -147,6 +147,8 @@
     /* #1426: the native endless-video surface. A build without it
        answers {on:false} and the page keeps its own <video>. */
     videoWall: promised("videoWall"),
+    /* #1427: the rolling screen recorder's switch. */
+    replayRun: promised("replayRun"),
 
     /* --- backend lifecycle: no-ops by design -------------------------
      * The station is not on the tablet. It runs on the box at
