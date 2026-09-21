@@ -173,8 +173,11 @@ class AdmitLineTests(unittest.TestCase):
             "_admission_module": ba,
             "admission_controller": lambda: self.controller,
             "_admission_producer": lambda depth=2: "a_test",
+            # app.py's own, in the part that matters here: a reply is the
+            # reply lane, which the controller exempts.
             "_admission_lane": lambda path, kind="", reply=False: (
-                "sfx" if "/sfx/" in str(path) else "speech"),
+                "reply" if (reply or str(kind) == "reply")
+                else "sfx" if "/sfx/" in str(path) else "speech"),
             "_admission_resolve": lambda path: self._resolve(path),
             "pipeline_log": lambda *a, **k: self.logs.append(a),
         }
@@ -265,6 +268,35 @@ class AdmitLineTests(unittest.TestCase):
     def test_no_clip_at_all_is_not_an_error(self):
         self.assertEqual(self.admit(None, who="dj", text="x"), "")
         self.assertEqual(self.admit({}, who="dj", text="x"), "")
+
+    def test_a_reply_is_never_committed(self):
+        """AN ASSISTANT ANSWERING YOU IS NOT BROADCAST.
+
+        #647 draws that boundary and `gate` keeps it there: the reply lane
+        returns `exempt` without ever beginning or finishing the occurrence.
+        So a reply committed here is a commitment nothing can consume - it
+        stands `admitted` for ever, and with ordering enforced it stands in
+        front of every line behind it.
+
+        Measured on the live station within three minutes of the first
+        deploy of this patch: one reply at position 37949, and every single
+        dispatch after it refused as out_of_order."""
+        clip = self.a_clip()
+        self.assertEqual(
+            self.admit(clip, who="dj", kind="reply", text="Yes, that one.",
+                       line_id="row-1"), "")
+        self.assertEqual(self.controller.stats()["occurrences"], 0)
+
+    def test_the_gate_would_have_exempted_it_too(self):
+        """The two answers have to agree, or the census is a fiction."""
+        clip = self.a_clip()
+        self.admit(clip, who="dj", kind="reply", text="Yes.", line_id="r")
+        verdict = self.controller.gate(lane="reply", path=clip["path"],
+                                       sig=clip["sig"], producer="p",
+                                       reply=True)
+        self.assertTrue(verdict.allow)
+        self.assertEqual(verdict.reason, "exempt")
+        self.assertFalse(verdict.would_refuse)
 
     def test_a_controller_that_is_off_changes_nothing(self):
         self.space["admission_controller"] = lambda: None

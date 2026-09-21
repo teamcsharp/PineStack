@@ -24251,6 +24251,19 @@ def admission_admit_line(clip: Any, *, who: str = "", kind: str = "",
         path = str((clip or {}).get("path") or "")
         if not path:
             return ""
+        # WHAT THE GATE EXEMPTS, THIS DOES NOT COMMIT.
+        #
+        # An assistant ANSWERING YOU is not broadcast - #647 draws that
+        # boundary and `gate` keeps it there by returning `exempt` for the
+        # reply lane without ever beginning or finishing the occurrence. So
+        # a reply committed here is a commitment nothing can ever consume:
+        # it stands ADMITTED for ever and, with ordering enforced, in front
+        # of every line behind it. Measured within three minutes of the
+        # first deploy: one reply at position 37949, and every dispatch
+        # after it refused as out_of_order.
+        lane = _admission_lane(path, kind)
+        if lane in getattr(controller, "exempt_lanes", ()):
+            return ""
         seconds = float(length or 0.0)
         if seconds <= 0:
             seconds = float((clip or {}).get("seconds") or 0.0)
@@ -24268,7 +24281,7 @@ def admission_admit_line(clip: Any, *, who: str = "", kind: str = "",
             path=path, sig=str((clip or {}).get("sig") or ""),
             rows=cues, length=max(0.05, seconds),
             producer=producer or _admission_producer(2),
-            lane=_admission_lane(path, kind),
+            lane=lane,
             label=str((clip or {}).get("label") or "")[:120])
         record = controller.admit(candidate)
         return str(record.get("occurrence_id") or "")
@@ -92623,6 +92636,17 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             _ready_round_ack(ready_meta)
                 # #760: the burst is done, not the round. Returning here
                 # is what made the whole conversation one clip.
+                # #1341: AND THE COMMITMENT COMES BACK ON A LIVE ROUND TOO.
+                # The withdrawal below is limited to prepared rounds on
+                # purpose - that is a rule about the FEED - but the gate
+                # does not care which kind it was. Measured: one live burst
+                # of 20 lines stood admitted for thirteen minutes with all
+                # twenty of its feed rows still reading `prepared`, and
+                # every out-of-order refusal in that window named it.
+                if not (page_delivery or (to_box and played_ok)):
+                    admission_withdraw(
+                        _round_occurrence,
+                        "neither the page nor the box took the clip")
                 if ready_takes is not None and not (page_delivery or (to_box and played_ok)):
                     _burst_withdraw(_entries, "neither the page nor the box took the clip")   # 2026-09-14
                     _sfx_cadence_release(_sfx_meta.values())

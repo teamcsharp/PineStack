@@ -217,6 +217,19 @@ ADMIT_LINE_NEW = '''def admission_admit_line(clip: Any, *, who: str = "", kind: 
         path = str((clip or {}).get("path") or "")
         if not path:
             return ""
+        # WHAT THE GATE EXEMPTS, THIS DOES NOT COMMIT.
+        #
+        # An assistant ANSWERING YOU is not broadcast - #647 draws that
+        # boundary and `gate` keeps it there by returning `exempt` for the
+        # reply lane without ever beginning or finishing the occurrence. So
+        # a reply committed here is a commitment nothing can ever consume:
+        # it stands ADMITTED for ever and, with ordering enforced, in front
+        # of every line behind it. Measured within three minutes of the
+        # first deploy: one reply at position 37949, and every dispatch
+        # after it refused as out_of_order.
+        lane = _admission_lane(path, kind)
+        if lane in getattr(controller, "exempt_lanes", ()):
+            return ""
         seconds = float(length or 0.0)
         if seconds <= 0:
             seconds = float((clip or {}).get("seconds") or 0.0)
@@ -234,7 +247,7 @@ ADMIT_LINE_NEW = '''def admission_admit_line(clip: Any, *, who: str = "", kind: 
             path=path, sig=str((clip or {}).get("sig") or ""),
             rows=cues, length=max(0.05, seconds),
             producer=producer or _admission_producer(2),
-            lane=_admission_lane(path, kind),
+            lane=lane,
             label=str((clip or {}).get("label") or "")[:120])
         record = controller.admit(candidate)
         return str(record.get("occurrence_id") or "")

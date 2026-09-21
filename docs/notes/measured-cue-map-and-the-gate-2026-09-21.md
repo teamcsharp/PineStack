@@ -223,27 +223,106 @@ Every app.py change is an idempotent, anchored, revertible patch under
 `tools/`, compiled before it is written. The station was paused for the
 whole deployment, which is why four restarts cost no air.
 
-## The last step, and it is one word
+## 5. Two more, which only enforcing found
 
-The gate is still `observe`. Everything that was in its way is out of it:
-the audio can be named, every producer commits first, and nothing is
-standing in the order. What remains is the procedure in
-[the admission note](admission-and-playout-2026-09-15.md#observe--enforce),
-which is a one-word write and no restart:
+The station was taken off pause and the SFX lane enforced with somebody
+watching. Two commitments that nothing could ever consume showed up within
+minutes of each other, and both were mine.
 
-```sh
-echo 'enforce sfx' > <data>/broadcast_admission/mode    # one lane
-echo 'enforce sfx,speech' > ...                         # widen
-echo 'enforce sfx,speech order' > ...                   # then the ordering rule
-echo observe > ...                                      # and back, any time
+**A reply is not broadcast, so it must not be committed.** #647 draws that
+boundary and `gate` keeps it there: the reply lane returns `exempt` without
+ever beginning or finishing the occurrence. `admission_admit_line` was
+committing every line `_dj_speak_floorless` produced, replies included — so
+a reply stood `admitted` for ever. Three minutes after the first deploy:
+one reply at position 37949, and every single dispatch after it refused as
+`out_of_order`. The helper now refuses any lane the controller exempts, and
+the census and the gate agree again, which is the whole point of a census.
+
+**A LIVE burst that neither road carried gave nothing back.** The end of
+each burst reads:
+
+```python
+if ready_takes is not None and not (page_delivery or (to_box and played_ok)):
+    _burst_withdraw(_entries, "neither the page nor the box took the clip")
 ```
 
-**It should be turned on while somebody is watching the air**, and the
-station has been paused since before this work started — so it is left in
-`observe`, armed, with the census as the evidence that each step is safe.
-Read `/api/admission` after each word: `counts` should show
-`refusal:unadmitted` and `admission_refused` flat, and nothing in `states`
-standing `admitted` behind the reader.
+The `ready_takes is not None` is deliberate and it is a rule about the
+FEED — a live round's rows are handled elsewhere. The gate does not care
+which kind of round it was. Measured ten minutes into enforcement: one live
+burst, 20 lines, 137 s of audio, all twenty of its feed rows still reading
+`prepared`, standing `admitted` for thirteen minutes — and all 24
+out-of-order refusals in that window named it. #1341 takes the commitment
+back regardless of the kind, and changes nothing about the feed.
+
+Both are the same shape as #1340 and both were invisible in observe mode,
+because in observe mode a commitment nothing consumes costs nothing. That
+is the argument for enforcing a lane rather than reading the census: the
+census counts refusals, and only enforcement makes a stuck commitment
+expensive enough to find.
+
+## Where it stands
+
+```text
+mode: enforce   lanes: ['sfx']   order: False
+```
+
+The SFX lane has been enforced on a live, on-air station since this was
+written. A sting through it, end to end, with nothing between the operator's
+thumb and the picture:
+
+```text
+admitted pos 38031 sfx origin=producer dj_sfx_play
+dispatched
+delivery accepted
+```
+
+and the audio it names is exact — `sha256-full`, 233,774 bytes, 5.3 s: the
+levelled copy, which is the file the box is handed.
+
+Across the watched windows: every admission `origin: producer`, every
+delivery `accepted`, and **no enforced refusal of any kind**.
+
+### What is NOT ready, and why
+
+**`order`.** Do not add it yet. The burst road commits a whole round and
+then the paced page road (#1146) waits for the air it has already sold to
+play out before it appends, so a committed round can legitimately sit
+unaired for as long as the feed is sold ahead — and with ordering enforced,
+every line that airs during that wait is refused. That is a design
+decision, not an omission: either the commitment moves below the pacing
+wait, or the reader learns that a round waiting on its own slot is not a
+blocker. Neither is a one-word change, and the evidence for choosing
+between them is not in yet.
+
+**The speech lane.** Everything that produces speech now commits first and
+the watched windows are clean, so `enforce sfx,speech` is the next word —
+but it is the whole of the show's audio, and the two faults above say that
+this class of bug only shows itself under enforcement. Add it while
+somebody is watching, and read the census afterwards.
+
+**An exception between the admit and the transports** still leaves an
+occurrence standing until the next restart, where
+`broadcast_admission.resume` withdraws it with `STRANDED_WHY`. Wrapping the
+whole delivery of the busiest function in the file in a try/finally is a
+bigger change than the evidence justifies today.
+
+## Turning it up, or off
+
+The mode file is re-read within three seconds; no restart, ever. It lives
+inside the container and is owned by root, so it is written through it:
+
+```sh
+docker exec spark-agent sh -c "echo enforce sfx > /app/data/broadcast_admission/mode"
+docker exec spark-agent sh -c "echo enforce sfx,speech > /app/data/broadcast_admission/mode"
+docker exec spark-agent sh -c "echo observe > /app/data/broadcast_admission/mode"   # back out
+```
+
+Read `/api/admission` after each word. What "good" looks like: every
+`admitted` row carrying `origin: producer`, `counts` showing
+`refusal:unadmitted` and `admission_refused` flat, no enforced refusal, and
+nothing in `states` standing `admitted` for longer than a round takes to
+air. A single stuck `admitted` row is the tell for every fault in this
+note, and `/api/admission` prints its producer.
 
 Related: [Recording speakers and assembling
 conversations](speaker-recording-and-script-assembly.md), [The admission

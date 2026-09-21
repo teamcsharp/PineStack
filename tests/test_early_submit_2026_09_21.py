@@ -85,6 +85,23 @@ class EarlySubmitTests(unittest.TestCase):
                 body = body_of(self.text, PRODUCERS[producer])
                 self.assertIn("admission_withdraw(", body)
 
+    def test_a_live_burst_nobody_carried_gives_its_commitment_back(self):
+        """#1341. The feed's own withdrawal is limited to PREPARED rounds
+        on purpose; the gate does not care which kind it was. Measured: one
+        live burst of 20 lines stood admitted for thirteen minutes with all
+        twenty feed rows still reading `prepared`, and every out-of-order
+        refusal in that window named it."""
+        burst = body_of(self.text, "async def _speak_turns_floorless(")
+        guarded = ("if ready_takes is not None and not (page_delivery or "
+                   "(to_box and played_ok)):")
+        plain = "if not (page_delivery or (to_box and played_ok)):"
+        self.assertIn(guarded, burst)
+        self.assertIn(plain, burst)
+        # the ungated one has to come FIRST, or it is the same rule twice
+        self.assertLess(burst.index(plain), burst.index(guarded))
+        after = burst[burst.index(plain):burst.index(guarded)]
+        self.assertIn("admission_withdraw(", after)
+
     def test_a_refused_burst_is_withdrawn_from_the_committed_sequence(self):
         """#1340. The burst road commits the whole round and then has five
         separate ways to refuse it at hand-over; 674 occurrences stood
