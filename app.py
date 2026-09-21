@@ -168384,7 +168384,20 @@ if (PINE_TABLET) {
     "  box-shadow: none !important; }",
     /* #1413h: and the profile ticker, a 1,733 px wide layer scrolling
        for ever behind everything else. */
-    "#phProfile { animation: none !important; }"
+    "#phProfile { animation: none !important; }",
+    /* #1430: THE SCRIPT IT CANNOT SEE IS NOT LAID OUT.
+       1,946 .sp-el, 492 rows of plan and 283 of feed, of which a couple
+       of dozen are on screen. content-visibility skips style, layout and
+       paint for the rest and does the work as they come near - which is
+       virtualisation that the reconciler, the re-seating in #1279, the
+       settled test in #1287 and the segment folds in #1300 never have to
+       hear about, because every row is still in the DOM.
+       `contain-intrinsic-size: auto` makes Chromium remember each row's
+       real height once it has been rendered, so scrolling does not lurch
+       and a jump to the live line still lands on it; the number is only
+       for a row that has never been seen. */
+    "#spScript .sp-el, #spPlan > *, #spFeed > * {",
+    "  content-visibility: auto; contain-intrinsic-size: auto 28px; }"
   ].join(" ");   /* a space: this script lives in a Python string, where 
  is a newline */
   (document.head || document.documentElement).appendChild(paceStyle);
