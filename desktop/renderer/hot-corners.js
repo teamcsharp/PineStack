@@ -1899,6 +1899,19 @@
     return entry;
   }
 
+  /* [#1225] The phases ScreenReplay.audioStatus reports, in the words
+   * the operator used. `not started` is the one that means something is
+   * wrong; every other value means the background capture is alive. */
+  var PINE_AUDIO_PHASE = {
+    ready: 'running',
+    filling: 'running, still filling',
+    starting: 'starting',
+    silent: 'running, but hearing silence',
+    not_started: 'NOT STARTED',
+    stopped: 'stopped',
+    no_replay: 'no replay on this surface',
+    '': 'unknown'
+  };
   function exportSheet() {
     if (captureBusy) { toast('Preparing the captured video\u2026'); return; }
     var canEdit = has('replayEdit');
@@ -1956,9 +1969,20 @@
     if (has('replayState')) {
       Promise.resolve(bridge().replayState()).then(function (got) {
         var audio = got && got.audio;
+        /* [#1225] IS THE TABLET CAPTURING, FIRST. This printed
+         * `audio.state`, which is the state of the last SAVE, not of the
+         * capture - so a tablet that had not captured a sample all day
+         * read "unavailable" exactly like one that had captured
+         * perfectly and simply had not been asked for a clip yet. The
+         * capture now runs as a background service whether or not the
+         * screen is lit, and its phase is one word. */
+        var phaseKey = String((got && got.capture_phase) || (audio && audio.capture_phase) || '');
         if (canEdit) audioNote.textContent = audio ?
-          'Audio: ' + String(audio.state || 'unknown').replace(/_/g, ' ') +
-          (audio.detail ? ' - ' + audio.detail : '') : 'Captured audio status is unavailable.';
+          'Audio capture: ' + (PINE_AUDIO_PHASE[phaseKey] || 'unknown')
+          + (Number(got && got.audio_seconds) > 0
+            ? ' (' + Math.round(Number(got.audio_seconds)) + ' s held)' : '')
+          + (audio.detail ? ' - ' + audio.detail : '')
+          : 'Captured audio status is unavailable.';
         var held = Number(got && got.seconds) || 0;
         table = stepTable(held);
         var last = -1;
