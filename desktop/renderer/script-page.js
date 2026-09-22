@@ -6009,6 +6009,8 @@
       + '<div id="spWho" class="sp-who"></div>'
       + '<canvas id="spSpectrum" class="sp-spectrum"></canvas>'
       + '<canvas id="spVoice" class="sp-voicemeter"></canvas>'
+      /* [#1198] the readout that only exists while a level is moving */
+      + '<div id="spLevelPill" class="sp-levelpill" aria-live="polite"></div>'
       + '<div class="sp-seekrow">'
       + '<i id="spAt" class="sp-time"></i>'
       + '<input id="spSeek" class="sp-seek" type="range" min="0" max="1000" value="0">'
@@ -6021,6 +6023,218 @@
       + '<button id="spNext" class="sp-tbtn" title="Skip to the next track" aria-label="Skip to the next track">⏭</button>'
       + '</div>';
     return box;
+  }
+
+  /* ---- #1198: THE METERS ARE THE LEVEL CONTROLS -------------------
+   *
+   * "I want to swipe my fingers on these spectra grams in order to set the
+   *  volume. So if I swipe to the left it goes down and if I swipe to the
+   *  right it goes up."
+   *
+   * The green bar is the music player, the amber one is the louder DJ voice,
+   * and those are two of the four kinds on the level bus (audio-law.js,
+   * #1192): 'music' and 'voice'. So the bar the operator is already looking
+   * at to read a level becomes the thing that sets it.
+   *
+   * RELATIVE, NOT ABSOLUTE, and the reason is the page it lives on. An
+   * absolute control means "the value is wherever your finger is", so the
+   * first frame of any contact snaps the level to that x - and this card sits
+   * in a column the operator scrolls with his thumb, an inch below a mixer
+   * dot he taps. A finger that grazes the bar on the way past would slam the
+   * music to 12% before the direction lock had anything to look at. Relative
+   * costs nothing: the level starts where it was, moves by how far the finger
+   * travelled, and a gesture that turns out not to be a level drag leaves the
+   * level exactly as it found it. It also keeps the ceiling honest - these
+   * two kinds reach 1.5, so an absolute map would put unity at two thirds of
+   * the way along a bar with no marks on it.
+   *
+   * THE SCALE: one full width of the bar = the full range (0 to the kind's
+   * ceiling). On the tablet's card that is about 340 px, so ~0.4% of level
+   * per pixel - fine enough to land on a number, coarse enough to cross the
+   * whole range in one swipe.
+   *
+   * INERTIA-FREE: the value is a pure function of the pointer's total dx from
+   * where it went down. Nothing continues after release, nothing smooths.
+   *
+   * IT MUST NOT FIRE WHILE THE PAGE IS BEING SCROLLED, and the lock is cut in
+   * two places on purpose:
+   *   - `touch-action: pan-y` on both canvases (script-page.css) lets the
+   *     compositor keep vertical panning. Once it claims the gesture we get a
+   *     pointercancel and stand down; we never see the moves at all.
+   *   - the script locks direction itself, because touch-action does nothing
+   *     for a mouse: no move counts until the pointer has travelled 8 px, and
+   *     at that moment |dx| <= |dy| means a scroll and this pointer is
+   *     abandoned for good.
+   *
+   * IT MUST NOT FIGHT A TAP: under 8 px of travel nothing is armed, nothing
+   * is captured, nothing is preventDefault'ed and no click is swallowed. A
+   * tap on these bars still means whatever a tap on them meant.
+   *
+   * Arrow keys move it by 2% of the range, because a desk with a keyboard
+   * should not need a mouse, and the canvases carry role="slider" with a live
+   * aria-valuenow so a reader can say what the level is.
+   */
+  var LEVEL_DRAG_SLOP = 8;           /* px before a gesture has a direction */
+  var LEVEL_NAMES = {music: 'MUSIC', voice: 'DJ VOICES'};
+  var levelPillTimer = 0;
+
+  function levelBus() {
+    return (root.pineLevels && typeof root.pineLevels.apply === 'function')
+      ? root.pineLevels : null;
+  }
+
+  function levelCeil(kind) {
+    var bus = levelBus();
+    var c = bus && bus.CEIL ? bus.CEIL[kind] : null;
+    return typeof c === 'number' && c > 0 ? c : 1.5;
+  }
+
+  function levelNow(kind) {
+    var bus = levelBus();
+    if (!bus) return null;
+    var m = null;
+    try { m = bus.get() || {}; } catch (err) { return null; }
+    return typeof m[kind] === 'number' ? m[kind] : 1;
+  }
+
+  function levelSay(kind, value) {
+    return (LEVEL_NAMES[kind] || kind).toUpperCase() + ' '
+      + Math.round(value * 100) + '%';
+  }
+
+  function levelPill(text, hold) {
+    var pill = el('spLevelPill');
+    if (!pill) return;
+    pill.textContent = text;
+    pill.classList.add('on');
+    if (levelPillTimer) { clearTimeout(levelPillTimer); levelPillTimer = 0; }
+    if (hold) return;
+    levelPillTimer = setTimeout(function () {
+      levelPillTimer = 0;
+      var p = el('spLevelPill');
+      if (p) p.classList.remove('on');
+    }, 900);
+  }
+
+  /* The hairline that says WHERE on the bar the level currently sits - drawn
+   * after PineMeters.draw, in the dpr transform it leaves behind. Without it
+   * the control is invisible and the operator is dragging in the dark. */
+  function levelMark(canvas, kind) {
+    if (!canvas) return;
+    var v = levelNow(kind);
+    if (v === null) return;
+    var w = canvas.clientWidth || 0;
+    var h = canvas.clientHeight || 0;
+    if (!w || !h) return;
+    var g = canvas.getContext('2d');
+    if (!g) return;
+    var dpr = Math.min(2, root.devicePixelRatio || 1);
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var x = Math.max(0.5, Math.min(w - 0.5, (v / levelCeil(kind)) * w));
+    g.globalAlpha = canvas.dataset.levelDragging ? 0.95 : 0.4;
+    g.fillStyle = '#e8f0ff';
+    g.fillRect(x - 0.5, 0, 1, h);
+    g.globalAlpha = 1;
+  }
+
+  function levelDrag(canvas, kind) {
+    if (!canvas || canvas.dataset.levelWired) return;
+    canvas.dataset.levelWired = '1';
+    canvas.setAttribute('role', 'slider');
+    canvas.setAttribute('tabindex', '0');
+    canvas.setAttribute('aria-label',
+      (kind === 'music' ? 'Music level' : 'DJ voices level')
+      + ' — swipe right to raise, left to lower');
+    canvas.setAttribute('aria-valuemin', '0');
+    canvas.setAttribute('aria-valuemax',
+      String(Math.round(levelCeil(kind) * 100)));
+
+    var aria = function () {
+      var v = levelNow(kind);
+      if (v === null) return;
+      canvas.setAttribute('aria-valuenow', String(Math.round(v * 100)));
+      canvas.setAttribute('aria-valuetext', Math.round(v * 100) + '%');
+    };
+    aria();
+
+    var id = -1;
+    var x0 = 0;
+    var y0 = 0;
+    var from = 1;
+    var armed = false;
+    var decided = false;
+
+    var stand = function () {
+      id = -1; armed = false; decided = false;
+      if (canvas.dataset.levelDragging) delete canvas.dataset.levelDragging;
+    };
+
+    canvas.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== undefined && ev.button !== 0) return;
+      var v = levelNow(kind);
+      if (v === null) return;              /* no bus here: stay inert */
+      id = ev.pointerId; x0 = ev.clientX; y0 = ev.clientY;
+      from = v; armed = false; decided = false;
+    });
+
+    canvas.addEventListener('pointermove', function (ev) {
+      if (ev.pointerId !== id) return;
+      var dx = ev.clientX - x0;
+      var dy = ev.clientY - y0;
+      if (!decided) {
+        if (Math.abs(dx) < LEVEL_DRAG_SLOP && Math.abs(dy) < LEVEL_DRAG_SLOP) return;
+        decided = true;
+        if (Math.abs(dx) <= Math.abs(dy)) { stand(); return; }   /* a scroll */
+        armed = true;
+        canvas.dataset.levelDragging = '1';
+        try { canvas.setPointerCapture(ev.pointerId); } catch (err) { /* mouse */ }
+      }
+      if (!armed) return;
+      if (ev.cancelable) ev.preventDefault();
+      var bus = levelBus();
+      if (!bus) return;
+      var span = canvas.clientWidth || 1;
+      var ceil = levelCeil(kind);
+      var want = Math.max(0, Math.min(ceil, from + (dx / span) * ceil));
+      bus.apply(kind, want);
+      levelPill(levelSay(kind, want), true);
+      aria();
+    });
+
+    var done = function (ev) {
+      if (id !== -1 && ev.pointerId !== id) return;
+      if (armed) {
+        try { canvas.releasePointerCapture(ev.pointerId); } catch (err) { /* gone */ }
+        var v = levelNow(kind);
+        levelPill(levelSay(kind, v === null ? 0 : v), false);
+      }
+      stand();
+      aria();
+    };
+    ['pointerup', 'pointercancel'].forEach(function (name) {
+      canvas.addEventListener(name, done);
+    });
+
+    canvas.addEventListener('keydown', function (ev) {
+      var step = ev.key === 'ArrowLeft' ? -0.02
+        : ev.key === 'ArrowRight' ? 0.02 : 0;
+      if (!step) return;
+      var bus = levelBus();
+      var v = levelNow(kind);
+      if (!bus || v === null) return;
+      ev.preventDefault();
+      var ceil = levelCeil(kind);
+      var want = Math.max(0, Math.min(ceil, v + step * ceil));
+      bus.apply(kind, want);
+      levelPill(levelSay(kind, want), false);
+      aria();
+    });
+
+    /* The mixer popup and the drawer move the same numbers; the bar's
+       hairline and its aria value follow them without a poll. */
+    if (root.pineLevels && typeof root.pineLevels.onApply === 'function') {
+      try { root.pineLevels.onApply(aria); } catch (err) { /* no watcher */ }
+    }
   }
 
   /* THE PLAYHEAD IS A REAL SCRUB, and it moves THIS terminal's player.
@@ -6049,6 +6263,9 @@
       });
     }
     seek && (seek.dataset.dragging = '');
+    /* [#1198] the two bars in this card are the two level controls */
+    levelDrag(el('spSpectrum'), 'music');
+    levelDrag(el('spVoice'), 'voice');
     var dot = el('spMixDot');                                    /* #1419 */
     if (dot) dot.addEventListener('click', function (ev) { ev.stopPropagation(); mixerOpen(); });
     var prev = el('spPrev');
@@ -6081,6 +6298,8 @@
         meters.draw(spectrum, meters.read('musicPlayer', 'music'), '#54d18b');
         meters.draw(el('spVoice'),
           meters.readLoudest(['djVoiceAudio0', 'djVoiceAudio1'], 'voice'), '#e3be63');
+        levelMark(spectrum, 'music');                             /* [#1198] */
+        levelMark(el('spVoice'), 'voice');                        /* [#1198] */
       }
       var p = player();
       if (p && isFinite(p.duration) && p.duration) {

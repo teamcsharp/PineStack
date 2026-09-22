@@ -652,3 +652,246 @@ test('a press on a hot corner is left to the hot corner', async () => {
   assert.ok(asked.length > 0, '_cornerAt was never consulted');
   glass.close();
 });
+
+/* ================================================================== #1211
+ *
+ * THE TWO PANES THAT SAID "COULD NOT BE COUNTED", AND THE THREE THINGS THE
+ * PANEL COULD SHOW BUT NEVER DO.
+ *
+ * All three of these fail SILENTLY, which is why they are tested:
+ *
+ * 1. A PANE THAT DRAWS NOTHING BECAUSE THE SHAPE CHANGED. The rooms pane
+ *    reads `in`/`out`/`stuck` through a list of accepted key names; a
+ *    server that sends `entered` instead of `in` is drawn, and a server
+ *    that sends a room with no counts at all must NOT be drawn as zeroes.
+ *    Both are asserted, because "0 in / 0 out" for a busy room is the one
+ *    reading that would send the operator hunting a fault that is not
+ *    there.
+ * 2. A BUTTON THAT POSTS NOTHING. Every action here is one POST to a road
+ *    that already exists; a typo in the path is invisible on screen - the
+ *    row just sits there - so the test asserts the exact route and body.
+ * 3. A RESULT NOBODY SEES. #1186 holds the repaint while a hand is over
+ *    the panel, which is right for the poll and wrong for a press: the
+ *    answer to his own press would be held behind the press that asked
+ *    for it. The test presses with the hold standing and asserts the
+ *    station's own sentence reaches the foot anyway.
+ */
+
+/* The two keys the server half adds, shaped as orchestrator_rooms.py
+   sends them - four rooms, a counted account, and one open ask. */
+function withRooms(over) {
+  return payload(Object.assign({
+    rooms_window_seconds: 600,
+    rooms_say: 'material only ever moves down this list.',
+    rooms: [
+      {key: 'writing', name: 'the writing desk', label: 'the writing desk',
+       why: 'a model turns the brief into a script.',
+       in: 12, out: 11, stuck: 1, window_seconds: 600,
+       in_door: 'a model visit began', out_door: 'a visit came back',
+       holding_door: 'visits in flight right now',
+       oldest_seconds: 34.2},
+      {key: 'reserve', name: 'the reserve', label: 'the reserve',
+       why: 'scripts waiting for a slot.',
+       in: 4, out: 2, stuck: 343, holding: 809, oldest_seconds: 238344,
+       window_seconds: 600,
+       in_door: 'a row was written onto a pile',
+       out_door: 'a row aired, or was withdrawn',
+       holding_door: 'every row standing on the larder or a shelf',
+       top: [{name: 'an advert', count: 86}, {name: 'a painting round', count: 70}],
+       blocked: [{name: 'never_handed', count: 61,
+                  why: 'nothing about it is stopping it - no road asked.',
+                  fix: 'hear it now, or let the sweep take it.'}]},
+      {key: 'recording', name: 'the recording room', label: 'the recording room',
+       why: 'one actor at a time.', in: 30, out: 28, stuck: 7,
+       window_seconds: 600, window_truncated: true,
+       window_covers_seconds: 210},
+      /* A ROOM THAT COULD NOT BE READ. No counts at all, on purpose. */
+      {key: 'broken', name: 'the pantry', label: 'the pantry',
+       why: 'this room could not be read on this pass (RuntimeError).'}
+    ],
+    waste: {
+      recorded: 1841, recorded_basis: 'lines sent to the microphone',
+      played: 902, played_basis: 'deliveries a listener acknowledged',
+      never_heard: 78, never_heard_what: 'finished round',
+      never_heard_seconds: 956.0,
+      covered: 14, executed: 2, unused: 12, scheduled: 9,
+      classes: [{name: 'a station ID', count: 67, seconds: 490,
+                 why: '67 have never aired.'}],
+      rows_basis: 'the oldest never-heard rounds',
+      rows: [{
+        id: 'station_id-aa11bb22cc33dd44', road: 'station_id',
+        label: 'a station ID', name: 'the top of the hour',
+        text: 'You are listening to Pine Box FM.',
+        written_ago_seconds: 238344, seconds: 7.3,
+        blocked: false, ready: true,
+        why: 'it is finished radio and no road has asked for it.',
+        why_code: 'never_handed', reasons: [],
+        actions: ['hear', 'retire', 'fork']
+      }]
+    },
+    asks: [{
+      id: 'ask0011', at: (Date.now() / 1000) - 120, topic: 'offline_stock',
+      urgency: 'routine', decides_alone_in: 1800,
+      why: 'Phone calls is furthest behind the three-hour goal.',
+      questions: [{ask: 'What should I do?', options: [
+        {face: 'Build phone calls first until covered', does: 'drive:caller',
+         note: 'the preparer stays on that shelf'},
+        {face: 'Leave it short', does: 'noop', note: ''}
+      ]}],
+      answer_url: '/api/orchestrator/asks/ask0011'
+    }]
+  }, over || {}));
+}
+
+/* Both doors, counted: the GET the poll uses and the POSTs a press uses. */
+function stationRW(answer) {
+  const got = [], sent = [];
+  globalThis.pineDesktop = {
+    get: async (route) => { got.push(route); return answer; },
+    post: async (route, body) => {
+      sent.push({route, body});
+      return {ok: true, say: 'the station took it', lines: ['a line of proof']};
+    }
+  };
+  return {got, sent};
+}
+
+test('[#1211] the rooms pane counts what it was sent and refuses to zero what it was not', async () => {
+  const {body} = world();
+  stationRW(withRooms());
+  const glass = load();
+  glass.open();
+  await wait(30);
+  const node = findByClass(body, 'og')[0];
+
+  const rooms = foldNamed(node, 'the four rooms');
+  assert.ok(rooms, 'the rooms pane was not drawn at all');
+  const summary = findByClass(rooms, 'og-tri-sum')[0];
+  assert.match(String(summary.textContent), /4 rooms/,
+    'the pane did not count the rooms it was sent: ' + summary.textContent);
+  assert.doesNotMatch(String(summary.textContent), /could not be counted/,
+    'the pane still says it cannot count a payload that carries rooms');
+
+  press(rooms);
+  const said = words(rooms);
+  assert.match(said, /the writing desk/, 'the first room is missing');
+  assert.match(said, /12 in/, 'what went in was not drawn');
+  assert.match(said, /343 stuck/, 'what is stuck was not drawn');
+  assert.match(said, /came out are counted over the last 10[.]0 min/,
+    'the caption did not name the ten-minute window: ' + said.slice(0, 400));
+
+  /* THE ROOM THAT COULD NOT BE READ IS NOT DRAWN AS ZERO. */
+  const pantry = foldNamed(rooms, 'the pantry');
+  assert.ok(pantry, 'the unreadable room was dropped instead of reported');
+  assert.match(String(findByClass(pantry, 'og-tri-sum')[0].textContent),
+    /could not be counted/,
+    'a room with no counts was summarised as something other than uncounted');
+  press(pantry);
+  assert.match(words(pantry), /went in|looked for/,
+    'the unreadable room did not name the keys it looked for');
+
+  /* The doors, the names and the blocked reason all reach the screen. */
+  const reserve = foldNamed(rooms, 'the reserve');
+  press(reserve);
+  const inside = words(reserve);
+  assert.match(inside, /a row was written onto a pile/,
+    'the in-door was not named');
+  assert.match(inside, /an advert/, 'the top few by name were not drawn');
+  assert.match(inside, /never_handed/, 'the blocked reason was not drawn');
+
+  /* A COUNT OFF A RING THAT HAS ROTATED IS A FLOOR AND SAYS SO. Only the
+     recording room carries `window_truncated` in this payload, so only it
+     may print the warning - and it must. */
+  const rec = foldNamed(rooms, 'the recording room');
+  press(rec);
+  assert.match(words(rec), /FLOORS, not totals/,
+    'a truncated window was printed as though it were a total');
+  assert.doesNotMatch(inside, /FLOORS, not totals/,
+    'a complete window was wrongly marked as a floor');
+  glass.close();
+});
+
+test('[#1211] a never-heard round can be heard, retired or edited, and the POST lands', async () => {
+  const {body} = world();
+  const doors = stationRW(withRooms());
+  const glass = load();
+  glass.open();
+  await wait(30);
+  const node = findByClass(body, 'og')[0];
+
+  const waste = foldNamed(node, 'made and never heard');
+  assert.ok(waste, 'the waste pane was not drawn');
+  assert.match(String(findByClass(waste, 'og-tri-sum')[0].textContent),
+    /never heard/, 'the headline did not reach the summary');
+  press(waste);
+  /* THE NOUN IS THE STATION'S. It counted rounds; the line used to say
+     "lines", which is a label quietly meaning something else. */
+  assert.match(words(waste), /78 finished rounds recorded and never played/,
+    'the headline used the wrong noun: ' + words(waste).slice(0, 300));
+
+  const round = foldNamed(waste, 'the top of the hour');
+  assert.ok(round, 'the never-heard round itself was not listed');
+  press(round);
+  const buttons = findByClass(round, 'og-offer-b');
+  assert.equal(buttons.length, 3,
+    'a row without three actions: ' + buttons.length);
+
+  buttons[0].fire('click', {});
+  await wait(20);
+  assert.equal(doors.sent.length, 1, 'pressing hear it now posted nothing');
+  assert.equal(doors.sent[0].route, '/api/cupboard/act',
+    'hear it now went to the wrong road: ' + doors.sent[0].route);
+  assert.deepEqual(doors.sent[0].body,
+    {id: 'station_id-aa11bb22cc33dd44', action: 'play'},
+    'the body was not the one the cupboard road understands');
+
+  /* AND THE ANSWER LANDS WHERE HE CAN SEE IT - in the footer, which the
+     reconcile never touches, so it survives every poll after this. */
+  const out = findByClass(node, 'og-cmd-out')[0];
+  assert.ok(out && !out.hidden, 'the foot never spoke');
+  assert.match(String(out.textContent), /the station took it/,
+    'the foot did not carry the station\'s own sentence');
+  glass.close();
+});
+
+test('[#1211] an ask is answered in place, and the command line runs a verb', async () => {
+  const {body} = world();
+  const doors = stationRW(withRooms());
+  const glass = load();
+  glass.open();
+  await wait(30);
+  const node = findByClass(body, 'og')[0];
+
+  const roads = foldNamed(node, 'what it is asking the station for');
+  assert.ok(roads, 'the roads pane was not drawn');
+  assert.match(String(findByClass(roads, 'og-tri-sum')[0].textContent),
+    /1 waiting on you/, 'the open ask was not counted on the pane');
+  press(roads);
+  const ask = foldNamed(roads, 'offline_stock');
+  assert.ok(ask, 'the open ask was not drawn inside the pane');
+  press(ask);
+  const options = findByClass(ask, 'og-offer-b');
+  assert.equal(options.length, 2, 'the options did not reach the screen');
+  options[0].fire('click', {});
+  await wait(20);
+  assert.equal(doors.sent[0].route, '/api/orchestrator/asks/ask0011',
+    'the answer went to the wrong road: ' + doors.sent[0].route);
+  assert.deepEqual(doors.sent[0].body, {picks: {'0': 'drive:caller'}},
+    'the pick was not shaped the way orch_answer reads it');
+
+  /* THE COMMAND LINE. One line, one POST, and the verb is carried
+     verbatim - the station owns the vocabulary, not this file. */
+  const input = findByClass(node, 'og-cmd-in')[0];
+  assert.ok(input, 'there is no command line at the foot of the panel');
+  input.value = 'more banter';
+  findByClass(node, 'og-cmd-go')[0].fire('click', {});
+  await wait(20);
+  assert.equal(doors.sent[1].route, '/api/orchestrator/command',
+    'the command went to the wrong road: ' + doors.sent[1].route);
+  assert.deepEqual(doors.sent[1].body, {text: 'more banter'},
+    'the typed line was not sent as it was typed');
+  const more = findByClass(node, 'og-cmd-more')[0];
+  assert.match(words(more), /a line of proof/,
+    'the station\'s own lines were not echoed at the foot');
+  glass.close();
+});

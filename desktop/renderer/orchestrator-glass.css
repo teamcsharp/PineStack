@@ -558,3 +558,124 @@
 @media (max-width: 760px) {
   .og-offer-b { padding: 10px; }
 }
+
+/* =========================================================== [#1211] #1211
+ *
+ * THE COMMAND LINE AT THE FOOT, AND WHERE AN ANSWER LANDS.
+ *
+ * `.og-cmd` sits below `.og-main` and outside it. That is a layout choice
+ * and a correctness one at the same time: the list is reconciled on every
+ * poll (#1186), so anything a person is typing into or reading out of must
+ * not live in it. `flex: 0 0 auto` for the same reason `.og-head` has one -
+ * this column hands its height to the list first, and a shrinkable footer
+ * would be squeezed to nothing the moment the list grew.
+ *
+ * A folded panel (#1213) hides the list; it hides this too, because the
+ * pill is the face, the mood and one line, and a command line on a pill is
+ * neither. */
+.og-cmd {
+  flex: 0 0 auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  padding: 6px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 46%;
+  overflow-y: auto;
+}
+.og.og-min .og-cmd { display: none; }
+
+.og-cmd-row { display: flex; gap: 6px; align-items: stretch; }
+
+.og-cmd-in {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  color: inherit;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+  padding: 4px 6px;
+}
+.og-cmd-in:focus {
+  outline: none;
+  border-color: rgba(120, 190, 255, 0.55);
+}
+
+.og-cmd-go,
+.og-cmd-b,
+.og-cmd-x {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.og-cmd-go:hover,
+.og-cmd-b:hover,
+.og-cmd-x:hover { background: rgba(255, 255, 255, 0.14); }
+.og-cmd-go[disabled],
+.og-cmd-b[disabled] { opacity: 0.5; cursor: default; }
+
+/* THE ANSWER, IN THE STATION'S OWN WORDS. Never invented on this side, so
+   it is styled as a quotation rather than as a status chip. */
+.og-cmd-out {
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 4px 6px;
+  border-left: 2px solid rgba(120, 190, 255, 0.55);
+  background: rgba(120, 190, 255, 0.07);
+  word-break: break-word;
+}
+.og-cmd-out.og-cmd-bad {
+  border-left-color: rgba(255, 140, 120, 0.7);
+  background: rgba(255, 140, 120, 0.08);
+}
+.og-cmd-more { display: flex; flex-direction: column; gap: 2px; }
+.og-cmd-line {
+  font-size: 10px;
+  line-height: 1.4;
+  opacity: 0.8;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* THE TURN EDITOR. It opens here rather than inside the round's own fold
+   because a fold is rebuilt by the reconcile and a half-typed line in one
+   would be thrown away by the next poll. */
+.og-cmd-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.14);
+  padding-top: 5px;
+}
+.og-cmd-h { font-size: 10px; opacity: 0.85; line-height: 1.4; }
+.og-cmd-turn { display: flex; flex-direction: column; gap: 3px; }
+.og-cmd-who { font-size: 10px; opacity: 0.7; }
+.og-cmd-area {
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  color: inherit;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+  padding: 4px 6px;
+  resize: vertical;
+  min-height: 2.6em;
+}
+.og-cmd-area:focus {
+  outline: none;
+  border-color: rgba(120, 190, 255, 0.55);
+}
+.og-cmd-x { align-self: flex-start; }

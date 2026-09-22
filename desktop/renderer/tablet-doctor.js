@@ -171,7 +171,258 @@
     }
   }
 
+  /* ==== [#1209] THE FINDER =============================================
+   *
+   * "Put a searchable radio display up for the Pine tablet as well,
+   *  allowing me to search and locate the Pine tablet on the network."
+   *
+   * The doctor above is a LADDER: it climbs on its own and prints a
+   * transcript. This is a LIST: every device on the station's network,
+   * what is known about each, and a click to say "that one is the
+   * tablet". They answer different questions and both are wanted - the
+   * ladder when it should just work, the list when it does not.
+   *
+   * The station does the looking (GET /api/tablet/find, on a thread: it
+   * is 254 connects plus the neighbour table). This draws it, filters it
+   * as you type, and posts the pick to the `use` rung.
+   *
+   * Built entirely from here, stylesheet included, so this file
+   * hot-reloads off the share on its own - no index.html, no styles.css,
+   * no relaunch.
+   */
+  var FIND_OPEN_KEY = 'pineTabletFindOpen';
+  var findRows = [];
+  var findSay = '';
+  var findBusy = false;
+
+  function findStyle() {
+    if (document.getElementById('tabletFindStyle')) return;
+    var s = document.createElement('style');
+    s.id = 'tabletFindStyle';
+    s.textContent = [
+      '.tfind{padding:0 9px 9px;display:none}',
+      '.vitals-box .tfind.on{display:block}',
+      '.vitals-box.shut .tfind{display:none}',
+      '.tfind-bar{display:flex;gap:5px;align-items:center;margin-bottom:5px}',
+      '.tfind-bar input{flex:1;min-width:0;background:#070c11;border:1px solid #1b2831;',
+      '  border-radius:4px;color:#cfe0ec;font:inherit;font-size:11px;padding:3px 6px}',
+      '.tfind-bar button{background:#111922;border:1px solid #1b2831;border-radius:4px;',
+      '  color:#9fb3c2;font:inherit;font-size:11px;padding:3px 7px;cursor:pointer}',
+      '.tfind-bar button:hover{background:#17222c}',
+      '.tfind-say{color:#7e94a6;font-size:10.5px;line-height:1.45;margin:0 0 5px}',
+      '.tfind-list{max-height:210px;overflow:auto;display:flex;flex-direction:column;gap:3px}',
+      '.tfind-row{display:block;width:100%;text-align:left;background:#0b1015;',
+      '  border:1px solid #16212a;border-radius:4px;color:#9fb3c2;font:inherit;',
+      '  font-size:11px;padding:4px 6px;cursor:pointer}',
+      '.tfind-row:hover{background:#121b24;border-color:#24404f}',
+      '.tfind-row.best{border-color:#2f6d4f;background:#0c1712}',
+      '.tfind-row.mine{border-color:#7a5a1f}',
+      '.tfind-row b{color:#cfe0ec;font-variant-numeric:tabular-nums}',
+      '.tfind-row i{font-style:normal;color:#6d8294;margin-left:6px}',
+      '.tfind-row em{display:block;font-style:normal;color:#6d8294;',
+      '  font-size:10px;line-height:1.4;margin-top:2px}'
+    ].join('');
+    document.head.appendChild(s);
+  }
+
+  function findOpenPref() {
+    try { return localStorage.getItem(FIND_OPEN_KEY) === '1'; } catch (err) { return false; }
+  }
+  function rememberFindOpen(open) {
+    try { localStorage.setItem(FIND_OPEN_KEY, open ? '1' : '0'); } catch (err) { /* session only */ }
+  }
+
+  /* The list is a diagnostic surface, so the broadcast steps back to 10%
+   * while it is open - the standing duck rule, same as the transcript. */
+  function findDuck(open) {
+    try {
+      if (!window.PineDuck) return;
+      if (open) window.PineDuck.hold('tablet-finder', window.PineDuck.REPORT);
+      else window.PineDuck.release('tablet-finder');
+    } catch (err) { /* no duck on this page */ }
+  }
+
+  function findBox() {
+    findStyle();
+    var box = document.getElementById('tabletFind');
+    if (box) return box;
+    var housing = document.getElementById('vitalsBox');
+    if (!housing) return null;
+    box = document.createElement('div');
+    box.id = 'tabletFind';
+    box.className = 'tfind';
+    box.innerHTML = '<div class="tfind-bar">'
+      + '<input id="tabletFindQ" type="search" placeholder="search the network…" '
+      + 'title="Search every column at once: an address, part of a hardware address, '
+      + 'a maker, a port, or a word like kiosk">'
+      + '<button id="tabletFindGo" type="button" title="Scan the network again">scan</button>'
+      + '</div><p class="tfind-say" id="tabletFindSay"></p>'
+      + '<div class="tfind-list" id="tabletFindList"></div>';
+    var doc = document.getElementById('tabletDoc');
+    if (doc && doc.parentNode === housing) housing.insertBefore(box, doc);
+    else housing.appendChild(box);
+    var q = box.querySelector('#tabletFindQ');
+    if (q) {
+      q.addEventListener('input', function () { paintFind(); });
+      q.addEventListener('keydown', function (ev) {
+        ev.stopPropagation();                 /* the app's hot keys are global */
+        if (ev.key === 'Enter') scanFind();
+      });
+    }
+    var go = box.querySelector('#tabletFindGo');
+    if (go) go.addEventListener('click', function (ev) { ev.stopPropagation(); scanFind(); });
+    return box;
+  }
+
+  function setFindOpen(open) {
+    var box = findBox();
+    if (!box) return;
+    box.classList.toggle('on', !!open);
+    var b = document.getElementById('tabletFindBtn');
+    if (b) b.setAttribute('aria-expanded', open ? 'true' : 'false');
+    findDuck(!!open);
+    if (open && !findRows.length && !findBusy) scanFind();
+  }
+
+  function findQuery() {
+    var q = document.getElementById('tabletFindQ');
+    return String((q && q.value) || '').trim().toLowerCase();
+  }
+
+  /* The station already searches, but it searches the answer it is about
+   * to send. Filtering here as well means typing is instant and costs no
+   * scan - the same rows, narrowed. */
+  function findHit(row, want) {
+    if (!want) return true;
+    var hay = [row.host, row.mac, row.vendor, row.iface, row.agent, row.why,
+               row.asked_for, row.port, Object.keys(row.ports || {}).join(' '),
+               row.known ? 'remembered current known tablet' : '',
+               row.kiosk ? 'kiosk pinetab tablet' : '']
+      .join(' ').toLowerCase();
+    return want.split(/\s+/).every(function (w) { return hay.indexOf(w) >= 0; });
+  }
+
+  function paintFind() {
+    var list = document.getElementById('tabletFindList');
+    var say = document.getElementById('tabletFindSay');
+    if (!list) return;
+    var want = findQuery();
+    var rows = findRows.filter(function (r) { return findHit(r, want); });
+    list.replaceChildren();
+    if (!findRows.length) {
+      if (say) say.textContent = findBusy ? 'looking at the network…'
+        : 'press scan to look at the network.';
+      return;
+    }
+    if (say && !findBusy) {
+      say.textContent = (want
+        ? rows.length + ' of ' + findRows.length + ' match “' + want + '”. '
+        : '') + (findSay || '');
+    }
+    if (!rows.length) {
+      var none = document.createElement('div');
+      none.className = 'tfind-say';
+      none.textContent = 'nothing on this network matches that.';
+      list.appendChild(none);
+      return;
+    }
+    rows.forEach(function (r) {
+      var line = document.createElement('button');
+      line.type = 'button';
+      line.className = 'tfind-row'
+        + ((r.score >= 40) ? ' best' : '')
+        + (r.known ? ' mine' : '');
+      var bits = [];
+      if (r.mac) bits.push(r.mac);
+      if (r.vendor) bits.push(r.vendor);
+      if (r.open) bits.push('port ' + r.port + ' · ' + Math.round(r.ms) + 'ms');
+      Object.keys(r.ports || {}).forEach(function (p) {
+        bits.push('port ' + p + ' · ' + Math.round(r.ports[p]) + 'ms');
+      });
+      if (r.known) bits.push('the remembered tablet');
+      var head = document.createElement('b');
+      head.textContent = r.host;
+      var tail = document.createElement('i');
+      tail.textContent = bits.join(' · ');
+      var why = document.createElement('em');
+      why.textContent = r.why || '';
+      line.appendChild(head); line.appendChild(tail); line.appendChild(why);
+      line.title = r.known
+        ? 'The station already uses this address.'
+        : 'Use ' + r.host + ' as the tablet from now on.';
+      line.onclick = function (ev) {
+        ev.stopPropagation();
+        useFind(r.host);
+      };
+      list.appendChild(line);
+    });
+  }
+
+  async function scanFind() {
+    if (findBusy) return;
+    findBusy = true;
+    var say = document.getElementById('tabletFindSay');
+    if (say) say.textContent = 'looking at the network…';
+    try {
+      var got = await ask('/api/tablet/find?deep=1');
+      findRows = (got && got.rows) || [];
+      findSay = String((got && got.say) || '');
+    } catch (err) {
+      findRows = [];
+      findSay = 'the station did not answer: ' + String(err && err.message || err);
+    } finally {
+      findBusy = false;
+      paintFind();
+    }
+  }
+
+  async function useFind(host) {
+    var say = document.getElementById('tabletFindSay');
+    try {
+      var got = await post('/api/tablet/doctor/use', {host: host});
+      findSay = String((got && got.say) || ('the tablet is ' + host + ' from now on'));
+      findRows = findRows.map(function (r) {
+        return Object.assign({}, r, {known: r.host === host});
+      });
+    } catch (err) {
+      findSay = 'could not write that down: ' + String(err && err.message || err);
+    }
+    if (say) say.textContent = findSay;
+    paintFind();
+  }
+
+  function wireFind() {
+    var heal = document.getElementById('tabletHeal');
+    if (!heal || document.getElementById('tabletFindBtn')) return;
+    var b = document.createElement('button');
+    b.id = 'tabletFindBtn';
+    b.type = 'button';
+    b.className = 'vitals-tool vitals-tool-2';
+    b.setAttribute('aria-expanded', 'false');
+    b.setAttribute('aria-controls', 'tabletFind');
+    b.title = 'Find the tablet on the network: every device, searchable, '
+      + 'with what is known about each. Click one to use it.';
+    b.innerHTML = '<span data-pine-icon="c:search" aria-hidden="true"></span>';
+    heal.parentNode.insertBefore(b, heal);
+    /* The sprite painter walks the document for data-pine-icon; a node
+     * added afterwards has to ask for itself. */
+    try {
+      if (typeof root.pineIcon === 'function') {
+        b.firstChild.innerHTML = root.pineIcon('c:search') || '';
+      }
+    } catch (err) { b.textContent = 'find'; }
+    b.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var box = findBox();
+      var open = !!(box && !box.classList.contains('on'));
+      setFindOpen(open);
+      rememberFindOpen(open);
+    });
+    if (findOpenPref()) setFindOpen(true);
+  }
+
   function start() {
+    wireFind();                                             /* [#1209] */
     var b = document.getElementById('tabletHeal');
     if (b && !b.__wired) {
       b.__wired = true;
@@ -192,7 +443,8 @@
     }
   }
 
-  root.PineTabletDoctor = {heal: heal};
+  root.PineTabletDoctor = {heal: heal, find: scanFind,   /* [#1209] */
+                           show: setFindOpen};
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start);

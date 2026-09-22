@@ -58,6 +58,13 @@ from crystal_prompts import (turn_prompt as crystal_prompt_turn,
                              budget_plan as crystal_budget_plan,
                              PROMPT_VERSION as CRYSTAL_PROMPT_VERSION)
 from crystal_source import clean_repair_prompt_echo, strip_repair_prompt_echo
+try:                                              # [#1252]
+    # A QR code with no dependencies - see pine_qr.py. Guarded because a
+    # picture of a link is worth exactly nothing next to the link, and a
+    # missing optional module must never stop the station coming up.
+    from pine_qr import qr_svg as _qr_svg
+except Exception:                                 # noqa: BLE001
+    _qr_svg = None
 from segment_contract import ad_sale_evidence
 from store_retention import retention_sweep, store_sizes
 import station_modifiers                 # #1169/#1170: the modifier desk
@@ -5902,6 +5909,9 @@ async def _track_generation(prompt_id: str, started_at: float | None = None,
             stats = dict(base_stats or {})
             if started_at:
                 stats["duration_s"] = round(time.time() - started_at, 1)
+                # [#1196] the one fact the unload price needs
+                await asyncio.to_thread(comfy_render_timed,
+                                        stats["duration_s"])
             stats.update(_summarize_system_stats(await _comfy_system_stats()))
             stats.update(_read_gpu_temp())
             await update_generation(
@@ -6312,6 +6322,214 @@ _COMFY_LAST_USED = [0.0]
 COMFY_IDLE_UNLOAD = float(os.getenv("COMFY_IDLE_UNLOAD", "900"))  # 15 min
 
 
+# [#1196] THE IDLE POLICY IS A DIAL, AND THE DIAL CARRIES ITS PRICE.
+#
+#   "So there are hours and hours and hours in which I am not using comfy UI.
+#    We might need to try a situation where we offload it from memory so that
+#    it can be more efficient during those times."
+#
+# Measured before a line of this was written (2026-09-21): at rest ComfyUI is
+# 351 MiB GPU + 648 MB anon = 0.97 GB of a 127.6 GB box. Offloading it while
+# it is idle buys three quarters of one percent, and the "tier1: ComfyUI cache
+# freed" line the operator was watching every 45 seconds was written with
+# 66.7 GB free. It was never the hog.
+#
+# What IS worth a policy: holding a finished workflow ComfyUI measured 39.9 GB,
+# and one POST /free gave back 40.6 GB of MemAvailable. On the night this was
+# written it held that 40 GB for twenty minutes with no clock about to take it,
+# because the clock below ran on a 300 s tick with a latch that only re-armed
+# when IT had seen the queue busy - and a picture takes 20-37 s, so a render
+# made from ComfyUI's own web page fell between two samples and was never seen.
+#
+# COMFY_IDLE_UNLOAD stays as the default and the fallback; the policy file
+# (data/comfy_idle.json) is what the operator actually turns.
+try:
+    import comfy_idle as _comfy_idle
+except Exception:  # noqa: BLE001  - a half-copied deploy must not kill the app
+    _comfy_idle = None
+
+COMFY_IDLE_TICK = float(os.getenv("COMFY_IDLE_TICK", "20"))
+COMFY_POWER_PATH = data_path("comfy_power")
+_COMFY_UNLOADED_AT = [0.0]
+_COMFY_IDLE_CACHE: dict[str, Any] = {"at": 0.0, "doc": None}
+
+
+def comfy_idle_doc(fresh: bool = False) -> dict[str, Any]:
+    """The stored policy, or the env-var defaults when the module is absent.
+
+    Cached for five seconds on purpose: the idle clock asks twice every
+    twenty seconds and the resource sampler asks again every forty-five,
+    and the broadcast loop must never wait on a disk read it could have
+    answered from memory (memory `library-loop-starved-the-loop`)."""
+    if _comfy_idle is None:
+        return {"minutes": int(COMFY_IDLE_UNLOAD // 60), "mode": "free",
+                "updated": 0.0, "by": "", "log": [], "renders": [],
+                "seed": {}, "module": False}
+    now = time.time()
+    cached = _COMFY_IDLE_CACHE.get("doc")
+    if not fresh and cached is not None and now - float(
+            _COMFY_IDLE_CACHE.get("at") or 0.0) < 5.0:
+        return cached
+    doc = _comfy_idle.read(DATA_DIR)
+    doc["module"] = True
+    _COMFY_IDLE_CACHE["at"] = now
+    _COMFY_IDLE_CACHE["doc"] = doc
+    return doc
+
+
+def comfy_idle_minutes() -> float:
+    doc = comfy_idle_doc()
+    try:
+        return float(doc.get("minutes") or 0)
+    except (TypeError, ValueError):
+        return COMFY_IDLE_UNLOAD / 60.0
+
+
+def comfy_idle_mode() -> str:
+    mode = str(comfy_idle_doc().get("mode") or "free")
+    return mode if mode in ("off", "free", "stop") else "free"
+
+
+def comfy_render_timed(seconds: float) -> None:
+    """One finished picture, and the one fact its price needs: was it the
+    first since an unload? Called from _track_generation in a thread."""
+    if _comfy_idle is None:
+        return
+    cold = bool(_COMFY_UNLOADED_AT[0])
+    _COMFY_UNLOADED_AT[0] = 0.0
+    try:
+        _comfy_idle.note_render(DATA_DIR, seconds, cold)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def comfy_host_available_gb() -> float | None:
+    """MemAvailable of the WHOLE box. Docker does not namespace /proc/meminfo
+    (verified: container and host read the same kB in the same second), and on
+    unified memory this single number covers GPU and CPU alike - which is why
+    only the DELTA across an action can name what an offload bought."""
+    if _comfy_idle is not None:
+        return _comfy_idle.host_available_gb()
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return round(int(line.split()[1]) / 1048576.0, 1)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+async def comfy_unload(mode: str, idle_s: float, why: str) -> dict[str, Any]:
+    """Take the memory back by whichever road the dial says, and write down
+    what it ACTUALLY bought - host MemAvailable either side of the action."""
+    mode = str(mode or "free").strip().lower()
+    if mode not in ("free", "stop"):
+        mode = "free"
+    before = comfy_host_available_gb()
+    ok = False
+    note = ""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(f"{COMFYUI_URL}/free",
+                                         json={"unload_models": True,
+                                               "free_memory": True})
+            response.raise_for_status()
+        ok = True
+    except Exception as exc:  # noqa: BLE001
+        note = f"ComfyUI did not answer /free ({type(exc).__name__})"
+    if ok and mode == "stop":
+        # The host power bridge, a companion to comfyui-kick.path: it CONSUMES
+        # the flag. A flag still sitting there twenty seconds later is honest
+        # proof that no bridge is installed, so nothing is claimed that did
+        # not happen and the mode degrades to `free` in the ledger.
+        try:
+            await asyncio.to_thread(COMFY_POWER_PATH.write_text, "stop\n",
+                                    "utf-8")
+            for _ in range(20):
+                await asyncio.sleep(1)
+                if not await asyncio.to_thread(COMFY_POWER_PATH.exists):
+                    break
+            if await asyncio.to_thread(COMFY_POWER_PATH.exists):
+                await asyncio.to_thread(COMFY_POWER_PATH.unlink)
+                note = ("the host power bridge is not installed, so the "
+                        "engine is still up; its models were freed instead")
+                mode = "free"
+        except Exception as exc:  # noqa: BLE001
+            note = f"the power flag could not be written ({type(exc).__name__})"
+            mode = "free"
+    await asyncio.sleep(3)          # the kernel gives the pages back lazily
+    after = comfy_host_available_gb()
+    _COMFY_UNLOADED_AT[0] = time.time()
+    if _comfy_idle is not None:
+        try:
+            await asyncio.to_thread(_comfy_idle.note_unload, DATA_DIR,
+                                    mode=mode, idle_s=idle_s,
+                                    before_gb=before, after_gb=after,
+                                    ok=ok, why=(note or why))
+        except Exception:  # noqa: BLE001
+            pass
+    freed = (round(after - before, 1)
+             if before is not None and after is not None else None)
+    pipeline_log("gpu", "ComfyUI sat idle past %d minutes — %s%s (#1196)"
+                 % (int(max(0.0, idle_s) // 60),
+                    "its models were freed" if mode == "free"
+                    else "it was stopped",
+                    "" if freed is None else ", %.1f GB back" % freed))
+    return {"ok": ok, "mode": mode, "before_gb": before, "after_gb": after,
+            "freed_gb": freed, "why": note or why}
+
+
+async def comfy_idle_live() -> dict[str, Any]:
+    """Where the engine is RIGHT NOW, for the dial to sit beside."""
+    up = False
+    busy = False
+    observed = False
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.get(f"{COMFYUI_URL}/queue")
+            response.raise_for_status()
+            q = response.json() or {}
+        up = True
+        observed = "queue_running" in q and "queue_pending" in q
+        busy = bool(q.get("queue_running") or q.get("queue_pending"))
+    except Exception:  # noqa: BLE001
+        pass
+    now = time.time()
+    quiet_since = max(_RESOURCE_COMFY_IDLE_SINCE[0] or now,
+                      _COMFY_LAST_USED[0] or 0.0)
+    idle = max(0.0, now - quiet_since) if not busy else 0.0
+    minutes = comfy_idle_minutes()
+    mode = comfy_idle_mode()
+    due = None
+    if mode != "off" and minutes > 0 and not busy:
+        due = max(0, int(minutes * 60 - idle))
+    return {"up": up, "busy": busy, "observed": observed,
+            "idle_seconds": int(idle), "unload_in_seconds": due,
+            "available_gb": comfy_host_available_gb(),
+            "last_unload_at": _COMFY_UNLOADED_AT[0] or None}
+
+
+async def comfy_idle_state() -> dict[str, Any]:
+    """Everything a screen needs: the dial, where it is, and the prices."""
+    doc = comfy_idle_doc(fresh=True)
+    live = await comfy_idle_live()
+    if _comfy_idle is None:
+        return {"policy": doc, "live": live, "prices": {}, "offers": [],
+                "why": ("The idle dial is unavailable: comfy_idle.py is not "
+                        "beside app.py. ComfyUI still unloads after "
+                        "%d minutes of quiet." % int(COMFY_IDLE_UNLOAD // 60)),
+                "log": [], "renders": []}
+    return {"policy": {k: doc[k] for k in ("minutes", "mode", "updated", "by")},
+            "live": live,
+            "prices": _comfy_idle.prices(doc),
+            "offers": _comfy_idle.offer(doc),
+            "why": _comfy_idle.explain(doc, live),
+            "log": (doc.get("log") or [])[-12:],
+            "renders": (doc.get("renders") or [])[-12:]}
+
+
+
 # --- THE COMFY DOCTOR (#1152) -----------------------------------------
 # "I want to be able to say what's going on with ComfyUI and have it run
 # a comprehensive troubleshooter in the background, showing me a console
@@ -6511,44 +6729,54 @@ def is_comfy_status_query(text: str) -> bool:
 
 
 async def comfy_idle_clock() -> None:
-    """Unload ComfyUI's model cache after a quiet spell. The next render
-    pays a one-time reload of its checkpoint; every other service on the
-    box gets the memory back the rest of the time."""
-    freed = False
+    """Unload ComfyUI after a quiet spell, on the operator's dial.  [#1196]
+
+    THREE THINGS WERE WRONG WITH THE OLD LOOP, and all three were measured
+    on 2026-09-21 with 40.6 GB sitting in ComfyUI for twenty minutes:
+
+    * IT TICKED EVERY 300 SECONDS and a picture takes 20-37 s here, so a
+      render the station did not originate - the operator using ComfyUI's
+      own page, which is precisely the case #1196 is about - fell between
+      two samples and was never seen as busy.
+    * THE `freed` LATCH ONLY RE-ARMED WHEN THIS LOOP HAD SEEN THE QUEUE
+      BUSY. Miss the render, and the latch stayed set for the rest of the
+      process's life: it had already emptied "this quiet spell" and the
+      spell never ended. Now the latch is stamped with the spell it
+      belongs to, so any new activity ends the spell and re-arms it.
+    * IT ONLY KNEW ONE VERB. The dial has three (off / free / stop), and
+      each one has a price the operator can read before choosing it.
+    """
+    freed_at = 0.0
+    last_busy = 0.0
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(max(5.0, COMFY_IDLE_TICK))
         try:
-            if COMFY_IDLE_UNLOAD <= 0:
+            mode = comfy_idle_mode()
+            minutes = comfy_idle_minutes()
+            if mode == "off" or minutes <= 0:
                 continue
-            idle = time.time() - (_COMFY_LAST_USED[0] or 0)
-            if _COMFY_LAST_USED[0] and idle < COMFY_IDLE_UNLOAD:
-                freed = False
-                continue
+            window = minutes * 60.0
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(f"{COMFYUI_URL}/queue")
                 response.raise_for_status()
                 q = response.json() or {}
-                if "queue_running" not in q or "queue_pending" not in q:
-                    continue
-                busy = bool(q.get("queue_running") or q.get("queue_pending"))
-                if busy:
-                    _RESOURCE_COMFY_IDLE_SINCE[0] = 0.0
-                    freed = False
-                    continue
-                if freed:               # already emptied this observed quiet spell
-                    continue
-                observed_idle = _RESOURCE_COMFY_IDLE_SINCE[0]
-                if not observed_idle or time.time() - observed_idle < COMFY_IDLE_UNLOAD:
-                    continue
-                response = await client.post(f"{COMFYUI_URL}/free",
-                                             json={"unload_models": True,
-                                                   "free_memory": True})
-                response.raise_for_status()
-            freed = True
-            pipeline_log("gpu", "ComfyUI sat idle past "
-                         f"{int(COMFY_IDLE_UNLOAD // 60)} minutes — its "
-                         "model cache was unloaded so the voice engines "
-                         "get the memory back (#796)")
+            if "queue_running" not in q or "queue_pending" not in q:
+                continue
+            if q.get("queue_running") or q.get("queue_pending"):
+                last_busy = time.time()
+                _RESOURCE_COMFY_IDLE_SINCE[0] = 0.0
+                continue
+            if not _RESOURCE_COMFY_IDLE_SINCE[0]:
+                _RESOURCE_COMFY_IDLE_SINCE[0] = time.time()
+            quiet_since = max(_RESOURCE_COMFY_IDLE_SINCE[0], last_busy,
+                              _COMFY_LAST_USED[0] or 0.0)
+            if time.time() - quiet_since < window:
+                continue
+            if freed_at >= quiet_since:   # already emptied THIS quiet spell
+                continue
+            freed_at = time.time()
+            await comfy_unload(mode, time.time() - quiet_since,
+                               "the idle clock")
         except Exception:  # noqa: BLE001
             pass                          # comfy down = nothing to free
 
@@ -6711,7 +6939,12 @@ async def resource_sample() -> dict[str, Any]:
                                             for job in writing.get("jobs", []))}
                                for row in models.get("models", [])],
                     "comfy": {"observed": comfy_observed, "busy": comfy_busy,
-                              "idle_seconds": max(0, now - comfy_idle_since)}}
+                              "idle_seconds": max(0, now - comfy_idle_since),
+                              # [#1196] the dial, where every monitor reads
+                              "policy": {k: comfy_idle_doc().get(k)
+                                         for k in ("minutes", "mode")},
+                              "last_unload": (comfy_idle_doc().get("log")
+                                              or [{}])[-1]}}
         available = available_gb(memory)
         _RESOURCE_PRESSURE_SAMPLES[0] = (_RESOURCE_PRESSURE_SAMPLES[0] + 1
                                          if available is not None and available < 24 else 0)
@@ -13295,6 +13528,436 @@ def remote_access(fresh: bool = False) -> dict[str, Any]:
     return data
 
 
+# --- [#1252] WHICH ROAD A LINK TAKES, AND WHO IS ON THE TAILNET ---------
+#
+# Three addresses can carry this station and they are not interchangeable,
+# which is the whole of #1252:
+#
+#   funnel   https://<magicdns>          anybody, anywhere, no Tailscale.
+#                                        Terminates at Tailscale's edge and
+#                                        proxies to the PUBLIC door on 8097,
+#                                        which only ever opens the listener
+#                                        side - a full-scope token handed to
+#                                        it is deliberately downgraded.
+#   tailnet  http://100.x:8096           only a machine signed in to this
+#            http://<magicdns>:8096      tailnet. This is the only road a
+#                                        FULL link can take.
+#   lan      http://10.x:8096            only the house wifi.
+#
+# The operator's one share was a full link on the tailnet road, handed to a
+# phone whose Tailscale had been logged out for eight days. Every part of
+# that was invisible: the link looked the same as any other, the phone's
+# state was not on any screen, and nothing anywhere said that "full" and
+# "works without Tailscale" cannot both be true.
+REACH_BOOK_PATH = data_path("reach_devices.json")
+TAILNET_SNAPSHOT = data_path("tailnet_peers.json")
+PEER_PROBE_PORTS = (80, 443)
+PEER_PROBE_TIMEOUT = 1.8
+PEERS_TTL = 90.0
+_PEERS_CACHE: dict[str, Any] = {"at": 0.0, "data": {}}
+
+
+def _magicdns_a(name: str, server: str = "100.100.100.100",
+                timeout: float = 2.0) -> str:
+    """The tailnet address of a machine, by its MagicDNS name.
+
+    The mirror of _ptr_lookup above, and hand-rolled for the same reason:
+    the box runs `tailscale up --accept-dns=false`, so 100.100.100.100 is
+    deliberately not in /etc/resolv.conf and getaddrinfo() would never ask
+    it. MEASURED 2026-09-21 from inside this container (which shares the
+    host's network namespace): iphone184.tail1fec29.ts.net ->
+    100.92.208.88, trebledroid-vanilla -> 100.95.199.28, an invented name
+    -> nothing. So the station can look a device up by the name Tailscale
+    shows for it, with no control socket and no host command."""
+    import socket
+    import struct
+    want = str(name or "").strip().strip(".")
+    if not want or " " in want:
+        return ""
+    query = struct.pack(">HHHHHH", 0x5151, 0x0100, 1, 0, 0, 0)
+    for label in want.split("."):
+        if not label or len(label) > 63:
+            return ""
+        # ascii, not idna: the idna codec refuses an error handler and
+        # works on whole domains, and every MagicDNS name is ascii.
+        query += bytes([len(label)]) + label.encode("ascii", "ignore")
+    query += b"\x00" + struct.pack(">HH", 1, 1)            # QTYPE=A QCLASS=IN
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(query, (server, 53))
+            data, _ = sock.recvfrom(2048)
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        if len(data) < 12 or struct.unpack(">H", data[6:8])[0] < 1:
+            return ""
+        answers = struct.unpack(">H", data[6:8])[0]
+        off = 12
+        while data[off]:                                   # skip the question
+            off += 1 + data[off]
+        off += 5
+        for _ in range(answers):
+            if data[off] & 0xC0 == 0xC0:
+                off += 2
+            else:
+                while data[off]:
+                    off += 1 + data[off]
+                off += 1
+            kind, _cls, _ttl, size = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            if kind == 1 and size == 4:
+                return socket.inet_ntoa(data[off:off + 4])
+            off += size
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _is_tailnet_ip(ip: str) -> bool:
+    """100.64.0.0/10, and nothing else that merely starts with 100."""
+    bits = str(ip or "").split(".")
+    if len(bits) != 4 or bits[0] != "100":
+        return False
+    try:
+        return 64 <= int(bits[1]) <= 127
+    except ValueError:  # noqa: BLE001
+        return False
+
+
+def _peer_answers(ip: str) -> dict[str, Any]:
+    """Is there a live tailscaled on the other end of this address?
+
+    MEASURED 2026-09-21 from the host's network namespace, against peers
+    whose state `tailscale status --json` already knew:
+
+        100.92.208.88  (iphone184, Online false)   timeout on 80/443/8096
+        100.95.199.28  (TrebleDroid, Online false) timeout on 80/443/8096
+        100.74.95.59   (this box, online)          80 refused in 0ms,
+                                                   443 and 8096 open
+
+    A peer that is up answers a connection to a shut port with a refusal,
+    because its own tailscaled generates it. A peer that is logged out,
+    asleep or gone answers nothing at all and the connect times out. So a
+    REFUSAL is a positive result here, which is the opposite of what it
+    means anywhere else in this file, and worth saying out loud."""
+    last: dict[str, Any] = {"answers": False, "ms": None, "why": "no answer"}
+    for port in PEER_PROBE_PORTS:
+        got = _tcp_open(ip, int(port), PEER_PROBE_TIMEOUT)
+        why = str(got.get("why") or "")
+        if got.get("open") or "efused" in why:
+            return {"answers": True, "ms": got.get("ms"),
+                    "why": "open" if got.get("open") else "refused the port"}
+        last = {"answers": False, "ms": got.get("ms"), "why": why or "no answer"}
+    return last
+
+
+def reach_book() -> dict[str, Any]:
+    """The devices the operator has named, so the station can ask after
+    them. Nothing discovers this: the container cannot read tailscaled's
+    netmap, so a device is known once somebody says its name."""
+    try:
+        got = json.loads(REACH_BOOK_PATH.read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def reach_remember(name: str, note: str = "") -> dict[str, Any]:
+    """Write a device name down. Idempotent, and it never overwrites the
+    note it already has with an empty one."""
+    want = str(name or "").strip().strip(".").lower()
+    if not want:
+        return {"ok": False, "say": "no device name was given"}
+    rows = reach_book()
+    devices = rows.setdefault("devices", {})
+    row = devices.setdefault(want, {"first": time.time()})
+    row["at"] = time.time()
+    if note:
+        row["note"] = str(note)[:80]
+    try:
+        REACH_BOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = REACH_BOOK_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+        tmp.replace(REACH_BOOK_PATH)
+    except OSError:
+        return {"ok": False, "say": "could not write the device book down"}
+    return {"ok": True, "name": want, "say": "%s is on the list now" % want}
+
+
+def reach_forget(name: str) -> dict[str, Any]:
+    want = str(name or "").strip().lower()
+    rows = reach_book()
+    if want not in (rows.get("devices") or {}):
+        return {"ok": False, "say": "%s was not on the list" % want}
+    rows["devices"].pop(want, None)
+    try:
+        REACH_BOOK_PATH.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    except OSError:
+        return {"ok": False, "say": "could not write the device book down"}
+    return {"ok": True, "say": "%s is off the list" % want}
+
+
+def _snapshot_peers() -> tuple[list[dict[str, Any]], float]:
+    """`tailscale status --json`, if somebody has dropped one in data/.
+
+    The container has no tailscale binary and tailscaled's socket is not
+    mounted, so the full netmap - every peer, its OS, and LastSeen - can
+    only come from the host. When it is there it is the best answer there
+    is, and its AGE is reported beside it so a stale one cannot be read as
+    current. When it is not, the device book plus a live probe still
+    answers the only question that matters."""
+    try:
+        raw = json.loads(TAILNET_SNAPSHOT.read_text(encoding="utf-8"))
+        made = TAILNET_SNAPSHOT.stat().st_mtime
+    except Exception:  # noqa: BLE001
+        return [], 0.0
+    out: list[dict[str, Any]] = []
+    try:
+        rows = list((raw.get("Peer") or {}).values())
+        mine = raw.get("Self") or {}
+        if mine:
+            rows.append(dict(mine, _self=True))
+        for peer in rows:
+            host = str(peer.get("HostName") or "")
+            if host == "funnel-ingress-node":
+                continue                       # Tailscale's own edge nodes
+            ips = [str(i) for i in (peer.get("TailscaleIPs") or [])
+                   if _is_tailnet_ip(str(i))]
+            if not ips:
+                continue
+            out.append({
+                "name": str(peer.get("DNSName") or host).strip(".").split(".")[0]
+                        or host,
+                "dns": str(peer.get("DNSName") or "").strip("."),
+                "os": str(peer.get("OS") or ""),
+                "ip": ips[0],
+                "online": bool(peer.get("Online")),
+                "last_seen": str(peer.get("LastSeen") or ""),
+                "self": bool(peer.get("_self")),
+                "source": "snapshot",
+            })
+    except Exception:  # noqa: BLE001
+        return [], made
+    return out, made
+
+
+def _last_seen_ago(stamp: str) -> float | None:
+    """Seconds since an RFC3339 stamp, or None. Tailscale writes the zero
+    time for a node that has never been seen; that is not 2000 years ago,
+    it is nothing."""
+    raw = str(stamp or "")
+    if not raw or raw.startswith("0001-01-01"):
+        return None
+    try:
+        from datetime import datetime, timezone
+        clean = raw.strip()
+        if clean.endswith("Z"):
+            clean = clean[:-1] + "+00:00"
+        # Tailscale writes a single fractional digit. Dropping the
+        # fraction entirely loses nothing anybody is going to read.
+        if "." in clean:
+            head, tail = clean.split(".", 1)
+            clean = head + tail.lstrip("0123456789")
+        when = datetime.fromisoformat(clean)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, time.time() - when.timestamp())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ago_words(secs: float | None) -> str:
+    if secs is None:
+        return ""
+    if secs < 90:
+        return "%.0fs ago" % secs
+    if secs < 5400:
+        return "%.0f min ago" % (secs / 60)
+    if secs < 172800:
+        return "%.1f h ago" % (secs / 3600)
+    return "%.0f days ago" % (secs / 86400)
+
+
+def tailnet_peers(fresh: bool = False) -> dict[str, Any]:
+    """Who else is on this tailnet, and can we reach them RIGHT NOW.
+
+    BLOCKING - a DNS query and up to two connects per device. Every caller
+    runs it in a thread."""
+    if not fresh and time.time() - float(_PEERS_CACHE.get("at") or 0) < PEERS_TTL:
+        return _PEERS_CACHE["data"]
+    v4, _v6 = _tailnet_ips()
+    magic = _magicdns_name(v4)
+    domain = magic.split(".", 1)[1] if "." in magic else ""
+    rows: dict[str, dict[str, Any]] = {}
+    snap, made = _snapshot_peers()
+    for peer in snap:
+        rows[peer["ip"]] = dict(peer)
+    # The device book: a name the operator gave us, resolved through
+    # MagicDNS every time, because a tailnet address can move.
+    for name, row in ((reach_book().get("devices") or {})).items():
+        full = name if "." in name else ("%s.%s" % (name, domain) if domain else name)
+        ip = _magicdns_a(full)
+        if not ip:
+            rows.setdefault("name:" + name, {
+                "name": name, "dns": full, "os": "", "ip": "",
+                "online": False, "last_seen": "", "self": False,
+                "source": "book", "note": str(row.get("note") or ""),
+                "unknown": True})
+            continue
+        got = rows.get(ip) or {}
+        rows[ip] = dict(got, **{
+            "name": got.get("name") or name, "dns": got.get("dns") or full,
+            "ip": ip, "os": got.get("os") or "", "self": bool(got.get("self")),
+            "online": bool(got.get("online")),
+            "last_seen": got.get("last_seen") or "",
+            "source": got.get("source") or "book",
+            "note": str(row.get("note") or "")})
+    if v4 and v4 not in rows:
+        rows[v4] = {"name": (magic.split(".")[0] or "this station"),
+                    "dns": magic, "os": "linux", "ip": v4, "online": True,
+                    "last_seen": "", "self": True, "source": "self"}
+    # The live half. A snapshot says what WAS true; this says what is.
+    live = [r for r in rows.values() if r.get("ip")]
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for row, got in zip(live, pool.map(
+                    lambda r: _peer_answers(r["ip"]), live)):
+                row.update({"answers": bool(got.get("answers")),
+                            "probe_ms": got.get("ms"),
+                            "probe_why": got.get("why")})
+    except Exception:  # noqa: BLE001
+        pass
+    out: list[dict[str, Any]] = []
+    for row in rows.values():
+        ago = _last_seen_ago(str(row.get("last_seen") or ""))
+        row["ago"] = ago
+        row["ago_say"] = _ago_words(ago)
+        if row.get("self"):
+            row["say"] = "this station"
+        elif row.get("unknown"):
+            row["say"] = ("the tailnet does not know a machine called %s - "
+                          "check the name Tailscale shows for it"
+                          % row.get("name"))
+        elif row.get("answers"):
+            row["say"] = "signed in and answering now"
+        elif row.get("online"):
+            row["say"] = ("the tailnet says it is online but it did not "
+                          "answer a connection")
+        else:
+            row["say"] = ("not on the tailnet right now - its Tailscale is "
+                          "logged out, switched off, or the device is asleep"
+                          + (" (last seen %s)" % row["ago_say"]
+                             if row["ago_say"] else ""))
+        out.append(row)
+    out.sort(key=lambda r: (not r.get("self"), not r.get("answers"),
+                            str(r.get("name") or "")))
+    reachable = [r for r in out if r.get("answers") and not r.get("self")]
+    data = {
+        "at": time.time(),
+        "peers": out,
+        "reachable": len(reachable),
+        "tailnet": magic,
+        "domain": domain,
+        "snapshot_at": made,
+        "snapshot_ago": (round(time.time() - made) if made else None),
+        # The container cannot read the netmap. This is the one host
+        # command that hands it over, and the line that keeps it fresh.
+        "how": ('ssh %s "tailscale status --json > '
+                '~/pinevoice-stack/spark-agent/data/tailnet_peers.json"'
+                % _ssh_target()),
+        "how_repeat": ('*/5 * * * * tailscale status --json > '
+                       '$HOME/pinevoice-stack/spark-agent/data/'
+                       'tailnet_peers.json'),
+        "say": ("nothing but this station is on the tailnet right now"
+                if not reachable else
+                "%d device(s) are on the tailnet and answering: %s"
+                % (len(reachable),
+                   ", ".join(str(r.get("name")) for r in reachable))),
+    }
+    _PEERS_CACHE.update({"at": time.time(), "data": data})
+    return data
+
+
+# The roads, and who can walk each one. This is the sentence the panel was
+# missing: a link is not "a link", it is a road, and the roads differ in
+# exactly who can open them.
+LINK_ROADS = {
+    "funnel": "anyone you send it to, from anywhere - no Tailscale, no "
+              "account, no invitation",
+    "tailnet": "only a device signed in to your tailnet - a phone whose "
+               "Tailscale is logged out cannot open it",
+    "lan": "only something on your own wifi",
+    "host": "only on your own wifi, and only where .local names resolve",
+    "other": "whoever can reach that address",
+}
+
+
+def link_road(url: str, net: dict[str, Any] | None = None) -> dict[str, Any]:
+    """[#1252] Which road this link takes, and therefore who can open it."""
+    raw = str(url or "")
+    host = ""
+    port = None
+    scheme = ""
+    try:
+        bits = urlparse(raw)
+        host = str(bits.hostname or "").lower()
+        port = bits.port
+        scheme = str(bits.scheme or "").lower()
+    except Exception:  # noqa: BLE001
+        pass
+    magic = str(((net or {}).get("tailscale") or {}).get("magicdns") or "").lower()
+    if not host:
+        return {"road": "", "public": False, "say": "that is not an address"}
+    if scheme == "https" and magic and host == magic and not port:
+        road = "funnel"
+    elif _is_tailnet_ip(host) or (magic and host == magic):
+        road = "tailnet"
+    elif host.endswith(".local"):
+        road = "host"
+    elif (host.startswith("10.") or host.startswith("192.168.")
+          or host == "localhost" or host.startswith("127.")
+          or (host.startswith("172.") and host.split(".")[1:2]
+              and host.split(".")[1].isdigit()
+              and 16 <= int(host.split(".")[1]) <= 31)):
+        road = "lan"
+    else:
+        road = "other"
+    return {"road": road, "public": road == "funnel",
+            "say": LINK_ROADS.get(road, LINK_ROADS["other"])}
+
+
+def road_warning(road: str, scope: str) -> str:
+    """[#1252] The trap that cost eight days: a FULL link cannot ride the
+    public door. PUBLIC_PORT downgrades a full token to listen on purpose
+    - a public-facing door does not open the studio no matter what it is
+    shown - so "full access" and "works without Tailscale" can never both
+    be true of one link, and the panel used to offer both with no word
+    about it."""
+    if str(scope) == "full" and str(road) == "funnel":
+        return ("this is a FULL link on the public door, and the public "
+                "door only ever opens the listener side - it will work as "
+                "a tune-in link and nothing more. A full link has to go "
+                "over the tailnet.")
+    if str(scope) == "full" and str(road) in ("lan", "host"):
+        return ("a full link on this address only works from your own "
+                "network - from the road it opens nothing.")
+    return ""
+
+
+def share_qr(url: str) -> str:
+    """[#1252] The link as a picture, or "" when the encoder is not
+    installed. A link you have to type into a phone is a link nobody
+    uses."""
+    if not _qr_svg or not url:
+        return ""
+    try:
+        return _qr_svg(str(url))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 # --- Share links (#632) -----------------------------------------------------
 # A tune-in link is a SIGNED token, never the API key: it expires, it can be
 # revoked, and it only opens the six routes a listener needs.
@@ -13323,6 +13986,37 @@ def write_shares(rows: dict[str, Any]) -> None:
 
 def share_epoch() -> int:
     return int((read_shares().get("epoch") or 1))
+
+
+# [#1252] THE TAGS THE OPERATOR HAS KILLED.
+#
+# MEASURED 2026-09-21: a link revoked through POST /api/share/revoke with
+# a tag was still answering 200 over the public funnel afterwards. That
+# route pops the row out of shares.json and nothing else; token_scope()
+# below checks the signature, the expiry and the epoch, and knew nothing
+# about that list. So the ✕ beside every link in the panel removed the
+# link from the LIST and left the link WORKING, for up to the ninety days
+# the panel is willing to mint.
+#
+# A deny list rather than "the tag must still be in links": additive, so
+# nothing that works today stops working, and a token whose row was lost
+# for any other reason is not collateral.
+#
+# Cached for five seconds because this is on the hot path - every listener
+# request verifies a token - and a json read per request is the shape of
+# the stall #1156 measured.
+_REVOKED_TAGS: dict[str, Any] = {"at": 0.0, "tags": frozenset()}
+
+
+def share_revoked() -> frozenset:
+    if time.time() - float(_REVOKED_TAGS.get("at") or 0) > 5.0:
+        try:
+            tags = frozenset(
+                str(t) for t in (read_shares().get("revoked") or []))
+        except Exception:  # noqa: BLE001
+            tags = _REVOKED_TAGS.get("tags") or frozenset()
+        _REVOKED_TAGS.update({"at": time.time(), "tags": tags})
+    return _REVOKED_TAGS["tags"]
 
 
 # A link is one of two things, and the difference is signed into it so it
@@ -13359,6 +14053,8 @@ def token_scope(token: str) -> str:
         expires, tag, _sig = raw.split(".", 2)
         if int(expires) < time.time():
             return ""
+        if tag in share_revoked():                       # [#1252]
+            return ""                                    # the ✕ means it
         if hmac.compare_digest(listen_token(int(expires), tag, scope), token):
             return scope
     except Exception:
@@ -24708,6 +25404,44 @@ except Exception as _bank_import_error:  # noqa: BLE001
         _bank_import_error,)
 else:
     _BANK_WHY = ""
+# [#1211] THE FOUR ROOMS, AND MADE AGAINST HEARD - the server half of
+# #1202, which was never written. The panel has drawn both panes since
+# that night and both have said "could not be counted", correctly:
+# measured 2026-09-21 22:34, /api/orchestrator/glass carried at, on,
+# paused, boot_at, up_seconds, keepers, live, recent, tail_depth,
+# tail_most, oldest_at, coverage, face, roads, commission, plan_why and
+# pressure - and neither `rooms` nor `waste`.
+#
+# Guarded exactly like the bank above it, and for the same reason: a
+# module that can throw out of here would be a new way for the station to
+# fail to reach the air, and this road exists to explain why work is not
+# reaching it.
+try:
+    import orchestrator_rooms as _rooms_module                 # [#1211]
+except Exception as _rooms_import_error:  # noqa: BLE001
+    _rooms_module = None
+    _ROOMS_WHY = ("orchestrator_rooms could not be imported: %r"
+                  % (_rooms_import_error,))
+else:
+    _ROOMS_WHY = ""
+
+
+def orch_rooms_view() -> dict[str, Any]:                       # [#1211]
+    """The four rooms and the made-against-heard account. Never raises.
+
+    CALL THIS ON A THREAD. It walks the larder, every shelf and the
+    pantry, and asks the air's own `cupboard_why_row` about the oldest
+    sixty never-heard rounds. The module memoises for twelve seconds, so
+    a tablet and two desks with the pop-up open cost one walk between
+    them; this wrapper adds nothing but the guard."""
+    if _rooms_module is None:
+        return {"why": _ROOMS_WHY or "the rooms ledger is not installed"}
+    import sys as _sys
+    try:
+        return dict(_rooms_module.rooms_and_waste(_sys.modules[__name__]))
+    except Exception as exc:  # noqa: BLE001
+        return {"why": "the rooms ledger could not be read (%s)"
+                       % type(exc).__name__}
 # What the standing producer last did, for /api/bank and the console.
 _BANK_PRODUCER: dict[str, Any] = {"at": 0.0, "runs": 0, "made": 0,
                                   "last": {}}                  # [#1184]
@@ -32539,8 +33273,14 @@ def audio_owner() -> str:
         return ""
 
 
-def listener_note(who: str, addr: str = "", agent: str = "") -> None:
-    """Remember enough about a player to tell two of them apart."""
+def listener_note(who: str, addr: str = "", agent: str = "",
+                  public: bool = False) -> None:
+    """Remember enough about a player to tell two of them apart.
+
+    [#1185] `public` says the poll arrived through the public listener
+    door, which is the one fact about a player that its address cannot
+    carry: a phone in the car and a browser in the kitchen look the same
+    from here otherwise."""
     try:
         if not who:
             return
@@ -32550,33 +33290,195 @@ def listener_note(who: str, addr: str = "", agent: str = "") -> None:
             row["addr"] = str(addr)[:60]
         if agent:
             row["agent"] = str(agent)[:120]
+        if public:                                            # [#1185]
+            row["public"] = True
     except Exception:  # noqa: BLE001
         pass
+
+
+# [#1185] WHAT A LISTENER IS, AND ONE ROW PER SURFACE.
+#
+# The station used to answer "a browser tab" about every player, because
+# from its side that is all any of them are: a page polling the clock.
+# Every client then had to guess the rest by matching the player's ADDRESS
+# against the `terminals` table - and an address is a MACHINE, while a
+# listener is a SURFACE. Two surfaces on one machine both matched the one
+# row, so the roster showed two identical names for one address and the
+# real application was indistinguishable from a browser window left open
+# beside it.
+#
+# Three of the four surfaces name themselves, and those names are
+# unforgeable enough for this purpose because nothing else mints them:
+#
+#   desktop-<rand>            the Electron shell (renderer.js
+#                             desktopListenerId)
+#   ...PineBoxKiosk/<ver>     the kiosk WebView's user agent
+#                             (MainActivity.kt desktopUserAgent)
+#   x-pinebox-public: 1       came in through the public listener door,
+#                             so it is somebody on a tune-in link
+#   anything else             a web page
+#
+# The row key is (kind, address). Two surfaces of the same kind at one
+# address are one device that reloaded - a listener id is minted fresh on
+# every page load - so they collapse into a single row that keeps the
+# freshest id, which is the id /api/radio/solo has to be given. The app
+# and a browser tab on the same PC are different KINDS and stay apart,
+# which is the distinction that was missing.
+LISTENER_WHAT = {
+    "app": "the Pine Box app",
+    "pinetab": "the PineTab",
+    "tune": "a tune-in link",
+    "page": "a web page",
+}
+
+
+def listener_kind(who: str, agent: str = "", public: bool = False) -> str:
+    """[#1185] Which of the four surfaces this player is."""
+    name = str(who or "")
+    said = str(agent or "")
+    if name.startswith("desktop-"):
+        return "app"
+    if "PineBoxKiosk" in said:
+        return "pinetab"
+    if public:
+        return "tune"
+    return "page"
+
+
+def listener_device(kind: str, addr: str, table: dict[str, Any],
+                    who: str = "") -> str:
+    """[#1185] Which `terminals` row this surface is, or "".
+
+    A row that NAMES a listener is spoken for and matches nothing else.
+    After that the two self-declaring surfaces take their own rows by
+    name - never by address - and only a plain web page is allowed to
+    claim a row by address, and then only a row that neither of them
+    owns. Without that last rule a browser window on the desk claims the
+    application's row, takes its name and its volumes, and the operator
+    is setting the levels of a page he is not listening to."""
+    rows = table or {}
+    if who:
+        for key, row in rows.items():
+            if str((row or {}).get("listener") or "") == who:
+                return key
+    if kind == "app":
+        return "desktop" if "desktop" in rows else ""
+    if kind == "pinetab":
+        return "pinetab" if "pinetab" in rows else ""
+    if kind != "page" or not addr:
+        return ""
+    for key, row in rows.items():
+        if key in ("desktop", "pinetab"):
+            continue
+        if str((row or {}).get("listener") or ""):
+            continue
+        if str((row or {}).get("addr") or "") == addr:
+            return key
+    return ""
+
+
+def listener_name(kind: str, device: str, addr: str,
+                  table: dict[str, Any]) -> str:
+    """[#1185] What to call this surface on a row a thumb reads."""
+    named = str(((table or {}).get(device) or {}).get("name") or "") \
+        if device else ""
+    if named:
+        return named
+    if kind == "pinetab":
+        return "PineTab"
+    if kind == "app":
+        return "the Pine Box app"
+    if kind == "tune":
+        return "a tune-in link"
+    # Deliberately without the address: the row carries `addr` beside
+    # this, and a name that repeats it reads as two different facts.
+    return "a web page"
 
 
 def listener_roster() -> list[dict[str, Any]]:
-    """#1008: every player on this broadcast, so two of them is a fact
-    rather than a mystery. The agent string is trimmed to the part that
-    tells an Electron shell from a browser tab."""
+    """#1008/[#1185]: every player on this broadcast, named by what it IS,
+    one row per surface.
+
+    The old answer was "a browser tab" for all of them and one row per
+    listener id, which meant a page that had reloaded inside the last
+    thirty seconds showed up twice and the application showed up beside a
+    browser window under the same borrowed name. See the note above
+    listener_kind for why the address cannot settle this and what can.
+
+    Every field the previous shape carried is still here - `listener`,
+    `seen`, `since`, `addr`, `what`, `owns_air` - so a client that has not
+    been taught the new ones keeps working; `what` is simply true now."""
     out: list[dict[str, Any]] = []
     try:
         now = time.time()
+        owner = audio_owner()
+        table = terminal_rows()
+        rows: dict[str, dict[str, Any]] = {}
         for who, when in sorted(_LISTENERS.items(), key=lambda kv: kv[1]):
-            row = _LISTENER_SEEN.get(who) or {}
-            agent = str(row.get("agent") or "")
-            short = ("the desktop app" if "Electron" in agent
-                     else "a browser tab" if agent else "unknown")
-            out.append({
-                "listener": who,
-                "seen": round(now - float(when or now), 1),
-                "since": round(now - float(row.get("first") or now), 1),
-                "addr": str(row.get("addr") or ""),
-                "what": short,
-                "owns_air": who == audio_owner(),
-            })
+            seen = _LISTENER_SEEN.get(who) or {}
+            agent = str(seen.get("agent") or "")
+            addr = str(seen.get("addr") or "")
+            kind = listener_kind(who, agent, bool(seen.get("public")))
+            device = listener_device(kind, addr, table, who)
+            ago = round(now - float(when or now), 1)
+            since = round(now - float(seen.get("first") or now), 1)
+            key = "%s@%s" % (kind, addr or who)
+            row = rows.get(key)
+            if row is None:
+                rows[key] = {
+                    "listener": who,
+                    "kind": kind,
+                    "what": LISTENER_WHAT.get(kind, "a web page"),
+                    "name": listener_name(kind, device, addr, table),
+                    "device": device,
+                    "addr": addr,
+                    "agent": agent[:60],
+                    "seen": ago,
+                    "since": since,
+                    # How many listener ids collapsed into this one row.
+                    # More than one is a page that reloaded, or two tabs
+                    # of the same thing - not a second device.
+                    "surfaces": 1,
+                    "ids": [who],
+                    "owns_air": who == owner,
+                }
+                continue
+            row["surfaces"] += 1
+            row["ids"].append(who)
+            row["since"] = max(row["since"], since)
+            # The freshest id is the one /api/radio/solo must be handed -
+            # a stale one names a page that is already gone. An id that
+            # holds the air outranks even that, because it is the one the
+            # station is actually gagging everybody else for.
+            if ago <= row["seen"]:
+                row["seen"] = ago
+                row["listener"] = who
+            if who == owner:
+                row["owns_air"] = True
+                row["listener"] = who
+            if not row["device"] and device:
+                row["device"] = device
+                row["name"] = listener_name(kind, device, addr, table)
+        out = sorted(rows.values(),
+                     key=lambda r: (not r["owns_air"], r["kind"], r["addr"]))
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+def listener_census(rows: list[dict[str, Any]]) -> str:
+    """[#1185] One sentence naming the surfaces, not counting anonymous
+    tabs. "the Pine Box app, the PineTab and a web page" reads; "3
+    players" does not."""
+    try:
+        names = [str(r.get("what") or "") for r in rows if r.get("what")]
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+        return ", ".join(names[:-1]) + " and " + names[-1]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _radio_listeners(seen: str = "") -> int:
@@ -113950,7 +114852,9 @@ async def radio_clock_api(
         try:
             listener_note(listener[:64],
                           str(getattr(request.client, "host", "") or ""),
-                          str(request.headers.get("user-agent") or ""))
+                          str(request.headers.get("user-agent") or ""),
+                          # [#1185] the one fact the address cannot carry
+                          request.headers.get("x-pinebox-public") == "1")
         except Exception:  # noqa: BLE001
             pass
     track = _RADIO.get("now") or {}
@@ -114012,16 +114916,25 @@ async def radio_listeners_api(
     require_read_auth(authorization)
     rows = listener_roster()
     owner = audio_owner()
+    # [#1185] Name them. A count answers "how many", which was never the
+    # question - "which of my things is making noise" was.
+    census = listener_census(rows)
+    held = next((r for r in rows if r.get("owns_air")), None)
     return {
         "listeners": rows,
         "audio_owner": owner,
+        # [#1185] how many listener ids collapsed away, so a client can
+        # say "one device, two tabs" rather than draw the tab twice
+        "surfaces": sum(int(r.get("surfaces") or 1) for r in rows),
         "say": ("nobody is listening" if not rows else
-                (f"{len(rows)} players are on this broadcast"
-                 + (f" and {owner} owns the air - the rest are muted"
+                (f"{census} are on this broadcast"
+                 + (" and %s owns the air - the rest are muted"
+                    % str((held or {}).get("what") or owner)
                     if owner else
-                    " - if that is one machine, they will be playing over "
-                    "each other. Give one of them the air.")
-                 ) if len(rows) > 1 else "one player, no overlap possible"),
+                    " - they will be playing over each other. Give one of "
+                    "them the air.")
+                 ) if len(rows) > 1 else
+                "%s, no overlap possible" % census),
     }
 
 
@@ -118801,6 +119714,216 @@ def tablet_sweep(port: int = 0, base: str = "") -> dict[str, Any]:
                     % (base, port))}
 
 
+# --- [#1209] THE TABLET FINDER ----------------------------------------
+# See the note in the patch that introduced this for the measurements.
+# In short: a port scan cannot find a tablet whose debugging port is shut,
+# and a MAC cannot name one that randomises its address - but a device
+# that fetched the show from us four seconds ago with the kiosk's user
+# agent IS the tablet, whatever its ports are doing.
+#
+# Everything here is a QUESTION except `tablet_use`, which writes an
+# address down on this side. Nothing touches the tablet, and nothing here
+# may ever run on the event loop: the sweep is 254 connects.
+TABLET_FIND_PORTS = tuple(
+    int(p) for p in str(
+        os.getenv("PINE_TABLET_PORTS", "5555,5037,8080")).replace(" ", "").split(",")
+    if p.strip().isdigit())
+
+# Only the prefixes worth naming. Anything else shows its own OUI and no
+# guess - a vendor table that invents an answer is worse than a blank,
+# and this one is never the evidence that decides anything.
+TABLET_OUI = {
+    "b8:27:eb": "Raspberry Pi", "dc:a6:32": "Raspberry Pi",
+    "e4:5f:01": "Raspberry Pi", "28:cd:c1": "Raspberry Pi",
+    "24:0a:c4": "Espressif", "30:ae:a4": "Espressif",
+    "8c:aa:b5": "Espressif", "3c:71:bf": "Espressif",
+    "a4:83:e7": "Apple", "f0:18:98": "Apple", "88:66:5a": "Apple",
+    "3c:07:54": "Apple", "68:ab:bc": "Apple", "00:1c:b3": "Apple",
+    "3c:5a:b4": "Google", "f4:f5:e8": "Google", "1c:f2:9a": "Google",
+    "44:65:0d": "Amazon", "f0:27:2d": "Amazon", "68:37:e9": "Amazon",
+    "5c:0a:5b": "Samsung", "78:bd:bc": "Samsung", "00:12:fb": "Samsung",
+    "00:15:5d": "Microsoft (Hyper-V)", "28:18:78": "Microsoft",
+    "48:b0:2d": "NVIDIA", "00:04:4b": "NVIDIA",
+    "00:0e:58": "Sonos", "5c:aa:fd": "Sonos",
+    "24:5a:4c": "Ubiquiti", "fc:ec:da": "Ubiquiti",
+    "50:c7:bf": "TP-Link", "a4:2b:b0": "TP-Link",
+    "94:e6:f7": "Intel",
+}
+
+
+def _mac_vendor(mac: str) -> str:
+    """Who made this, when that can be known honestly."""
+    raw = str(mac or "").lower().replace("-", ":")
+    bits = raw.split(":")
+    if len(bits) < 3 or raw.startswith("00:00:00:00"):
+        return ""
+    try:
+        first = int(bits[0], 16)
+    except ValueError:  # noqa: BLE001
+        return ""
+    if first & 0x02:
+        # Not a manufacturer's address at all: the device invented it.
+        # Android, iOS and Windows all randomise per network, so this is
+        # itself a hint rather than a dead end - and it is exactly what
+        # the PineTab does.
+        return "randomised - a phone or tablet hiding its maker"
+    return TABLET_OUI.get(":".join(bits[:3]), "")
+
+
+def _find_row_verdict(row: dict[str, Any], lan: str) -> dict[str, Any]:
+    """How likely this is the tablet, and the plain words for why."""
+    score = 0
+    why: list[str] = []
+    if row.get("kiosk"):
+        score += 60
+        why.append("it is running the kiosk app - it calls itself "
+                   "PineBoxKiosk")
+    ago = row.get("asked_ago")
+    if ago is not None and float(ago) < 120:
+        score += 25
+        why.append("it asked this station for the show %.0fs ago" % float(ago))
+    elif ago is not None:
+        why.append("it last asked this station for something %.0fs ago"
+                   % float(ago))
+    if row.get("open"):
+        score += 20
+        why.append("its wireless debugging port answered in %.0fms"
+                   % float(row.get("ms") or 0))
+    if row.get("known"):
+        score += 10
+        why.append("this is the address the station already uses")
+    if row.get("vendor", "").startswith("randomised"):
+        score += 5
+    if row.get("mac") and not row.get("open") and ago is None:
+        why.append("it is on this network but has not spoken to the station")
+    if str(row.get("host") or "").endswith(".1"):
+        score -= 60
+        why.append("this is almost certainly the router")
+    if lan and row.get("host") == lan:
+        score -= 80
+        why.append("this is the station itself")
+    row["score"] = score
+    row["why"] = "; ".join(why) or "nothing is known about it beyond its address"
+    return row
+
+
+def tablet_find(query: str = "", port: int = 0, base: str = "",
+                deep: bool = True) -> dict[str, Any]:
+    """Every candidate on the station's own /24, with what is known about
+    each. BLOCKING - every caller runs it in a thread."""
+    port = int(port or TABLET_ADB_PORT)
+    base = str(base or _local_subnet())
+    started = time.monotonic()
+    known = tablet_address()
+    lan = _route_source_ip()
+    arp = {r["ip"]: r for r in _arp_table() if r.get("flags") != "0x0"}
+    hosts = ["%s.%d" % (base, n) for n in range(1, 255)]
+    answered: dict[str, dict[str, Any]] = {}
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=TABLET_SWEEP_WIDE) as pool:
+            for host, got in zip(hosts, pool.map(
+                    lambda h: _tcp_open(h, port, TABLET_SWEEP_TIMEOUT), hosts)):
+                if got.get("open"):
+                    answered[host] = got
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "base": base, "port": port, "rows": [],
+                "why": "%s: %s" % (type(exc).__name__, str(exc)[:120]),
+                "say": "the finder could not run"}
+    now = time.time()
+    prefix = base + "."
+    asked_here = {h: r for h, r in _SEEN.items() if str(h).startswith(prefix)}
+    found = sorted(
+        {h for h in (set(answered) | set(arp) | set(asked_here))
+         if str(h).startswith(prefix)},
+        key=lambda h: int(str(h).rsplit(".", 1)[-1] or 0))
+    rows: list[dict[str, Any]] = []
+    for host in found:
+        near = arp.get(host) or {}
+        asked = asked_here.get(host) or {}
+        agent = str(asked.get("agent") or "")
+        mac = str(near.get("mac") or "")
+        rows.append(_find_row_verdict({
+            "host": host,
+            "mac": mac,
+            "vendor": _mac_vendor(mac),
+            "iface": str(near.get("device") or ""),
+            "port": port,
+            "open": bool(answered.get(host)),
+            "ms": (answered.get(host) or {}).get("ms"),
+            "agent": agent[:80],
+            "asked_ago": (round(now - float(asked.get("at") or 0), 1)
+                          if asked.get("at") else None),
+            "asked_for": str(asked.get("what") or "")[:40],
+            "kiosk": "PineBoxKiosk" in agent,
+            "known": host == known,
+            "configured": host == TABLET_HOST,
+            "ports": {},
+        }, lan))
+    # The extra ports, asked only of the handful we already have reason to
+    # look at. Sweeping three ports across a /24 would triple the cost for
+    # no new candidates.
+    extra = [p for p in TABLET_FIND_PORTS if int(p) != port]
+    if deep and extra and rows:
+        look = [r for r in rows if r["score"] > 0 or r["mac"]][:40]
+        jobs = [(r, p) for r in look for p in extra]
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=TABLET_SWEEP_WIDE) as pool:
+                for (row, p), got in zip(jobs, pool.map(
+                        lambda j: _tcp_open(j[0]["host"], j[1],
+                                            TABLET_SWEEP_TIMEOUT), jobs)):
+                    if got.get("open"):
+                        row["ports"][str(p)] = got.get("ms")
+        except Exception:  # noqa: BLE001
+            pass
+    rows.sort(key=lambda r: (-int(r.get("score") or 0),
+                             int(str(r["host"]).rsplit(".", 1)[-1] or 0)))
+    best = rows[0] if rows and int(rows[0].get("score") or 0) >= 40 else None
+    # The search is over everything the row SAYS, not just its address, so
+    # "kiosk", "randomised", "PineTab" and "5555" all find it.
+    want = " ".join(str(query or "").lower().split())
+    shown = rows
+    if want:
+        def hit(r: dict[str, Any]) -> bool:
+            hay = " ".join(str(r.get(k) or "") for k in (
+                "host", "mac", "vendor", "iface", "agent", "why",
+                "asked_for")).lower()
+            hay += " " + " ".join(
+                [str(r.get("port") or "")] + list(r.get("ports") or {}))
+            if r.get("known"):
+                hay += " remembered current known tablet"
+            if r.get("kiosk"):
+                hay += " kiosk pinetab tablet"
+            return all(w in hay for w in want.split())
+        shown = [r for r in rows if hit(r)]
+    return {
+        "ok": True, "base": base, "port": port, "query": want,
+        "rows": shown, "total": len(rows), "scanned": len(hosts),
+        "answered": len(answered), "remembered": known,
+        "configured": TABLET_HOST,
+        "best": best,
+        "seconds": round(time.monotonic() - started, 2),
+        "say": (("%s is almost certainly the tablet - %s"
+                 % (best["host"], best["why"])) if best else
+                ("%d device(s) on %s.0/24, none of them recognisably the "
+                 "tablet. If it is playing the station it will be in this "
+                 "list; pick it and the station will remember it."
+                 % (len(rows), base))),
+    }
+
+
+def tablet_use(host: str) -> dict[str, Any]:
+    """[#1209] Use this address from now on. The one rung here that
+    writes anything, and it writes on THIS side only."""
+    host = str(host or "").strip()
+    if not host:
+        return {"ok": False, "say": "no address was given to use"}
+    _tablet_remember(host, "picked from the finder")
+    return {"ok": True, "host": host,
+            "say": "the tablet is %s from now on - the mirror, the camera "
+                   "and the terminal use that address" % host}
+
 def tablet_look() -> dict[str, Any]:
     """Every layer of "is the tablet there", from the wire upwards.
 
@@ -118901,6 +120024,18 @@ TABLET_STEPS: list[dict[str, str]] = [
      "say": "Walk the whole /24 for anything answering on the debugging "
             "port. This is what finds a tablet whose address has moved.",
      "tone": "deep"},
+    # [#1209] the searchable half: every candidate on the network, with
+    # what is known about each and how sure the station is.
+    {"key": "find", "label": "Find it on the network",
+     "say": "List every device on this network with what is known about "
+            "it - its address, its hardware address and maker, how fast "
+            "it answered, and whether it has asked this station for the "
+            "show. Search it by any of those.",
+     "tone": "deep"},
+    {"key": "use", "label": "Use this one",
+     "say": "Write the address you picked down as the tablet's, so the "
+            "mirror, the camera and the terminal all use it.",
+     "tone": "do"},
     {"key": "adopt", "label": "Use the address we found",
      "say": "Write the swept address down as the tablet's, so the mirror, "
             "the camera and the terminal all use it from now on.",
@@ -118942,6 +120077,12 @@ def tablet_step(action: str, host: str = "") -> dict[str, Any]:
                         "network has answered for it" % target)}
     if action == "sweep":
         return {"action": action, **tablet_sweep()}
+    if action == "find":                                      # [#1209]
+        # `host` is the search box here - the ladder only ever hands one
+        # free-text argument down, and a finder wants a query.
+        return {"action": action, **tablet_find(host)}
+    if action == "use":                                       # [#1209]
+        return {"action": action, **tablet_use(host)}
     if action == "adopt":
         got = tablet_sweep()
         picks = [r for r in got.get("found") or []
@@ -123268,6 +124409,28 @@ async def tablet_doctor_api(
                    % (", ".join(TABLET_ACTIONS), action))
     host = str((payload or {}).get("host") or "").strip()
     return await asyncio.to_thread(tablet_step, action, host)
+
+
+@app.get("/api/tablet/find")
+async def tablet_find_api(
+    q: str = "",
+    port: int = 0,
+    base: str = "",
+    deep: int = 1,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """[#1209] Every device on the station's own network, searchable, with
+    what is known about each and which one is the tablet.
+
+    254 connects and a neighbour-table read - it runs on a thread, never
+    on the loop."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    got = await asyncio.to_thread(tablet_find, q, port, base, bool(deep))
+    got["ports_probed"] = list(TABLET_FIND_PORTS)
+    return got
 
 
 @app.get("/api/tablet/seen")
@@ -129558,7 +130721,278 @@ async def api_orch_glass(
     (#1091 was exactly that mistake, and it turned a coordinator decision
     into a browser poll)."""
     require_read_auth(authorization)
-    return orch_glass_state(max(1, min(200, int(most))))
+    state = orch_glass_state(max(1, min(200, int(most))))
+
+    # [#1211] AND THE THREE THINGS THIS PAYLOAD NEVER CARRIED.
+    #
+    # `rooms` and `waste` are the #1202 panes' own keys; `asks` is what
+    # the orchestrator wants decided, so the row can be answered where it
+    # is read rather than in a second surface. All of it is composed on a
+    # WORKER THREAD - orch_rooms_view walks every shelf and asks the air
+    # road why sixty rounds are not on it, which is not work for the loop
+    # that carries the audio. The docstring above still holds: this moves
+    # no clock, commissions nothing and writes nothing.
+    def _extra() -> dict[str, Any]:                            # [#1211]
+        got = orch_rooms_view()
+        got["asks"] = orch_glass_asks()
+        # ON THE THREAD TOO, and this one is not obvious: orch_verbs()
+        # calls inspect.getsource(orch_apply), which READS app.py OFF DISK.
+        # A ten-megabyte file read on the event loop every five seconds,
+        # from a panel whose whole argument is that it must not be able to
+        # cause a stall, would be the joke writing itself.
+        got["commands"] = orch_command_help()
+        return got
+
+    try:
+        extra = await asyncio.to_thread(_extra)
+    except Exception as exc:  # noqa: BLE001
+        extra = {"why": "the rooms ledger could not be taken (%s)"
+                        % type(exc).__name__}
+    if isinstance(extra.get("rooms"), list):
+        state["rooms"] = extra["rooms"]
+    if isinstance(extra.get("waste"), dict):
+        state["waste"] = extra["waste"]
+    if isinstance(extra.get("asks"), list):
+        state["asks"] = extra["asks"]
+    # A KEY IS A MEASUREMENT OR IT IS ABSENT. Nothing above defaults to an
+    # empty list: the panel reads an absent key as "could not be counted"
+    # and names what it looked for, and a zero drawn over a failure is the
+    # exact lie #1202 was written to stop. `rooms_why` is the sentence,
+    # when there is one.
+    if extra.get("why"):
+        state["rooms_why"] = str(extra["why"])[:300]
+    if extra.get("rooms_say"):
+        state["rooms_say"] = str(extra["rooms_say"])[:400]
+    if extra.get("window_seconds"):
+        state["rooms_window_seconds"] = int(extra["window_seconds"])
+    if isinstance(extra.get("commands"), list):
+        state["commands"] = extra["commands"]
+    return state
+
+
+def orch_glass_asks() -> list[dict[str, Any]]:                  # [#1211]
+    """The open questionnaires, shaped so the glass can answer them.
+
+    "The rows must be answerable in place." They were reachable only from
+    the panel's own asks popup, so a question the orchestrator raised
+    while the operator was reading the glass could be READ there and not
+    DECIDED there. Every option already names the action it takes
+    (`does`), which is the whole vocabulary orch_apply accepts, so the
+    answer road is the one that already exists:
+    POST /api/orchestrator/asks/{id} {"picks": {"<index>": "<does>"}}."""
+    rows: list[dict[str, Any]] = []
+    try:
+        for row in orch_open()[:4]:
+            rows.append({
+                "id": str(row.get("id") or ""),
+                "at": float(row.get("at") or 0),
+                "topic": str(row.get("topic") or ""),
+                "urgency": str(row.get("urgency") or "routine"),
+                "why": str(row.get("why") or "")[:900],
+                "questions": [{
+                    "ask": str(q.get("ask") or ""),
+                    "options": [{"face": str(o.get("face") or ""),
+                                 "does": str(o.get("does") or ""),
+                                 "note": str(o.get("note") or "")[:160]}
+                                for o in (q.get("options") or [])[:4]],
+                } for q in (row.get("questions") or [])[:3]],
+                "answer_url": ("/api/orchestrator/asks/"
+                               + str(row.get("id") or "")),
+                # #1081: the clock the operator is on. An ask nobody
+                # answers is answered by the station, and saying so is the
+                # difference between a question and a deadline.
+                "decides_alone_in": max(0.0, round(
+                    float(ORCH_DECIDE_AFTER.get(
+                        str(row.get("urgency") or "routine"),
+                        ORCH_DECIDE_AFTER.get("routine", 0)) or 0)
+                    - (time.time() - float(row.get("at") or 0)), 1)),
+            })
+    except Exception:  # noqa: BLE001
+        return []
+    return rows
+
+
+# [#1211] THE COMMAND LINE AT THE FOOT OF THE GLASS.
+#
+# "understanding the verbs the orchestrator already has". Every verb here
+# is a door that already existed and was reachable only from somewhere
+# else - the judgment dials from the logic graph, the rungs from the
+# broadcast console, hear and retire from the retirement desk, why from
+# the director's room. Nothing new can be done from this line; what is
+# new is that it can be done from the panel that explains why it needs
+# doing. No verb invents a power (the #1056 rule), and the result is
+# echoed onto the orchestrator's own tail so "what it has been doing, in
+# order" shows the operator's own presses beside the station's.
+ORCH_COMMAND_VERBS: tuple[tuple[str, str], ...] = (            # [#1211]
+    ("help", "list every verb this line understands"),
+    ("more <road> | less <road> | ease <road> | drop <road>",
+     "the judgment dials - the same four the logic graph turns, and every "
+     "turn lands in the judgment book"),
+    ("<verb>:<arg>",
+     "a standing policy, e.g. drive:banter, thin:0.5, drive:none"),
+    ("run <rung>", "one rung of the broadcast ladder, by its key"),
+    ("hear <id>", "put that cupboard round on the air now, out of turn"),
+    ("retire <id>", "take that round out of the cupboard"),
+    ("why <road>", "why that road has nothing behind it"),
+)
+
+
+def orch_command_help() -> list[dict[str, str]]:               # [#1211]
+    """The vocabulary, read off the functions that implement it."""
+    rows = [{"verb": v, "does": d} for v, d in ORCH_COMMAND_VERBS]
+    try:
+        rows.append({"verb": "the policy verbs",
+                     "does": ", ".join(orch_verbs())})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rows.append({"verb": "the rungs",
+                     "does": ", ".join(str(s.get("key") or "")
+                                       for s in BROADCAST_STEPS)})
+    except Exception:  # noqa: BLE001
+        pass
+    return rows
+
+
+def orch_command_echo(text: str, lines: list[str]) -> None:    # [#1211]
+    """Put the command and what it did onto the orchestrator's own tail.
+
+    `_orch_shut` is called by hand because it normally runs at the START
+    of the NEXT turn of the same keeper - which for a command line typed
+    once an hour would mean the press only appeared after the next press.
+    Shutting it here puts it on the tail immediately, which is what "echo
+    its result into the panel's own list" means."""
+    try:
+        name = "the operator's command line"
+        orch_turn(name, str(text)[:120], claim=True)
+        orch_step("command", "$ " + str(text)[:160])
+        for line in list(lines)[:8]:
+            orch_step("command", "  " + str(line)[:190])
+        row = _ORCH_KEEPERS.get(name)
+        if row is not None:
+            _orch_shut(row, time.time())
+        _ORCH_WHO.set("")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def orch_command_run(text: str) -> dict[str, Any]:       # [#1211]
+    """One typed line. Returns {ok, say, lines} and echoes onto the tail."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return {"ok": False, "say": "nothing was typed.", "lines": []}
+    head = raw.split(" ")[0].lower()
+    arg = raw[len(head):].strip()
+    lines: list[str] = []
+    ok = True
+
+    if head in ("help", "?", "verbs"):
+        lines = ["%s - %s" % (r["verb"], r["does"])
+                 for r in orch_command_help()]
+        say = "the verbs this line understands:"
+    elif head in ("more", "less", "ease", "drop") and arg:
+        said = judgment_move(arg.split(" ")[0], head)
+        say = str(said or "the dial did not move")
+        lines = ["the factor for %s is now %.2f"
+                 % (arg.split(" ")[0], coord_judgment_factor(arg.split(" ")[0]))]
+    elif head == "why" and arg:
+        got = await asyncio.to_thread(director_why, arg.split(" ")[0])
+        say = str((got or {}).get("say") or "that road said nothing")
+        for row in ((got or {}).get("entries") or [])[:4]:
+            lines.append("%s - %s: %s" % (str(row.get("label") or "")[:40],
+                                          str(row.get("commit") or ""),
+                                          str(row.get("why") or "")[:120]))
+    elif head in ("hear", "play") and arg:
+        rid = arg.split(" ")[0]
+        kind, row = cupboard_find(rid)
+        if row is None:
+            ok = False
+            say = ("no round with that id is in the cupboard - it may have "
+                   "aired or been retired already")
+        elif not _RADIO.get("on") or radio_paused():
+            ok = False
+            say = "the station is not on air, so nothing can be put out"
+        else:
+            said = await _ready_shelf_air(kind, _RADIO.get("now"),
+                                          rescue=True, pick=row)
+            ok = bool(said)
+            say = (("%d line(s) of that %s round went out" % (len(said), kind))
+                   if said else
+                   "the air's own door refused it - ask why %s" % kind)
+            lines = [str(s)[:160] for s in (said or [])[:6]]
+            if said:
+                _RESCUE_AT[0] = time.time()
+                _UNHEARD_AT[0] = time.time()
+    elif head == "retire" and arg:
+        rid = arg.split(" ")[0]
+        kind, row = cupboard_find(rid)
+        if row is None:
+            ok = False
+            say = "no round with that id is in the cupboard"
+        else:
+            got = retire_decide([rid], "remove", None)
+            say = "that %s round is out of the cupboard" % kind
+            lines = [str(got.get("say") or "")[:160]] if got.get("say") else []
+    elif head in ("run", "step", "rung") and arg:
+        want = arg.split(" ")[0]
+        keys = [str(s.get("key") or "") for s in BROADCAST_STEPS]
+        if want not in keys:
+            ok = False
+            say = "%s is not a rung (%s)" % (want, ", ".join(keys))
+        else:
+            got = await broadcast_step(want)
+            ok = bool(got.get("ok", True))
+            lines = [str(s)[:190] for s in (got.get("lines") or [])[:10]]
+            say = ("the %s rung ran and %s" % (
+                want, "changed something" if got.get("changed")
+                else "changed nothing"))
+    elif ":" in raw and raw.partition(":")[0].strip().lower() in orch_verbs():
+        does = raw.strip()
+        try:
+            said = orch_apply(does)
+            orch_save()
+            say = str(said or "left as it is")
+            lines = ["the policy book now reads %s"
+                     % ", ".join("%s=%s" % (k, (v or {}).get("value"))
+                                 for k, v in
+                                 list((_ORCH.get("policy") or {}).items())[:6])]
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            say = "that policy was refused: %s" % str(exc)[:160]
+    else:
+        ok = False
+        say = ('"%s" is not something this line understands. Type help.'
+               % raw[:60])
+
+    orch_command_echo(raw, ([say] + lines) if ok else [say])
+    if ok:
+        try:
+            note_action("the orchestrator's command line ran: %s" % raw[:120])
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": ok, "say": say, "lines": lines, "text": raw,
+            "at": time.time()}
+
+
+@app.post("/api/orchestrator/command")                         # [#1211]
+async def api_orch_command(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1211: one typed line at the foot of the orchestrator glass.
+
+    `{"text": "more banter"}`. Every verb is a door that already existed
+    somewhere else on this station; nothing here adds a power. The result
+    is echoed onto the orchestrator's own register, so the press shows up
+    in "what it has been doing, in order" beside the station's own
+    passes."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    return await orch_command_run(str(body.get("text") or "")[:240])
 
 
 @app.post("/api/orchestrator/pressure/relieve")
@@ -137818,18 +139252,37 @@ async def share_list(
         # is useless to somebody on your wifi, and vice versa; this stops
         # that being a dead end (#687).
         token = url.rsplit("/tune/", 1)[-1] if "/tune/" in url else ""
+        scope = row.get("scope") or "listen"
+        # [#1252] WHICH ROAD, said out loud. A link is not "a link": the
+        # funnel address opens for anybody anywhere, a 100.x address opens
+        # only for a machine signed in to the tailnet, and a 10.x address
+        # only on the house wifi. Nothing said which one was in your hand.
+        road = link_road(url, net)
+        alts = ([dict(link_road(f"{u['url']}/tune/{token}", net),
+                      **{"label": u["label"], "kind": u["kind"],
+                         "url": f"{u['url']}/tune/{token}"})
+                 for u in (net.get("urls") or [])]
+                if token else [])
+        # The one to hand out: the public door for a listener, the tailnet
+        # for a full link, because those are the only roads that work for
+        # each - see road_warning.
+        want = "tailnet" if scope == "full" else "funnel"
+        best = next((a["url"] for a in alts if a.get("road") == want), "")
         out.append({"tag": tag, "label": row.get("label") or "",
                     "expires": int(row.get("expires") or 0),
                     # #1354: may this person see the Pine Cam?
                     "camera": bool(row.get("camera")),
                     "hours_left": round(left / 3600, 1),
                     # Links minted before scopes existed are listener links.
-                    "scope": row.get("scope") or "listen",
+                    "scope": scope,
                     "url": url,
-                    "alts": ([{"label": u["label"], "kind": u["kind"],
-                               "url": f"{u['url']}/tune/{token}"}
-                              for u in (net.get("urls") or [])]
-                             if token else [])})
+                    "road": road["road"],                    # [#1252]
+                    "road_say": road["say"],
+                    "public": road["public"],
+                    "warn": road_warning(road["road"], scope),
+                    "best": best,
+                    "for": str(row.get("for") or ""),
+                    "alts": alts})
     return {"links": sorted(out, key=lambda r: -r["expires"])}
 
 
@@ -137874,6 +139327,31 @@ async def share_make(
     # device, because your request arrived on it. `base` overrides it when
     # you know better than we do.
     want = str(payload.get("base") or "").strip().lower()
+    # [#1252] WHO IS THIS FOR. A device name (the one Tailscale shows for
+    # it) is looked up on the tailnet and remembered, so that from now on
+    # the panel can say whether that phone is reachable instead of leaving
+    # it to be inferred from a link that silently does not open.
+    meant_for = str(payload.get("for") or "").strip().lower()
+    for_ip = ""
+    for_here = False
+    if meant_for:
+        reach_remember(meant_for, str(payload.get("label") or ""))
+        try:
+            book = await asyncio.to_thread(tailnet_peers, True)
+            row = next((p for p in book.get("peers") or []
+                        if str(p.get("name") or "").lower() == meant_for
+                        or str(p.get("dns") or "").lower().startswith(
+                            meant_for + ".")), None)
+            for_ip = str((row or {}).get("ip") or "")
+            for_here = bool((row or {}).get("answers"))
+        except Exception:  # noqa: BLE001
+            pass
+        # A device that is NOT on the tailnet must not be handed a tailnet
+        # address, whatever the panel asked for. This is the whole of the
+        # #1252 fault, turned into a rule.
+        if want in ("tailscale", "tailnet", "magicdns") and not for_here \
+                and scope != "full":
+            want = "funnel"
     chosen = ""
     if want:
         chosen = next((u["url"] for u in net["urls"]
@@ -137882,9 +139360,15 @@ async def share_make(
     # it is the only one that works for somebody with no Tailscale, no
     # account and no invitation, which is the whole point of a share link.
     # A listener token is all it opens, so this is safe to default to.
-    if not chosen:
+    # [#1252] ...but never for a FULL link. The public door downgrades a
+    # full token to listen by design, so defaulting a full link onto the
+    # funnel hands over an address that quietly does less than it says.
+    if not chosen and scope != "full":
         chosen = next((u["url"] for u in net["urls"]
                        if u["kind"] == "funnel"), "")
+    if not chosen and scope == "full":
+        chosen = next((u["url"] for u in net["urls"]
+                       if u["kind"] == "tailscale"), "")
     if not chosen:
         host_hdr = (request.headers.get("host") or "").strip()
         if host_hdr:
@@ -137902,10 +139386,156 @@ async def share_make(
         # camera, so inviting somebody to watch is one action rather
         # than two. Off unless asked for, like every other reach.
         "camera": bool(payload.get("camera")),
+        "for": meant_for,                                    # [#1252]
         "made": int(time.time())}
     write_shares(rows)
+    road = link_road(url, net)                               # [#1252]
+    warn = road_warning(road["road"], scope)
+    say = "this link opens for " + road["say"]
+    if meant_for:
+        say += (" - and %s is on the tailnet and answering" % meant_for
+                if for_here else
+                " - %s is NOT on the tailnet right now%s, so a tailnet "
+                "address would not have opened on it"
+                % (meant_for, (" (%s)" % for_ip) if for_ip else ""))
+    if warn:
+        say += ". " + warn
     return {"token": token, "url": url, "expires": expires, "label": label,
-            "scope": scope, "remote": bool(net["tailscale"]["up"])}
+            "scope": scope, "remote": bool(net["tailscale"]["up"]),
+            "tag": tag,
+            "road": road["road"], "road_say": road["say"],
+            "public": road["public"], "warn": warn, "say": say,
+            "for": meant_for, "for_ip": for_ip, "for_here": for_here,
+            "qr": share_qr(url)}
+
+
+@app.post("/api/share/car")
+async def share_car(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1252] One tap: a link that works in the car RIGHT NOW.
+
+    Listener scope, on the public funnel, with a QR code beside it. Those
+    three together are the answer to "get it back up so I'm able to access
+    it on the iPhone and listen to it in the car" - listener scope because
+    that is all the public door will ever carry, the funnel because it is
+    the only address that opens on a phone with no Tailscale, and the QR
+    because a ninety-character signed link is not something anybody types
+    at a kerb.
+
+    It is an ordinary share: it appears in the list, it expires, and
+    revoking it kills it like any other."""
+    require_auth(authorization)
+    if not SPARK_AGENT_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="No API key configured, so nothing can be signed.")
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    hours = max(1.0, min(24 * 30, float((payload or {}).get("hours") or 12)))
+    label = str((payload or {}).get("label") or "the car")[:60]
+    net = await asyncio.to_thread(remote_access, True)
+    base = next((u["url"] for u in (net.get("urls") or [])
+                 if u["kind"] == "funnel"), "")
+    if not base:
+        # Honest about which half is down, and about the one command that
+        # fixes it - the container cannot run tailscale at all.
+        up = bool((net.get("tailscale") or {}).get("up"))
+        return {
+            "ok": False,
+            "why": ("the public door is not up" if up else
+                    "this box is not on a tailnet"),
+            "cmd": ('ssh %s "sudo tailscale funnel --bg %d"'
+                    % (_ssh_target(), PUBLIC_PORT)) if up else
+                   (net.get("install_cmd") or ""),
+            "say": ("There is no public address to build a car link on. "
+                    + ("Tailscale is up but Funnel is not carrying the "
+                       "listener door." if up else
+                       "This box is not on a tailnet yet.")),
+        }
+    tag = uuid.uuid4().hex[:8]
+    expires = int(time.time() + hours * 3600)
+    token = listen_token(expires, tag, "listen")
+    url = "%s/tune/%s" % (base, token)
+    rows = read_shares()
+    rows.setdefault("epoch", 1)
+    rows.setdefault("links", {})[tag] = {
+        "label": label, "expires": expires, "url": url, "scope": "listen",
+        "camera": False, "for": "", "made": int(time.time())}
+    write_shares(rows)
+    return {
+        "ok": True, "tag": tag, "token": token, "url": url,
+        "expires": expires, "hours": round(hours, 1), "label": label,
+        "scope": "listen", "road": "funnel", "public": True,
+        "qr": share_qr(url),
+        "say": ("Point the phone's camera at the code, or open this link on "
+                "it. It works from anywhere with no Tailscale and no "
+                "account, it plays the station, and it stops working in "
+                "%.0f hours or the moment you revoke it." % hours),
+    }
+
+
+@app.get("/api/share/qr")
+async def share_qr_api(
+    url: str = "",
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> Response:
+    """[#1252] Any link, as a picture. Served as SVG so it stays crisp on
+    a tablet and costs nothing to draw."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    svg = share_qr(url)
+    if not svg:
+        raise HTTPException(
+            status_code=503 if not _qr_svg else 400,
+            detail=("the QR encoder is not installed beside app.py"
+                    if not _qr_svg else "that link cannot be drawn"))
+    return Response(content=svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/remote/peers")
+async def remote_peers_api(
+    fresh: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1252] Who else is on this tailnet, and can we reach them now.
+
+    The question the operator had no way to ask: his phone had been logged
+    out of Tailscale for eight days and every screen in the station was
+    green. Operator only - a guest has no business seeing the topology."""
+    require_auth(authorization)
+    return await asyncio.to_thread(tailnet_peers, bool(fresh))
+
+
+@app.post("/api/remote/device")
+async def remote_device_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1252] Add or drop a device this station should ask after.
+
+    Nothing discovers these: the container cannot read tailscaled's
+    netmap. Give it the name Tailscale shows for the phone and the station
+    resolves it through MagicDNS from then on."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    name = str((payload or {}).get("name") or "")
+    if (payload or {}).get("forget"):
+        got = reach_forget(name)
+    else:
+        got = reach_remember(name, str((payload or {}).get("note") or ""))
+    if got.get("ok"):
+        _PEERS_CACHE.update({"at": 0.0})
+    return got
 
 
 @app.post("/api/share/camera")
@@ -137955,12 +139585,29 @@ async def share_revoke(
     if payload.get("all"):
         rows["epoch"] = int(rows.get("epoch") or 1) + 1
         rows["links"] = {}
+        # [#1252] the epoch kills every token ever signed, so the deny
+        # list has nothing left to deny and is cleared rather than grown.
+        rows["revoked"] = []
         write_shares(rows)
-        return {"revoked": "all"}
+        _REVOKED_TAGS.update({"at": 0.0})
+        return {"revoked": "all",
+                "say": "every outstanding link is dead"}
     tag = str(payload.get("tag") or "")
+    label = str(((rows.get("links") or {}).get(tag) or {}).get("label") or "")
     (rows.setdefault("links", {})).pop(tag, None)
+    if tag:                                              # [#1252]
+        # ...and put it beyond use, which popping the row never did.
+        dead = rows.setdefault("revoked", [])
+        if not isinstance(dead, list):
+            dead = rows["revoked"] = []
+        if tag not in dead:
+            dead.append(tag)
+        del dead[:-500]
     write_shares(rows)
-    return {"revoked": tag}
+    _REVOKED_TAGS.update({"at": 0.0})                    # [#1252] at once
+    return {"revoked": tag, "label": label,
+            "say": ("%s is dead - that link stops opening immediately, "
+                    "everywhere" % (label or "that link"))}
 
 
 # --- The public listener door (#687) ----------------------------------------
@@ -144207,6 +145854,12 @@ BROADCAST_STEPS: list[dict[str, str]] = [
             "lost 2h24m on 2026-09-21. Reads the host keeper's ledger and "
             "says whether it is installed and when it last had to start "
             "something. Changes nothing.", "tone": "look"},
+    {"key": "comfy", "label": "Is the image engine hoarding memory?",
+     "say": "ComfyUI at rest is under a gigabyte of a hundred and twenty "
+            "seven, so it is never the hog - but holding a finished "
+            "picture it measured forty. Reads the dial, says what it "
+            "is holding, and takes it back if it is idle. Costs about "
+            "sixteen seconds on the next picture.", "tone": "do"},   # [#1196]
     {"key": "onair", "label": "Put it back on air",
      "say": "Lifts a pause. The booth banks material while the door is "
             "shut, so there is always something to say on the way back.",
@@ -144404,6 +146057,40 @@ async def broadcast_step(step: str) -> dict[str, Any]:
         said.append(str(got.get("say") or ""))
         return {"ok": True, "step": step, "lines": said, "changed": False,
                 "keeper": got}
+
+    # [#1196] the image engine's memory, pressable.
+    if step == "comfy":
+        got = await comfy_idle_state()
+        live = got.get("live") or {}
+        pol = got.get("policy") or {}
+        said.append("$ comfy idle")
+        said.append("  engine     %s" % ("up" if live.get("up")
+                                         else "NOT ANSWERING"))
+        said.append("  quiet for  %s s" % live.get("idle_seconds"))
+        said.append("  dial       %s minutes, %s"
+                    % (pol.get("minutes"), pol.get("mode")))
+        said.append("  box free   %s GB" % live.get("available_gb"))
+        said.append("")
+        said.append(str(got.get("why") or ""))
+        if live.get("busy"):
+            said.append("")
+            said.append("  It is rendering; freeing it now would "
+                        "restart the picture.")
+        elif live.get("up") and pol.get("mode") != "off":
+            out = await comfy_unload(str(pol.get("mode") or "free"),
+                                     float(live.get("idle_seconds")
+                                           or 0),
+                                     "the orchestrator pressed the rung")
+            changed = bool(out.get("ok"))
+            said.append("")
+            said.append("  took back  %s"
+                        % ("nothing - %s" % out.get("why")
+                           if not out.get("ok")
+                           else "%s GB" % out.get("freed_gb")
+                           if out.get("freed_gb") is not None
+                           else "done"))
+        return {"ok": True, "step": step, "lines": said,
+                "changed": changed, "comfy": got}
 
     # #1240: name the fault, and - for `repair` - run its cure.
     if step == "rebind":                                     # [#1237]
@@ -169661,6 +171348,63 @@ async def api_paper_delete(
         _PAPER["headline"] = ""
         _PAPER["scanned"] = False
     return {"deleted": edition_id}
+
+
+@app.get("/api/comfy/idle")
+async def api_comfy_idle_state(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1196: the idle dial, where the engine is, and what each mode costs."""
+    require_read_auth(authorization)
+    return await comfy_idle_state()
+
+
+@app.post("/api/comfy/idle")
+async def api_comfy_idle_set(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1196: set the dial. {"minutes": 30, "mode": "free"|"stop"|"off"}."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if _comfy_idle is None:
+        raise HTTPException(status_code=503,
+                            detail="comfy_idle.py is not installed beside app.py")
+    await asyncio.to_thread(
+        _comfy_idle.set_policy, DATA_DIR,
+        payload.get("minutes"), payload.get("mode"), "the operator")
+    _COMFY_IDLE_CACHE["at"] = 0.0
+    return await comfy_idle_state()
+
+
+@app.post("/api/comfy/idle/now")
+async def api_comfy_idle_now(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1196: unload now, by the dial's mode (or one named in the body).
+    Refused while a picture is rendering - freeing mid-render restarts it."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    live = await comfy_idle_live()
+    if live.get("busy"):
+        return {"done": False,
+                "why": "ComfyUI is rendering; freeing it now would restart "
+                       "the picture."}
+    mode = str(payload.get("mode") or comfy_idle_mode())
+    if mode == "off":
+        mode = "free"
+    out = await comfy_unload(mode, live.get("idle_seconds") or 0,
+                             "the operator pressed the button")
+    out["done"] = True
+    out["state"] = await comfy_idle_state()
+    return out
 
 
 @app.get("/api/comfy/doctor")
@@ -196295,6 +198039,29 @@ async function remotePanel() {
       };
       line.appendChild(name); line.appendChild(copy); line.appendChild(kill);
       live.appendChild(line);
+      /* [#1252] WHICH ROAD THIS LINK TAKES, under the link itself. The
+       * list used to show four links that looked identical and behaved
+       * completely differently - one opens for anybody on earth, one only
+       * for a machine signed in to your tailnet, one only on your own
+       * wifi. Which one you were holding was not written anywhere. */
+      const road = el("div", "muted", (l.road_say || "")
+        + (l.warn ? " — " + l.warn : ""));
+      road.style.cssText = "font-size:10px;line-height:1.45;"
+        + "margin:-3px 0 6px 2px;"
+        + (l.warn ? "color:#ffb27a" : (l.public ? "color:#86d6a8" : ""));
+      live.appendChild(road);
+      if (l.best && l.best !== l.url) {
+        const swap = el("button", "", l.scope === "full"
+          ? "copy the tailnet one" : "copy the one that works anywhere");
+        swap.style.cssText = "font-size:10px;margin:-3px 0 7px 2px";
+        swap.title = l.best;
+        swap.onclick = async () => {
+          const took = await copyText(l.best, null);
+          setStatus(took ? "copied " + l.best
+                         : "could not reach the clipboard — " + l.best);
+        };
+        live.appendChild(swap);
+      }
     });
     if (!(got.links || []).length) {
       live.appendChild(el("div", "muted", "No links out."));
@@ -196302,6 +198069,160 @@ async function remotePanel() {
     }
   };
   await drawLinks();
+
+  /* [#1252] ONE TAP FOR THE CAR.
+   *
+   * The operator's whole request was "get it back up so I'm able to
+   * access it on the iPhone and listen to it in the car", and the road
+   * was never down - he had been handed a TAILNET link for a phone whose
+   * Tailscale had been logged out for eight days. This mints the only
+   * shape that cannot go wrong: listener scope, on the public funnel,
+   * drawn as a code the phone's camera reads. */
+  const car = el("div", "", "");
+  car.style.cssText = "margin-top:10px;padding:9px;border-radius:6px;"
+    + "border:1px solid #1d3a2c;background:#0a1410";
+  const carGo = el("button", "primary", "");
+  carGo.innerHTML = scriptIcon("c:phone") + "<span>Make me a link that "
+    + "works in the car right now</span>";
+  carGo.style.cssText = "display:inline-flex;align-items:center;gap:6px";
+  carGo.title = "A listener link on the public address, good for 12 hours. "
+    + "It opens on any phone, with no Tailscale and no account.";
+  const carSay = el("div", "muted", "");
+  carSay.style.cssText = "font-size:10.5px;line-height:1.5;margin-top:6px";
+  const carArt = el("div", "", "");
+  carArt.style.cssText = "margin-top:8px;display:none;text-align:center";
+  const carUrl = el("div", "", "");
+  carUrl.style.cssText = "font-size:10px;word-break:break-all;margin-top:6px;"
+    + "color:#86d6a8;cursor:pointer";
+  carGo.onclick = async () => {
+    const done = pending(carGo, "making it…");
+    try {
+      const got = await api("/api/share/car", {method: "POST",
+        body: JSON.stringify({hours: 12, label: "the car"})});
+      if (!got.ok) {
+        carSay.textContent = got.say || "no public address to build on";
+        carSay.style.color = "#ffb27a";
+        if (got.cmd) copyable(carSay, got.cmd, "the command that fixes it");
+        return;
+      }
+      carSay.textContent = got.say || "";
+      carSay.style.color = "";
+      carArt.style.display = "block";
+      carArt.innerHTML = got.qr || "";
+      if (!got.qr) {
+        carArt.textContent = "(the code drawer is not installed on this "
+          + "station, so here is the link on its own)";
+      }
+      carUrl.textContent = got.url;
+      copyable(carUrl, got.url, "the car link");
+      const took = await copyText(got.url, null);
+      setStatus(took ? "car link copied — it works from anywhere"
+                     : "car link made — scan the code or copy it below");
+      await drawLinks();
+      remoteDotPaint();
+    } catch (e) { setStatus(e.message, true); }
+    finally { done(); }
+  };
+  car.appendChild(carGo); car.appendChild(carSay);
+  car.appendChild(carArt); car.appendChild(carUrl);
+  body.appendChild(car);
+
+  /* [#1252] WHO IS ACTUALLY ON THE TAILNET.
+   *
+   * "the phone is logged out of Tailscale" was a thing that could only be
+   * INFERRED, from a link that silently did not open. The container has no
+   * tailscale binary and no control socket, so a device is known once
+   * somebody names it - and from then on the station resolves it through
+   * MagicDNS and asks it, every time this pane opens. */
+  const peerBox = el("div", "", "");
+  peerBox.style.cssText = "margin-top:10px";
+  body.appendChild(peerBox);
+  const drawPeers = async (fresh) => {
+    peerBox.textContent = "";
+    const busy = el("div", "muted", "asking your tailnet…");
+    busy.style.cssText = "font-size:11px";
+    peerBox.appendChild(busy);
+    let got;
+    try {
+      got = await api("/api/remote/peers" + (fresh ? "?fresh=1" : ""));
+    } catch (e) {
+      busy.textContent = "could not ask the tailnet: " + e.message;
+      return;
+    }
+    peerBox.textContent = "";
+    const head = el("div", "row", "");
+    head.style.cssText = "align-items:baseline;gap:8px;margin-bottom:4px";
+    const title = el("span", "", "Devices on your tailnet");
+    title.style.cssText = "font-size:11.5px;font-weight:700;flex:1";
+    const again = el("button", "", "ask again");
+    again.style.fontSize = "10px";
+    again.onclick = () => drawPeers(true);
+    head.appendChild(title); head.appendChild(again);
+    peerBox.appendChild(head);
+    (got.peers || []).forEach((p) => {
+      const row = el("div", "", "");
+      row.style.cssText = "font-size:10.5px;line-height:1.5;margin-bottom:3px";
+      const who = el("b", "", String(p.name || "?"));
+      who.style.color = p.self ? "#8aa4b8"
+        : (p.answers ? "#86d6a8" : "#ffb27a");
+      row.appendChild(who);
+      const rest = el("span", "muted", " · " + (p.ip || "no address")
+        + " · " + (p.say || ""));
+      rest.style.fontSize = "10px";
+      row.appendChild(rest);
+      if (!p.self) {
+        const drop = el("button", "", "✕");
+        drop.style.cssText = "font-size:9px;margin-left:6px";
+        drop.title = "Stop asking after " + p.name;
+        drop.onclick = async () => {
+          try {
+            await api("/api/remote/device", {method: "POST",
+              body: JSON.stringify({name: p.name, forget: true})});
+            drawPeers(true);
+          } catch (e) { setStatus(e.message, true); }
+        };
+        row.appendChild(drop);
+      }
+      peerBox.appendChild(row);
+    });
+    const add = el("div", "row", "");
+    add.style.cssText = "gap:6px;margin-top:6px";
+    const who = el("input", "", "");
+    who.placeholder = "name of a device on your tailnet";
+    who.title = "The name Tailscale shows for it — the iPhone in this "
+      + "tailnet is called iphone184. The station looks it up through "
+      + "MagicDNS and asks it from then on.";
+    who.style.cssText = "flex:1;min-width:0;font-size:11px";
+    const put = el("button", "", "watch it");
+    put.onclick = async () => {
+      const name = who.value.trim();
+      if (!name) { setStatus("type the device's Tailscale name", true); return; }
+      const done = pending(put, "…");
+      try {
+        const answer = await api("/api/remote/device", {method: "POST",
+          body: JSON.stringify({name: name})});
+        setStatus(answer.say || "added");
+        who.value = "";
+        await drawPeers(true);
+      } catch (e) { setStatus(e.message, true); }
+      finally { done(); }
+    };
+    add.appendChild(who); add.appendChild(put);
+    peerBox.appendChild(add);
+    const note = el("div", "muted", got.snapshot_ago === null
+      ? "Only the devices named here are asked after: this station runs in "
+        + "a container with no tailscale binary, so it cannot read the full "
+        + "machine list on its own. One command on the box drops one in, "
+        + "and then every peer appears with its last-seen time. Click to "
+        + "copy it."
+      : "Full machine list is " + Math.round((got.snapshot_ago || 0) / 60)
+        + " minutes old. Click to copy the command that refreshes it.");
+    note.style.cssText = "font-size:10px;line-height:1.5;margin-top:6px;"
+      + "cursor:pointer";
+    copyable(note, got.how || "", "the command that lists every machine");
+    peerBox.appendChild(note);
+  };
+  await drawPeers(false);
 
   const make = el("div", "row", "");
   make.style.marginTop = "8px";
@@ -196354,13 +198275,17 @@ async function remotePanel() {
       // #687: goes through copyText, which works on a plain-http origin
       // where navigator.clipboard does not exist at all.
       const took = await copyText(got.url, null);
-      const reach = got.remote
+      /* [#1252] the station now says which road the link it just minted
+       * takes, and whether the device it was meant for is reachable. That
+       * sentence is the answer; "it works from anywhere on your tailnet"
+       * was the claim that was wrong for eight days. */
+      const reach = got.say || (got.remote
         ? "it works from anywhere on your tailnet"
         : "this one only works on your own network, since there is no "
-          + "tailnet yet";
+          + "tailnet yet");
       setStatus((got.scope === "full" ? "FULL-ACCESS link " : "link ")
         + (took ? "copied — " : "made (copy it from the list below) — ")
-        + reach);
+        + reach, !!got.warn);
     } catch (e) { setStatus(e.message, true); }
     mint.disabled = false;
   };
@@ -215579,6 +217504,97 @@ async function comfyDoctorPanel() {
   x.onclick = comfyDoctorClose;
   head.appendChild(run); head.appendChild(deep); head.appendChild(x);
   box.appendChild(head);
+
+  /* [#1196] THE IDLE DIAL. How long ComfyUI may sit loaded, what happens
+     when it has, and what each of those costs - measured, on the strip. */
+  const dial = el("div", "", "");
+  dial.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "flex-wrap:wrap;padding:9px 14px;border-bottom:1px solid #1b2735;"
+    + "font-size:11px";
+  dial.appendChild(el("span", "muted", "Unload after"));
+  const dialMins = document.createElement("input");
+  dialMins.type = "number"; dialMins.min = "1"; dialMins.max = "720";
+  dialMins.style.cssText = "width:70px";
+  dialMins.title = "Minutes of quiet before ComfyUI is unloaded";
+  dial.appendChild(dialMins);
+  dial.appendChild(el("span", "muted", "quiet minutes:"));
+  const dialMode = document.createElement("select");
+  dialMode.style.cssText = "width:auto";
+  [["off", "leave it loaded"], ["free", "free its models"],
+   ["stop", "stop the engine"]].forEach((row) => {
+    const opt = document.createElement("option");
+    opt.value = row[0]; opt.textContent = row[1];
+    dialMode.appendChild(opt);
+  });
+  dial.appendChild(dialMode);
+  const dialSet = el("button", "primary", "Set");
+  const dialNow = el("button", "", "Unload now");
+  dialNow.title = "Take the memory back this second";
+  dial.appendChild(dialSet); dial.appendChild(dialNow);
+  const dialWhy = el("div", "muted", "reading the idle policy…");
+  dialWhy.style.cssText = "flex:1 1 100%;font-size:11px;line-height:1.6";
+  dial.appendChild(dialWhy);
+  const dialPrice = el("div", "muted", "");
+  dialPrice.style.cssText = "flex:1 1 100%;font-size:10px;line-height:1.6;"
+    + "opacity:.8";
+  dial.appendChild(dialPrice);
+  box.appendChild(dial);
+
+  let dialTouched = 0;
+  [dialMins, dialMode].forEach((node) => {
+    node.addEventListener("input", () => { dialTouched = Date.now(); });
+  });
+  const dialPaint = (d) => {
+    if (!d) return;
+    const p = d.policy || {};
+    /* Never yank a control out from under a hand that is on it. */
+    if (Date.now() - dialTouched > 4000) {
+      if (p.minutes !== undefined) dialMins.value = String(p.minutes);
+      if (p.mode) dialMode.value = p.mode;
+    }
+    dialWhy.textContent = d.why || "";
+    const rows = (d.offers || []).map(
+      (o) => o.label + ": gives back about " + (o.buys_gb || 0)
+        + " GB, " + o.costs);
+    const live = d.live || {};
+    if (live.available_gb) {
+      rows.unshift("the box has " + live.available_gb
+        + " GB available right now");
+    }
+    const last = (d.log || [])[(d.log || []).length - 1];
+    if (last && last.freed_gb !== null && last.freed_gb !== undefined) {
+      rows.push("the last unload gave back " + last.freed_gb + " GB");
+    }
+    dialPrice.textContent = rows.join(" · ");
+  };
+  const dialRead = async () => {
+    try { dialPaint(await api("/api/comfy/idle")); }
+    catch (e) { dialWhy.textContent = e.message; }
+  };
+  dialSet.onclick = async () => {
+    dialTouched = 0;
+    try {
+      dialPaint(await api("/api/comfy/idle", {method: "POST",
+        body: JSON.stringify({minutes: Number(dialMins.value),
+                              mode: dialMode.value})}));
+      setStatus("The idle policy is set.");
+    } catch (e) { setStatus(e.message, true); }
+  };
+  dialNow.onclick = async () => {
+    const was = dialNow.textContent;
+    dialNow.textContent = "unloading…";
+    try {
+      const out = await api("/api/comfy/idle/now",
+        {method: "POST", body: "{}"});
+      dialNow.textContent = was;
+      if (out && out.done === false) { setStatus(out.why || "not now", true); }
+      else if (out && out.freed_gb !== null && out.freed_gb !== undefined) {
+        setStatus("ComfyUI gave back " + out.freed_gb + " GB.");
+      } else { setStatus("ComfyUI was unloaded."); }
+      if (out && out.state) dialPaint(out.state);
+    } catch (e) { dialNow.textContent = was; setStatus(e.message, true); }
+  };
+  dialRead();
   const term = el("div", "", "");
   term.style.cssText = "flex:1;overflow:auto;padding:12px 14px;"
     + "font:12px/1.7 PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#9fd0a6;"
@@ -215611,9 +217627,12 @@ async function comfyDoctorPanel() {
         + "with ComfyUI.";
     term.scrollTop = term.scrollHeight;
   };
+  let dialTick = 0;                                      /* [#1196] */
   const poll = async () => {
     try { paint(await api("/api/comfy/doctor")); }
     catch (e) { /* the console keeps its last lines */ }
+    dialTick = (dialTick + 1) % 5;         /* the dial every 10 s */
+    if (!dialTick) dialRead();
   };
   poll();
   comfyDocTimer = setInterval(poll, 2000);

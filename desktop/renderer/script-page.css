@@ -323,6 +323,40 @@
 .sp-spectrum { height: 22px; }
 .sp-voicemeter { height: 12px; }
 
+/* [#1198] THE BARS ARE CONTROLS. Swipe right raises, left lowers; the page
+   still scrolls vertically through them because pan-y leaves that gesture
+   with the compositor, which is also what stops a scroll from nudging a
+   level. The taller music bar is a comfortable thumb target already; the
+   12px voice bar gets a transparent border so the finger has 20px to land
+   on without the drawn bar changing size. */
+.sp-spectrum, .sp-voicemeter {
+  touch-action: pan-y;
+  cursor: ew-resize;
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.sp-voicemeter { border-top: 4px solid transparent; border-bottom: 4px solid transparent; background-clip: padding-box; }
+.sp-spectrum:focus-visible, .sp-voicemeter:focus-visible {
+  outline: 1px solid var(--sp-accent, #65c7da); outline-offset: 1px;
+}
+.sp-spectrum[data-level-dragging], .sp-voicemeter[data-level-dragging] {
+  background: rgba(255, 255, 255, .10);
+}
+/* The live readout. It exists only while a level is moving, sits above the
+   title between the art and the mixer dot, and never takes a pointer. */
+.sp-levelpill {
+  position: absolute; left: 50%; top: 3px; z-index: 4;
+  transform: translateX(-50%) translateY(-3px);
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 10px; letter-spacing: .05em;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  color: #eaf3ff; background: rgba(4, 9, 17, .94);
+  border: 1px solid var(--sp-line);
+  opacity: 0; pointer-events: none;
+  transition: opacity .12s ease, transform .12s ease;
+}
+.sp-levelpill.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+
 .sp-seekrow { display: flex; align-items: center; gap: 7px; }
 .sp-seek { flex: 1 1 auto; min-width: 0; }
 .sp-time {

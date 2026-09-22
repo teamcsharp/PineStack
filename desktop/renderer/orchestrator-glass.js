@@ -915,6 +915,11 @@
     for (k in src) {
       if (!Object.prototype.hasOwnProperty.call(src, k)) continue;
       if (used[k]) continue;
+      /* [#1211] `<key>_basis` is the sentence saying what `<key>` counted,
+         and it is drawn beside its own number by basis(). Repeating it as a
+         loose pair here would print the same words twice. It is only
+         skipped when the number it explains WAS drawn. */
+      if (/_basis$/.test(k) && used[k.replace(/_basis$/, '')]) continue;
       value = src[k];
       if (value === null || typeof value === 'undefined') continue;
       if (typeof value === 'object') continue;   /* lists are drawn as rows */
@@ -978,6 +983,7 @@
          measured (#1191); this is which value, under the name the station
          itself gave it. */
       pair(into, 'the station called it', hit.name);
+      basis(into, src, hit.name, used);            /* [#1211] */
     }, spec.cls || ''));
   }
 
@@ -1066,6 +1072,9 @@
         + 'identical, so this says which one it is rather than drawing '
         + 'zeroes over the difference.'));
       pair(body, 'the key this pane reads', 'waste');
+      if (last && last.rooms_why) {                /* [#1211] */
+        pair(body, 'and the station says', String(last.rooms_why));
+      }
       pair(body, 'what arrived instead', src === null ? 'null'
         : (typeof src === 'undefined' ? 'nothing' : typeof src));
       return;
@@ -1094,7 +1103,15 @@
     big.appendChild(el('div', 'og-big-v', headSecs === null ? UNREAD : mins(headSecs)));
     sub = el('div', 'og-big-s');
     if (headCount !== null) {
-      sub.textContent = num(headCount, 0) + ' line'
+      /* [#1211] THE NOUN COMES FROM THE STATION, because the station is
+         what knows. This counted ROUNDS and the line said "lines", which
+         is a label quietly meaning something else - the exact fault this
+         pane prints provenance to catch. If no noun arrives, the old
+         word stands and nothing is invented. */
+      var noun = (typeof src.never_heard_what === 'string'
+        && /\S/.test(src.never_heard_what)) ? src.never_heard_what : 'line';
+      used.never_heard_what = true;
+      sub.textContent = num(headCount, 0) + ' ' + noun
         + (headCount === 1 ? '' : 's') + ' recorded and never played';
     } else {
       sub.textContent = 'the station did not send a count of the lines, only '
@@ -1138,6 +1155,12 @@
     for (i = 0; i < WASTE_ROWS.length; i += 1) {
       tally(body, 'waste:' + WASTE_ROWS[i].id, WASTE_ROWS[i], src, used, missing);
     }
+
+    /* [#1211] AND THE ROUNDS THEMSELVES, EACH WITH SOMETHING HE CAN DO.
+       "a list ... with an action per row: hear it now, retire it, or fork
+       and edit." A count of waste he cannot act on is a complaint; the
+       list is the part that ends it. */
+    roundsInto(body, src, used);
 
     extras(body, src, used);
     notCounted(body, missing);
@@ -1229,6 +1252,524 @@
     var head = key() ? {Authorization: 'Bearer ' + key()} : {};
     return root.fetch(where() + path, {method: 'POST', headers: head, cache: 'no-store'})
       .then(function (res) { return res.ok ? res.json() : null; });
+  }
+
+  /* ================================================================ #1211
+   *
+   * THE PANES STOPPED SAYING "COULD NOT BE COUNTED", AND THE ROWS BECAME
+   * SOMETHING HE CAN ACT ON.
+   *
+   * "Make sure to finish the orchestrator task so that I have access to
+   *  all of these features and understandings and I'm able to go through
+   *  and deal with the orchestrator."
+   *
+   * The two #1202 panes were right all along: the station was sending
+   * neither `rooms` nor `waste`, so both said, correctly, that the rooms
+   * were not empty but uncounted. The server half exists now
+   * (orchestrator_rooms.py) and everything below draws it - plus the
+   * three things this panel could show but never DO: act on a round that
+   * was made and never heard, answer a question the orchestrator is
+   * asking, and type a verb at it.
+   *
+   * WHERE AN ANSWER LANDS, AND WHY IT IS NOT IN THE LIST. Every result
+   * here is written into the FOOTER, which is a sibling of the scrolling
+   * list and is never touched by #1186's reconcile. A sentence written
+   * into a fold would be thrown away by the next paint, and a half-typed
+   * edit with it. The footer is built once, in build(), and lives as long
+   * as the pop-up does.
+   *
+   * NOTHING HERE ACTS ON ITS OWN. Every road below is reached only by a
+   * person pressing something, and every verb it can reach is a door that
+   * already existed somewhere else on this station. The five-second poll
+   * is still a GET and still cannot reach any of them. */
+
+  var ROUND_BUSY = '';      /* '<id>:<action>' while one is in flight */
+  var EDIT_SID = '';        /* the round open in the footer's turn editor */
+  var forceOnce = false;    /* [#1211] his own press always shows its result */
+
+  /* THE SAME DOOR AS post(), WITH A BODY ON IT. post() above sends none,
+     which is all a tier button needs; answering an ask, acting on a round
+     and typing a command all carry one. The station's own sentence is read
+     back even from a refusal, because "the station refused it" with the
+     reason is an answer and a bare failure is not. */
+  function postBody(path, body) {
+    var sent = body || {};
+    try {
+      if (root.pineDesktop && root.pineDesktop.post) {
+        return root.pineDesktop.post(path, sent);
+      }
+    } catch (err) { /* fall through to the bare door */ }
+    var head = {'Content-Type': 'application/json'};
+    if (key()) head.Authorization = 'Bearer ' + key();
+    return root.fetch(where() + path, {
+      method: 'POST', headers: head, cache: 'no-store',
+      body: JSON.stringify(sent)
+    }).then(function (res) {
+      return res.json()['catch'](function () { return null; })
+        .then(function (got) {
+          if (got && typeof got === 'object') {
+            if (!res.ok) {
+              got.ok = false;
+              if (!got.say) {
+                got.say = String(got.detail || ('the station refused it ('
+                  + res.status + ')'));
+              }
+            }
+            return got;
+          }
+          return {ok: !!res.ok, say: res.ok ? 'done'
+            : ('the station refused it (' + res.status + ')')};
+        });
+    });
+  }
+
+  function getJson(path) { return get(path); }
+
+  /* THE FOOT SPEAKS. One line, the station's own words, never invented
+     here - and it is a live DOM write rather than a repaint, so it
+     appears under his hand while #1186's hold is still standing. */
+  function foot(text, ok) {
+    if (!box) return;
+    var out = box.querySelector('.og-cmd-out');
+    if (!out) return;
+    out.hidden = false;
+    out.className = 'og-cmd-out' + (ok === false ? ' og-cmd-bad' : '');
+    out.textContent = String(text || '');
+  }
+
+  function footLines(lines) {
+    if (!box) return;
+    var more = box.querySelector('.og-cmd-more');
+    if (!more) return;
+    more.innerHTML = '';
+    var rows = lines || [];
+    more.hidden = !rows.length;
+    for (var i = 0; i < rows.length; i += 1) {
+      more.appendChild(el('div', 'og-cmd-line', String(rows[i])));
+    }
+  }
+
+  /* A press of his own is an explicit ask to see what it did, so the next
+     answer paints through the hold once. The hold itself is untouched -
+     this is one pass, not a setting. */
+  function refreshNow() {
+    forceOnce = true;
+    pull();
+  }
+
+  /* ------------------------------------------------- one never-heard round */
+
+  var ROUND_DOES = {
+    hear: 'play', retire: 'remove'
+  };
+
+  function roundAct(id, verb) {
+    var action = ROUND_DOES[verb] || verb;
+    ROUND_BUSY = id + ':' + verb;
+    foot('asking the station to ' + verb + ' that round...', true);
+    footLines([]);
+    postBody('/api/cupboard/act', {id: id, action: action})
+      .then(function (got) {
+        ROUND_BUSY = '';
+        foot(String((got && got.say) || 'the station did not answer'),
+          !!(got && got.ok !== false));
+        footLines((got && got.lines) || []);
+        refreshNow();
+      })['catch'](function () {
+        ROUND_BUSY = '';
+        foot('the station could not be reached', false);
+      });
+  }
+
+  /* FORK AND EDIT. The station forks for itself: director_edit_turn copies
+     a kept or already-aired round before it writes, because a frozen row is
+     restored from its kept copy and an edit written into one is accepted and
+     silently thrown away - which was measured the first time that desk ran
+     against this station. So this opens the round's turns and posts one of
+     them; whether it becomes a fork is the station's decision, and it says
+     which it did. */
+  function editOpen(id) {
+    EDIT_SID = id;
+    var drawer = box && box.querySelector('.og-cmd-edit');
+    if (!drawer) return;
+    drawer.hidden = false;
+    drawer.innerHTML = '';
+    drawer.appendChild(el('div', 'og-cmd-h', 'reading the script...'));
+    getJson('/api/director/script/' + encodeURIComponent(id))
+      .then(function (got) {
+        if (EDIT_SID !== id) return;
+        editDraw(id, got);
+      })['catch'](function () {
+        if (EDIT_SID !== id) return;
+        drawer.innerHTML = '';
+        drawer.appendChild(el('div', 'og-cmd-h',
+          'that script could not be read from here'));
+      });
+  }
+
+  function editClose() {
+    EDIT_SID = '';
+    var drawer = box && box.querySelector('.og-cmd-edit');
+    if (!drawer) return;
+    drawer.hidden = true;
+    drawer.innerHTML = '';
+  }
+
+  function editDraw(id, got) {
+    var drawer = box && box.querySelector('.og-cmd-edit');
+    if (!drawer) return;
+    drawer.innerHTML = '';
+    var turns = (got && got.turns) || [];
+    var head = el('div', 'og-cmd-h',
+      'editing ' + String((got && got.kind) || 'a round') + ' - '
+      + turns.length + ' turn' + (turns.length === 1 ? '' : 's')
+      + ((got && got.kept) ? ' - this one is KEPT, so a save forks it'
+        : ' - never aired, so a save rewrites it in place'));
+    drawer.appendChild(head);
+    var shut = el('button', 'og-cmd-x');
+    shut.setAttribute('type', 'button');
+    shut.textContent = 'close the editor';
+    shut.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      editClose();
+    });
+    drawer.appendChild(shut);
+    for (var i = 0; i < turns.length && i < 24; i += 1) {
+      drawer.appendChild(editTurn(id, turns[i] || {}, i));
+    }
+    if (!turns.length) {
+      drawer.appendChild(el('div', 'og-quiet',
+        'the station returned no turns for that round'));
+    }
+  }
+
+  function editTurn(id, turn, index) {
+    var wrap = el('div', 'og-cmd-turn');
+    var was = String(turn.text || turn.say || '');
+    wrap.appendChild(el('div', 'og-cmd-who',
+      String(turn.who || turn.marker || ('turn ' + (index + 1)))));
+    var area = root.document.createElement('textarea');
+    area.className = 'og-cmd-area';
+    area.value = was;
+    area.rows = 2;
+    wrap.appendChild(area);
+    var save = el('button', 'og-cmd-b');
+    save.setAttribute('type', 'button');
+    save.textContent = 'save this turn';
+    save.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      save.disabled = true;
+      postBody('/api/director/script/' + encodeURIComponent(id) + '/turn',
+        {index: index, text: area.value, was: was})
+        .then(function (got) {
+          save.disabled = false;
+          foot(String((got && (got.say || got.detail))
+            || 'the turn was saved'), !!(got && got.ok !== false));
+          refreshNow();
+        })['catch'](function () {
+          save.disabled = false;
+          foot('that turn could not be saved from here', false);
+        });
+    });
+    wrap.appendChild(save);
+    return wrap;
+  }
+
+  /* ------------------------------------------------------ one open ask */
+
+  function answerAsk(ask, index, does) {
+    var picks = {};
+    picks[String(index)] = String(does);
+    foot('answering "' + String(ask.topic || 'the question') + '"...', true);
+    footLines([]);
+    postBody(String(ask.answer_url || ('/api/orchestrator/asks/'
+      + encodeURIComponent(ask.id))), {picks: picks})
+      .then(function (got) {
+        var said = (got && (got.say || got.said)) || '';
+        if (said && said.join) said = said.join('; ');
+        foot(String(said || 'the orchestrator took the answer'),
+          !!(got && got.ok !== false));
+        refreshNow();
+      })['catch'](function () {
+        foot('the station could not be reached', false);
+      });
+  }
+
+  function askFold(ask, n) {
+    var id = 'ask:' + String(ask.id || n);
+    var qs = ask.questions || [];
+    var summary = String(ask.urgency || 'routine');
+    if (typeof ask.decides_alone_in === 'number' && ask.decides_alone_in > 0) {
+      summary += '  /  decides alone in ' + secs(ask.decides_alone_in);
+    }
+    return fold(id, String(ask.topic || 'a question'), summary,
+      function (body) {
+        if (ask.why) body.appendChild(el('div', 'og-lead', String(ask.why)));
+        for (var q = 0; q < qs.length; q += 1) {
+          var one = qs[q] || {};
+          body.appendChild(el('div', 'og-sub', String(one.ask || '')));
+          var options = one.options || [];
+          for (var o = 0; o < options.length; o += 1) {
+            body.appendChild(askButton(ask, q, options[o] || {}));
+          }
+          if (!options.length) {
+            body.appendChild(el('div', 'og-quiet',
+              'this question arrived with no options on it, so it cannot be '
+              + 'answered from here - the asks popup has the whole of it.'));
+          }
+        }
+        /* #1081: the clock, spelled out. An unanswered ask is answered by
+           the station, and a surface that hides that is a surface that
+           lets a decision be taken by default without saying so. */
+        if (typeof ask.decides_alone_in === 'number') {
+          pair(body, 'if nobody answers, the station decides in',
+            ask.decides_alone_in > 0 ? secs(ask.decides_alone_in)
+              : 'it is already past - the station will answer on its next scan');
+        }
+        pair(body, 'the road this lands on',
+          String(ask.answer_url || ''));
+      }, 'og-pinned');
+  }
+
+  function askButton(ask, index, option) {
+    var row = el('div', 'og-offer');
+    var btn = el('button', 'og-offer-b');
+    btn.setAttribute('type', 'button');
+    iconInto(btn, 'c:checkmark--outline', '');
+    btn.appendChild(el('span', null, String(option.face || option.does || '?')));
+    btn.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      btn.disabled = true;
+      answerAsk(ask, index, option.does);
+    });
+    row.appendChild(btn);
+    row.appendChild(el('div', 'og-offer-cost',
+      String(option.note || ('this applies ' + String(option.does || '')))));
+    return row;
+  }
+
+  function asksInto(body) {
+    var rows = (last && last.asks) || [];
+    if (!rows.length) return 0;
+    body.appendChild(el('div', 'og-sub',
+      'and what it is asking YOU - answerable here'));
+    for (var i = 0; i < rows.length; i += 1) {
+      body.appendChild(askFold(rows[i] || {}, i));
+    }
+    return rows.length;
+  }
+
+  /* --------------------------------------------- what a number counts */
+
+  /* PROVENANCE, ONE STEP FURTHER THAN THE KEY NAME. "the station called it
+     covered" says which field carried the number; this says what the field
+     actually counted. Both matter, and the second is the one that catches a
+     label quietly meaning something else - which has happened twice on this
+     station. The server sends it as `<key>_basis`. */
+  function basis(into, src, name, used) {
+    if (!into || !src || !name) return;
+    var k = String(name) + '_basis';
+    if (used) used[k] = true;
+    var text = src[k];
+    if (typeof text !== 'string' || !/\S/.test(text)) return;
+    into.appendChild(el('div', 'og-blind-n', 'which counts: ' + text));
+  }
+
+  /* ------------------------------------------------- inside one room */
+
+  var ROOM_DOORS = [
+    ['holding_door', 'what "stuck here now" counts'],
+    ['in_door', 'what "went in" counts'],
+    ['out_door', 'what "came out" counts']
+  ];
+
+  function roomDoors(into, row, used) {
+    var i, k, any = false;
+    /* A LEDGER THAT COULD NOT BE READ NAMES ITSELF. The server sends no
+       count at all in that case - the panel already draws an absent key as
+       "could not be counted" - and this is the sentence that turns that
+       into something actionable: WHICH ledger, and therefore what to fix. */
+    used.ledger_why = true;
+    if (typeof row.ledger_why === 'string' && /\S/.test(row.ledger_why)) {
+      into.appendChild(warnBox(String(row.ledger_why)));
+    }
+    for (i = 0; i < ROOM_DOORS.length; i += 1) {
+      k = ROOM_DOORS[i][0];
+      used[k] = true;
+      if (typeof row[k] !== 'string' || !/\S/.test(row[k])) continue;
+      if (!any) {
+        into.appendChild(el('div', 'og-sub',
+          'the doors this room is counted at'));
+        any = true;
+      }
+      pair(into, ROOM_DOORS[i][1], row[k]);
+    }
+    used.key = true;
+    used.holding = true;
+    used.window_seconds = true;
+    used.window_truncated = true;
+    used.window_covers_seconds = true;
+    if (told(row.holding) !== null) {
+      pair(into, 'standing in this room right now', num(row.holding, 0));
+    }
+    if (told(row.window_seconds) !== null) {
+      pair(into, 'went in / came out are counted over the last',
+        secs(row.window_seconds));
+    }
+    /* A COUNT THAT HAS LOST ROWS IS A FLOOR AND MUST SAY SO. The ledgers
+       these movements are read off are rings; if one has rotated inside
+       the window then "11 came out" means "at least 11", and printing it
+       as a total would be the same confident-number fault the whole
+       screen is built against. */
+    if (row.window_truncated) {
+      into.appendChild(warnBox(
+        'the ledger these movements are counted off has rotated inside the '
+        + 'window, so "went in" and "came out" here are FLOORS, not totals '
+        + '- at least this many, over the '
+        + secs(row.window_covers_seconds) + ' it could still see.'));
+    }
+  }
+
+  function roomList(into, row, used, name, title) {
+    used[name] = true;
+    var rows = [], i, one;
+    if (Object.prototype.toString.call(row[name]) === '[object Array]') {
+      rows = row[name];
+    }
+    if (!rows.length) return;
+    into.appendChild(el('div', 'og-sub', title));
+    for (i = 0; i < rows.length; i += 1) {
+      one = rows[i] || {};
+      pair(into, String(one.name || one.label || ('row ' + (i + 1))),
+        told(one.count) === null ? UNREAD : num(one.count, 0));
+    }
+  }
+
+  function roomBlocked(into, row, used) {
+    used.blocked = true;
+    var rows = [], i, one, n;
+    if (Object.prototype.toString.call(row.blocked) === '[object Array]') {
+      rows = row.blocked;
+    }
+    if (!rows.length) return;
+    into.appendChild(el('div', 'og-sub',
+      'and what is blocked here, with its named reason'));
+    for (i = 0; i < rows.length; i += 1) {
+      one = rows[i] || {};
+      n = told(one.count);
+      into.appendChild(fold(
+        'block:' + String(row.name || '') + ':' + String(one.name || i),
+        String(one.name || 'a reason with no name'),
+        n === null ? UNREAD : num(n, 0),
+        (function (o) {
+          return function (b) {
+            if (o.why) b.appendChild(el('div', 'og-lead', String(o.why)));
+            if (o.fix) pair(b, 'what to do about it', String(o.fix));
+          };
+        }(one)), 'og-pinned'));
+    }
+  }
+
+  /* --------------------------------- one round that was never heard */
+
+  function roundRow(row, n) {
+    var id = String(row.id || '');
+    var title = String(row.name || row.label || ('a ' + String(row.road || 'round')));
+    var age = told(row.written_ago_seconds);
+    var summary = (age === null ? UNREAD : 'written ' + secs(age) + ' ago');
+    if (told(row.seconds) !== null) summary += '  /  ' + secs(row.seconds);
+    return fold('unheard:' + (id || n), title, summary, function (body) {
+      if (row.why) body.appendChild(el('div', 'og-lead', String(row.why)));
+      pair(body, 'the road it is on', String(row.label || row.road || '?'));
+      pair(body, 'written', age === null ? UNREAD : secs(age) + ' ago');
+      pair(body, 'how long it runs',
+        told(row.seconds) === null ? UNREAD : secs(row.seconds));
+      pair(body, 'why it has not been heard', row.blocked
+        ? 'something about the round stops it - the reasons are below'
+        : 'nothing about the round stops it: no road has asked for it');
+      pair(body, 'its id', id || UNREAD);
+      if (row.text) body.appendChild(el('div', 'og-refuse', String(row.text)));
+      var reasons = row.reasons || [];
+      if (reasons.length) {
+        body.appendChild(el('div', 'og-sub', 'what the air road itself says'));
+        for (var i = 0; i < reasons.length; i += 1) {
+          pair(body, String(reasons[i].code || '?'),
+            String(reasons[i].say || ''));
+          if (reasons[i].fix) {
+            body.appendChild(el('div', 'og-blind-n',
+              'the cure: ' + String(reasons[i].fix)));
+          }
+        }
+      }
+      if (!id) {
+        body.appendChild(el('div', 'og-quiet',
+          'the station sent this round without an id, so nothing here can '
+          + 'act on it.'));
+        return;
+      }
+      body.appendChild(el('div', 'og-sub', 'and what may be done about it'));
+      body.appendChild(roundButton(id, 'hear', 'c:play',
+        'hear it now', 'out of turn, through the rescue door. The air\'s own '
+        + 'door still refuses anything unfinished.'));
+      body.appendChild(roundButton(id, 'retire', 'c:trash-can',
+        'retire it', 'out of the cupboard. The retirement desk records it; '
+        + 'finished work is not destroyed.'));
+      body.appendChild(roundButton(id, 'edit', 'c:edit',
+        'fork and edit', 'opens its turns at the foot of this panel. A kept '
+        + 'or already-aired round is FORKED by the station before a word is '
+        + 'written, so the original is never altered.'));
+    }, row.blocked ? '' : 'og-pinned');
+  }
+
+  function roundButton(id, verb, ref, face, why) {
+    var wrap = el('div', 'og-offer');
+    var btn = el('button', 'og-offer-b');
+    btn.setAttribute('type', 'button');
+    iconInto(btn, ref, '');
+    btn.appendChild(el('span', null, ROUND_BUSY === (id + ':' + verb)
+      ? 'asking the station...' : face));
+    if (ROUND_BUSY) btn.disabled = true;
+    btn.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      if (verb === 'edit') { editOpen(id); return; }
+      roundAct(id, verb);
+    });
+    wrap.appendChild(btn);
+    wrap.appendChild(el('div', 'og-offer-cost', why));
+    return wrap;
+  }
+
+  function roundsInto(body, src, used) {
+    used.rows = true;
+    used.rows_basis = true;
+    used.rows_asked = true;
+    used.rows_cap = true;
+    used.reason_cap = true;
+    used.rows_truncated = true;
+    used.rows_truncated_basis = true;
+    var rows = [];
+    if (Object.prototype.toString.call(src.rows) === '[object Array]') {
+      rows = src.rows;
+    }
+    body.appendChild(el('div', 'og-sub',
+      'the rounds themselves, and what you can do with each'));
+    if (!rows.length) {
+      body.appendChild(el('div', 'og-quiet',
+        'the station sent no list of never-heard rounds on this payload. '
+        + 'That is not "there are none" unless the count above is 0 - it is '
+        + 'a list that was not sent. Looked for: rows.'));
+      return;
+    }
+    if (typeof src.rows_basis === 'string') {
+      body.appendChild(el('div', 'og-lead', String(src.rows_basis)));
+    }
+    for (var i = 0; i < rows.length; i += 1) {
+      body.appendChild(roundRow(rows[i] || {}, i));
+    }
+    if (src.rows_truncated) {
+      body.appendChild(warnBox(String(src.rows_truncated_basis
+        || 'more rounds have never been heard than are listed here')));
+    }
   }
 
   function disarm() {
@@ -1474,6 +2015,11 @@
         pair(into, 'the station timed it as', heldHit.name);
       }
 
+      /* [#1211] the doors, the names inside, and what is blocked. */
+      roomDoors(into, row, used);
+      roomList(into, row, used, 'top', 'the top few in this room, by name');
+      roomBlocked(into, row, used);
+
       extras(into, row, used);
       notCounted(into, missing);
     }, stuck.value ? 'og-pinned' : '');
@@ -1491,6 +2037,12 @@
         + 'That is the exact failure the blind pane below was written to '
         + 'stop, and it applies to this pane too.'));
       pair(body, 'the key this pane reads', 'rooms');
+      /* [#1211] and the station's OWN sentence about why, when it has one -
+         a missing module and a read that threw are different faults with
+         different cures, and "absent" alone cannot tell them apart. */
+      if (last && last.rooms_why) {
+        pair(body, 'and the station says', String(last.rooms_why));
+      }
       pair(body, 'what arrived instead', src === null ? 'null'
         : (typeof src === 'undefined' ? 'nothing' : typeof src));
       return;
@@ -1502,9 +2054,23 @@
         + 'it is worth saying out loud.'));
       return;
     }
+    /* [#1211] THE WINDOW IS TEN MINUTES, NOT SINCE BOOT. This line said
+       "since this process started", which was a guess written before the
+       server half existed - and it is the wrong guess: what went in and
+       came out are counted over a ROLLING WINDOW the station names on the
+       payload. A caption that misstates the window makes every number
+       under it wrong by however long the process has been up. */
     body.appendChild(el('div', 'og-lead',
-      'what went in, what came out, and what is stuck - per room, counted '
-      + 'since this process started ' + secs(last.up_seconds) + ' ago.'));
+      'what went in, what came out, and what is stuck - per room. What is '
+      + 'stuck is right now; what went in and came out are counted over '
+      + 'the last '
+      + (told(last.rooms_window_seconds) === null
+          ? 'window the station did not name'
+          : secs(last.rooms_window_seconds))
+      + '. The process came up ' + secs(last.up_seconds) + ' ago.'));
+    if (last.rooms_say) {
+      body.appendChild(el('div', 'og-quiet', String(last.rooms_say)));
+    }
     for (i = 0; i < rows.length; i += 1) body.appendChild(roomRow(rows[i], i));
   }
 
@@ -1829,9 +2395,16 @@
       }));
 
     /* 5. WHAT IT IS WORKING TOWARDS, and the arithmetic behind each number. */
+    /* [#1211] ...and what it is asking YOU for, in the same pane, because
+       a question that can be read and not answered is the same shape of
+       surface as a number that can be read and not checked. */
+    var openAsks = (last.asks || []).length;
     main.appendChild(fold('roads', 'what it is asking the station for',
-      roads.length ? roads.length + ' roads' : 'no plan yet', function (body) {
+      (roads.length ? roads.length + ' roads' : 'no plan yet')
+        + (openAsks ? '  /  ' + openAsks + ' waiting on you' : ''),
+      function (body) {
         if (last.plan_why) body.appendChild(el('div', 'og-lead', last.plan_why));
+        asksInto(body);                            /* [#1211] */
         if (!roads.length) {
           body.appendChild(el('div', 'og-quiet',
             'the coordinator has not written a work order since this '
@@ -1988,16 +2561,22 @@
          touches his place in the list. */
       /* [#1213] folded: there is no body to wait for. */
       if (mini) { waiting = false; pendingUpdates = 0; paintSay(); paintHeader(); return; }
-      if (reading()) {
+      /* [#1211] HIS OWN PRESS ALWAYS SHOWS ITS RESULT. The hold is right
+         for the poll and wrong for an action he just took: after answering
+         an ask or airing a round his hand is still over the panel, so
+         reading() is true and the answer would be held back behind the very
+         press that asked for it. One pass, then the hold stands again. */
+      if (reading() && !forceOnce) {
         /* [#1186] and it says so, with a count, rather than silently going
            stale - a surface that is behind and does not admit it is the
            fault this station has been bitten by more than any other. */
         waiting = true;
         pendingUpdates += 1;
         paintSay(); paintHeader(); paintHeld();
-      } else { paint(); }
+      } else { forceOnce = false; paint(); }   /* [#1211] */
     })['catch'](function () {
       if (!box) return;
+      forceOnce = false;                        /* [#1211] */
       lastMs = Date.now() - began;
       trouble('the station could not be reached');
     });
@@ -2178,6 +2757,7 @@
     });
 
     node.appendChild(el('div', 'og-main'));
+    node.appendChild(commandLine());               /* [#1211] */
     /* A SIBLING OF <main>, never a child of a view: every view in this
        window goes display:none the moment another tab is chosen, and three
        of them are webviews with documents of their own. A pop-up built
@@ -2196,6 +2776,84 @@
       }
     } catch (err) { /* a window that cannot take a drop is still a window */ }
     return node;
+  }
+
+  /* [#1211] THE COMMAND LINE, AT THE FOOT, OUTSIDE THE LIST.
+   *
+   * It is a sibling of `.og-main` for the same reason the pressure offer is
+   * a two-press button: this is the one place on the panel where a person
+   * acts, and an acting surface must not be rebuilt under them. The
+   * reconcile only ever touches `.og-main`, so what is typed here survives
+   * every poll, and the station's answers land here too - a sentence
+   * written into a fold would be thrown away by the next paint.
+   *
+   * Every verb it understands is a door that already existed: the judgment
+   * dials from the logic graph, the policy verbs orch_apply already accepts,
+   * the rungs of the broadcast ladder, hear and retire from the retirement
+   * desk, why from the director's room. The line invents nothing, and the
+   * station echoes each press onto its own register so it shows up in "what
+   * it has been doing, in order" beside the station's own passes. */
+  function commandLine() {
+    var wrap = el('div', 'og-cmd');
+    var row = el('div', 'og-cmd-row');
+    var input = root.document.createElement('input');
+    input.className = 'og-cmd-in';
+    input.type = 'text';
+    input.setAttribute('placeholder', 'a verb for the orchestrator - type help');
+    input.setAttribute('aria-label', 'a command for the orchestrator');
+    row.appendChild(input);
+    var go = el('button', 'og-cmd-go');
+    go.setAttribute('type', 'button');
+    iconInto(go, 'c:send--alt', '');
+    go.appendChild(el('span', null, 'run'));
+    row.appendChild(go);
+    wrap.appendChild(row);
+    var out = el('div', 'og-cmd-out', '');
+    out.hidden = true;
+    out.setAttribute('role', 'status');
+    wrap.appendChild(out);
+    var more = el('div', 'og-cmd-more');
+    more.hidden = true;
+    wrap.appendChild(more);
+    var edit = el('div', 'og-cmd-edit');
+    edit.hidden = true;
+    wrap.appendChild(edit);
+
+    function send() {
+      var text = String(input.value || '').replace(/^\s+|\s+$/g, '');
+      if (!text) { foot('type a verb - help lists them', false); return; }
+      go.disabled = true;
+      foot('running "' + text + '"...', true);
+      footLines([]);
+      postBody('/api/orchestrator/command', {text: text})
+        .then(function (got) {
+          go.disabled = false;
+          foot(String((got && got.say) || 'the station did not answer'),
+            !!(got && got.ok !== false));
+          footLines((got && got.lines) || []);
+          if (got && got.ok !== false) input.value = '';
+          refreshNow();
+        })['catch'](function () {
+          go.disabled = false;
+          foot('the station could not be reached', false);
+        });
+    }
+
+    go.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      send();
+    });
+    input.addEventListener('keydown', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      if (ev && (ev.key === 'Enter' || ev.keyCode === 13)) send();
+    });
+    /* A press in the footer must never fold the panel: the head's click
+       handler is on the head, but the box carries the drag and a stray
+       bubble would be read as a gesture. */
+    wrap.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+    });
+    return wrap;
   }
 
   /* ------------------------------------------------------------- the door */

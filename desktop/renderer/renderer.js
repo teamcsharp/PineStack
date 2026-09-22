@@ -2196,11 +2196,26 @@ const PLAYERS_DEVICES = [
    why: "The Pine Box application on this computer."},
   {id: "pinetab", row: "pinetab", label: "PineTab", page: true,
    why: "The tablet."},
+  /* [#1185] "there should be another listing, the web page". A browser tab
+   * on this machine is a THIRD surface, not a second copy of the app, and
+   * it was the one row this list never had - so a tab left open was either
+   * invisible or, on the tablet's copy of this list, drawn under the app's
+   * own name. */
+  {id: "web", row: "web", label: "Web page", page: true,
+   why: "A browser tab with the station open."},
   {id: "box", row: "", label: "Pine Box", page: false,
    why: "The box speaker."},
   {id: "nabu", row: "", label: "Nabu", page: false,
    why: "The Nabu device."}
 ];
+
+/* [#1185] Which `kind` the station reports for each of the page surfaces.
+ * The station decides this: it sees the `desktop-` id prefix the shell
+ * mints, the `PineBoxKiosk/<ver>` marker in the kiosk WebView's own user
+ * agent, and the x-pinebox-public header on a tune-in listener. None of
+ * those reach this side, which is why this used to be guessed from an
+ * address and why the guess was wrong whenever two surfaces shared one. */
+const PLAYERS_KIND = {app: "app", pinetab: "pinetab", web: "page"};
 
 /* Which listener id a page device is using right now, or "" if it is not
  * looking. The app names itself by its id prefix; the tablet is placed by
@@ -2210,10 +2225,24 @@ function playersListenerFor(device) {
   for (const row of rows) {
     const listener = String(row.listener || "");
     const addr = String(row.addr || "");
+    /* [#1185] Take the station's answer when it has one. It also collapses
+     * a page that reloaded inside the last thirty seconds into a single
+     * row, so `surfaces` is how many tabs this one device has open rather
+     * than how many devices there are. */
+    const kind = String(row.kind || "");
+    if (kind) {
+      if (kind !== PLAYERS_KIND[device.id]) continue;
+      return {listener, addr, seen: row.seen,
+              what: String(row.what || ""),
+              surfaces: Number(row.surfaces || 1)};
+    }
+    /* A station that has not been restarted yet: the old address match,
+     * which cannot tell the app from a browser tab beside it. */
     if (device.id === "app") {
       if (listener.startsWith("desktop-")) return {listener, addr, seen: row.seen};
       continue;
     }
+    if (device.id === "web") continue;       /* nothing honest to match on */
     const want = String((playersTerminals[device.row] || {}).addr || "");
     if (want && addr === want && !listener.startsWith("desktop-")) {
       return {listener, addr, seen: row.seen};
@@ -2250,7 +2279,12 @@ function paintPlayers() {
         : (toBox && voiceDevice !== "nabu");
     const detail = device.page
       ? (here
-          ? [here.addr, Number.isFinite(here.seen)
+          ? [here.addr,
+             /* [#1185] several tabs of one surface is one device, and
+              * saying so is the difference between "two of my things are
+              * playing" and "I left a tab open". */
+             Number(here.surfaces || 1) > 1 ? here.surfaces + " tabs" : "",
+             Number.isFinite(here.seen)
               ? Math.round(here.seen) + "s ago" : ""].filter(Boolean).join(" · ")
           : "not open")
       : (owns ? "routed here" : "not routed");
