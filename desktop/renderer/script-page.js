@@ -2634,6 +2634,361 @@
    * node of a segment that had no hand-offs at all - has no one line, so it
    * reveals that seat's FIRST line and the card says which seat it is. That
    * is honest: the station recorded the seat, not a line, for that node. */
+  /* ---------------------------------------------- [#1386] TECHNICAL VIEW */
+  var techView = null;          /* the mounted graph, when there is one */
+  var techHost = null;          /* the div it lives in, beside the feed */
+  var techOn = false;
+  var techOpening = false;
+  var techWide = false;         /* [#1387] across the whole bottom */
+  try { techWide = localStorage.getItem('sp.tech.wide') === '1'; }
+  catch (e) { techWide = false; }
+
+  /* [#1386] ABSOLUTE, ALWAYS.
+   *
+   * import() resolves a RELATIVE specifier against the importing script's
+   * base URL - and this file is INJECTED into the kiosk's WebView rather
+   * than loaded from a URL, so its base is `about:blank` and every
+   * relative path fails with "Failed to resolve module specifier". The
+   * error names the cause exactly and is easy to misread as a missing
+   * file, which is what it looked like.
+   *
+   * `pineThreeUrl` is no help either: it lives in the Electron shell's
+   * renderer.js and does not exist in the panel page at all.
+   *
+   * So the origin is taken from the page itself when there is one - on
+   * the tablet the panel is served from http://127.0.0.1:8096 - and only
+   * a file:// shell falls back to naming the station outright. */
+  function techUrl(name) {
+    try {
+      if (/^https?:$/.test(location.protocol) && location.origin
+          && location.origin !== 'null') {
+        return location.origin + name;
+      }
+    } catch (err) { /* no location worth having */ }
+    try {
+      if (root.pineThreeUrl) {
+        return String(root.pineThreeUrl())
+          .replace(/\/vendor\/three\.min\.js.*$/, '') + name;
+      }
+    } catch (err) { /* older shell */ }
+    return 'http://127.0.0.1:8096' + name;
+  }
+
+  function techBox() {
+    if (techHost) return techHost;
+    var feed = document.getElementById('spFeed');
+    if (!feed || !feed.parentNode) return null;
+    techHost = make('div', 'sp-tech');
+    techHost.style.display = 'none';
+    feed.parentNode.insertBefore(techHost, feed.nextSibling);
+    return techHost;
+  }
+
+  async function techMount() {
+    if (techView || techOpening) return techView;
+    var box = techBox();
+    if (!box) return null;
+    techOpening = true;
+    try {
+      if (!document.getElementById('spTechStyle')) {
+        var style = document.createElement('link');
+        style.id = 'spTechStyle';
+        style.rel = 'stylesheet';
+        style.href = techUrl('/word-cause/word-cause.css?v=3');
+        document.head.appendChild(style);
+      }
+      var mod = await import(techUrl('/word-cause/word-cause.js?v=3'));
+      techView = mod.openWordCause({
+        embed: true,
+        host: box,
+        threeUrl: techUrl('/vendor/three.min.js'),
+        base: location.origin,
+        /* [#1387] The full-screen host is the panel's own PINE_3JS frame.
+           On the tablet this code IS the panel's document, so the function
+           is right there; in the desktop shell it is not, and a new window
+           on the same road is the honest fallback rather than a button
+           that silently does nothing. */
+        onFull: function (want) {
+          try {
+            if (typeof root.pineShow3JS === 'function') {
+              root.__wcWant = want;
+              root.pineShow3JS('wordcause');
+              return;
+            }
+          } catch (err) { /* fall through to the window */ }
+          var q = '/?view=wordcause'
+            + (want && want.line ? '&wc=' + encodeURIComponent(want.line) : '')
+            + (want && !want.line && want.word
+               ? '&wcq=' + encodeURIComponent(want.word) : '');
+          try { root.open(techUrl('') + q, '_blank'); }
+          catch (err) { /* a shell with no window opener */ }
+        },
+        request: function (path, options) { return api()[
+          (options && options.method === 'PUT') ? 'put'
+            : (options && options.method === 'POST') ? 'post' : 'get'](
+          path, options && options.body ? JSON.parse(options.body) : undefined); },
+        onClose: function () { techView = null; },
+      });
+    } catch (err) {
+      box.textContent = '';
+      box.appendChild(make('div', 'sp-techbad',
+        'the technical view could not open: ' + String((err && err.message) || err)));
+    } finally { techOpening = false; }
+    return techView;
+  }
+
+  /* [#1387] ACROSS THE WHOLE BOTTOM.
+   *
+   * "I might also need to be able to expand the technical view in the
+   *  script sub page to be able to go all the way across to the right side.
+   *  So it's basically splitting into the script section and taking up that
+   *  whole bottom section of the window, allowing me to have more room to
+   *  work horizontally."
+   *
+   * The feed column is about a third of the glass, and a flowchart that
+   * fans out five columns deep cannot be read in a third of the glass - his
+   * screenshot is the proof. So the pane can leave its column: pinned to
+   * the page, left to right, taking the bottom band under BOTH the column
+   * and the script, with a handle on its top edge to say how much of the
+   * height it gets. The script keeps running above it.
+   *
+   * It is the same mounted graph either way - moved, not rebuilt - so
+   * nothing is re-fetched and nothing loses its place; only `resize` is
+   * told, because the canvas has to be re-measured after any move. */
+  function techPage() {
+    var at = document.querySelector('.' + HOST_CLASS);
+    return at || document.body;
+  }
+
+  function techPlace() {
+    if (!techHost) return;
+    var page = techPage();
+    if (techWide) {
+      techHost.classList.add('sp-tech-wide');
+      var tall = 0;
+      try { tall = parseInt(localStorage.getItem('sp.tech.tall') || '0', 10); }
+      catch (e) { tall = 0; }
+      techHost.style.height = (tall >= 160 ? tall : Math.round(
+        (page.clientHeight || 700) * 0.55)) + 'px';
+      if (techHost.parentNode !== page) page.appendChild(techHost);
+    } else {
+      techHost.classList.remove('sp-tech-wide');
+      techHost.style.height = '';
+      var feed = document.getElementById('spFeed');
+      if (feed && feed.parentNode && techHost.parentNode !== feed.parentNode) {
+        feed.parentNode.insertBefore(techHost, feed.nextSibling);
+      }
+    }
+    var flip = document.querySelector('.sp-techwide');
+    if (flip) {
+      flip.textContent = techWide ? 'in column' : 'full width';
+      flip.title = techWide
+        ? 'Put the technical view back in the feed column'
+        : 'Take the technical view across the whole bottom of the window';
+    }
+    if (techView && techView.resize) {
+      setTimeout(function () { try { techView.resize(); } catch (e) { /* gone */ } }, 40);
+    }
+  }
+
+  function techWideSet(on) {
+    techWide = !!on;
+    try { localStorage.setItem('sp.tech.wide', techWide ? '1' : '0'); }
+    catch (e) { /* a private window; the choice lasts this session */ }
+    /* [#1389] THE TABS GET OUT OF THE WAY.
+     *
+     * "whenever this is brought into full mode ... these tabs need to
+     *  slide out of the way so that the buttons aren't being overlapped
+     *  with by tabs because I can never tap them."
+     *
+     * The vertical view rail (#pineViewRail: TECH, SAMPLER, SCRIPT ...)
+     * is `position: fixed; right: 0` and sits at z-index 2147483001 - so
+     * it floats over ANY pane, and in full width the technical view's own
+     * bar runs right underneath it. Fit, full and the layout picker were
+     * all behind a tab.
+     *
+     * A class on <html>, exactly as listen.js's bare mode does it, because
+     * rail.js injects its own stylesheet AFTER every other one: a bare
+     * `#pineViewRail` rule here would lose every tie, and `html.<class>
+     * #pineViewRail` is an id plus a class, which wins whatever the source
+     * order. rail.js itself is untouched.
+     *
+     * It slides OUT, not away: a strip stays on the edge and a finger on
+     * it brings the whole rail back. A control whose only way back is a
+     * control you just hid is the fault in [[a-modal-needs-its-own-way-out]],
+     * and this does not repeat it. */
+    try {
+      document.documentElement.classList.toggle('pine-tech-wide', techWide);
+    } catch (e) { /* no document element is not a thing, but never throw here */ }
+    techPlace();
+    /* The feed only hides when the pane is IN its column. Wide, the pane is
+       somewhere else entirely and the feed can carry on being the feed. */
+    var feed = document.getElementById('spFeed');
+    if (feed) feed.style.display = (techOn && !techWide) ? 'none' : '';
+  }
+
+  /* The handle on its top edge. Drag to say how much of the bottom band the
+     drawing gets; double tap to put it back to the middle. */
+  function techGrip() {
+    if (!techHost || techHost.querySelector('.sp-tech-grip')) return;
+    var grip = make('div', 'sp-tech-grip');
+    grip.title = 'Drag to resize; double tap to put it back';
+    var from = 0;
+    var was = 0;
+    var move = function (ev) {
+      var page = techPage();
+      var want = Math.max(160, Math.min(
+        Math.max(240, (page.clientHeight || 700) - 140),
+        was + (from - ev.clientY)));
+      techHost.style.height = want + 'px';
+      if (techView && techView.resize) {
+        try { techView.resize(); } catch (e) { /* gone */ }
+      }
+    };
+    var stop = function (ev) {
+      try { grip.releasePointerCapture(ev.pointerId); } catch (e) { /* gone */ }
+      grip.removeEventListener('pointermove', move);
+      grip.removeEventListener('pointerup', stop);
+      grip.removeEventListener('pointercancel', stop);
+      try {
+        localStorage.setItem('sp.tech.tall',
+          String(parseInt(techHost.style.height, 10) || 0));
+      } catch (e) { /* nothing is lost but the memory */ }
+    };
+    grip.addEventListener('pointerdown', function (ev) {
+      if (!techWide) return;
+      ev.preventDefault();
+      from = ev.clientY;
+      was = techHost.clientHeight;
+      try { grip.setPointerCapture(ev.pointerId); } catch (e) { /* older */ }
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', stop);
+      grip.addEventListener('pointercancel', stop);
+    });
+    grip.addEventListener('dblclick', function () {
+      techHost.style.height = Math.round(
+        (techPage().clientHeight || 700) * 0.55) + 'px';
+      try { localStorage.removeItem('sp.tech.tall'); } catch (e) { /* fine */ }
+      if (techView && techView.resize) {
+        try { techView.resize(); } catch (e) { /* gone */ }
+      }
+    });
+    techHost.appendChild(grip);
+  }
+
+  function techShowFace(on) {
+    var feed = document.getElementById('spFeed');
+    techOn = !!on;
+    /* Wide, the pane is not in the feed's place, so the feed stays. */
+    if (feed) feed.style.display = (techOn && !techWide) ? 'none' : '';
+    if (techHost) techHost.style.display = techOn ? '' : 'none';
+    if (techOn) { techGrip(); techPlace(); }
+    var flip = document.querySelector('.sp-feedflip');
+    if (flip) flip.textContent = techOn ? 'feed' : 'technical';
+    var name = document.querySelector('.sp-feedhead b');
+    if (name) name.textContent = techOn ? 'Technical' : 'Feed';
+    var why = document.querySelector('.sp-feedwhy');
+    if (why) {
+      why.textContent = techOn
+        ? 'where it came from - pinch to zoom, tap a node, double tap to bring it in'
+        : 'everything the station is doing';
+    }
+    if (techOn && techView && techView.resize) {
+      setTimeout(function () { try { techView.resize(); } catch (e) { /* gone */ } }, 30);
+    }
+  }
+
+  function technicalToggle() {
+    if (!techOn) {
+      techMount().then(function () {
+        techShowFace(true);
+        /* Re-stamp on the way in: the pane can be reopened already wide
+           from a remembered choice, and the rail would not know. */
+        techWideSet(techWide);
+      });
+    } else {
+      techShowFace(false);
+      /* [#1389] The pane is gone, so the tabs are nobody's problem any
+         more - they come back whatever `wide` is remembered as. */
+      try {
+        document.documentElement.classList.remove('pine-tech-wide');
+      } catch (e) { /* never throw on the way out */ }
+    }
+  }
+
+  /* Tapping a name in the script traces THAT line, here, without taking
+     the show off the glass. */
+  function technicalTrace(lineId, said) {
+    if (!lineId) return;
+    techMount().then(function (view) {
+      techShowFace(true);
+      if (view && view.showLine) view.showLine(lineId, said);
+    });
+  }
+  root.PineTechnical = {trace: technicalTrace, toggle: technicalToggle};
+
+  /* [#1386] ANY NAME, ANY TITLE, ANY SECTION.
+   *
+   * "whenever I tap on a title or any name or a section inside of the
+   *  script view, I want the feed to become a visual node editor."
+   *
+   * ONE delegated listener rather than a handle sewn onto each renderer.
+   * The screenplay is built out of `.sp-el` elements - scene, character,
+   * dialogue, parenthetical, action - and a dialogue element carries its
+   * `data-line`. A character heading has none of its own, because a name
+   * is not a line; the line it names is the next element down, which is
+   * exactly what sayingWho() walks backwards to find. So: take the id off
+   * whichever element was tapped, or off the first one below it that has
+   * one.
+   *
+   * Delegated also means it keeps working for every element the script
+   * grows later without anybody remembering to wire it up. */
+  function techIdNear(node) {
+    var at = node;
+    for (var up = 0; at && up < 4; up += 1) {
+      if (at.classList && at.classList.contains('sp-el')) break;
+      at = at.parentNode;
+    }
+    if (!at || !at.classList || !at.classList.contains('sp-el')) return null;
+    /* A REAL line id, not a plan key. The screenplay carries two kinds of
+       `data-line`: an aired line's own 32-character id, and the planner's
+       composite key for an entry that has not happened yet (`seg:c3`).
+       The ledger only knows the first, and answering "that line is not in
+       the ledger" for a row that was never a line is a true sentence that
+       helps nobody. So a short or punctuated key is skipped and the walk
+       carries on to the next element that has a real one. */
+    var REAL = /^[0-9a-f]{24,}$/i;
+    var own = at.getAttribute && at.getAttribute('data-line');
+    if (own && REAL.test(own)) {
+      return {id: own, said: String(at.textContent || '')};
+    }
+    /* A heading, a scene or a cue: the line it introduces is below it. */
+    var walk = at.nextElementSibling;
+    for (var down = 0; walk && down < 6; down += 1) {
+      var got = walk.getAttribute && walk.getAttribute('data-line');
+      if (got && REAL.test(got)) {
+        return {id: got, said: String(walk.textContent || '')};
+      }
+      walk = walk.nextElementSibling;
+    }
+    return null;
+  }
+
+  document.addEventListener('click', function (ev) {
+    var node = ev.target;
+    if (!node || !node.closest) return;
+    /* Not while something is being edited or dragged over the script, and
+       never over the technical pane itself - a tap on a node there is the
+       graph's own. */
+    if (node.closest('.wc-dialog') || node.closest('input')
+        || node.closest('textarea') || node.closest('button')) return;
+    var el2 = node.closest('.sp-el');
+    if (!el2) return;
+    var got = techIdNear(el2);
+    if (!got) return;
+    technicalTrace(got.id, got.said);
+  }, true);
+
   function segReveal(lineId, seat) {
     var card = segCardFor(lineId) || (seat ? segCardForSeat(seat) : null);
     if (!card) {
@@ -3425,7 +3780,21 @@
     if (String(l.aired || '') === 'withdrawn') card.classList.add('sp-withdrawn');
     card.style.borderLeftColor = look.colour;
     var top = make('div', 'sp-segline-top');
-    top.appendChild(make('b', 'sp-segline-who', segWord(l.name, look.label)));
+    /* [#1386] THE NAME IS THE HANDLE. "whenever I tap on a title or any
+       name or a section inside of the script view, I want the feed to
+       become a visual node editor." The line's own body still unfolds the
+       record underneath it; the NAME is what traces it. */
+    var whoTag = make('b', 'sp-segline-who sp-tracable',
+      segWord(l.name, look.label));
+    whoTag.title = 'Trace this line - where it came from, and what made it';
+    whoTag.addEventListener('click', function (ev) {
+      /* The inspector's own cards are not `.sp-el`, so the delegated
+         listener above never sees them - this stays, and stops the tap
+         before it also unfolds the record underneath. */
+      ev.stopPropagation();
+      technicalTrace(l.line_id, l.text);
+    });
+    top.appendChild(whoTag);
     var tags = [];
     if (segHas(l.ord)) tags.push('#' + l.ord);
     if (segHas(l.kind)) tags.push(String(l.kind));
@@ -3438,6 +3807,42 @@
     top.appendChild(make('span', 'sp-segline-tag', tags.join('  ·  ')));
     card.appendChild(top);
     card.appendChild(make('div', 'sp-segline-text', segWord(l.text, '(no text)')));
+    /* [#1386] THE DICE, BESIDE THE LINE THEY MADE.
+     *
+     * "Next to each piece of dialogue in the script editor, I want to be
+     *  able to see the dice roll and the result that it got and the
+     *  intensity result of what each dice value equals."
+     *
+     * The raw roll is shown, not a bucket name, because the bucket is
+     * derived and the roll is the fact. The band is shown beside it so a
+     * locked range is visible as a range: a 0.12 inside [0, 0.35] is the
+     * dice doing what it was told, and a 0.12 inside [0, 1] is chance. */
+    if (l.dice && l.dice.roll != null) {
+      var d = l.dice;
+      var band = Array.isArray(d.band) ? d.band : [0, 1];
+      var locked = !(Number(band[0]) === 0 && Number(band[1]) === 1);
+      var hard = Number(d.hard || 0);
+      var means = hard >= 0.72 ? 'hard' : hard >= 0.36 ? 'plainly' : 'mildly';
+      var dice = make('div', 'sp-segline-dice');
+      if (locked) dice.classList.add('sp-dice-locked');
+      var pip = make('span', 'sp-dice-pip', String(d.roll));
+      pip.style.background = Number(d.lean) > 0 ? '#54d18b' : '#e06c9f';
+      dice.appendChild(pip);
+      dice.appendChild(make('span', 'sp-dice-axis', String(d.axis || 'stance')));
+      dice.appendChild(make('span', 'sp-dice-means',
+        (Number(d.lean) > 0 ? 'with them' : 'against them') + ' \u00b7 ' + means));
+      if (locked) {
+        dice.appendChild(make('span', 'sp-dice-band',
+          'locked ' + band[0] + '-' + band[1]));
+      }
+      if (d.answers) {
+        dice.appendChild(make('span', 'sp-dice-ans', 'answering #' + d.answers));
+      }
+      if (d.text) dice.appendChild(make('span', 'sp-dice-text', String(d.text)));
+      dice.title = 'rolled ' + d.roll + ' in [' + band[0] + ', ' + band[1] + ']'
+        + '  ->  ' + means + (d.text ? ('  ->  ' + d.text) : '');
+      card.appendChild(dice);
+    }
     var made = [];
     if (segHas(l.voice)) made.push('voice ' + l.voice);
     if (segHas(l.engine)) made.push('engine ' + l.engine);
@@ -9317,9 +9722,38 @@
     left.appendChild(treeRow);
     left.appendChild(buildPanel());
     left.appendChild(buildPlayer());         /* 5 */
+    /* [#1386] THE FEED HAS TWO FACES.
+     *
+     * "I want to be able to toggle feed view between being feed view and
+     *  technical view which is what it jumps into when i select any
+     *  element in the script view."
+     *
+     * Feed is what the station is DOING. Technical is where any of it
+     * CAME FROM - the same pane, the same place on the glass, so tracing
+     * a line does not take the show off the screen. Tapping a name in the
+     * script flips it here and traces that line; the toggle flips it back
+     * and the feed carries on where it was. */
     var feedHead = make('div', 'sp-feedhead');
-    feedHead.appendChild(make('b', '', 'Feed'));
-    feedHead.appendChild(make('i', 'sp-feedwhy', 'everything the station is doing'));
+    var feedName = make('b', '', 'Feed');
+    feedHead.appendChild(feedName);
+    var feedWhy = make('i', 'sp-feedwhy', 'everything the station is doing');
+    feedHead.appendChild(feedWhy);
+    var feedFlip = make('button', 'sp-feedflip', 'technical');
+    feedFlip.title = 'Trace where any of this came from. Tap a name in the '
+      + 'script to trace that line.';
+    feedFlip.addEventListener('click', function () {
+      technicalToggle();
+    });
+    feedHead.appendChild(feedFlip);
+    var wideFlip = make('button', 'sp-feedflip sp-techwide',
+      techWide ? 'in column' : 'full width');
+    wideFlip.addEventListener('click', function () {
+      /* Pressing this is also asking to SEE it - going wide with the pane
+         still shut would look like a button that does nothing. */
+      if (!techOn) { technicalToggle(); }
+      techWideSet(!techWide);
+    });
+    feedHead.appendChild(wideFlip);
     left.appendChild(feedHead);
     var feed = make('div', 'sp-feed');       /* 6 */
     feed.id = 'spFeed';

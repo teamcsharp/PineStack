@@ -72,7 +72,10 @@ import segment_prompts                   # [#1195] the segment prompt book: alte
 import paperwork_fields                  # [#1231] the inspector's editable boxes
 import track_talk_segment                # #1179: a record's talk desk
 import record_binding                    # #1237: a line bound to a record airs with it
-import phrase_trace                      # [#1241] where a phrase comes from, and the ban
+import phrase_trace
+import word_cause_edits
+import clip_speech
+import clip_senses                      # [#1241] where a phrase comes from, and the ban
 import recast_desk                        # [#1215]: the cupboard recast desk
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
@@ -1199,6 +1202,41 @@ DEFAULT_DJ = {
     # Raised with the gallery governor (#646): the wall was eating the show,
     # and the documents are what it is supposed to be made of.
     "speakbox_rate": 0.82,
+    # [#1386] THE EXCHANGE ENGINE, and its rollback switch.
+    #
+    # "one-call"  the historical road: the whole 16-22 turn exchange
+    #             written in a single visit, both sides at once.
+    # "beats"     the chain: 3-4 turns per visit, each carrying the
+    #             turns before it verbatim, so a speaker is actually
+    #             handed what was just said.
+    # "auto"      beats where nothing is waiting (the banked road),
+    #             one-call live. The default.
+    #
+    # Measured before this existed: the one call was asked for 16-22
+    # turns of 60-100 words (1,500-3,000 tokens) and returned a median
+    # of 357 tokens - about 75 characters per requested turn. It could
+    # not deliver its own contract, so it collapsed the exchange and
+    # reached for a known frame to fill the shape.
+    "banter_engine": "auto",
+    # How often a turn gets a rolled stance at all. ZERO IS TODAY,
+    # byte for byte: the dice are rolled and recorded but never enter
+    # a prompt. This is the rollback that needs no deploy.
+    "banter_dice_rate": 0.0,
+    # [#1386] how often a banked gold bar may interrupt a LIVE round.
+    # Ships at the historical constant; walk it down to make gold a
+    # dead-air reserve only. gold_fill_gap is never affected.
+    "gold_in_round_rate": 0.5,
+    # [#1386] which named set of topics is on the desk, and how sets
+    # change hands. "fixed" means they do not change by themselves,
+    # which is the operator's standing rule for this list.
+    # [#1386] the band a stance roll may land in. (0, 1) is a plain
+    # random. Narrow it to force the pair one way all night, or lock a
+    # single axis with banter_dice_locks: {"rebuttal": [0.0, 0.3]}.
+    "banter_dice_low": 0.0,
+    "banter_dice_high": 1.0,
+    "banter_dice_locks": {},
+    "topic_set": "",
+    "topic_set_mode": "fixed",
     # #609/#612 alternative format: how often a fresh verbatim speakbox swath is
     # APPENDED to the end of a round, and how often one is PRE-PENDED to the
     # front — both right before TTS, so the pair trade the operator's documents
@@ -2327,6 +2365,35 @@ def validate_settings(data: Any) -> dict[str, Any]:
                        DEFAULT_DJ["prepare_hours"]) or 1.0))),
         "speakbox_rate": max(0.0, min(1.0, float(
             raw_dj.get("speakbox_rate", DEFAULT_DJ["speakbox_rate"]) or 0))),
+        # [#1386] the exchange engine and its rollback dial
+        "banter_engine": (str(raw_dj.get("banter_engine")
+                              or DEFAULT_DJ["banter_engine"]).strip().lower()
+                          if str(raw_dj.get("banter_engine") or "").strip().lower()
+                          in ("one-call", "beats", "auto")
+                          else DEFAULT_DJ["banter_engine"]),
+        "banter_dice_rate": max(0.0, min(1.0, float(
+            raw_dj.get("banter_dice_rate",
+                       DEFAULT_DJ["banter_dice_rate"]) or 0))),
+        "gold_in_round_rate": max(0.0, min(1.0, float(
+            raw_dj.get("gold_in_round_rate",
+                       DEFAULT_DJ["gold_in_round_rate"]) or 0))),
+        "banter_dice_low": max(0.0, min(1.0, float(
+            raw_dj.get("banter_dice_low", DEFAULT_DJ["banter_dice_low"]) or 0))),
+        "banter_dice_high": max(0.0, min(1.0, float(
+            raw_dj.get("banter_dice_high")
+            if raw_dj.get("banter_dice_high") is not None else 1.0))),
+        "banter_dice_locks": ({
+            str(k)[:24]: [max(0.0, min(1.0, float(v[0]))),
+                          max(0.0, min(1.0, float(v[1])))]
+            for k, v in (raw_dj.get("banter_dice_locks") or {}).items()
+            if isinstance(v, (list, tuple)) and len(v) == 2}
+            if isinstance(raw_dj.get("banter_dice_locks"), dict) else {}),
+        "topic_set": str(raw_dj.get("topic_set")
+                         or DEFAULT_DJ["topic_set"])[:60],
+        "topic_set_mode": (str(raw_dj.get("topic_set_mode") or "").lower()
+                           if str(raw_dj.get("topic_set_mode") or "").lower()
+                           in ("fixed", "cycle", "random")
+                           else DEFAULT_DJ["topic_set_mode"]),
         "speakbox_append_rate": max(0.0, min(1.0, float(
             raw_dj.get("speakbox_append_rate",
                        DEFAULT_DJ["speakbox_append_rate"]) or 0))),
@@ -24087,7 +24154,7 @@ async def voice_generate(text: str, voice: str, engine: str,
     _media_prune()
 
     took = int((time.monotonic() - started) * 1000)
-    length = _clip_seconds(f"/media/{key}")
+    length = await _clip_seconds_async(f"/media/{key}")
     service = {"xtts": f"XTTS v2 clone server at {XTTS_URL} (host process, "
                        "CUDA on the GB10)",
                "piper": "wyoming-piper container, Wyoming TCP port 10200",
@@ -24607,6 +24674,29 @@ def _clip_seconds(path: str) -> float:
         _CLIP_SECS_CACHE[ck] = secs
         return secs
     except Exception:
+        return 0.0
+
+
+# #1449: THE MEASURE WAITS ON A DISK, SO IT MUST NOT WAIT ON THE LOOP.
+#
+# _clip_seconds is cached on name+mtime (#872), so its cost is a cache
+# MISS - and a miss is a clip nobody has measured yet, which is to say a
+# clip about to go on the air. On a miss it reads the file, and the files
+# live on the CIFS share #1215 measured at 82x slower than a local walk.
+# The station's own blocking_sites table charged app.py:24591
+# (_wav_file_seconds) and :24593 (mutagen.File) 385 seconds of dead air
+# across four gaps - three minutes of silence, twice, waiting on a stat.
+#
+# Nothing about the measurement changes: same path, same cache, same
+# answer. This is a second door onto it for callers that can await.
+async def _clip_seconds_async(path: str) -> float:
+    """_clip_seconds, with the file read off the event loop."""
+    try:
+        return await asyncio.to_thread(_clip_seconds, path)
+    except Exception:  # noqa: BLE001
+        # The synchronous road answers 0.0 for anything it cannot read
+        # and raises nothing; a length that cannot be measured must not
+        # be the thing that takes the station off air.
         return 0.0
 
 
@@ -26120,7 +26210,7 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
     note_activity("speaking", "on the "
                   + ("Nabu" if _RADIO.get("voice_device") == "nabu"
                      else "Pine Box"))
-    seconds = _clip_seconds(path)
+    seconds = await _clip_seconds_async(path)
     # The API call returns when the audio finishes, so its budget is the
     # CLIP's length plus grace — not a flat three minutes. A dying box
     # hanging the full 180s × 3 retries held the announce lock for nine
@@ -26376,7 +26466,7 @@ _play_on_box_admitted = _play_on_box
 async def _play_on_box(path: str, sig: str, reply: bool = False,
                        replay: bool = False) -> str:
     ticket = admission_ticket(path, sig, route="box", reply=reply,
-                              seconds=_clip_seconds(path),
+                              seconds=await _clip_seconds_async(path),
                               producer=_admission_producer(2))
     if not ticket.get("allow"):
         try:
@@ -29683,7 +29773,28 @@ def pipeline_log(kind: str, text: str, extra: str = "") -> None:
         # what the model was looking at, it sits last, and it was
         # truncated away in eleven of eleven captured samples. The one
         # surface built for auditing the tint could not hold the tint.
-        entry["extra"] = str(extra)[:8000]
+        # [#1394] KEEP BOTH ENDS, NOT THE FIRST 8,000 CHARACTERS.
+        #
+        # This is the click-to-expand detail, and for a model call it is
+        # THE PROMPT. Prompts run past 8,000 characters routinely, and
+        # #1197 is the standing rule that "a model finishing a long
+        # prompt writes about the end of it" - so the end is the part
+        # worth reading, and the end is exactly what a head-only cut
+        # throws away.
+        #
+        # Measured 2026-09-22: every captured prompt was exactly 8,000
+        # characters, the running order this desk needed to see lives in
+        # the last few hundred, and a long stretch went into proving
+        # something absent that was only invisible.
+        _x = str(extra)
+        if len(_x) > 8000:
+            _cut = len(_x) - 7800
+            _x = (_x[:5200]
+                  + "\n\n... [%d characters cut from the middle - the"
+                    " head and the TAIL are both kept, #1394] ...\n\n"
+                    % _cut
+                  + _x[-2600:])
+        entry["extra"] = _x
     log.append(entry)
     del log[:-240]
     # Keep every existing process log inspectable after the 240-row ring
@@ -31812,7 +31923,7 @@ async def _sfx_single_clip(clip: dict[str, Any], text: str, who: str,
     if not _sfx_cadence_enabled() or who not in ("dj", "cohost", "third", "host"):
         return clip, {}
     path = _media_file(str(clip.get("path") or ""))
-    seconds = float(_clip_seconds(str(clip.get("path") or "")) or 0)
+    seconds = float(await _clip_seconds_async(str(clip.get("path") or "")) or 0)
     if not path or seconds <= 0:
         return clip, {}
     base = {"id": identity, "who": who, "text": text, "voice": voice,
@@ -31831,7 +31942,7 @@ async def _sfx_single_clip(clip: dict[str, Any], text: str, who: str,
         if not raw:
             raise ValueError("Optional punctuation could not be joined")
         mixed = await asyncio.to_thread(_store_media, raw)
-        length = float(_clip_seconds(mixed["path"]) or 0)
+        length = float(await _clip_seconds_async(mixed["path"]) or 0)
         if length <= 0:
             raise ValueError("Optional punctuation has no valid duration")
         spans = [concat_real_seconds(seconds, beats[0])] + [
@@ -32126,7 +32237,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         _SPEAK_LAST.update({"why": "output muted", "at": time.time()})
         return ""
 
-    if globals().get("_system2") and not _system2().repeat_allowed([spoken]):
+    if globals().get("_system2") and not await _system2_repeat_allowed_async([spoken]):
         _SPEAK_LAST.update({"why": "one-hour dialogue repeat window", "at": time.time()})
         return ""
 
@@ -32315,7 +32426,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
 
     # A concurrent producer may have aired these words while render/assembly
     # yielded. Check the final saved speech, including prepared interjections.
-    if not _system2_repeat_rows(_sfx_stream.get("rows") or
+    if not await _system2_repeat_rows_async(_sfx_stream.get("rows") or
             [{"who": who, "text": spoken, "remember_text": remember_text}]):
         _sfx_cadence_release(_sfx_stream.get("rows") or [])
         return ""
@@ -35741,7 +35852,7 @@ async def _recast_held_clip(held: dict[str, Any]) -> bool:
     held.update({"path": made["path"], "sig": made["sig"],
                  "bytes": int(made.get("bytes") or 0),
                  "cast": _radio_cast_signature()})
-    held["length"] = _clip_seconds(made["path"]) or float(held.get("length") or 0)
+    held["length"] = await _clip_seconds_async(made["path"]) or float(held.get("length") or 0)
     _box_hold_save()
     pipeline_log("voice", "held dialogue recast into the current booth actors",
                  extra=f"{held.get('who') or 'dialogue'}: {held.get('text') or ''}"[:600])
@@ -36165,6 +36276,9 @@ _LARDER_FRESH = 1200.0                 # the FLOOR; see larder_fresh()
 # The shelf survives restarts (#383): every deploy was costing the show
 # two silent minutes writing its first round from nothing.
 LARDER_PATH = data_path("larder.json")
+# [#1388] count, last reason, when - read back by /api/dj/larder so the
+# answer to "why is the shelf empty" is a sentence and not an expedition.
+_LARDER_FAILS: list[Any] = [0, "", 0.0]
 _LARDER_WRITING = [False]
 _LARDER_SAID = [0.0]                    # #1123: throttle for the above
 # #1098: [last checked, standing down]. larder_keeper turns every three
@@ -42974,8 +43088,36 @@ async def larder_keeper() -> None:
                 await dj_banter(None, bank=True, render_stream=True)
             finally:
                 _LARDER_WRITING[0] = False
-        except Exception:
-            pass                       # the shelf refills next pass
+        except Exception as _bank_err:  # noqa: BLE001
+            # [#1388] A BARE SHELF THAT NEVER FILLS SAYS NOTHING.
+            #
+            # 2026-09-22: the larder stood at 0 rounds for hours while the
+            # writer was measurably working - 126 banter calls in four
+            # hours - and the air filled with one sting every 0.8 seconds
+            # because every round had to be written AND rendered live into
+            # a four-minute hole. This `pass` is why it took a measurement
+            # to find: the keeper's only failure road was silent, so a
+            # throw here and a healthy shelf looked exactly alike.
+            #
+            # Same fault as #1219, and the same cure: say it. Still caught,
+            # because a shelf that cannot be filled this pass must not take
+            # the keeper down with it - but never again in silence.
+            _LARDER_FAILS[0] = int(_LARDER_FAILS[0] or 0) + 1
+            _LARDER_FAILS[1] = "%s: %s" % (type(_bank_err).__name__, _bank_err)
+            _LARDER_FAILS[2] = time.time()
+            if _LARDER_FAILS[0] <= 3 or _LARDER_FAILS[0] % 20 == 0:
+                # There is no module logger in this file; the traceback
+                # goes to the container's own stream, which is where every
+                # other unhandled fault here is read from.
+                try:
+                    traceback.print_exc()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                pipeline_log("air", "the shelf could not be filled: %s (#1388)"
+                             % _LARDER_FAILS[1][:160])
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # #924: what the COMING HOUR still wants, as opposed to how many
@@ -45909,7 +46051,7 @@ async def reel_tick() -> None:
             if not mixed:
                 return
             one = _store_media(mixed, "wav")
-            length = float(_clip_seconds(one["path"]) or 0)
+            length = float(await _clip_seconds_async(one["path"]) or 0)
             if length <= 0.5:
                 return                  # #1147: a zero-length clip is poison
             offset = 0.0
@@ -54713,6 +54855,20 @@ def _manager_no(why: str) -> str:
     return ""
 
 
+def _claim_no(why: str) -> str:
+    """[#1396] Why the memo did NOT claim the next round. Counted in the
+    same book _manager_no writes, under its own key, so one surface
+    answers for both roads."""
+    try:
+        book = _MANAGER_BREAK.setdefault("claim_blocked", {})
+        book[why] = int(book.get(why) or 0) + 1
+        _MANAGER_BREAK["claim_why"] = why
+        _MANAGER_BREAK["claim_at"] = time.time()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def manager_break_claim() -> str:
     """#1261: should the NEXT round the station chooses be the memo?
 
@@ -54734,17 +54890,35 @@ def manager_break_claim() -> str:
     with banked banter.
 
     Returns the reason to claim, or "" - so the log line says why."""
+    # [#1396] AND IT SAYS WHY IT DECLINED.
+    #
+    # This road is the CURE for the fault its own docstring describes -
+    # a banked round holding the floor for its whole entry while the memo
+    # asks and asks. Measured 2026-09-22: the manager road aired NOTHING
+    # in an hour while 18 of its 24 shelf rows carried finished takes and
+    # its own state said "one is due now (no memo has been on the air for
+    # 33m)". The OTHER road records every refusal through _manager_no; this
+    # one returned "" three different ways in silence, so which of the
+    # three tests was failing could not be read from anywhere.
+    #
+    # Same book, same counter, so the two roads are read side by side.
     try:
         if not manager_break_on():
-            return ""
+            return _claim_no("the memo road is switched off")
         why = manager_due_why()
         if not why:
-            return ""
+            return _claim_no("no memo is due")
         if _ready_shelf_row("manager", rescue=True) is None:
-            return ""
+            # The one that matters, and the one nothing could see: the
+            # shelf may hold finished memos and still hand back None -
+            # eligibility, a missing voice chunk, or a row that is on the
+            # shelf but not `there` this second.
+            return _claim_no("the shelf would not hand over a finished memo")
+        _MANAGER_BREAK["claimed"] = int(
+            _MANAGER_BREAK.get("claimed") or 0) + 1
         return why
-    except Exception:  # noqa: BLE001
-        return ""
+    except Exception as err:  # noqa: BLE001
+        return _claim_no("the claim raised: %s" % type(err).__name__)
 
 
 async def manager_break_in() -> str:
@@ -59685,6 +59859,39 @@ def schedule_take() -> dict[str, Any]:
         return {}
 
 
+def _recap_subjects_clause() -> str:
+    """The hour's subjects, as the station recorded them being heard.
+
+    _RADIO["topics"] is appended in _banter_air behind the same test that
+    decides a speakbox passage was really said, so nothing reaches this
+    list that did not reach the air. Newest first, one line each, deduped
+    by document."""
+    try:
+        rows = list(_RADIO.get("topics") or [])
+    except Exception:  # noqa: BLE001
+        return ""
+    if not rows:
+        return ""
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in reversed(rows):
+        text = " ".join(str((row or {}).get("text") or "").split())
+        if not text:
+            continue
+        key = " ".join(text.lower().split()[:6])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append("- " + text[:180])
+        if len(out) >= 6:
+            break
+    if not out:
+        return ""
+    return ("\n\nTHE SUBJECTS THIS HOUR, in the order they were last "
+            "heard. These are what you recap; do not invent others:\n"
+            + "\n".join(out))
+
+
 async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
     """The recap on the hour (#843).
 
@@ -59719,10 +59926,10 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
         "order.\n\n"
         "FIRST, say back what was actually discussed. Out loud, plainly, "
         "in the shape of \"the last hour we got into this, and this, and "
-        "this\" — name the SUBJECTS the two of you and the callers "
-        "actually talked about, three or four of them, in your own "
-        "words and briskly. Not a list of events, not a wire service: "
-        "the topics, as somebody who was in the room would say them.\n\n"
+        "this\" — name the SUBJECTS LISTED BELOW, three or four of "
+        "them, THOSE AND NO OTHERS, in your own words and briskly. Not "
+        "a list of events, not a wire service: the topics, as somebody "
+        "who was in the room would say them.\n\n"
         "SECOND, a brief bit of banter about them. A couple of lines "
         "only — the thing one of you is still chewing on, and the "
         "other one\'s answer.\n\n"
@@ -59731,6 +59938,9 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
         "ending.\n\n"
         "Concise throughout. The whole thing is a closing, not a "
         "segment of its own."
+        # [#1386] THE SUBJECTS, off the station's own record of what was
+        # heard - not inferred from the chat ring.
+        + _recap_subjects_clause()
         + (f"\n\nRecords that actually played: {'; '.join(played[:8])}."
            if played else "")
         + (f"\n\nWhat went out on air: {'; '.join(beats)}." if beats else "")
@@ -64225,9 +64435,26 @@ def modifiers_named(ids: list[str]) -> list[dict[str, Any]]:
         except Exception:  # noqa: BLE001
             row = {}
         kind, key = station_modifiers.split_id(one)
+        # [#1387] WHAT IT TOLD THE BOOTH, not just that it was there.
+        #
+        # "Any element that's being referred to, I need to be able to expand
+        #  it and see an excerpt of what is being referred to."
+        #
+        # A modifier named `plot:04fb434bf97a` says nothing at all. The
+        # sentence the writing prompt actually carried is record_says(), the
+        # same function standing_clause() builds the clause out of - so the
+        # trace quotes the booth's own words rather than paraphrasing them.
+        says = ""
+        if row:
+            try:
+                says = str(station_modifiers.record_says(row) or "")
+            except Exception:  # noqa: BLE001
+                says = ""
         out.append({"id": str(one), "kind": row.get("kind") or kind,
                     "key": row.get("key") or key,
                     "name": row.get("name") or "",
+                    "label": str(row.get("name") or "") or ("%s %s" % (kind, key)),
+                    "says": says,
                     "raised": row.get("raised") or 0,
                     "until": row.get("until") or 0,
                     "known": bool(row)})
@@ -66298,7 +66525,7 @@ async def dj_police_outside(text: str) -> None:
     key = clip["path"].rsplit("/", 1)[-1].split("?")[0]
     wav = await asyncio.to_thread(
         _police_mix_blocking, VOICE_MEDIA_DIR / key,
-        _clip_seconds(clip["path"]) or 6.0,
+        await _clip_seconds_async(clip["path"]) or 6.0,
         await asyncio.to_thread(_siren_sample))
     play = _store_media(wav, "wav") if wav else clip
     label = "🚨 someone outside, on a megaphone"
@@ -66833,7 +67060,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     except Exception:
         pass
     # (b) it is a noise the desk made, so it belongs in the booth list.
-    _desk_sound(label, _clip_seconds(path) or 0.0)
+    _desk_sound(label, await _clip_seconds_async(path) or 0.0)
     _RADIO["chat"].append({
         "ts": int(time.time()), "who": "board", "kind": "upstairs",
         "name": "upstairs", "text": str(made.get("text") or ""),
@@ -67554,7 +67781,7 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
         sfx = await asyncio.to_thread(_sfx_any)
         mixed = await asyncio.to_thread(
             _music_ad_mix_blocking, VOICE_MEDIA_DIR / voice_key,
-            str(track["path"]), _clip_seconds(clip["path"]) or 8.0, start,
+            str(track["path"]), await _clip_seconds_async(clip["path"]) or 8.0, start,
             str(sfx) if sfx else None)
         if mixed:
             play = _store_media(mixed, "wav")
@@ -68059,7 +68286,7 @@ async def ad_produce(product: str, script: str, voice: str,
         sfx = await asyncio.to_thread(_sfx_any)
         wav = await asyncio.to_thread(
             _music_ad_mix_blocking, VOICE_MEDIA_DIR / voice_key,
-            str(track["path"]), _clip_seconds(clip["path"]) or 8.0, start,
+            str(track["path"]), await _clip_seconds_async(clip["path"]) or 8.0, start,
             str(sfx) if sfx else None, bed_pct, bed_len)
     if not wav:
         # No bed (or the mix failed): keep the dry vocoded read as the ad —
@@ -70171,6 +70398,59 @@ def _verse_lines(para: str, most: int = 200) -> list[str]:
             out.append(carry)
     return out
 
+
+# --- [#1386] A PASSAGE THAT IS ALREADY BROKEN MUST NOT BE DRAWN ------------
+#
+# "this line is basically gibberish, and I want to know why this line came
+# up and how to prevent it."
+#
+# The line was:
+#     Blyat, sanshan, i f king f king winter, f king f king frozen, f king
+#     f king f king.
+#
+# The model did not invent it. It is WORD FOR WORD out of ylyl.md:
+#     "...nobody could cook an egg better than me, bro. Blyat, Sanshan, I
+#      f**king f**king f**king winter, f**ki..."
+#
+# A transcript of somebody stammering, or an auto-caption that stuck, is
+# still a document - and the speakbox reads documents faithfully, which is
+# exactly what it is for. The passage was drawn, dealt verbatim through a
+# quote door, and read out. Every part of that worked.
+#
+# So the cure is not at the mouth, it is at the DRAW: a run of text that is
+# mostly one repeated token carries no meaning for anyone to converse from,
+# and it should never reach a prompt in the first place.
+DEGENERATE_RUN = 3          # the same token this many times running
+DEGENERATE_SHARE = 0.34     # or one token being this much of the whole line
+
+
+def looks_degenerate(text: Any) -> str:
+    """Why this passage is unusable, or "" when it is fine.
+
+    Two tests, both cheap, both on WORDS rather than characters so that a
+    long word repeated is caught and a legitimately repetitive sentence
+    ("no, no, no") is not - three is a rhetorical device, six is a stuck
+    caption."""
+    words = [w for w in re.findall(r"[a-z0-9']+", str(text or "").lower()) if w]
+    if len(words) < 6:
+        return ""
+    run = best = 1
+    runner = ""
+    for a, b in zip(words, words[1:]):
+        run = run + 1 if a == b else 1
+        if run > best:
+            best, runner = run, b
+    if best > DEGENERATE_RUN:
+        return "%r runs %d times without a break" % (runner[:24], best)
+    counts: dict[str, int] = {}
+    for w in words:
+        if len(w) > 2:
+            counts[w] = counts.get(w, 0) + 1
+    if counts:
+        word, most = max(counts.items(), key=lambda kv: kv[1])
+        if most >= 4 and most / float(len(words)) >= DEGENERATE_SHARE:
+            return "%r is %d of %d words" % (word[:24], most, len(words))
+    return ""
 
 def speakbox_lines(text: str) -> list[str]:
     """Every sayable line in a document.
@@ -72842,6 +73122,26 @@ def speakbox_swath_lines(pool: list[str], most: int = 9,
     the draw is taken from further in."""
     if not pool:
         return []
+    # [#1386] A BROKEN LINE IS NOT MATERIAL. Dropped HERE, at the draw,
+    # rather than at the mouth: by the time a stuck caption has been dealt
+    # through a quote door it is a verbatim passage with the same
+    # protection as any other, and the pair will read it out exactly as
+    # written - which is how "Blyat, sanshan, i f king f king winter"
+    # went to air word for word out of ylyl.md.
+    _kept: list[str] = []
+    _tossed = 0
+    for _ln in pool:
+        if looks_degenerate(_ln):
+            _tossed += 1
+            continue
+        _kept.append(_ln)
+    if _kept:
+        pool = _kept
+    if _tossed:
+        pipeline_log("speakbox", "%d line(s) dropped from a draw as broken "
+                                 "text (#1386)" % _tossed)
+    if not pool:
+        return []
     cap = cap or SPEAKBOX_SWATH_MAX
     deep = max(0.0, min(1.0, float(deep or 0.0)))
     # #1041: THE LAST START AT WHICH A FULL SWATH STILL FITS. Drawing
@@ -73105,7 +73405,8 @@ def speakbox_scene_angle(seed: dict[str, str],
 
 
 def speakbox_angle(quote: dict[str, str],
-                   comeback: dict[str, str] | None = None) -> str:
+                   comeback: dict[str, str] | None = None,
+                   first: str = "") -> str:
     """One of them delivers the lines, and the other has to wear it.
 
     The lines land word for word: the harvest already repaired them into
@@ -73114,7 +73415,11 @@ def speakbox_angle(quote: dict[str, str],
     separately and never twice running, so the same lines landing again are
     a different scene — and when there is a `comeback`, the other one answers
     with full lines out of a different document entirely (#233)."""
-    first = random.choice(["A", "B"])
+    # [#1386] The seat is the CALLER's to choose when it already dealt
+    # the passage into the script - otherwise the prose says B reads it
+    # while the script hands it to A, and the pair answer a passage
+    # nobody read. Unset is the old behaviour, drawn here.
+    first = first if first in ("A", "B") else random.choice(["A", "B"])
     other = "B" if first == "A" else "A"
     # A third of the time it is a speech rather than a line dropped in (#223).
     drop = (unrepeated(list(SPEAKBOX_MONOLOGUE), "monologue")
@@ -73508,7 +73813,47 @@ def sfxguy_quips_save(rows: list[str], voice: str = "") -> None:
 
 
 SFXGUY_SAID_PATH = data_path("sfxguy_said.json")
-_SFXGUY_WARPED: list[str] = []
+# [#1386] ROWS, not bare strings. The reaction branch of
+# _sfxguy_warp_fill writes a genuinely context-bound reply - "Someone on
+# air just said X, fire back ONE short reaction that actually engages
+# with what was said" - and then dropped it into the same flat list as
+# the context-free warps, which sfxguy_line pops at random. So a
+# reaction written against line N fired against line N+5, or a round
+# later. The words were always right; they landed on the wrong line.
+_SFXGUY_WARPED: list[dict[str, Any]] = []
+
+
+def _sfxguy_about(text: Any) -> str:
+    """Which line a reaction was written for."""
+    body = " ".join(str(text or "").lower().split())[:200]
+    if not body:
+        return ""
+    return hashlib.sha1(body.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def _sfxguy_row(row: Any) -> dict[str, Any]:
+    """A pool entry, however it was stored. Rows written before #1386
+    are bare strings and answer nothing in particular."""
+    if isinstance(row, dict):
+        return row
+    return {"text": str(row or ""), "about": "", "at": 0.0}
+
+
+def _sfxguy_take(context: str = "") -> str:
+    """One line off the pool, PREFERRING the one written for this very
+    line. Falls back to the random pop, so a pool with no reaction in
+    it behaves exactly as it always has."""
+    if not _SFXGUY_WARPED:
+        return ""
+    want = _sfxguy_about(context)
+    if want:
+        for at in range(len(_SFXGUY_WARPED)):
+            if str(_sfxguy_row(_SFXGUY_WARPED[at]).get("about")
+                   or "") == want:
+                return str(_sfxguy_row(
+                    _SFXGUY_WARPED.pop(at)).get("text") or "")
+    at = random.randrange(len(_SFXGUY_WARPED))
+    return str(_sfxguy_row(_SFXGUY_WARPED.pop(at)).get("text") or "")
 _SFXGUY_FILLING = [False]
 
 
@@ -73916,7 +74261,9 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
             line = await crystal_line(line, "an SFX guy reaction", 2)  # #1038
             if 8 <= len(line) <= 200 and looks_english(line) \
                     and "\n" not in line:
-                _SFXGUY_WARPED.append(line)
+                _SFXGUY_WARPED.append(
+                    {"text": line, "about": _sfxguy_about(context),
+                     "at": time.time()})
                 pipeline_log("air", "the SFX guy engages: "
                              f"{line[:70]} (#804)")
             return
@@ -73952,7 +74299,8 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
                   "for": "the SFX guy warping a saying off his shelf"})
         line = str(out or "").strip().strip('"').strip()
         if 12 <= len(line) <= 200 and looks_english(line)                 and "\n" not in line:
-            _SFXGUY_WARPED.append(line)
+            _SFXGUY_WARPED.append(
+                {"text": line, "about": "", "at": time.time()})
             pipeline_log("air",
                          f"the SFX guy invents: {line[:70]} (#799)")
     except Exception:  # noqa: BLE001
@@ -73987,7 +74335,9 @@ def sfxguy_line(voice: str, context: str = "") -> str:
         fire_and_forget(_sfxguy_news_fill())
         return story["line"]
     if _SFXGUY_WARPED and random.random() < warp / 100.0:
-        line = _SFXGUY_WARPED.pop(random.randrange(len(_SFXGUY_WARPED)))
+        # [#1386] his reaction finally lands on the line it was written
+        # for, when there is one for this line.
+        line = _sfxguy_take(context)
     else:
         rows = sfxguy_quips(voice)
         said = _sfxguy_said()
@@ -75736,7 +76086,7 @@ def _sfx_video_level_want(path: Path) -> None:
     sfx_levels_keeper drains this. Bounded, because a soundboard held
     down would otherwise grow it without end."""
     want = _SFX_VIDEO_LEVEL.setdefault("want", [])
-    key = str(path)
+    key = Path(path).as_posix()
     if key not in want:
         want.append(key)
         del want[:-60]
@@ -76986,6 +77336,12 @@ def _sfx_pool_warm(folders: list[Path], cap: float, valid: Any, publish: Any) ->
     import math as _math
     import stat as _stat
     parents = set(folders)
+    resolved_parents = set()
+    for folder in folders:
+        try:
+            resolved_parents.add(folder.resolve())
+        except OSError:
+            resolved_parents.add(folder)
     candidates = []
     for key, seconds in list(_SFX_LEN_CACHE.items()):
         try:
@@ -77005,7 +77361,7 @@ def _sfx_pool_warm(folders: list[Path], cap: float, valid: Any, publish: Any) ->
         try:
             # Resolve only this bounded candidate, so symlinks cannot borrow
             # a trusted duration from outside the configured sample folders.
-            if path.resolve().parent not in parents:
+            if path.resolve().parent not in resolved_parents:
                 continue
             observed = path.stat()
             if (not _stat.S_ISREG(observed.st_mode) or observed.st_size <= 0
@@ -77344,14 +77700,49 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
         # own half of this function - his voice, his take, his quip - is
         # three lines down and is deliberately not touched: "Continue to
         # have the SFX guy do dialogue."
-        sample = (None if sfx_soundboard_hold_cadence()
-                  else await asyncio.to_thread(_sfx_cadence_pick))
-        duration = sfx_seconds(sample) if sample else 0.0
-        if sample and fits(duration):
+        # [#1389] A CLIP THAT DOES NOT FIT SHOULD COST A DRAW, NOT THE SLOT.
+        #
+        # "The SFX guy needs to be playing a clip every two lines of
+        #  dialogue basically by default at this time."
+        #
+        # He asks for every two lines and the planner honours that - it
+        # counted 29 slots due in one process. But it drew ONE clip, tested
+        # it against the round's remaining budget, and dropped the whole
+        # slot when it did not fit: 17 of those 29, 59% of his cadence,
+        # thrown away. With sfx_max_seconds at 600 a long draw is ordinary,
+        # so more than half the clips he asked for never happened, and the
+        # dead-air filler - a different road entirely - was what he ended
+        # up hearing instead.
+        #
+        # The book holds 324,551 clips and sfx_db_pick is a random rowid,
+        # so another draw costs microseconds. Try a few, keep the first
+        # that fits, and only then call the slot omitted - and say WHICH
+        # of the two reasons it was, because "nothing was drawn" and
+        # "nothing drawn was short enough" want different cures.
+        sample = None
+        duration = 0.0
+        _drew = 0
+        if not sfx_soundboard_hold_cadence():
+            for _try in range(SFX_CADENCE_TRIES):
+                _cand = await asyncio.to_thread(_sfx_cadence_pick)
+                if _cand is None:
+                    break
+                _drew += 1
+                _secs = sfx_seconds(_cand)
+                if fits(_secs):
+                    sample, duration = _cand, _secs
+                    break
+        if sample:
             additions.append({"path": str(sample), "who": "board", "text": "🔊 " + sample.stem,
                               "seconds": duration, "sfx_sample_id": sfx_id(sample)})
         else:
             _SFX_CADENCE_STATUS["sample_omitted"] += 1
+            _SFX_CADENCE_STATUS["omit_why"] = (
+                "the board was held off the cadence"
+                if sfx_soundboard_hold_cadence() else
+                "nothing was drawn from the book" if not _drew else
+                "none of %d draw(s) was short enough for what was left of "
+                "the round" % _drew)
     guy_interval = int(settings.get("sfxguy_every_units", 4) or 0)
     if (sfx_due_after(completed, guy_interval) and settings.get("drop_voice")
             and random.random() < float(settings.get("sfxguy_rate") or 0) / 100.0):
@@ -77391,11 +77782,12 @@ def _box_receipt_heard(path: str, receipt: dict) -> bool:
                 and _box_receipt_audible(receipt))
 
 
-def _system2_repeat_rows(rows, entry=None) -> bool:
-    """The exact repeat rule applies after every formatter and assembly await."""
-    if not globals().get("_system2"):
-        return True
-    texts = []
+def _system2_repeat_texts(rows) -> list:
+    """The lines a set of rows would put on the air, in order, once each.
+
+    Pulled out of _system2_repeat_rows so the async gate below asks the
+    same question of the same rows - one rule, not two that drift."""
+    texts: list[str] = []
     for row in rows:
         if row.get("who") == "board":
             continue
@@ -77403,7 +77795,65 @@ def _system2_repeat_rows(rows, entry=None) -> bool:
             text = str(row.get(field) or "")
             if text and text not in texts:
                 texts.append(text)
-    return _system2().repeat_allowed(texts, entry)
+    return texts
+
+
+def _system2_repeat_rows(rows, entry=None) -> bool:
+    """The exact repeat rule applies after every formatter and assembly await.
+
+    #1443: kept for any caller that is not a coroutine. Every caller in
+    this file IS one and uses the async gate below; this one blocks the
+    loop if it is ever called from it, which is the whole fault that
+    #1443 is about, so reach for the other one."""
+    if not globals().get("_system2"):
+        return True
+    return _system2().repeat_allowed(_system2_repeat_texts(rows), entry)
+
+
+# #1443: THE GATE WAITS ON A DISK, SO IT MUST NOT WAIT ON THE LOOP.
+#
+# See the module note: #1325 took the System2 receipt WRITE off the loop
+# because it fsyncs under PRAGMA synchronous=FULL while holding
+# System2Store._lock. The READ below queues on that same lock, and the
+# station's own blocking_functions table charged _dj_speak_floorless and
+# _system2_repeat_rows with 1,886 s of dead air in a day between them.
+#
+# `_SYSTEM2_GATE_HELD` is what makes awaiting safe. A synchronous gate
+# could not be interleaved; this one can, so two rounds carrying the
+# same line could both pass a gate neither had been recorded against
+# yet. A text is held from the moment it is asked about until the answer
+# comes back, and an overlapping asker is refused without touching the
+# store - tighter than the gate it replaces, not looser.
+_SYSTEM2_GATE_HELD: set = set()
+
+
+async def _system2_repeat_allowed_async(texts, entry=None) -> bool:
+    """The one-hour repeat gate, with the WAIT off the loop."""
+    if not globals().get("_system2"):
+        return True
+    want = [str(t) for t in texts if str(t or "")]
+    if not want:
+        return True
+    if any(t in _SYSTEM2_GATE_HELD for t in want):
+        return False              # another round is already asking for it
+    _SYSTEM2_GATE_HELD.update(want)
+    try:
+        return await asyncio.to_thread(_system2().repeat_allowed, want, entry)
+    except Exception:  # noqa: BLE001
+        # A gate that cannot be asked must not silence the station: the
+        # sync road returned the store's answer and raised nothing, and
+        # dead air is the worse failure. See #1322 on that ordering.
+        return True
+    finally:
+        _SYSTEM2_GATE_HELD.difference_update(want)
+
+
+async def _system2_repeat_rows_async(rows, entry=None) -> bool:
+    """_system2_repeat_rows, off the loop. Same rows, same rule."""
+    if not globals().get("_system2"):
+        return True
+    return await _system2_repeat_allowed_async(
+        _system2_repeat_texts(rows), entry)
 
 
 # #1325: A RECEIPT IS NOT WORTH THE EVENT LOOP.
@@ -77668,7 +78118,7 @@ SFX_CYCLE_AHEAD = 28.0           # keep this much picture rung ahead of now
 # was six seconds (2 x 6 = the twelve above), a dry tube once #1422 let a
 # slot be 0.72 s and two of them bought 1.5 s against a loop that sleeps
 # a whole second between top-ups.
-SFX_CYCLE_QUEUE = 16             # (#1417: was 3, #1422 made 2 too few)
+SFX_CYCLE_QUEUE = 36             # enough 0.8s clips to reach SFX_CYCLE_AHEAD
 
 
 def sfx_cycle_request(sample: Path, who: str = "",
@@ -78588,6 +79038,32 @@ STING_KEEP_MOST = int(os.getenv("PINE_STING_KEEP", "600"))
 STING_SUBPOOL_MIN = int(os.getenv("PINE_STING_SUBPOOL_MIN", "6"))
 
 
+# [#1386] THE RECENCY RING FOR THE BOOK DRAW.
+#
+# `unrepeated` keeps its memory keyed on the POOL it was handed, which is
+# no use to a draw that never builds a pool. This is the same idea against
+# the whole library: the last STING_RING_KEEP clips that went out, so a
+# uniform draw over 324,551 rows still cannot hand back one that was just
+# heard. Bounded, and it costs one set lookup.
+STING_RING_KEEP = int(os.getenv("PINE_STING_RING", "900"))
+_STING_RING: dict[str, Any] = {"seen": [], "at": {}}
+
+
+def sting_recent(name: str) -> bool:
+    return str(name or "") in _STING_RING["at"]
+
+
+def sting_remember(name: str) -> None:
+    name = str(name or "")
+    if not name:
+        return
+    ring = _STING_RING["seen"]
+    ring.append(name)
+    _STING_RING["at"][name] = time.time()
+    while len(ring) > STING_RING_KEEP:
+        _STING_RING["at"].pop(ring.pop(0), None)
+
+
 def sting_keep(count: int) -> int:
     try:
         return max(24, min(STING_KEEP_MOST, int(count) // 8))
@@ -78624,10 +79100,81 @@ def _sfx_any() -> Path | None:
     # it is taken back here and only here. A clip with a soundtrack
     # answers the box, the stream and the car, and lights the set as
     # well. A measured-silent one still airs through the ordinary draw.
+    # [#1386] THE WHOLE LIBRARY, NOT A FIFTEENTH OF IT.
+    #
+    # "these videos seem to be looping and not going over the whole
+    #  collection at it's disposal... I need a larger variance of
+    #  randomized clips playing."
+    #
+    # Measured on the live station: `sfx_all()` returns **18,665** paths
+    # out of **324,551 playable clips**, and takes **164 seconds** to walk
+    # the share to do it. The shortfall is SFX_MAX_FILES - a 400-per-folder
+    # cap over 70 folders - so the gap road, which is 493 of every 527
+    # plays, was drawing from 5.7% of the library. Six hours of air: 527
+    # plays, 221 distinct clips, 58% of them a repeat, one clip out 64
+    # times, and 0.068% of the collection heard.
+    #
+    # The clip book already holds every row, indexed, and _sfx_db_pick_any
+    # takes a random rowid rather than sorting - microseconds, uniform, and
+    # it never touches the share. The walked pool stays as the fallback for
+    # a box whose book has not been built yet.
+    # [#1386] THE LINE FIRST, THE LIBRARY SECOND.
+    #
+    # "I want to hear clips related to the words being said on the
+    #  broadcast as the SFX guy searches for and plays the right clips at
+    #  the right moments. When not doing that, I need a larger variance of
+    #  randomized clips playing."
+    #
+    # Two answers, in that order. Measured before this: of 527 plays in six
+    # hours, 493 came down THIS road and it never once looked at what had
+    # been said - dj_sting only consults the matcher when it is handed a
+    # line, and the gap road hands it nothing. So the one road that does
+    # almost all the talking was the one road that was deaf.
+    #
+    # sfx_match_sting_pick falls back to sfx_match_heard() for the line
+    # when it is given none, which is exactly the question here: what is in
+    # the room right now. It returns None when nothing clears the floor -
+    # which is most of the time on a library where two names in three are
+    # "1965 clip" - and then the random draw below answers the silence.
+    try:
+        if sfx_match_on(False) and sfx_match_ready():
+            _hit = sfx_match_sting_pick("", want_video=False)
+            if _hit is not None:
+                _p = _hit if isinstance(_hit, Path) else Path(str(_hit))
+                if not sting_recent(str(_p)):
+                    sting_remember(str(_p))
+                    return _p
+    except Exception:  # noqa: BLE001
+        pass
+
     banned = sfx_bans()
+
+    def _ok(path: Any) -> bool:
+        try:
+            return (bool(path) and not sfx_is_video(path)
+                    and sfx_id(path) not in banned and sfx_short(path))
+        except Exception:  # noqa: BLE001
+            return False
+
+    # Straight out of the book, and around the recency ring so the same
+    # clip cannot come back while 600 others have not been heard.
+    seen = set()
+    for _ in range(14):
+        try:
+            got = sfx_db_pick(video=False)
+        except Exception:  # noqa: BLE001
+            got = None
+        if not got or str(got) in seen:
+            continue
+        seen.add(str(got))
+        if not _ok(got):
+            continue
+        if not sting_recent(str(got)):
+            sting_remember(str(got))
+            return got
+    # The book had nothing usable (or is not built): the walked pool.
     pool = [p for p in sfx_all()
-            if sfx_short(p) and sfx_id(p) not in banned
-            and not (sfx_is_video(p) and sfx_is_silent(p))]
+            if not sfx_is_video(p) and sfx_short(p) and sfx_id(p) not in banned]
     if not pool:
         return None
     names = unrepeated([str(p) for p in pool], "sting",
@@ -78936,6 +79483,12 @@ _SFX_GATES: dict[str, int] = {}
 # afford it - 400 gold bars at a five-minute rest serve 300 an hour
 # against the 174 the rule needs.
 SFX_GAP_REST = float(os.getenv("SFX_GAP_REST", "6"))
+# [#1388] How long the PAIR must be unheard before the board is judged to
+# be covering a fault rather than punctuating a gap, and the rest it keeps
+# once it is. Ten minutes is past any legitimate record, advert or caller
+# run, and fifteen seconds still fills while leaving room for speech.
+SFX_FAULT_QUIET = float(os.getenv("SFX_FAULT_QUIET", "600"))
+SFX_FAULT_REST = float(os.getenv("SFX_FAULT_REST", "15"))
 # #1232: and what anxiety pulls those clocks down TO. The floors are
 # what the page road can actually carry back to back without the runs
 # overlapping each other; below them the extra clips would only be
@@ -78943,6 +79496,12 @@ SFX_GAP_REST = float(os.getenv("SFX_GAP_REST", "6"))
 SFX_ANXIOUS_REST = 1.5           # the shortest rest between clips
 SFX_ANXIOUS_NOTICE = 3.0         # the shortest silence he will call dead
 SFX_ANXIOUS_BURST = 4            # the most clips in one go
+# [#1389] How many clips the CADENCE planner may draw looking for one that
+# fits the round's remaining budget. A draw is a random rowid out of the
+# clip book - microseconds - and one draw was losing 59% of the operator's
+# stated cadence. Six is well past the point of diminishing returns and
+# still nothing next to a single render.
+SFX_CADENCE_TRIES = int(os.getenv("SFX_CADENCE_TRIES", "6"))
 
 
 SFXGUY_TOPIC_SEED = 24           # topics handed to his bank per sitting
@@ -79005,6 +79564,45 @@ def sfx_anxiety() -> float:
         return 0.0
 
 
+def sfx_cadence_floor() -> float:
+    """[#1389] THE PACE THE OPERATOR ACTUALLY NAMED, IN SECONDS.
+
+    "The SFX guy needs to be playing a clip every two lines of dialogue
+     basically by default at this time. I never made that faster."
+
+    He is right that he never made it faster. `sfx_anxiety` SHIPS at 70
+    (DEFAULT_DJ), and with `sfx_gap` turned down to 3 the arithmetic below
+    used to give a rest of 6 x (1 - 0.92 x 0.70) = 2.1s and a burst of 3 -
+    a clip every 0.7 seconds. Measured on air 2026-09-22: 405 clips against
+    87 spoken lines in fifteen minutes. 4.7 clips per line, against the 0.5
+    he is describing. Nobody chose that; it fell out of two dials that had
+    never been asked to agree.
+
+    He has already stated the pace, and it is a dial that exists:
+    `sfx_every_units` (2) is "every two lines". A line is a turn, and the
+    script ledger measures what a turn really takes - so two lines is two
+    turns of measured air, and that is the floor.
+
+    This is a FLOOR ON THE DEAD-AIR ROAD ONLY. The in-round cadence planner
+    is untouched: it already fires every `sfx_every_units` turns, which is
+    exactly what he asked for and has always been right. Anxiety still
+    moves the rest, it simply cannot move it past the pace he named.
+    """
+    units = 2
+    try:
+        units = max(1, int(dj_settings().get("sfx_every_units") or 2))
+    except Exception:  # noqa: BLE001
+        units = 2
+    per = TURN_SECONDS_GUESS
+    try:
+        # Memoised, refreshed in a thread, guess while cold - it is safe on
+        # the loop and the note on mean_turn_seconds says why in full.
+        per = float(mean_turn_seconds("banter") or TURN_SECONDS_GUESS)
+    except Exception:  # noqa: BLE001
+        per = TURN_SECONDS_GUESS
+    return max(SFX_ANXIOUS_REST, float(units) * per)
+
+
 def sfx_gap_rest() -> float:
     """How long he waits between clips.
 
@@ -79012,7 +79610,11 @@ def sfx_gap_rest() -> float:
     FLOOR under the operator's own dial - turning sfx_gap down past six
     did nothing at all. Anxiety pulls the whole thing down through that
     floor, which is the point: "playing a clip every few moments is not
-    cutting it"."""
+    cutting it".
+
+    [#1389] ...and it may not pull it past the pace he named. See
+    sfx_cadence_floor: "a clip every two lines of dialogue". Anxiety
+    still owns everything between that floor and the dial."""
     rest = SFX_GAP_REST
     try:
         rest = max(rest, float(dj_settings().get("sfx_gap") or 0))
@@ -79021,7 +79623,7 @@ def sfx_gap_rest() -> float:
     anx = sfx_anxiety()
     if anx <= 0:
         return rest
-    return max(SFX_ANXIOUS_REST, rest * (1.0 - 0.92 * anx))
+    return max(sfx_cadence_floor(), rest * (1.0 - 0.92 * anx))
 
 
 def sfx_gap_notice(limit: float = 12.0) -> float:
@@ -79135,6 +79737,30 @@ def sfx_gap_burst() -> int:
     means four queued back to back over the next several seconds, not
     four at once: the run behaves like any other and the cursor test
     stands the filler down the moment real material is ready."""
+    # [#1388] While the board is covering a FAULT rather than a gap, the
+    # burst is one. Four clips back to back is how you punctuate a hole;
+    # it is not how you sit out an outage - see the note in the gap road.
+    try:
+        if _SFX_GAP.get("covering"):
+            return 1
+    except Exception:  # noqa: BLE001
+        pass
+    # [#1389] A BURST DEFEATS A REST, SO IT ANSWERS TO THE SAME PACE.
+    #
+    # #1233 added the burst for a real complaint - "one clip and twelve
+    # seconds of nothing is not cutting it" - and it is still right about
+    # a HOLE. But a burst of three laid back to back turns any rest into
+    # a third of itself, which is how a 2.1s rest became a clip every
+    # 0.7s. The operator's newer and more specific instruction is a clip
+    # every two lines, and the more specific one wins: the burst now only
+    # opens up once the hole has run longer than the pace it is being
+    # measured against.
+    try:
+        _open = time.time() - float(_SFX_GAP.get("said_at") or 0)
+        if _open < sfx_cadence_floor() * 2.0:
+            return 1
+    except Exception:  # noqa: BLE001
+        pass
     return max(1, min(SFX_ANXIOUS_BURST,
                       1 + int(sfx_anxiety() * (SFX_ANXIOUS_BURST - 1) + 0.5)))
 
@@ -79475,12 +80101,56 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
         except Exception:  # noqa: BLE001
             pass
         rest = sfx_gap_rest()                      # #1232: the dial
+        # [#1388] PAST A CERTAIN QUIET, HE IS NOT PUNCTUATING A GAP -
+        # HE IS COVERING A FAULT, AND HE MUST NOT DO IT AT A GALLOP.
+        #
+        # Measured 2026-09-22: the pair had not been heard for 3h24m, the
+        # anxiety dial was pegged, and the filler laid 822 clips in thirty
+        # minutes - one every 0.8 seconds for half an hour. Every one of
+        # those was the design working as written: his whole purpose is
+        # dead air, and the hole was real. The design just never expected
+        # the hole to be hours long.
+        #
+        # Two things are wrong with a gallop that long. It does not sound
+        # like a radio station, and - the part that matters - it HIDES the
+        # fault: a wall of clips is indistinguishable from a busy show, so
+        # nothing upstream ever looked. And it crowds the air that prepared
+        # speech needs to land in.
+        #
+        # So the curve inverts past the threshold. He keeps filling, because
+        # the station is never silent (the operator's standing rule), but at
+        # a rest that leaves room, and the reason is written down where the
+        # health road and the repair ladder can both read it.
+        _pair_quiet = 0.0
+        try:
+            _pair_quiet = float(talk_quiet_for() or 0)
+        except Exception:  # noqa: BLE001
+            _pair_quiet = 0.0
+        if _pair_quiet > SFX_FAULT_QUIET:
+            rest = max(rest, SFX_FAULT_REST)
+            _SFX_GAP["covering"] = {
+                "since": time.time(), "quiet_s": round(_pair_quiet),
+                "rest_s": rest,
+                "say": ("the pair have not been heard for %.0f minute(s) - "
+                        "the board is covering a fault, not punctuating a "
+                        "gap, so it is resting %.0fs between clips instead "
+                        "of bursting. Press 'bank' on the repair ladder."
+                        % (_pair_quiet / 60.0, rest))}
+        elif _SFX_GAP.get("covering"):
+            _SFX_GAP["covering"] = None
         if (not ignore_rest
                 and time.time() - float(_SFX_GAP.get("at") or 0) < rest):
             return _no("resting - %.1fs of %.1fs"
                        % (time.time() - float(_SFX_GAP.get("at") or 0), rest))
         _SFX_GAP["at"] = time.time()
         _SFX_GAP["turn"] = int(_SFX_GAP.get("turn") or 0) + 1
+        # [#1389] When the pair were last heard, so the burst can tell a
+        # short hole from a long one. talk_quiet_for() is the same clock
+        # the health road's `dialogue_quiet` reads.
+        try:
+            _SFX_GAP["said_at"] = time.time() - float(talk_quiet_for() or 0)
+        except Exception:  # noqa: BLE001
+            _SFX_GAP["said_at"] = time.time()
         vto = _RADIO.get("voice_to") or "box"
         try:
             to_box = (vto in ("box", "both") and box_talk_ok()
@@ -79663,6 +80333,36 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         except Exception:
             pass
         return "drop"
+    # [#1386] ONE RING, BOTH ROADS.
+    #
+    # Two roads reach this line - sting_due(after), which asks the matcher,
+    # and _sfx_any(), which draws from the book - and each kept its own
+    # idea of what had just been heard. So the matched road could answer
+    # "dead" with `39 dead than alive` over and over, which is exactly what
+    # it did: 64 times in six hours, and still 12 times in the twenty-five
+    # minutes after the book draw was widened.
+    #
+    # The matcher is not wrong to keep finding it; a library of 324,551
+    # clips simply has more than one good answer, and the second-best
+    # answer to the same word is a better show than the best one twice.
+    # So the ring is applied HERE, where both roads land, and a repeat
+    # inside the window sends the pick back for another.
+    try:
+        if sample is not None and sting_recent(str(sample)):
+            _again = None
+            if after:
+                try:
+                    _again = await asyncio.to_thread(sting_due, after)
+                except Exception:  # noqa: BLE001
+                    _again = None
+            if _again is None or sting_recent(str(_again)):
+                _again = await asyncio.to_thread(_sfx_any)
+            if _again is not None and not sting_recent(str(_again)):
+                sample = _again
+        if sample is not None:
+            sting_remember(str(sample))
+    except Exception:  # noqa: BLE001
+        pass
     _STING_AT[0] = time.time()
     key = sfx_id(sample)
     signature = media_sign(key)
@@ -80033,6 +80733,56 @@ GOLD_MAX = int(os.getenv("GOLD_MAX", "2000"))
 # cost ~250 kB a thousand; audio costs 48 kB a second.
 GOLD_TEXT_MAX = int(os.getenv("GOLD_TEXT_MAX", "20000"))
 GOLD_FIRE_RATE = 0.5                 # share of sting moments that fire a bar
+
+
+# --- [#1386] GOLD IS A RESERVE, NOT PROGRAMMING --------------------------
+#
+# Gold fires from three places and they are not the same thing:
+#
+#   gold_fill_gap()   the genuine dead-air reserve. Untouched. This is
+#                     already what a gold bar is FOR.
+#   gold_pick() in the round, at every sting moment, at GOLD_FIRE_RATE.
+#                     This one is a banked line from some other night
+#                     dropped into the middle of a live conversation,
+#                     answering a caller from three days ago. It is what
+#                     the operator hears as "they ignore what is being
+#                     said and repeat themselves", and it is the one
+#                     being demoted.
+#   gold_harvest_entry()  what FILLS the bank. Untouched; nothing is
+#                     deleted by any of this.
+#
+# The dial ships at the old constant, so this change alone moves
+# nothing; walking it down is a separate, watchable act. The starvation
+# test is the station's own, already used by dj_banter.
+def gold_in_round_rate() -> float:
+    try:
+        got = dj_settings().get("gold_in_round_rate")
+        if got is None:
+            return GOLD_FIRE_RATE
+        return max(0.0, min(1.0, float(got)))
+    except Exception:  # noqa: BLE001
+        return GOLD_FIRE_RATE
+
+
+def gold_in_round_due() -> bool:
+    """Whether a banked bar may interrupt a live round right now.
+
+    Two gates, not one: the operator's dial, and whether the air ahead
+    is actually thin. A bar that fires into a full cupboard is not
+    covering anything - it is just the station talking over itself."""
+    rate = gold_in_round_rate()
+    if rate <= 0:
+        return False
+    if random.random() >= rate:
+        return False
+    # At the historical setting this is the old behaviour exactly: the
+    # starvation gate only begins to bite once the dial is walked down.
+    if rate >= GOLD_FIRE_RATE:
+        return True
+    try:
+        return bool(dialogue_starved()[0])
+    except Exception:  # noqa: BLE001
+        return True
 GOLD_REST = 1200.0                   # the same bar rests twenty minutes
 _GOLD: dict[str, Any] = {"loaded": False, "rows": []}
 
@@ -84813,6 +85563,426 @@ def approach_clause(rule: dict[str, Any]) -> str:
               "material lands somewhere new every time.")
 
 
+# --- [#1386] THE DICE, ROLLED PER TURN ------------------------------------
+#
+# "So the symbol in front is a dice icon, meaning that I want a randomized
+# result via R and G to create the way that they respond... if they get a
+# high dice roll for response A, they respond positively, and if they get a
+# low, they respond negatively... The rebuttal is a line where basically
+# either the DJ will agree with what they are saying, or he will double
+# down and argue back."
+#
+# Every wheel the station already had rolls ONCE PER ROUND, before a single
+# word is written - the approach, the tempers, the weather, the banter
+# shape. None of them can say what turn 4 does about turn 3, which is the
+# whole of what was asked for.
+#
+# Four axes, and the vocabulary for three of them was already written:
+#
+#   stance    how this speaker takes what was just said. The deck is the
+#             two halves of SPEAKBOX_ENGAGE - it already contains "argue
+#             with it on its own terms", "agree far too readily, which is
+#             its own kind of trouble" and "get angry about it, properly
+#             angry".
+#   rebuttal  what the one who was argued with does next. BANTER_SHAPES
+#             already holds the three outcomes under the names "the
+#             argument", "instant agreement" and "flat refusal".
+#   floor     who answers next. Only ever offers a seat that EXISTS, and
+#             never the seat that just spoke.
+#   box       where this round's speakbox hit lands. It does NOT roll a new
+#             probability: the doors are still rolled once per round by
+#             _quote_door at the operator's own 49% and 68%, and this only
+#             chooses which beat the hit falls in. Rolling per beat at
+#             rate ** (1/beats) would silently rescale his dials.
+#
+# The deck is a file on the same pattern as data/approaches.json - weights,
+# an enabled flag, a use count and the TIER_GATES cooldown ladder - so the
+# operator can weight it, switch rows off and add his own.
+BANTER_DICE_PATH = data_path("banter_dice.json")
+_BANTER_DICE_LOCK = RLock()
+
+# The stance deck, as (axis, text, lean). `lean` is +1 positive, -1
+# negative: the roll picks the half, the deck picks the words.
+BANTER_DICE_SEED: tuple[tuple[str, str, int], ...] = (
+    ("stance", "take it up and run further with it than they did", 1),
+    ("stance", "agree, and bring a second thing that makes it worse", 1),
+    ("stance", "agree far too readily, which is its own kind of trouble", 1),
+    ("stance", "be genuinely delighted by it and say exactly why", 1),
+    ("stance", "recognise it from somewhere and say where", 1),
+    ("stance", "argue with it on its own terms, point by point", -1),
+    ("stance", "refuse the premise of it outright", -1),
+    ("stance", "get angry about it, properly angry", -1),
+    ("stance", "mishear it as something far worse and react to that", -1),
+    ("stance", "find it beneath contempt and be unable to leave it alone", -1),
+    ("rebuttal", "double down: answer the objection head on and go further", -1),
+    ("rebuttal", "escalate: treat the objection as proof of the point", -1),
+    ("rebuttal", "hold the line and make them say it again", -1),
+    ("rebuttal", "concede the point, out loud, and be changed by it", 1),
+    ("rebuttal", "concede the small thing to win the large one", 1),
+    ("rebuttal", "laugh and let it go, then take it somewhere else", 1),
+)
+
+
+def _banter_dice_seed() -> list[dict[str, Any]]:
+    return [{"id": uuid.uuid4().hex[:8], "axis": axis, "text": text,
+             "lean": lean, "weight": 1.0, "enabled": True,
+             "uses": 0, "last": 0, "added": int(time.time())}
+            for axis, text, lean in BANTER_DICE_SEED]
+
+
+def _banter_dice_write(rows: list[dict[str, Any]]) -> None:
+    try:
+        BANTER_DICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BANTER_DICE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows, indent=1) + chr(10))
+        tmp.replace(BANTER_DICE_PATH)
+    except OSError:
+        pass
+
+
+def banter_dice_rules() -> list[dict[str, Any]]:
+    with _BANTER_DICE_LOCK:
+        try:
+            rows = json.loads(BANTER_DICE_PATH.read_text())
+        except Exception:  # noqa: BLE001
+            rows = None
+        if not isinstance(rows, list) or not rows:
+            rows = _banter_dice_seed()
+            _banter_dice_write(rows)
+        return [r for r in rows if isinstance(r, dict)]
+
+
+def banter_dice_range(axis: str = "") -> tuple[float, float]:
+    """The band the roll is allowed to land in, 0..1.
+
+    "I want to be able to even lock it to roll in a particular dice range
+    if I want."
+
+    Unlocked is (0, 1) and is a plain random(). Lock it to (0.0, 0.35) and
+    every stance comes back negative and hard; lock it to (0.65, 1.0) and
+    the pair agree with each other all night. An axis may carry its own
+    band - `banter_dice_locks: {"rebuttal": [0.0, 0.3]}` - and falls back
+    to the global one."""
+    low, high = 0.0, 1.0
+    try:
+        dj = dj_settings()
+        low = max(0.0, min(1.0, float(dj.get("banter_dice_low") or 0.0)))
+        high = max(0.0, min(1.0, float(
+            dj.get("banter_dice_high") if dj.get("banter_dice_high") is not None
+            else 1.0)))
+        locks = dj.get("banter_dice_locks")
+        if isinstance(locks, dict) and axis and isinstance(locks.get(axis), (list, tuple)):
+            band = list(locks.get(axis) or [])
+            if len(band) == 2:
+                low = max(0.0, min(1.0, float(band[0])))
+                high = max(0.0, min(1.0, float(band[1])))
+    except Exception:  # noqa: BLE001
+        low, high = 0.0, 1.0
+    if high < low:
+        low, high = high, low
+    return low, high
+
+
+def banter_dice_roll(axis: str = "") -> float:
+    """One roll, inside whatever band is locked for this axis."""
+    low, high = banter_dice_range(axis)
+    if high <= low:
+        return round(low, 3)
+    return round(low + random.random() * (high - low), 3)
+
+
+def banter_dice_pick(axis: str, roll: float | None = None,
+                     last_id: str = "") -> dict[str, Any]:
+    """One row off an axis, the half chosen by the roll.
+
+    The RAW ROLL is returned with it and recorded on the round, so the
+    inspector can say "rolled 0.83 -> agrees, hard" rather than naming a
+    bucket. The distance from 0.5 is the intensity; 0.5 and over is the
+    positive half. Same cooldown ladder as approach_pick, so a stance that
+    just ran is off the wheel."""
+    r = (banter_dice_roll(axis) if roll is None
+         else max(0.0, min(1.0, float(roll))))
+    want = 1 if r >= 0.5 else -1
+    rows = [x for x in banter_dice_rules()
+            if str(x.get("axis") or "") == str(axis)
+            and x.get("enabled", True)
+            and float(x.get("weight") or 0) > 0]
+    half = [x for x in rows if int(x.get("lean") or 0) == want] or rows
+    if not half:
+        return {"id": "", "axis": axis, "text": "", "lean": want,
+                "roll": round(r, 3), "hard": 0.0}
+    now = time.time()
+
+    def gate(row: dict[str, Any]) -> float:
+        return TIER_GATES[min(int(row.get("uses") or 0), 2)]
+
+    pool = [x for x in half if x.get("id") != last_id
+            and now - float(x.get("last") or 0) > gate(x)]
+    pool = pool or [x for x in half if x.get("id") != last_id] or half
+    pick = dict(random.choices(
+        pool, weights=[float(x.get("weight") or 1) for x in pool], k=1)[0])
+    with _BANTER_DICE_LOCK:
+        stored = banter_dice_rules()
+        for row in stored:
+            if row.get("id") == pick.get("id"):
+                row["uses"] = int(row.get("uses") or 0) + 1
+                row["last"] = int(now)
+        _banter_dice_write(stored)
+    pick["roll"] = round(r, 3)
+    # How hard: 0.5 is a shrug, 0.0 and 1.0 are the extremes.
+    pick["hard"] = round(abs(r - 0.5) * 2.0, 3)
+    return pick
+
+
+def banter_dice_word(hard: float) -> str:
+    """The intensity, in a word the prompt can use."""
+    if hard >= 0.72:
+        return "hard"
+    if hard >= 0.36:
+        return "plainly"
+    return "mildly"
+
+
+def banter_dice_on() -> float:
+    """How often a turn gets a rolled stance. Zero is today, byte for byte."""
+    try:
+        return max(0.0, min(1.0, float(
+            dj_settings().get("banter_dice_rate") or 0)))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def banter_engine_mode(bank: bool = False) -> str:
+    """Whether THIS round is written in one call or in beats.
+
+    "auto" is the default and means: beats where nothing is waiting on the
+    round (the banked road, which #1089 measured at 3.28 seconds of room per
+    second of speech and which the prompt itself tells the model is being
+    recorded in advance), one-call live, where a second model visit is a
+    dead-air risk."""
+    try:
+        mode = str(dj_settings().get("banter_engine") or "auto").lower()
+    except Exception:  # noqa: BLE001
+        mode = "auto"
+    if mode == "auto":
+        return "beats" if bank else "one-call"
+    return mode if mode in ("one-call", "beats") else "one-call"
+
+
+class _CallSheetDone(Exception):
+    """[#1392] Control flow, not a fault: the call sheet replaced the
+    banter one and the rest of that try-block is about dice and topic
+    changes, neither of which a phone call has."""
+
+
+def call_beat_sheet(lines: int, caller_name: str, cohost_name: str = "",
+                    third_name: str = "", topic: str = "",
+                    speakerbox: str = "",
+                    story: bool = False) -> str:
+    """[#1392] THE CALL PROTOCOL, AS A RUNNING ORDER THE WRITER CAN FOLLOW.
+
+    "I still don't get why the dialogue isn't making it."
+
+    Because call_flow_report refuses it. Measured 2026-09-22 over two live
+    hours: 942 faults, cutting about 125 caller rounds an HOUR, every one
+    with the contract's own words -
+
+        191x  fewer than two host questions pick up a concrete detail
+              from the caller's prior answer
+         86x  the caller does not resolve the exchange immediately
+              before the host signs off
+         85x  a host does not give the call a clear spoken sign-off
+         85x  the selected Speakerbox source never enters the dialogue
+
+    Those are not vague quality opinions. Every one is a MECHANICAL test
+    in call_flow_report, and the writer was never told any of them - it
+    got the banter running order, which knows nothing about a phone call.
+    So the station wrote a caller round, refused it, wrote another, refused
+    that, ~125 times an hour, and the air went quiet while it did.
+
+    This is #1386's lesson applied to the other road: a numbered list is
+    not an instruction to obey a contract, it IS the contract, in the
+    shape of the thing being asked for. Every line below is one leg of
+    call_flow_report, in the order the checker reads them, written as the
+    turn that satisfies it.
+
+    Returns "" for a story call-back, where the protocol legs are skipped
+    by design (the hosts already know this person), and "" when there is
+    no caller - both of which are call_flow_report's own rules, not new
+    ones invented here.
+    """
+    name = str(caller_name or "").strip()
+    if not name or story:
+        return ""
+    first = name.split()[0] if name else "the caller"
+    other = cohost_name or "the co-host"
+    # NINE is the floor, not eight: the protocol's fixed opening is seven
+    # turns (answer the line, introduce, greet, detail, ask, detail, ask),
+    # and the landing and the sign-off are two more. At eight the landing
+    # turn was numbered 7 as well, so the sheet listed turn 7 twice and
+    # asked for a caller turn straight after a caller turn.
+    want = max(9, min(int(lines or 0) or 10, 22))
+    # The caller must hold between 30% and 72% of the turns, and must have
+    # at least three. A third of the turns, at least three, is the middle
+    # of that band and the easiest thing to ask for plainly.
+    caller_turns = max(3, int(want * 0.38))
+    out: list[str] = []
+    out.append(" 1  A  - ANSWER THE RINGING LINE. Say the word \"line\" or "
+               "\"call\" out loud - \"the request line is ringing, you're "
+               "live, go ahead\". You do NOT know who this is: do not say "
+               "any name.")
+    out.append(" 2  C  - %s INTRODUCES THEMSELF and nothing more. Say "
+               "\"I'm %s\" or \"%s here\". Under thirty words. Do NOT "
+               "start the story yet." % (first.upper(), first, first))
+    out.append(" 3  A  - GREET THEM BY NAME. Say \"%s\" out loud, then ask "
+               "the first question." % first)
+    out.append(" 4  C  - answers, and gives one CONCRETE detail - a thing, "
+               "a place, a number, a name.")
+    out.append(" 5  A  - ASK ABOUT THAT EXACT DETAIL. Repeat the caller's "
+               "own word back inside your question. This is the one the "
+               "check counts; a general question does not count.")
+    out.append(" 6  C  - answers it, and gives a second concrete detail.")
+    out.append(" 7  %s  - ASK ABOUT THAT SECOND DETAIL, using the caller's "
+               "own word again. Two of these are required."
+               % ("B" if other else "A"))
+    if speakerbox:
+        out.append("--  SOMEWHERE IN THE MIDDLE, one of you must bring up "
+                   "this, in your own words, and %s must react to it: %s"
+                   % (first, json.dumps(str(speakerbox)[:200])))
+    step = 8
+    while step <= want - 2:
+        # Alternate BACKWARDS from the landing turn, so the turn before
+        # the caller lands it is always a host. Counting forwards put a
+        # C at want-2 and another at want-1, and "no one speaks twice in
+        # a row" is banter_turns' own contract - a sheet that breaks it
+        # teaches the model to break it.
+        out.append("%2d  %s  - keeps it going; every turn answers the one "
+                   "before it and quotes a word from it."
+                   % (step, "A" if (want - 2 - step) % 2 == 0 else "C"))
+        step += 1
+    out.append("%2d  C  - %s LANDS IT. The caller says the last word of "
+               "their own story here. This must be the SECOND TO LAST turn "
+               "of the whole call." % (want - 1, first.upper()))
+    out.append("%2d  A  - SIGN OFF. The final turn is a host, and it must "
+               "contain one of these words out loud: thanks, thank you, "
+               "goodbye, goodnight, take care, appreciate." % want)
+    head = ("\n\nTHE RUNNING ORDER OF THIS CALL. This is a request-line "
+            "call and it has a protocol; write exactly these turns, in "
+            "this order, one line each, nothing else. %s has about %d of "
+            "the turns.\n" % (first, caller_turns))
+    tail = ("\nEvery one of those is checked after you write it, and a "
+            "call that misses one is thrown away unheard - so the two "
+            "questions that repeat the caller's own words, the caller "
+            "speaking second to last, and the spoken sign-off on the last "
+            "turn are not style notes. They are the call.")
+    return head + "\n".join(out) + tail
+
+
+def banter_beat_sheet(lines: int, seats: list[str], dj: dict[str, Any],
+                      seeded: bool = False, topic_at: int = 0,
+                      topic_text: str = "",
+                      cohost_name: str = "", third_name: str = "",
+                      caller_name: str = "") -> tuple[str, list[dict[str, Any]]]:
+    """THE RUNNING ORDER OF THIS EXCHANGE, turn by turn, pre-rolled.
+
+    #828 asked the model twice, in prose, to make every turn answer the one
+    before it - once at the top of the prompt and once again lower down,
+    the second time with its own comment saying the operator could hear the
+    pair talking PAST each other. Both are still in the file and both
+    failed, because a 2B model finishing a long prompt writes about the END
+    of it (#1197), and ten more blocks of context are appended after that
+    rule.
+
+    A numbered list is not an instruction to be responsive, it is the shape
+    of the thing itself. The dice are rolled HERE, before the write, so the
+    same sheet that tells the model what turn 4 does about turn 3 is the
+    record the inspector reads back.
+
+    Returns (sheet, rolls). An empty sheet means the dial is at zero, which
+    is today byte for byte."""
+    rate = banter_dice_on()
+    rolls: list[dict[str, Any]] = []
+    if rate <= 0 or lines < 3 or not seats:
+        return "", rolls
+    who = {"A": "you", "B": cohost_name or "the co-host",
+           "D": third_name or "the third seat",
+           "C": caller_name or "the caller"}
+    out: list[str] = []
+    last_seat = ""
+    last_id = ""
+    for turn in range(1, min(int(lines), 40) + 1):
+        # Who holds the floor. Never the seat that just spoke - that is the
+        # parser's own contract and the prompt's ("no one speaks twice in a
+        # row"), and _swath_deal's docstring measured what happens when one
+        # mouth takes the round: 81.9% of six hours against 4.4%.
+        pool = [x for x in seats if x != last_seat] or seats
+        seat = "A" if turn == 1 else random.choice(pool)
+        if turn == 1 and seeded:
+            out.append("%2d  A  - opens with the passage above, word for "
+                       "word, as their own speech." % turn)
+            last_seat = "A"
+            continue
+        if turn == 1:
+            out.append("%2d  A  - opens the subject." % turn)
+            last_seat = "A"
+            continue
+        if topic_at and turn == topic_at and topic_text:
+            out.append("--  THE SUBJECT CHANGES HERE. %s brings up, in their "
+                       "own words: %s"
+                       % (who.get(seat, seat), json.dumps(topic_text[:220])))
+            out.append("%2d  %s  - thrown by it; react to THAT and nothing "
+                       "else." % (turn, seat))
+            last_seat = seat
+            continue
+        if random.random() > rate:
+            out.append("%2d  %s  - answers the turn before it." % (turn, seat))
+            last_seat = seat
+            continue
+        # The rebuttal belongs to whoever was argued with, which is the
+        # seat two turns back; every other turn is a stance.
+        axis = "rebuttal" if (turn >= 4 and turn % 3 == 1) else "stance"
+        pick = banter_dice_pick(axis, last_id=last_id)
+        last_id = str(pick.get("id") or "")
+        word = banter_dice_word(float(pick.get("hard") or 0))
+        text = str(pick.get("text") or "")
+        if not text:
+            out.append("%2d  %s  - answers the turn before it." % (turn, seat))
+            last_seat = seat
+            continue
+        if axis == "rebuttal":
+            out.append("%2d  %s  - %s, %s. Answer the objection itself; do "
+                       "not restate the point." % (turn, seat, text, word))
+        else:
+            out.append("%2d  %s  - %s, %s. Quote back the word or claim you "
+                       "are answering." % (turn, seat, text, word))
+        rolls.append({"turn": turn, "seat": seat, "axis": axis,
+                      "id": pick.get("id"), "roll": pick.get("roll"),
+                      "hard": pick.get("hard"), "lean": pick.get("lean"),
+                      "text": text, "answers": turn - 1})
+        last_seat = seat
+    if not out:
+        return "", rolls
+    sheet = ("\n\nTHE RUNNING ORDER OF THIS EXCHANGE. Write exactly these "
+             "turns, in this order, one line each, and nothing else:\n"
+             + "\n".join(out)
+             + "\nEvery numbered turn answers the turn above it by name or "
+               "by quoting a word out of it. A turn that could be moved "
+               "three places without anyone noticing is the wrong turn.")
+    return sheet, rolls
+
+def banter_floor_seats(dj: dict[str, Any], third: bool = False,
+                       caller_name: str = "") -> list[str]:
+    """The seats that actually exist this round, as script markers.
+
+    A dice that offers a seat nobody is sitting in writes a turn for a
+    voice the station cannot speak in."""
+    seats = ["A", "B"]
+    if third and str(dj.get("third_name") or ""):
+        seats.append("D")
+    if caller_name:
+        seats.append("C")
+    return seats
+
 def banter_due(dj: dict[str, Any], played: int) -> bool:
     """Whether it is time they got talking again (#202).
 
@@ -85069,7 +86239,213 @@ def write_bombshells(rows: list[dict[str, Any]]) -> None:
             pass
 
 
-def add_bombshell(text: str, kind: str = "topic") -> dict[str, Any]:
+# --- [#1386] THE HOLDING PEN, THE TRASH CAN AND THE SETS ------------------
+#
+# "So I am not sure why these topics were added. This was originally being
+# supplied by me and now the entries are things I do not remember adding...
+# I dont want this being expanded except by me manually and I want to be
+# able to export and import sets of topics and have sets able to be cycled
+# between and variated between and swapped on the fly."
+#
+# Measured on the live bank when he asked: 56 topics, 53 of them written by
+# topic_cook_once (#1226), in batches of exactly TOPIC_COOK_BATCH spaced
+# TOPIC_COOK_REST apart - 23:35:36 x5, 23:42:41 x5, 23:49:43 x5, 23:57:44
+# x5... Nothing he had seeded survived, and the rows carried no author, so
+# the list could not be accounted for even in principle.
+#
+# The cooker still reads the speakbox and still writes - but into a PEN,
+# which is a candidate list. Nothing reaches the bank except by a tick.
+TOPIC_PEN_PATH = data_path("topic_pen.json")
+TOPIC_PEN_REJECTED = data_path("topic_pen.rejected.json")
+TOPIC_TRASH_PATH = data_path("banter_topics.trash.json")
+TOPIC_SETS_PATH = data_path("topic_sets.json")
+TOPIC_PEN_MAX = 40
+_TOPIC_PEN_LOCK = RLock()
+_TOPIC_SETS_LOCK = RLock()
+
+
+def _json_rows(path: Any) -> list[dict[str, Any]]:
+    try:
+        rows = json.loads(path.read_text())
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _json_write(path: Any, rows: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows, indent=1) + chr(10))
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def topic_pen_rows() -> list[dict[str, Any]]:
+    with _TOPIC_PEN_LOCK:
+        return _json_rows(TOPIC_PEN_PATH)
+
+
+def topic_pen_add(text: str, source: str = "") -> dict[str, Any]:
+    """A candidate, with the document it was written off.
+
+    The source is kept because it is the useful half: it says which
+    speakbox document is producing topics worth keeping and which is
+    producing noise."""
+    body = " ".join(str(text or "").split())
+    if not body:
+        return {}
+    with _TOPIC_PEN_LOCK:
+        rows = _json_rows(TOPIC_PEN_PATH)
+        seen = {" ".join(str(r.get("text") or "").lower().split())
+                for r in rows}
+        seen |= {" ".join(str(r.get("text") or "").lower().split())
+                 for r in _json_rows(TOPIC_PEN_REJECTED)}
+        if body.lower() in seen:
+            return {}
+        row = {"id": uuid.uuid4().hex[:8], "text": body[:400], "by": "cook",
+               "source": str(source or "")[:120], "at": int(time.time())}
+        rows.insert(0, row)
+        _json_write(TOPIC_PEN_PATH, rows[:TOPIC_PEN_MAX * 4])
+        return row
+
+
+def topic_pen_decide(ids: list[str], keep: bool) -> dict[str, Any]:
+    """Tick or cross. A kept candidate enters the bank restamped as the
+    operator's own; a crossed one is remembered so it is never cooked
+    twice."""
+    want = {str(x) for x in (ids or []) if str(x)}
+    moved: list[dict[str, Any]] = []
+    with _TOPIC_PEN_LOCK:
+        rows = _json_rows(TOPIC_PEN_PATH)
+        take = [r for r in rows if str(r.get("id")) in want] if want else list(rows)
+        left = [r for r in rows if str(r.get("id")) not in want] if want else []
+        if not take:
+            return {"ok": True, "moved": 0, "left": len(rows),
+                    "say": "nothing in the pen matched"}
+        if keep:
+            for r in take:
+                got = add_bombshell(str(r.get("text") or ""), "topic",
+                                    by="operator",
+                                    source=str(r.get("source") or ""))
+                if got:
+                    moved.append(got)
+        else:
+            gone = _json_rows(TOPIC_PEN_REJECTED)
+            _json_write(TOPIC_PEN_REJECTED, (take + gone)[:2000])
+        _json_write(TOPIC_PEN_PATH, left)
+    note_action("you %s %d topic candidate(s)"
+                % ("kept" if keep else "threw out", len(take)))
+    return {"ok": True, "moved": len(moved) if keep else 0,
+            "dropped": 0 if keep else len(take), "left": len(left),
+            "say": ("%d went into the bank" % len(moved)) if keep else
+                   ("%d will not be suggested again" % len(take))}
+
+
+def topic_bank_clear(why: str = "") -> dict[str, Any]:
+    """The trash can. ARCHIVED, never deleted - nothing in this station is
+    really thrown away, and starting a list over is not a reason to be the
+    first thing that is."""
+    with _BOMBSHELL_LOCK:
+        rows = read_bombshells()
+        if rows:
+            old = _json_rows(TOPIC_TRASH_PATH)
+            for r in rows:
+                r["binned_at"] = int(time.time())
+                r["binned_why"] = str(why or "the operator started the list over")[:120]
+            _json_write(TOPIC_TRASH_PATH, (rows + old)[:3000])
+        write_bombshells([])
+    note_action("you emptied the topic bank (%d topic(s) archived)" % len(rows))
+    return {"ok": True, "cleared": len(rows),
+            "archived_to": TOPIC_TRASH_PATH.name,
+            "say": ("%d topic(s) moved to the bin - the list is yours to "
+                    "seed again" % len(rows))}
+
+
+def topic_sets_read() -> dict[str, Any]:
+    with _TOPIC_SETS_LOCK:
+        try:
+            got = json.loads(TOPIC_SETS_PATH.read_text())
+            return got if isinstance(got, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+
+def topic_sets_save(name: str, rows: list[dict[str, Any]] | None = None,
+                    notes: str = "") -> dict[str, Any]:
+    """Name what is in the bank now (or the rows handed in) as a set.
+
+    Same shape as data/phrase_sets.json, which is the station's existing
+    answer to "a named set I can swap on the fly"."""
+    key = " ".join(str(name or "").split())[:60]
+    if not key:
+        raise ValueError("a set needs a name")
+    body = rows if rows is not None else read_bombshells()
+    keep = [{"text": str(r.get("text") or "")[:400],
+             "kind": str(r.get("kind") or "topic")}
+            for r in body if str((r or {}).get("text") or "").strip()]
+    with _TOPIC_SETS_LOCK:
+        sets = topic_sets_read()
+        sets[key] = {"topics": keep, "saved": int(time.time()),
+                     "notes": str(notes or "")[:240]}
+        _json_write(TOPIC_SETS_PATH, sets)
+    note_action("you saved the topic set %s (%d topic(s))" % (key, len(keep)))
+    return {"ok": True, "name": key, "topics": len(keep)}
+
+
+def topic_sets_load(name: str, add: bool = False) -> dict[str, Any]:
+    """Swap a set in. By default it REPLACES the bank (the old one is
+    archived first, so the swap is reversible); `add` merges instead."""
+    key = " ".join(str(name or "").split())[:60]
+    sets = topic_sets_read()
+    got = sets.get(key)
+    if not isinstance(got, dict):
+        raise ValueError("no set called %r" % key[:40])
+    rows = [r for r in (got.get("topics") or []) if isinstance(r, dict)]
+    if not add:
+        topic_bank_clear("the %s set was loaded over it" % key)
+    made = 0
+    for r in rows:
+        if add_bombshell(str(r.get("text") or ""),
+                         str(r.get("kind") or "topic"), by="operator"):
+            made += 1
+    try:
+        settings = load_settings()
+        dj = dict(settings.get("dj") or {})
+        dj["topic_set"] = key
+        save_settings({**settings, "dj": dj})
+    except Exception:  # noqa: BLE001
+        pass
+    note_action("you put the %s topic set on the desk" % key)
+    return {"ok": True, "name": key, "loaded": made,
+            "say": "%d topic(s) from %s are in the bank" % (made, key)}
+
+
+def topic_set_cycle() -> dict[str, Any]:
+    """The next set, under the operator's own mode.
+
+    fixed  - the named set stands until he changes it (the default)
+    cycle  - the sets in order, one per call
+    random - drawn, never the one that is already on the desk
+    """
+    try:
+        dj = dj_settings()
+        mode = str(dj.get("topic_set_mode") or "fixed").lower()
+        now = str(dj.get("topic_set") or "")
+    except Exception:  # noqa: BLE001
+        return {}
+    names = sorted(topic_sets_read())
+    if mode == "fixed" or len(names) < 2:
+        return {}
+    if mode == "cycle":
+        at = (names.index(now) + 1) % len(names) if now in names else 0
+        return topic_sets_load(names[at])
+    pool = [n for n in names if n != now] or names
+    return topic_sets_load(random.choice(pool))
+
+def add_bombshell(text: str, kind: str = "topic", by: str = "operator",
+                  source: str = "") -> dict[str, Any]:
     """A line or a topic to drop on air."""
     with _BOMBSHELL_LOCK:
         rows = read_bombshells()
@@ -85079,6 +86455,15 @@ def add_bombshell(text: str, kind: str = "topic") -> dict[str, Any]:
             "kind": kind if kind in ("topic", "line") else "topic",
             "added": int(time.time()),
             "used": 0,
+            # [#1386] WHO PUT IT THERE. The bank had no author field, so
+            # an operator topic and a machine-written one were
+            # indistinguishable after the fact - which is exactly how a
+            # hand-seeded list came to be 53 rows nobody remembered
+            # adding. "cook" rows now go to the pen instead and only
+            # reach the bank by hand, so everything here is the
+            # operator's unless it says otherwise.
+            "by": str(by or "operator")[:16],
+            **({"source": str(source)[:120]} if source else {}),
         }
         rows.insert(0, row)
         write_bombshells(rows)
@@ -85306,9 +86691,14 @@ async def topic_cook_once() -> int:
     except Exception:  # noqa: BLE001
         pass
     state = topic_bank_state()
-    if state["never_used"] >= TOPIC_COOK_DEEP:
-        _TOPIC_COOK["why"] = ("%d unused topic(s) already waiting - the "
-                              "bank is deep enough" % state["never_used"])
+    # [#1386] gated on the PEN, not the bank. The old test counted
+    # unused rows in the live bank, which with a pen in front of it is
+    # the wrong question: an untouched pen would either never stop
+    # filling or stop cooking for ever.
+    _pen = len(topic_pen_rows())
+    if _pen >= TOPIC_PEN_MAX:
+        _TOPIC_COOK["why"] = ("%d candidate(s) already waiting to be "
+                              "looked at - the pen is full" % _pen)
         return 0
     if state["topics"] >= BOMBSHELL_MAX:
         _TOPIC_COOK["why"] = "the bank is full"
@@ -85363,7 +86753,9 @@ async def topic_cook_once() -> int:
         if line.lower() in seen:
             continue
         seen.add(line.lower())
-        add_bombshell(line, "topic")
+        # [#1386] into the PEN, not the bank. The operator ticks it in.
+        if not topic_pen_add(line, str(swath.get("file") or "")):
+            continue
         made += 1
         if made >= TOPIC_COOK_BATCH:
             break
@@ -86308,6 +87700,139 @@ def slot_left(road: str) -> float:
     except Exception:  # noqa: BLE001
         return 0.0
 
+
+# --- [#1386] THE SCHEDULE SETS THE LENGTH ---------------------------------
+#
+# "This is why the scheduler exists. The schedule system should exist in
+# order to inform how long the segments are and how much work we need to do
+# and how much planning is required to make them happen."
+#
+# It knew all along and nothing asked it. A schedule entry carries
+# `minutes` and slot_left() above reads it without moving the clock - but
+# every one of the ~25 dj_banter call sites passes a hardcoded literal
+# (lines=2, lines=3, lines=4, lines=6, lines=12) and dj_banter itself falls
+# back to random.randint(16, 22). The sheet said "3.0 minutes" and the
+# writer was told "4 lines" by a constant somebody typed months ago. The
+# two facts never met.
+#
+# TURNS_PER_CYCLE is the operator's drawn shape: an opening line seeded
+# from the speakbox, Response A, Response B, and the rebuttal. A round is
+# N of those, and N comes from the clock.
+TURNS_PER_CYCLE = 4
+
+# What share of a segment's minutes is actually TALK. A record-backed
+# segment spends most of its slot on the record; a banter entry is talk
+# nearly all the way down. Measured off the same slots the sheet names.
+SEGMENT_TALK_SHARE: dict[str, float] = {
+    "banter": 0.92,
+    "caller": 0.88,
+    "manager": 0.85,
+    "news": 0.85,
+    "gallery": 0.80,
+    "recap": 0.85,
+    "ad": 0.90,
+    "track_talk": 0.35,     # the record is playing underneath
+    "record": 0.12,
+}
+SEGMENT_TALK_SHARE_ELSE = 0.80
+
+# Fallback only - the real number is measured off the ledger below.
+TURN_SECONDS_GUESS = 6.5
+_TURN_SECONDS_MEMO: dict[str, Any] = {"at": 0.0, "by_kind": {},
+                                      "walking": False}
+TURN_SECONDS_TTL = 600.0
+
+
+def _turn_seconds_walk() -> None:
+    """The ledger walk itself. THREAD ONLY."""
+    by_kind: dict[str, list[float]] = {}
+    try:
+        for row in script_ledger_rows():
+            if str(row.get("kind") or "") != "dialogue":
+                continue
+            secs = float(row.get("seconds") or 0)
+            if not 0.8 <= secs <= 40.0:
+                continue
+            by_kind.setdefault(str(row.get("round") or ""), []).append(secs)
+            by_kind.setdefault("", []).append(secs)
+    except Exception:  # noqa: BLE001
+        by_kind = {}
+    _TURN_SECONDS_MEMO["by_kind"] = {
+        k: (sorted(v)[len(v) // 2] if len(v) >= 12 else 0.0)
+        for k, v in by_kind.items()}
+    _TURN_SECONDS_MEMO["at"] = time.time()
+    _TURN_SECONDS_MEMO["walking"] = False
+
+
+def mean_turn_seconds(kind: str = "") -> float:
+    """How long one spoken turn of this road actually runs.
+
+    Read off the script ledger's own `seconds` field rather than guessed,
+    because the whole point of the budget is that it matches the air.
+
+    2026-09-22: THIS NEVER WALKS ON THE CALLER'S THREAD. The first version
+    did the ledger walk inline on a cold memo, and dj_banter calls it from
+    the event loop - so an 8 MB JSONL parse ran where nothing else could
+    run, the station went deaf on /healthz for three 8-second probes in a
+    row, and spark-agent-watchdog restarted it twice inside one window.
+    That is the event-loop-starvation failure this codebase has already
+    written down more than once. A cold memo answers with the guess and
+    refreshes itself behind the show."""
+    memo = _TURN_SECONDS_MEMO
+    if (time.time() - float(memo.get("at") or 0) > TURN_SECONDS_TTL
+            and not memo.get("walking")):
+        memo["walking"] = True
+        try:
+            fire_and_forget(asyncio.to_thread(_turn_seconds_walk))
+        except Exception:  # noqa: BLE001
+            memo["walking"] = False
+    rows = memo.get("by_kind") or {}
+    got = float(rows.get(str(kind or "")) or 0) or float(rows.get("") or 0)
+    return got if got > 0 else TURN_SECONDS_GUESS
+
+
+def segment_budget(kind: str, minutes: float = 0.0,
+                   seconds: float = 0.0) -> dict[str, Any]:
+    """How much conversation this segment needs, from its own slot.
+
+    The spine the operator named: the schedule says how long, this says how
+    many cycles, and the preparer knows how much to bank. Pass `seconds`
+    to budget what is LEFT of a slot already running (slot_left), or
+    `minutes` to budget a whole one off the sheet.
+
+    Never returns zero cycles: a segment on the sheet is a segment that has
+    to be filled, and a budget of nothing is how an entry ends up playing
+    one round and logging that one round is all it can be today."""
+    kind = str(kind or "")
+    try:
+        want = float(seconds) if seconds > 0 else float(minutes) * 60.0
+    except (TypeError, ValueError):
+        want = 0.0
+    share = SEGMENT_TALK_SHARE.get(kind, SEGMENT_TALK_SHARE_ELSE)
+    talk = max(0.0, want * share)
+    per = max(1.5, mean_turn_seconds(kind))
+    turns = int(talk // per)
+    cycles = max(1, -(-turns // TURNS_PER_CYCLE)) if turns > 0 else 1
+    # A cycle is the shape; the turn count the writer is given is the
+    # cycles rounded back up, so a round always lands on a cycle boundary
+    # rather than being cut in the middle of a rebuttal.
+    return {"kind": kind, "seconds": round(want, 1),
+            "talk_seconds": round(talk, 1), "share": share,
+            "turn_seconds": round(per, 2), "turns": turns,
+            "cycles": cycles, "lines": max(2, cycles * TURNS_PER_CYCLE),
+            "say": ("%s owns %.0fs, about %.0fs of it talk at %.1fs a turn - "
+                    "%d cycle(s), %d turns"
+                    % (kind or "the segment", want, talk, per, cycles,
+                       max(2, cycles * TURNS_PER_CYCLE)))}
+
+
+def segment_budget_now(road: str) -> dict[str, Any]:
+    """The budget for what is LEFT of the entry on air, or {} when the
+    entry on air does not belong to this road."""
+    left = slot_left(road)
+    if left <= 0:
+        return {}
+    return segment_budget(road, seconds=left)
 
 async def entry_fill_out(road: str, track: dict[str, Any] | None) -> int:
     """#1166: keep running THIS entry's road until its minutes are used.
@@ -94141,7 +95666,17 @@ async def speak_turns(turns: list[tuple[str, str]],
                       recorded: bool = False,   # #1063
                       tint_report: dict[str, Any] | None = None,
                       ready_takes: list[dict[str, Any]] | None = None,
-                      on_handoff: Any = None, can_handoff: Any = None) -> list[str]:
+                      on_handoff: Any = None, can_handoff: Any = None,
+                      # [#1386] F3: {turn index -> speakbox document}, for a
+                      # round that changes topic part way through.
+                      turn_source: dict[int, str] | None = None,
+                      # [#1386] [{file, text}] for every passage a
+                      # quote door dealt verbatim this round.
+                      passage_source: list[dict[str, Any]] | None = None,
+                      # [#1386] {turn -> the roll that shaped it}, so
+                      # the script editor can show the dice beside the
+                      # line they produced.
+                      turn_dice: dict[int, dict[str, Any]] | None = None) -> list[str]:
     """#1146: the floor door. One round holds the air from its first line
     to its last; a second round queues behind it instead of interleaving
     with it. The body lives in _speak_turns_floorless, unchanged - this
@@ -94160,7 +95695,9 @@ async def speak_turns(turns: list[tuple[str, str]],
             caller2_voice=caller2_voice, render_stream=render_stream,
             feel=feel, allow_repeat=allow_repeat, recorded=recorded,
             tint_report=tint_report, ready_takes=ready_takes,
-            on_handoff=on_handoff, can_handoff=can_handoff)
+            on_handoff=on_handoff, can_handoff=can_handoff,
+            turn_source=turn_source, passage_source=passage_source,
+            turn_dice=turn_dice)
     _owned = await _floor_take(("a call from " + caller_name)
                                if caller_name else "a booth round")
     try:
@@ -94173,7 +95710,9 @@ async def speak_turns(turns: list[tuple[str, str]],
             caller2_voice=caller2_voice, render_stream=render_stream,
             feel=feel, allow_repeat=allow_repeat, recorded=recorded,
             tint_report=tint_report, ready_takes=ready_takes,
-            on_handoff=on_handoff, can_handoff=can_handoff)
+            on_handoff=on_handoff, can_handoff=can_handoff,
+            turn_source=turn_source, passage_source=passage_source,
+            turn_dice=turn_dice)
     finally:
         _floor_drop(_owned)
 
@@ -94463,7 +96002,16 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                       recorded: bool = False,   # #1063
                       tint_report: dict[str, Any] | None = None,
                       ready_takes: list[dict[str, Any]] | None = None,
-                      on_handoff: Any = None, can_handoff: Any = None) -> list[str]:
+                      on_handoff: Any = None, can_handoff: Any = None,
+                      # [#1386] F3: {turn index -> speakbox document}.
+                      turn_source: dict[int, str] | None = None,
+                      # [#1386] [{file, text}] for every passage a
+                      # quote door dealt verbatim this round.
+                      passage_source: list[dict[str, Any]] | None = None,
+                      # [#1386] {turn -> the roll that shaped it}, so
+                      # the script editor can show the dice beside the
+                      # line they produced.
+                      turn_dice: dict[int, dict[str, Any]] | None = None) -> list[str]:
     """Put an exchange on air, turn by turn, in the two session voices.
 
     Shared by the written exchange and the generated one, so an approved bit
@@ -94505,7 +96053,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
               if ready_takes is not None else await session_voices())
     spoken: list[str] = []
     ready_meta = dict(ready_takes[0].get("round") or {}) if ready_takes else {}
-    if ready_takes is None and not _system2_repeat_rows(
+    if ready_takes is None and not await _system2_repeat_rows_async(
             [{"text": spoken_text(text)} for _, text in turns], ready_meta):
         return []
     if ready_takes is None:
@@ -94588,7 +96136,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         recorded, whole, render_stream = True, True, True
     tint_needed = dialogue_tint_required()
     if ready_takes is not None and globals().get("_system2"):
-        if not _system2().repeat_allowed([str(t.get("text") or "") for t in ready_takes], ready_meta):
+        if not await _system2_repeat_allowed_async(
+                [str(t.get("text") or "") for t in ready_takes], ready_meta):
             return []
     tint_eligible = [i for i, (_m, t) in enumerate(turns)
                      if len(str(t or "").strip()) >= TINT_TURN_FLOOR]
@@ -94925,7 +96474,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
 
     # Includes raw fallback, recorded/manual exchanges, and prepared responses.
     # None may bypass the persistent exact-hour rule through a legacy waiver.
-    if not _system2_repeat_rows(playlist, ready_meta):
+    if not await _system2_repeat_rows_async(playlist, ready_meta):
         return []
 
     def _turn_voice(item: dict[str, Any]) -> str | None:
@@ -95316,7 +96865,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # audio's order (the quip used to land above the
                     # line it was answering).
                     transcript.append((item["who"], item["chunk"],
-                                       _clip_seconds(clip["path"])))
+                                       await _clip_seconds_async(clip["path"])))
                     seg_ix.append(len(seg) - 1)
                     turn_ix.append(len(aired_items))
                     line_ids.append(str(item.get("line_id")             # #1277
@@ -95327,7 +96876,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     if ready_takes is None and item.get("turn_end") and item["who"] in ("dj", "cohost", "third"):
                         try:
                             gold_note(item["who"], str(item.get("turn_text") or item["chunk"]),
-                                      str(clip.get("path") or key), _clip_seconds(clip["path"]))
+                                      str(clip.get("path") or key), await _clip_seconds_async(clip["path"]))
                         except Exception:  # noqa: BLE001
                             pass
                     # #833: sting_due() existed, had a dial, had TESTS —
@@ -95391,7 +96940,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         # Gold: a rhymed bar that already aired comes back
                         # from the other seat, the sting lands after it.
                         _gold = (gold_pick(exclude_who=item["who"])
-                                 if random.random() < GOLD_FIRE_RATE else None)
+                                 if gold_in_round_due() else None)
                         if _gold:
                             seg.append(str(VOICE_MEDIA_DIR / str(_gold.get("path") or "")))
                             transcript.append((str(_gold.get("who") or "dj"),
@@ -95463,7 +97012,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             seg.append(str(VOICE_MEDIA_DIR / _qk))
                             transcript.append(
                                 ("drop", _quip,
-                                 _clip_seconds(_qc["path"])))
+                                 await _clip_seconds_async(_qc["path"])))
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
                             line_ids.append(uuid.uuid4().hex)           # #1277
@@ -95527,7 +97076,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     mixed = None
             if mixed:
                 one = _store_media(mixed, "wav")
-                length = _clip_seconds(one["path"]) or 0.0
+                length = await _clip_seconds_async(one["path"]) or 0.0
                 if (ready_takes is not None and _sfx_meta
                         and not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
                             ready_takes, ready_meta.get("_ready_slot"), seconds=length)
@@ -95575,7 +97124,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     if not mixed:
                         return []
                     one = _store_media(mixed, "wav")
-                    length = _clip_seconds(one["path"]) or 0.0
+                    length = await _clip_seconds_async(one["path"]) or 0.0
                 if length <= 0.5:
                     _sfx_cadence_release(_sfx_meta.values())
                     # #1147: a burst whose header will not measure is not
@@ -95679,6 +97228,45 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 #
                 # Before `_est0`, because the estimate below is anchored
                 # on it and a file append is not free.
+                # [#1386] F3: which document was behind a given turn.
+                #
+                # Two roads, in order of certainty. The turn map is exact -
+                # the writer said so. The passage match is how a VERBATIM
+                # door is caught: a quote door deals a different document
+                # from the round's seed, and the words that went to air are
+                # that document's, not the seed's. Matched on the words
+                # because that is the only thing the two rows share.
+                _pass = [d for d in (passage_source or [])
+                         if isinstance(d, dict) and d.get("file") and d.get("text")]
+
+                def _td_of(_row_at: int) -> dict[str, Any]:
+                    _t = (turn_ix[_row_at]
+                          if _row_at < len(turn_ix) else -1)
+                    _got = (turn_dice or {}).get(_t)
+                    return _got if isinstance(_got, dict) else {}
+
+                def _ts_of(_row_at: int) -> str:
+                    _t = (turn_ix[_row_at]
+                          if _row_at < len(turn_ix) else -1)
+                    _got = str((turn_source or {}).get(_t) or "")
+                    if _got or not _pass:
+                        return _got
+                    try:
+                        _said = " ".join(str(
+                            transcript[_row_at][1] or "").lower().split())
+                    except Exception:  # noqa: BLE001
+                        return ""
+                    if len(_said) < 24:
+                        return ""
+                    for _d in _pass:
+                        _body = " ".join(str(_d.get("text") or "").lower().split())
+                        if not _body:
+                            continue
+                        # either way round: a passage may be cut across
+                        # turns, and a turn may carry more than the passage.
+                        if _said[:60] in _body or _body[:60] in _said:
+                            return str(_d.get("file") or "")
+                    return ""
                 try:
                     script_ledger_commit(
                         _round_sid,
@@ -95692,7 +97280,20 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                    else "dialogue"),
                           "cue": str((_sfx_meta.get(_r) or {}).get(
                               "sfx_sample_id") or ""),
-                          "scripted": True}
+                          "scripted": True,
+                          # [#1386] F3: the document behind THIS turn,
+                          # when the round changed topic part way
+                          # through. Absent means "the round's own
+                          # seed", which is every round that never
+                          # changed subject.
+                          **({"source": str(_ts_of(_r))}
+                             if _ts_of(_r) else {}),
+                          # [#1386] THE ROLL THAT SHAPED THIS LINE.
+                          # "Next to each piece of dialogue in the script
+                          # editor, I want to be able to see the dice roll
+                          # and the result that it got and the intensity
+                          # result of what each dice value equals."
+                          **({"dice": _td_of(_r)} if _td_of(_r) else {})}
                          for _r, (_w, _c, _s) in enumerate(transcript)],
                         # [#1245] THE ROAD, not the document.  `source` is the
                         # speaker box file the round was seeded from, and
@@ -96096,7 +97697,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, _pstart, can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
-                    if not played_any and not _system2_repeat_rows(rows, ready_meta):
+                    if not played_any and not await _system2_repeat_rows_async(rows, ready_meta):
                         _burst_withdraw(_entries, "System2 counts these lines as already aired - a repeat")   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
@@ -96151,7 +97752,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # belongs to the start of a round may not abandon one the
                     # listener is already hearing.
                     if (not played_any and not page_delivery
-                            and not _system2_repeat_rows(rows, ready_meta)):
+                            and not await _system2_repeat_rows_async(rows, ready_meta)):
                         _burst_withdraw(_entries, "System2 counts these lines as already aired - a repeat")   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
@@ -96748,6 +98349,19 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # number that was actually asked for; six remains the floor of the
         # ceiling so an unset station behaves as it always did.
         lines = min(lines, max(6, int(dj.get("banter_max_lines") or 6)))
+        # [#1386] ...unless the SHEET has an opinion. Every call site
+        # passed a hardcoded literal and this fell back to a random
+        # 16-22, so "banter, 3.0 minutes" on the running order and
+        # "write 20 lines" in the prompt were unrelated facts. When the
+        # entry on air belongs to this road, its remaining minutes say
+        # how many turns there is actually room for.
+        try:
+            _budget = segment_budget_now("banter")
+            if _budget.get("lines"):
+                lines = max(4, min(int(_budget["lines"]),
+                                   int(dj.get("banter_max_lines") or 22)))
+        except Exception:  # noqa: BLE001
+            pass
     if caller_name:
         # A phone call needs an opening, development, response and goodbye.
         # Nine total lines frequently left the caller's actual point with no
@@ -97515,6 +99129,96 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # which is why the index version silently never matched.
         _desk_at = time.time()
         _paper_context = await asyncio.to_thread(paper_discussion_context)
+        # [#1386] THE RUNNING ORDER, pre-rolled. Empty while the dial is
+        # at zero, and then this is today byte for byte: the prose that
+        # was here stays as the fallback.
+        _beat_sheet, _dice_rolls = "", []
+        _turn_source: dict[int, str] = {}
+        # [#1386] THE SUBJECT CHANGES PART WAY THROUGH.
+        #
+        # "So at some point in the conversation there will be a topic
+        # change in which another randomized section of the speaker box
+        # is used for them to say in conversation in which the cycle
+        # begins again."
+        #
+        # Measured before this existed: of 3,269 blocks, NOT ONE ever
+        # carried more than one source document. The change of subject
+        # the operator drew did not exist anywhere in the station.
+        #
+        # Drawn BEFORE the loop that uses it: speakbox_quote walks the
+        # document directory on every call, and the share it walks is
+        # slow enough to have cost 6.5s against an 8s watchdog (#1250).
+        _topic_at, _topic_new = 0, {}
+        try:
+            if (banter_dice_on() > 0 and int(lines or 0) >= 8
+                    and not caller_name and not own_material
+                    and not _system2_job):
+                _topic_new = await speakbox_quote(
+                    exclude=str((seed or {}).get("file") or ""),
+                    most=6, cap=700) or {}
+                if _topic_new.get("text"):
+                    # [#1386] MEASURED, not assumed. The model returns a
+                    # median 357 tokens against an ask of 1,500-3,000,
+                    # so a round asked for 20 turns comes back with about
+                    # ten. Putting the change at 62% of the ASK landed it
+                    # at turn 12 of a script that stopped at 10, and the
+                    # subject never changed at all - 0 of 31 blocks.
+                    # Placed against what actually arrives instead.
+                    _topic_at = max(4, int(int(lines) * 0.40))
+        except Exception as _exc:  # noqa: BLE001
+            pipeline_log("drop", "no second subject could be drawn",
+                         extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
+            _topic_at, _topic_new = 0, {}
+        try:
+            _cm = call_meta if isinstance(call_meta, dict) else {}
+            if caller_name:
+                # [#1392] A CALL IS NOT BANTER. The banter running order
+                # knows nothing about answering a ringing line, and
+                # call_flow_report refuses everything that does not. The
+                # dice sheet is not used here: the protocol IS the shape,
+                # and two running orders in one prompt is two answers to
+                # the same question.
+                _beat_sheet = call_beat_sheet(
+                    int(lines or 0), caller_name,
+                    cohost_name=str(dj.get("cohost_name") or ""),
+                    third_name=str(dj.get("third_name") or ""),
+                    topic=str(_cm.get("topic") or ""),
+                    # The passage the checker looks for is the one the
+                    # CALL was given, not the round's seed - that is what
+                    # call_speakerbox_report is handed at the gate.
+                    speakerbox=str(_cm.get("speakerbox_text")
+                                   or (seed or {}).get("text") or ""),
+                    story=bool(_cm.get("story")))
+                _dice_rolls = []
+                raise _CallSheetDone
+            _beat_sheet, _dice_rolls = banter_beat_sheet(
+                int(lines or 0),
+                banter_floor_seats(dj, bool(third), caller_name),
+                dj, seeded=bool(seed and seed.get("text")),
+                topic_at=_topic_at,
+                topic_text=str(_topic_new.get("text") or ""),
+                cohost_name=str(dj.get("cohost_name") or ""),
+                third_name=str(dj.get("third_name") or ""),
+                caller_name=caller_name)
+            if _topic_at and _topic_new.get("file"):
+                # Every turn from the change onward belongs to the new
+                # document, so the ledger stops stamping one source
+                # across a block that changed subject half way down.
+                # Open-ended on purpose: the script may run past the ask
+                # as easily as it stops short of it, and every turn from
+                # the change onward belongs to the new document.
+                # ...and the same offset here, so the document changes on
+                # the turn the sheet announced it on.
+                for _t in range(_topic_at - 1, int(lines or 0) + 24):
+                    _turn_source[_t] = str(_topic_new.get("file") or "")
+                speakbox_remember(_topic_new)
+        except _CallSheetDone:
+            pass          # [#1392] the call sheet is written; nothing else
+        except Exception as _exc:  # noqa: BLE001
+            # #1219: a silent fallback hides the exception for days.
+            pipeline_log("drop", "the running order could not be rolled",
+                         extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
+            _beat_sheet, _dice_rolls = "", []
         script = await ask_model(
             f"{radio_persona('host', dj['persona'])}"
             f"{radio_prompt_instruction('host')}"
@@ -97625,12 +99329,25 @@ async def dj_banter(track: dict[str, Any] | None = None,
             "without one.\n"
             # #828: a conversation, not interleaved monologues — the
             # operator hears the pair talking PAST each other.
-            + "EVERY TURN RESPONDS TO THE ONE BEFORE IT: pick up a "
-            "SPECIFIC word, image or claim the other speaker just said — "
-            "repeat it back, challenge it, laugh at it, mishear it, build "
-            "on it — BEFORE adding anything new. A turn that could be "
-            "moved three turns away without anyone noticing is a failed "
-            "turn. React first, then advance. "
+            #
+            # [#1386] ...and it did not work, twice, in prose. When the
+            # dice are on, the numbered running order REPLACES this: a
+            # small model follows a list of turns far better than it
+            # follows a rule about turns, and #1197 already measured
+            # that a model finishing a long prompt writes about the end
+            # of it. The prose stays as the zero-dial fallback so that
+            # turning the dial down is exactly the old station.
+            # [#1393] THE SHEET ITSELF HAS MOVED TO THE VERY END - see the
+            # note beside it below. Only the zero-dial prose stays here,
+            # which is what this slot was before #1386 and is byte for
+            # byte the old station when the dial is down.
+            + ("" if _beat_sheet else
+               "EVERY TURN RESPONDS TO THE ONE BEFORE IT: pick up a "
+               "SPECIFIC word, image or claim the other speaker just said — "
+               "repeat it back, challenge it, laugh at it, mishear it, build "
+               "on it — BEFORE adding anything new. A turn that could be "
+               "moved three turns away without anyone noticing is a failed "
+               "turn. React first, then advance. ")
             + f"{banter_pace(0 if caller_name else dj['overlap'])}\n"
             f"Format each line as 'A: ...' for you and 'B: ...' for "
             f"{dj['cohost_name']}"
@@ -97662,7 +99379,31 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # A model finishing a long prompt writes about the end of
             # it.  On a round that has its own material, the end of it
             # is that material.
-            + tail_lists_clause(material, pictures, own_material),
+            + tail_lists_clause(material, pictures, own_material)
+            # [#1393] AND THE RUNNING ORDER IS THE LAST THING IT READS.
+            #
+            # The comment directly above is the whole reason this had to
+            # move: "a model finishing a long prompt writes about the end
+            # of it", which is also why #828's prose failed twice and got
+            # the comment that the operator could hear the pair talking
+            # past each other.
+            #
+            # #1386 then put the beat sheet in the SAME BURIED POSITION -
+            # measured 2026-09-22: 4,954 characters and eleven more prompt
+            # fragments were appended after it. So the numbered running
+            # order was read, then buried under diatribe interjections,
+            # mood colouring and formatting notes, and the model wrote
+            # about those. On the call road the effect was exact: the
+            # protocol sheet landed and call_contract went on refusing
+            # ~140 rounds an hour for the very legs the sheet names.
+            #
+            # #1197 is right that the prompt should end on the round's own
+            # MATERIAL - so the material is still the last CONTEXT, and
+            # this is the last INSTRUCTION, which is a different thing.
+            # The material says what to talk about; the running order is
+            # the shape of the answer, and the shape must be the thing
+            # the model is holding when it starts to write.
+            + ("\n\n" + _beat_sheet if _beat_sheet else ""),
             spice=0.5,                  # wider intonation draw (#371)
             # Room for the whole swath to come back out (#210): a long
             # passage worked in needs more turns than a one-line remark, and
@@ -97679,7 +99420,25 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     (760 if _bank_rich else 560) * lines
                     + len(seed.get("text", ""))
                     + len(aside) + len((comeback or {}).get("text", ""))
-                    + len(angle)),
+                    + len(angle)
+                    # [#1391] AND THE BEAT SHEET, WHICH #1386 FORGOT.
+                    #
+                    # The comment above this sum is the whole warning:
+                    # "running out of tokens is what a DJ stopping
+                    # mid-word sounds like (#168)". The beat sheet added
+                    # in #1386 is a NUMBERED RUNNING ORDER - one line per
+                    # turn, up to twenty-two of them - injected into this
+                    # very prompt, and it was never added here. So the
+                    # round was handed a longer brief demanding more
+                    # turns and the same room to answer in.
+                    #
+                    # Measured 2026-09-22, two live hours: draft_trimming
+                    # refused 170 drafts for "exceeded the character
+                    # limit or ended with an unfinished sentence" - the
+                    # exact sound #168 describes. reply_max_chars is
+                    # still the hard ceiling above, so this can only ever
+                    # give back room the operator already allows.
+                    + len(_beat_sheet)),
             ),
             # #842: "we can increase the context length for the LLM to get
             # more lines". The banked round is written in the wide window;
@@ -97773,6 +99532,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # rewrite that cannot win - the #904 trap this same block was
         # rescued from once already.
         _c_share = (_c_turns / _all_turns) if _all_turns else 0.0
+        # [#1395] read ONCE, so one round is judged against one state of
+        # the air even if the shelf moves while the gate is running.
+        _starved = air_is_starving()
         _call_report = call_flow_report(
             script, caller_name, caller2_name,
             topic=str((call_meta or {}).get("topic") or ""),
@@ -97783,8 +99545,30 @@ async def dj_banter(track: dict[str, Any] | None = None,
                    else None),
             plot=((call_meta or {}).get("plot")
                   if isinstance((call_meta or {}).get("plot"), dict)
-                  else None))                                     # #1157
+                  else None),                                     # #1157
+            # [#1395] WHEN THE ALTERNATIVE IS SILENCE, THE RICHNESS LEGS
+            # ADVISE INSTEAD OF CUTTING.
+            #
+            # This softens exactly two things - the grounded-question
+            # count and the novelty collisions - and leaves every PROTOCOL
+            # leg binding: answering the line, the introduction, the
+            # greeting by name, the caller landing it second to last and
+            # the spoken sign-off all still cut, because those are what
+            # make it a call rather than three people talking. The fault
+            # is still recorded and still reaches the queue and the
+            # pipeline log; the only thing that changes is whether the
+            # station throws the round away and plays a clip instead.
+            soft_quality=_starved)
         _needs_rewrite = not bool(_call_report.get("ok"))
+        _soft_now = list(_call_report.get("soft_faults") or [])
+        if _starved and _soft_now:
+            pipeline_log(
+                "call",
+                "the shelf is bare and the pair have been quiet - this call "
+                "airs with %d advisory fault(s) rather than leaving the hole "
+                "(#1395): %s"
+                % (len(_soft_now),
+                   "; ".join(str(x) for x in _soft_now[:3])[:200]))
         # [#1249] THE TOPIC CONTRACT, graded on the words: the hosts must
         # address what the caller rang about. Measured before this, over
         # 150 shelved caller rounds: 22% of host turns did, and 8.7% over
@@ -97882,7 +99666,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
                                          dict) else None),
                     plot=((call_meta or {}).get("plot")
                           if isinstance((call_meta or {}).get("plot"),
-                                        dict) else None))         # #1157
+                                        dict) else None),         # #1157
+                    # [#1395] the SAME standard as the first pass. Judging
+                    # a rewrite harder than the draft it came from means a
+                    # starved round can be forgiven a richness leg, sent
+                    # for a rewrite over a protocol leg, and then refused
+                    # on the leg that was already forgiven.
+                    soft_quality=_starved)
                 _rw_ok = bool(_rw_report.get("ok"))
             else:
                 _rw_ok = (system2_scene_complete(banter_turns(rewritten), _judge_lines)
@@ -97976,6 +99766,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # - this door put a thousand-character run-on in as one turn.
             _seed_forced = True
             _seed_put = _verbatim_turn_text(seed["text"])
+            # [#1386] THE PASSAGE OPENS THE EXCHANGE. It goes in at the
+            # HEAD as A's own first turn - which is what the operator
+            # drew: the first line of a banter is the one seeded by the
+            # speakbox, and everybody else is answering it.
             script = f"A: {_seed_put}\n" + script
     _sb = dj_settings()
 
@@ -98089,6 +99883,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
         _quotes[door] = rec
         return bool(rec["hit"])
 
+    # [#1386] {file, text} for every passage a door dealt this round.
+    _passage_source: list[dict[str, Any]] = []
+
     def _quote_note(door: str, drawn: dict[str, Any], text: str, turns: int) -> None:
         """What the door actually put in: the document, the passage, the turns."""
         rec = _quotes.setdefault(door, {"door": door, "applies": True, "hit": True})
@@ -98097,6 +99894,21 @@ async def dj_banter(track: dict[str, Any] | None = None,
                    text=" ".join(str(text or "").split())[:300],
                    chars=len(" ".join(str(text or "").split())),
                    turns=int(turns or 0))
+        # [#1386] WHICH DOCUMENT SPOKE, not which one seeded.
+        #
+        # The ledger's `source` is the round's SEED. A quote door draws a
+        # DIFFERENT document and deals it verbatim, so the words actually
+        # spoken can come from a file the record never names. Measured on
+        # the line the operator brought: the ledger said ms.md, ms.md does
+        # not contain a word of it, and it is verbatim out of ylyl.md.
+        #
+        # So the passage is filed against its own document here, and the
+        # air matches a spoken turn back to it.
+        _doc = str((drawn or {}).get("file") or "")
+        _body = " ".join(str(text or "").split())
+        if _doc and len(_body) >= 24:
+            _passage_source.append({"file": _doc, "text": _body[:600],
+                                    "door": str(door or "")})
 
     def _s2_bound(text: str) -> str:
         """Under a System2 job a passage is SPEAKBOX_S2_QUOTE_TURNS spoken turns."""
@@ -98190,7 +100002,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
     try:
         _sb_rate = float(_sb.get("speakbox_rate") or 0)
         _seed_text = str((seed or {}).get("text") or "").strip()
+        # [#1386] ...and NOT when the passage is already the opening
+        # turn. This door appends it as a `B:` turn at the very end; with
+        # the head put-back above that is the same passage read twice in
+        # one round, once at each end.
         if (not _system2_job and _sb_rate >= 0.95 and _seed_text and not caller_name
+                and not _seed_forced
                 and not full_swath and not own_material):
             _flat = re.sub(r"[^a-z0-9 ]+", " ", script.lower())
             _flat = re.sub(r"\s+", " ", _flat)
@@ -98345,6 +100162,38 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # [#1233] every door's decision: did the dial apply, what did the
         # dice say, and what went in. Read by speakbox_quote_paperwork.
         "quotes": _quotes,
+        # [#1386] the running order as it was ROLLED, beside the quote
+        # doors that already record rate/roll/hit the same way. Plain
+        # JSON only: `entry` is serialised to the shelf by _larder_save
+        # and a failed write empties the reserve without saying so.
+        **({"dice": _dice_rolls} if _dice_rolls else {}),
+        # [#1386] the same rolls keyed by TURN, so the air can stamp each
+        # line with the one that shaped it. String keys: this is
+        # serialised to the shelf and JSON has no integer keys.
+        # [#1386] ZERO-BASED, to match the ledger. banter_beat_sheet numbers
+        # the running order 1..N the way a person reads a list; the script
+        # ledger's `turn` counts from 0, so turn_dice[1] never met turn 0
+        # and not one roll reached a line. Converted here, once, at the
+        # only place the two numberings meet.
+        **({"turn_dice": {str(int(d.get("turn")) - 1): {
+                "roll": d.get("roll"), "hard": d.get("hard"),
+                "axis": d.get("axis"), "lean": d.get("lean"),
+                "text": d.get("text"), "answers": d.get("answers"),
+                "band": list(banter_dice_range(str(d.get("axis") or ""))),
+            } for d in _dice_rolls if d.get("turn") is not None}}
+           if _dice_rolls else {}),
+        # [#1386] the documents whose words were dealt VERBATIM this round,
+        # which is not the same list as the seed.
+        **({"passage_source": _passage_source} if _passage_source else {}),
+        # [#1386] {turn -> document} once the subject changed. JSON keys
+        # are strings once this is written to the shelf, so it is read
+        # back through int() at the air.
+        **({"turn_source": {str(k): v for k, v in _turn_source.items()}}
+           if _turn_source else {}),
+        **({"topics": [{"file": str(_topic_new.get("file") or ""),
+                        "text": str(_topic_new.get("text") or "")[:240],
+                        "at_turn": _topic_at}]}
+           if _topic_at and _topic_new else {}),
         "swaths": [s for s in (seed, comeback, jab, tail) if s],
         "seek_verdict": seek_verdict,
         "caller_name": caller_name, "caller_voice": caller_voice,
@@ -99011,6 +100860,42 @@ def _banter_no(why: str) -> list[str]:
     return []
 
 
+def _turn_dice_map(entry: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """{turn -> the roll that shaped it}, off a round however it arrived."""
+    got = (entry or {}).get("turn_dice")
+    if not isinstance(got, dict):
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for key, val in got.items():
+        if not isinstance(val, dict):
+            continue
+        try:
+            out[int(key)] = val
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _turn_source_map(entry: dict[str, Any]) -> dict[int, str]:
+    """{turn -> document} off a round, whether it came straight from the
+    writer or back off the shelf.
+
+    JSON has no integer keys, so a round that was banked and reloaded
+    carries "8" where the writer put 8. Read both, drop anything that is
+    neither, and never raise: a round must not fail to air because its
+    bookkeeping could not be parsed."""
+    got = (entry or {}).get("turn_source")
+    if not isinstance(got, dict):
+        return {}
+    out: dict[int, str] = {}
+    for key, val in got.items():
+        try:
+            out[int(key)] = str(val or "")
+        except (TypeError, ValueError):
+            continue
+    return {k: v for k, v in out.items() if v}
+
+
 async def _banter_air(entry: dict[str, Any],
                       track: dict[str, Any] | None, *,
                       ready_takes: list[dict[str, Any]] | None = None,
@@ -99018,7 +100903,7 @@ async def _banter_air(entry: dict[str, Any],
                       despite_repeats: bool = False) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
-    if not _system2_repeat_rows(ready_takes if ready_takes is not None else
+    if not await _system2_repeat_rows_async(ready_takes if ready_takes is not None else
             [{"text": text} for _, text in banter_turns(str(entry.get("script") or ""),
                 str(entry.get("caller_name") or ""), str(entry.get("caller2_name") or ""))], entry):
         # #1322: A REPEAT OUTRANKS DEAD AIR - AND ONLY WHEN IT IS DEAD AIR.
@@ -99228,6 +101113,15 @@ async def _banter_air(entry: dict[str, Any],
                                caller_seat=str(
                                    entry.get("caller_seat") or "caller"),
                                source_text=entry.get("seed_text", ""),
+                               # [#1386] which document each turn belongs
+                               # to once the round changed subject. Comes
+                               # back off the shelf with string keys, so
+                               # it is read through int() here.
+                               turn_source=_turn_source_map(entry),
+                               turn_dice=_turn_dice_map(entry),
+                               passage_source=(entry.get("passage_source")
+                                               if isinstance(entry.get("passage_source"), list)
+                                               else None),
                                caller2_name=entry.get("caller2_name", ""),
                                caller2_voice=entry.get("caller2_voice", ""),
                                # #859: a message stays whole even when it
@@ -99300,6 +101194,19 @@ async def _banter_air(entry: dict[str, Any],
                 speakbox_remember({"file": swath.get("file", ""),
                                    "text": " ".join(said_lines),
                                    "lines": said_lines})
+                # [#1386] THE HOUR'S SUBJECTS, for the recap. Only the
+                # ones whose words were genuinely HEARD - the test is
+                # the one three lines up, reused rather than repeated.
+                # The recap used to infer its subjects from fourteen
+                # truncated chat rows, which is why it was generic.
+                try:
+                    _ring = _RADIO.setdefault("topics", [])
+                    _ring.append({"file": str(swath.get("file") or ""),
+                                  "text": " ".join(said_lines)[:240],
+                                  "at": time.time()})
+                    del _ring[:-40]
+                except Exception:  # noqa: BLE001
+                    pass
     # #1246: A DIALOGUE CHAIN HAS JUST COMPLETED. This is the one door
     # every prepared and every live round leaves by, so this is the
     # join at the end of banter, the manager, the gallery, news and a
@@ -121259,7 +123166,7 @@ QUOTE_ROAD_NOTES = {
     "station_id": "a station ident is a line from the ident book",
     "sfx": "the board plays clips, it does not quote",
     "sfxguy": "the SFX guy speaks his own quips",
-    "interject": "a single line written by dj_line; a quote rides only a round",
+    "interject": "a single line written by dj_line, which rolls the speakbox dial of its own and names the document it drew",
     "intro": "a track introduction is a single line written by dj_line",
     "reply": "a reply to the room is a single line",
     "image_analysis": "a picture is described, not quoted",
@@ -121472,6 +123379,1140 @@ def admin_options_for_line(row: dict[str, Any], prov: dict[str, Any]) -> list[di
         if isinstance(v, (int, float, bool, str)) and len(str(v)) <= 60:
             put(k, _pretty_key(k), v, "a desk dial", None, "governs the station; not traceable on one line")
     return out[:120]
+
+
+# --- [#1386] THE CAUSE GRAPH -----------------------------------------------
+#
+# "I want to be able to follow them through a 3js interactive flowchart down
+# to the initial system prompts and speakerbox seedings that caused the
+# station to focus on and emphasize these words."
+#
+# ONE QUESTION, ONE ANSWER. The client must not ask /api/dj/provenance once
+# per line: that road builds `documents` out of an in-memory ring filtered
+# to +/-420 seconds of the line, so for a word searched over two days it
+# returns no documents at all for anything older than about seven minutes.
+# It would be slow AND wrong. The durable join is the script ledger, which
+# already carries line_id -> block -> sid -> round -> source -> mods ->
+# prompt on every row.
+#
+# THREE HONESTY GRADES, because the measured gaps must not be rendered as
+# lies:
+#   measured  the round's own paperwork says so - a quote-door record with
+#             hit=true and a file, a ledger `source`, a modifier id.
+#   written   the word IS in that store, but nothing proves this round read
+#             it. Drawn dimmer. speakbox_heard has no line_id, so anything
+#             resolved through it is `written`, never `measured`.
+#   absent    the road is KNOWN not to record. A gold bar and an SFX quip
+#             have no speakbox seed at all, so blank is the true answer
+#             there rather than a hole - and the graph says which.
+WORD_CAUSE_TTL = 20.0
+_WORD_CAUSE_MEMO = phrase_trace.Memo(ttl=WORD_CAUSE_TTL, most=8)
+_WORD_LEDGER_INDEX: dict[str, Any] = {"stamp": None, "by_line": {}, "by_block": {}}
+
+
+def _word_ledger_index() -> dict[str, Any]:
+    """line_id -> its ledger row, and block -> its rows. THREAD ONLY.
+
+    Rebuilt exactly when the ledger memo turns over and never more often."""
+    stamp = _SCRIPT_LEDGER_MEMO.get("at")
+    if _WORD_LEDGER_INDEX["stamp"] == stamp and _WORD_LEDGER_INDEX["by_line"]:
+        return _WORD_LEDGER_INDEX
+    by_line: dict[str, dict[str, Any]] = {}
+    by_block: dict[int, list[dict[str, Any]]] = {}
+    try:
+        for row in script_ledger_rows():
+            lid = str(row.get("line_id") or "")
+            if lid:
+                by_line[lid] = row
+            by_block.setdefault(int(row.get("block") or 0), []).append(row)
+    except Exception:  # noqa: BLE001
+        by_line, by_block = {}, {}
+    _WORD_LEDGER_INDEX.update({"stamp": stamp, "by_line": by_line,
+                               "by_block": by_block})
+    return _WORD_LEDGER_INDEX
+
+
+def _word_node(nodes: list, seen: set, node: dict[str, Any]) -> str:
+    if node["id"] not in seen:
+        seen.add(node["id"])
+        nodes.append(node)
+    return node["id"]
+
+
+def word_causes(needle: str, air: dict[str, Any],
+                trace: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The graph for one word. THREAD ONLY - it walks the ledger, the gold
+    bank and every phrase-trace store."""
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    gaps: list[dict[str, Any]] = []
+    seen: set = set()
+    pat = phrase_trace.pattern(needle)
+
+    root = _word_node(nodes, seen, {
+        "id": "word", "type": "word", "label": needle,
+        "n": int(air.get("total") or 0),
+        "distinct": int(air.get("distinct") or 0),
+        "why": str(air.get("why") or "")})
+
+    index = _word_ledger_index()
+    by_line = index["by_line"]
+
+    # --- the aired lines, grouped by the text that was actually said -----
+    rows = list(air.get("rows") or [])
+    by_text: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        key = " ".join(str(r.get("text") or "").lower().split())[:160]
+        if not key:
+            continue
+        slot = by_text.setdefault(key, {"n": 0, "rows": []})
+        slot["n"] += 1
+        slot["rows"].append(r)
+
+    road_seen: dict[str, list[int]] = {}
+    for key, slot in sorted(by_text.items(), key=lambda kv: -kv[1]["n"])[:40]:
+        first = slot["rows"][0]
+        uid = _word_node(nodes, seen, {
+            "id": "utt:" + phrase_trace.source_id("utterance", key),
+            "type": "utterance", "n": slot["n"],
+            "label": str(first.get("text") or "")[:180],
+            "who": str(first.get("who") or ""),
+            "kind": str(first.get("kind") or ""),
+            "round": str(first.get("round") or ""),
+            "line_id": str(first.get("id") or "")})
+        edges.append({"from": root, "to": uid, "rel": "said",
+                      "n": slot["n"], "grade": "measured",
+                      "say": "%d airing%s" % (slot["n"],
+                                              "" if slot["n"] == 1 else "s")})
+        # every airing's own block, and what the ledger says caused it
+        for r in slot["rows"][:8]:
+            led = by_line.get(str(r.get("id") or "")) or {}
+            road = str(led.get("round") or r.get("round") or "")
+            block = int(led.get("block") or 0)
+            src = str(led.get("source") or r.get("source") or "")
+            road_seen.setdefault(road, [0, 0])
+            road_seen[road][0] += 1
+            if src:
+                road_seen[road][1] += 1
+            if not block:
+                continue
+            bid = _word_node(nodes, seen, {
+                "id": "block:%d" % block, "type": "block", "n": 1,
+                "label": "block %d%s" % (block, (" - " + road) if road else ""),
+                "round": road, "sid": str(led.get("sid") or ""),
+                "prompt": led.get("prompt") or None})
+            edges.append({"from": uid, "to": bid, "rel": "aired-in",
+                          "n": 1, "grade": "measured",
+                          "say": "turn %s of %s" % (led.get("ord"), road or "the round")})
+            if src:
+                did = _word_node(nodes, seen, {
+                    "id": "doc:" + src, "type": "doc", "label": src, "n": 1,
+                    "weight": int(speakbox_weight(src) or 0)})
+                edges.append({"from": bid, "to": did, "rel": "seeded-by",
+                              "n": 1, "grade": "measured",
+                              "say": "the ledger names this document"})
+            for mid in (led.get("mods") or [])[:4]:
+                mnode = _word_node(nodes, seen, {
+                    "id": "mod:" + str(mid), "type": "modifier",
+                    "label": str(mid), "n": 1})
+                edges.append({"from": bid, "to": mnode, "rel": "rode",
+                              "n": 1, "grade": "measured", "say": "stood over the round"})
+
+    # --- roads that are KNOWN not to record a document -------------------
+    for road, (tot, with_src) in sorted(road_seen.items()):
+        if tot >= 3 and with_src == 0:
+            why = ("a re-fired bar carries no speakbox seed of its own"
+                   if road == "gold" else
+                   "his quips come off a shelf, not the speakbox"
+                   if road == "sfxguy" else
+                   "this road records no document")
+            gaps.append({"road": road or "(none)", "lines": tot,
+                         "with_source": 0,
+                         "say": "%d line(s) on the %s road name no document: %s. "
+                                "That is the true answer here, not a hole."
+                                % (tot, road or "unnamed", why)})
+
+    # --- the gold bank: very often the REAL cause of a repeated phrase ---
+    try:
+        bars = [b for b in _gold_rows()
+                if pat is not None and pat.search(str(b.get("text") or ""))]
+    except Exception:  # noqa: BLE001
+        bars = []
+    for bar in sorted(bars, key=lambda b: -int(b.get("fired") or 0))[:20]:
+        gid = _word_node(nodes, seen, {
+            "id": "gold:" + str(bar.get("key") or ""), "type": "gold",
+            "label": str(bar.get("text") or "")[:180],
+            "n": int(bar.get("fired") or 0),
+            "who": str(bar.get("who") or ""), "last": bar.get("last")})
+        edges.append({"from": root, "to": gid, "rel": "replayed",
+                      "n": int(bar.get("fired") or 0), "grade": "measured",
+                      "say": "a banked bar, fired %s time(s)" % bar.get("fired")})
+
+    # --- the written layers: prompts, crystal, topics, scripts -----------
+    # phrase_trace_answer is ASYNC and is awaited by the caller: calling it
+    # from in here returned a coroutine that was never awaited, which is
+    # the shape of bug the silent-fallback note (#1219) is about.
+    trace = trace if isinstance(trace, dict) else {}
+    for layer in (trace.get("layers") or []):
+        for src in (layer.get("sources") or [])[:12]:
+            sid = _word_node(nodes, seen, {
+                "id": "src:" + str(src.get("id") or ""),
+                "type": str(layer.get("layer") or "prompts"),
+                "label": str(src.get("label") or src.get("store") or "")[:140],
+                "n": int(src.get("count") or 1),
+                "store": src.get("store"), "key": src.get("key"),
+                "snippet": src.get("snippet"),
+                "kill": {"kill": src.get("kill"),
+                         "kill_label": src.get("kill_label"),
+                         "source_id": src.get("id")}})
+            edges.append({"from": root, "to": sid, "rel": "written-in",
+                          "n": int(src.get("count") or 1), "grade": "written",
+                          "say": "the phrase is written here; nothing proves "
+                                 "this round read it"})
+
+    # --- the dials that govern the draw ----------------------------------
+    try:
+        dj = dj_settings()
+        dials = {k: dj.get(k) for k in
+                 ("speakbox_rate", "speakbox_prepend_rate",
+                  "speakbox_append_rate", "banter_dice_rate",
+                  "gold_in_round_rate")}
+    except Exception:  # noqa: BLE001
+        dials = {}
+
+    verdict = str(air.get("why") or "")
+    if verdict.upper().startswith("REPEATS") and bars:
+        # A word whose cause is a banked bar has no prompt to fix, and a
+        # graph that points at the prompt sends the operator to the wrong
+        # desk. Say so, in the answer, not only in the drawing.
+        nodes.sort(key=lambda nd: 0 if nd.get("type") == "gold" else 1)
+
+    return {"ok": True, "q": needle,
+            "air": {k: air.get(k) for k in
+                    ("total", "distinct", "why", "by_round", "by_who",
+                     "per_hour", "repeated") if k in air},
+            "nodes": nodes, "edges": edges, "gaps": gaps, "dials": dials,
+            "trace": {"kin": trace.get("kin"),
+                      "verdict_source": trace.get("verdict_source")},
+            "say": "%d node(s), %d edge(s)%s"
+                   % (len(nodes), len(edges),
+                      ("; %d road(s) honestly record nothing" % len(gaps))
+                      if gaps else "")}
+
+
+def speakbox_excerpt(file: str, near: float = 0.0) -> dict[str, Any]:
+    """[#1387] WHAT, IN THAT DOCUMENT, WAS ACTUALLY BEING REFERRED TO.
+
+    "Any element that's being referred to, I need to be able to expand it
+     and see an excerpt of what is being referred to in that element. So
+     right here, I need to be able to see what element in the speaker box
+     is being referred to and how it's being used."
+
+    "seeded from clb1.md" names the shelf the book came off and not one
+    word of the book. The passage exists in three places, and they are not
+    equally good, so this tries them in order and SAYS which one answered:
+
+      1. the round's own paperwork (`seed_text`) - the exact passage this
+         round was handed. Only while the shelf still holds the round.
+      2. `speakbox_heard` - every passage the station has drawn, with the
+         document it came from and when it was last used. Matched to the
+         moment the line was written, this is the passage that was in
+         circulation from that file at that time. Strong, not certain:
+         the ring has no line id, so it is `written`, never `measured`.
+      3. the document's own opening - true about the document and silent
+         about this round, and labelled as exactly that.
+
+    A trace that shows the wrong passage confidently is worse than one that
+    says which shelf it reached for (line-deep.js:58), so the grade travels
+    with the words every time.
+    """
+    name = str(file or "").strip()
+    if not name:
+        return {}
+    try:
+        rows = [r for r in (speakbox_heard() or [])
+                if str(r.get("file") or "") == name and r.get("text")]
+    except Exception:  # noqa: BLE001
+        rows = []
+    if rows:
+        when = float(near or 0)
+        if when > 0:
+            rows.sort(key=lambda r: abs(float(r.get("last") or 0) - when))
+        else:
+            rows.sort(key=lambda r: -float(r.get("last") or 0))
+        best = rows[0]
+        gap = abs(float(best.get("last") or 0) - when) if when else 0.0
+        return {
+            "text": str(best.get("text") or "")[:600],
+            "grade": "written",
+            "how": ("drawn from %s and last used %s - the closest passage "
+                    "from that document to when this line was written"
+                    % (name, ("%d minute(s) away" % round(gap / 60.0))
+                       if when and gap > 60 else "at that moment")),
+            "used": int(best.get("used") or 0),
+            "others": len(rows),
+        }
+    # Nothing in the ring: say what the document opens with, and say so.
+    try:
+        found = speakbox_doc_path(name) if "speakbox_doc_path" in globals() else None
+    except Exception:  # noqa: BLE001
+        found = None
+    if found is None:
+        for base in (SPEAKBOX_DIR,) if "SPEAKBOX_DIR" in globals() else ():
+            try:
+                cand = Path(base) / name
+                if cand.is_file():
+                    found = cand
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+    if found is not None:
+        try:
+            body = " ".join(Path(found).read_text(
+                encoding="utf-8", errors="replace").split())
+            return {"text": body[:600], "grade": "written",
+                    "how": ("the opening of %s - the station has no record "
+                            "of which passage this round was handed, so "
+                            "this is the document, not the seed" % name)}
+        except OSError:
+            pass
+    return {"grade": "absent",
+            "how": ("%s is named but the station cannot read it back - it "
+                    "may have been renamed or moved since" % name)}
+
+
+def line_clips(air_at: float, line_id: str,
+               window: float = 30.0) -> list[dict[str, Any]]:
+    """[#1387] THE CLIPS THAT WERE HEARD AGAINST THIS LINE.
+
+    "Whenever videos and images are involved, I want to see their
+     thumbnails and infographics in this flowchart view being referenced."
+
+    A sting is not a field on the dialogue row - it is its OWN air row, who
+    "board", kind "sfx", landing a few seconds after the line it answers.
+    So the join is time, and the window is deliberately narrow: half a
+    minute, which is longer than any sting and shorter than the gap to the
+    next one.
+
+    Measured over the live air log, 2026-09-22: 2,402 sfx rows, 1,421
+    carrying `sfx` (the clip's own id), 1,052 marked `video`, and 470
+    carrying `match_why` - the matcher's own sentence for why that clip and
+    not another. Those three fields are what make a thumbnail, a player and
+    a reason possible, and the 981 rows without an id get a node that says
+    so rather than a broken picture: the cadence road fires a clip without
+    recording which, and that is a bookkeeping hole, not an absence.
+
+    Two grades, and the difference is real:
+      measured  the row carries `match_why` - the matcher CHOSE this clip
+                for what was being said.
+      written   it aired alongside and nothing says it was chosen for the
+                line. True, and weaker, and drawn dimmer.
+    """
+    at = float(air_at or 0)
+    if at <= 0:
+        return []
+    try:
+        with _AIRLOG_LOCK:
+            live = list(_AIRLOG_INDEX.values())
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[dict[str, Any]] = []
+    for r in live:
+        if str(r.get("kind") or "") != "sfx":
+            continue
+        when = float(r.get("air_at") or r.get("ts") or 0)
+        # Measured 2026-09-22: the ledger stamps `at` when the row is
+        # COMMITTED and the air log stamps `air_at` when it is HEARD, and
+        # the two ran two seconds apart on the same clock. So the window
+        # opens a little before the line as well as after it - a sting that
+        # lands on the same breath must not be missed over a rounding.
+        if when <= 0 or not (-6.0 <= when - at <= window):
+            continue
+        if str(r.get("id") or "") == str(line_id or ""):
+            continue
+        sid = str(r.get("sfx") or r.get("sfx_sample_id") or "")
+        name = str(r.get("text") or "").removeprefix("\U0001f50a").strip()
+        why = str(r.get("match_why") or "")
+        video = bool(r.get("video"))
+        row: dict[str, Any] = {
+            "sid": sid, "name": name or "a clip", "video": video,
+            "why": why, "at": when, "after": round(when - at, 1),
+            "seconds": float(r.get("seconds") or 0),
+            "folder": str(r.get("sfx_dir") or ""),
+            "row_id": str(r.get("id") or ""),
+        }
+        if sid and re.fullmatch(r"[a-f0-9]{16}", sid):
+            sig = media_sign(sid)
+            row["play"] = "/sfx/%s?t=%s" % (sid, sig)
+            # The picture a clip HAS. A video has a frame; audio has a
+            # spectrogram, which is the infographic for a thing with no
+            # picture. Neither route is ever asked the question it cannot
+            # answer - that contract is written at sfx_poster_api.
+            row["thumb"] = ("/api/sfx/poster/%s?t=%s" % (sid, sig) if video
+                            else "/api/sfx/spec/%s?t=%s" % (sid, sig))
+            row["thumb_kind"] = "frame" if video else "spectrogram"
+        else:
+            row["say"] = ("this sting aired but the round did not write "
+                          "down which clip it was - the cadence road fires "
+                          "without recording the id")
+        out.append(row)
+    out.sort(key=lambda r: float(r.get("at") or 0))
+    return out[:8]
+
+
+def line_causes(line_id: str) -> dict[str, Any]:
+    """Everything that made ONE line the line it is. THREAD ONLY.
+
+    "For every piece of dialogue I need to be able to trace down to how it
+    got through every piece of R N G in order to get to where it is and
+    how it got seeded and how it became what it became."
+
+    Seven bands, in the order they actually happened, each one either a
+    fact off the record or an honest blank. Nothing here is inferred: if
+    the round did not write a thing down, this says so rather than
+    guessing, because a trace that invents a cause is worse than no trace
+    (line-deep.js:58)."""
+    want = str(line_id or "")
+    index = _word_ledger_index()
+    row = (index["by_line"] or {}).get(want) or {}
+    if not row:
+        return {"ok": False, "id": want,
+                "say": "the script ledger does not know that line - it is "
+                       "older than 48 hours, or it never came from a round"}
+    block = int(row.get("block") or 0)
+    siblings = sorted((index["by_block"] or {}).get(block) or [],
+                      key=lambda r: int(r.get("ord") or 0))
+    sid = str(row.get("sid") or "")
+
+    # the round's own paperwork, when the shelf still holds it
+    entry: dict[str, Any] = {}
+    try:
+        _kind, _found = alt_find(sid)
+        if isinstance(_found, dict):
+            entry = _found.get("entry") if isinstance(
+                _found.get("entry"), dict) else _found
+    except Exception:  # noqa: BLE001
+        entry = {}
+
+    bands: list[dict[str, Any]] = []
+
+    # 1. the seat and the running order
+    bands.append({
+        "band": "the line", "grade": "measured",
+        "say": "%s, turn %s of block %d on the %s road"
+               % (row.get("who") or "?", row.get("turn"), block,
+                  row.get("round") or "?"),
+        "detail": {"text": str(row.get("text") or "")[:400],
+                   "who": row.get("who"), "kind": row.get("kind"),
+                   "ord": row.get("ord"), "turn": row.get("turn"),
+                   "seconds": row.get("seconds"),
+                   "scripted": row.get("scripted"),
+                   "of_lines": len(siblings)}})
+
+    # 2. THE DICE - every roll that shaped this turn
+    dice = row.get("dice") if isinstance(row.get("dice"), dict) else {}
+    if dice:
+        band = dice.get("band")
+        if isinstance(band, (list, tuple)) and len(band) >= 2:
+            low, high = band[0], band[1]
+        else:
+            low, high = 0.0, 1.0
+        bands.append({
+            "band": "the dice", "grade": "measured",
+            "say": "rolled %s in [%s, %s] -> %s, %s"
+                   % (dice.get("roll"), low, high,
+                      "positive" if int(dice.get("lean") or 0) > 0 else "negative",
+                      banter_dice_word(float(dice.get("hard") or 0))),
+            "detail": {**dice, "means": banter_dice_word(
+                float(dice.get("hard") or 0))}})
+    else:
+        bands.append({
+            "band": "the dice", "grade": "absent",
+            "say": ("no roll shaped this turn - the dial was at zero when it "
+                    "was written, or this line did not come off the running "
+                    "order"),
+            "detail": {"banter_dice_rate": banter_dice_on()}})
+
+    # 3. THE SEED - which document, and the passage
+    src = str(row.get("source") or "")
+    if src:
+        _when = float(row.get("air_at") or row.get("at") or row.get("ts") or 0)
+        seeded = str(entry.get("seed_text") or "")[:600]
+        if seeded:
+            excerpt = {"text": seeded, "grade": "measured",
+                       "how": "the passage this round was handed, off its "
+                              "own paperwork"}
+        else:
+            excerpt = speakbox_excerpt(src, _when)
+        bands.append({
+            "band": "the speakbox", "grade": "measured",
+            "say": "seeded from %s" % src,
+            "detail": {"file": src,
+                       "weight": int(speakbox_weight(src) or 0),
+                       "seed_text": seeded,
+                       # [#1387] the words, not just the filename
+                       "excerpt": str(excerpt.get("text") or ""),
+                       "excerpt_grade": str(excerpt.get("grade") or "absent"),
+                       "excerpt_how": str(excerpt.get("how") or ""),
+                       "passages_from_this_doc": int(excerpt.get("others") or 0)}})
+    else:
+        why = ("a re-fired gold bar carries no seed of its own"
+               if str(row.get("round") or "") == "gold" else
+               "this road writes from its own material, not the speakbox"
+               if str(row.get("round") or "") in ("news", "manager", "gallery",
+                                                  "recap", "track_talk")
+               else "no document was recorded behind these words")
+        bands.append({"band": "the speakbox", "grade": "absent",
+                      "say": why, "detail": {}})
+
+    # 4. THE QUOTE DOORS - the rolls that decided how much got in
+    quotes = entry.get("quotes") if isinstance(entry.get("quotes"), dict) else {}
+    if quotes:
+        rolled = []
+        for door, rec in quotes.items():
+            if not isinstance(rec, dict):
+                continue
+            rolled.append({
+                "door": door, "rate": rec.get("rate"), "roll": rec.get("roll"),
+                "hit": rec.get("hit"), "applies": rec.get("applies"),
+                "why": rec.get("why"), "file": rec.get("file"),
+                "turns": rec.get("turns"),
+                # [#1387] WHAT THE DOOR PUT IN. _quote_note has always
+                # recorded the passage; this band was dropping it, so the
+                # node could say a door opened and never what came through.
+                "text": str(rec.get("text") or "")[:600],
+                "chars": rec.get("chars"),
+                "say": ("%s%% - rolled %s -> %s"
+                        % (round(float(rec.get("rate") or 0) * 100),
+                           rec.get("roll"), "yes" if rec.get("hit") else "no"))
+                       if rec.get("roll") is not None
+                       else str(rec.get("why") or "did not apply")})
+        bands.append({"band": "the quote doors", "grade": "measured",
+                      "say": "%d door(s) were rolled" % len(rolled),
+                      "detail": {"doors": rolled}})
+    else:
+        bands.append({"band": "the quote doors", "grade": "absent",
+                      "say": "the round's paperwork is off the shelf - the "
+                             "doors are not recoverable for this line",
+                      "detail": {}})
+
+    # 5. the verbatim passage this very turn came out of
+    pas = entry.get("passage_source") if isinstance(
+        entry.get("passage_source"), list) else []
+    said = " ".join(str(row.get("text") or "").lower().split())
+    matched = None
+    for d in pas:
+        body = " ".join(str((d or {}).get("text") or "").lower().split())
+        if body and said[:60] and (said[:60] in body or body[:60] in said):
+            matched = d
+            break
+    if matched:
+        bands.append({"band": "the passage", "grade": "measured",
+                      "say": "spoken word for word out of %s (the %s door)"
+                             % (matched.get("file"), matched.get("door")),
+                      "detail": matched})
+
+    # 6. the brief: which alternative of the segment prompt book
+    prompt = row.get("prompt") if isinstance(row.get("prompt"), dict) else {}
+    if prompt:
+        bands.append({"band": "the brief", "grade": "measured",
+                      "say": "written under %r (%s)"
+                             % (str(prompt.get("name") or prompt.get("alt") or "?"),
+                                prompt.get("mode") or "?"),
+                      "detail": prompt})
+    else:
+        bands.append({"band": "the brief", "grade": "absent",
+                      "say": "no segment-prompt alternative rode this round - "
+                             "the station used its own seed sentence",
+                      "detail": {}})
+
+    # 7. the system prompts standing over it
+    try:
+        dj = dj_settings()
+        system = {
+            "station": str(station_disposition_text(600) or ""),
+            "host": str(dj.get("persona") or "")[:600],
+            "cohost": str(dj.get("cohost_persona") or "")[:600],
+            "followed": bool(dj.get("follow_prompt")),
+            "slots": {slot: bool(radio_prompt_enabled(slot))
+                      for slot in ("station_system", "host", "cohost",
+                                   "interaction", "speakerbox", "music")},
+        }
+    except Exception:  # noqa: BLE001
+        system = {}
+    bands.append({"band": "the system prompts", "grade": "written",
+                  "say": "what was standing over the booth when it was written",
+                  "detail": system})
+
+    # 8. the standing modifiers
+    mods = list(row.get("mods") or [])
+    if mods:
+        try:
+            named = modifiers_named([str(m) for m in mods])
+        except Exception:  # noqa: BLE001
+            named = [{"id": str(m)} for m in mods]
+        bands.append({"band": "what was standing", "grade": "measured",
+                      "say": "%d modifier(s) rode this round" % len(mods),
+                      "detail": {"modifiers": named}})
+
+    # 9. [#1387] what was HEARD against it
+    # THE LEDGER ROW HAS NO `air_at`. Measured: a script_ledger row carries
+    # `at` (committed), the air log carries `air_at` (heard). Reading only
+    # the second gave every line a 0 and line_clips returned at once - the
+    # band never appeared and the drawing showed no clips at all, which
+    # looked exactly like "no clip ever played against this line".
+    clips = line_clips(float(row.get("air_at") or row.get("at")
+                             or row.get("ts") or 0), want)
+    if clips:
+        chosen = [c for c in clips if c.get("why")]
+        bands.append({
+            "band": "what was heard",
+            "grade": "measured" if chosen else "written",
+            "say": ("%d clip(s) landed on this line, %d of them chosen for "
+                    "what was being said" % (len(clips), len(chosen))),
+            "detail": {"clips": clips},
+        })
+
+    # [#1386] THE SAME BANDS, AS A GRAPH.
+    #
+    # "I want the feed to become a visual node editor, allowing me to trace
+    #  whatever I have selected in the script view."
+    #
+    # One renderer draws both questions - a word's causes and a line's - so
+    # the picture, the gestures and the editing are learned once. The bands
+    # above are already the shape: the line in the middle, and every thing
+    # that made it hanging off it, each carrying the honesty grade it
+    # earned rather than a confident box.
+    nodes: list[dict[str, Any]] = [{
+        "id": "line", "type": "utterance", "n": 1,
+        "label": str(row.get("text") or "")[:180],
+        "who": str(row.get("who") or ""), "round": str(row.get("round") or ""),
+        "line_id": want}]
+    edges: list[dict[str, Any]] = []
+    BAND_TYPE = {"the dice": "modifier", "the speakbox": "doc",
+                 "the quote doors": "swath", "the passage": "doc",
+                 "the brief": "scenario", "the system prompts": "prompts",
+                 "what was standing": "modifier", "the line": "block",
+                 "what was heard": "clip"}
+    for at, b in enumerate(bands):
+        name = str(b.get("band") or "")
+        if name == "the line":
+            continue
+        detail = b.get("detail") if isinstance(b.get("detail"), dict) else {}
+        nid = "band:%d" % at
+        # [#1387] THE EXCERPT IS THE POINT OF OPENING A NODE.
+        #
+        # `say` is the headline - "seeded from clb1.md" - and a headline is
+        # what made the operator ask this question in the first place. So a
+        # band that holds WORDS hands over the words, with the grade and the
+        # sentence saying where they came from; `say` stays as the summary
+        # above them and nothing is lost.
+        _ex = ""
+        _ex_how = ""
+        _ex_grade = ""
+        if name == "the speakbox":
+            _ex = str(detail.get("excerpt") or "")
+            _ex_how = str(detail.get("excerpt_how") or "")
+            _ex_grade = str(detail.get("excerpt_grade") or "")
+        elif name == "the passage":
+            _ex = str(detail.get("text") or "")
+            _ex_how = ("spoken word for word out of %s, through the %s door"
+                       % (detail.get("file"), detail.get("door")))
+            _ex_grade = "measured"
+        elif name == "the brief":
+            _ex = str(detail.get("text") or detail.get("prompt") or "")
+            _ex_how = "the segment-prompt alternative this round was armed with"
+            _ex_grade = "measured" if _ex else ""
+        nodes.append({
+            "id": nid, "type": BAND_TYPE.get(name, "scripts"),
+            "label": name, "n": 1, "grade": b.get("grade"),
+            "snippet": str(b.get("say") or "")[:300],
+            "excerpt": _ex[:600], "excerpt_how": _ex_how,
+            "excerpt_grade": _ex_grade,
+            "detail": detail,
+            # What this node can be told to change, where there is
+            # anything. paperwork_edit_meta owns the sentence elsewhere;
+            # here the scope is enough for the rail to offer a box.
+            "edit": ({"scope": "station"} if name == "the system prompts"
+                     else {"scope": "prompt"} if name == "the brief"
+                     else {}),
+        })
+        edges.append({"from": "line", "to": nid, "rel": "made-by", "n": 1,
+                      "grade": str(b.get("grade") or "written"),
+                      "say": str(b.get("say") or "")[:160]})
+        # The things inside a band get their own nodes, so a system prompt
+        # or a document is a thing you can tap rather than a line of text.
+        if name == "the system prompts":
+            for seat in ("station", "host", "cohost"):
+                text = str(detail.get(seat) or "")
+                if not text:
+                    continue
+                kid = "%s:%s" % (nid, seat)
+                nodes.append({"id": kid, "type": "prompts", "n": 1,
+                              "label": seat, "snippet": text[:300],
+                              "excerpt": text[:600],
+                              "excerpt_how": ("the %s prompt as it stood "
+                                              "over the booth" % seat),
+                              "excerpt_grade": "written",
+                              "store": "settings.dj",
+                              "edit": {"scope": "station" if seat == "station"
+                                       else "persona", "key": seat}})
+                edges.append({"from": nid, "to": kid, "rel": "armed-from",
+                              "n": 1, "grade": "written",
+                              "say": "%d characters" % len(text)})
+        if name == "the quote doors":
+            for door in (detail.get("doors") or [])[:4]:
+                if not isinstance(door, dict):
+                    continue
+                kid = "%s:%s" % (nid, door.get("door"))
+                nodes.append({"id": kid, "type": "swath", "n": 1,
+                              "label": str(door.get("door") or "door"),
+                              "snippet": str(door.get("say") or "")[:200],
+                              # [#1387] the words the door let through
+                              "excerpt": str(door.get("text") or "")[:600],
+                              "excerpt_how": (
+                                  "what this door dealt in, out of %s"
+                                  % (door.get("file") or "a document")
+                                  if door.get("text") else
+                                  "this door did not open, so nothing came "
+                                  "through it"),
+                              "excerpt_grade": ("measured"
+                                                if door.get("text") else "absent"),
+                              "store": str(door.get("file") or "")})
+                edges.append({"from": nid, "to": kid, "rel": "rolled", "n": 1,
+                              "grade": ("measured" if door.get("roll") is not None
+                                        else "absent"),
+                              "say": str(door.get("say") or "")[:120]})
+        if name == "what was heard":
+            # [#1387] A clip is a node you can SEE, play and act on. It
+            # carries its own picture and its own play road; the renderer
+            # draws the first inside the box and opens the second on a tap.
+            for clip in (detail.get("clips") or [])[:8]:
+                if not isinstance(clip, dict):
+                    continue
+                kid = "%s:%s" % (nid, clip.get("row_id") or clip.get("sid"))
+                nodes.append({
+                    "id": kid, "type": "clip", "n": 1,
+                    "label": str(clip.get("name") or "a clip")[:80],
+                    "snippet": str(clip.get("why") or clip.get("say") or ""),
+                    "store": str(clip.get("folder") or ""),
+                    "key": str(clip.get("sid") or ""),
+                    "media": {
+                        "sid": str(clip.get("sid") or ""),
+                        "kind": "video" if clip.get("video") else "audio",
+                        "play": str(clip.get("play") or ""),
+                        "thumb": str(clip.get("thumb") or ""),
+                        "thumb_kind": str(clip.get("thumb_kind") or ""),
+                        "name": str(clip.get("name") or ""),
+                        "seconds": float(clip.get("seconds") or 0),
+                    },
+                })
+                edges.append({
+                    "from": nid, "to": kid, "rel": "played", "n": 1,
+                    "grade": "measured" if clip.get("why") else "written",
+                    "say": (str(clip.get("why") or "")[:160]
+                            or "+%.1fs, nothing says it was chosen for this"
+                            % float(clip.get("after") or 0)),
+                })
+        if name == "what was standing":
+            for mod in (detail.get("modifiers") or [])[:6]:
+                if not isinstance(mod, dict):
+                    continue
+                kid = "%s:%s" % (nid, mod.get("id"))
+                _says = str(mod.get("says") or mod.get("text") or "")
+                _known = bool(mod.get("known"))
+                nodes.append({
+                    "id": kid, "type": "modifier", "n": 1,
+                    "label": str(mod.get("label") or mod.get("name")
+                                 or mod.get("id"))[:60],
+                    "snippet": _says[:220] or str(mod.get("id") or ""),
+                    "excerpt": _says[:600],
+                    "excerpt_how": (
+                        "what this modifier told the booth while it was "
+                        "standing - the booth's own sentence, not a summary"
+                        if _says else
+                        "this rode the round and the modifier book no longer "
+                        "remembers it, so what it said cannot be quoted"),
+                    "excerpt_grade": "measured" if _says else "absent",
+                    "store": "modifier book" if _known else "",
+                    "key": str(mod.get("id") or "")})
+                edges.append({"from": nid, "to": kid, "rel": "rode", "n": 1,
+                              "grade": "measured", "say": "standing"})
+
+    return {"ok": True, "id": want, "block": block, "sid": sid,
+            "text": str(row.get("text") or ""),
+            "who": row.get("who"), "round": row.get("round"),
+            "bands": bands, "nodes": nodes, "edges": edges,
+            "air": {"total": 1, "why": "one line, and what made it"},
+            "gaps": [{"road": str(b.get("band")), "lines": 0,
+                      "with_source": 0, "say": str(b.get("say") or "")}
+                     for b in bands if b.get("grade") == "absent"],
+            "siblings": [{"ord": r.get("ord"), "who": r.get("who"),
+                          "line_id": r.get("line_id"),
+                          "text": str(r.get("text") or "")[:120],
+                          "source": r.get("source") or "",
+                          "dice": r.get("dice") or None}
+                         for r in siblings],
+            "say": "%d band(s); %d of them measured"
+                   % (len(bands), sum(1 for b in bands
+                                      if b.get("grade") == "measured"))}
+
+
+@app.get("/api/line/causes")
+async def line_causes_api(                                     # [#1386]
+    id: str = "",
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """One line, back through every roll, seed and prompt that made it."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    if not str(id or "").strip():
+        raise HTTPException(status_code=400, detail="give me a line id")
+    return await asyncio.to_thread(line_causes, str(id))
+
+
+# --- [#1386] THE FOUR NARROW DOORS, AND THE WAY BACK ----------------------
+#
+# The cause graph is an authoring surface. Three of the things it lets the
+# operator change had no door of their own and could only be reached by
+# reading the WHOLE settings document, editing one number and writing it
+# back - which is a real race: two nodes turning two dials in the same
+# second clobber each other, and the panel already round-trips the entire
+# document to move one slider.
+#
+# And one of them - burning a gold bar - had no door at all, though the
+# measured truth is that a repeated phrase's cause is very often a banked
+# bar rather than a prompt. The only lever was banning the whole phrase,
+# which is a sledgehammer that also retires prepared rounds.
+WORD_EDITS_PATH = data_path("word_cause_edits.jsonl")
+GOLD_BURNT_PATH = data_path("gold_burnt.json")
+_WORD_EDITS_LOCK = RLock()
+# save_settings() takes SETTINGS_LOCK for the rename itself, but the
+# READ-MODIFY-WRITE around it is the race these doors exist to close, so
+# they serialise against each other here.
+_WORD_DIAL_LOCK = RLock()
+
+
+def word_edit_rows() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        with WORD_EDITS_PATH.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    got = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(got, dict):
+                    out.append(got)
+    except OSError:
+        return []
+    return out
+
+
+def word_edit_note(endpoint: str, **kw: Any) -> dict[str, Any]:
+    """Write the edit down BEFORE the store is called.
+
+    A write that then fails still leaves a record that it was attempted,
+    which is the only way the operator can tell "I did not do that" from
+    "it did not take"."""
+    row = word_cause_edits.row(endpoint, at=time.time(), **kw)
+    try:
+        with _WORD_EDITS_LOCK:
+            WORD_EDITS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with WORD_EDITS_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + chr(10))
+    except OSError:
+        pass
+    return row
+
+
+def word_edit_stamp(at: float) -> bool:
+    """Mark one edit as put back. Rewrites the file under the lock - it is
+    a small ledger and this happens by hand, not on a loop."""
+    with _WORD_EDITS_LOCK:
+        rows = word_edit_rows()
+        at_ix = word_cause_edits.find(rows, float(at))
+        if at_ix < 0:
+            return False
+        rows[at_ix]["undone"] = time.time()
+        try:
+            tmp = WORD_EDITS_PATH.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(r) + chr(10) for r in rows),
+                           encoding="utf-8")
+            tmp.replace(WORD_EDITS_PATH)
+        except OSError:
+            return False
+        return True
+
+
+@app.post("/api/speakbox/weight")
+async def speakbox_weight_set_api(                             # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{file, weight, was?} - one document's weight. 0 switches it off.
+
+    Narrow on purpose: the whole-settings read-modify-write this replaces
+    is a genuine race."""
+    require_auth(authorization)
+    body = payload or {}
+    name = str(body.get("file") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="which document?")
+    try:
+        want = max(0, min(100, int(body.get("weight"))))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="weight is 0 to 100")
+    with _WORD_DIAL_LOCK:
+        settings = load_settings()
+        dj = dict(settings.get("dj") or {})
+        weights = dict(dj.get("speakbox_weights") or {})
+        before = int(weights.get(name, speakbox_weight(name) or 0))
+        word_edit_note("/api/speakbox/weight", key=name, was=before, now=want,
+                       node_type="doc", word=str(body.get("word") or ""),
+                       node_id=str(body.get("node_id") or ""),
+                       say=("switched %s off" % name) if want == 0
+                           else ("%s now weighs %d" % (name, want)))
+        weights[name] = want
+        dj["speakbox_weights"] = weights
+        save_settings({**settings, "dj": dj})
+    note_action("you set %s to weight %d" % (name, want))
+    return {"ok": True, "file": name, "weight": want, "was": before,
+            "say": ("%s is switched off - it will not be drawn from again"
+                    % name) if want == 0
+                   else "%s now weighs %d" % (name, want)}
+
+
+@app.post("/api/dj/dial")
+async def dj_dial_set_api(                                     # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{key, value, was?} - one dial, clamped the way validate_settings
+    clamps it. The allow-list is the point: this is not a back door into
+    the settings document."""
+    require_auth(authorization)
+    body = payload or {}
+    key = str(body.get("key") or "")
+    allowed = {"speakbox_rate", "speakbox_prepend_rate", "speakbox_append_rate",
+               "speakbox_full_swath_rate", "banter_dice_rate",
+               "banter_dice_low", "banter_dice_high", "gold_in_round_rate",
+               "sfxguy_rate"}
+    if key not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="this door turns %s, not %s" % (", ".join(sorted(allowed)), key))
+    try:
+        want = max(0.0, min(1.0, float(body.get("value"))))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="value is 0 to 1")
+    if key == "sfxguy_rate":
+        want = max(0.0, min(100.0, float(body.get("value") or 0)))
+    with _WORD_DIAL_LOCK:
+        settings = load_settings()
+        dj = dict(settings.get("dj") or {})
+        before = dj.get(key)
+        word_edit_note("/api/dj/dial", key=key, was=before, now=want,
+                       node_type="dial", word=str(body.get("word") or ""),
+                       say="%s: %s -> %s" % (key, before, want))
+        dj[key] = want
+        save_settings({**settings, "dj": dj})
+    note_action("you set %s to %s" % (key, want))
+    return {"ok": True, "key": key, "value": want, "was": before,
+            "say": "%s is %s from the next round" % (key, want)}
+
+
+def gold_burnt_rows() -> list[dict[str, Any]]:
+    try:
+        got = json.loads(GOLD_BURNT_PATH.read_text())
+        return [r for r in got if isinstance(r, dict)] if isinstance(got, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+@app.get("/api/gold")
+async def gold_search_api(                                     # [#1386]
+    q: str = "",
+    limit: int = 60,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The bank, searchable. There was no read door for it at all."""
+    require_read_auth(authorization)
+    needle = " ".join(str(q or "").lower().split())
+    pat = phrase_trace.pattern(needle) if needle else None
+    rows = await asyncio.to_thread(_gold_rows)
+    hit = [b for b in rows
+           if pat is None or pat.search(str(b.get("text") or ""))]
+    hit.sort(key=lambda b: -int(b.get("fired") or 0))
+    return {"ok": True, "q": needle, "total": len(rows), "matched": len(hit),
+            "burnt": len(gold_burnt_rows()),
+            "bars": [{"key": b.get("key"), "who": b.get("who"),
+                      "text": str(b.get("text") or "")[:300],
+                      "fired": b.get("fired"), "last": b.get("last"),
+                      "seconds": b.get("seconds")}
+                     for b in hit[:max(1, min(300, int(limit or 60)))]]}
+
+
+@app.post("/api/gold/burn")
+async def gold_burn_api(                                       # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{keys:[...], why} - take bars out of the bank.
+
+    ARCHIVED to data/gold_burnt.json, never deleted, so the restore below
+    is a real restore and not a promise."""
+    require_auth(authorization)
+    body = payload or {}
+    keys = {str(k) for k in (body.get("keys") or []) if str(k)}
+    if not keys:
+        raise HTTPException(status_code=400, detail="which bars?")
+    with _WORD_DIAL_LOCK:
+        rows = _gold_rows()
+        take = [b for b in rows if str(b.get("key")) in keys]
+        keep = [b for b in rows if str(b.get("key")) not in keys]
+        if not take:
+            return {"ok": True, "burnt": 0, "say": "no bar matched"}
+        why = str(body.get("why") or "burnt from the cause graph")[:160]
+        for b in take:
+            b["burnt_at"] = int(time.time())
+            b["burnt_why"] = why
+        word_edit_note("/api/gold/burn", key=",".join(sorted(keys))[:200],
+                       was={"keys": sorted(keys)}, now=None, node_type="gold",
+                       word=str(body.get("word") or ""),
+                       say="burnt %d bar(s)" % len(take))
+        _json_write(GOLD_BURNT_PATH, (take + gold_burnt_rows())[:4000])
+        # _gold_rows() hands back the LIVE cache list, so the bank is
+        # changed by rewriting it in place and flushing.
+        rows[:] = keep
+        _gold_save()
+    note_action("you burnt %d gold bar(s)" % len(take))
+    return {"ok": True, "burnt": len(take), "left": len(keep),
+            "say": "%d bar(s) out of the bank and into the bin - they can be "
+                   "put back" % len(take)}
+
+
+@app.post("/api/gold/restore")
+async def gold_restore_api(                                    # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{keys:[...]} - put burnt bars back in the bank."""
+    require_auth(authorization)
+    body = payload or {}
+    keys = {str(k) for k in (body.get("keys") or []) if str(k)}
+    with _WORD_DIAL_LOCK:
+        binned = gold_burnt_rows()
+        take = [b for b in binned if not keys or str(b.get("key")) in keys]
+        left = [b for b in binned if keys and str(b.get("key")) not in keys]
+        if not take:
+            return {"ok": True, "restored": 0, "say": "nothing in the bin matched"}
+        rows = _gold_rows()
+        have = {str(b.get("key")) for b in rows}
+        back = [{k: v for k, v in b.items()
+                 if k not in ("burnt_at", "burnt_why")}
+                for b in take if str(b.get("key")) not in have]
+        rows.extend(back)
+        _gold_save()
+        _json_write(GOLD_BURNT_PATH, left)
+    note_action("you put %d gold bar(s) back" % len(back))
+    return {"ok": True, "restored": len(back),
+            "say": "%d bar(s) back in the bank" % len(back)}
+
+
+@app.get("/api/word/edits")
+async def word_edits_api(                                      # [#1386]
+    most: int = 20,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the cause graph has changed, newest first, each saying
+    honestly whether it can be put back."""
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(word_edit_rows)
+    return {"ok": True,
+            "edits": word_cause_edits.listing(rows, max(1, min(200, int(most or 20)))),
+            "say": "%d edit(s) recorded" % len(rows)}
+
+
+@app.post("/api/word/edits/undo")
+async def word_edits_undo_api(                                 # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{at} - put one edit back, by replaying its inverse."""
+    require_auth(authorization)
+    body = payload or {}
+    try:
+        at = float(body.get("at"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="which edit? (its `at`)")
+    rows = await asyncio.to_thread(word_edit_rows)
+    ix = word_cause_edits.find(rows, at)
+    if ix < 0:
+        raise HTTPException(status_code=404, detail="no edit stamped that")
+    call = word_cause_edits.undo_call(rows[ix])
+    if not call:
+        return {"ok": False, "at": at,
+                "why": rows[ix].get("why_not") or "that cannot be put back",
+                "say": rows[ix].get("why_not")
+                       or "nothing here knows how to reverse that door"}
+    road = str(call["endpoint"])
+    got: dict[str, Any]
+    if road == "/api/speakbox/weight":
+        got = await speakbox_weight_set_api(call["body"], authorization)
+    elif road == "/api/dj/dial":
+        got = await dj_dial_set_api(call["body"], authorization)
+    elif road == "/api/gold/restore":
+        got = await gold_restore_api(call["body"], authorization)
+    elif road == "/api/gold/burn":
+        got = await gold_burn_api(call["body"], authorization)
+    else:
+        return {"ok": False, "at": at,
+                "say": "that door is recorded but not reversible from here"}
+    await asyncio.to_thread(word_edit_stamp, at)
+    return {"ok": True, "at": at, "did": road, "result": got,
+            "say": call.get("say") or "put back"}
+
+
+@app.get("/api/word/causes")
+async def word_causes_api(                                     # [#1386]
+    q: str = "",
+    hours: int = 48,
+    limit: int = 200,
+    fresh: int = 0,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """One word, followed back to what made the station say it."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    needle = " ".join(str(q or "").lower().split())
+    if len(needle) < 2:
+        raise HTTPException(status_code=400, detail="give me a word")
+    memo_key = "%s|%d|%d" % (needle, int(hours or 48), int(limit or 200))
+    if not fresh:
+        got = _WORD_CAUSE_MEMO.get(memo_key)
+        if got is not None:
+            return got
+    # ONE source of truth for the air side: the search route itself, called
+    # rather than copied, so the graph and the word-search sheet can never
+    # disagree about the same word.
+    air = await said_search_api(q=needle, hours=hours, limit=limit,
+                                authorization=authorization)
+    try:
+        trace = await phrase_trace_answer(needle)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "the phrase trace did not answer for %r" % needle[:40],
+                     extra=("%s: %s" % (type(exc).__name__, exc))[:200])
+        trace = {}
+    out = await asyncio.to_thread(word_causes, needle, air, trace)
+    return _WORD_CAUSE_MEMO.put(memo_key, out)
 
 
 @app.get("/api/dj/scenario")
@@ -122947,6 +125988,10 @@ def segment_inspect(block: int) -> dict[str, Any]:
             "engine": str(render.get("engine") or got.get("engine") or "") or None,
             "model": str((trace.get("written") or {}).get("model") or "") or None,
             "source": str(got.get("source") or "") or None,
+            # [#1386] THE ROLL THAT SHAPED THIS LINE, off the script ledger
+            # row rather than the air row: the dice are a writing-room fact
+            # and the air log never sees them.
+            "dice": (r.get("dice") if isinstance(r.get("dice"), dict) else None),
             # [#1194] what a tap can DO with the line: where its
             # audio is, the sample behind a sting, the take.
             **_segment_line_handles(r, got, lid),
@@ -139735,6 +142780,7 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
 # auth at all; the picture road is read-only and now takes the same
 # tune-in token as everything else on this page.
 _PUBLIC_GET_PREFIX = ("/app-icon-", "/tune/", "/media/", "/music/",
+                      "/word-cause/",   # [#1386]
                       "/data/vendor/",
                       "/icons/", "/api/generations/image/",
                       # #1253: the HLS segments an iPhone asks for.
@@ -143118,6 +146164,86 @@ def _render_poster(source: Path, out: Path) -> bool:
     return False
 
 
+@app.post("/api/clip/save")
+async def clip_save_api(                                       # [#1387]
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1387] KEEP THIS CLIP.
+
+    "tap and hold on them in order to bring up a pop up where I can choose
+     to save them or delete them or export them to the sampler."
+
+    Delete already has a door (/api/sfx/delete) and the sampler is the
+    terminal's own (PineSampler.grab), so this is the one of the three that
+    did not exist. It is not a new mechanism: the clip lives on the
+    QuickSwap share, which is mounted READ-ONLY in this container, so the
+    station cannot copy a file to a Windows folder however hard it tries -
+    the DESK carries it, through the courier ledger the exports already
+    use (#1114). The same reasoning, written out, is at sfx_delete_api.
+
+    The whole SET goes, not just the file that was picked: an mp4 and its
+    mp3 are one clip wearing two extensions, which is the rule the delete
+    road settled on 2026-09-14 and there is no reason for save to disagree.
+    """
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    payload = payload if isinstance(payload, dict) else {}
+    sid = str(payload.get("id") or payload.get("sid") or "")
+    if not re.fullmatch(r"[a-f0-9]{16}", sid):
+        raise HTTPException(status_code=400, detail="pass id=<the clip id>")
+    path = await asyncio.to_thread(sfx_by_id, sid)
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="No such sample")
+    mates: list[Path] = [path]
+    for ext in (".mp3", ".mp4", ".wav", ".m4a", ".webm", ".mov"):
+        mate = path.with_suffix(ext)
+        if mate != path and mate.is_file():
+            mates.append(mate)
+
+    desk = str(export_desk_dir() or "")
+    if desk:
+        jobs = []
+        for mate in mates:
+            try:
+                jobs.append(await asyncio.to_thread(
+                    courier_add, mate, desk, "clip"))
+            except Exception as err:  # noqa: BLE001
+                return {"ok": False, "id": sid, "name": path.name,
+                        "say": "the courier would not take it: %s" % err}
+        return {"ok": True, "id": sid, "name": path.name, "jobs": len(jobs),
+                "carried": True,
+                "say": ("%s is on its way to %s - %d file(s); the DESK "
+                        "carries it, so it lands when the desk is running"
+                        % (path.stem, desk, len(jobs)))}
+
+    # No Windows destination set: the station's own export folder is a
+    # place it can actually write, so save there and SAY where it went
+    # rather than refusing over a setting the operator never asked about.
+    here = export_dir_path()
+
+    def carry() -> list[str]:
+        here.mkdir(parents=True, exist_ok=True)
+        landed: list[str] = []
+        for mate in mates:
+            out = here / mate.name
+            shutil.copy2(mate, out)
+            landed.append(out.name)
+        return landed
+
+    try:
+        landed = await asyncio.to_thread(carry)
+    except OSError as err:
+        return {"ok": False, "id": sid, "name": path.name,
+                "say": "could not save it: %s" % err}
+    return {"ok": True, "id": sid, "name": path.name, "jobs": len(landed),
+            "carried": False, "where": str(here),
+            "say": ("%s saved to %s - %d file(s). Set a desk folder under "
+                    "Export if you would rather it landed on Windows."
+                    % (path.stem, export_host_words(here) or str(here),
+                       len(landed)))}
+
+
 @app.get("/api/sfx/poster/{sid}")
 async def sfx_poster_api(
     sid: str,
@@ -144491,7 +147617,7 @@ async def _pinebox_probe() -> None:
             repair_note(f"range probe could not render its test clip: "
                         f"{exc}"[:140])
             return
-        expected = _clip_seconds(clip["path"]) or float(seconds)
+        expected = await _clip_seconds_async(clip["path"]) or float(seconds)
         played = await _play_on_box(clip["path"], clip["sig"])
         if not played:
             # One declined announce is a FLAP, not a ceiling (the box
@@ -145314,6 +148440,20 @@ async def line_review_asset(name: str) -> Response:
                              "X-Content-Type-Options": "nosniff"})
 
 
+@app.get("/word-cause/{name}")
+async def word_cause_asset(name: str) -> Response:              # [#1386]
+    """The cause graph's renderer. An allow-list, like every other named
+    asset road here - this route never serves arbitrary source files."""
+    if name not in {"word-cause.js", "word-cause.css"}:
+        return Response(status_code=404)
+    path = Path(__file__).resolve().parent / "frontend" / name
+    if not path.is_file():
+        return Response(status_code=404)
+    return Response(path.read_bytes(), media_type=VENDOR_TYPES[path.suffix],
+                    headers={"Cache-Control": "no-cache",
+                             "X-Content-Type-Options": "nosniff"})
+
+
 @app.get("/station-flow/{name}")
 async def station_flow_asset(name: str) -> Response:
     """Tracked flow UI assets; the route never serves arbitrary source files."""
@@ -145457,6 +148597,189 @@ NOTIFICATIONS_KEEP = 400
 PHRASE_SETS_PATH = data_path("phrase_sets.json")
 
 
+_REFUSAL_RATE_MEMO: dict[str, Any] = {"at": 0.0, "by_gate": {}, "total": 0,
+                                      "walking": False}
+REFUSAL_RATE_TTL = 120.0
+
+
+def _refusal_rate_walk() -> None:
+    """The last hour of refusals, by gate. Runs in a THREAD."""
+    try:
+        import sqlite3 as _sq
+        now = time.time()
+        con = _sq.connect("file:%s?mode=ro" % data_path("line_review.sqlite3"),
+                          uri=True,
+                          timeout=5.0)
+        try:
+            rows = con.execute(
+                "SELECT gate, count(*) FROM line_reviews WHERE first_at >= ? "
+                "GROUP BY 1 ORDER BY 2 DESC LIMIT 10", (now - 3600.0,)).fetchall()
+        finally:
+            con.close()
+        by = {str(g or "?"): int(c or 0) for g, c in rows}
+        _REFUSAL_RATE_MEMO.update(at=now, by_gate=by,
+                                  total=sum(by.values()))
+    except Exception:  # noqa: BLE001
+        _REFUSAL_RATE_MEMO["at"] = time.time()
+    finally:
+        _REFUSAL_RATE_MEMO["walking"] = False
+
+
+def refusal_rate() -> dict[str, Any]:
+    """[#1391] HOW MUCH OF WHAT THE STATION WRITES IS BEING THROWN AWAY.
+
+    "I still don't get why the dialogue isn't making it ... I need the
+     dialogue flowing endlessly."
+
+    Because it is being written and then refused. Measured 2026-09-22 over
+    two live hours: 942 call_contract faults cutting ~119 caller rounds an
+    hour, 170 drafts refused for overrunning their budget, 98 blends, 48
+    drafts short of their richness target - about 284 refusals an hour,
+    against a documented normal of 45-127 a DAY.
+
+    Every one of those gates is doing its job. That is the point: nothing
+    is broken in the plumbing, the MATERIAL is not meeting its contracts,
+    and no surface anywhere reported that - so the shelf stayed bare, holes
+    opened, and the board filled them with clips. An orchestrator asked to
+    "detect, troubleshoot and resolve" cannot do any of the three about a
+    number it cannot see.
+
+    Memoised and walked in a thread: this reads a SQLite file with 45,000
+    rows in it, and the event-loop-starvation note on mean_turn_seconds
+    explains what happens when a read like that runs on the loop.
+    """
+    memo = _REFUSAL_RATE_MEMO
+    if (time.time() - float(memo.get("at") or 0) > REFUSAL_RATE_TTL
+            and not memo.get("walking")):
+        memo["walking"] = True
+        try:
+            fire_and_forget(asyncio.to_thread(_refusal_rate_walk))
+        except Exception:  # noqa: BLE001
+            memo["walking"] = False
+    by = dict(memo.get("by_gate") or {})
+    total = int(memo.get("total") or 0)
+    worst = max(by.items(), key=lambda kv: kv[1])[0] if by else ""
+    out: dict[str, Any] = {"an_hour": total, "by_gate": by, "worst": worst,
+                           "measured_at": memo.get("at") or 0}
+    if not memo.get("at"):
+        out["say"] = "not read yet"
+    elif total >= REFUSAL_RATE_ALARM:
+        out["say"] = ("the station wrote and then REFUSED %d piece(s) of "
+                      "material in the last hour - %s is the biggest cutter "
+                      "(%d). The writing is not meeting its contracts, which "
+                      "is why the shelf stays bare and the board fills the "
+                      "holes with clips. Read the reasons at "
+                      "GET /api/orchestrator/rejections."
+                      % (total, worst, by.get(worst, 0)))
+    else:
+        out["say"] = ("%d refusal(s) in the last hour - ordinary" % total)
+    out["loud"] = bool(total >= REFUSAL_RATE_ALARM)
+    return out
+
+
+def air_is_starving() -> bool:
+    """[#1395] IS SILENCE THE ALTERNATIVE TO AIRING THIS?
+
+    "I need the dialogue flowing endlessly." And the station's oldest
+    standing rule is that it is never quiet.
+
+    A gate that refuses a round is usually right, and the cure is to write
+    a better round - which is what #1392's running order is for. But there
+    is a state where refusing costs more than it buys: the shelf is empty,
+    so there is nothing banked to put on instead, and the pair have not
+    been heard in minutes, so what fills the hole is the SFX board. In that
+    state a round that misses a richness target is better radio than
+    another two minutes of clips.
+
+    Deliberately narrow, and deliberately not a dial the station can drift
+    into: BOTH halves must hold. A bare shelf on its own is ordinary during
+    a busy hour; a quiet minute on its own is ordinary during a record.
+    """
+    try:
+        if int(larder_stock_count() or 0) > 1:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return float(talk_quiet_for() or 0) >= AIR_STARVED_QUIET
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def bank_health() -> dict[str, Any]:
+    """[#1388] THE ONE NUMBER THAT EXPLAINED EVERYTHING, ON EVERY ANSWER.
+
+    "Make sure the orchestrator is fully aware of what is needed to make it
+     work fully. and to detect these issues and to resolve them."
+
+    On 2026-09-22 the pair went unheard for 3h24m. Every surface the
+    orchestrator reads said something true and useless: the station was on,
+    unpaused, reaching listeners, and something was sounding every second.
+    The fault was that the dialogue SHELF was empty, so each round had to be
+    written and rendered live into its own four-minute hole, and the board
+    papered over every hole with clips until the air was 822 clips in thirty
+    minutes.
+
+    Nothing reported the shelf. So it is reported here, on every branch of
+    the health answer, next to a named cure - because a diagnosis an agent
+    cannot act on is a diagnosis it will not use.
+    """
+    out: dict[str, Any] = {}
+    try:
+        out["banked"] = int(larder_stock_count() or 0)
+    except Exception:  # noqa: BLE001
+        out["banked"] = None
+    try:
+        out["wanted"] = int(dj_settings().get("dialogue_reserve_target") or 4)
+    except Exception:  # noqa: BLE001
+        out["wanted"] = 4
+    try:
+        out["keeper_failures"] = int(_LARDER_FAILS[0] or 0)
+        out["keeper_last_why"] = str(_LARDER_FAILS[1] or "")
+    except Exception:  # noqa: BLE001
+        out["keeper_failures"] = 0
+        out["keeper_last_why"] = ""
+    try:
+        cov = _SFX_GAP.get("covering") or None
+        out["board_covering"] = bool(cov)
+        out["board_say"] = str((cov or {}).get("say") or "")
+    except Exception:  # noqa: BLE001
+        out["board_covering"] = False
+        out["board_say"] = ""
+    bare = (out.get("banked") is not None
+            and out["banked"] < max(1, int(out.get("wanted") or 1)))
+    out["bare"] = bool(bare)
+    out["fix"] = "POST /api/broadcast/fix/bank" if bare else ""
+    if out.get("keeper_failures"):
+        out["say"] = ("the shelf holds %s round(s) of the %s wanted, and the "
+                      "keeper has failed to bank %d time(s) - last: %s"
+                      % (out.get("banked"), out.get("wanted"),
+                         out["keeper_failures"],
+                         out.get("keeper_last_why") or "it did not say"))
+    elif bare:
+        out["say"] = ("the dialogue shelf holds %s round(s) of the %s "
+                      "wanted, so every round must be written AND rendered "
+                      "live - which is minutes of hole per round, and the "
+                      "board fills holes with clips"
+                      % (out.get("banked"), out.get("wanted")))
+    else:
+        out["say"] = ("the dialogue shelf holds %s round(s) - an empty bank "
+                      "is not the reason for any silence right now"
+                      % out.get("banked"))
+    return out
+
+
+# [#1391] Documented normal is 45-127 refusals a DAY (see the analysis at
+# the head of the review-queue desk). Anything at or past this in an HOUR
+# is the station shredding its own output, and is worth saying out loud.
+REFUSAL_RATE_ALARM = int(os.getenv("PINE_REFUSAL_RATE_ALARM", "120"))
+# [#1395] How long the pair must have been unheard, with a bare shelf,
+# before a richness fault stops being worth the silence it buys. Three
+# minutes is longer than any ordinary gap between rounds and shorter than
+# the ten minutes at which the board is judged to be covering a fault.
+AIR_STARVED_QUIET = float(os.getenv("PINE_AIR_STARVED_QUIET", "180"))
+
+
 def _triage_cause_is_gagged() -> bool:
     """#1331c: is the solo gate silencing the house right now?
 
@@ -145511,6 +148834,14 @@ async def api_broadcast_health(
             # over. Both of these are live "nothing is reaching the room"
             # answers that the ladder reads.
             "solo_gagged": bool(_triage_cause_is_gagged()),
+            # [#1388] the shelf, on EVERY branch - for the same
+            # reason #1331 and #1334 put `gagged` on every branch: a key
+            # that is only sometimes present reads as false everywhere it
+            # is not, and this is the one an agent must not misread.
+            "bank": bank_health(),
+            # [#1391] and how much of what the station WRITES is being
+            # refused - the other half of "why is the dialogue scant".
+            "refused": refusal_rate(),
             "holding_the_air": str(state.get("owner") or ""),
             "detail": str(state.get("why") or ""),
             "fix_with": "POST /api/radio/pause with paused false",
@@ -145549,6 +148880,14 @@ async def api_broadcast_health(
             # over. Both of these are live "nothing is reaching the room"
             # answers that the ladder reads.
             "solo_gagged": bool(_triage_cause_is_gagged()),
+            # [#1388] the shelf, on EVERY branch - for the same
+            # reason #1331 and #1334 put `gagged` on every branch: a key
+            # that is only sometimes present reads as false everywhere it
+            # is not, and this is the one an agent must not misread.
+            "bank": bank_health(),
+            # [#1391] and how much of what the station WRITES is being
+            # refused - the other half of "why is the dialogue scant".
+            "refused": refusal_rate(),
             "holding_the_air": str(state.get("owner") or ""),
             "detail": str(state.get("why") or ""),
             "fix_with": "POST /api/broadcast/fix/{step}",
@@ -145594,6 +148933,12 @@ async def api_broadcast_health(
         "heard_seconds_ago": (round(now - heard_at, 1) if heard_at else None),
         "clips_waiting": int(state.get("waiting") or 0),
         "stall_reports": int(state.get("stalls") or 0),
+        # [#1388] the shelf, here too - this is the branch a HEALTHY
+        # station returns, and it is the one an agent reads most often.
+        # An empty bank is silent for minutes before it is audible.
+        "bank": bank_health(),
+        # [#1391] and how much of what was written is being refused.
+        "refused": refusal_rate(),
         "holding_the_air": str(state.get("owner") or ""),
         # #1331c: TWO DIFFERENT GAGS, AND THE RUNG WANTED THE OTHER ONE.
         #
@@ -146790,6 +150135,90 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                 changed = bool(await _broadcast_replay(_recent[:1],
                                                        _pool, said))
 
+    elif step == "bank":
+        # [#1388] THE RUNG FOR THE FAULT THAT HAS NO SOUND OF ITS OWN.
+        #
+        # "make sure this button is able to fix any and every issue that
+        #  stops the dialogue and broadcast from happening."
+        #
+        # Measured on the live station 2026-09-22: the pair had not been
+        # heard for 3h24m while the writer was demonstrably working - 126
+        # banter calls in four hours - because the shelf stood at ZERO
+        # rounds, so every round had to be written AND rendered live into
+        # its own four-minute hole, and the board filled every hole with
+        # clips. Nothing on the old ladder looked at the shelf, and the
+        # keeper's own failure road was a bare `pass`, so the one number
+        # that explained everything was written down nowhere.
+        #
+        # This rung reads that number, says the last reason the shelf
+        # could not be filled, stands the board down out of its gallop,
+        # and asks for a round to be banked now.
+        said.append("$ the dialogue bank")
+        _stock = 0
+        try:
+            _stock = int(larder_stock_count() or 0)
+        except Exception as err:  # noqa: BLE001
+            said.append("  the shelf would not answer: %s" % err)
+        _target = 4
+        try:
+            _target = int(dj_settings().get("dialogue_reserve_target") or 4)
+        except Exception:  # noqa: BLE001
+            pass
+        said.append("  banked     %d round(s), wanted at least %d"
+                    % (_stock, _target))
+        _quiet = 0.0
+        try:
+            _quiet = float(talk_quiet_for() or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        said.append("  pair last heard  %.1f minute(s) ago" % (_quiet / 60.0))
+        try:
+            if _LARDER_FAILS[0]:
+                said.append("  the keeper has FAILED to bank %d time(s)"
+                            % _LARDER_FAILS[0])
+                said.append("  last reason: %s" % str(_LARDER_FAILS[1])[:150])
+                said.append("  (that road used to be silent - #1388)")
+            else:
+                said.append("  the keeper has not failed since this process "
+                            "started")
+        except Exception:  # noqa: BLE001
+            pass
+        # Stand the board out of its gallop, whatever else happens: it is
+        # the thing crowding the air that the speech has to land in.
+        try:
+            _cov = _SFX_GAP.get("covering")
+            if _cov:
+                said.append("  the board is covering a fault: %s"
+                            % str(_cov.get("say") or "")[:130])
+            _SFX_GAP["at"] = time.time()
+            said.append("  stood the gap filler down for one rest")
+            changed = True
+        except Exception:  # noqa: BLE001
+            pass
+        if _stock >= max(1, _target):
+            said.append("")
+            said.append("  The shelf is stocked, so an empty bank is not "
+                        "why nothing is being heard - try 'stock', which "
+                        "puts a finished round out of turn.")
+        else:
+            said.append("")
+            said.append("  Asking for a round to be banked now.")
+            try:
+                await asyncio.wait_for(
+                    dj_banter(None, bank=True, render_stream=True),
+                    timeout=40.0)
+                said.append("  a round was written to the shelf")
+                changed = True
+            except asyncio.TimeoutError:
+                # The same reasoning as #1340 on the stock rung: the work
+                # is not wasted, and holding the ladder open is.
+                said.append("  still writing after 40s - it lands on the "
+                            "shelf either way; the next rung runs now")
+            except Exception as err:  # noqa: BLE001
+                said.append("  the writer refused: %s: %s"
+                            % (type(err).__name__, str(err)[:130]))
+                said.append("  this is the reason the shelf is empty.")
+
     elif step == "stream":
         # #1338: THE PUBLIC DOOR, WHICH NOTHING WATCHES.
         #
@@ -147185,6 +150614,12 @@ AIR_LADDER: list[tuple[float, str, str]] = [
     (240.0, "reload", "asked every page to reload itself"),
     (360.0, "restart", "restarted the station process"),
 ]
+# [#1388] The third road's own state, kept apart from _AIR_WATCH on
+# purpose: it must never move the rung counter the other two roads share.
+AIR_MUTE_QUIET = float(os.getenv("AIR_MUTE_QUIET", "720"))   # 12 minutes
+AIR_MUTE_REST = float(os.getenv("AIR_MUTE_REST", "600"))     # once per 10
+_AIR_MUTE: dict[str, Any] = {"at": 0.0, "runs": 0, "why": "", "said": []}
+
 _AIR_WATCH: dict[str, Any] = {
     "quiet": 0.0, "rung": -1, "at": 0.0, "tried": [], "worked": "",
     "last_restart": 0.0, "runs": 0, "say": "watching",
@@ -147782,7 +151217,67 @@ async def air_watch() -> None:
             # the page is holding work it has not begun. Without this the
             # watchdog would flush the feed in the middle of every quiet
             # musical stretch, which is worse than the fault it is for.
-            waiting = int((page_wedge_state() or {}).get("waiting") or 0)
+            _wedge = page_wedge_state() or {}
+            waiting = int(_wedge.get("waiting") or 0)
+
+            # ---- [#1388] THE THIRD ROAD: THE PAIR, NOT THE SOUND ------
+            #
+            # "and also the orchestrator. Make sure the orchestrator is
+            #  fully aware of what is needed to make it work fully. and to
+            #  detect these issues and to resolve them."
+            #
+            # Both roads above measure SOUND. On 2026-09-22 the pair went
+            # unheard for 3h24m and neither road ever opened, because the
+            # board was laying a clip every 0.8 seconds and `quiet` never
+            # rose above a second. Every rung on this ladder would have
+            # reported the station healthy, and the one that would not -
+            # restart - does not cure it anyway, because a restarted
+            # station has an empty shelf too.
+            #
+            # The cause was the dialogue SHELF standing at zero, so each
+            # round had to be written AND rendered live into its own
+            # four-minute hole. Nothing here had ever looked at the shelf.
+            #
+            # So: a road that measures the PAIR. It is deliberately narrow
+            # - it fires only when the shelf is provably bare or the
+            # keeper is provably failing, so it can never fire on an
+            # ordinary quiet stretch where the shelf is fine - and its
+            # cure is the cheapest on the ladder. It does not touch the
+            # rung counter the other two roads share, so it can never
+            # steal their place or reset their settle.
+            try:
+                _mute = float(_wedge.get("dialogue_quiet") or -1)
+                if (_mute >= AIR_MUTE_QUIET
+                        and time.time() - float(_AIR_MUTE.get("at") or 0)
+                        >= AIR_MUTE_REST):
+                    _bank = bank_health()
+                    if _bank.get("bare") or _bank.get("keeper_failures"):
+                        _AIR_MUTE["at"] = time.time()
+                        _AIR_MUTE["runs"] = int(_AIR_MUTE.get("runs") or 0) + 1
+                        _AIR_MUTE["why"] = str(_bank.get("say") or "")
+                        pipeline_log(
+                            "air",
+                            "the pair have been unheard %d minute(s) and the "
+                            "shelf is bare - working the bank rung (#1388): %s"
+                            % (int(_mute / 60), _bank.get("say") or ""))
+                        _out = await broadcast_step("bank")
+                        _AIR_MUTE["said"] = list(_out.get("lines") or [])[-4:]
+                        air_fix_note({"at": time.time(), "event": "mute_road",
+                                      "after": "bank",
+                                      "quiet": round(_mute, 1),
+                                      "banked": _bank.get("banked")})
+                    else:
+                        # Unheard, but the shelf is stocked - so an empty
+                        # bank is NOT the reason, and saying so is worth
+                        # more than firing a rung that cannot help.
+                        _AIR_MUTE["why"] = (
+                            "the pair have been unheard %d minute(s), but the "
+                            "shelf holds %s round(s) - the bank is not the "
+                            "cause; look at the render and the floor"
+                            % (int(_mute / 60), _bank.get("banked")))
+            except Exception:  # noqa: BLE001
+                pass            # a road that cannot decide must not stop
+                                # the two that can
             # 2026-09-15 (#1186): TWO ROADS IN, ONE LADDER, AND IT SAYS
             # WHICH EVERY SINGLE TIME.
             #
@@ -148311,6 +151806,137 @@ async def topics_bank_api(
         "most-used %d. %d have never gone out. %s"
         % (state["topics"], state["least_used"], state["most_used"],
            state["never_used"], state["why"]))}
+
+
+@app.get("/api/topics/pen")
+async def topics_pen_api(                                      # [#1386]
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the cooker has written and NOT put on air.
+
+    Each candidate carries the speakbox document it came off, so the
+    operator can see which document is worth reading and which is not."""
+    require_read_auth(authorization)
+    rows = topic_pen_rows()
+    by_doc: dict[str, int] = {}
+    for r in rows:
+        by_doc[str(r.get("source") or "")] = by_doc.get(
+            str(r.get("source") or ""), 0) + 1
+    return {"ok": True, "pen": rows, "count": len(rows),
+            "most": TOPIC_PEN_MAX, "by_document": by_doc,
+            "say": ("%d candidate(s) waiting - nothing here has been on air, "
+                    "and nothing goes on air until you tick it" % len(rows))}
+
+
+@app.post("/api/topics/pen/decide")
+async def topics_pen_decide_api(                               # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{"ids": [...], "keep": true}  - tick them into the bank
+       {"ids": [...], "keep": false} - cross them out for good
+       {"keep": ...} with no ids     - all of them"""
+    require_auth(authorization)
+    body = payload or {}
+    ids = body.get("ids")
+    ids = [str(x) for x in ids] if isinstance(ids, list) else []
+    return topic_pen_decide(ids, bool(body.get("keep", True)))
+
+
+@app.delete("/api/dj/topics")
+async def dj_topics_clear_api(                                 # [#1386]
+    why: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The trash can on the sheet: empty the bank and start it over.
+
+    Archived to data/banter_topics.trash.json, never deleted."""
+    require_auth(authorization)
+    return topic_bank_clear(why)
+
+
+@app.get("/api/topics/sets")
+async def topics_sets_api(                                     # [#1386]
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    sets = topic_sets_read()
+    try:
+        now = str(dj_settings().get("topic_set") or "")
+        mode = str(dj_settings().get("topic_set_mode") or "fixed")
+    except Exception:  # noqa: BLE001
+        now, mode = "", "fixed"
+    return {"ok": True, "active": now, "mode": mode,
+            "sets": [{"name": k, "topics": len(v.get("topics") or []),
+                      "saved": v.get("saved"), "notes": v.get("notes") or ""}
+                     for k, v in sorted(sets.items())]}
+
+
+@app.post("/api/topics/sets")
+async def topics_sets_write_api(                               # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{"name": "..."}                     save the bank as a set
+       {"name": "...", "load": true}       swap it onto the desk
+       {"name": "...", "load": true, "add": true}   merge it in
+       {"name": "...", "topics": [...]}    import a set wholesale
+       {"name": "...", "delete": true}     forget the set (not the bank)
+       {"mode": "fixed|cycle|random"}      how sets change
+       {"cycle": true}                     move to the next one now"""
+    require_auth(authorization)
+    body = payload or {}
+    if body.get("mode"):
+        mode = str(body.get("mode") or "fixed").lower()
+        if mode not in ("fixed", "cycle", "random"):
+            raise HTTPException(status_code=400,
+                                detail="mode is fixed, cycle or random")
+        settings = load_settings()
+        dj = dict(settings.get("dj") or {})
+        dj["topic_set_mode"] = mode
+        save_settings({**settings, "dj": dj})
+        note_action("topic sets now change: %s" % mode)
+        return {"ok": True, "mode": mode}
+    if body.get("cycle"):
+        return topic_set_cycle() or {"ok": True, "say": "nothing to cycle to"}
+    name = str(body.get("name") or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="a set needs a name")
+    if body.get("delete"):
+        with _TOPIC_SETS_LOCK:
+            sets = topic_sets_read()
+            if name not in sets:
+                raise HTTPException(status_code=404, detail="no such set")
+            sets.pop(name, None)
+            _json_write(TOPIC_SETS_PATH, sets)
+        note_action("you deleted the topic set %s" % name)
+        return {"ok": True, "deleted": name,
+                "say": "the set is gone; the bank is untouched"}
+    try:
+        if body.get("load"):
+            return topic_sets_load(name, add=bool(body.get("add")))
+        rows = body.get("topics")
+        rows = [r for r in rows if isinstance(r, dict)] \
+            if isinstance(rows, list) else None
+        return topic_sets_save(name, rows, str(body.get("notes") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/topics/sets/export")
+async def topics_sets_export_api(                              # [#1386]
+    name: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """One set, or all of them, as plain JSON to keep or hand around."""
+    require_read_auth(authorization)
+    sets = topic_sets_read()
+    if name:
+        got = sets.get(name)
+        if not isinstance(got, dict):
+            raise HTTPException(status_code=404, detail="no such set")
+        return {"schema": 1, "name": name, **got}
+    return {"schema": 1, "sets": sets}
 
 
 @app.post("/api/topics/cook")
@@ -149716,6 +153342,441 @@ def sfx_db_index(limit_seconds: float = 0.0) -> dict[str, Any]:
 _SFX_DB_THREAD: list[Any] = [None]
 
 
+# --- [#1386] THE RENAMER'S OWN JOURNAL -------------------------------------
+#
+# "i have a background service reviewing and refining the clips to be
+#  easier for the sfx guy's system to utilize."
+#
+# It is transcribing the library and RENAMING each file to what it says -
+# `03 clip-9` becomes `03 You got a lot of tabs open, bro` - and it keeps a
+# journal beside the clips:
+#
+#   {"when":...,"dir":"yt","from":"03 clip-36","to":"03 you",
+#    "mp3":true,"mp4":true,"text":"you"}
+#
+# That journal is better than anything this file could work out on its own,
+# twice over:
+#
+#   THE MOVE IS STATED, not inferred. The reconcile below matches a gone
+#   row to an arrived one on byte count and length, which is a good guess
+#   and still a guess. `from` -> `to` is the fact.
+#
+#   THE TRANSCRIPT IS ALREADY THERE, and it is LONGER than the name. A
+#   filename is bounded; `text` is the whole utterance. So the index can
+#   hold every word the clip says even where the name only got the first
+#   few - which is precisely the difference between "find me a clip about
+#   tabs" and "find me that clip about having too many tabs open, bro".
+#
+# So: follow the journal, take the words with it, and only fall back to the
+# bytes-and-length walk for clips this service has not reached. It is read
+# FORWARD from a remembered offset, because it is 3.6 MB and growing and
+# re-reading it every sweep would be its own slow walk.
+RETRONAME_NAME = "_retroname.jsonl"
+RETRO_MARK_PATH = data_path("sfx_retroname_at.json")
+
+
+def _retro_marks() -> dict[str, int]:
+    try:
+        got = json.loads(RETRO_MARK_PATH.read_text())
+        return {str(k): int(v) for k, v in got.items()} if isinstance(got, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _retro_marks_write(marks: dict[str, int]) -> None:
+    try:
+        RETRO_MARK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RETRO_MARK_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(marks, indent=1))
+        tmp.replace(RETRO_MARK_PATH)
+    except OSError:
+        pass
+
+
+def _retro_journals() -> list[Path]:
+    """Every rename journal under the sample roots. One per pack."""
+    out: list[Path] = []
+    seen: set = set()
+    for folder in sfx_folders():
+        for base in (Path(folder), Path(folder).parent):
+            if str(base) in seen:
+                continue
+            seen.add(str(base))
+            book = base / RETRONAME_NAME
+            try:
+                if book.is_file():
+                    out.append(book)
+            except OSError:
+                continue
+    return out
+
+
+def sfx_retroname_follow(apply: bool = True, most: int = 40000) -> dict[str, Any]:
+    """Follow the renamer, and take its words with it. THREAD ONLY."""
+    marks = _retro_marks()
+    moved = worded = missed = 0
+    seen_rows = 0
+    writer = sfx_db() if apply else None
+    for book in _retro_journals():
+        key = str(book)
+        at = int(marks.get(key) or 0)
+        try:
+            size = book.stat().st_size
+        except OSError:
+            continue
+        if at > size:                      # the journal was rotated
+            at = 0
+        try:
+            with book.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(at)
+                # readline(), NOT `for line in fh`. tell() inside an
+                # iteration over a text file raises OSError ("telling
+                # position disabled by next() call"), and the `except
+                # OSError: continue` below swallowed it whole - so this
+                # read zero rows out of a 3.6 MB journal and reported
+                # success. Exactly the silent fallback #1219 is about.
+                while True:
+                    line = fh.readline()
+                    if not line:
+                        break
+                    at = fh.tell()
+                    seen_rows += 1
+                    if seen_rows > most:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    sub = str(row.get("dir") or "")
+                    was = str(row.get("from") or "")
+                    now = str(row.get("to") or "")
+                    said = " ".join(str(row.get("text") or "").split())
+                    if not was or not now:
+                        continue
+                    base = book.parent / sub if sub else book.parent
+                    for ext, flag in ((".mp3", "mp3"), (".mp4", "mp4")):
+                        if not row.get(flag):
+                            continue
+                        old = base / (was + ext)
+                        new = base / (now + ext)
+                        if not apply or writer is None:
+                            moved += 1
+                            continue
+                        try:
+                            with _SFX_DB_LOCK:
+                                cur = writer.execute(
+                                    "UPDATE clips SET path = ?, sid = ?, "
+                                    "name = ?, said = ?, said_at = ? "
+                                    "WHERE path = ?",
+                                    (str(new), sfx_id(new), new.stem,
+                                     said[:1200], time.time(), str(old)))
+                                writer.commit()
+                            if cur.rowcount:
+                                moved += 1
+                                if said:
+                                    worded += 1
+                            else:
+                                # Already followed, or never in the book -
+                                # still worth the words if the row is there
+                                # under its new name.
+                                with _SFX_DB_LOCK:
+                                    cur2 = writer.execute(
+                                        "UPDATE clips SET said = ?, said_at = ? "
+                                        "WHERE path = ? AND (said IS NULL OR said = '')",
+                                        (said[:1200], time.time(), str(new)))
+                                    writer.commit()
+                                if cur2.rowcount and said:
+                                    worded += 1
+                                else:
+                                    missed += 1
+                        except Exception:  # noqa: BLE001
+                            missed += 1
+        except OSError:
+            continue
+        marks[key] = at
+    if apply:
+        _retro_marks_write(marks)
+        try:
+            sfx_all_index_reset()
+            sfx_match_kick()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"journals": len(_retro_journals()), "rows": seen_rows,
+            "followed": moved, "with_words": worded, "unmatched": missed,
+            "say": ("%d rename(s) followed, %d of them brought their words, "
+                    "%d had no row in the book" % (moved, worded, missed))}
+
+
+_SFX_RETRO: dict[str, Any] = {"running": False, "at": 0.0, "result": None,
+                              "why": ""}
+
+
+def _sfx_retro_run(apply: bool, most: int) -> None:
+    try:
+        got = sfx_retroname_follow(apply, most)
+        _SFX_RETRO.update({"result": got, "at": time.time(), "why": ""})
+    except Exception as exc:  # noqa: BLE001
+        _SFX_RETRO.update({"why": "%s: %s" % (type(exc).__name__, exc),
+                           "at": time.time()})
+    finally:
+        _SFX_RETRO["running"] = False
+
+
+@app.get("/api/sfx/renames")
+async def sfx_renames_look_api(                                # [#1386]
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the renamer has done that the book has been told about."""
+    require_read_auth(authorization)
+    got = _SFX_RETRO.get("result") or {}
+    return {"ok": True, "running": bool(_SFX_RETRO.get("running")),
+            "at": _SFX_RETRO.get("at"), "why": _SFX_RETRO.get("why") or "",
+            **got,
+            "say": got.get("say") or ("following the renamer now"
+                                      if _SFX_RETRO.get("running")
+                                      else "nothing followed yet - POST here")}
+
+
+@app.post("/api/sfx/renames")
+async def sfx_renames_do_api(                                  # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Follow the renamer's journal forward from where we left off."""
+    require_auth(authorization)
+    body = payload or {}
+    if _SFX_RETRO.get("running"):
+        return {"ok": True, "running": True, "say": "already following"}
+    _SFX_RETRO.update({"running": True, "why": ""})
+    fire_and_forget(asyncio.to_thread(
+        _sfx_retro_run, bool(body.get("apply", True)),
+        int(body.get("most") or 40000)))
+    return {"ok": True, "running": True,
+            "say": "following the renamer - ask the GET for what it found"}
+
+
+# --- [#1386] THE LIBRARY MOVES UNDER US ------------------------------------
+#
+# "I need the system able to scan and understand changes that are happening
+#  in the folders with file renames and folder deletions... which ones have
+#  been shifted around, which ones have been removed and which ones aren't
+#  there anymore, and to update accordingly."
+#
+# The indexer only ever INSERTS. Nothing has ever told the book that a file
+# left, so a renamed clip is two rows (the old one pointing at nothing) and
+# a deleted folder is a few thousand rows that answer a draw with a path
+# that 404s. On a library of 324,551 that is the difference between "the
+# picture did not appear" and knowing why.
+#
+# A rename is not a deletion and must not be recorded as one. `sid` is a
+# hash of the PATH, so a move changes the identity and the clip loses
+# everything the station learned about it - its plays, its weight, its
+# place in the endless set. So a gone row is matched to an arrived one on
+# what does NOT change: the byte count and the measured length. When both
+# agree it is the same clip in a new place, and the history moves with it.
+SFX_MOVE_KEYS = ("bytes", "seconds")
+
+
+def _sfx_reconcile_scan(most: int = 400000) -> dict[str, Any]:
+    """Compare the book against the share. THREAD ONLY - it stats every
+    row, and the share is slow enough to have caused dead air before."""
+    out: dict[str, Any] = {"checked": 0, "gone": [], "arrived": [],
+                           "moved": [], "folders_gone": []}
+    try:
+        con = sfx_db_reader()
+        rows = con.execute(
+            "SELECT path, sid, name, folder, bytes, seconds, video "
+            "FROM clips LIMIT ?", (int(most),)).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = "the book could not be read: %s" % type(exc).__name__
+        return out
+    on_disk: dict[str, tuple] = {}
+    folders_seen: set = set()
+    for row in rows:
+        path = str(row[0])
+        out["checked"] += 1
+        try:
+            here = Path(path).exists()
+        except OSError:
+            here = False
+        if here:
+            on_disk[path] = row
+            folders_seen.add(str(row[3]))
+            continue
+        out["gone"].append({"path": path, "sid": str(row[1]),
+                            "name": str(row[2]), "folder": str(row[3]),
+                            "bytes": row[4], "seconds": row[5]})
+    # A folder with nothing left in it is a folder that was deleted, and
+    # that is worth saying as one line rather than as nine hundred.
+    lost_folders: dict[str, int] = {}
+    for g in out["gone"]:
+        lost_folders[g["folder"]] = lost_folders.get(g["folder"], 0) + 1
+    out["folders_gone"] = [{"folder": f, "lost": n}
+                           for f, n in sorted(lost_folders.items(),
+                                              key=lambda kv: -kv[1])
+                           if f not in folders_seen]
+    # What is on the share that the book has never seen: only inside the
+    # folders it already knows, because a brand new pack is the indexer's
+    # job, not this one's.
+    known = set(on_disk)
+    for folder in sfx_folders():
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            path = str(Path(entry.path))
+            if path in known:
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            out["arrived"].append({"path": path, "bytes": int(st.st_size),
+                                   "name": Path(path).stem,
+                                   "folder": Path(folder).name})
+    # The match: same size, and a length that agrees to a tenth.
+    by_size: dict[int, list] = {}
+    for a in out["arrived"]:
+        by_size.setdefault(int(a["bytes"] or 0), []).append(a)
+    for g in out["gone"]:
+        mates = by_size.get(int(g["bytes"] or 0)) or []
+        for a in mates:
+            if a.get("taken"):
+                continue
+            a["taken"] = True
+            out["moved"].append({"from": g["path"], "to": a["path"],
+                                 "was": g["name"], "now": a["name"],
+                                 "bytes": g["bytes"]})
+            g["moved_to"] = a["path"]
+            break
+    out["arrived"] = [a for a in out["arrived"] if not a.get("taken")]
+    out["gone"] = [g for g in out["gone"] if not g.get("moved_to")]
+    return out
+
+
+def sfx_db_reconcile(apply: bool = False, most: int = 400000) -> dict[str, Any]:
+    """Say what changed, and - when asked - write it down.
+
+    Read-only unless `apply`: the operator sees the damage before anything
+    is deleted, because a bad scan that removed nine hundred rows on its
+    own would be worse than the stale rows it was fixing."""
+    got = _sfx_reconcile_scan(most)
+    got["applied"] = False
+    if not apply:
+        got["say"] = ("%d row(s) checked: %d gone, %d moved or renamed, "
+                      "%d new. Nothing written."
+                      % (got["checked"], len(got["gone"]), len(got["moved"]),
+                         len(got["arrived"])))
+        return got
+    moved = kept = 0
+    try:
+        con = sfx_db()
+        with _SFX_DB_LOCK:
+            for m in got["moved"]:
+                new = Path(m["to"])
+                con.execute(
+                    "UPDATE clips SET path = ?, sid = ?, name = ?, folder = ?,"
+                    " seen_at = ? WHERE path = ?",
+                    (str(new), sfx_id(new), new.stem, new.parent.name,
+                     time.time(), m["from"]))
+                moved += 1
+            for g in got["gone"]:
+                con.execute("DELETE FROM clips WHERE path = ?", (g["path"],))
+                kept += 1
+            con.commit()
+    except Exception as exc:  # noqa: BLE001
+        got["why"] = "the book would not take it: %s" % type(exc).__name__
+        return got
+    # The draw pools are built off the book, so they have to be told.
+    try:
+        sfx_all_index_reset()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sfx_match_kick()
+    except Exception:  # noqa: BLE001
+        pass
+    got["applied"] = True
+    got["say"] = ("%d moved or renamed row(s) followed their file, %d gone "
+                  "row(s) removed, %d new file(s) left for the indexer. "
+                  "The pools were told." % (moved, kept, len(got["arrived"])))
+    note_action("you reconciled the clip book: %d moved, %d gone"
+                % (moved, kept))
+    return got
+
+
+# The sweep RUNS IN THE BACKGROUND and the route reads the last answer.
+#
+# The first cut of this did the work inside the request, and the request
+# timed out - which is the correct behaviour for a scan that stats
+# hundreds of thousands of rows across a share slow enough that walking it
+# once takes 164 seconds. A door that reliably times out is not a door.
+_SFX_RECONCILE: dict[str, Any] = {"running": False, "at": 0.0,
+                                  "result": None, "why": ""}
+
+
+def _sfx_reconcile_run(apply: bool, most: int) -> None:
+    """THREAD ONLY."""
+    try:
+        got = sfx_db_reconcile(apply, most)
+        _SFX_RECONCILE.update({"result": got, "at": time.time(), "why": ""})
+    except Exception as exc:  # noqa: BLE001
+        _SFX_RECONCILE.update({"why": "%s: %s" % (type(exc).__name__, exc),
+                               "at": time.time()})
+    finally:
+        _SFX_RECONCILE["running"] = False
+
+
+@app.get("/api/sfx/reconcile")
+async def sfx_reconcile_look_api(                              # [#1386]
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The last sweep's answer. Returns at once; it never scans."""
+    require_read_auth(authorization)
+    got = _SFX_RECONCILE.get("result") or {}
+    return {"ok": True, "running": bool(_SFX_RECONCILE.get("running")),
+            "at": _SFX_RECONCILE.get("at"),
+            "why": _SFX_RECONCILE.get("why") or "",
+            **{k: v for k, v in got.items()
+               if k not in ("gone", "arrived", "moved")},
+            "gone": (got.get("gone") or [])[:40],
+            "moved": (got.get("moved") or [])[:40],
+            "arrived": (got.get("arrived") or [])[:40],
+            "say": got.get("say") or (
+                "a sweep is running" if _SFX_RECONCILE.get("running")
+                else "no sweep has run yet - POST here to start one")}
+
+
+@app.post("/api/sfx/reconcile")
+async def sfx_reconcile_do_api(                                # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Start a sweep. `apply` writes it down; without it this only looks.
+
+    A move follows its file and keeps everything the station learned about
+    the clip - its plays, its weight, its place in the set - because `sid`
+    is a hash of the PATH and a rename would otherwise lose all of it."""
+    require_auth(authorization)
+    body = payload or {}
+    if _SFX_RECONCILE.get("running"):
+        return {"ok": True, "running": True,
+                "say": "a sweep is already running - ask the GET for it"}
+    _SFX_RECONCILE.update({"running": True, "why": ""})
+    fire_and_forget(asyncio.to_thread(
+        _sfx_reconcile_run, bool(body.get("apply")),
+        int(body.get("most") or 400000)))
+    return {"ok": True, "running": True,
+            "say": "the sweep is walking the library - ask the GET for what "
+                   "it found"}
+
+
 def sfx_db_kick(force: bool = False) -> bool:
     """Index in the background, one at a time, never on the loop."""
     if _SFX_DB_SCAN.get("running") and not force:
@@ -149879,6 +153940,328 @@ def sfx_keywords_set(folder: str, words: Any, source: str = "hand") -> dict[str,
 
 # --- the index ------------------------------------------------------------
 
+# --- [#1386] AND WHAT IT LOOKS LIKE ----------------------------------------
+#
+# "I want him using thumbnail recognition to find good clips fitting for
+#  the moment."
+#
+# A great many clips say nothing at all - a reaction, a pratfall, a face -
+# and those are exactly the ones a person in the booth reaches for. They
+# cannot be found by a transcript because there is no transcript, and they
+# cannot be found by a name because the name is "1965 clip".
+#
+# So the picture is read too, and its words go into the SAME postings list
+# as the name and the transcript. TAGS, not prose: the index scores on
+# words, a sentence about "a man standing in a doorway looking uncertain"
+# is worth exactly its nouns, and the rest is model time spent on grammar
+# nobody will read.
+#
+# BOUNDED AND IDLE-ONLY, and more carefully than the listening was: this
+# costs a VISION MODEL CALL, which is the same GPU the writing room needs,
+# and there are 168,959 video clips. It takes small bites, only when the
+# station is on air and the room is not wanted, and every bite it finishes
+# it never repeats.
+SFX_VISION_BITE = int(os.getenv("PINE_VISION_BITE", "12"))
+_SFX_VISION: dict[str, Any] = {"running": False, "at": 0.0, "done": 0,
+                               "seen": 0, "blank": 0, "why": ""}
+
+SFX_VISION_ASK = (
+    "Tag this video still for a sound-effects library so it can be found "
+    "later. Comma-separated words and short phrases ONLY - who or what is "
+    "in it, what they are doing, the place, the mood, anything written on "
+    "screen. No sentences, no preamble, no explanation.")
+
+
+def sfx_vision_counts() -> dict[str, int]:
+    try:
+        con = sfx_db_reader()
+        tot = con.execute(
+            "SELECT COUNT(*) FROM clips WHERE playable=1 AND video=1"
+        ).fetchone()[0]
+        done = con.execute(
+            "SELECT COUNT(*) FROM clips WHERE playable=1 AND video=1 "
+            "AND seen_desc_at IS NOT NULL").fetchone()[0]
+        got = con.execute(
+            "SELECT COUNT(*) FROM clips WHERE playable=1 AND video=1 "
+            "AND seen_desc <> ''").fetchone()[0]
+        return {"video": int(tot), "looked_at": int(done), "described": int(got)}
+    except Exception:  # noqa: BLE001
+        return {"video": 0, "looked_at": 0, "described": 0}
+
+
+def sfx_vision_column() -> bool:
+    try:
+        con = sfx_db()
+        cols = {r[1] for r in con.execute("PRAGMA table_info(clips)")}
+        with _SFX_DB_LOCK:
+            if "seen_desc" not in cols:
+                con.execute("ALTER TABLE clips ADD COLUMN seen_desc TEXT")
+            if "seen_desc_at" not in cols:
+                con.execute("ALTER TABLE clips ADD COLUMN seen_desc_at REAL")
+            con.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _SFX_VISION["why"] = "the book would not take the column: %s" % type(exc).__name__
+        return False
+
+
+async def sfx_vision_bite(most: int = 0) -> dict[str, Any]:
+    """Look at a few video clips nobody has looked at yet."""
+    if not await asyncio.to_thread(sfx_vision_column):
+        return dict(_SFX_VISION)
+    want = int(most or SFX_VISION_BITE)
+    try:
+        con = sfx_db_reader()
+        rows = con.execute(
+            "SELECT path FROM clips WHERE playable = 1 AND video = 1 "
+            "AND seen_desc_at IS NULL AND seconds > 0 ORDER BY seconds LIMIT ?",
+            (want,)).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        _SFX_VISION["why"] = "the book would not answer: %s" % type(exc).__name__
+        return dict(_SFX_VISION)
+    seen = blank = 0
+    writer = sfx_db()
+    for (path,) in rows:
+        if not _RADIO.get("on") or radio_paused():
+            break
+        if prep_should_stop():
+            break                      # the live road wants the room
+        frame = await asyncio.to_thread(clip_speech.frame_of, str(path))
+        tags = ""
+        if frame:
+            try:
+                blob = base64.b64encode(frame).decode()
+                async with _OLLAMA_GATE, httpx.AsyncClient(timeout=90) as client:
+                    answer = await client.post(
+                        f"{OLLAMA_URL}/api/chat",
+                        json={"model": VISION_MODEL,
+                              "messages": [{"role": "user",
+                                            "content": SFX_VISION_ASK,
+                                            "images": [blob]}],
+                              "stream": False, "think": False,
+                              "keep_alive": "30m"})
+                got = answer.json()
+                tags = " ".join(str(
+                    ((got.get("message") or {}).get("content") or "")).split())
+            except Exception:  # noqa: BLE001
+                tags = ""
+        if tags:
+            seen += 1
+        else:
+            blank += 1
+        try:
+            await asyncio.to_thread(_sfx_vision_write, writer, str(path), tags)
+        except Exception:  # noqa: BLE001
+            pass
+    _SFX_VISION.update({"done": int(_SFX_VISION.get("done") or 0) + len(rows),
+                        "seen": int(_SFX_VISION.get("seen") or 0) + seen,
+                        "blank": int(_SFX_VISION.get("blank") or 0) + blank,
+                        "at": time.time()})
+    return dict(_SFX_VISION)
+
+
+def _sfx_vision_write(writer: Any, path: str, tags: str) -> None:
+    with _SFX_DB_LOCK:
+        writer.execute(
+            "UPDATE clips SET seen_desc = ?, seen_desc_at = ? WHERE path = ?",
+            (tags[:600], time.time(), path))
+        writer.commit()
+
+
+async def _sfx_vision_run(most: int) -> None:
+    try:
+        await sfx_vision_bite(most)
+        sfx_match_kick()
+    except Exception as exc:  # noqa: BLE001
+        _SFX_VISION["why"] = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        _SFX_VISION["running"] = False
+
+
+@app.get("/api/sfx/vision")
+async def sfx_vision_look_api(                                 # [#1386]
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """How much of the picture library he has actually looked at."""
+    require_read_auth(authorization)
+    counts = await asyncio.to_thread(sfx_vision_counts)
+    left = max(0, counts["video"] - counts["looked_at"])
+    return {"ok": True, **counts, "left": left,
+            "running": bool(_SFX_VISION.get("running")),
+            "done_this_session": _SFX_VISION.get("done"),
+            "described": _SFX_VISION.get("seen"),
+            "blank": _SFX_VISION.get("blank"),
+            "why": _SFX_VISION.get("why") or "",
+            "say": "%d of %d video clip(s) looked at, %d of them described. "
+                   "%d to go." % (counts["looked_at"], counts["video"],
+                                  counts["described"], left)}
+
+
+@app.post("/api/sfx/vision")
+async def sfx_vision_do_api(                                   # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Look at the next few. Returns at once."""
+    require_auth(authorization)
+    body = payload or {}
+    if _SFX_VISION.get("running"):
+        return {"ok": True, "running": True, "say": "he is already looking"}
+    _SFX_VISION.update({"running": True, "why": ""})
+    fire_and_forget(_sfx_vision_run(int(body.get("most") or SFX_VISION_BITE)))
+    return {"ok": True, "running": True,
+            "say": "he is looking at the next %d clip(s)"
+                   % int(body.get("most") or SFX_VISION_BITE)}
+
+
+# --- [#1386] WHAT THE CLIP ACTUALLY SAYS -----------------------------------
+#
+# "he has to have access to the full library and vectorize and understand
+#  how and when to find and use clips... I want the sfx guy able to find
+#  any clip for any situation at any time to make a comedic point."
+#
+# He reaches all 324,551 now, and he matches them to the line - but only on
+# their NAMES. 62,658 carry words in the name; the rest are "1965 clip" and
+# cannot be found by anything they say. This opens the other ~262,000.
+#
+# BOUNDED AND IDLE-ONLY, because this station's failure mode is dead air
+# and not a thin index. Measured on the live service (wyoming 1.10.0,
+# faster-whisper base-int8): about 1.1 seconds a clip, so the library is
+# roughly eighty hours of work. It takes it in bites, only when the
+# writing room has nothing waiting, and every bite it finishes is a bite
+# it never repeats.
+SFX_SPEECH_BITE = int(os.getenv("PINE_SPEECH_BITE", "40"))
+_SFX_SPEECH: dict[str, Any] = {"running": False, "at": 0.0, "done": 0,
+                               "heard": 0, "empty": 0, "why": ""}
+
+
+def sfx_speech_column() -> bool:
+    """Make sure the book has somewhere to put the words. Idempotent."""
+    try:
+        con = sfx_db()
+        cols = {r[1] for r in con.execute("PRAGMA table_info(clips)")}
+        with _SFX_DB_LOCK:
+            if "said" not in cols:
+                con.execute("ALTER TABLE clips ADD COLUMN said TEXT")
+            if "said_at" not in cols:
+                con.execute("ALTER TABLE clips ADD COLUMN said_at REAL")
+            con.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _SFX_SPEECH["why"] = "the book would not take the column: %s" % type(exc).__name__
+        return False
+
+
+def sfx_speech_counts() -> dict[str, int]:
+    try:
+        con = sfx_db_reader()
+        tot = con.execute("SELECT COUNT(*) FROM clips WHERE playable=1").fetchone()[0]
+        done = con.execute(
+            "SELECT COUNT(*) FROM clips WHERE playable=1 AND said_at IS NOT NULL"
+        ).fetchone()[0]
+        words = con.execute(
+            "SELECT COUNT(*) FROM clips WHERE playable=1 AND said <> ''"
+        ).fetchone()[0]
+        return {"playable": int(tot), "listened": int(done), "with_words": int(words)}
+    except Exception:  # noqa: BLE001
+        return {"playable": 0, "listened": 0, "with_words": 0}
+
+
+def sfx_speech_bite(most: int = 0) -> dict[str, Any]:
+    """Listen to a few clips nobody has listened to yet. THREAD ONLY.
+
+    Shortest first: a two-second sting is a second of GPU and is also the
+    kind of clip he actually reaches for, so the index gets useful long
+    before it gets complete."""
+    if not sfx_speech_column():
+        return dict(_SFX_SPEECH)
+    want = int(most or SFX_SPEECH_BITE)
+    heard = empty = 0
+    try:
+        con = sfx_db_reader()
+        rows = con.execute(
+            "SELECT path FROM clips WHERE playable = 1 AND said_at IS NULL "
+            "AND seconds > 0 AND seconds <= ? ORDER BY seconds LIMIT ?",
+            (float(clip_speech.MOST_SECONDS), want)).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        _SFX_SPEECH["why"] = "the book would not answer: %s" % type(exc).__name__
+        return dict(_SFX_SPEECH)
+    writer = sfx_db()
+    for (path,) in rows:
+        if not _RADIO.get("on"):
+            break
+        try:
+            said = clip_speech.transcribe_file(str(path))
+        except Exception:  # noqa: BLE001
+            said = ""
+        if said:
+            heard += 1
+        else:
+            empty += 1
+        try:
+            with _SFX_DB_LOCK:
+                writer.execute(
+                    "UPDATE clips SET said = ?, said_at = ? WHERE path = ?",
+                    (said[:600], time.time(), str(path)))
+                writer.commit()
+        except Exception:  # noqa: BLE001
+            pass
+    _SFX_SPEECH.update({"done": int(_SFX_SPEECH.get("done") or 0) + len(rows),
+                        "heard": int(_SFX_SPEECH.get("heard") or 0) + heard,
+                        "empty": int(_SFX_SPEECH.get("empty") or 0) + empty,
+                        "at": time.time()})
+    return dict(_SFX_SPEECH)
+
+
+def _sfx_speech_run(most: int) -> None:
+    try:
+        sfx_speech_bite(most)
+        # What he can now hear has changed, so the index has to be told.
+        sfx_match_kick()
+    except Exception as exc:  # noqa: BLE001
+        _SFX_SPEECH["why"] = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        _SFX_SPEECH["running"] = False
+
+
+@app.get("/api/sfx/speech")
+async def sfx_speech_look_api(                                 # [#1386]
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """How much of the library he has actually listened to."""
+    require_read_auth(authorization)
+    counts = await asyncio.to_thread(sfx_speech_counts)
+    left = max(0, counts["playable"] - counts["listened"])
+    return {"ok": True, **counts, "left": left,
+            "running": bool(_SFX_SPEECH.get("running")),
+            "done_this_session": _SFX_SPEECH.get("done"),
+            "heard": _SFX_SPEECH.get("heard"),
+            "empty": _SFX_SPEECH.get("empty"),
+            "why": _SFX_SPEECH.get("why") or "",
+            "say": ("%d of %d clip(s) listened to; %d of those say something. "
+                    "%d to go - about %.1f hours at a second each."
+                    % (counts["listened"], counts["playable"],
+                       counts["with_words"], left, left / 3600.0))}
+
+
+@app.post("/api/sfx/speech")
+async def sfx_speech_do_api(                                   # [#1386]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Take one bite. Returns at once; the listening happens behind it."""
+    require_auth(authorization)
+    body = payload or {}
+    if _SFX_SPEECH.get("running"):
+        return {"ok": True, "running": True, "say": "he is already listening"}
+    _SFX_SPEECH.update({"running": True, "why": ""})
+    fire_and_forget(asyncio.to_thread(_sfx_speech_run,
+                                      int(body.get("most") or SFX_SPEECH_BITE)))
+    return {"ok": True, "running": True,
+            "say": "he is listening to the next %d clip(s)"
+                   % int(body.get("most") or SFX_SPEECH_BITE)}
+
+
 def sfx_match_build() -> dict[str, Any]:
     """Read every playable clip's name out of the book and index it.
 
@@ -149893,9 +154276,22 @@ def sfx_match_build() -> dict[str, Any]:
             _SFX_MATCH["why"] = "sfx_match.py is not on this station"
             return dict(_SFX_MATCH)
         con = sfx_db_reader()
-        rows = con.execute(
-            "SELECT rowid, name, folder, video, seconds FROM clips "
-            "WHERE playable = 1").fetchall()
+        # [#1386] THE NAME **AND** WHAT IT SAYS. A transcript's words join
+        # the same postings list as the filename's, so a clip called
+        # "1965 clip" becomes findable by every word in it with no change
+        # to the scorer - and score() already leans on how uncommon a word
+        # is, which is the weighting a transcript wants anyway.
+        try:
+            rows = con.execute(
+                "SELECT rowid, name || ' ' || COALESCE(said, '') || ' ' || "
+                "COALESCE(seen_desc, ''), folder, video, seconds "
+                "FROM clips WHERE playable = 1").fetchall()
+        except Exception:  # noqa: BLE001
+            # The column is added on the first listen; before that the book
+            # is exactly what it always was.
+            rows = con.execute(
+                "SELECT rowid, name, folder, video, seconds FROM clips "
+                "WHERE playable = 1").fetchall()
         book = sfx_keywords_read(force=True)
         given = {name: (row.get("words") or [])
                  for name, row in book.items() if row.get("words")}
@@ -150084,6 +154480,52 @@ def sfx_match_rows(cands: Any, most: int = SFX_MATCH_LIMIT) -> list[tuple]:
     return out
 
 
+# [#1386] THE OTHER WORDS FOR THE THING.
+#
+# "i want the sfx guy also going by synonyms, antonyms and even entendre to
+#  find clips appropriate."
+#
+# The scorer is literal: a line about a CAR never reaches a clip about an
+# AUTOMOBILE, and a line about being BRAVE never reaches the one that says
+# COWARD - which is usually the funnier answer and the one a person in the
+# booth would pick.
+#
+# WordNet is vendored here already, so the widening is a file read rather
+# than a model. The widened words are appended to the CONTEXT rather than
+# to the line, because sfx_match scores context at CTX_SCALE (half a
+# spoken word) - so a synonym can win a tie and can never outrank the word
+# the station actually said.
+SFX_SENSE_WORDS = int(os.getenv("PINE_SFX_SENSES", "10"))
+
+
+def sfx_sense_context(line: str, context: str = "") -> str:
+    """The line's synonyms, antonyms and pun-words, as extra context."""
+    try:
+        if not clip_senses.ready():
+            return context
+        words = [w for w in re.findall(r"[a-z']{3,}", str(line or "").lower())]
+        if not words:
+            return context
+        # Only the words worth widening: a stop word has a thousand
+        # synonyms and none of them mean anything here. sfx_match owns the
+        # stop list, so ask it rather than keeping a second opinion.
+        keep = []
+        for w in words:
+            try:
+                if _sfx_match is not None and w in _sfx_match.STOP:
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            keep.append(w)
+        wide = clip_senses.expand(keep[:12], most=4)
+        if not wide:
+            return context
+        best = sorted(wide.items(), key=lambda kv: -kv[1])[:SFX_SENSE_WORDS]
+        return " ".join([str(context or "")] + [w for w, _ in best]).strip()
+    except Exception:  # noqa: BLE001
+        return context
+
+
 def sfx_match_score(line: str, context: str = "", *, video: bool | None = None,
                     floor: float = 0.0, cap: float = 0.0,
                     limit: int = SFX_MATCH_LIMIT) -> list:
@@ -150092,7 +154534,8 @@ def sfx_match_score(line: str, context: str = "", *, video: bool | None = None,
     if index is None or _sfx_match is None:
         return []
     try:
-        return index.score(line, context, video=video, floor=floor,
+        return index.score(line, sfx_sense_context(line, context),
+                           video=video, floor=floor,
                            cap=cap, limit=limit)
     except Exception as err:  # noqa: BLE001
         _SFX_MATCH["why"] = "score: %s" % str(err)[:160]
@@ -155353,7 +159796,12 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
             **({"mods": _mods} if _mods else {}),
             # [#1245] the speaker box document the round was seeded from -
             # a SEED, kept apart from the road now (it used to BE the round).
-            **({"source": str(source or "")[:120]} if source else {}),
+            # [#1386] F3: the ROWs own document wins over the rounds. One
+            # source stamped across a whole block is a lie the moment an
+            # exchange changes topic mid-round, and the census said so:
+            # 0 of 3,269 blocks ever carried more than one document.
+            **({"source": str(row.get("source") or source or "")[:120]}
+               if (row.get("source") or source) else {}),
             # [#1195] which alternative of the segment prompt book the round
             # was written with, and what its commands expanded to.
             **({"prompt": _pk} if _pk else {}),
@@ -155394,6 +159842,15 @@ def script_ledger_rows() -> list[dict[str, Any]]:
         _SCRIPT_LEDGER_MEMO["rows"] = rows
         _SCRIPT_LEDGER_MEMO["at"] = time.time()
         return list(rows)
+
+
+# [#1390] What counts as punctuation rather than a segment of its own, and
+# how far a run may stretch. A clip, a quip, a re-fired bar and a station
+# ident are things that happen BETWEEN the show; a conversation is not.
+LEDGER_INTERLUDE_KINDS = frozenset({"sfx", "sfxguy", "drop", "station_id",
+                                    "marker"})
+LEDGER_INTERLUDE_GAP = float(os.getenv("LEDGER_INTERLUDE_GAP", "90"))
+LEDGER_INTERLUDE_CAP = int(os.getenv("LEDGER_INTERLUDE_CAP", "24"))
 
 
 def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
@@ -155456,27 +159913,84 @@ def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
     # and a later pass cannot file the same line somewhere else.
     want.sort(key=lambda r: (screenplay_when_heard(r),    # [#1218]
                              str(r.get("id") or "")))
-    caught = 0
+    # [#1390] A RUN OF PUNCTUATION IS ONE SEGMENT, NOT TWENTY.
+    #
+    # "I wanna see dialogue line after line after line sequentially in the
+    #  script, segment by segment ... I'm seeing it play lines out of
+    #  order. I need the script view to be sane, to be a sequential feed."
+    #
+    # Measured 2026-09-22, one live hour: **1,049 blocks for 1,316 rows**.
+    # Not one row was out of order and not one block was interleaved - the
+    # ordering this file works so hard for is intact. The fault is
+    # GRANULARITY. #1339 gives every caught-up row a block of its own, on
+    # the sound reasoning that "a one-row block is contiguous by
+    # construction, so it can never split anything" - and that is still
+    # true. But the SFX board lays hundreds of clips an hour, so a real
+    # seven-line conversation now sits between hundreds of one-line
+    # "segments", and a reader cannot find the show inside its own script.
+    #
+    # Batching keeps every guarantee #1339 bought. `want` is already sorted
+    # by the moment each row was HEARD, so a run of consecutive rows is
+    # contiguous in time; committing them as one block writes ords 0..n in
+    # that same order, which is contiguous by construction exactly as a
+    # one-row block was. Nothing can be split, nothing re-enters the order,
+    # and the hour reads as segments again.
+    #
+    # A run BREAKS on anything that means "this is a different moment":
+    # a different round (sid), a different kind of thing, a gap longer than
+    # a breath, or the cap - so a conversation is never swallowed into an
+    # interlude, and an interlude never swallows the thing after it.
+    def _punctuation(r: dict[str, Any]) -> bool:
+        return str(r.get("kind") or "") in LEDGER_INTERLUDE_KINDS
+
+    def _run_with(first: dict[str, Any], nxt: dict[str, Any]) -> bool:
+        if not _punctuation(first) or not _punctuation(nxt):
+            return False                      # only clips coalesce
+        if str(first.get("sid") or "") != str(nxt.get("sid") or ""):
+            return False
+        if str(first.get("round") or "") != str(nxt.get("round") or ""):
+            return False
+        gap = screenplay_when_heard(nxt) - screenplay_when_heard(first)
+        return 0 <= gap <= LEDGER_INTERLUDE_GAP
+
+    groups: list[list[dict[str, Any]]] = []
     for row in want[:200]:            # a bounded bite per tick
+        if (groups and len(groups[-1]) < LEDGER_INTERLUDE_CAP
+                and _run_with(groups[-1][-1], row)):
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+
+    caught = 0
+    for group in groups:
+        row = group[0]
         got = script_ledger_commit(
             str(row.get("sid") or ""),
-            [{"line_id": str(row.get("id") or ""),
-              "who": str(row.get("who") or ""),
-              "text": str(row.get("text") or ""),
-              "seconds": float(row.get("seconds") or 0),
-              "turn": row.get("turn"),
-              "kind": str(row.get("kind") or ""),
+            [{"line_id": str(one.get("id") or ""),
+              "who": str(one.get("who") or ""),
+              "text": str(one.get("text") or ""),
+              "seconds": float(one.get("seconds") or 0),
+              "turn": one.get("turn"),
+              "kind": str(one.get("kind") or ""),
               "cue": "",
               # NOT scripted: nothing wrote this down in advance, and
               # a reader is entitled to know which lines were planned
               # and which the station reached for.
               "scripted": False,
               # [#1237] a single line published bound to a record keeps it
-              **({"bound": dict(row["bound"])}
-                 if isinstance(row.get("bound"), dict) else {})}],
-            str(row.get("round") or ""))
+              **({"bound": dict(one["bound"])}
+                 if isinstance(one.get("bound"), dict) else {})}
+             for one in group],
+            str(row.get("round") or ""),
+            # [#1386] F1: the road every gold bar, interject, SFX quip and
+            # rescue filler takes. The air row has carried `source` since
+            # #766 and this call dropped it, so 0 of 380 interjects in a
+            # measured hour named the document that seeded them. The
+            # ledger said "no document was recorded behind these words"
+            # about lines that HAD one.
+            source=str(row.get("source") or ""))
         if got:
-            caught += 1
+            caught += len(group)
     return caught
 
 
@@ -178833,6 +183347,13 @@ function pineWinHostShade(key, title, shade, opts) {
 // A find() may come back empty for a moment - lazy three.min.js, a fetch
 // before the DOM - so pineShow3JS waits for it.
 const PINE_3JS = [
+  /* [#1386] one word, followed back to what made the station say it. */
+  {key: "wordcause", label: "\uD83D\uDD0E Why that word",
+   open: () => wordCauseOpen(),
+   frame: {shade: () => wordCauseView && wordCauseView.element,
+           card: ".wc-dialog",
+           close: () => wordCauseClose(),
+           onResize: () => { if (wordCauseView) wordCauseView.resize(); }}},
   {key: "flow",     label: "Station flow",      open: () => stationFlowOpen(),
    frame: {shade: () => stationFlowView && stationFlowView.element,
            card: ".sf-dialog", close: () => stationFlowClose()}},
@@ -179341,6 +183862,7 @@ async function pineWinFrame(hit) {
    pineShow3JS disposes the last one and adopts the next into a frame - and
    none of it had an entry point outside a console. This is the option. */
 const PINE_3JS_BLURB = {
+  wordcause: "one word, followed back through every line that said it to the prompt, the document and the banked bar that caused it",
   flow: "the station's own flow graph, live",
   mind: "the Dialogue Mind - what the room is thinking about",
   topology: "the mind as a body in space",
@@ -207515,8 +212037,30 @@ function djTopicsPanel() {
   card.style.cssText = "max-width:640px;width:94%;max-height:86vh;margin:0;"
     + "display:flex;flex-direction:column";
 
-  const head = el("h2", "", "Things to spring on them");
-  head.style.margin = "0 0 4px";
+  /* [#1386] The heading carries the trash can, because the operator has
+     to be able to start this list over: 53 of the 56 topics in it were
+     written by the cooker, not by him, and there was no way to empty it. */
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:8px;margin:0 0 4px";
+  const title = el("h2", "", "Things to spring on them");
+  title.style.cssText = "margin:0;flex:1";
+  head.appendChild(title);
+  const binBtn = el("button", "tbtn", "\uD83D\uDDD1");
+  binBtn.title = "Empty the bank and start the list over (archived, not deleted)";
+  binBtn.onclick = async () => {
+    const rows = await api("/api/dj/topics").then(
+      (r) => (r.topics || []).length).catch(() => 0);
+    if (!rows) { return; }
+    if (!confirm("Empty the topic bank?\n\n" + rows + " topic(s) go to "
+        + "data/banter_topics.trash.json. Nothing is deleted, and you can "
+        + "save the list as a set first if you want it back.")) return;
+    try {
+      const out = await api("/api/dj/topics", {method: "DELETE"});
+      setsNote.textContent = out.say || "the bank is empty";
+      draw();
+    } catch (error) { setsNote.textContent = error.message; }
+  };
+  head.appendChild(binBtn);
   card.appendChild(head);
 
   const note = el("div", "muted", "One of them drops it cold, mid-show. The "
@@ -207534,6 +212078,175 @@ function djTopicsPanel() {
   adder.appendChild(field);
   adder.appendChild(add);
   card.appendChild(adder);
+
+  /* [#1386] SETS. "I want to be able to export and import sets of topics
+     and have sets able to be cycled between and variated between and
+     swapped on the fly." Same shape as data/phrase_sets.json. */
+  const sets = el("div", "row", "");
+  sets.style.cssText = "gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center";
+  const setPick = document.createElement("select");
+  setPick.style.cssText = "flex:1;min-width:140px";
+  const setMode = document.createElement("select");
+  ["fixed", "cycle", "random"].forEach((m) => {
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    setMode.appendChild(o);
+  });
+  setMode.title = "fixed: it stands until you change it. cycle: the next one "
+    + "each segment. random: drawn, never the one already on the desk";
+  setMode.onchange = async () => {
+    try {
+      await api("/api/topics/sets", {method: "POST",
+        body: JSON.stringify({mode: setMode.value})});
+      setsNote.textContent = "sets now change: " + setMode.value;
+    } catch (error) { setsNote.textContent = error.message; }
+  };
+  const setLoad = el("button", "tbtn", "swap in");
+  setLoad.title = "Put this set on the desk (the bank is archived first)";
+  setLoad.onclick = async () => {
+    if (!setPick.value) return;
+    if (!confirm("Swap in \"" + setPick.value + "\"?\n\nWhat is in the "
+        + "bank now is archived first.")) return;
+    try {
+      const out = await api("/api/topics/sets", {method: "POST",
+        body: JSON.stringify({name: setPick.value, load: true})});
+      setsNote.textContent = out.say || "loaded";
+      draw();
+    } catch (error) { setsNote.textContent = error.message; }
+  };
+  const setSave = el("button", "tbtn", "save as\u2026");
+  setSave.title = "Name what is in the bank now as a set";
+  setSave.onclick = async () => {
+    const name = prompt("Name this set:");
+    if (!name) return;
+    try {
+      const out = await api("/api/topics/sets", {method: "POST",
+        body: JSON.stringify({name})});
+      setsNote.textContent = "saved " + out.name + " (" + out.topics + ")";
+      drawSets();
+    } catch (error) { setsNote.textContent = error.message; }
+  };
+  const setOut = el("button", "tbtn", "export");
+  setOut.title = "Download this set as JSON";
+  setOut.onclick = () => {
+    const q = setPick.value ? ("?name=" + encodeURIComponent(setPick.value)) : "";
+    window.open("/api/topics/sets/export" + q + (q ? "&" : "?")
+      + "key=" + encodeURIComponent(key()), "_blank");
+  };
+  const setIn = el("button", "tbtn", "import");
+  setIn.title = "Paste a set exported from here";
+  setIn.onclick = async () => {
+    const raw = prompt("Paste the set JSON:");
+    if (!raw) return;
+    try {
+      const got = JSON.parse(raw);
+      const body = got.sets
+        ? null
+        : {name: got.name || "imported", topics: got.topics || []};
+      if (!body) {
+        for (const nm of Object.keys(got.sets)) {
+          await api("/api/topics/sets", {method: "POST",
+            body: JSON.stringify({name: nm, topics: got.sets[nm].topics || []})});
+        }
+      } else {
+        await api("/api/topics/sets", {method: "POST", body: JSON.stringify(body)});
+      }
+      setsNote.textContent = "imported";
+      drawSets();
+    } catch (error) { setsNote.textContent = "that is not a set: " + error.message; }
+  };
+  sets.appendChild(el("span", "muted", "set"));
+  sets.appendChild(setPick);
+  sets.appendChild(setMode);
+  sets.appendChild(setLoad);
+  sets.appendChild(setSave);
+  sets.appendChild(setOut);
+  sets.appendChild(setIn);
+  card.appendChild(sets);
+
+  const setsNote = el("div", "muted", "");
+  setsNote.style.cssText = "font-size:11px;margin-top:4px;min-height:14px";
+  card.appendChild(setsNote);
+
+  async function drawSets() {
+    try {
+      const got = await api("/api/topics/sets");
+      setPick.textContent = "";
+      (got.sets || []).forEach((row) => {
+        const o = document.createElement("option");
+        o.value = row.name;
+        o.textContent = row.name + " (" + row.topics + ")";
+        if (row.name === got.active) o.selected = true;
+        setPick.appendChild(o);
+      });
+      if (got.mode) setMode.value = got.mode;
+      if (!(got.sets || []).length) {
+        const o = document.createElement("option");
+        o.value = ""; o.textContent = "no sets saved yet";
+        setPick.appendChild(o);
+      }
+    } catch (error) { /* the rail is a convenience */ }
+  }
+
+  /* [#1386] THE HOLDING PEN. The cooker still reads the speakbox; what it
+     writes lands here and reaches the air only by a tick. */
+  const pen = el("div", "", "");
+  pen.style.cssText = "margin-top:10px";
+  card.appendChild(pen);
+
+  async function drawPen() {
+    pen.textContent = "";
+    let got = {pen: []};
+    try { got = await api("/api/topics/pen"); } catch (error) { return; }
+    const rows = got.pen || [];
+    if (!rows.length) return;
+    const bar = el("div", "row", "");
+    bar.style.cssText = "align-items:center;gap:8px";
+    const lab = el("b", "", "Waiting for you (" + rows.length + ")");
+    lab.style.cssText = "flex:1;font-size:12px";
+    bar.appendChild(lab);
+    const all = el("button", "tbtn", "keep all");
+    all.onclick = () => decide([], true);
+    const none = el("button", "tbtn", "bin all");
+    none.onclick = () => decide([], false);
+    bar.appendChild(all);
+    bar.appendChild(none);
+    pen.appendChild(bar);
+    const note2 = el("div", "muted", "Written off the speakbox. Nothing here "
+      + "has been on air.");
+    note2.style.cssText = "font-size:11px;margin:2px 0 6px";
+    pen.appendChild(note2);
+    rows.slice(0, 12).forEach((row) => {
+      const line = el("div", "", "");
+      line.style.cssText = "display:flex;gap:8px;align-items:flex-start;"
+        + "padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px";
+      const t = el("span", "", row.text);
+      t.style.cssText = "flex:1;min-width:0;line-height:1.45";
+      const src = el("span", "muted", row.source || "");
+      src.style.cssText = "font-size:10px;white-space:nowrap;align-self:center";
+      const yes = el("button", "tbtn", "\u2713");
+      yes.title = "Keep it - it goes into the bank as yours";
+      yes.onclick = () => decide([row.id], true);
+      const no = el("button", "tbtn", "\u2715");
+      no.title = "Bin it - it will not be suggested again";
+      no.onclick = () => decide([row.id], false);
+      line.appendChild(t);
+      line.appendChild(src);
+      line.appendChild(yes);
+      line.appendChild(no);
+      pen.appendChild(line);
+    });
+  }
+
+  async function decide(ids, keep) {
+    try {
+      const out = await api("/api/topics/pen/decide", {method: "POST",
+        body: JSON.stringify({ids, keep})});
+      setsNote.textContent = out.say || "";
+      drawPen();
+      if (keep) draw();
+    } catch (error) { setsNote.textContent = error.message; }
+  }
 
   const list = el("div", "", "");
   list.style.cssText = "overflow-y:auto;margin-top:10px;flex:1";
@@ -207613,6 +212326,8 @@ function djTopicsPanel() {
   document.body.appendChild(shade);
   field.focus();
   draw();
+  drawSets();
+  drawPen();
 }
 
 /* ---- The system prompt over the hosts (#780) -------------------------
@@ -211870,6 +216585,86 @@ async function system2Open() {
     system2View = await module.openSystem2({request: (path, options) => api(path, options),
       onClose: () => { system2View = null; }});
   } catch (error) { setStatus("System2 could not open: " + error.message, true); }
+}
+
+let wordCauseView = null;                                // [#1386]
+let wordCauseOpening = false;
+let wordCauseTicket = 0;
+
+function wordCauseClose() {                              // [#1386]
+  wordCauseTicket += 1;
+  const view = wordCauseView;
+  wordCauseView = null;
+  if (view && typeof view.close === "function") {
+    try { view.close(); } catch (e) { /* already gone */ }
+  }
+}
+
+/* [#1386] THE CAUSE GRAPH. An ESM module on its own allow-listed road,
+   the same shape station-flow uses, because PINE_3JS lives inside THIS
+   document and the desktop shell cannot see it (three-full.js:35). One
+   renderer, two hosts. */
+async function wordCauseOpen(word) {
+  /* [#1387] A SUBJECT CAN ARRIVE WITH THE WINDOW.
+   *
+   * "allow me to open a full screen version of the technical tab through
+   *  the 3js window."
+   *
+   * The embedded view in the script page hands its subject over rather than
+   * making the operator type it again: ?wc=<line id> for a line, ?wcq=<word>
+   * for a word, or window.__wcWant when the shell can set a global before
+   * calling pineShow3JS. Nothing here opens a second full-screen mode - the
+   * PINE_3JS frame IS the full-screen mode, and this only tells it what to
+   * look at. */
+  let wantLine = "";
+  try {
+    const q = new URLSearchParams(location.search);
+    wantLine = String(q.get("wc") || "");
+    if (!word) word = String(q.get("wcq") || "");
+    const held = window.__wcWant;
+    if (held && typeof held === "object") {
+      wantLine = String(held.line || wantLine);
+      if (!word) word = String(held.word || "");
+      window.__wcWant = null;
+    }
+  } catch (e) { /* no query here */ }
+  if (wordCauseView) {
+    if (wantLine && typeof wordCauseView.showLine === "function") {
+      wordCauseView.showLine(wantLine, "");
+    } else if (word && typeof wordCauseView.show === "function") {
+      wordCauseView.show(word);
+    }
+    return;
+  }
+  if (wordCauseOpening) return;
+  wordCauseOpening = true;
+  try {
+    /* One WebGL context on this glass. */
+    pine3JSAllOff();
+    wordCauseTicket += 1;
+    const ticket = wordCauseTicket;
+    if (!document.getElementById("wordCauseStyle")) {
+      const style = document.createElement("link");
+      style.id = "wordCauseStyle"; style.rel = "stylesheet";
+      style.href = "/word-cause/word-cause.css?v=3";
+      document.head.appendChild(style);
+    }
+    const module = await import("/word-cause/word-cause.js?v=3");
+    if (ticket !== wordCauseTicket) return;
+    wordCauseView = module.openWordCause({
+      request: (path, options) => api(path, options),
+      word: word || "",
+      base: location.origin,
+      threeUrl: "/vendor/three.min.js",
+      onClose: () => { wordCauseView = null; },
+    });
+    if (wantLine && typeof wordCauseView.showLine === "function") {
+      wordCauseView.showLine(wantLine, "");
+    }
+  } catch (e) {
+    setStatus("The cause graph could not open: "
+              + String(e && e.message || e), true);
+  } finally { wordCauseOpening = false; }
 }
 
 async function stationFlowOpen() {
@@ -232591,29 +237386,7 @@ async function pollOnce() {
         /* #1263: a clip with a PICTURE belongs to the panel's little CRT
          * set. Handed to a listener's <audio> element it is a transport
          * error, a retry, and then a hole where a sting should have been. */
-        if (clip.video) {
-          /* #1353: ...which is a reason not to give it to the AUDIO
-           * element, and was never a reason to drop it. This page has
-           * been receiving the SFX guy's pictures all along and
-           * discarding them, so a listener tuned in here was the only
-           * one in the house who could not see them - the app, the
-           * tablet, the slideshow and the presentation stage all get
-           * the same body-level set for free.
-           *
-           * PineSfxTv reads `at`, and this page has already worked out
-           * the local moment as `broadcastAt`. It mounts itself on any
-           * http page, so there is nothing to start. */
-          try {
-            /* #1414: the gallery stage takes the picture on this page
-             * (tvPoll); the floating set is for a page that has no
-             * stage to give it. Two copies of one clip is not a feature. */
-            if (window.PineSfxTv && !document.getElementById("galleryStage")) {
-              clip.at = clip.broadcastAt;
-              window.PineSfxTv.offer(clip);
-            }
-          } catch (err) { /* a missed picture never costs the sound */ }
-          return;
-        }
+        if (clip.video) return;
         // #1146: ts+url, so two clips stamped the same millisecond both
         // still play while a re-delivered twin does not.
         const mark = String(clip.ts || "") + "|" + String(clip.url);

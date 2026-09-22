@@ -2004,3 +2004,162 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
 .sp-segpr-uses { flex: 0 0 auto; margin: 6px 14px 0; font-size: 10.5px; line-height: 1.5; color: #7f8f9c; }
 .sp-segpr-ta.sp-segpr-dirty { border-color: #e3be63; }
 .sp-segpr-pick .sp-segrow-v { color: #65c7da; }
+
+
+/* [#1386] THE DICE BESIDE THE LINE. A locked band reads differently from
+   a free roll on purpose - the whole point of locking one is to be able
+   to see, at a glance, that it is locked. */
+.sp-segline-dice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: #9fb0bd;
+}
+.sp-dice-pip {
+  color: #06121a;
+  font-weight: 700;
+  border-radius: 9px;
+  padding: 1px 7px;
+  min-width: 36px;
+  text-align: center;
+}
+.sp-dice-axis {
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: #6f8190;
+}
+.sp-dice-means { color: #b9cbd8; }
+.sp-dice-band {
+  color: #e3be63;
+  border: 1px solid rgba(227, 190, 99, .4);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.sp-dice-ans { color: #6f8190; }
+.sp-dice-text {
+  flex: 1 0 100%;
+  color: #7f95a5;
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+.sp-segline-dice.sp-dice-locked { background: rgba(227, 190, 99, .06); }
+
+
+/* [#1386] The feed's other face. */
+.sp-feedflip {
+  margin-left: auto;
+  background: #12202c;
+  border: 1px solid rgba(159, 216, 255, .34);
+  border-radius: 6px;
+  color: #dcecf6;
+  padding: 2px 9px;
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.sp-feedflip:hover { background: #1b3040; }
+.sp-tech {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+  background: #05080c;
+}
+.sp-techbad { padding: 14px; color: #e06c9f; font-size: 12px; }
+/* A name you can tap reads as one. */
+.sp-segline-who.sp-tracable {
+  cursor: pointer;
+  border-bottom: 1px dotted rgba(159, 216, 255, .45);
+}
+.sp-segline-who.sp-tracable:hover { color: #9fd8ff; }
+
+
+/* [#1386] The script is tappable all the way down. Understated on purpose:
+   a screenplay that underlines every line is not a screenplay. */
+.sp-el.sp-character { cursor: pointer; }
+.sp-el.sp-character:hover { color: #9fd8ff; }
+
+
+/* [#1387] THE TECHNICAL VIEW ACROSS THE WHOLE BOTTOM.
+   Pinned to the page rather than living in the feed column, so it gets the
+   full width under both the column and the script. The script carries on
+   above it; this takes a band off the bottom, it does not cover the page. */
+.sp-page { position: relative; }
+.sp-tech.sp-tech-wide {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 55%;
+  z-index: 40;
+  border-top: 1px solid rgba(255, 95, 31, .5);
+  box-shadow: 0 -14px 40px rgba(0, 0, 0, .6);
+  padding-top: 7px;
+  background: #0e0e0d;
+}
+/* The handle on its top edge: 7px of grab, because a 1px target on glass
+   cannot be hit. It only grabs in wide mode - in the column the pane has
+   no top edge of its own to pull. */
+.sp-tech-grip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 7px;
+  cursor: row-resize;
+  touch-action: none;
+  display: none;
+}
+.sp-tech.sp-tech-wide .sp-tech-grip { display: block; }
+.sp-tech.sp-tech-wide .sp-tech-grip::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 2px;
+  width: 42px;
+  height: 3px;
+  margin-left: -21px;
+  border-top: 1px solid rgba(255, 95, 31, .55);
+  border-bottom: 1px solid rgba(255, 95, 31, .55);
+}
+
+
+/* [#1389] THE VIEW RAIL SLIDES OUT OF THE TECHNICAL VIEW'S WAY.
+
+   rail.js injects `#pineViewRail{position:fixed;right:0;top:50%;
+   transform:translateY(-50%)}` from its own stylesheet, which lands after
+   this one - so these rules are written as `html.pine-tech-wide
+   #pineViewRail`, an id PLUS a class, which beats a bare id whatever the
+   source order. Same trick, same reason, as listen-music.css's bare mode.
+
+   IT SLIDES, IT DOES NOT VANISH. A 16px strip stays on the edge, keeps
+   its pointer events, and :hover / :active / :focus-within bring the whole
+   rail back - three pseudo-classes and no JavaScript, no listener, no
+   timer, no frame, which is the only kind of "while the finger is near it"
+   this tablet should be asked to pay for. On glass Chromium applies :hover
+   on touch and holds it until the next tap elsewhere, so the tabs come up
+   under the thumb and settle back once the drawing is touched again. */
+html.pine-tech-wide #pineViewRail {
+  transform: translateY(-50%) translateX(calc(100% - 16px));
+  opacity: .38;
+  transition: transform 260ms ease, opacity 260ms ease;
+}
+html.pine-tech-wide #pineViewRail:hover,
+html.pine-tech-wide #pineViewRail:active,
+html.pine-tech-wide #pineViewRail:focus-within {
+  transform: translateY(-50%) translateX(0);
+  opacity: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  html.pine-tech-wide #pineViewRail { transition: none; }
+}
+
+/* And the bar keeps its hands clear of that 16px strip, so the edge a
+   finger reaches for is never also a button. */
+html.pine-tech-wide .sp-tech.sp-tech-wide .wc-bar,
+html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
+  padding-right: 26px;
+}

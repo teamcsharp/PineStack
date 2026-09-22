@@ -335,10 +335,10 @@ try:
     check("a miss plays the clip as it is", levelled(fresh, make=False),
           fresh)
     check("AND asks for a copy, or nothing would ever level it",
-          ns["_SFX_VIDEO_LEVEL"]["want"], [str(fresh)])
+          ns["_SFX_VIDEO_LEVEL"]["want"], [fresh.as_posix()])
     levelled(fresh, make=False)
     check("asked once, however many times it airs",
-          ns["_SFX_VIDEO_LEVEL"]["want"].count(str(fresh)), 1)
+          ns["_SFX_VIDEO_LEVEL"]["want"].count(fresh.as_posix()), 1)
     levelled(fresh, make=True)
     ns["_SFX_VIDEO_LEVEL"]["want"] = []
     check("and once made, the request path serves the copy",

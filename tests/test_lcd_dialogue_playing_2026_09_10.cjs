@@ -55,9 +55,11 @@ test('the playhead moves between turns as the round runs', () => {
   assert.equal(playing[0].text, 'the second line of the round');
 });
 
-test('the current speaker is listed last, so it does not jump around', () => {
+test('the current speaker stays in script order, so it does not jump around', () => {
   const rows = stationRows(coalesced(), NOW);
-  assert.equal(rows[rows.length - 1].lcdStatus, 'Playing');
+  assert.deepEqual(rows.map((row) => row.id), ['one', 'two']);
+  assert.equal(rows[0].lcdStatus, 'Playing');
+  assert.equal(rows[1].lcdStatus, 'Aired');
 });
 
 test('the single-line road still works - it always did', () => {

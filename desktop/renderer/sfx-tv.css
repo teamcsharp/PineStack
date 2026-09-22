@@ -95,6 +95,16 @@
   background: #000;
   transform-origin: 50% 50%;
   will-change: transform, filter, opacity;
+  /* [#1386] THE PICTURE IS THE FLOOR OF THIS BOX, SAID EXPLICITLY.
+     `will-change: transform` promotes this to its own compositor layer,
+     and on the tablet's WebView a promoted layer holding a <video> is
+     handed to a hardware overlay plane that draws OVER ordinary web
+     content whatever its z-index says. So the hold sheet - z-index 6,
+     correct on the desktop - came up BEHIND the picture on the glass and
+     none of its options could be tapped. An explicit 0 puts the tube at
+     the bottom of the frame's own stacking order; the promotions below
+     are what actually win the argument on Android. */
+  z-index: 0;
 }
 .sfx-tv-tube video {
   display: block;
@@ -132,6 +142,50 @@
 }
 
 /* #1306b: the pad icon, over the top right of the picture. */
+/* [#1386b] THE SURFACE COMES DOWN WHILE THE OPTIONS ARE UP.
+ *
+ * "whenever I tap on a video the UI for the video pops up behind the
+ * video. So I'm not able to tap anything to make any choices."
+ *
+ * Measured on the glass: `dumpsys activity top` shows an
+ * android.view.SurfaceView as a CHILD of the WebView. Android promotes a
+ * playing <video> to a hardware overlay plane, and that plane is
+ * composited above ALL web content - every z-index, every promoted layer,
+ * the lot. The z-order work below is correct and cannot win against it,
+ * because the argument is not happening in the web layer at all.
+ *
+ * `visibility: hidden` on the element is what actually retires the
+ * surface. The tube keeps its geometry, so the sheet still has a black
+ * ground under it and the frame does not resize; only the overlay plane
+ * goes, and the options become visible and tappable. It comes straight
+ * back when the sheet closes.
+ */
+.sfx-tv.sfx-tv-sheetup .sfx-tv-tube video { visibility: hidden; }
+.sfx-tv.sfx-tv-sheetup .sfx-tv-tube { background: #000; }
+
+/* [#1386b] FULL SCREEN, because they are video options and one of them
+   should be "make it big". Fixed rather than the Fullscreen API: this
+   WebView is already a kiosk filling the glass, and requestFullscreen on
+   a promoted <video> hands the picture back to the very overlay plane
+   this file spends its time getting out from under. */
+.sfx-tv.sfx-tv-full {
+  left: 0 !important;
+  top: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  border-radius: 0;
+}
+
+/* [#1386] Every control that sits OVER the picture needs its own layer
+   for the same reason the sheet does - see the note on .sfx-tv-tube. */
+.sfx-tv-pad,
+.sfx-tv-time,
+.sfx-tv-time-clock {
+  transform: translateZ(0);
+}
+
 .sfx-tv-pad {
   position: absolute;
   top: 8px; right: 8px;
@@ -195,6 +249,12 @@
   position: absolute;
   left: 8px; right: 8px; bottom: 8px;
   z-index: 6;
+  /* [#1386] ...and a compositor layer of its own, so it is composited
+     ABOVE the video's overlay plane rather than under it. z-index alone
+     does not settle this against a hardware video surface; a promoted
+     layer does. */
+  transform: translateZ(0);
+  will-change: transform;
   padding: 9px 10px;
   border-radius: 8px;
   border: 1px solid rgba(159, 216, 255, .34);

@@ -77,7 +77,32 @@
     const live = current || station.speaking_now;
     if (live?.id) {
       const before = rows.get(String(live.id)) || {};
-      rows.delete(String(live.id)); // the current speaker stays visible last
+      /* [#1386] THE SPEAKING LINE STAYS WHERE THE SCRIPT PUT IT.
+       *
+       * "the script window is still jumping around the script unusually
+       * instead of streaming as a stable feed with one line happening
+       * after another sequentially... the goal of having the script
+       * window being 1:1 and flowing logically."
+       *
+       * This Map iterates in INSERTION order, and the line that was
+       * speaking used to be deleted and re-inserted so it would land at
+       * the end of the list. That is what threw the reader around: the
+       * active line leapt out of its place in the conversation, and every
+       * line that had ALREADY been live stayed bunched at the tail in the
+       * order it went live rather than the order it was written. A pane
+       * asked to read downwards cannot, because the row it is following
+       * keeps moving.
+       *
+       * A Map.set on a key that is already present keeps its original
+       * position, so absorb() below now updates the row IN PLACE and the
+       * list stays in the order the lines arrived - which for a script is
+       * the order they are meant to be read. Nothing is lost: the row is
+       * still marked `aired: airing` and labelled Playing, so any view
+       * that wants to find the live line looks at the mark instead of at
+       * the position. The ledger's own (block, ord) sort is measured
+       * clean - 518 rows, 0 backward pairs - so the document was right
+       * and only this one re-insertion was moving it.
+       */
       /* A stream_now turn carries ONLY {id, from, until} - app.py:25295
        * serialises no text for it. So `current` never has any, the old
        * `live.text` guard failed, and absorb() (which drops a row with no

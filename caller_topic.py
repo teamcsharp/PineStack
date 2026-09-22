@@ -398,6 +398,11 @@ _PLACES = (
     "the apartment stairwell because everybody else is asleep",
     "a motel walkway with the ice machine grinding behind me",
 )
+# The incident and the object are paired BY INDEX - obj = _OBJECTS[
+# incident_at] below - because selecting them apart produced "a
+# dashboard incident followed by a host inexplicably asking about a warm
+# handrail". So the two tuples must stay the same length and in the same
+# order: entry N of one is entry N of the other. [#1386]
 _INCIDENTS = (
     "the metal table got warm enough that my paper receipt curled",
     "the dashboard display blinked twice and the radio lost its clock",
@@ -407,10 +412,35 @@ _INCIDENTS = (
     "the fan changed pitch and pushed a hot-paper smell across the room",
     "the handrail felt warm even though nobody had touched it",
     "the ice machine stopped, coughed once, and started blowing warm air",
+    "the door handle went tacky, like it had been held all day",
+    "the meter box outside started humming in a key it has never used",
+    "the window sweated on the inside while the night was dry",
+    "the vending machine flickered every time somebody walked past it",
+    "the coin return was warm and there had been no coins in it",
+    "the radiator ticked in threes and it is not even switched on",
+    "a stack of cardboard went damp from the bottom up with no water near it",
+    "the strip light buzzed louder whenever anyone stopped talking",
+    "the escalator stalled and started again with nobody on it",
+    "the freezer door clouded over from the outside",
+    "the manhole cover outside sat loose and it rocked when the air moved",
+    "the smoke alarm chirped once an hour and the battery is new",
 )
 _OBJECTS = ("curled receipt", "blinking clock", "loose labels",
             "sliding magnets", "dimming light", "box fan",
-            "warm handrail", "broken ice machine")
+            "warm handrail", "broken ice machine",
+            # [#1386] the deck was EIGHT, picked round-robin, and it
+            # showed: 909 of 5,951 gold bars carried one of these eight
+            # nouns, spread almost perfectly evenly (166/153/125/124/
+            # 124/115/112/102) - the fingerprint of a modulo, not of
+            # speech. On air it was one frame with the noun swapped:
+            # "warm handrail is the part", "box fan is the part",
+            # "dimming light is the part". Banning "handrail" removed
+            # one of eight and the other seven kept running.
+            "tacky door handle", "humming meter box", "sweating window",
+            "flickering vending machine", "warm coin return",
+            "ticking radiator", "damp cardboard", "buzzing strip light",
+            "stalled escalator", "clouded freezer door",
+            "loose manhole cover", "chirping smoke alarm")
 _LANDINGS = (
     "I wanted somebody else to hear the detail before I talked myself out of it",
     "I needed to know whether that sounds ordinary from inside your booth",
