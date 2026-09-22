@@ -1087,6 +1087,15 @@ class MainActivity : AppCompatActivity() {
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
             ),
         )
+        /* [#1441] the picture is native, so the tap on it is native too -
+         * handed to the page, which owns the hold sheet and everything in
+         * it. Screen pixels go over as they are; the page divides by its
+         * own devicePixelRatio, where that number actually lives. */
+        wall.onTap = { x, y ->
+            val js = ("try{window.PineSfxTv&&PineSfxTv.tapPicture&&"
+                + "PineSfxTv.tapPicture(" + x.toInt() + "," + y.toInt() + ")}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
         videoWall = wall
         bridge.videoWall = wall
         android.util.Log.i("PineVideoWall", "install: wall handed to the bridge")

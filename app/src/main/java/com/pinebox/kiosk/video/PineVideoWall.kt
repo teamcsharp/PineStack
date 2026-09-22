@@ -12,6 +12,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultLoadControl   // [#1212]
 import com.pinebox.kiosk.net.StationClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -82,7 +83,10 @@ class PineVideoWall(
     private val scope: CoroutineScope,
 ) : FrameLayout(context) {
 
-    private data class Clip(val id: String, val file: File)
+    /* [#1212] `seconds` is the clip's own measured length off the ring, so the
+     * pump can keep a runway measured in PICTURE rather than in rows. 0 means
+     * the station did not say, and secondsOf() falls back to the floor. */
+    private data class Clip(val id: String, val file: File, val seconds: Double = 0.0)
 
     /* THE one surface. Media-overlay so it sits over the WebView and
      * under this app's own chrome. */
@@ -101,6 +105,10 @@ class PineVideoWall(
 
     @Volatile private var showing: String = ""
     @Volatile private var made: Int = 0
+
+    /* [#1192]: this terminal's own video level, 0..1. Survives every rebuild
+     * the watchdog below does, because build() reads it. */
+    @Volatile private var wallLevel: Float = 1f
 
     /* #1440: THE WATCHDOG. 2026-09-21 15:31 the operator: "the clips are
      * frozen on the pine tab". Measured: the wall's SurfaceView had posted
@@ -140,17 +148,55 @@ class PineVideoWall(
 
     init {
         addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        /* It must not eat touches: the operator reaches the panel through it. */
-        isClickable = false
+        /* [#1441] IT ANSWERS A TAP NOW. #1431 made this pass every touch
+         * through, because at the time it covered the whole screen and
+         * swallowed the panel. It sits in the operator's own box now, and
+         * a surface that IS the picture should answer a press on the
+         * picture - there is nothing behind it the press was meant for. */
+        isClickable = true
         isFocusable = false
         isFocusableInTouchMode = false
         visibility = View.GONE
     }
 
-    @Suppress("ClickableViewAccessibility")
-    override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
+    /** Where the operator's press lands, handed over as a screen point. */
+    @Volatile var onTap: ((Float, Float) -> Unit)? = null
 
-    override fun onInterceptTouchEvent(event: android.view.MotionEvent?): Boolean = false
+    private var downX = 0f
+    private var downY = 0f
+    private var downAt = 0L
+
+    /**
+     * [#1441] A PRESS AND A RELEASE INSIDE THE SLOP IS A TAP; anything
+     * else is not, so a drag across the picture still opens nothing.
+     * Consumed either way: this surface is the picture, and a press on it
+     * was never meant for whatever the box happens to be lying over.
+     */
+    @Suppress("ClickableViewAccessibility")
+    override fun onTouchEvent(event: android.view.MotionEvent?): Boolean {
+        val press = event ?: return false
+        if (!running.get() || veiled || visibility != View.VISIBLE) return false
+        when (press.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                downX = press.rawX
+                downY = press.rawY
+                downAt = android.os.SystemClock.uptimeMillis()
+            }
+            android.view.MotionEvent.ACTION_UP -> {
+                val moved = Math.hypot(
+                    (press.rawX - downX).toDouble(), (press.rawY - downY).toDouble())
+                val held = android.os.SystemClock.uptimeMillis() - downAt
+                if (moved <= TAP_SLOP_PX && held <= TAP_HOLD_MS) {
+                    Log.i(TAG, "tap at ${press.rawX.toInt()},${press.rawY.toInt()}")
+                    try { onTap?.invoke(press.rawX, press.rawY) }
+                    catch (err: Throwable) { Log.w(TAG, "tap: ${err.message}") }
+                }
+            }
+        }
+        return true
+    }
+
+    override fun onInterceptTouchEvent(event: android.view.MotionEvent?): Boolean = true
 
     // ---------------------------------------------------------------- api
 
@@ -219,12 +265,41 @@ class PineVideoWall(
         }
     }
 
+    /**
+     * [#1192] HOW LOUD THE SET PLAYS ON THIS TERMINAL.
+     *
+     * "Offer a slider for setting the volume of videos that play as well."
+     *
+     * The wall is not in the page, so no slider in any document could reach
+     * it: `document.querySelectorAll("audio,video")` - the walk every level
+     * road in this product makes - cannot see a SurfaceView.  This is the
+     * door, reached through the bridge's `videoWall("level", {level: v})`.
+     *
+     * REMEMBERED, not written once.  The #1440 watchdog throws the player
+     * away and builds a new one on the third strike of "ready but frozen",
+     * and a level that lived only on the player would come back at 1 - the
+     * operator would have set it, heard it, and then heard it undone by a
+     * repair he never saw.  build() reads this field.
+     */
+    fun setLevel(value: Double) {
+        val v = value.coerceIn(0.0, 1.0).toFloat()
+        wallLevel = v
+        onMain {
+            try { player?.volume = v } catch (err: Throwable) { Log.w(TAG, "level: ${err.message}") }
+        }
+    }
+
+    /** What the level is, without touching the player. */
+    fun level(): Double = wallLevel.toDouble()
+
     fun state(): JSONObject = JSONObject()
         .put("on", running.get())
         .put("veiled", veiled)
         .put("queued", aheadCount())
+        .put("queued_s", aheadMs() / 1000.0)                // [#1212]
         .put("playing", showing)
         .put("made", made)
+        .put("level", wallLevel.toDouble())          // [#1192]
         .put("cached", den.listFiles()?.size ?: 0)
         /* #1440: what the watchdog saw on its last tick - readable from any
          * thread, and the only honest answer to "is it frozen?". */
@@ -275,6 +350,7 @@ class PineVideoWall(
         playWhenReady = p.playWhenReady
         atCount = p.mediaItemCount
         atDuration = p.duration
+        retally()                                           // [#1212]
         val moved = idx != atIndex || pos != atPos
         atIndex = idx
         atPos = pos
@@ -338,17 +414,37 @@ class PineVideoWall(
 
     private fun build() {
         if (player != null) return
-        val p = ExoPlayer.Builder(context).build()
+        /* [#1212] A LOAD CONTROL FOR WHOLE LOCAL FILES, BACK TO BACK.
+         * DefaultLoadControl will not start an item until it holds
+         * bufferForPlaybackMs of it - 2500 by default, which is longer than
+         * half the clips in this library (#1422 lets a slot be the clip's own
+         * length and the shortest measured is 1.1 s). Everything here is
+         * already on disk, so the only honest answer is "as soon as there is
+         * a frame". */
+        val control = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                LOAD_MIN_MS, LOAD_MAX_MS, LOAD_PLAY_MS, LOAD_REPLAY_MS)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+        val p = ExoPlayer.Builder(context).setLoadControl(control).build()
         p.setVideoSurfaceView(screen)
         p.repeatMode = Player.REPEAT_MODE_OFF
         p.playWhenReady = true
-        p.volume = 1f
+        p.volume = wallLevel                                     // [#1192]
         p.addListener(object : Player.Listener {
             override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
                 val at = p.currentMediaItemIndex
                 showing = listed.getOrNull(at)?.id ?: ""
                 Log.i(TAG, "now showing $showing (item $at of ${p.mediaItemCount})")
-                trimBehind(p)
+                /* [#1212] NOT ON THE FRAME OF THE JOIN.
+                 * Measured over thirteen transitions: four of them went
+                 * BUFFERING one millisecond after this line and stayed
+                 * there 31-127 ms, and the item count dropped in the same
+                 * breath. removeMediaItems() inside onMediaItemTransition
+                 * edits the timeline while the player is moving across it.
+                 * Posted, it lands after the hand-over has settled and the
+                 * picture never stops. */
+                post { trimBehind(p) }
             }
 
             override fun onPlaybackStateChanged(state: Int) {
@@ -388,6 +484,7 @@ class PineVideoWall(
      * indices are the only thing that says which clip is on.
      */
     private fun trimBehind(p: ExoPlayer) {
+        if (p != player || !running.get()) return          // [#1212] posted: it may have gone
         val at = p.currentMediaItemIndex
         if (at < BEHIND_KEEP) return
         val cut = at - BEHIND_KEEP
@@ -416,6 +513,7 @@ class PineVideoWall(
                     p.seekTo(p.mediaItemCount - 1, 0L)
                     p.playWhenReady = true
                 }
+                retally()                                   // [#1212]
             } catch (err: Throwable) {
                 Log.w(TAG, "offer ${clip.id}: ${err.message}")
             }
@@ -427,9 +525,21 @@ class PineVideoWall(
     private suspend fun feed() {
         while (scope.isActive && running.get()) {
             try {
-                if (aheadCount() < KEEP_AHEAD) {
+                /* [#1212] THE RUNWAY IS PICTURE, NOT ROWS. Three clips is
+                 * eighteen seconds on a six-second library and two point two
+                 * on the short end of this one, and a wall that runs out
+                 * shows the join it was queued to hide. Both bounds hold: at
+                 * least AHEAD_MS of picture, and never more than
+                 * ROWS_MOST rows however short the clips are. */
+                val thin = aheadMs() < AHEAD_MS || aheadRows() < KEEP_AHEAD
+                if (thin && aheadRows() < ROWS_MOST) {
                     val got = nextClip()
-                    if (got != null) offer(got) else delay(1_200)
+                    if (got != null) {
+                        offer(got)
+                        delay(120)          // let the main thread's tally land
+                    } else {
+                        delay(1_200)
+                    }
                 } else {
                     delay(500)
                 }
@@ -453,6 +563,37 @@ class PineVideoWall(
         }
     }
 
+    /* [#1212] The same question in seconds. `aheadTally` is written on the
+     * main thread - by the watchdog once a second and by every offer() - and
+     * read from the pump, which is why it is volatile and why the pump rests
+     * a moment after an offer rather than trusting a number it just changed.
+     * A clip whose length the station did not give us counts as the cycle's
+     * own floor, exactly as app.py's sfx_cycle_slot does. */
+    @Volatile private var aheadTally: Long = 0L
+    @Volatile private var aheadRowsTally: Int = 0
+
+    private fun secondsOf(c: Clip): Long =
+        if (c.seconds > 0.0) (c.seconds * 1000.0).toLong() else SLOT_FLOOR_MS
+
+    /** Main thread only: how much picture is queued past the one showing. */
+    private fun retally() {
+        val p = player
+        if (p == null) { aheadTally = 0L; aheadRowsTally = 0; return }
+        val at = try { p.currentMediaItemIndex } catch (err: Throwable) { 0 }
+        var ms = 0L
+        var rows = 0
+        for (i in (at + 1) until listed.size) {
+            ms += secondsOf(listed[i])
+            rows += 1
+        }
+        aheadTally = ms
+        aheadRowsTally = rows
+    }
+
+    private fun aheadMs(): Long = aheadTally
+
+    private fun aheadRows(): Int = aheadRowsTally
+
     /** The next clip off the ring, or one out of the larder. */
     private suspend fun nextClip(): Clip? = withContext(Dispatchers.IO) {
         val base = client.config().base
@@ -470,13 +611,14 @@ class PineVideoWall(
                 val url = row.optString("url")
                 if (id.isBlank() || url.isBlank()) continue
                 if (rung.contains(id) || listed.any { it.id == id }) continue
+                val secs = row.optDouble("length", row.optDouble("seconds", 0.0))
                 val file = pull(base + url, id)
                 /* Remembered either way: a clip the station cannot give us
                  * is as finished with as one that played, and leaving a
                  * failure eligible meant picking the same dead id for ever. */
                 remember(id)
                 if (file == null) continue
-                return@withContext Clip(id, file)
+                return@withContext Clip(id, file, secs)     // [#1212]
             }
         }
         fromLarder()
@@ -554,10 +696,31 @@ class PineVideoWall(
     companion object {
         private const val TAG = "PineVideoWall"
         private const val CACHE_DIR = "pine-wall"
+        /** [#1441] a press that moves further than this was a drag, not a tap. */
+        private const val TAP_SLOP_PX = 24.0
+        private const val TAP_HOLD_MS = 700L
         /** How many clips to keep queued past the one playing. */
         private const val KEEP_AHEAD = 3
-        /** Spent items left behind the playhead before the list is trimmed. */
-        private const val BEHIND_KEEP = 2
+        /* [#1212] ...and what actually governs the pump now: SECONDS of
+         * picture queued past the one showing, which is what a hand-over
+         * needs and what a row count stopped meaning when #1422 let a slot
+         * be the clip's own length. 24 s is the station's own runway
+         * (SFX_CYCLE_AHEAD = 28) less a poll. The row cap is only a bound. */
+        private const val AHEAD_MS = 24_000L
+        private const val ROWS_MOST = 12
+        /** A clip the ring gave no length for, paced like app.py's floor. */
+        private const val SLOT_FLOOR_MS = 6_000L
+        /* [#1212] The load control, for whole files that are already on disk.
+         * bufferForPlaybackMs defaults to 2500, which is longer than half
+         * the clips in this library. */
+        private const val LOAD_MIN_MS = 5_000
+        private const val LOAD_MAX_MS = 30_000
+        private const val LOAD_PLAY_MS = 250
+        private const val LOAD_REPLAY_MS = 500
+        /** Spent items left behind the playhead before the list is trimmed.
+         * [#1212] was 2: a trim ran on nearly every join, and a trim on the
+         * frame of a join is what the BUFFERING was. */
+        private const val BEHIND_KEEP = 4
         private const val RUNG_KEEP = 400
         private const val MIN_BYTES = 4096
         private const val CACHE_MOST = 240
