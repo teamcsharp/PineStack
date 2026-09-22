@@ -201,8 +201,70 @@
   background: rgba(8, 14, 20, .93);
   color: #dcecf6;
   box-shadow: 0 8px 24px rgba(0, 0, 0, .55);
+  /* [#1256] It used to be laid out from the bottom up with no ceiling, so
+     once it held more than the frame is tall it grew straight out of the
+     top and took the strip and the glue rails' heads with it. */
+  max-height: calc(100% - 16px);
+  display: flex;
+  flex-direction: column;
 }
-.sfx-tv-sheet > b {
+
+/* [#1256] The only part that scrolls. `min-height: 0` is load-bearing: a
+   flex child will not shrink below its content without it, and a capped
+   column whose child refuses to shrink overflows exactly as before. */
+.sfx-tv-sheetbody {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(159, 216, 255, .32) transparent;
+}
+.sfx-tv-sheetbody::-webkit-scrollbar { width: 5px; }
+.sfx-tv-sheetbody::-webkit-scrollbar-track { background: transparent; }
+.sfx-tv-sheetbody::-webkit-scrollbar-thumb {
+  background: rgba(159, 216, 255, .32);
+  border-radius: 3px;
+}
+
+/* [#1256] A step down, applied when the sheet measured itself against its
+   own frame and did not fit. Smaller beats scrolling; scrolling is only
+   the guarantee underneath it. */
+.sfx-tv-sheet.sfx-tv-tight { padding: 6px 7px; }
+/* [#1256b] `> b` matched nothing once #1256 moved the name into the body. */
+.sfx-tv-sheet.sfx-tv-tight > b,
+.sfx-tv-sheet.sfx-tv-tight > .sfx-tv-sheetbody > b {
+  font-size: 10px; margin-bottom: 4px;
+}
+/* [#1256b] The strip is the tallest thing in the sheet and the tight step
+   did not reach it. `stripTile` sets these inline, so a class rule needs
+   !important to win - there is no lower-specificity road to an inline
+   declaration. Tiles stay square-ish and tappable, just smaller. */
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-strip { margin-bottom: 4px !important; }
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-tile { width: 58px !important; }
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-shot { height: 30px !important; }
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-note { font-size: 9.5px; min-height: 11px; }
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-sheetrow { gap: 4px; margin-bottom: 4px; }
+.sfx-tv-sheet.sfx-tv-tight button { font-size: 10px; padding: 3px 4px; }
+.sfx-tv-sheet.sfx-tv-tight.sfx-tv-hasglue {
+  padding-left: 32px; padding-right: 32px;
+}
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-glue { width: 26px; }
+
+/* [#1256] When even the tight step needs the scroll, say so at the edge
+   rather than leaving it to be discovered by a thumb. */
+.sfx-tv-sheet.sfx-tv-scrolls .sfx-tv-sheetbody {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 10px,
+                      #000 calc(100% - 10px), transparent 100%);
+          mask-image: linear-gradient(to bottom, transparent 0, #000 10px,
+                      #000 calc(100% - 10px), transparent 100%);
+}
+/* [#1256b] Both, because #1256 put the name one level down inside the
+   scrolling body and this rule carries the ellipsis that keeps a long
+   clip name on ONE line. Without it the sheet grows instead of shrinks. */
+.sfx-tv-sheet > b,
+.sfx-tv-sheet > .sfx-tv-sheetbody > b {
   display: block;
   font-size: 11px;
   letter-spacing: .06em;

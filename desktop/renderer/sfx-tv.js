@@ -2179,6 +2179,7 @@
     s.border = mine ? '1px solid #65c7da'
                     : '1px solid rgba(159, 216, 255, .24)';
     var shot = document.createElement('div');
+    shot.className = 'sfx-tv-shot';                        /* [#1256b] */
     shot.style.height = '44px'; shot.style.background = '#05080b';
     shot.style.overflow = 'hidden'; shot.style.position = 'relative';
     if (row.id) {
@@ -3238,6 +3239,80 @@
       }, 900);
     }
 
+
+  /* [#1256] MAKE THE SHEET FIT THE PICTURE IT IS IN.
+   *
+   * He asked for it "scaled down so I'm able to get to the elements at the
+   * top". A transform scale was the wrong tool - it blurs this panel's text
+   * and leaves the touch targets where the unscaled layout put them. So the
+   * sheet takes a step down in font, padding and gap instead, and only when
+   * the room it has actually calls for it.
+   *
+   * Two passes, because one is not enough: `tight` may itself be enough, and
+   * if it is not the body keeps its scroll and nothing is ever unreachable.
+   * Both passes run off rAF so they measure a laid-out sheet rather than an
+   * empty one. */
+  function sheetFit(wrap, body) {
+    var look = function () {
+      if (!wrap || !wrap.parentNode) return;
+      /* [#1256c] ROOM IS WHAT CAN BE SEEN, not what the host measures.
+         offsetParent is ALWAYS null for a fixed element, so the wall's
+         own sheet fell through to the body - 9969px tall on the kiosk
+         page against a 690px screen - and never went tight at all. */
+      var seen = 0;
+      try { seen = root.innerHeight || 0; } catch (err) { seen = 0; }
+      if (!seen) {
+        seen = (document.documentElement
+                && document.documentElement.clientHeight) || 0;
+      }
+      var fixed = false;
+      try {
+        fixed = getComputedStyle(wrap).position === 'fixed';
+      } catch (err) { fixed = false; }
+      var room = 0;
+      if (fixed) {
+        room = seen;
+        /* the wall path pins its own ceiling inline; honour the smaller. */
+        var cap = parseFloat(wrap.style.maxHeight || '') || 0;
+        if (cap > 0 && cap < room) room = cap;
+      } else {
+        var host = wrap.offsetParent || wrap.parentNode;
+        try {
+          room = (host && host.getBoundingClientRect
+                  ? host.getBoundingClientRect().height : 0) || 0;
+        } catch (err) { room = 0; }
+        /* a host taller than the screen is not room either. */
+        if (seen > 0 && room > seen) room = seen;
+      }
+      if (room <= 0) return;
+      /* 16px is the sheet's own top+bottom inset against the frame. */
+      var allowed = Math.max(0, room - 16);
+      var wanted = wrap.scrollHeight;
+      if (wanted > allowed) wrap.classList.add('sfx-tv-tight');
+      else wrap.classList.remove('sfx-tv-tight');
+      /* Say so rather than leaving a silent scrollbar to be discovered. */
+      try {
+        var over = body.scrollHeight - body.clientHeight > 4;
+        wrap.classList.toggle('sfx-tv-scrolls', !!over);
+      } catch (err) { /* nothing to say */ }
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(function () { look(); requestAnimationFrame(look); });
+    } else {
+      look();
+    }
+    /* The strip loads its pictures late and the glue rails answer the
+     * station before they can say whether there is a neighbour, so the
+     * sheet's height is not final at build. Watch it while it is open. */
+    try {
+      if (typeof ResizeObserver === 'function') {
+        var ro = new ResizeObserver(look);
+        ro.observe(wrap);
+        if (body) ro.observe(body);
+      }
+    } catch (err) { /* the two passes above still ran */ }
+  }
+
     function button(into, label, title, go) {
       var b = document.createElement('button');
       b.type = 'button';
@@ -3407,19 +3482,33 @@
        sheet. Added before the name so they are underneath every row in
        paint order; the stylesheet pins them and pads the sheet aside. */
     glueRails(wrap, clip, say, at);
-    wrap.appendChild(name);
+    /* [#1256] EVERYTHING BELOW THE RAILS GOES IN A BODY THAT CAN SCROLL.
+       The sheet is pinned to the bottom of the frame and used to grow
+       upward out of it once it held more than the frame is tall - which
+       is how the rails' heads and the strip ended up off screen. The
+       rails stay children of the sheet so they are pinned against the
+       BOUNDED sheet; only this body scrolls. */
+    var body = document.createElement('div');
+    body.className = 'sfx-tv-sheetbody';
+    body.appendChild(name);
     /* #1184: the cycle's own picture, directly under the clip's name and
        above every button - "show thumbnails of the last 2 videos played
        and the next 2 videos planned for play". It is what he is looking
        at, so it goes where the eye lands first. */
-    wrap.appendChild(stripBuild(clip, say));
-    wrap.appendChild(rowA);
-    wrap.appendChild(rowF);                                /* #1184 */
-    wrap.appendChild(rowB);
-    wrap.appendChild(rowD);
-    wrap.appendChild(rowE);
-    wrap.appendChild(rowC);
-    wrap.appendChild(note);
+    body.appendChild(stripBuild(clip, say));
+    body.appendChild(rowA);
+    body.appendChild(rowF);                                /* #1184 */
+    body.appendChild(rowB);
+    body.appendChild(rowD);
+    body.appendChild(rowE);
+    body.appendChild(rowC);
+    body.appendChild(note);
+    wrap.appendChild(body);
+    /* [#1256] ...and it tries to be small enough not to need the scroll.
+       Measured after layout against the frame this sheet is actually in,
+       because the same sheet is drawn on the desk, in the panel, on the
+       tune page and on the tablet at four different sizes. */
+    sheetFit(wrap, body);
     wrap.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
     /* A right-click on the sheet itself is not a right-click on the
        video: the browser's own menu must not open over it either. */
