@@ -3185,7 +3185,13 @@
 
   var sheetAt = null;
   function sheet(clip, at) {
-    if (!host) return;
+    /* [#1441] A WALL SHEET DOES NOT HANG OFF THE SET'S FRAME. When `at`
+       is given this is the #1184 sheet, mounted on the BODY further down
+       precisely because the set it belongs to may be veiled - or, since
+       the picture went native, may never have been built at all. Guarding
+       both kinds on `host` meant a tap on the native picture opened
+       nothing, which is exactly what was reported. */
+    if (!host && !at) return;
     /* #1112: a second hold shuts it - through the one door, so a clip
        that ended under the sheet is finished now, not left standing. */
     if (sheetHeld()) { sheetClose(); return; }
@@ -4064,6 +4070,80 @@
     }
   }
 
+  /* [#1442] THE PICTURE GOES UNDER ANYTHING THE OPERATOR OPENS.
+   *
+   * SurfaceFlinger composites the wall's surface ABOVE the WebView, so no
+   * z-index in this document can put an element over it - the hold sheet
+   * opened UNDERNEATH the picture and half its buttons could not be
+   * reached. The only way the page gets above the picture is for the
+   * picture to go.
+   *
+   * It is the OVERLAP that matters, not that something is open. Measured
+   * on the device: real pop-ups are body children at or above
+   * UI_Z_FLOOR, which is where the view hosts sit, and ordinary content
+   * is under 200 - but PERSISTENT chrome is up there too (the
+   * orchestrator dot is z 2147483004 and never leaves), so hiding on
+   * "anything open" would hide the picture for ever. A sheet across the
+   * box takes it away; a dot in the far corner does not.
+   *
+   * Walks document.body.children only - a handful of nodes - and runs on
+   * the poll this module already makes. */
+  var UI_Z_FLOOR = 2147483000;
+  var UI_AREA_MIN = 20000;          /* a panel, not a button */
+
+  function uiOverPicture() {
+    var box;
+    try { box = readBox(); } catch (err) { return false; }
+    if (!box || !(box.width > 0) || !(box.height > 0)) return false;
+    var x1 = box.left, y1 = box.top;
+    var x2 = box.left + box.width, y2 = box.top + box.height;
+    var kids;
+    try { kids = document.body.children; } catch (err) { return false; }
+    for (var i = 0; i < kids.length; i += 1) {
+      var el = kids[i];
+      var cs;
+      try { cs = getComputedStyle(el); } catch (err) { continue; }
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      if (Number(cs.opacity) === 0) continue;
+      var z = parseInt(cs.zIndex, 10);
+      /* [#1442b] STRICTLY above. The view hosts sit AT the floor and one
+         of them is always full-screen, so `<` let a host through as a
+         pop-up covering everything. */
+      if (!isFinite(z) || z <= UI_Z_FLOOR) continue;
+      var r;
+      try { r = el.getBoundingClientRect(); } catch (err) { continue; }
+      if (r.width * r.height < UI_AREA_MIN) continue;
+      /* The wall's own frame, if the page ever builds one, is not a
+         pop-up over the wall. */
+      if (/sfx-tv-frame|sfx-tv-host/.test(String(el.className || ''))) continue;
+      if (r.right > x1 && r.left < x2 && r.bottom > y1 && r.top < y2) return true;
+    }
+    return false;
+  }
+
+  /* One decision about whether the surface is up, and every reason for
+     taking it down goes through it.
+     [#1442b] IT IS RECONCILED AGAINST THE WALL, not against what we last
+     said to it. The first cut cached its own answer and refused to
+     repeat itself, so one call from anywhere else - the bridge directly,
+     another road, a rebuild - left the page certain of something that
+     was no longer true, and it never spoke again. `st` is the wall's own
+     state, which wallFollow() already fetches every poll; when it is not
+     to hand the change is simply sent. */
+  function wallReconcile(st) {
+    var bridge = api();
+    if (!bridge || typeof bridge.videoWall !== 'function') return;
+    var want;
+    try { want = !!veiled || uiOverPicture(); }
+    catch (err) { return; }
+    if (st && typeof st.veiled === 'boolean' && !!st.veiled === want) return;
+    bridge.videoWall(want ? 'hide' : 'show')['catch'](function () {
+      /* the next poll asks again; nothing here is remembered */
+    });
+  }
+
+  function wallVisibility() { wallReconcile(null); }
+
   /* #1435: what the WALL says is on screen, as a clip this page can use.
      Silent when the wall is not running, so a browser with no bridge -
      a Tailscale viewer on the listen page - is untouched. */
@@ -4073,6 +4153,9 @@
     bridge.videoWall('state').then(function (got) {
       var st = wallState(got);
       var id = st && st.playing;
+      /* [#1442b] BEFORE the veiled early-return below: a wall that is
+         hidden must still be told when it may come back. */
+      wallReconcile(st);
       if (!id || (st && st.veiled)) return;
       var row = ringSeen[id];
       if (!row) return;                      /* a larder clip we never saw */
@@ -4850,24 +4933,12 @@
     veil: function (on) {
       veiled = !!on;
       try { if (host) host.style.visibility = veiled ? 'hidden' : ''; } catch (err) { /* no set up */ }
-      /* #1434: AND THE NATIVE SURFACE, which has no `host` to hide. The
+      /* #1434: AND THE NATIVE SURFACE, which has no `host` to hide - the
          listen view veils whoever is showing the endless clip so it is
-         not on screen twice (#1184); with the wall running there was no
-         page set to veil, so it veiled nothing and the native picture
-         carried on over the listen backdrop. Hidden, not stopped - the
-         playlist keeps running underneath. */
-      try {
-        var bridge = api();
-        /* #1434b: NOT guarded on wallHas. That flag is only set once the
-           page's own poll has turned the wall on, so a wall started by
-           any other road - the bridge directly, a previous session -
-           went on showing its picture through the veil. The bridge
-           answers harmlessly when there is no wall, which is a better
-           test than a flag this file happens to have set. */
-        if (bridge && typeof bridge.videoWall === 'function') {
-          bridge.videoWall(veiled ? 'hide' : 'show')['catch'](function () {});
-        }
-      } catch (err) { /* no bridge: the page set is the only one there is */ }
+         not on screen twice (#1184). [#1442] folds this into the one
+         decision, because being veiled and being covered are two reasons
+         for the same thing and two writers would fight over it. */
+      try { wallVisibility(); } catch (err) { /* no bridge, no wall */ }
     },
     mount: function (opts) {
       if (mounted) return;
@@ -5026,6 +5097,26 @@
       catch (err) { showing = false; return false; }
     },
     playing: function () { return playing; },
+
+    /* [#1441] THE PICTURE IS NATIVE, SO THE TAP ON IT ARRIVES HERE.
+     *
+     * The wall consumes the press (it IS the picture; nothing behind it
+     * wanted that tap) and hands over the SCREEN point in DEVICE pixels.
+     * The ratio lives here, so the conversion does too - carrying 1.25
+     * in two places is how the two drift apart.
+     *
+     * It opens the same hold sheet a press on the old tube opened, on
+     * whatever PineSfxTv.playing() says is up - which #1435 keeps
+     * pointed at the clip the wall is actually showing. */
+    tapPicture: function (x, y) {
+      if (!playing) return false;
+      var d = Number(root.devicePixelRatio) || 1;
+      var px = Number(x) / d;
+      var py = Number(y) / d;
+      if (!isFinite(px) || !isFinite(py)) return false;
+      try { sheet(playing, {x: px, y: py}); } catch (err) { return false; }
+      return true;
+    },
     /* #1200: NUMBERS RATHER THAN A CLAIM IN A COMMENT. The one thing that
        has to be PROVED about the poster queue is a negative - that more
        than two are never in flight - and a negative cannot be seen on
