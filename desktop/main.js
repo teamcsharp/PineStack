@@ -1194,6 +1194,249 @@ function hotSayRelaunch(name) {
 
 ipcMain.handle("config:read", () => readConfig());
 ipcMain.handle("config:write", (_event, cfg) => writeConfig(cfg));
+
+/* ===================================================================== */
+/* #1224: DICTATION ON THE DESK, AND AN OVERLAY ABOVE EVERY WINDOW.      */
+/*                                                                       */
+/* "Voice dictation through the Pine app on the computer isn't working.  */
+/*  I'm able to use dictation with the Pine tab."                        */
+/*                                                                       */
+/* Measured: the renderer is file://, so its fetch to the station is     */
+/* preflighted and the station answers OPTIONS with 405 and no           */
+/* Access-Control-Allow-Origin on anything; and talk-dot's where() was   */
+/* falling back to http://127.0.0.1:8096, where nothing listens on this  */
+/* machine.  Both go away if the request is made out here, which is      */
+/* also where the key already is.  The renderer hands over WAV bytes -   */
+/* proven against the live route: the same speech as WAV transcribes and */
+/* as webm/opus comes back with no words in it.                          */
+
+ipcMain.handle("listen:transcribe", async (_event, bytes) => {  // [#1224]
+  try {
+    const cfg = readConfig();
+    const body = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes || []);
+    if (body.length < 2000) {
+      return { ok: false, why: "that was too short to hear",
+        bytes: body.length };
+    }
+    const response = await fetch(`${cfg.baseUrl}/api/listen/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream",
+        ...authHeaders(cfg) },
+      body
+    });
+    let said = {};
+    try { said = await response.json(); } catch { said = {}; }
+    if (!response.ok) {
+      return { ok: false, status: response.status,
+        why: String(said.detail || `${response.status} ${response.statusText}`),
+        bytes: body.length };
+    }
+    /* An empty transcript is not a failure of the road; the station says
+     * WHY in `detail` and the dot repeats that rather than guessing. */
+    return { ok: true, text: String(said.text || ""),
+      heard: !!said.heard, detail: String(said.detail || ""),
+      bytes: body.length };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* The spoken reply took the same broken road, for the same two reasons. */
+ipcMain.handle("speech:say", async (_event, opts) => {          // [#1224]
+  try {
+    const cfg = readConfig();
+    const want = opts && typeof opts === "object" ? opts : {};
+    const response = await fetch(`${cfg.baseUrl}/v1/audio/speech`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders(cfg) },
+      body: JSON.stringify({
+        input: String(want.input || "").slice(0, 600),
+        voice: String(want.voice || "piper:en_US-libritts-high"),
+        response_format: String(want.format || "mp3")
+      })
+    });
+    if (!response.ok) {
+      return { ok: false, status: response.status,
+        why: `the voice bench said ${response.status}` };
+    }
+    const raw = Buffer.from(await response.arrayBuffer());
+    if (!raw.length) return { ok: false, why: "the voice bench sent nothing" };
+    return { ok: true, bytes: new Uint8Array(raw),
+      type: String(response.headers.get("content-type") || "audio/mpeg") };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* --- the overlay ----------------------------------------------------- */
+/*                                                                       */
+/* "The text overlay isn't on top of all the windows.  So the graphic of */
+/*  it responding to my speech needs to be on top of every window."      */
+/*                                                                       */
+/* A z-index cannot answer that here.  #pineTalkDot is in the main       */
+/* window's document and this app opens a dozen other BrowserWindows;    */
+/* whichever of them is in front is in front of the dot, and no value in */
+/* view-chrome.css reaches outside its own page.  So the dictation       */
+/* surface gets a window of its own: frameless, transparent, not         */
+/* focusable, click-through, and pinned at the "screen-saver" level,     */
+/* which on Windows sits above ordinary always-on-top windows.           */
+/*                                                                       */
+/* It carries no preload and no node: main pushes state in with          */
+/* executeJavaScript, the way glass:still and the replay roads in this   */
+/* file already talk to their pages.                                     */
+
+let talkOverlayWin = null;                                      // [#1224]
+let talkOverlayLast = null;
+let talkOverlayTimer = null;
+const TALK_OVERLAY_CEILING_MS = 30000;
+
+const TALK_OVERLAY_HTML = [                                     // [#1224]
+  '<!doctype html><html><head><meta charset="utf-8"><style>',
+  'html,body{margin:0;height:100%;background:transparent;overflow:hidden;',
+  '  -webkit-user-select:none;user-select:none;}',
+  'body{display:flex;flex-direction:column;justify-content:flex-end;',
+  '  align-items:flex-end;gap:10px;padding:14px;box-sizing:border-box;',
+  '  font:13px/1.55 Inter,Segoe UI,system-ui,sans-serif;color:#edf3f5;}',
+  '#say{max-width:100%;padding:9px 13px;border:1px solid #35414c;',
+  '  border-radius:10px;background:rgba(10,14,18,.96);',
+  '  box-shadow:0 14px 34px rgba(0,0,0,.55);display:none;}',
+  '#say.bad{border-color:#e46b6b;color:#e46b6b;}',
+  '#orb{width:212px;height:74px;border:1px solid #65c7da;border-radius:14px;',
+  '  background:rgba(10,14,18,.92);box-shadow:0 14px 34px rgba(0,0,0,.55);',
+  '  display:none;align-items:center;justify-content:center;gap:4px;}',
+  '#orb.thinking{border-color:#e3be63;}',
+  '#orb i{display:block;width:5px;height:6px;border-radius:3px;',
+  '  background:#65c7da;transition:height .07s linear;}',
+  '#orb.thinking i{background:#e3be63;}',
+  '</style></head><body>',
+  '<div id="say"></div><div id="orb"></div>',
+  '<script>(function(){',
+  'var say=document.getElementById("say"),orb=document.getElementById("orb");',
+  'var bars=[],i;for(i=0;i<21;i+=1){var b=document.createElement("i");',
+  '  orb.appendChild(b);bars.push(b);}',
+  'var level=0,shown=0,mode="idle";',
+  'function frame(){requestAnimationFrame(frame);',
+  '  shown+=(level-shown)*0.25;',
+  '  for(var i=0;i<bars.length;i+=1){',
+  '    var mid=1-Math.abs(i-(bars.length-1)/2)/((bars.length-1)/2);',
+  '    var h=6+shown*54*(0.35+mid*0.65)*(0.7+0.3*Math.sin(i*1.7+Date.now()/160));',
+  '    bars[i].style.height=Math.max(4,Math.min(60,h))+"px";}}',
+  'requestAnimationFrame(frame);',
+  'window.pineTalkPaint=function(s){s=s||{};mode=String(s.mode||"idle");',
+  '  level=Math.max(0,Math.min(1,Number(s.level)||0));',
+  '  var t=String(s.text||"");say.textContent=t;',
+  '  say.style.display=t?"block":"none";',
+  '  say.className=s.bad?"bad":"";',
+  '  var open=(mode==="listening"||mode==="thinking");',
+  '  orb.style.display=open?"flex":"none";',
+  '  orb.className=(mode==="thinking")?"thinking":"";',
+  '  if(!open)level=0;};',
+  '})();<\/script></body></html>'
+].join("\n");
+
+function talkOverlayWindow() {                                  // [#1224]
+  if (talkOverlayWin && !talkOverlayWin.isDestroyed()) return talkOverlayWin;
+  const { screen } = require("electron");
+  const area = screen.getPrimaryDisplay().workArea;
+  const wide = 560;
+  const tall = 260;
+  talkOverlayWin = new BrowserWindow({
+    width: wide,
+    height: tall,
+    x: area.x + area.width - wide - 20,
+    y: area.y + area.height - tall - 20,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    hasShadow: false,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    show: false,
+    alwaysOnTop: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      /* It has to keep animating while another window holds focus - that
+       * is the whole point of it. */
+      backgroundThrottling: false
+    }
+  });
+  /* "screen-saver" is the highest ordinary level; plain alwaysOnTop loses
+   * to another always-on-top window, and this must lose to nothing. */
+  talkOverlayWin.setAlwaysOnTop(true, "screen-saver");
+  try {
+    talkOverlayWin.setVisibleOnAllWorkspaces(true,
+      { visibleOnFullScreen: true });
+  } catch { /* not every platform has workspaces */ }
+  /* Click-through: it is a readout, not a control.  The dot he presses is
+   * still the one in the page. */
+  talkOverlayWin.setIgnoreMouseEvents(true, { forward: false });
+  talkOverlayWin.loadURL("data:text/html;charset=UTF-8,"
+    + encodeURIComponent(TALK_OVERLAY_HTML));
+  /* A state that arrived before the document did would be swallowed by
+   * the guard in pineTalkPaint, so it is replayed once the page is up. */
+  talkOverlayWin.webContents.on("did-finish-load", () => {
+    if (talkOverlayLast) talkOverlayPaint(talkOverlayLast);
+  });
+  talkOverlayWin.on("closed", () => { talkOverlayWin = null; });
+  return talkOverlayWin;
+}
+
+function talkOverlayPaint(state) {                              // [#1224]
+  if (!talkOverlayWin || talkOverlayWin.isDestroyed()) return;
+  const payload = JSON.stringify(state);
+  talkOverlayWin.webContents
+    .executeJavaScript(
+      "window.pineTalkPaint && window.pineTalkPaint(" + payload + ")")
+    .catch(() => { /* the page is still loading; did-finish-load replays */ });
+}
+
+ipcMain.handle("talk:overlay", (_event, want) => {              // [#1224]
+  try {
+    const state = want && typeof want === "object" ? want : {};
+    const mode = String(state.mode || "idle");
+    clearTimeout(talkOverlayTimer);
+    if (mode === "off") {
+      talkOverlayLast = null;
+      if (talkOverlayWin && !talkOverlayWin.isDestroyed()) {
+        talkOverlayPaint({ mode: "idle", text: "", bad: false, level: 0 });
+        talkOverlayWin.hide();
+      }
+      return { ok: true, shown: false };
+    }
+    talkOverlayLast = {
+      mode,
+      text: String(state.text || "").slice(0, 400),
+      bad: !!state.bad,
+      level: Math.max(0, Math.min(1, Number(state.level) || 0))
+    };
+    const win = talkOverlayWindow();
+    talkOverlayPaint(talkOverlayLast);
+    if (!win.isVisible()) win.showInactive();
+    /* Re-assert the level: another app going full screen can demote it. */
+    win.setAlwaysOnTop(true, "screen-saver");
+    /* NOTHING MAY LEAVE IT ON SCREEN.  A renderer that is torn down
+     * mid-take never sends the "off", and an overlay stuck over every
+     * window is worse than no overlay at all. */
+    talkOverlayTimer = setTimeout(() => {
+      try {
+        if (talkOverlayWin && !talkOverlayWin.isDestroyed()) {
+          talkOverlayWin.hide();
+        }
+      } catch { /* already gone */ }
+    }, TALK_OVERLAY_CEILING_MS);
+    return { ok: true, shown: true };
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+/* ===================== end #1224 ===================================== */
 ipcMain.handle("backend:start", async () => {
   const started = startBackend();
   const ok = await waitForHealth(readConfig().baseUrl);

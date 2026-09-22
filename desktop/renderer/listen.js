@@ -1574,6 +1574,22 @@
       + 'the player itself."><span>here</span>'
       + '<input id="plDeskLocal" type="range" min="0" max="100" step="1">'
       + '<i id="plDeskLocalVal"></i></label>'
+      /* [#1187]: "Offer a slider for setting the volume of videos that play
+       * as well."  Everything with a picture and a soundtrack on this glass:
+       * the SFX guy's set, the panel's little CRT tube, and - on the tablet -
+       * the NATIVE endless wall, which is an ExoPlayer on a SurfaceView and
+       * is reached through the bridge rather than through the DOM.
+       *
+       * 0-100 and no further, deliberately.  This lands on a real
+       * <video>.volume (and on ExoPlayer's own volume), which cannot exceed
+       * 1; a knob that said 150% would have dead travel on it, which is the
+       * lie #1222 exists to remove. */
+      + '<label class="pl-deskrow" title="How loud videos play on this '
+      + 'terminal - the SFX set, the little CRT tube, and the endless set. '
+      + 'A video cannot play louder than itself, so this one stops at 100%. '
+      + 'Remembered on this device."><span>videos</span>'
+      + '<input id="plDeskVideo" type="range" min="0" max="100" step="1">'
+      + '<i id="plDeskVideoVal"></i></label>'
       + '<i class="pl-deskwhy">This terminal only. The station has no '
       + 'per-listener level; these are the desk this panel already has. '
       + '<span id="plDeskWhere"></span></i>'
@@ -1924,6 +1940,92 @@
         if (vol) vol.value = local.value;
       });
     }
+    wireVideoRow();                                              /* [#1187] */
+  }
+
+  /* [#1187]: THE VIDEOS ROW, ON ITS OWN ROAD.
+   *
+   * window.pineLevels (audio-law.js, #1192) is the one bus for the four
+   * listener levels.  It persists to this device's `pineMixer`, moves
+   * everything this document owns synchronously, and coalesces the two
+   * things that cost a crossing - the shell's injection into its webviews
+   * and the tablet's native video wall - onto one animation frame.
+   *
+   * So this handler is free to fire per pixel: the label and the sound in
+   * this window move under the thumb, and nothing queues a tail of stale
+   * writes behind the finger. */
+  function videoBus() {
+    return (root.pineLevels && typeof root.pineLevels.apply === "function")
+      ? root.pineLevels : null;
+  }
+
+  function videoLevelNow() {
+    const bus = videoBus();
+    if (bus) {
+      const got = Number((bus.get() || {}).video);
+      if (Number.isFinite(got)) return Math.max(0, Math.min(1, got));
+    }
+    try {
+      const m = JSON.parse(localStorage.getItem("pineMixer") || "{}") || {};
+      const v = Number(m.video);
+      if (Number.isFinite(v)) return Math.max(0, Math.min(1, v));
+    } catch (err) { /* first run */ }
+    return 1;
+  }
+
+  function wireVideoRow() {
+    const row = el("plDeskVideo");
+    if (!row || row.dataset.wired) return;
+    row.dataset.wired = "1";
+    const label = el("plDeskVideoVal");
+    const paint = (pct, road) => {
+      if (!label) return;
+      label.textContent = pct + "%" + (road ? "" : " (no video here)");
+      label.classList.toggle("gone", !road);
+    };
+    row.value = String(Math.round(videoLevelNow() * 100));
+    paint(row.value, videoBus() ? "bus" : "");
+    row.addEventListener("input", () => {
+      deskTouched.video = Date.now();     /* a read-back must not fight the thumb */
+      const want = Number(row.value) / 100;
+      const bus = videoBus();
+      let road = "";
+      if (bus) {
+        road = bus.apply("video", want) || "bus";
+      } else {
+        /* No bus in this host: keep the honest old road rather than a dead
+         * knob - the store plus whatever mixer this document has. */
+        try {
+          const m = JSON.parse(localStorage.getItem("pineMixer") || "{}") || {};
+          m.video = want;
+          localStorage.setItem("pineMixer", JSON.stringify(m));
+          road = "store";
+        } catch (err) { /* private mode */ }
+        try {
+          if (root.pineMixer && root.pineMixer.set) {
+            root.pineMixer.set({video: want});
+            road = "mixer";
+          }
+        } catch (err) { /* the store still moved */ }
+      }
+      paint(row.value, road);
+    });
+  }
+
+  /* Read back, but never over a thumb that is still on it. */
+  function paintVideoRow() {
+    const row = el("plDeskVideo");
+    if (!row) return;
+    if (document.activeElement === row) return;
+    if (Date.now() - (deskTouched.video || 0) < 1200) return;
+    const pct = String(Math.round(videoLevelNow() * 100));
+    if (row.value === pct) return;
+    row.value = pct;
+    const label = el("plDeskVideoVal");
+    if (label) {
+      label.textContent = pct + "%";
+      label.classList.toggle("gone", !videoBus());
+    }
   }
 
   /* The HERE row's writer and its road probe. The probe is applyVolume's
@@ -2188,6 +2290,7 @@
       const label = el("plDeskLocalVal");
       if (label) { label.textContent = here + "%"; label.classList.remove("gone"); }
     }
+    paintVideoRow();                                               /* [#1187] */
     /* WHERE THESE KNOBS LAND, SAID ON THE FACE OF THE DRAWER.
      * The operator asked for the sliders to mix what he is hearing; when
      * the desk they reach is in another document he should be able to see

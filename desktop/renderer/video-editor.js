@@ -11,6 +11,11 @@
   var frameRing = [], FRAME_RING = 48, spriteImage = null, spriteUrl = '';
   var seekWatch = 0, loadWatch = 0, decodeWatch = 0, loadPhase = '';
   var sourceId = new URLSearchParams(location.search).get('source') || '';
+  /* [#1223] The station puts ?sfx=1 on the url it hands back when the
+     source it adopted is a clip out of the library. Nothing about the
+     editor changes except that a second landing becomes available. */
+  var sfxClip = new URLSearchParams(location.search).get('sfx') === '1';
+  var sfxPlan = null;
   var host = window;
   try { if (window.parent !== window && window.parent.location.origin === location.origin) host = window.parent; } catch (_) { /* standalone */ }
   var bridge = host.pineDesktop || window.pineDesktop || {};
@@ -24,17 +29,32 @@
     if (host !== window) host.postMessage(data, location.origin);
     window.dispatchEvent(new CustomEvent(type, {detail: detail || {}}));
   }
-  async function api(method, path, body) {
+  async function api(method, path, body, again) {
     var result;
     if (method === 'GET' && typeof bridge.get === 'function') result = await bridge.get(path);
     else if (method === 'POST' && typeof bridge.post === 'function') result = await bridge.post(path, body);
     else if (host !== window && typeof host.api === 'function') result = await host.api(path, {method: method, body: body ? JSON.stringify(body) : undefined});
     else {
+      /* [#1242] THIS IS THE BRANCH THE DESK TAKES, AND IT HAD NO CREDENTIAL.
+       * The desk opens this page in an iframe from a file:// document, so the
+       * parent is cross-origin, Electron's preload is not injected into
+       * subframes, and window.__PINE_VIDEO_EDITOR_KEY is assigned nowhere in
+       * the tree. The permit below is what the station now accepts instead. */
       var headers = {'Content-Type': 'application/json'}, key = window.__PINE_VIDEO_EDITOR_KEY || '';
       if (key) headers.Authorization = 'Bearer ' + key;
+      if (savePermit) headers['X-Pine-Save-Token'] = savePermit;                    /* [#1242] */
       var response = await fetch(path, {method: method, headers: headers, body: body ? JSON.stringify(body) : undefined});
-      result = await response.json();
-      if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'The video could not be processed.');
+      result = await response.json().catch(function () { return {}; });
+      if (!response.ok) {
+        /* A refusal is not an answer. One re-mint and one retry happen before
+         * the operator is ever shown the word. */
+        if (!again && (response.status === 401 || response.status === 403)
+          && await permitRenew()) return api(method, path, body, true);            /* [#1242] */
+        var refused = new Error(typeof result.detail === 'string' ? result.detail : 'The video could not be processed.');
+        refused.status = response.status;
+        refused.locked = response.status === 401 || response.status === 403;
+        throw refused;
+      }
     }
     if (!result || result.ok === false || result.error && !result.status) throw new Error(result && (result.error || result.detail) || 'The station did not answer.');
     return result;
@@ -99,7 +119,7 @@
     if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
     var crop = displayCrop(), cw = source.width * crop.w, ch = source.height * crop.h, sideways = edit.rotation % 180;
-    frameRect = M.fit(w, h, sideways ? ch / cw : cw / ch);
+    frameRect = viewApply(M.fit(w, h, sideways ? ch / cw : cw / ch));              /* [#1242] */
     var scale = frameRect.w / (sideways ? ch : cw);
     ctx.save(); ctx.beginPath(); ctx.rect(frameRect.x, frameRect.y, frameRect.w, frameRect.h); ctx.clip();
     ctx.translate(frameRect.x + frameRect.w / 2, frameRect.y + frameRect.h / 2); ctx.rotate(edit.rotation * Math.PI / 180); ctx.scale(scale, scale);
@@ -327,6 +347,9 @@
     $('audio').checked = !!edit.include_audio; $('audio').disabled = !source.has_audio || busy; video.muted = !edit.include_audio;
     $('audioLabel').textContent = source.has_audio ? 'Include audio' : 'No audio in recording';
     $('undo').disabled = !past.length || busy; $('redo').disabled = !future.length || busy; $('save').disabled = busy || source.status !== 'ready'; $('play').disabled = busy;
+    /* [#1223] the same rule as Save copy. Guarded, because this editor is
+       also served to a page whose HTML has not been updated yet. */
+    if ($('saveOver')) $('saveOver').disabled = busy || source.status !== 'ready';
     $('clearMarks').disabled = !edit.marks.length;
     ['brightness', 'contrast', 'saturation'].forEach(function (key) { $(key).value = edit[key]; $(key + 'Value').textContent = Math.round((edit[key] - 1) * 100); });
     var size = M.outputSize(source, edit); $('dimensions').textContent = size.width + ' × ' + size.height;
@@ -391,6 +414,57 @@
     changed();
   });
   ['pointerup', 'pointercancel'].forEach(function (name) { canvas.addEventListener(name, function () { gesture = null; changed(); }); });
+
+  /* [#1221] STROKES DRAWN WHILE THIS WINDOW WAS PUSHED OFF THE SCREEN.
+   *
+   * "For the video editor frame window that pops up when we do a capture, I
+   *  want to be able to slide it out of the screen so that way I can draw on
+   *  the screen full screen."
+   *
+   * hot-corners.js parks this window at the edge and puts a transparent ink
+   * pad over the live screen behind it. The recording being edited is a
+   * recording OF THAT SCREEN, so a stroke's place on the glass is its place in
+   * the frame, and the pad hands them over already normalised. They arrive
+   * here as ordinary Draw-layer marks: one Undo takes the whole handover back,
+   * and Save carries them in the overlay PNG exactly like hand-drawn ones.
+   *
+   * WHO IS ALLOWED TO SEND THEM. Only the window that embedded this one, and
+   * only when there IS one. The desk cannot compare origins with its embedder
+   * (the shell is not the station), so the guard is the frame relationship
+   * rather than a string - and every number that arrives is clamped, the kind
+   * is one of three words, and the colour has to be six hex digits, so the
+   * worst a stranger's frame could do is draw on a recording it cannot read. */
+  window.addEventListener('message', function (event) {
+    if (window.parent === window || event.source !== window.parent) return;
+    var data = event.data;
+    if (!data || data.type !== 'pine-video-editor-marks' || !Array.isArray(data.marks)) return;
+    if (!source || !edit || busy) return;
+    remember();
+    var added = 0;
+    data.marks.forEach(function (mark) {
+      if (!mark || !Array.isArray(mark.points) || !mark.points.length) return;
+      if (edit.marks.length >= 100) return;
+      var points = [];
+      mark.points.slice(0, 1600).forEach(function (point) {
+        var x = Number(point && point.x), y = Number(point && point.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        points.push({x: M.clamp(x, 0, 1), y: M.clamp(y, 0, 1)});
+      });
+      if (!points.length) return;
+      edit.marks.push({
+        kind: mark.kind === 'box' || mark.kind === 'arrow' ? mark.kind : 'pen',
+        color: /^#[0-9a-fA-F]{6}$/.test(String(mark.color)) ? String(mark.color) : '#ff2828',
+        weight: M.clamp(Number(mark.weight) || 6, 1, 24),
+        points: points
+      });
+      added += 1;
+    });
+    if (!added) { past.pop(); return; }
+    pickTab('draw');
+    changed();
+    status(added === 1 ? 'One stroke from the screen joined the drawings.'
+      : added + ' strokes from the screen joined the drawings.');
+  });
 
   function pickTab(name) { tab = name; document.querySelectorAll('[data-tab]').forEach(function (b) { b.classList.toggle('selected', b.dataset.tab === name); b.setAttribute('aria-pressed', b.dataset.tab === name); }); document.querySelectorAll('[data-panel]').forEach(function (p) { p.hidden = p.dataset.panel !== name; }); $('cropHint').hidden = name !== 'crop'; repaint(); }
   document.querySelectorAll('[data-tab]').forEach(function (b) { b.addEventListener('click', function () { if (!busy) pickTab(b.dataset.tab); }); });
@@ -572,6 +646,7 @@
     status('Opening your recording…');
     try {
       var result = await api('GET', '/api/video-editor/sources/' + encodeURIComponent(sourceId)); if (disposed) return;
+      permitTake(result);                                                          /* [#1242] */
       sourceFailed = result.status === 'failed' || result.status === 'error';
       if (sourceFailed) throw new Error(result.error || 'The recording could not be opened.');
       if (result.url && result.duration > 0 && result.width > 0 && result.height > 0) hydrate(result);
@@ -586,6 +661,7 @@
     drawMarks(c.getContext('2d'), edit.marks, source.width, source.height); return c.toDataURL('image/png');
   }
   async function finishSave(result) {
+    lastExport = result;                                                           /* [#1242] */
     $('download').href = result.url || '/api/video-editor/exports/' + result.id + '/file'; $('download').download = result.name || 'edited-video.mp4'; $('download').hidden = false;
     notify('pine-video-editor-export', {id: result.id, export_id: result.id, url: result.url, name: result.name});
     if (typeof bridge.replayKeepEdited === 'function') {
@@ -593,14 +669,27 @@
       var saved = await bridge.replayKeepEdited({export_id: result.id, name: result.name});
       if (!saved || saved.ok === false) throw new Error(saved && (saved.detail || saved.error) || 'The copy is ready, but could not be saved on this device.');
       status('Saved copy. Your original is kept.');
-    } else status('Your copy is ready to download.');
+      toast('Saved to ' + (saved.where || 'this device'));                         /* [#1207] */
+    } else {
+      /* [#1242] No bridge on this surface — the desk's cross-origin iframe and
+       * any plain browser. "Your copy is ready to download" left the clip
+       * sitting behind a link nobody was told to press. The copy goes to the
+       * device now: Electron catches the download in will-download and opens
+       * the save window on the folder the last save went to. */
+      var kept = await keepOnDevice($('download').href, $('download').download);
+      if (kept.ok && kept.where) { status('Saved to ' + kept.where + '. Your original is kept.'); toast('Saved to ' + kept.where); }
+      else if (kept.ok) { status('Your copy is made — choose where to keep it.'); toast('Choose where to keep the copy'); }
+      else { status('Your copy is made, but it did not reach this device.', true, save); showEscape(kept.detail || 'The copy is made but was not written to this device.'); }
+    }
   }
-  async function save() {
+  async function save(land) {
     if (!source || !edit || busy || source.status !== 'ready') return;
     busy = true; video.pause(); document.body.classList.add('busy'); $('save').textContent = 'Saving…'; changed(); $('download').hidden = true;
     try {
       status('Creating your copy…');
+      exportShow(0);                                                               /* [#1207] */
       var body = M.exportBody(source, edit, overlayImage()), signature = JSON.stringify(body);
+      if (savePermit) body.save_token = savePermit;             /* [#1242] after the signature, never in it */
       if (!exportState || exportState.signature !== signature) exportState = {signature: signature, result: await api('POST', '/api/video-editor/exports', body)};
       var result = exportState.result, id = result.id;
       while (!['complete', 'done', 'failed', 'error'].includes(result.status)) {
@@ -608,16 +697,515 @@
         await new Promise(function (resolve) { setTimeout(resolve, 1000); });
         result = await api('GET', result.poll_url || '/api/video-editor/exports/' + encodeURIComponent(id));
         result.id = result.id || id; exportState.result = result;
-        if (result.progress !== undefined) status('Creating your copy… ' + Math.round(Number(result.progress) <= 1 ? Number(result.progress) * 100 : Number(result.progress)) + '%');
+        if (result.progress !== undefined) {
+          /* [#1207] one reading, three places: the scan bar, the flat bar and
+           * the footer. The number is ffmpeg's own out_time, not a guess. */
+          var share = Number(result.progress) <= 1 ? Number(result.progress) : Number(result.progress) / 100;
+          exportShow(share);
+          status('Creating your copy… ' + Math.round(share * 100) + '%'
+            + (result.eta_s > 1 ? ' · about ' + Math.round(result.eta_s) + 's left' : ''));
+        }
       }
       if (['failed', 'error'].includes(result.status)) { exportState = null; throw new Error(result.error || 'The copy could not be made.'); }
-      result.id = result.id || id; await finishSave(result);
-    } catch (error) { status(error.message || 'The copy could not be saved.', true, save); }
-    finally { busy = false; document.body.classList.remove('busy'); $('save').textContent = 'Save copy'; changed(); }
+      lastExport = result; exportShow(1); await exportHold(420);                   /* [#1207] the bar lands on 100 */
+      result.id = result.id || id;
+      /* [#1223] the one export loop, two landings. A click Event is not a
+         function, so the plain Save copy button still lands in
+         finishSave() exactly as it always has. */
+      await (typeof land === 'function' ? land(result) : finishSave(result));
+    } catch (error) { saveEscape(error); }                                         /* [#1242] */
+    finally { exportHide(); busy = false; document.body.classList.remove('busy'); $('save').textContent = 'Save copy'; changed(); }
   }
+
+  /* ---------------- [#1223] back over the library clip ---------------- */
+
+  /* What the save will do, asked of the station rather than guessed here:
+     the container has the samples share mounted READ-ONLY, so for most
+     clips "save over the original" cannot mean what it says, and the
+     honest answer - a copy in the station's own folder that supersedes
+     the original - has to be in front of the operator BEFORE the render,
+     not in an error after it. */
+  async function sfxWhere() {
+    var button = $('saveOver'), notice = $('sfxNotice');
+    if (!sfxClip || !sourceId || !button) return;
+    try {
+      sfxPlan = await api('GET', '/api/sfx/edit/where?source=' + encodeURIComponent(sourceId));
+    } catch (error) { sfxPlan = null; }
+    if (!sfxPlan || !sfxPlan.ok) return;
+    button.hidden = false;
+    button.textContent = sfxPlan.in_place ? 'Save over the original' : 'Save and replace on air';
+    button.title = String(sfxPlan.say || '');
+    var line = String(sfxPlan.say || '');
+    if (sfxPlan.supports) line += '. This editor gives you ' + sfxPlan.supports + '.';
+    if (notice) { notice.textContent = line; notice.hidden = !line; }
+  }
+
+  async function landOnClip(result) {
+    status('Putting it back in the library…');
+    var saved = await api('POST', '/api/sfx/edit/save', {export: result.id});
+    status(String(saved.say || 'Saved.'));
+    /* The sheet that opened this editor listens for this and reopens on
+       whatever clip goes out from now on - the same file when the save
+       was in place, the edited copy when it was not. */
+    notify('pine-sfx-edit-saved', saved);
+  }
+
+  if ($('saveOver')) $('saveOver').addEventListener('click', function () { save(landOnClip); });
+  sfxWhere();
   $('save').addEventListener('click', save);
   if (typeof ResizeObserver !== 'undefined') new ResizeObserver(function () { repaint(); waveform(); }).observe(viewer);
   else window.addEventListener('resize', function () { repaint(); waveform(); });
   window.addEventListener('pagehide', function () { disposed = true; video.pause(); clearTimeout(sourcePoll); cancelAnimationFrame(raf); });
+
+  /* ==========================================================================
+   * [#1242] A SAVE THAT CANNOT END IN "UNAUTHORIZED"
+   * [#1207] and an export that can be WATCHED, on the footage
+   *
+   * "There should be no reason that I'm not able to save a clip ever. So it
+   *  needs to at least pop up a window letting me export and save a clip."
+   *
+   * Everything below is additive: new top-level functions inside this IIFE.
+   * ======================================================================== */
+
+  var savePermit = new URLSearchParams(location.search).get('save') || '';
+  var savePermitAsked = 0, lastExport = null;
+
+  /* The source record carries a permit for ITS OWN source id. Reads are open
+   * on this station, so this is the road that works on every surface — the
+   * desk's cross-origin iframe included. */
+  function permitTake(record) {
+    if (record && record.save_token) savePermit = String(record.save_token);
+  }
+
+  /* The page that opened us holds the key. hot-corners.js answers this ask by
+   * minting on /api/video-editor/sources/<id>/save-token and posting the
+   * permit back. The reply is accepted only from our own parent — the only
+   * window that could already navigate us anywhere it liked. */
+  function permitFromOpener() {
+    var up = null;
+    try { up = window.parent && window.parent !== window ? window.parent : null; } catch (err) { up = null; }
+    if (!up || !sourceId) return Promise.resolve(false);
+    return new Promise(function (resolve) {
+      var settled = false;
+      function heard(event) {
+        if (settled || event.source !== up) return;
+        var said = event.data;
+        if (!said || said.type !== 'pine-video-editor-save-token') return;
+        settled = true; window.removeEventListener('message', heard);
+        var got = (said.detail && said.detail.save_token) || said.save_token || '';
+        if (got) savePermit = String(got);
+        resolve(!!got);
+      }
+      window.addEventListener('message', heard);
+      try { up.postMessage({type: 'pine-video-editor-need-save-token', detail: {source_id: sourceId}}, '*'); }
+      catch (err) { /* the parent is gone; the timer below closes it out */ }
+      setTimeout(function () {
+        if (settled) return;
+        settled = true; window.removeEventListener('message', heard); resolve(false);
+      }, 2500);
+    });
+  }
+
+  async function permitRenew() {
+    if (!sourceId) return false;
+    var now = Date.now();
+    if (now - savePermitAsked < 1500) return false;
+    savePermitAsked = now;
+    var had = savePermit;
+    try {
+      var answer = await fetch('/api/video-editor/sources/' + encodeURIComponent(sourceId)
+        + '?mint=' + now, {cache: 'no-store'});
+      if (answer.ok) { var record = await answer.json(); permitTake(record); }
+    } catch (err) { /* the read door is shut too; ask the opener */ }
+    if (savePermit && savePermit !== had) return true;
+    await permitFromOpener();
+    return !!savePermit && savePermit !== had;
+  }
+
+  /* ------------------------------------------------ putting a file on a device */
+
+  function bytesToBase64(buffer) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { var s = String(reader.result || ''); resolve(s.slice(s.indexOf(',') + 1)); };
+      reader.onerror = function () { reject(new Error('the clip could not be read back')); };
+      reader.readAsDataURL(new Blob([buffer], {type: 'video/mp4'}));
+    });
+  }
+
+  function safeName(name, fallback) {
+    var said = String(name || '').replace(/[^\w.() -]+/g, '-').replace(/\s+/g, ' ').trim();
+    if (!said) said = fallback;
+    if (!/\.mp4$/i.test(said)) said += '.mp4';
+    return said.slice(-120);
+  }
+
+  /* Two roads, because the two surfaces are genuinely different. An <a download>
+   * is INERT inside the tablet's WebView, so there the bytes go through the
+   * native MediaStore road the sampler kits already use. On the desk the anchor
+   * IS the road: Electron catches it in will-download (main.js, session-created)
+   * and opens the save window on the folder the last save went to. */
+  async function keepOnDevice(url, name) {
+    var called = safeName(name, 'pine-edited');
+    if (typeof bridge.saveBytes === 'function') {
+      try {
+        var raw = await fetch(url, {cache: 'no-store'});
+        if (!raw.ok) throw new Error('the station would not hand the file over (' + raw.status + ')');
+        var b64 = await bytesToBase64(await raw.arrayBuffer());
+        var kept = await bridge.saveBytes({base64: b64, name: called, folder: 'Pine Box', mime: 'video/mp4'});
+        if (kept && kept.ok) return {ok: true, road: 'tablet', where: kept.where || 'Downloads/Pine Box'};
+        return {ok: false, road: 'tablet', where: '', detail: (kept && kept.detail) || 'the tablet would not write the file'};
+      } catch (err) { return {ok: false, road: 'tablet', where: '', detail: err.message}; }
+    }
+    try {
+      var link = document.createElement('a');
+      link.href = url; link.download = called; link.rel = 'noopener'; link.style.display = 'none';
+      document.body.appendChild(link); link.click();
+      setTimeout(function () { if (link.parentNode) link.parentNode.removeChild(link); }, 4000);
+      return {ok: true, road: 'dialog', where: ''};
+    } catch (err) { return {ok: false, road: 'dialog', where: '', detail: err.message}; }
+  }
+
+  function originalUrl() {
+    return (source && source.url) || ('/api/video-editor/sources/' + encodeURIComponent(sourceId) + '/file');
+  }
+
+  /* ------------------------------------------------------------------ toast */
+
+  function toast(text) {
+    var node = document.getElementById('veToast');
+    if (!node) {
+      node = document.createElement('div');
+      node.id = 'veToast'; node.className = 've-toast'; node.setAttribute('role', 'status');
+      document.body.appendChild(node);
+    }
+    node.textContent = String(text || '');
+    node.classList.add('on');
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(function () { node.classList.remove('on'); }, 7000);
+  }
+
+  /* --------------------------------------------------------- the escape window */
+
+  function escapeClose() {
+    var old = document.getElementById('veEscape');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+  }
+
+  /* Every failure the save can suffer ends here, and this window never offers
+   * a road that needs the station's permission. The original recording can
+   * always be kept: reading it is the same open read that painted the
+   * filmstrip on this very screen. */
+  function showEscape(why) {
+    escapeClose();
+    var box = document.createElement('div');
+    box.className = 've-escape'; box.id = 'veEscape';
+    box.setAttribute('role', 'dialog'); box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-label', 'Other ways to save this clip');
+    var card = document.createElement('div'); card.className = 've-escape-card';
+    var head = document.createElement('h2'); head.textContent = 'Save this clip another way';
+    var said = document.createElement('p'); said.className = 've-escape-why'; said.textContent = String(why || 'The copy could not be saved.');
+    var kept = document.createElement('p'); kept.className = 've-escape-note';
+    kept.textContent = 'Your original recording is kept whatever you choose here.';
+    var told = document.createElement('p'); told.className = 've-escape-told'; told.setAttribute('role', 'status'); told.hidden = true;
+    var rows = document.createElement('div'); rows.className = 've-escape-rows';
+    card.appendChild(head); card.appendChild(said); card.appendChild(kept); card.appendChild(rows); card.appendChild(told);
+    box.appendChild(card); document.body.appendChild(box);
+
+    function tell(text, bad) { told.textContent = text; told.hidden = !text; told.classList.toggle('bad', !!bad); }
+    function row(label, hint, run) {
+      var line = document.createElement('div'); line.className = 've-escape-row';
+      var press = document.createElement('button'); press.type = 'button'; press.textContent = label;
+      var note = document.createElement('span'); note.textContent = hint;
+      press.addEventListener('click', async function () {
+        press.disabled = true; tell('Working…');
+        try { await run(tell); } catch (err) { tell(err.message || 'That road did not answer either.', true); }
+        press.disabled = false;
+      });
+      line.appendChild(press); line.appendChild(note); rows.appendChild(line);
+      return press;
+    }
+
+    if (lastExport && lastExport.id) {
+      row('Keep the edited copy', 'the trimmed clip, on this device', async function (tell) {
+        var got = await keepOnDevice(lastExport.url || ('/api/video-editor/exports/' + lastExport.id + '/file'),
+          lastExport.name || 'pine-edited.mp4');
+        if (got.ok && got.where) { tell('Kept to ' + got.where); toast('Saved to ' + got.where); }
+        else if (got.ok) tell('The save window is open — choose where to keep it.');
+        else tell(got.detail || 'This device would not take the file.', true);
+      });
+      row('Send it to the export courier', 'the desk carries it to your export folder', async function (tell) {
+        var answer = await api('POST', '/api/video-editor/exports/'
+          + encodeURIComponent(lastExport.id) + '/courier', {});
+        tell(answer.detail || ('Handed to the courier for ' + (answer.dest || 'the export folder')));
+        toast(answer.detail || 'Handed to the export courier');
+      });
+    }
+    row('Keep the original recording', 'untrimmed, and it always works', async function (tell) {
+      var got = await keepOnDevice(originalUrl(), source && source.name ? source.name : 'pine-recording');
+      if (got.ok && got.where) { tell('Kept to ' + got.where); toast('Saved to ' + got.where); }
+      else if (got.ok) tell('The save window is open — choose where to keep it.');
+      else tell(got.detail || 'This device would not take the file.', true);
+    });
+    row('Try the save again', 'ask the station once more', async function () { escapeClose(); save(); });
+
+    var shut = document.createElement('button');
+    shut.type = 'button'; shut.className = 'quiet ve-escape-shut'; shut.textContent = 'Close';
+    shut.addEventListener('click', escapeClose);
+    card.appendChild(shut);
+    box.addEventListener('click', function (event) { if (event.target === box) escapeClose(); });
+    setTimeout(function () { try { card.querySelector('button').focus(); } catch (err) { /* no focus */ } }, 0);
+  }
+
+  function saveEscape(error) {
+    var why = (error && error.message) || 'The copy could not be saved.';
+    if (error && error.locked) {
+      why = 'This editor window has no live permission to render a copy, so the '
+        + 'station refused. Everything below saves the clip without it.';
+    }
+    status(why, true, save);
+    showEscape(why);
+  }
+
+  /* ====================================================== [#1207] the scan bar
+   * "I want to see a 3JS powered visualization of a loading bar happening on
+   *  the footage showing the progress of it happening while it's being
+   *  exported with a loading bar kind of scrolling across on the footage."
+   *
+   * three.js is VENDORED — the station serves it at /vendor/three.min.js and
+   * this page is served BY the station, so the bare path is right and no CDN
+   * is ever reached (the tablet has no internet). Where there is no WebGL the
+   * flat bar underneath carries the same number.
+   * ======================================================================== */
+
+  var exportLayer = null, exportScene = null, exportTried = false, exportRaf = 0;
+  var exportSeen = 0, exportAt = 0, exportT0 = 0;
+
+  function threeReady() {
+    if (window.THREE) return Promise.resolve(window.THREE);
+    /* Same-origin parent (the tablet's panel) has already paid for three.js. */
+    try { if (host !== window && host.THREE) { window.THREE = host.THREE; return Promise.resolve(window.THREE); } }
+    catch (err) { /* cross-origin parent; load our own */ }
+    if (threeReady.pending) return threeReady.pending;
+    threeReady.pending = new Promise(function (resolve) {
+      var tag = document.createElement('script');
+      tag.src = '/vendor/three.min.js';
+      tag.onload = function () { resolve(window.THREE || null); };
+      tag.onerror = function () { resolve(null); };
+      document.head.appendChild(tag);
+    });
+    return threeReady.pending;
+  }
+
+  function buildExportLayer() {
+    var root = document.createElement('div');
+    root.className = 've-export'; root.id = 'veExport'; root.hidden = true;
+    var glass = document.createElement('canvas'); glass.className = 've-export-gl';
+    var say = document.createElement('span'); say.className = 've-export-say'; say.textContent = 'Exporting this segment';
+    var pct = document.createElement('span'); pct.className = 've-export-pct'; pct.textContent = '0%';
+    var bar = document.createElement('div'); bar.className = 've-export-bar';
+    var fill = document.createElement('i'); fill.className = 've-export-fill';
+    bar.appendChild(fill);
+    root.appendChild(glass); root.appendChild(say); root.appendChild(pct); root.appendChild(bar);
+    viewer.appendChild(root);
+    return {root: root, glass: glass, bar: bar, fill: fill, pct: pct, say: say};
+  }
+
+  function makeScanScene(THREE, glass) {
+    var renderer = new THREE.WebGLRenderer({canvas: glass, alpha: true, antialias: false});
+    renderer.setClearColor(0x000000, 0);
+    var camera = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, 0, 10);
+    camera.position.z = 2;
+    var scene = new THREE.Scene();
+    var uniforms = {uHead: {value: 0}, uDone: {value: 0}, uTime: {value: 0}};
+    var sheet = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({
+      uniforms: uniforms, transparent: true, depthTest: false, depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexShader: 'varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
+      fragmentShader: [
+        'precision mediump float;',
+        'varying vec2 vUv;uniform float uHead;uniform float uDone;uniform float uTime;',
+        'void main(){',
+        '  float d = abs(vUv.x - uHead);',
+        '  float core = smoothstep(0.010, 0.0, d);',
+        '  float halo = smoothstep(0.100, 0.0, d) * 0.34;',
+        '  float ripple = 0.11 * smoothstep(0.24, 0.0, d) * (0.5 + 0.5 * sin(vUv.y * 46.0 - uTime * 4.2));',
+        '  float behind = step(vUv.x, uDone) * 0.085;',
+        '  float rail = smoothstep(0.006, 0.0, min(vUv.y, 1.0 - vUv.y)) * step(vUv.x, uDone) * 0.30;',
+        '  float a = core + halo + ripple + behind + rail;',
+        '  vec3 col = mix(vec3(1.00, 0.84, 0.04), vec3(0.22, 0.76, 1.00), clamp(d * 9.0, 0.0, 1.0));',
+        '  gl_FragColor = vec4(col, clamp(a, 0.0, 0.85));',
+        '}'
+      ].join('\n')
+    }));
+    scene.add(sheet);
+    var N = 240, pos = new Float32Array(N * 3), seed = new Float32Array(N * 3);
+    for (var i = 0; i < N; i += 1) {
+      seed[i * 3] = Math.random();
+      seed[i * 3 + 1] = Math.random() - 0.5;
+      seed[i * 3 + 2] = 0.4 + Math.random() * 1.8;
+    }
+    var cloud = new THREE.BufferGeometry();
+    cloud.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    scene.add(new THREE.Points(cloud, new THREE.PointsMaterial({
+      color: 0xffd60a, size: 2.4, sizeAttenuation: false, transparent: true,
+      opacity: .55, depthTest: false, depthWrite: false, blending: THREE.AdditiveBlending
+    })));
+    return {renderer: renderer, camera: camera, scene: scene, uniforms: uniforms,
+      pos: pos, seed: seed, n: N, attr: cloud.getAttribute('position'), w: 0, h: 0};
+  }
+
+  function startExportGl() {
+    exportTried = true;
+    var able = false;
+    try { var probe = document.createElement('canvas'); able = !!(probe.getContext('webgl2') || probe.getContext('webgl')); }
+    catch (err) { able = false; }
+    if (!able) { exportLayer.root.classList.add('flat'); return; }
+    threeReady().then(function (THREE) {
+      if (!THREE || !exportLayer) { if (exportLayer) exportLayer.root.classList.add('flat'); return; }
+      try { exportScene = makeScanScene(THREE, exportLayer.glass); }
+      catch (err) { exportScene = null; exportLayer.root.classList.add('flat'); }
+    });
+  }
+
+  function exportTick() {
+    exportRaf = 0;
+    if (!exportLayer || exportLayer.root.hidden) return;
+    var now = (window.performance && performance.now ? performance.now() : Date.now()) / 1000;
+    if (!exportT0) exportT0 = now;
+    exportAt += (exportSeen - exportAt) * .10;
+    var head = Math.min(1, exportAt + .055 * (.5 + .5 * Math.sin((now - exportT0) * 2.1)));
+    exportLayer.fill.style.width = (exportAt * 100).toFixed(1) + '%';
+    exportLayer.pct.textContent = Math.round(exportSeen * 100) + '%';
+    var s = exportScene;
+    if (s) {
+      var w = viewer.clientWidth, h = viewer.clientHeight;
+      if (w !== s.w || h !== s.h) {
+        s.w = w; s.h = h;
+        s.renderer.setPixelRatio(Math.min(1.5, window.devicePixelRatio || 1));
+        s.renderer.setSize(w, h, false);
+      }
+      s.uniforms.uHead.value = head;
+      s.uniforms.uDone.value = exportAt;
+      s.uniforms.uTime.value = now - exportT0;
+      for (var i = 0; i < s.n; i += 1) {
+        var lag = s.seed[i * 3] * .15 * (.45 + .55 * Math.sin((now - exportT0) * s.seed[i * 3 + 2] + i));
+        s.pos[i * 3] = head - .5 - Math.abs(lag);
+        s.pos[i * 3 + 1] = s.seed[i * 3 + 1] * .96;
+        s.pos[i * 3 + 2] = 0;
+      }
+      s.attr.needsUpdate = true;
+      try { s.renderer.render(s.scene, s.camera); }
+      catch (err) { exportScene = null; exportLayer.root.classList.add('flat'); }
+    }
+    exportRaf = requestAnimationFrame(exportTick);
+  }
+
+  function exportHold(ms) { return new Promise(function (settle) { setTimeout(settle, ms); }); }
+
+  function exportShow(share) {
+    exportSeen = Math.max(0, Math.min(1, Number(share) || 0));
+    if (!exportLayer) exportLayer = buildExportLayer();
+    exportLayer.root.hidden = false;
+    /* Painted here as well as in the tick, so the number is right the instant
+     * it is known - the last reading of a short render is otherwise only ever
+     * seen by a frame that never gets to run. */
+    exportLayer.pct.textContent = Math.round(exportSeen * 100) + '%';
+    if (exportSeen >= 1) { exportAt = 1; exportLayer.fill.style.width = '100%'; }
+    if (!exportTried) startExportGl();
+    if (!exportRaf) exportRaf = requestAnimationFrame(exportTick);
+  }
+
+  function exportHide() {
+    if (exportRaf) { cancelAnimationFrame(exportRaf); exportRaf = 0; }
+    if (exportLayer) { exportLayer.root.hidden = true; exportLayer.fill.style.width = '0%'; }
+    exportSeen = 0; exportAt = 0; exportT0 = 0;
+  }
+
+  /* ============================================ [#1242] Photoshop navigation
+   * The standing rule for every editor window: wheel zoom about the pointer,
+   * middle-drag pan, 0 to fit. Space is NOT a pan modifier on this surface —
+   * it has a transport, and space is play/pause, which the rule keeps.
+   *
+   * Zoom is applied to frameRect, the one rectangle the whole editor already
+   * measures against, so the crop corners, the ink and the click-to-scrub all
+   * follow the zoom without any of them knowing it exists.
+   * ======================================================================== */
+
+  var view = {scale: 1, x: 0, y: 0}, viewPan = null;
+
+  function viewApply(r) {
+    if (view.scale === 1 && !view.x && !view.y) return r;
+    var cx = viewer.clientWidth / 2, cy = viewer.clientHeight / 2;
+    return {x: cx + (r.x - cx) * view.scale + view.x, y: cy + (r.y - cy) * view.scale + view.y,
+      w: r.w * view.scale, h: r.h * view.scale};
+  }
+
+  function viewClamp() {
+    if (view.scale <= 1.001) { view.scale = 1; view.x = 0; view.y = 0; }
+    else {
+      var w = viewer.clientWidth, h = viewer.clientHeight;
+      view.x = M.clamp(view.x, -w * view.scale, w * view.scale);
+      view.y = M.clamp(view.y, -h * view.scale, h * view.scale);
+    }
+    viewer.classList.toggle('ve-zoomed', view.scale > 1.001);
+  }
+
+  function viewZoom(factor, px, py) {
+    var next = M.clamp(view.scale * factor, 1, 12);
+    if (Math.abs(next - view.scale) < 1e-6) return;
+    var cx = viewer.clientWidth / 2, cy = viewer.clientHeight / 2, k = next / view.scale;
+    view.x = px - cx - (px - cx - view.x) * k;
+    view.y = py - cy - (py - cy - view.y) * k;
+    view.scale = next;
+    viewClamp(); repaint();
+  }
+
+  function viewFit() { view.scale = 1; view.x = 0; view.y = 0; viewClamp(); repaint(); }
+
+  viewer.addEventListener('wheel', function (event) {
+    if (!source || busy) return;
+    event.preventDefault();
+    var r = viewer.getBoundingClientRect();
+    var step = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1);
+    viewZoom(Math.pow(.9985, step), event.clientX - r.left, event.clientY - r.top);
+  }, {passive: false});
+
+  /* Capture phase on the viewer, so the middle button never reaches the
+   * canvas's own pointerdown and starts a scrub, a stroke or a crop. */
+  viewer.addEventListener('pointerdown', function (event) {
+    if (event.button !== 1 || !source || busy) return;
+    event.preventDefault(); event.stopPropagation();
+    viewPan = {id: event.pointerId, x: event.clientX, y: event.clientY};
+    viewer.classList.add('ve-panning');
+    try { viewer.setPointerCapture(event.pointerId); } catch (err) { /* no capture here */ }
+  }, true);
+  viewer.addEventListener('pointermove', function (event) {
+    if (!viewPan || viewPan.id !== event.pointerId) return;
+    event.preventDefault(); event.stopPropagation();
+    view.x += event.clientX - viewPan.x; view.y += event.clientY - viewPan.y;
+    viewPan.x = event.clientX; viewPan.y = event.clientY;
+    viewClamp(); repaint();
+  }, true);
+  ['pointerup', 'pointercancel'].forEach(function (name) {
+    viewer.addEventListener(name, function (event) {
+      if (!viewPan || viewPan.id !== event.pointerId) return;
+      event.stopPropagation(); viewPan = null; viewer.classList.remove('ve-panning');
+      try { viewer.releasePointerCapture(event.pointerId); } catch (err) { /* already gone */ }
+    }, true);
+  });
+  viewer.addEventListener('auxclick', function (event) { if (event.button === 1) event.preventDefault(); });
+  document.addEventListener('keydown', function (event) {
+    if (/INPUT|TEXTAREA/.test(event.target.tagName) || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.key === 'Escape' && document.getElementById('veEscape')) { event.preventDefault(); escapeClose(); return; }
+    if (event.key === '0') { event.preventDefault(); viewFit(); }
+    else if (event.key === '+' || event.key === '=') { event.preventDefault(); viewZoom(1.25, viewer.clientWidth / 2, viewer.clientHeight / 2); }
+    else if (event.key === '-' || event.key === '_') { event.preventDefault(); viewZoom(.8, viewer.clientWidth / 2, viewer.clientHeight / 2); }
+  });
+  window.addEventListener('pagehide', function () {
+    exportHide();
+    if (exportScene) { try { exportScene.renderer.dispose(); } catch (err) { /* going anyway */ } exportScene = null; }
+  });
+
   loadSource();
 })();

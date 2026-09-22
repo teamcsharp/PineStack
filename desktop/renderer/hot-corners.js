@@ -112,6 +112,21 @@
   var SCRUB_STEP = 5;
   var SCRUB_SETTLE = 260;
   var SCRUB_CACHE = 5 * 1024 * 1024;
+  /* [#1221] SLIDING THE CAPTURE WINDOW OUT OF THE WAY.
+   *
+   * "For the video editor frame window that pops up when we do a capture, I
+   *  want to be able to slide it out of the screen so that way I can draw on
+   *  the screen full screen."
+   *
+   * A drag on the grab handle counts once it has carried the window past
+   * SLIDE_TRIGGER of its own width; then it springs to the nearer edge with
+   * SLIDE_PEEK pixels still on screen so the edge is never a bare line, and a
+   * tab is put out to bring it back. The same fraction inward brings it home,
+   * which is why the number is a fraction of the width and not a pixel count:
+   * the desk window and the tablet's 1154 px glass are not the same size. */
+  var SLIDE_TRIGGER = 0.40;
+  var SLIDE_PEEK = 10;
+  var SLIDE_SPRING = 'transform .34s cubic-bezier(.22, 1.18, .36, 1)';
   var ACTIONS = ['off', 'shot', 'export', 'inspect', 'sfx', 'report'];
   var ACTION_WORDS = {
     off: 'Off',
@@ -710,6 +725,270 @@
     sheets.length = 0;
   }
 
+  /* ------------------------------------------- [#1221] the ink, on its own */
+
+  /* THE INK PAD, LIFTED OUT OF THE ANNOTATOR SO BOTH WINDOWS HAVE IT.
+   *
+   * It paints ONLY ink. Everywhere a stroke has not been laid the canvas is
+   * transparent, and that is the whole of why the capture window can leave:
+   * whatever is behind the pad shows through it - the frozen picture on the
+   * annotator's plate while the plate is home, and the LIVE panel once the
+   * plate has been pushed to the edge. The strokes are kept as a list rather
+   * than baked into pixels, so Undo takes one back, Clear takes them all, a
+   * resize repaints them at the new size, and the compose step can lay them
+   * over any background it likes.
+   *
+   * inkPad(canvas) answers {strokes, fit, redraw, undo, clear, metrics}. */
+  function inkPad(canvas) {
+    var ctx = canvas.getContext('2d');
+    var strokes = [];
+    var stroke = null;
+    var W = 0, H = 0, dpr = 1;
+    var inkId = null;
+
+    function inkStyle() {
+      ctx.strokeStyle = 'rgba(255,40,40,.95)';
+      ctx.lineWidth = 6;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+    }
+
+    function fit() {
+      W = root.innerWidth || 1280;
+      H = root.innerHeight || 800;
+      dpr = Math.min(2, root.devicePixelRatio || 1);
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+      canvas.style.width = W + 'px';
+      canvas.style.height = H + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      redraw();
+      return {w: W, h: H, dpr: dpr};
+    }
+
+    function path(points) {
+      if (!points.length) return;
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      if (points.length === 1) ctx.lineTo(points[0].x + 0.01, points[0].y);
+      for (var i = 1; i < points.length; i += 1) ctx.lineTo(points[i].x, points[i].y);
+      ctx.stroke();
+    }
+
+    function redraw() {
+      ctx.clearRect(0, 0, W, H);
+      inkStyle();
+      for (var i = 0; i < strokes.length; i += 1) path(strokes[i]);
+    }
+
+    canvas.addEventListener('pointerdown', function (ev) {
+      if (inkId !== null) return;
+      if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+      inkId = ev.pointerId;
+      try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+      stroke = [{x: ev.clientX, y: ev.clientY}];
+      /* #1154: the ink style is set ONCE per stroke, not once per move.
+       * Every redraw() ends by setting it too, and changing canvas.width
+       * (fit) resets the context and then redraws - so the context is
+       * always carrying the ink's stroke style when a move arrives. */
+      inkStyle();
+      path(stroke);
+      ev.preventDefault();
+    }, {passive: false});
+
+    /* #1154: "This is alright. It looks like it's better, but it is a
+     *  little laggy when I'm drawing the strokes."
+     *
+     * MEASURED FIRST, AND THE OBVIOUS SUSPECT WAS INNOCENT. This handler
+     * already drew only the NEW segment rather than repainting the world,
+     * and it costs 0.055 ms a move on the tablet (240 moves, p95 0.1 ms,
+     * worst 3.1 ms). The page around it is the cost - see hush() - and on
+     * top of that the panel paces requestAnimationFrame to one group every
+     * ~67 ms (app.py, PINE_PACE), so pointermove arrives in clumps rather
+     * than one delivery per digitiser sample.
+     *
+     * COALESCED EVENTS are the cure for what that clumping LOOKS like.
+     * The engine keeps every sample taken between two deliveries; without
+     * asking for them a fast stroke is one straight chord across the whole
+     * gap, which reads as angular AND late. With them the line follows the
+     * finger's real path, and the whole batch goes down as ONE path with
+     * one stroke() rather than a beginPath/stroke pair per point. */
+    canvas.addEventListener('pointermove', function (ev) {
+      if (inkId === null || ev.pointerId !== inkId || !stroke) return;
+      ev.preventDefault();
+      var pts = null;
+      if (typeof ev.getCoalescedEvents === 'function') {
+        try { pts = ev.getCoalescedEvents(); } catch (e) { pts = null; }
+      }
+      if (!pts || !pts.length) pts = [ev];
+      var last = stroke[stroke.length - 1];
+      ctx.beginPath();
+      ctx.moveTo(last.x, last.y);
+      for (var i = 0; i < pts.length; i += 1) {
+        var p = {x: pts[i].clientX, y: pts[i].clientY};
+        stroke.push(p);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }, {passive: false});
+
+    function inkUp(ev) {
+      if (inkId === null || ev.pointerId !== inkId) return;
+      try { canvas.releasePointerCapture(ev.pointerId); } catch (e) { /* not held */ }
+      inkId = null;
+      if (stroke && stroke.length) strokes.push(stroke);
+      stroke = null;
+    }
+    canvas.addEventListener('pointerup', inkUp);
+    canvas.addEventListener('pointercancel', inkUp);
+
+    return {
+      strokes: strokes,
+      fit: fit,
+      redraw: redraw,
+      undo: function () { strokes.pop(); redraw(); },
+      clear: function () { strokes.length = 0; redraw(); },
+      metrics: function () { return {w: W, h: H, dpr: dpr}; }
+    };
+  }
+
+  /* ----------------------------------------- [#1221] push the window aside */
+
+  /* THE GRAB HANDLE AND WHAT IT DOES.
+   *
+   * slideRig(opts) builds one handle - a grip, a word, and a Carbon button -
+   * and wires a sideways drag on it. It owns no geometry of its own: the
+   * caller's `apply(px, spring)` decides WHAT moves, because the annotator
+   * moves two elements (the picture plate and its furniture) around a canvas
+   * that must stay put, while the video editor is a single box.
+   *
+   * WHY THE JUDGEMENT IS A FRACTION OF THE WIDTH AND WHY IT IS TWO-SIDED.
+   * From home, the window goes once the drag has carried it SLIDE_TRIGGER of
+   * its width; from parked, it comes home once the drag has carried it the
+   * same fraction back. Judging a parked window by the same "past 40% of the
+   * width" test would re-park it on every attempt to pull it back, because a
+   * parked window is already 90-odd percent of a width away from home.
+   *
+   * opts: apply(px, spring), width(), z, tabWord, handleWord, onAway(side),
+   *       onHome(was). Answers {handle, away, home, toggle, isAway, destroy}. */
+  function slideRig(opts) {
+    opts = opts || {};
+    var move = typeof opts.apply === 'function' ? opts.apply : function () { /* nothing moves */ };
+    var widthOf = typeof opts.width === 'function' ? opts.width
+      : function () { return root.innerWidth || 1280; };
+    var side = 0;                 /* 0 home, -1 parked left, +1 parked right */
+    var at = 0;                   /* where it sits now, in px from home */
+    var drag = null;
+    var tab = null;
+    var dead = false;
+
+    function parkX(s) { return (s < 0 ? -1 : 1) * Math.max(40, widthOf() - SLIDE_PEEK); }
+    function place(px, spring) { at = px; move(px, !!spring); }
+
+    function dropTab() {
+      if (tab && tab.parentNode) tab.parentNode.removeChild(tab);
+      tab = null;
+    }
+
+    /* The tab is the ONLY thing left on screen, so it is built fresh on each
+     * park: the caret has to point the way the window will come back from. */
+    function showTab(s) {
+      dropTab();
+      tab = make('div', 'hc-slide-tab ' + (s < 0 ? 'left' : 'right'));
+      if (opts.z) tab.style.zIndex = String(opts.z);
+      var b = button('hc-btn hc-slide-tab-btn', String(opts.tabWord || 'bring it back'),
+        s < 0 ? 'c:caret--right' : 'c:caret--left');
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); home(); });
+      tab.appendChild(b);
+      doc.body.appendChild(tab);
+    }
+
+    function away(s) {
+      if (dead) return;
+      s = s < 0 ? -1 : 1;
+      side = s;
+      place(parkX(s), true);
+      showTab(s);
+      if (typeof opts.onAway === 'function') { try { opts.onAway(s); } catch (e) { /* theirs */ } }
+    }
+
+    function home() {
+      if (dead) return;
+      var was = side;
+      side = 0;
+      place(0, true);
+      dropTab();
+      if (typeof opts.onHome === 'function') { try { opts.onHome(was); } catch (e) { /* theirs */ } }
+    }
+
+    function toggle() { if (side) home(); else away(1); }
+
+    function settle() {
+      var w = Math.max(1, widthOf());
+      if (!side) {
+        if (Math.abs(at) >= w * SLIDE_TRIGGER) away(at < 0 ? -1 : 1); else home();
+      } else if (Math.abs(at) <= w * (1 - SLIDE_TRIGGER)) {
+        home();
+      } else {
+        away(side);
+      }
+    }
+
+    var handle = make('div', 'hc-grab');
+    handle.appendChild(make('span', 'hc-grab-grip'));
+    handle.appendChild(make('span', 'hc-grab-word',
+      String(opts.handleWord || 'drag this bar sideways to clear the screen')));
+    var go = button('hc-btn hc-grab-go', 'Slide away', 'c:caret--right');
+    go.addEventListener('click', function (ev) { ev.stopPropagation(); toggle(); });
+    handle.appendChild(go);
+
+    handle.addEventListener('pointerdown', function (ev) {
+      if (dead || drag) return;
+      if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+      /* The button on the handle is a button, not a grip. */
+      if (ev.target && ev.target !== handle && ev.target.closest && ev.target.closest('button')) return;
+      drag = {id: ev.pointerId, x: ev.clientX, from: at};
+      try { handle.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+      place(at, false);                       /* no spring under the finger */
+      ev.preventDefault();
+    }, {passive: false});
+
+    handle.addEventListener('pointermove', function (ev) {
+      if (!drag || ev.pointerId !== drag.id) return;
+      ev.preventDefault();
+      place(drag.from + (ev.clientX - drag.x), false);
+    }, {passive: false});
+
+    function letGo(ev) {
+      if (!drag || ev.pointerId !== drag.id) return;
+      try { handle.releasePointerCapture(ev.pointerId); } catch (e) { /* not held */ }
+      drag = null;
+      settle();
+    }
+    handle.addEventListener('pointerup', letGo);
+    handle.addEventListener('pointercancel', letGo);
+
+    /* A parked window is parked in PIXELS, so a rotation or a resized desk
+     * window would leave it half on screen. Re-park it against the new width. */
+    function onResize() { if (!dead && side) place(parkX(side), false); }
+    root.addEventListener('resize', onResize);
+
+    function destroy() {
+      dead = true;
+      root.removeEventListener('resize', onResize);
+      dropTab();
+    }
+
+    return {
+      handle: handle,
+      away: away,
+      home: home,
+      toggle: toggle,
+      isAway: function () { return side; },
+      destroy: destroy
+    };
+  }
+
   /* ------------------------------------------------- "shot": draw on it */
 
   /* The picture. Tablet first (the kiosk's PixelCopy of the whole screen),
@@ -773,8 +1052,18 @@
    * Answers {close}. */
   function annotate(src, opts) {
     opts = opts || {};
+    /* [#1221] THREE LAYERS WHERE THERE USED TO BE ONE CANVAS.
+     *
+     * `plate` carries the picture and `chrome` carries the toolbar and the
+     * scrub strip; both slide together. `canvas` is the ink and it NEVER
+     * slides, so with the plate parked at the edge the operator is drawing on
+     * the live screen at full size and the strokes still line up with the
+     * frozen picture when it comes back - both are the viewport, to the pixel. */
     var wrap = make('div', 'hc-ink');
+    var plate = make('div', 'hc-ink-plate');                          /* [#1221] */
+    var pic = make('canvas', 'hc-ink-pic');                           /* [#1221] */
     var canvas = make('canvas', 'hc-ink-canvas');
+    var chrome = make('div', 'hc-ink-chrome');                        /* [#1221] */
     var bar = make('div', 'hc-ink-bar');
     var note = make('span', 'hc-ink-note', String(opts.note || 'draw on the picture, then file the report'));
     var undo = button('hc-btn', 'Undo', 'c:skip--back--filled');
@@ -787,8 +1076,11 @@
     bar.appendChild(clear);
     bar.appendChild(cancel);
     bar.appendChild(file);
+    plate.appendChild(pic);                                           /* [#1221] */
+    wrap.appendChild(plate);
     wrap.appendChild(canvas);
-    wrap.appendChild(bar);
+    chrome.appendChild(bar);                                          /* [#1221] */
+    wrap.appendChild(chrome);
     doc.body.appendChild(wrap);
     if (root.PineDuck) root.PineDuck.hold('hc-ink', root.PineDuck.REPORT, wrap);   /* 2026-09-14 */
     /* #1154: the sheet covers the screen, so nothing under it needs to be
@@ -796,13 +1088,15 @@
      * what it deliberately leaves alone. */
     hush();
 
-    var ctx = canvas.getContext('2d');
+    var pad = inkPad(canvas);                                         /* [#1221] */
+    var strokes = pad.strokes;
+    var picCtx = pic.getContext('2d');                                /* [#1221] */
     var img = new Image();
-    var strokes = [];
-    var stroke = null;
     var W = 0, H = 0;
     var revoke = null;
     var busy = false;
+    var slid = false;                                                 /* [#1221] */
+    var scrubClass = '';                                              /* [#1221] */
     /* #1148, the scrub strip. `liveSrc` is the picture the annotator
      * opened with - the live screenshot - which the strip calls "now";
      * `bgSrc` is whatever the canvas is painted from at this moment;
@@ -883,6 +1177,7 @@
       /* FIRST, and outside everything that can throw: a sheet that went
        * away leaving the page hidden would be a black terminal. */
       unhush();
+      try { rig.destroy(); } catch (e) { /* [#1221] the tab goes anyway */ }
       if (unwatch) { try { unwatch(); } catch (e) { /* gone */ } unwatch = null; }
       root.removeEventListener('resize', fit);
       if (revoke) { try { revoke(); } catch (e) { /* gone */ } revoke = null; }
@@ -896,41 +1191,48 @@
       unwatch = root.PineDismiss.watch(wrap, close, []);
     }
 
-    function inkStyle() {
-      ctx.strokeStyle = 'rgba(255,40,40,.95)';
-      ctx.lineWidth = 6;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
+    /* [#1221] The sheet's class is rebuilt from the two facts that can change
+     * it - which scrub state it is in, and whether it is parked - so that the
+     * strip arriving can never wipe the parked state off the sheet. */
+    function dressWrap() {
+      wrap.className = 'hc-ink' + (scrubClass ? ' ' + scrubClass : '') + (slid ? ' hc-slid' : '');
+    }
+
+    /* [#1221] The picture has its own canvas, the same size and the same dpr
+     * as the ink, sitting on the plate that slides. */
+    function paintPicture() {
+      picCtx.clearRect(0, 0, W, H);
+      picCtx.fillStyle = '#000';
+      picCtx.fillRect(0, 0, W, H);
+      if (img.complete && img.naturalWidth) picCtx.drawImage(img, 0, 0, W, H);
     }
 
     function fit() {
-      W = root.innerWidth || 1280;
-      H = root.innerHeight || 800;
-      var dpr = Math.min(2, root.devicePixelRatio || 1);
-      canvas.width = Math.round(W * dpr);
-      canvas.height = Math.round(H * dpr);
-      canvas.style.width = W + 'px';
-      canvas.style.height = H + 'px';
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      redraw();
+      var m = pad.fit();                                              /* [#1221] */
+      W = m.w;
+      H = m.h;
+      pic.width = Math.round(W * m.dpr);
+      pic.height = Math.round(H * m.dpr);
+      pic.style.width = W + 'px';
+      pic.style.height = H + 'px';
+      picCtx.setTransform(m.dpr, 0, 0, m.dpr, 0, 0);
+      paintPicture();
     }
 
-    function path(points) {
-      if (!points.length) return;
-      ctx.beginPath();
-      ctx.moveTo(points[0].x, points[0].y);
-      if (points.length === 1) ctx.lineTo(points[0].x + 0.01, points[0].y);
-      for (var i = 1; i < points.length; i += 1) ctx.lineTo(points[i].x, points[i].y);
-      ctx.stroke();
-    }
+    function redraw() { pad.redraw(); }                               /* [#1221] */
 
-    function redraw() {
-      ctx.clearRect(0, 0, W, H);
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, W, H);
-      if (img.complete && img.naturalWidth) ctx.drawImage(img, 0, 0, W, H);
-      inkStyle();
-      for (var i = 0; i < strokes.length; i += 1) path(strokes[i]);
+    /* [#1221] Two canvases go out as one PNG, at exactly the size the single
+     * canvas used to be: the picture first, the ink over it. Ink laid while
+     * the plate was parked is in the same viewport coordinates as the frozen
+     * picture, so it lands where the operator drew it. */
+    function compose() {
+      var out = doc.createElement('canvas');
+      out.width = canvas.width;
+      out.height = canvas.height;
+      var o = out.getContext('2d');
+      o.drawImage(pic, 0, 0);
+      o.drawImage(canvas, 0, 0);
+      return out.toDataURL('image/png');
     }
 
     /* #1148: THE BACKGROUND IS SWAPPABLE, AND ONLY THE BACKGROUND.
@@ -952,7 +1254,7 @@
       next.onload = function () {
         if (bgSrc !== url) return;          /* a later pick already won */
         img = next;
-        redraw();
+        paintPicture();                                               /* [#1221] */
       };
       next.onerror = function () {
         if (bgSrc !== url) return;
@@ -974,71 +1276,52 @@
       toast('the picture could not be fetched: ' + String((err && err.message) || err), true);
     });
 
-    /* Ink. The canvas owns its pointer (touch-action:none in the sheet, so
-     * the WebView never turns a stroke into a scroll). */
-    var inkId = null;
-    canvas.addEventListener('pointerdown', function (ev) {
-      if (inkId !== null) return;
-      if (ev.pointerType === 'mouse' && ev.button !== 0) return;
-      inkId = ev.pointerId;
-      try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
-      stroke = [{x: ev.clientX, y: ev.clientY}];
-      /* #1154: the ink style is set ONCE per stroke, not once per move.
-       * Every redraw() ends by setting it too, and changing canvas.width
-       * (fit) resets the context and then redraws - so the context is
-       * always carrying the ink's stroke style when a move arrives. */
-      inkStyle();
-      path(stroke);
-      ev.preventDefault();
-    }, {passive: false});
-
-    /* #1154: "This is alright. It looks like it's better, but it is a
-     *  little laggy when I'm drawing the strokes."
+    /* [#1221] The ink lives on inkPad now - the same coalesced-event stroke
+     * handling as before (#1154), on a canvas that stays where it is when the
+     * picture slides off the screen.
      *
-     * MEASURED FIRST, AND THE OBVIOUS SUSPECT WAS INNOCENT. This handler
-     * already drew only the NEW segment rather than repainting the world,
-     * and it costs 0.055 ms a move on the tablet (240 moves, p95 0.1 ms,
-     * worst 3.1 ms). The page around it is the cost - see hush() below -
-     * and on top of that the panel paces requestAnimationFrame to one
-     * group every ~67 ms (app.py, PINE_PACE), so pointermove arrives in
-     * clumps rather than one delivery per digitiser sample.
-     *
-     * COALESCED EVENTS are the cure for what that clumping LOOKS like.
-     * The engine keeps every sample taken between two deliveries; without
-     * asking for them a fast stroke is one straight chord across the whole
-     * gap, which reads as angular AND late. With them the line follows the
-     * finger's real path, and the whole batch goes down as ONE path with
-     * one stroke() rather than a beginPath/stroke pair per point. */
-    canvas.addEventListener('pointermove', function (ev) {
-      if (inkId === null || ev.pointerId !== inkId || !stroke) return;
-      ev.preventDefault();
-      var pts = null;
-      if (typeof ev.getCoalescedEvents === 'function') {
-        try { pts = ev.getCoalescedEvents(); } catch (e) { pts = null; }
-      }
-      if (!pts || !pts.length) pts = [ev];
-      var last = stroke[stroke.length - 1];
-      ctx.beginPath();
-      ctx.moveTo(last.x, last.y);
-      for (var i = 0; i < pts.length; i += 1) {
-        var p = {x: pts[i].clientX, y: pts[i].clientY};
-        stroke.push(p);
-        ctx.lineTo(p.x, p.y);
-      }
-      ctx.stroke();
-    }, {passive: false});
-    function inkUp(ev) {
-      if (inkId === null || ev.pointerId !== inkId) return;
-      try { canvas.releasePointerCapture(ev.pointerId); } catch (e) { /* not held */ }
-      inkId = null;
-      if (stroke && stroke.length) strokes.push(stroke);
-      stroke = null;
+     * AND THE WINDOW CAN LEAVE. The plate and the furniture move together; the
+     * ink canvas underneath them does not move at all. Parking also ENDS THE
+     * HUSH: the page below was taken out of the rendering lifecycle because an
+     * opaque sheet covered it (#1154), and the moment the sheet is not
+     * covering it there is nothing to hush - a parked plate over a hushed page
+     * would be a blank screen to draw on. */
+    function s2Note() {
+      return scrubAt > 0
+        ? 'the frame from ' + fmtBack(scrubAt) + ' before the capture - the ink stays'
+        : String(opts.note || 'draw on the picture, then file the report');
     }
-    canvas.addEventListener('pointerup', inkUp);
-    canvas.addEventListener('pointercancel', inkUp);
 
-    undo.addEventListener('click', function () { if (busy) return; strokes.pop(); redraw(); });
-    clear.addEventListener('click', function () { if (busy) return; strokes.length = 0; redraw(); });
+    var rig = slideRig({
+      z: 2147483036,
+      tabWord: 'the capture',
+      handleWord: 'drag sideways to draw on the whole screen',
+      apply: function (px, spring) {
+        var css = px ? 'translateX(' + Math.round(px) + 'px)' : '';
+        plate.style.transition = spring ? SLIDE_SPRING : 'none';
+        chrome.style.transition = spring ? SLIDE_SPRING : 'none';
+        plate.style.transform = css;
+        chrome.style.transform = css;
+      },
+      onAway: function () {
+        slid = true;
+        dressWrap();
+        unhush();
+        note.textContent = 'the whole screen takes ink - the capture is at the edge';
+        toast('the capture is parked; draw anywhere, then bring it back');
+      },
+      onHome: function (was) {
+        slid = false;
+        dressWrap();
+        hush();
+        note.textContent = s2Note();
+        if (was && strokes.length) toast('the ink came back with it');
+      }
+    });
+    chrome.appendChild(rig.handle);                                   /* [#1221] */
+
+    undo.addEventListener('click', function () { if (busy) return; pad.undo(); });
+    clear.addEventListener('click', function () { if (busy) return; pad.clear(); });
     cancel.addEventListener('click', function () {
       if (busy) return;
       close();
@@ -1142,7 +1425,8 @@
       cache = {};
       cacheOrder = [];
       cacheChars = 0;
-      wrap.className = 'hc-ink';
+      scrubClass = '';                                                /* [#1221] */
+      dressWrap();
     }
 
     /* '-1m 12s' for the older frames, 'now' for the live shot. */
@@ -1167,9 +1451,9 @@
           }
         }
       }
-      note.textContent = s.at > 0
-        ? 'the frame from ' + fmtBack(s.at) + ' before the capture - the ink stays'
-        : String(opts.note || 'draw on the picture, then file the report');
+      note.textContent = rig.isAway()                                 /* [#1221] */
+        ? 'the whole screen takes ink - the capture is at the edge'
+        : s2Note();
     }
 
     /* Paint the thumbnails for the window now in hand. `list` is the
@@ -1331,15 +1615,17 @@
       strip.appendChild(stripSlider);
       strip.appendChild(row);
       strip.appendChild(stripWhen);
-      wrap.className = 'hc-ink hc-scrub';
+      scrubClass = 'hc-scrub';                                        /* [#1221] */
+      dressWrap();
       return true;
     }
 
     if (opts.scrub && has('replayFrames')) {
       strip = make('div', 'hc-strip hc-strip-wait');
       strip.appendChild(make('div', 'hc-strip-line', 'reading the last five seconds...'));
-      wrap.appendChild(strip);
-      wrap.className = 'hc-ink hc-scrub-wait';
+      chrome.appendChild(strip);                                      /* [#1221] rides with the plate */
+      scrubClass = 'hc-scrub-wait';                                   /* [#1221] */
+      dressWrap();
       /* What the ring holds, asked for beside the frames rather than
        * before them - the first window must not wait on a second call.
        * replayState is only a nicety here; replayFrames reports `held`
@@ -1376,7 +1662,7 @@
     file.addEventListener('click', function () {
       if (busy) return;
       var png = '';
-      try { png = canvas.toDataURL('image/png'); } catch (e) { png = ''; }
+      try { png = compose(); } catch (e) { png = ''; }                /* [#1221] */
       if (!png) {
         toast('the marked-up picture could not be composed (the picture is not ours to export)', true);
         return;
@@ -1445,6 +1731,36 @@
     return kind === 'pine-video-editor-close' || kind === 'pine-video-editor-export' ? kind : '';
   }
 
+  /* [#1242] THE EDITOR IS AN IFRAME AND CANNOT HOLD THE KEY.
+   *
+   * On the desk this page is a file:// document and the editor is loaded from
+   * the station, so the frame is cross-origin: Electron's preload never runs
+   * inside it, window.pineDesktop is not there, and the editor's last resort
+   * (window.__PINE_VIDEO_EDITOR_KEY) is assigned nowhere in this tree. Its
+   * save POST therefore went out bare and the station answered 401, which the
+   * editor's footer printed as the bare word "Unauthorized".
+   *
+   * This surface DOES hold the key. When the editor asks, mint a permit for
+   * that one source and post it back into the frame - never the key itself,
+   * and never to any window but the frame we opened. */
+  function editorPermitAsk(event, frameWindow, origin) {
+    if (!event || event.source !== frameWindow || event.origin !== origin) return;
+    var said = event.data;
+    if (!said || said.type !== 'pine-video-editor-need-save-token') return;
+    var id = String((said.detail && said.detail.source_id) || '');
+    if (!/^[0-9a-f]{32}$/.test(id)) return;
+    function hand(token) {
+      try { frameWindow.postMessage({type: 'pine-video-editor-save-token', detail: {save_token: token || ''}}, origin); }
+      catch (err) { /* the editor closed while we were minting */ }
+    }
+    Promise.resolve().then(function () {
+      if (!has('post')) throw new Error('no station bridge on this surface');
+      return bridge().post('/api/video-editor/sources/' + id + '/save-token', {});
+    }).then(function (answer) {
+      hand((answer && (answer.save_token || answer.token)) || '');
+    })['catch'](function () { hand(''); });
+  }
+
   /* Keep the station document and its player alive underneath the editor.
    * The source is an opaque station identity; returned URLs cannot navigate
    * the native bridge to another host. Export notifications never save files. */
@@ -1463,9 +1779,71 @@
     frame.title = 'Edit screen recording';
     frame.setAttribute('allow', 'autoplay; fullscreen');
     frame.src = url;
+    /* [#1221] "I want to be able to slide it out of the screen so that way I
+     * can draw on the screen full screen."
+     *
+     * The editor is the window he named. It gets the same grab handle as the
+     * annotator, and BEHIND IT a full-screen ink pad that only takes pointers
+     * while the editor is parked. The recording under the editor is a
+     * recording OF THIS SCREEN, so a stroke's place on the glass is its place
+     * in the picture: x/innerWidth, y/innerHeight is the mark's normalised
+     * point, which is exactly the coordinate space video-editor.js keeps its
+     * marks in. When the editor comes back the strokes are handed to it as
+     * Draw-layer marks over the same-origin postMessage road it already
+     * speaks, and the pad is wiped so nothing is added twice. */
+    var free = make('canvas', 'hc-free-ink');
+    var freePad = inkPad(free);
+    var editorRig = slideRig({
+      z: 2147483037,
+      tabWord: 'the editor',
+      handleWord: 'drag sideways to draw on the whole screen',
+      apply: function (px, spring) {
+        box.style.transition = spring ? SLIDE_SPRING : 'none';
+        box.style.transform = px ? 'translateX(' + Math.round(px) + 'px)' : '';
+      },
+      onAway: function () {
+        free.classList.add('on');
+        freePad.fit();
+        toast('the editor is parked; draw anywhere and it goes into its drawings');
+      },
+      onHome: function (was) {
+        free.classList.remove('on');
+        if (was) handOff();
+      }
+    });
+    /* Marks are normalised to the viewport and the editor holds them
+     * normalised to the source frame. The recording IS the screen, so the two
+     * are the same numbers; a stroke of one point is still a dot. */
+    function handOff() {
+      var m = freePad.metrics();
+      var w = Math.max(1, m.w);
+      var h = Math.max(1, m.h);
+      var marks = [];
+      for (var i = 0; i < freePad.strokes.length; i += 1) {
+        var pts = [];
+        for (var k = 0; k < freePad.strokes[i].length; k += 1) {
+          pts.push({x: Math.min(1, Math.max(0, freePad.strokes[i][k].x / w)),
+            y: Math.min(1, Math.max(0, freePad.strokes[i][k].y / h))});
+        }
+        if (pts.length) marks.push({kind: 'pen', color: '#ff2828', weight: 6, points: pts});
+      }
+      freePad.clear();
+      if (!marks.length) return;
+      try {
+        frame.contentWindow.postMessage({type: 'pine-video-editor-marks', marks: marks}, origin);
+        toast(marks.length === 1 ? 'the stroke went into the editor drawings'
+          : marks.length + ' strokes went into the editor drawings');
+      } catch (err) {
+        toast('the strokes could not be handed to the editor: '
+          + String((err && err.message) || err), true);
+      }
+    }
+    box.appendChild(editorRig.handle);                                /* [#1221] */
     box.appendChild(bar);
     box.appendChild(frame);
+    doc.body.appendChild(free);                                       /* [#1221] */
     doc.body.appendChild(box);
+    freePad.fit();                                                    /* [#1221] */
     /* 2026-09-15 (#1172): "Whenever I'm in the process of editing a screen
      * recording or editing a screenshot or filing a report, stop playing
      * video and audio until I close the window. Also stop playing videos
@@ -1500,6 +1878,11 @@
       root.removeEventListener('message', receive);
       var at = sheets.indexOf(entry);
       if (at >= 0) sheets.splice(at, 1);
+      /* [#1221] Ink first: a parked editor that is closed still owes the
+       * editor its strokes, and the pad may never outlive the window. */
+      try { if (editorRig.isAway()) handOff(); } catch (e) { /* the window still shuts */ }
+      try { editorRig.destroy(); } catch (e) { /* the window still shuts */ }
+      if (free.parentNode) free.parentNode.removeChild(free);
       if (box.parentNode) box.parentNode.removeChild(box);
       if (videoEditor === entry) videoEditor = null;
     }
@@ -1507,6 +1890,7 @@
       var kind = editorMessage(event, frame.contentWindow, origin);
       if (kind === 'pine-video-editor-close') close();
       else if (kind === 'pine-video-editor-export') toast('Edited video is ready');
+      else editorPermitAsk(event, frame.contentWindow, origin);        /* [#1242] */
     }
     back.addEventListener('click', close);
     root.addEventListener('message', receive);
@@ -1956,6 +2340,9 @@
     railTab: railTab,
     /* #1140: the red-ink annotator, for any picture - see annotate(). */
     annotate: annotate,
+    /* [#1221] the editor window, so the slide can be proved over CDP without
+     * cutting a fresh recording out of the ring first. */
+    videoEditor: openVideoEditor,
     /* #1181: the rail keeps clear of the corner squares, and it can only
      * do that if it knows how big they are. One number, one owner. */
     CORNER_PX: CORNER_PX,

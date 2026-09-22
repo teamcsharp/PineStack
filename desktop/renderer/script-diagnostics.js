@@ -11,6 +11,9 @@
       block: number(row.block), ord: number(row.ord), kind: String(row.kind || row.type || ''),
       who: String(row.who || row.name || ''), text: text.slice(0, TEXT_LIMIT),
       text_truncated: text.length > TEXT_LIMIT, media: String(row.media || row.clip_media || ''),
+      /* [#1189] every name the row answers to, so the server folds aliases rather than flagging them */
+      sfx: String(row.sfx || ''), url: String(row.url || row.clip || '').split('?')[0].split('/').pop() || '',
+      aired: String(row.aired || ''),
       from_s: number(row.from_s), until_s: number(row.until_s), document_index: number(row.document_index)};
   }
   function revision(elements) {
@@ -52,7 +55,16 @@
   }
   function selectMappings(feed, audio, activeId, highlightId) {
     var file = String((audio && audio.file) || ''), position = number(audio && audio.position_s);
-    function rowFile(row) { return String(row.clip_media || row.media || ''); }
+    /* [#1189] the same fold script-page.js applies: a board sting's row
+       carries no media at all, only `sfx: <16hex>` and `url: /sfx/<16hex>?t=`,
+       so the neighbourhood around a sounding sting was always empty and the
+       report had no rows to show for #1188, #1197, #1228 or #1234. */
+    function rowFile(row) {
+      var named = String(row.clip_media || row.media || '');
+      if (named) return named;
+      var base = String(row.url || row.clip || '').split('?')[0].split('/').pop();
+      return base || String(row.sfx || '');
+    }
     function offset(row, own, clip) { return number(row[own]) !== null ? number(row[own]) : number(row[clip]); }
     var same = file ? feed.filter(function (r) { return rowFile(r) === file; }) : [];
     same = same.slice().sort(function (a, b) {
@@ -104,12 +116,16 @@
         document_revision: String(sample.document_revision || ''), element_index: number(sample.element_index),
         block: number(sample.block), ord: number(sample.ord), scroll_top_px: number(sample.scroll_top_px),
         lit_top_px: number(sample.lit_top_px), follow: !!sample.follow, paused: !!sample.paused,
+        /* [#1189] the resolver's decision at this sample: how the mark was placed */
+        mark: String(sample.mark || ''), road: String(sample.road || ''), sync: String(sample.sync || ''),
+        expected_id: String(sample.expected_id || ''), carried_id: String(sample.carried_id || ''),
         audio: {source: String(audio.source || 'unavailable'), file: String(audio.file || ''),
           position_start_s: number(audio.position_s), position_end_s: number(audio.position_s)}};
       var last = events[events.length - 1];
       var signature = JSON.stringify([event.highlight_id, event.active_id, event.document_revision,
         event.element_index, event.block, event.ord, event.scroll_top_px, event.lit_top_px,
-        event.follow, event.paused, event.audio.source, event.audio.file]);
+        event.follow, event.paused, event.audio.source, event.audio.file,
+        event.mark, event.road, event.expected_id, event.carried_id]);   /* [#1189] */
       var seek = false;
       if (last && last.audio.position_end_s !== null && event.audio.position_end_s !== null) {
         var delta = event.audio.position_end_s - last.audio.position_end_s;
@@ -145,7 +161,10 @@
         return out;
       }).filter(Boolean);
       var current = copy(snapshot || latest || {}), wanted = new Set();
-      taken.forEach(function (e) { if (e.highlight_id) wanted.add(e.highlight_id); if (e.active_id) wanted.add(e.active_id); });
+      taken.forEach(function (e) {
+        if (e.highlight_id) wanted.add(e.highlight_id); if (e.active_id) wanted.add(e.active_id);
+        if (e.expected_id) wanted.add(e.expected_id); if (e.carried_id) wanted.add(e.carried_id);   /* [#1189] */
+      });
       (current.nearby || []).forEach(function (r) { if (r.id) wanted.add(r.id); });
       (current.mapping_rows || []).forEach(function (id) { wanted.add(id); });
       var kept = {}, missing = 0, truncated = 0;

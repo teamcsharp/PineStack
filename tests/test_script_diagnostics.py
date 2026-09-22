@@ -88,7 +88,12 @@ class CaptureAnalysisTests(unittest.TestCase):
         self.assertEqual(normalized['events'][0]['audio']['file'], identity)
         result = analyze_capture(capture)
         self.assertEqual(result['findings'][0]['code'], 'observed_file_mismatch')
-        self.assertIn('path aliases', result['findings'][0]['message'])
+        # [#1189] the finding names the CLASS of what was sounding - a line, a board
+        # sting, an advert - because "path aliases require review" told the operator
+        # nothing they could act on. Still cautious: it claims only that no captured
+        # row named the file, never that the wrong thing was heard.
+        self.assertIn('a line', result['findings'][0]['message'])
+        self.assertIn('no captured row names', result['findings'][0]['message'])
 
     def test_published_prepared_do_not_become_audible_claims(self):
         capture = view([event(source='estimated')])

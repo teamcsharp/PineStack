@@ -211,11 +211,33 @@ window.pineMixer = {
     try { localStorage.setItem(PINE_MIXER_KEY, JSON.stringify(mixerLevels)); } catch (err) {}
     const player = $("desktopRadioPlayer");
     if (player) { player.volume = desktopMusicGain(); player.muted = desktopMusicGain() <= 0; }
-    applyAppVolume();
+    /* [#1192]: ONE FRAME, NOT ONE PIXEL.
+     *
+     * applyAppVolume() executeJavaScript()s the levelling script into
+     * controlFrame, radioFrame and guideFrame - three IPC round trips, each
+     * carrying ~3 KB.  That is the right cost for a route change and the
+     * wrong cost for a drag: the Levels sheet calls this from an `input`
+     * handler, so a 200-pixel drag asked for 600 crossings and the value
+     * that landed was whichever of them answered last.  This window's own
+     * player and the store are written above, synchronously, so nothing the
+     * operator can see or hear in THIS document lags the thumb; only the
+     * crossings wait, and only the last value ever goes.  #1194 wrote the
+     * same rule for the mixing drawer. */
+    mixerCrossSoon();
     return Object.assign({}, mixerLevels);
   },
   apply: () => applyAppVolume(),
 };
+
+/* [#1192]: the coalescing latch for the three webview crossings. */
+let mixerCrossBooked = false;
+function mixerCrossSoon() {
+  if (mixerCrossBooked) return;
+  mixerCrossBooked = true;
+  const go = () => { mixerCrossBooked = false; try { applyAppVolume(); } catch (err) { /* next move */ } };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(go);
+  else setTimeout(go, 16);
+}
 
 function desktopMusicGain() {
   const share = (streamVolumes && Number.isFinite(streamVolumes.music))
@@ -578,6 +600,64 @@ function initNowCell() {
   if (!cell || cell.dataset.wired) return;
   cell.dataset.wired = "1";
   cell.onclick = () => { nowCellOpen(); };
+}
+
+/* [#1217]: THE MEDIA / VIDEOS ROW.
+ *
+ * "Also add a volume slider for media slash videos here."
+ *
+ * The three rows above it are BROADCAST streams: each has a route (where the
+ * station sends it) and a share of the master.  Video is not a stream the
+ * station routes - it is a thing that plays - so this row has a level and no
+ * picker, and it is written through window.pineLevels (audio-law.js, #1192),
+ * the one bus the Script view's Levels sheet and the Listen desk also use.
+ *
+ * WHAT IT REACHES FROM HERE, measured: PineSfxTv's television is an element
+ * in THIS document (levelled by applyAppVolume); the panel's own little CRT
+ * tube is inside the controlFrame webview and is levelled by the injected
+ * appVolumeScript, which multiplies window.__pineDesktopMixer.video into
+ * every <video> it finds - including every one created after the drag, which
+ * is the half that was missing.  The tablet's NATIVE wall is not in this
+ * window at all and is reached through the kiosk bridge; on the desk that
+ * road simply is not there, and the bus says so rather than pretending. */
+function mediaLevelBus() {
+  return (window.pineLevels && typeof window.pineLevels.apply === "function")
+    ? window.pineLevels : null;
+}
+
+function paintMediaLevel() {
+  const slider = $("vol_video");
+  if (!slider) return;
+  if (document.activeElement === slider) return;   /* never under the thumb */
+  const bus = mediaLevelBus();
+  const now = bus ? Number((bus.get() || {}).video) : Number(mixerLevels.video);
+  const pct = Math.round(Math.max(0, Math.min(1, Number.isFinite(now) ? now : 1)) * 100);
+  if (Number(slider.value) !== pct) slider.value = String(pct);
+  const label = $("vol_videoValue");
+  if (label) label.textContent = pct + "%";
+  const row = slider.parentElement;
+  if (row) row.classList.toggle("hushed", pct <= 0);
+}
+
+function initMediaLevel() {
+  const slider = $("vol_video");
+  if (!slider || slider.dataset.wired) return;
+  slider.dataset.wired = "1";
+  paintMediaLevel();
+  slider.addEventListener("input", () => {
+    const want = Math.max(0, Math.min(100, Number(slider.value) || 0)) / 100;
+    const bus = mediaLevelBus();
+    if (bus) bus.apply("video", want);
+    else { try { window.pineMixer.set({video: want}); } catch (err) { /* nothing here */ } }
+    const label = $("vol_videoValue");
+    if (label) label.textContent = Math.round(want * 100) + "%";
+    const row = slider.parentElement;
+    if (row) row.classList.toggle("hushed", want <= 0);
+  });
+  /* Follow a level set in the Script view's sheet or the Listen desk, so the
+     drawer never shows a number nobody is hearing. */
+  const bus = mediaLevelBus();
+  if (bus && typeof bus.onApply === "function") bus.onApply(() => paintMediaLevel());
 }
 
 function initStreamVolumes() {
@@ -1424,15 +1504,45 @@ function createDesktopRejectionNotices({request, openReview, storage = localStor
   const review = document.createElement('button'); review.type = 'button'; review.textContent = 'Review lines';
   const later = document.createElement('button'); later.type = 'button'; later.textContent = 'Later';
   const badge = document.createElement('button'); badge.type = 'button'; badge.className = 'badge'; badge.textContent = 'Rejected lines';
+  // [#1208] LATER MEANS THIRTY MINUTES, AND IT IS WRITTEN DOWN.
+  //
+  // dismiss() only cleared `fresh`, and `fresh` climbs again on the very next
+  // rejection event - which on this station is minutes, not hours. So Later
+  // meant "until the next line is cut", and the card came back over whatever
+  // he had moved on to. The badge is untouched: the queue is still countable
+  // at a glance, it just stops interrupting.
+  const snoozeKey = 'pine-desktop-rejection-snooze:' + key;
+  const SNOOZE_MS = 30 * 60 * 1000;
+  let snoozedUntil = 0;
+  try { snoozedUntil = Number(storage.getItem(snoozeKey)) || 0; } catch (_) { /* storage unavailable */ }
+  // ...and it is never raised over a moving page. Same complaint as #1186:
+  // something appearing while he reads. A scroll anywhere in this window holds
+  // the card back; the next poll offers it again.
+  let scrolledAt = 0;
+  const noteScroll = () => { scrolledAt = Date.now(); };
+  try {
+    window.addEventListener('scroll', noteScroll, {passive: true, capture: true});
+    window.addEventListener('wheel', noteScroll, {passive: true, capture: true});
+  } catch (_) { /* an older host still gets the snooze */ }
   function dismiss() { fresh = 0; card.hidden = true; }
+  function snooze() {
+    snoozedUntil = Date.now() + SNOOZE_MS;
+    try { storage.setItem(snoozeKey, String(snoozedUntil)); } catch (_) { /* storage unavailable */ }
+    dismiss();
+  }
   async function open(id) {
+    snoozedUntil = 0;
+    try { storage.setItem(snoozeKey, '0'); } catch (_) { /* storage unavailable */ }
     try { await openReview(id); dismiss(); }
     catch (error) { card.hidden = false; title.textContent = 'Review could not open'; text.textContent = error.message; text.classList.add('error'); }
   }
-  review.onclick = () => open(newest); badge.onclick = () => open(null); later.onclick = dismiss;
+  review.onclick = () => open(newest); badge.onclick = () => open(null); later.onclick = snooze;
   actions.append(review, later); card.append(title, text, actions); root.append(style, card, badge); document.body.append(root);
   function paint() {
     badge.textContent = count ? 'Rejected lines (' + count + ')' : 'Rejected lines';
+    // [#1208] the count is always current; the INTERRUPTION waits.
+    if (Date.now() < snoozedUntil) return;
+    if (card.hidden && (Date.now() - scrolledAt) < 2000) return;
     if (fresh) {
       // #1088: only a line that actually left the work reaches this card;
       // rewrites the station re-asked and repaired are the orchestrator's
@@ -1579,17 +1689,108 @@ function createDesktopRetireNotices({request, openDesk, storage = localStorage, 
 }
 
 let desktopRejectionOpenToken = 0;
+
+// [#1208] THE REVIEW IS FRAMED WHERE IT STANDS.
+//
+// "Clicking this makes the viewport change when really I just need to pop up
+//  the pop-up that this is related to."
+//
+// The review is a <dialog> built by frontend/rejection-review.js inside the
+// /radio webview - a document of its own that this chrome can only speak to
+// through executeJavaScript. The old road therefore walked to that room:
+// selectView('radio'), which swaps the whole viewport and loses the scroll of
+// whatever he was reading.
+//
+// A <webview> CANNOT BE MOVED to solve this. Re-parenting one destroys and
+// reloads the guest, and the radio frame is carrying the station's audio. So
+// the section stays exactly where it is in the tree and a body class lifts it
+// out of the flow as a fixed panel: the chosen view keeps .active, its tab
+// stays lit, and nothing it holds is touched. The style is injected here
+// rather than added to styles.css so this whole behaviour is one file.
+let pineReviewWatch = null;
+function pineReviewDressing() {
+  if (document.getElementById('pineReviewFrameStyle')) return;
+  const style = document.createElement('style');
+  style.id = 'pineReviewFrameStyle';
+  style.textContent = `
+    #pineReviewBackdrop{position:fixed;inset:0;z-index:2147482990;background:rgba(6,9,12,.74);display:none}
+    body.pine-review-modal #pineReviewBackdrop{display:block}
+    body.pine-review-modal #radio.view{display:block !important;position:fixed;left:3vw;top:3vh;
+      width:94vw;height:94vh;z-index:2147482991;overflow:hidden;border:1px solid #799066;
+      border-radius:12px;box-shadow:0 18px 60px rgba(0,0,0,.72);background:#0b0f12;margin:0}
+    body.pine-review-modal #radio.view webview{width:100%;height:100%}
+    #pineReviewShut{position:fixed;right:calc(3vw + 12px);top:calc(3vh + 12px);z-index:2147482992;
+      display:none;font:13px/1.45 system-ui;color:#eaf0eb;background:#263a2e;border:1px solid #799066;
+      border-radius:7px;padding:6px 12px;cursor:pointer}
+    body.pine-review-modal #pineReviewShut{display:block}
+  `;
+  document.head.append(style);
+  const back = document.createElement('div'); back.id = 'pineReviewBackdrop';
+  back.onclick = () => pineReviewFrame(false);
+  const shut = document.createElement('button'); shut.type = 'button'; shut.id = 'pineReviewShut';
+  shut.textContent = 'Close the review';
+  shut.onclick = () => pineReviewFrame(false);
+  document.body.append(back, shut);
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    if (!document.body.classList.contains('pine-review-modal')) return;
+    pineReviewFrame(false);
+  });
+}
+
+function pineReviewFrame(on) {
+  pineReviewDressing();
+  document.body.classList.toggle('pine-review-modal', !!on);
+  if (pineReviewWatch) { clearInterval(pineReviewWatch); pineReviewWatch = null; }
+  if (!on) {
+    // Tell the guest to put its dialog away too, or the next open finds one
+    // already standing and the frame would come straight back down.
+    try {
+      const frame = $('radioFrame');
+      if (frame) frame.executeJavaScript('(()=>{try{if(window.PineRejectionReview)window.PineRejectionReview.close();}catch(e){}return true;})()', false).catch(() => {});
+    } catch (_) { /* the guest is gone; the class is already off */ }
+    return;
+  }
+  // ...and when HE closes the review from inside the guest, the frame comes
+  // down by itself. Asked, never assumed: the dialog carries the same
+  // data-rejection-review="dialog" mark the panel's own probe uses.
+  //
+  // IT MUST SEE THE DIALOG BEFORE IT MAY MISS IT. The guest can take ten
+  // seconds to import its module on a cold frame; a watcher that treated
+  // "not there yet" as "he closed it" would tear the frame down at 900 ms
+  // every single time.
+  let seen = false;
+  pineReviewWatch = setInterval(async () => {
+    if (!document.body.classList.contains('pine-review-modal')) return;
+    const frame = $('radioFrame');
+    if (!frame) return;
+    try {
+      const up = await frame.executeJavaScript('!!document.querySelector(\'dialog[data-rejection-review="dialog"]\')', false);
+      if (up) { seen = true; return; }
+      if (seen) pineReviewFrame(false);
+    } catch (_) { /* mid-navigation: ask again next tick */ }
+  }, 900);
+}
+
 async function openDesktopRejectionReview(id) {
   const token = ++desktopRejectionOpenToken;
-  selectView('radio');
   const frame = $('radioFrame');
   if (!frame) throw new Error('The Radio view is unavailable.');
+  // [#1208] loadFrames() only gives a src to the webview of the CHOSEN view,
+  // and we are deliberately not choosing it, so this road loads its own.
+  try {
+    if (!frame.src) { frameBridge(frame); frame.src = viewUrl('/radio'); wireFrame(frame); }
+  } catch (_) { /* a frame that will not take a src still gets the retries */ }
+  pineReviewFrame(true);
   const code = '(async()=>{if(!window.PineRejectionReview)return false;await window.PineRejectionReview.open(' + JSON.stringify(id || null) + ');return true;})()';
   for (let attempt = 0; attempt < 40 && token === desktopRejectionOpenToken; attempt++) {
     try { if (await frame.executeJavaScript(code, false)) return; } catch (_) { /* module or webview still loading */ }
     await new Promise(resolve => setTimeout(resolve, 250));
   }
-  if (token === desktopRejectionOpenToken) throw new Error('The Radio review is still loading. Select Review lines to retry.');
+  if (token === desktopRejectionOpenToken) {
+    pineReviewFrame(false);   // [#1208] never leave him behind a blank frame
+    throw new Error('The Radio review is still loading. Select Review lines to retry.');
+  }
 }
 
 function routeKeyFromState(status) {
@@ -2266,6 +2467,7 @@ async function refresh() {
     paintStreamRoutes(status.routing);
     initStreamRoutes();
     initStreamVolumes();
+    initMediaLevel();                                       // [#1217]
     paintNabuMix(status.routing);
     initSegCell();                                          // #988
     pineTipsInstall();                                      // #1011
@@ -2311,7 +2513,14 @@ async function loadConfig() {
     if (window.PineSfxTv) {
       window.PineSfxTv.mount({baseUrl: config.baseUrl});
       window.PineSfxTv.rebase(config.baseUrl);
-      window.PineSfxTv.level(desktopVoiceGain());
+      /* [#1216] THE SAME ARITHMETIC applyAppVolume USES. This was
+         desktopVoiceGain() alone - the booth share without the listener's
+         Videos share (#1419) - so with that slider anywhere but 100% the
+         set was mounted at one level and corrected to another as soon as
+         anything called applyAppVolume(). A clip that started in between
+         began at the wrong loudness and was edited mid-picture, which is
+         the whole of this request. */
+      window.PineSfxTv.level(Math.min(1, desktopVoiceGain() * mixerLevels.video));
     }
   } catch (err) { /* the rest of the window still comes up */ }
   loadFrames();
@@ -13452,8 +13661,168 @@ function dxProvScene(canvas, systems, centreText, onPick) {
 /* The window itself: the line, its systems as a readable ledger, and the
  * same thing as the infographic beside it. Opened by a click, never by a
  * timer, and torn right down on close. */
+/* [#1206] A SENTENCE, NOT A STACK TRACE — and a way onward.
+ *
+ * The provenance route answers off the booth's live ring, and that ring
+ * holds 240 rows: measured on the box 2026-09-21, twenty-five minutes of
+ * air. The marquee pool keeps 60 lines and reruns the last dozen for
+ * ever while the booth is quiet, so a row an hour old is still sitting
+ * there to be clicked. What the operator got back was the Electron
+ * bridge's own wrapper printed raw. This pane says what happened, what
+ * would have been needed, and offers the one thing that can still help:
+ * the same words, looked for across two days of durable air log. */
+function dxProvEl(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text != null) el.textContent = String(text);
+  return el;
+}
+
+function dxProvGone(side, err, said, at) {
+  let read = null;
+  try {
+    if (window.PineScriptLineage
+        && typeof window.PineScriptLineage.readFailure === "function") {
+      read = window.PineScriptLineage.readFailure(err);
+    }
+  } catch (e) { read = null; }
+  const kind = (read && read.kind) || "gone";
+  const box = dxProvEl("div", "dxp-none");
+  box.appendChild(dxProvEl("b", "",
+    (read && read.title) || "That line is no longer in the booth"));
+  box.appendChild(dxProvEl("p", "", kind === "gone"
+    ? "Nothing is broken. The booth answers for the lines it still has "
+      + "in hand — the last 240, about twenty-five minutes — and the "
+      + "durable air log behind it keeps two days. This line is in "
+      + "neither, so there is no paperwork left to show. What would "
+      + "have been needed is the prompt as it was sent, the script that "
+      + "came back and the recording, and all three left with the row."
+    : kind === "unreachable"
+    ? "The station did not answer. It is a live radio station writing "
+      + "and recording audio, so a request can simply queue behind that "
+      + "work — try the line again before assuming it is down."
+    : (read && read.say) || "The station could not answer for that line."));
+  side.appendChild(box);
+
+  const words = String(said || "").trim();
+  if (!words) return;
+  const go = dxProvEl("button", "dxp-find", "Search the ledger for these words");
+  go.style.cssText = "margin:8px 0 0;padding:6px 10px;border-radius:6px;"
+    + "border:1px solid rgba(159,216,255,.35);background:rgba(159,216,255,.10);"
+    + "color:#9fd8ff;cursor:pointer;font:inherit";
+  const list = dxProvEl("div", "");
+  side.appendChild(go);
+  side.appendChild(list);
+  go.onclick = async () => {
+    go.disabled = true;
+    list.textContent = "";
+    list.appendChild(dxProvEl("p", "", "reading two days of air log…"));
+    let got = null;
+    try {
+      const since = Math.floor((Date.now() / 1000) - 48 * 3600);
+      got = await api.get("/api/airlog?quiet=1&most=200&since=" + since
+        + "&q=" + encodeURIComponent(words.slice(0, 120)));
+    } catch (e) {
+      list.textContent = "";
+      list.appendChild(dxProvEl("p", "",
+        "the air log could not be read: " + (e && e.message ? e.message : e)));
+      go.disabled = false;
+      return;
+    }
+    const rows = (got && got.rows) || [];
+    list.textContent = "";
+    if (!rows.length) {
+      list.appendChild(dxProvEl("p", "",
+        "those words are not in the last two days of air log either. "
+        + "This line went out before the ledger's window, or never went "
+        + "out at all."));
+      go.disabled = false;
+      return;
+    }
+    list.appendChild(dxProvEl("p", "",
+      rows.length + " line(s) in the air log say the same thing — "
+      + "click one to read its paperwork"));
+    rows.slice(-12).reverse().forEach((row) => {
+      const hit = dxProvEl("div", "dxp-leaf",
+        new Date(Number(row.air_at || row.ts || 0) * 1000)
+          .toLocaleTimeString() + " · " + String(row.round || row.kind || "")
+        + " · " + String(row.text || "").slice(0, 90));
+      hit.style.cursor = "pointer";
+      hit.onclick = () => dxProvOpen(String(row.id || ""),
+        String(row.name || row.who || ""), String(row.text || ""),
+        Number(row.air_at || row.ts || 0));
+      list.appendChild(hit);
+    });
+    go.disabled = false;
+  };
+}
+
+/* [#1206] THE MAKING OF AN ANALYSIS. A gallery row says only "Image
+ * analysis complete: <file>"; everything interesting about it — the
+ * picture, the prompt the station looked through, what it said back,
+ * which model and how long — was on the ring row and is now kept on the
+ * durable row too. This is that, held up. */
+function dxProvMaking(side, prov, base) {
+  const line = prov.line || {};
+  const pic = prov.picture || {};
+  const answer = String(line.analysis || "");
+  const prompt = String((prov.written || {}).prompt || "");
+  const name = String(pic.name || line.image || "");
+  if (!name && !answer) return;
+  const card = dxProvEl("div", "dxp-sys");
+  const h = dxProvEl("h5", "");
+  const dot = dxProvEl("span", "", "●");
+  dot.style.color = "#ffd7a1";
+  h.appendChild(dot);
+  h.appendChild(dxProvEl("span", "", "The making of this look"));
+  card.appendChild(h);
+  if (name && base) {
+    const shot = document.createElement("img");
+    shot.src = base + (pic.url || ("/api/generations/image/"
+      + encodeURIComponent(name)));
+    shot.alt = name;
+    shot.title = name + " — click to open it full size";
+    shot.style.cssText = "max-width:100%;max-height:190px;border-radius:8px;"
+      + "display:block;margin:4px 0 6px;cursor:pointer";
+    shot.onclick = () => {
+      try { api.openExternal(shot.src); } catch (e) { /* no shell */ }
+    };
+    card.appendChild(shot);
+  }
+  if (name) card.appendChild(dxProvEl("p", "", name));
+  const looked = [];
+  if (line.model || (prov.written || {}).model) {
+    looked.push("looked at by " + String(line.model
+      || (prov.written || {}).model));
+  }
+  if (line.ms) looked.push("in " + Math.round(Number(line.ms)) + "ms");
+  if (looked.length) card.appendChild(dxProvEl("p", "", looked.join(" ")));
+  if (prompt) {
+    card.appendChild(dxProvEl("p", "", "the prompt it looked through"));
+    card.appendChild(dxProvEl("div", "dxp-leaf", prompt.slice(0, 900)));
+  }
+  if (answer) {
+    card.appendChild(dxProvEl("p", "", "what it said back"));
+    card.appendChild(dxProvEl("div", "dxp-leaf", answer.slice(0, 1600)));
+  }
+  const made = pic.made || null;
+  if (made && (made.request || made.model)) {
+    card.appendChild(dxProvEl("p", "", "and the picture itself was made "
+      + (made.model ? "by " + made.model + " " : "")
+      + (made.seconds ? "in " + Math.round(Number(made.seconds)) + "s " : "")
+      + "from this request"));
+    card.appendChild(dxProvEl("div", "dxp-leaf",
+      String(made.request || "(no request recorded)")));
+  } else if (name) {
+    card.appendChild(dxProvEl("p", "",
+      "no generation record for this file — it was not made here, or it "
+      + "was made before the generation ledger's window"));
+  }
+  side.appendChild(card);
+}
+
 let dxProvLive = null;
-async function dxProvOpen(lineId, who, said) {
+async function dxProvOpen(lineId, who, said, at) {
   const pop = $("dxProvPopup");
   if (!pop || !lineId) return;
   if (dxProvLive) { try { dxProvLive.stop(); } catch (e) { /* gone */ } }
@@ -13521,11 +13890,14 @@ async function dxProvOpen(lineId, who, said) {
 
   let prov = null;
   try {
-    prov = await api.get("/api/dj/provenance/" + encodeURIComponent(lineId));
+    /* [#1206] the row's own words and air time ride along, so the
+     * station can find it in the durable ledger by text once the id
+     * has gone out of the booth's 240-row ring. */
+    prov = await api.get("/api/dj/provenance/" + encodeURIComponent(lineId)
+      + "?text=" + encodeURIComponent(String(said || "").slice(0, 600))
+      + "&at=" + encodeURIComponent(String(Number(at) || 0)));
   } catch (err) {
-    side.appendChild(mk("div", "dxp-none",
-      "that line has scrolled out of the booth — its paperwork went with "
-      + "it (" + err.message + ")"));
+    dxProvGone(side, err, said, at);                        // [#1206]
     return;
   }
   if (!prov || prov.ok === false) {
@@ -13534,8 +13906,28 @@ async function dxProvOpen(lineId, who, said) {
     return;
   }
   say.textContent = String((prov.line || {}).text || said || "");
-  head.querySelector(".dxp-who").textContent =
+  head.querySelector(".dxp-who").textContent =              // [#1206] below
     String((prov.line || {}).name || (prov.line || {}).who || who || "");
+
+  /* [#1206] WHICH RECORD AM I READING. A line read back off the air log
+   * is a narrower record than a live one — no trace, no crystal, no
+   * vectors — and saying so is the difference between a thin answer and
+   * a lying one. */
+  if (prov.from_ledger) {
+    const note = dxProvEl("div", "dxp-none",
+      "This line had already scrolled out of the booth, so this is the "
+      + "durable air log's record of it"
+      + (prov.recovered_by === "text"
+        ? ", found by its words and the moment it aired. " : ". ")
+      + "The booth's own working papers — the crystal, the vector "
+      + "searches, the swaths — went with the row; what was written "
+      + "down survives.");
+    side.appendChild(note);
+  }
+  try {
+    dxProvMaking(side, prov, (typeof window.pineStationBase === "function"
+      ? window.pineStationBase() : ""));                    // [#1206]
+  } catch (e) { /* the provenance below still draws */ }
 
   /* #970: A PHONE CALL IS NOT A LINE, IT IS A CONVERSATION.
    *
@@ -14066,7 +14458,8 @@ function initAirMarquee() {
     let el = ev.target;
     while (el && el !== track && !el.dataset.lineId) el = el.parentElement;
     if (!el || el === track || !el.dataset.lineId) return;
-    dxProvOpen(el.dataset.lineId, el.dataset.name, el.dataset.say);
+    dxProvOpen(el.dataset.lineId, el.dataset.name, el.dataset.say,
+              Number(el.dataset.at || 0));              // [#1206]
   });
   if (sell) {
     sell.onclick = () => { sell.classList.toggle("big"); };

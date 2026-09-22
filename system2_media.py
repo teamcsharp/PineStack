@@ -229,14 +229,31 @@ class System2Media:
         entry = copy.deepcopy(fresh["entry"])
         entry.update(copy.deepcopy(entry_overrides or {}))
 
+        def _no(why):
+            # [#1191] the reason, on the host's register, so app.py's
+            # _burst_refusal_why can print it instead of "the caller's own
+            # check said no (can_handoff)".
+            try:
+                h._HANDOFF_NO.update({"at": time.time(), "why": str(why)[:200]})
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
         def allowed():
-            if not h._RADIO.get("on") or h.radio_paused() or not can_handoff():
-                return False
+            if not h._RADIO.get("on") or h.radio_paused():
+                return _no("the station is paused" if h.radio_paused() else "the station is off")
+            if not can_handoff():
+                return False                     # the runtime's check has said why
             if resolved["kind"] == "track_talk":
                 position = entry.get("_system2_track_position") or {}
-                return (str(position.get("track_id") or "") == fresh["track_id"]
-                        and str(position.get("part") or "") == fresh["part"]
-                        and str((h._RADIO.get("now") or {}).get("id") or "") == fresh["track_id"])
+                ok = (str(position.get("track_id") or "") == fresh["track_id"]
+                      and str(position.get("part") or "") == fresh["part"]
+                      and str((h._RADIO.get("now") or {}).get("id") or "") == fresh["track_id"])
+                if not ok:
+                    return _no("the record moved on - this talk was written for %s (%s) and %s is playing"
+                               % (str(fresh.get("track_id") or "?")[:24], str(fresh.get("part") or "?"),
+                                  str((h._RADIO.get("now") or {}).get("id") or "nothing")[:24]))
+                return True
             return True
 
         if not allowed():

@@ -13,3 +13,43 @@
 .viewer-note.decoding{left:12px;right:auto;bottom:12px}
 /* A measured level is not a warning, so it must not wear the amber warning box. */
 .audio-notice.level{background:#1d2a28;color:#bfe6da}
+
+/* [#1207] THE EXPORT, WATCHED ON THE FOOTAGE. A three.js scan bar sweeps the
+   preview in step with ffmpeg's own out_time; the flat bar under it carries
+   the same number where there is no WebGL (.flat), and is the readable
+   fallback everywhere else. [#1242] adds the escape window and the toast. */
+.ve-export{position:absolute;inset:0;z-index:6;pointer-events:none;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding:0 0 18px;gap:6px}
+.ve-export::before{content:"";position:absolute;inset:0;background:radial-gradient(120% 90% at 50% 50%,#0000 35%,#05050699 100%)}
+.ve-export-gl{position:absolute;inset:0;width:100%;height:100%;display:block}
+.ve-export.flat .ve-export-gl{display:none}
+.ve-export-say{position:relative;font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:#e9eaee;text-shadow:0 1px 3px #000}
+.ve-export-pct{position:relative;font-size:27px;font-weight:700;font-variant-numeric:tabular-nums;color:#fff;text-shadow:0 2px 6px #000}
+.ve-export-bar{position:relative;width:min(70%,420px);height:5px;border-radius:4px;background:#ffffff26;overflow:hidden;box-shadow:0 1px 4px #0009}
+.ve-export-fill{display:block;height:100%;width:0;border-radius:4px;background:linear-gradient(90deg,#39c2ff,var(--accent));transition:width .2s linear}
+.ve-export.flat .ve-export-bar{width:min(78%,480px);height:8px}
+
+/* [#1242] Zoom and pan cursors. Wheel zooms about the pointer, the middle
+   button drags, 0 fits; space stays play/pause because this editor has a
+   transport. */
+.viewer.ve-zoomed{cursor:grab}
+.viewer.ve-panning,.viewer.ve-panning canvas{cursor:grabbing}
+
+/* [#1242] "It needs to at least pop up a window letting me export and save a
+   clip." Nothing offered in here needs the station's permission. */
+.ve-escape{position:fixed;inset:0;z-index:40;background:#05050ecc;display:flex;align-items:center;justify-content:center;padding:18px;backdrop-filter:blur(3px)}
+.ve-escape-card{width:min(520px,100%);max-height:88dvh;overflow:auto;background:#17191e;border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:0 22px 60px #000a}
+.ve-escape-card h2{margin:0 0 8px;font-size:18px}
+.ve-escape-why{margin:0 0 6px;color:#ffb3ad;font-size:13px;line-height:1.45}
+.ve-escape-note{margin:0 0 14px;color:var(--muted);font-size:12px}
+.ve-escape-rows{display:flex;flex-direction:column;gap:9px}
+.ve-escape-row{display:flex;align-items:center;gap:11px}
+.ve-escape-row button{flex:0 0 auto;min-width:212px;text-align:left}
+.ve-escape-row span{font-size:12px;color:var(--muted);line-height:1.35}
+.ve-escape-told{margin:13px 0 0;font-size:12px;color:#bfe6da;background:#1d2a28;border-radius:8px;padding:8px 11px}
+.ve-escape-told.bad{color:#ffb3ad;background:#2d1b1b}
+.ve-escape-shut{margin-top:14px;width:100%}
+@media(max-width:620px){.ve-escape-row{flex-direction:column;align-items:stretch;gap:3px}.ve-escape-row button{min-width:0;text-align:center}.ve-escape-row span{text-align:center}}
+
+/* [#1207] Where a save says what became of it. */
+.ve-toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,16px);z-index:50;max-width:min(560px,92vw);padding:11px 18px;border-radius:26px;background:#202329ef;border:1px solid #6a6d7699;color:#f2f3f6;font-size:13px;text-align:center;opacity:0;pointer-events:none;transition:opacity .18s ease,transform .18s ease}
+.ve-toast.on{opacity:1;transform:translate(-50%,0)}

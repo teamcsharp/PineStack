@@ -1,8 +1,70 @@
 const { contextBridge, ipcRenderer, clipboard, nativeImage } = require("electron");
 
-contextBridge.exposeInMainWorld("pineDesktop", {
+/* [#1206] ONE SENTENCE, NOT A STACK TRACE.
+ *
+ * Electron re-throws a main-process handler's error in the renderer with
+ * its own wrapper round it:
+ *
+ *     Error invoking remote method 'agent:get': Error: That line is no
+ *     longer in the booth
+ *
+ * 296 places under desktop/renderer print `err.message` at the operator,
+ * and that string is what they printed. The wrapper is put on HERE, so
+ * it comes off here — one place instead of 296. The station's own words
+ * survive; the plumbing does not. The original is kept on `err.raw` and
+ * the channel on `err.ipcChannel` for anything that wants to log it. */
+function pineIpcSentence(channel, error) {
+  /* String(new Error("")) is the word "Error" and nothing else, which
+   * is worse than saying nothing — so only a real message counts. */
+  const raw = String((error && error.message)
+    || (typeof error === "string" ? error : "")).trim();
+  const said = raw
+    .replace(/^Error invoking remote method '[^']*':\s*/, "")
+    .replace(/^(?:Error|TypeError|RangeError|SyntaxError):\s*/, "")
+    .trim();
+  const out = new Error(said || raw
+    || ("the desk could not carry out " + channel));
+  out.ipcChannel = channel;
+  out.raw = raw;
+  return out;
+}
+
+function pineSpeakPlainly(api) {
+  const out = {};
+  Object.keys(api).forEach((name) => {
+    const fn = api[name];
+    if (typeof fn !== "function") { out[name] = fn; return; }
+    out[name] = function () {
+      let got = null;
+      try {
+        got = fn.apply(null, Array.prototype.slice.call(arguments));
+      } catch (error) {
+        throw pineIpcSentence(name, error);
+      }
+      if (got && typeof got.then === "function"
+          && typeof got.catch === "function") {
+        return got.catch((error) => {
+          throw pineIpcSentence(name, error);
+        });
+      }
+      return got;
+    };
+  });
+  return out;
+}
+
+contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
   readConfig: () => ipcRenderer.invoke("config:read"),
   writeConfig: (cfg) => ipcRenderer.invoke("config:write", cfg),
+  /* [#1224] DICTATION, FROM A file:// PAGE TO A STATION ON THE LAN.
+   * The bytes and the reply go through the shell because the renderer's
+   * origin is file://, the station carries no CORS headers and answers a
+   * preflight with 405, and the key is out there anyway.  `talkOverlay`
+   * drives the always-on-top window that puts the dictation graphic above
+   * every other window this app opens. */
+  listenTranscribe: (bytes) => ipcRenderer.invoke("listen:transcribe", bytes),
+  speechSay: (opts) => ipcRenderer.invoke("speech:say", opts),
+  talkOverlay: (state) => ipcRenderer.invoke("talk:overlay", state),
   startBackend: () => ipcRenderer.invoke("backend:start"),
   stopBackend: () => ipcRenderer.invoke("backend:stop"),
   setupBackend: () => ipcRenderer.invoke("backend:setup"),
@@ -319,4 +381,4 @@ contextBridge.exposeInMainWorld("pineDesktop", {
       return false;
     }
   }
-});
+}));                                                        // [#1206]

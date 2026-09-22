@@ -86,6 +86,61 @@ KEEP_HOURS = 48.0               # same as every other ledger here
 RESTART_REST = 5.0
 _LAST_SEEN: dict = {"seen": False, "signal": 0}
 
+# #1250b: WHICH TRANSPORT, and it is a measurement, not a taste.
+#
+# Measured 2026-09-21 against this camera with nothing else watching it:
+#   tcp  30.2 s / 896 packets, then "EOF while reading input"
+#        29.8 s / 887 packets, then "Error during demuxing: Connection
+#        timed out"                      - three runs, all thirty seconds
+#   udp  400 s with no drop at all, and a five-minute segment that ran
+#        to its full five minutes for the first time
+#
+# The camera runs "Nvt RTSP, streamed by the LIVE555 Media Server" and it
+# closes an INTERLEAVED RTP-over-TCP session at thirty seconds. ffmpeg
+# does send the GET_PARAMETER keepalive; it is torn down regardless.
+# Thirty seconds of picture plus the twenty-three the supervisor spent
+# rescanning the radio before each retry IS the ten-to-fifteen seconds
+# the operator saw - and it is why no clip ever reached five minutes.
+#
+# TCP is kept as the fallback rather than deleted, because a network
+# that blocks the RTP ports is the one case where it is the only way
+# through. Nothing here is a standing guess: a transport that cannot
+# hold a stream for TRANSPORT_GOOD_S is rotated away from.
+TRANSPORTS = ("udp", "tcp")
+TRANSPORT_GOOD_S = 45.0         # longer than the camera's 30 s TCP cut
+_TRANSPORT = [0]
+# #1250b: udp is the transport that can lose a packet, and on this link
+# it does - 22 "RTP: missed" in a clean two-minute run. That is half a
+# packet a second out of thirty frames a second, and the recording came
+# back 119.5 seconds long out of 120, so it is a blemish and not a hole.
+# A 4 MB socket buffer and a wider reorder window were MEASURED against
+# the defaults and were WORSE (53 s of media in 94 s, and the wider
+# reorder window only adds latency: RTP over udp has no retransmission,
+# so waiting longer for a lost packet recovers nothing). The defaults
+# stand; this comment is here so nobody spends the afternoon again.
+#
+# #1388's `-timeout` stays exactly as it is. Two udp runs did end on
+# "Error during demuxing: Connection timed out" at 94 s and 338 s, and
+# an idle RTSP control socket was the suspicion - but the camera's own
+# RTSP server was then observed to shut down entirely (port 554 refused
+# while its HTTP server still answered 302), which produces the same
+# line, so the suspicion is unproven and the timeout is not worth
+# touching on one. What it costs is now small: with the rescan gated
+# below, a drop is five seconds off the air instead of twenty-five.
+# Lines ffmpeg prints once per muxer at start-up that mean nothing at
+# all. They cost this request two sessions: they were the whole of the
+# drop reason, so the muxer was blamed and the closed session was not.
+STREAM_NOISE = (
+    "Timestamps are unset in a packet",
+    "Non-monotonic DTS in output",
+)
+_STREAM: dict = {"transport": TRANSPORTS[0], "class": "", "say": "",
+                 "life_s": 0.0, "lives": [], "exit": "", "noise": 0}
+# #1250b: a wifi rescan takes the spare radio off channel for about
+# twenty-three seconds. Paying that before every retry doubled the hole.
+DOCTOR_EVERY_S = 300.0
+_DOCTOR = [0.0]
+
 
 def run(cmd: list[str], timeout: float = 30.0) -> tuple[int, str]:
     try:
@@ -107,7 +162,9 @@ def say(state: str, **more) -> None:
             "rtsp": RTSP, "ssid": SSID, "iface": SPARE_IF,
             # #1347: so a surface can draw "the camera is there but not
             # joined yet" without being able to see a radio.
-            **_LAST_SEEN, **more}, indent=2))
+            # #1250b: how the last stream ended travels with every
+            # other reading, so no surface has to ask a second door.
+            **_LAST_SEEN, "stream": dict(_STREAM), **more}, indent=2))
     except Exception:  # noqa: BLE001
         pass
 
@@ -150,6 +207,13 @@ def remember() -> None:
         run(['nmcli', 'connection', 'modify', name,
              'connection.autoconnect', 'yes',
              'connection.autoconnect-priority', '-10',
+             # #1250: NEVER let this radio doze. In power
+             # save an RTL8821AU sleeps between beacons and
+             # the camera's AP does not buffer for it, so
+             # the RTSP stream stalls and the watchdog kills
+             # ffmpeg - measured as two recorder lifetimes
+             # inside fifty-three seconds. 2 is 'disable'.
+             '802-11-wireless.powersave', '2',
              'connection.interface-name', SPARE_IF], 20)
     except Exception:  # noqa: BLE001
         pass          # the sweep rejoins anyway; this only makes it quicker
@@ -168,6 +232,11 @@ def join() -> bool:
     ok = code == 0 and linked()
     if ok:
         remember()          # #1350: next time, it just comes back
+        # #1250: the profile setting applies at ACTIVATION, and
+        # this activation has already happened - so say it to the
+        # interface too, or the first session after a fresh join
+        # is the one that dozes.
+        run(['iw', 'dev', SPARE_IF, 'set', 'power_save', 'off'], 10)
     return ok
 
 
@@ -312,6 +381,20 @@ def doctor() -> dict:
         out['iface_up'] = ' UP ' in (link or '') or 'UP>' in (link or '')
     except Exception:  # noqa: BLE001
         out['iface_up'] = False
+    # #1250: a dozing radio drops the stream every ten or fifteen
+    # seconds and every other reading here stays green while it
+    # does. One line of output; it belongs on the ladder.
+    try:
+        code, ps = run(['iw', 'dev', SPARE_IF, 'get', 'power_save'], 10)
+        out['power_save'] = 'on' if ' on' in (ps or '').lower() else (
+            'off' if ' off' in (ps or '').lower() else 'unknown')
+    except Exception:  # noqa: BLE001
+        out['power_save'] = 'unknown'
+    if out.get('power_save') == 'on':
+        out['steps'].append(
+            'the spare radio is in power save - it dozes between '
+            'beacons and the camera stops mid-stream; run: sudo iw '
+            'dev %s set power_save off' % SPARE_IF)
     seen = []
     try:
         run(['nmcli', 'device', 'wifi', 'rescan', 'ifname', SPARE_IF], 40)
@@ -386,6 +469,25 @@ def doctor() -> dict:
             'client slot - disconnect it first',
             'then press Look again',
         ]
+    # #1250b: HOW THE LAST STREAM ENDED, on the ladder, in one word.
+    # Every other reading here was green while the picture cut out
+    # every thirty seconds, because not one of them was about the
+    # stream. This rung is.
+    out['stream'] = dict(_STREAM)
+    if _STREAM.get('class') == 'session-cut':
+        out['steps'].append(
+            'the camera is ending the RTSP session itself - it does that '
+            'to an interleaved TCP session at thirty seconds; the link '
+            'runs on %s and rotates transport by itself if that stops '
+            'holding' % rtsp_transport())
+    elif _STREAM.get('class') == 'decode':
+        out['steps'].append(
+            'the picture is arriving damaged: bring the camera closer to '
+            'the DGX, or the USB adapter towards the camera')
+    elif _STREAM.get('class') == 'stalled':
+        out['steps'].append(
+            'the camera stopped sending mid-stream - a fresh battery or '
+            'a shorter distance is usually what that wants')
     return out
 
 
@@ -412,10 +514,63 @@ def trim_old() -> int:
     return gone
 
 
+def rtsp_transport() -> str:
+    """#1250b: the transport in force. See TRANSPORTS - it rotates."""
+    return TRANSPORTS[_TRANSPORT[0] % len(TRANSPORTS)]
+
+
+def stream_fault(err: str, life_s: float, stalled: bool) -> dict:
+    """#1250b: NAME the way a stream ended, in one word.
+
+    `why` was already there and it was never a reading: it carried
+    whichever four lines ffmpeg happened to print last, and for this
+    camera those are always the two harmless start-up warnings about
+    timestamps. Two sessions read them and went after the muxer. The
+    line that named the fault - the session being closed at thirty
+    seconds - was cut off the end and shown to nobody.
+    """
+    lines = [x.strip() for x in (err or "").splitlines() if x.strip()]
+    noisy = [x for x in lines if any(n in x for n in STREAM_NOISE)]
+    real = [x for x in lines if x not in noisy]
+    last = (real[-1] if real else (lines[-1] if lines else ""))
+    low = " ".join(real).lower()
+    was = rtsp_transport()
+    if stalled:
+        cls = "stalled"
+        said = ("no new frame for %ds with ffmpeg still running - the "
+                "camera stopped sending" % int(FRAME_STALL_S))
+    elif ("connection refused" in low or "no route to host" in low
+            or "network is unreachable" in low):
+        cls = "unreachable"
+        said = "the camera did not answer at all"
+    elif (("eof while reading input" in low or "connection timed out" in low
+           or "end of file" in low or "immediate exit" in low)
+          and 2.0 <= life_s <= 40.0):
+        cls = "session-cut"
+        said = ("the camera closed the session itself after %.0fs - it "
+                "cuts an interleaved TCP session at thirty seconds, and "
+                "this run was on %s" % (life_s, was))
+    elif "error while decoding" in low or "corrupt" in low:
+        cls = "decode"
+        said = "packets are arriving damaged - the radio link is weak"
+    elif life_s < 2.0:
+        cls = "no-start"
+        said = "ffmpeg gave up before any picture arrived"
+    else:
+        cls = "ended"
+        said = "the stream ended after %.0fs" % life_s
+    return {"class": cls, "say": said, "exit": last[:300],
+            "noise": len(noisy), "transport": was,
+            "life_s": round(life_s, 1)}
+
+
 def ffmpeg_cmd() -> list[str]:
+    # #1250b: udp first, and which one is in force is the rotating
+    # measurement above rather than a constant typed in here.
+    tport = rtsp_transport()
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-rtsp_transport", "tcp",
+        "-rtsp_transport", tport,
         # #1388: a read that gets nothing for twenty seconds is a dead
         # link, and ffmpeg must EXIT on it. Without this it sat on a
         # dropped camera for 12.9 hours (measured: pid alive, the radio
@@ -471,10 +626,21 @@ def supervise(once: bool = False) -> None:
         # has already been paid for - and it is the difference between
         # a surface that says 'not found' and one that says which of
         # the three reasons it is.
-        try:
-            _LAST_SEEN['doctor'] = doctor()
-        except Exception:  # noqa: BLE001
-            pass
+        # #1250b: NOT BEFORE EVERY RETRY. A rescan takes the spare
+        # radio off channel for about twenty-three seconds, and the
+        # old loop paid it on every pass - so a camera that dropped at
+        # thirty seconds was off the air for another third of every
+        # minute on top, to answer a question nobody had asked (we
+        # were already joined). Scan when there is a reason to, or
+        # every five minutes.
+        if (not linked()) or (time.time() - _DOCTOR[0] > DOCTOR_EVERY_S):
+            try:
+                doc = doctor()
+                doc['at'] = time.time()
+                _LAST_SEEN['doctor'] = doc
+                _DOCTOR[0] = time.time()
+            except Exception:  # noqa: BLE001
+                pass
         if not join():
             say("no-link", why="the camera's network is not being "
                 "broadcast, or the join failed")
@@ -497,8 +663,10 @@ def supervise(once: bool = False) -> None:
         say("live", pid=0, trimmed=trimmed,
             hls="data/pinelink/live/index.m3u8")
         print("PineLink live: %s -> %s" % (RTSP, LIVE))
+        began = time.time()                                   # #1250b
         proc = subprocess.Popen(ffmpeg_cmd(), stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True)
+        _STREAM["transport"] = rtsp_transport()               # #1250b
         say("live", pid=proc.pid, hls="data/pinelink/live/index.m3u8")
         # #1388: WATCH THE FRAMES, NOT THE PIPE.
         #
@@ -543,12 +711,35 @@ def supervise(once: bool = False) -> None:
             return
         if stalled:
             err = (err or "") + "\nno new frame for %ds - the link is gone; ffmpeg killed (#1388)" % int(FRAME_STALL_S)
-        tail = "\n".join((err or "").strip().splitlines()[-4:])
-        # An ffmpeg that exits is not an error to swallow: the camera
-        # sleeps, wanders out of range, or its battery goes. Say which,
-        # as far as can be told, and try again.
-        say("dropped", why=tail[:400] or "the stream ended")
-        print("PineLink dropped: %s" % (tail[:200] or "stream ended"))
+        # #1250b: THE LAST LINE IS THE ANSWER, and it was the one
+        # thing thrown away. `tail[:400]` took four lines and then
+        # cut them from the FRONT, so a surface was handed the two
+        # start-up warnings and never the line that said the session
+        # had been closed. Classify first, keep the real last line
+        # whole, and count the noise instead of printing it.
+        life = time.time() - began
+        fault = stream_fault(err, life, stalled)
+        lives = ([float(x) for x in (_STREAM.get("lives") or [])][-7:]
+                 + [round(life, 1)])
+        _STREAM.clear()
+        _STREAM.update(fault)
+        _STREAM["lives"] = lives
+        # A transport that cannot hold a stream for TRANSPORT_GOOD_S
+        # is the wrong transport. Do not rotate on a run that never
+        # started: that says nothing about transports.
+        if 2.0 <= life < TRANSPORT_GOOD_S:
+            _TRANSPORT[0] += 1
+            _STREAM["next_transport"] = rtsp_transport()
+        rest = [x.strip() for x in (err or "").splitlines() if x.strip()
+                and not any(n in x for n in STREAM_NOISE)][-4:-1]
+        why = fault["say"]
+        if fault["exit"]:
+            why += " | " + fault["exit"]
+        if rest:
+            why += "\n" + "\n".join(rest)[:300]
+        say("dropped", why=why[:600])
+        print("PineLink dropped after %.0fs (%s): %s"
+              % (life, fault["class"], fault["say"]))
         if once:
             return
         time.sleep(RESTART_REST)

@@ -50,6 +50,20 @@
   cursor: grab;
   touch-action: none;          /* the drag is ours, not the scroller's */
   user-select: none;
+  /* [#1213] THE HEAD IS NOT SHRINKABLE. This is the fault itself.
+     `.og` is a column flex box with a saved pixel height and a list that
+     always wants more room than it has, so the column was shrinking the head
+     - measured at 53px against the 73.9px its own contents need - and the
+     avatar button was clamped with it. A button whose height is clamped does
+     not shrink what is inside it; the face simply overflowed, 16.9px of it,
+     onto the panel behind. The list already has `overflow-y: auto`, so it is
+     the one that can give room and this one never has to.
+     AND IT CLIPS, as a guarantee that no future font can put anything in this
+     strip outside the panel - which is only safe BECAUSE of the line above:
+     `overflow: hidden` removes a flex item's automatic minimum size, so on
+     its own it would have let the head shrink to nothing. */
+  flex: 0 0 auto;
+  overflow: hidden;
 }
 .og-head:active { cursor: grabbing; }
 .og-name {
@@ -86,6 +100,17 @@
   padding: 3px 5px;
   cursor: pointer;
   color: #9fd6e8;
+  /* [#1213] THE CARD IS PINNED TO WHAT IS IN IT. `flex: 0 0 auto` above
+     governs the main axis only; across it the button was taking whatever
+     height the squeezed head had left. max-content is Glyphy's own height,
+     whatever the host renders him at - 48.9px of pre on the desk at 8px,
+     73.4px on the PineTab where the WebView clamps the same pre to a 12px
+     minimum - so this holds on both without naming a number. */
+  align-self: flex-start;
+  min-height: max-content;
+  overflow: hidden;
+  display: block;
+  box-sizing: border-box;
 }
 .og-avatar:hover { border-color: #4a5a68; }
 .og-avatar:active { transform: translateY(1px); }
@@ -128,6 +153,56 @@
   color: #6f8090;
 }
 .og-say-text { color: #cfe3ea; }
+/* [#1213] the face folds the panel now, so the line that shows what he says
+   is the thing that steps through saying / because / the brief. */
+.og-say { cursor: pointer; }
+
+/* [#1186] "paused while you read - N updates waiting".
+   A LINE, NOT A TOAST. The complaint was that things moved while he read;
+   answering it with something that appears over the reading would be the same
+   fault in a friendlier colour. It sits under the SAYING row, it is only there
+   while something is actually held, and pressing it takes the update now. */
+.og-held {
+  padding: 5px 12px;
+  border-bottom: 1px solid #222b33;
+  background: rgba(30, 26, 12, .85);
+  color: #e0ad63;
+  font-size: 11px;
+  letter-spacing: .02em;
+  cursor: pointer;
+}
+.og-held[hidden] { display: none; }
+.og-held:hover { background: rgba(44, 37, 15, .9); color: #f0c789; }
+
+/* ------------------------------------------------------- [#1213] THE PILL
+
+   "if I click the orchestrator I want it to collapse."
+
+   Folded, the panel is his face, the badges and the one line he is saying.
+   The height is the only thing forced: place() writes an inline px height
+   that a saved size restores, and a pill has to be as tall as its contents.
+   The WIDTH is left alone on purpose - it is the width he dragged it to, and
+   a box that changes width when it folds is a box that has moved. */
+.og.og-min {
+  height: auto !important;
+  min-height: 0 !important;
+  resize: none;
+}
+.og.og-min .og-main { display: none !important; }
+.og.og-min .og-name { display: none; }
+.og.og-min .og-held { display: none !important; }
+.og.og-min .og-head { border-bottom: 0; padding: 6px 6px 6px 10px; }
+.og.og-min .og-say {
+  border-bottom: 0;
+  padding: 4px 12px 8px;
+  align-items: center;
+}
+.og.og-min .og-say-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
 
 /* ------------------------------------------------------------- the body */
 

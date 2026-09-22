@@ -123,11 +123,37 @@
   var READ_QUIET_MS = 12000;    /* how long he gets after his last touch */
   var restTimer = null;
 
+  /* 2026-09-21 (#1186): THREE MORE SIGNS OF A HAND, EACH WITH ITS OWN CLOCK.
+   *
+   * "don't refresh the orchestrator whenever I'm scrolling through it."
+   *
+   * #1220's `pressed` is true only while a pointer is physically down, and it
+   * is bound to the HEAD's drag, so a hand resting over the list, a momentum
+   * scroll and a triangle pressed a moment ago all read as an empty room. The
+   * three below are the three things he was actually doing when it moved under
+   * him, and each gets the quiet it needs: a pointer inside the box holds for
+   * as long as it is there, a scroll holds for two seconds after the last
+   * scroll event (which covers momentum), and a triangle holds for five,
+   * because opening one is the start of reading it, not the end. */
+  var inside = false;           /* [#1186] the pointer is over the pop-up */
+  var scrollAt = 0;             /* [#1186] the list was last scrolled */
+  var toggleAt = 0;             /* [#1186] a triangle was last pressed */
+  var pendingUpdates = 0;       /* [#1186] payloads held back while he reads */
+  var SCROLL_QUIET_MS = 2000;   /* [#1186] */
+  var TOGGLE_QUIET_MS = 5000;   /* [#1186] */
+  /* [#1213] folded to the pill, and remembered per device. */
+  var mini = false;
+  var MINI = 'pineOrchGlassMin';
+  var dragMoved = false;        /* [#1213] the head was dragged, not pressed */
+
   function touched() { touchedAt = Date.now(); }
 
   function reading() {
-    if (pressed) return true;
-    return (Date.now() - touchedAt) < READ_QUIET_MS;
+    if (pressed || inside) return true;          /* [#1186] */
+    var now = Date.now();
+    if ((now - scrollAt) < SCROLL_QUIET_MS) return true;   /* [#1186] */
+    if ((now - toggleAt) < TOGGLE_QUIET_MS) return true;   /* [#1186] */
+    return (now - touchedAt) < READ_QUIET_MS;
   }
 
   /* Every road a person's attention arrives by. Passive where it can be, so
@@ -143,6 +169,47 @@
             ? false : {passive: true, capture: true});
       } catch (err) { /* older host: the ones that took are enough */ }
     }
+    /* [#1186] ...and the three that carry their own clock. All passive and
+       all captured, so nothing here can make his scroll feel heavy, and all
+       guarded one at a time - a host that lacks pointerenter must still get
+       the scroll hold. */
+    try {
+      node.addEventListener('scroll', stampScroll, {passive: true, capture: true});
+    } catch (err) { /* the touch stamp above still covers it */ }
+    try {
+      node.addEventListener('wheel', stampScroll, {passive: true, capture: true});
+    } catch (err) { /* as above */ }
+    try {
+      node.addEventListener('pointerenter', stampIn, true);
+      node.addEventListener('pointerover', stampIn, true);
+    } catch (err) { /* a host with no pointer events: the rest stands */ }
+    try {
+      node.addEventListener('pointerleave', stampOut, true);
+      node.addEventListener('mouseleave', stampOut, false);
+      node.addEventListener('pointerout', function (ev) {
+        try {
+          if (ev && ev.relatedTarget && node.contains(ev.relatedTarget)) return;
+        } catch (err) { /* a cross-document relatedTarget: treat it as out */ }
+        stampOut();
+      }, true);
+    } catch (err) { /* as above */ }
+  }
+
+  function stampScroll() { scrollAt = Date.now(); }   /* [#1186] */
+  function stampIn() { inside = true; }               /* [#1186] */
+
+  /* [#1186] THE HAND LEFT, SO THE DIFF GOES IN. Not instantly - the other two
+     clocks still have to agree, and a pointer that crosses a gap between two
+     children of this box raises leave/enter in that order - so it is asked
+     again one tick later and the one-second rest timer is the backstop. */
+  function stampOut() {
+    inside = false;
+    try {
+      root.setTimeout(function () {
+        if (!box || !waiting || reading()) return;
+        paint();
+      }, 60);
+    } catch (err) { /* the rest timer will catch it */ }
   }
 
   /* ------------------------------------------------------------ plumbing */
@@ -345,6 +412,11 @@
   function fold(id, title, summary, build, cls) {
     var wrap = el('div', 'og-fold' + (cls ? ' ' + cls : ''));
     wrap.setAttribute('data-fold', id);
+    /* [#1186] THE BUILDER LIVES ON THE NODE, not only in this closure.
+       reconcile() keeps a live fold and hands it the newest payload's builder,
+       so a triangle opened ten minutes after the poll that drew it still
+       expands into what the station says NOW rather than what it said then. */
+    wrap.__ogBuild = build;
     var head = el('button', 'og-tri');
     head.setAttribute('type', 'button');
     head.setAttribute('aria-expanded', open[id] ? 'true' : 'false');
@@ -360,12 +432,14 @@
     }
     head.addEventListener('click', function (ev) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
+      toggleAt = Date.now();   /* [#1186] he has just started reading this */
       if (open[id]) { delete open[id]; } else { open[id] = true; }
       wrap.classList.toggle('open', !!open[id]);
       head.setAttribute('aria-expanded', open[id] ? 'true' : 'false');
       body.hidden = !open[id];
       if (open[id] && !body.children.length) {
-        try { build(body); } catch (err) { body.appendChild(el('div', 'og-warn', 'this detail could not be drawn')); }
+        var make = wrap.__ogBuild || build;   /* [#1186] the newest builder */
+        try { make(body); } catch (err) { body.appendChild(el('div', 'og-warn', 'this detail could not be drawn')); }
       }
       remember();
       duck();
@@ -420,7 +494,9 @@
    * sound back by itself if this surface is ever torn out without closing -
    * which a view change or a kiosk relaunch will do. */
   function duck() {
-    var want = !!(box && anyOpen());
+    /* [#1213] a folded panel shows no arithmetic, so it is not a reading
+       surface and must not tear the wallpaper off the wall. */
+    var want = !!(box && !mini && anyOpen());
     if (want === holding) return;
     holding = want;
     try {
@@ -449,7 +525,13 @@
    * and triggered". `steps` is the station's own narration, filed against
    * the pass that wrote it; `systems` is what that pass called. */
   function turnRow(row, n) {
-    var id = 'turn:' + row.keeper + ':' + row.turn + ':' + n;
+    /* [#1186] KEYED BY THE PASS, NEVER BY ITS PLACE IN THE LIST.
+       `recent` is newest-first, so one new pass shifted every index by one and
+       every open triangle's key changed with it - which is what he saw as the
+       list reordering and his open sections closing. keeper+turn+start is the
+       pass itself and does not move when something is put above it. */
+    var id = 'turn:' + row.keeper + ':' + row.turn + ':'
+      + (row.at ? Math.round(Number(row.at) * 1000) : n);
     var summary = (row.systems && row.systems.length)
       ? row.systems.length + ' system' + (row.systems.length === 1 ? '' : 's')
       : (row.steps && row.steps.length ? row.steps.length + ' line'
@@ -1450,20 +1532,232 @@
 
   /* --------------------------------------------------------- the drawing */
 
+  /* 2026-09-21 (#1186): A RECONCILE, NOT A REBUILD.
+   *
+   * paint() still builds a whole fresh tree - that is the only honest way to
+   * draw a payload, and every pane below stays exactly as it was written. It
+   * builds it into a DETACHED STAGE, and these three move the difference into
+   * the live list: a section that has not changed is not touched at all, a
+   * section whose words changed has its words rewritten in place, and a
+   * section whose body changed has its body swapped while the triangle, the
+   * open state, the order and the scroll all stand.
+   *
+   * The key is `data-fold`, which every pane already carries and which is the
+   * same key the open map and localStorage use, so nothing new has to be
+   * remembered for this to work. */
+  function kid(node, cls) {
+    var list = node ? node.children : null;
+    for (var i = 0; list && i < list.length; i += 1) {
+      var name = list[i].className || '';
+      if ((' ' + name + ' ').indexOf(' ' + cls + ' ') >= 0) return list[i];
+    }
+    return null;
+  }
+
+  function setText(node, text) {
+    if (!node) return;
+    var want = String(text === null || typeof text === 'undefined' ? '' : text);
+    if (node.textContent !== want) node.textContent = want;
+  }
+
+  /* Hand every live fold under `live` the builder its twin under `fresh`
+     carries, so a triangle opened later expands into the newest reading. */
+  function everyFold(node, out) {
+    out = out || [];
+    var list = node ? node.children : null;
+    for (var i = 0; list && i < list.length; i += 1) {
+      if (list[i].getAttribute && list[i].getAttribute('data-fold')) out.push(list[i]);
+      everyFold(list[i], out);
+    }
+    return out;
+  }
+
+  function syncBuilds(live, fresh) {
+    var mine = everyFold(live);
+    var theirs = everyFold(fresh);
+    var book = Object.create(null);
+    var i;
+    for (i = 0; i < theirs.length; i += 1) {
+      book[theirs[i].getAttribute('data-fold')] = theirs[i].__ogBuild;
+    }
+    for (i = 0; i < mine.length; i += 1) {
+      var got = book[mine[i].getAttribute('data-fold')];
+      if (got) mine[i].__ogBuild = got;
+    }
+  }
+
+  function refold(live, fresh) {
+    live.__ogBuild = fresh.__ogBuild;
+    if (live.className !== fresh.className) live.className = fresh.className;
+    var lh = kid(live, 'og-tri');
+    var fh = kid(fresh, 'og-tri');
+    if (lh && fh) {
+      setText(kid(lh, 'og-tri-title'), (kid(fh, 'og-tri-title') || {}).textContent);
+      var ls = kid(lh, 'og-tri-sum');
+      var fs = kid(fh, 'og-tri-sum');
+      if (ls && fs) setText(ls, fs.textContent);
+      else if (fs && !ls) lh.appendChild(fs);
+      else if (ls && !fs) lh.removeChild(ls);
+      lh.setAttribute('aria-expanded', fh.getAttribute('aria-expanded') || 'false');
+    }
+    var lb = kid(live, 'og-body');
+    var fb = kid(fresh, 'og-body');
+    if (!lb || !fb) return;
+    lb.hidden = fb.hidden;
+    if (lb.innerHTML === fb.innerHTML) { syncBuilds(lb, fb); return; }
+    /* A body that is ITSELF a list of keyed rows - which is what the two
+       lists that churn, "being pursued right now" and "what it has been
+       doing, in order", both are - is reconciled the same way rather than
+       thrown away and built again. This is the difference between a pass he
+       had open surviving a newer pass arriving above it and not. */
+    if (allKeyed(lb) && allKeyed(fb)) { reconcile(lb, fb); return; }
+    lb.innerHTML = '';
+    while (fb.children.length) lb.appendChild(fb.removeChild(fb.children[0]));
+  }
+
+  function allKeyed(node) {
+    var list = node ? node.children : null;
+    if (!list || !list.length) return false;
+    for (var i = 0; i < list.length; i += 1) {
+      if (!list[i].getAttribute || !list[i].getAttribute('data-fold')) return false;
+    }
+    return true;
+  }
+
+  function reconcile(host, stage) {
+    var have = Object.create(null);
+    var i, k;
+    for (i = 0; i < host.children.length; i += 1) {
+      k = host.children[i].getAttribute && host.children[i].getAttribute('data-fold');
+      if (k) have[k] = host.children[i];
+    }
+    var fresh = [];
+    while (stage.children.length) fresh.push(stage.removeChild(stage.children[0]));
+    var want = [];
+    for (i = 0; i < fresh.length; i += 1) {
+      k = fresh[i].getAttribute && fresh[i].getAttribute('data-fold');
+      var node = (k && have[k]) || null;
+      if (node) { refold(node, fresh[i]); delete have[k]; }
+      else { node = fresh[i]; }
+      want.push(node);
+    }
+    for (k in have) {
+      if (have[k] && have[k].parentNode === host) host.removeChild(have[k]);
+    }
+    for (i = 0; i < want.length; i += 1) {
+      if (host.children[i] === want[i]) continue;
+      if (host.insertBefore) host.insertBefore(want[i], host.children[i] || null);
+      else host.appendChild(want[i]);
+    }
+    while (host.children.length > want.length) {
+      host.removeChild(host.children[host.children.length - 1]);
+    }
+  }
+
+  /* [#1186] "paused while you read - N updates waiting". It is a line rather
+     than a toast because a toast would be the very thing he complained about:
+     something appearing over what he is reading. Pressing it takes the update
+     now. */
+  function paintHeld() {
+    if (!box) return;
+    var line = box.querySelector('.og-held');
+    if (!line) return;
+    var show = !mini && waiting && pendingUpdates > 0;
+    line.hidden = !show;
+    if (!show) return;
+    setText(line, 'paused while you read \u00b7 ' + pendingUpdates
+      + ' update' + (pendingUpdates === 1 ? '' : 's') + ' waiting');
+  }
+
+  /* ---------------------------------------------- [#1213] folded to a pill
+   *
+   * "if I click the orchestrator I want it to collapse ... I want him fitting
+   *  inside of the container box that holds him."
+   *
+   * The circle-x has always closed the pop-up outright, which is why pressing
+   * it did not "collapse" anything - it took the whole thing away and the
+   * launcher dot was the only way back. Folding is the third state he was
+   * asking for and it is the one this surface wanted all along: he leaves it
+   * up all show, and most of that time he only needs the face, the mood and
+   * the one line the conductor is saying.
+   *
+   * A FOLDED PANEL BUILDS NOTHING. paint() returns at the top and the poll
+   * only rewrites two lines of text, so the pill costs one small request every
+   * five seconds and no DOM at all. */
+  function recallMini() {
+    try { mini = root.localStorage.getItem(MINI) === '1'; }
+    catch (err) { mini = false; }
+    return mini;
+  }
+
+  function rememberMini() {
+    try { root.localStorage.setItem(MINI, mini ? '1' : '0'); }
+    catch (err) { /* a preference that will not save is not a fault */ }
+  }
+
+  function applyMini() {
+    if (!box) return;
+    box.classList.toggle('og-min', !!mini);
+    box.setAttribute('aria-expanded', mini ? 'false' : 'true');
+    var list = box.querySelector('.og-main');
+    if (list) list.hidden = !!mini;
+    var av = box.querySelector('.og-avatar');
+    if (av) {
+      av.setAttribute('aria-label', mini
+        ? 'The orchestrator - press to open him out'
+        : 'The orchestrator - press to fold him away');
+    }
+    duck();
+    paintHeld();
+  }
+
+  function collapse(want) {
+    if (!box) return mini;
+    mini = (typeof want === 'boolean') ? want : !mini;
+    rememberMini();
+    applyMini();
+    if (!mini) {
+      /* opening out is an explicit ask to see the newest reading, so the
+         three clocks are cleared and the held diff goes in at once. */
+      waiting = false;
+      pendingUpdates = 0;
+      touchedAt = 0;
+      scrollAt = 0;
+      toggleAt = 0;
+      if (last) paint();
+    }
+    return mini;
+  }
+
   function paint() {
     if (!box || !last) return;
-    var main = box.querySelector('.og-main');
-    if (!main) return;
-    var scroll = main.scrollTop;
+    var host = box.querySelector('.og-main');   /* [#1186] the LIVE list */
+    if (!host) return;
+    /* [#1213] folded: two lines of text and not one node of arithmetic. */
+    if (mini) {
+      waiting = false;
+      pendingUpdates = 0;
+      paintSay();
+      paintHeader();
+      paintHeld();
+      return;
+    }
+    var scroll = host.scrollTop;
     /* #1220: innerHTML = '' destroys whatever had focus, which he reported as
        the cursor moving. Remember it by id so it can be handed back. */
     var hadFocus = '';
     try {
       var act = root.document.activeElement;
-      if (act && act.id && main.contains(act)) hadFocus = act.id;
+      if (act && act.id && host.contains(act)) hadFocus = act.id;
     } catch (err) { hadFocus = ''; }
     waiting = false;
-    main.innerHTML = '';
+    pendingUpdates = 0;
+    /* [#1186] EVERYTHING BELOW BUILDS INTO A DETACHED STAGE.
+       It is still the local `main`, on purpose: every pane in this function -
+       and every pane a later patch adds beside them - keeps writing
+       `main.appendChild(...)` and needs to know nothing about any of this.
+       reconcile() at the foot moves only the difference into `host`. */
+    var main = el('div', 'og-stage');
 
     var cover = (last.coverage || {});
     var live = last.live || [];
@@ -1644,22 +1938,24 @@
         }
       }, 'og-blindfold'));
 
-    main.scrollTop = scroll;
+    reconcile(host, main);        /* [#1186] the stage goes in, by key */
+    host.scrollTop = scroll;
     /* #1220: ...and again after layout. Assigning scrollTop immediately after
        innerHTML='' is CLAMPED to whatever height the box has at that instant,
        so a restore to 900px can land at 200 and stay there. One frame later
        the content is measured and the same assignment takes. */
     try {
       root.requestAnimationFrame(function () {
-        if (!box || !main || !main.isConnected) return;
-        if (Math.abs(main.scrollTop - scroll) > 2) main.scrollTop = scroll;
+        if (!box || !host || !host.isConnected) return;
+        if (Math.abs(host.scrollTop - scroll) > 2) host.scrollTop = scroll;
         if (!hadFocus) return;
-        var back = main.querySelector('#' + hadFocus);
+        var back = host.querySelector('#' + hadFocus);
         if (back && back.focus) { try { back.focus({preventScroll: true}); } catch (err) { back.focus(); } }
       });
     } catch (err) { /* no rAF: the assignment above is what there is */ }
     paintSay();
     paintHeader();
+    paintHeld();                  /* [#1186] */
   }
 
   function paintHeader() {
@@ -1690,8 +1986,16 @@
       /* #1220: the data is fresh either way; the BODY waits until he is
          done. The face and header still move - one line each, and neither
          touches his place in the list. */
-      if (reading()) { waiting = true; paintSay(); paintHeader(); }
-      else { paint(); }
+      /* [#1213] folded: there is no body to wait for. */
+      if (mini) { waiting = false; pendingUpdates = 0; paintSay(); paintHeader(); return; }
+      if (reading()) {
+        /* [#1186] and it says so, with a count, rather than silently going
+           stale - a surface that is behind and does not admit it is the
+           fault this station has been bitten by more than any other. */
+        waiting = true;
+        pendingUpdates += 1;
+        paintSay(); paintHeader(); paintHeld();
+      } else { paint(); }
     })['catch'](function () {
       if (!box) return;
       lastMs = Date.now() - began;
@@ -1763,6 +2067,7 @@
     var from = null;
     handle.addEventListener('pointerdown', function (ev) {
       pressed = true;
+      dragMoved = false;   /* [#1213] a press is not yet a drag */
       if (overControl(ev.target)) return;
       if (cornerAt(ev.clientX, ev.clientY)) return;
       from = {x: ev.clientX, y: ev.clientY,
@@ -1773,8 +2078,12 @@
     });
     handle.addEventListener('pointermove', function (ev) {
       if (!from) return;
-      node.style.left = (from.left + (ev.clientX - from.x)) + 'px';
-      node.style.top = Math.max(0, from.top + (ev.clientY - from.y)) + 'px';
+      /* [#1213] four pixels of travel, the same threshold the launcher dot
+         uses, so moving the box never also folds it. */
+      var dx = ev.clientX - from.x, dy = ev.clientY - from.y;
+      if ((dx * dx + dy * dy) >= 16) dragMoved = true;
+      node.style.left = (from.left + dx) + 'px';
+      node.style.top = Math.max(0, from.top + dy) + 'px';
     });
     function done(ev) {
       pressed = false;
@@ -1789,7 +2098,9 @@
           width: parseInt(node.style.width, 10) || 420,
           height: parseInt(node.style.height, 10) || 540}));
       } catch (err) { /* a position that will not save is not a fault */ }
-      if (last) paint();
+      /* [#1186] a drag moved the box, not the data: nothing to repaint, and
+         repainting here was one more rebuild under his hand. */
+      if (last && waiting && !reading()) paint();
     }
     handle.addEventListener('pointerup', done);
     handle.addEventListener('pointercancel', done);
@@ -1814,9 +2125,12 @@
     avatar.setAttribute('aria-label', 'Glyphy - press for what he is saying');
     var pre = el('pre', 'og-face', '');
     avatar.appendChild(pre);
+    /* [#1213] HIS FACE IS THE FOLD. What he is saying moved to the SAYING
+       line itself, which is a larger target and reads as the thing it steps. */
     avatar.addEventListener('click', function (ev) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
-      tapFace();
+      if (dragMoved) { dragMoved = false; return; }
+      collapse();
     });
     head.appendChild(avatar);
 
@@ -1834,7 +2148,34 @@
     var say = el('div', 'og-say');
     say.appendChild(el('span', 'og-say-what', 'saying'));
     say.appendChild(el('span', 'og-say-text', 'reading the board...'));
+    /* [#1213] pressing his face folds the panel now, so the three things he
+       has to say are stepped from the line that shows them. */
+    say.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      tapFace();
+    });
     node.appendChild(say);
+
+    /* [#1186] the one line that admits the panel is holding something back. */
+    var held = el('div', 'og-held', '');
+    held.hidden = true;
+    held.setAttribute('role', 'status');
+    held.setAttribute('title', 'press to take the waiting update now');
+    held.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      touchedAt = 0; scrollAt = 0; toggleAt = 0; inside = false;
+      if (waiting) paint();
+    });
+    node.appendChild(held);
+
+    /* [#1213] and the whole head is the other way to fold him - a press on
+       the strip, never a drag of it, and never the two buttons standing on it
+       (both of those stop the press before it gets here). */
+    head.addEventListener('click', function (ev) {
+      if (dragMoved) { dragMoved = false; return; }
+      if (ev && ev.target && overControl(ev.target)) return;
+      collapse();
+    });
 
     node.appendChild(el('div', 'og-main'));
     /* A SIBLING OF <main>, never a child of a view: every view in this
@@ -1862,7 +2203,9 @@
   function show() {
     if (box) return box;
     recall();
+    recallMini();          /* [#1213] he left it folded, it comes back folded */
     box = build();
+    applyMini();           /* [#1213] */
     frame = 0;
     sayAt = 0;
     paintFace();
@@ -1899,6 +2242,13 @@
     if (box && box.parentNode) box.parentNode.removeChild(box);
     box = null;
     pressed = false;
+    /* [#1186] every clock back to zero, or the next open inherits a hold
+       nobody is standing in. */
+    inside = false;
+    scrollAt = 0;
+    toggleAt = 0;
+    pendingUpdates = 0;
+    dragMoved = false;
   }
 
   function toggle() { if (box) { close(); return null; } return show(); }
@@ -2002,6 +2352,16 @@
     dot: dot,
     undot: undot,
     isOpen: function () { return !!box; },
+    /* [#1213] the fold, for a test, a corner gesture or a future button. */
+    collapse: collapse,
+    isFolded: function () { return !!mini; },
+    /* [#1186] what the hold is doing right now, so a probe can assert it
+       rather than infer it from a screenshot. */
+    _held: function () {
+      return {reading: reading(), inside: inside, waiting: !!waiting,
+              pending: pendingUpdates, scrollAt: scrollAt, toggleAt: toggleAt};
+    },
+    _reconcile: reconcile,
     /* For the tests and for anything that wants to know how hard this
        surface is leaning on the station. */
     asks: function () { return asks; },

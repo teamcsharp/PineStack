@@ -964,7 +964,16 @@ class System2Store:
             raise System2Conflict('Reservation ownership changed.')
         return row
 
-    def _validate(self, db, row, seconds=None):
+    def _validate(self, db, row, seconds=None, grace=0.0):
+        # [#1191] `grace` is seconds past the deadline THE CALLER is willing
+        # to run - the air road's own segment_overrun (#1166: "a finished
+        # segment may run past the fold rather than not run at all"), and
+        # nobody else's. It defaults to 0.0, so every existing caller is
+        # unchanged. Before this the two roads kept different arithmetic:
+        # on 2026-09-16 08:36:30Z the air road measured a 33.16 s gallery
+        # round as fitting with 39 s to spare and this line refused it by
+        # 3.50 s, with a bare False that reached the operator as "the
+        # caller's own check said no (can_handoff)" - Segment 11032.
         slot = self._get(db, 's2_slots', row['slot_id'])
         if row['state'] not in ACTIVE: return 'reservation_not_active'
         if not slot or slot['revision'] != row['revision']: return 'slot_revision_changed'
@@ -975,21 +984,65 @@ class System2Store:
         reason = self._eligible(db, candidate, self.now(), own=row['id'])
         if reason: return reason
         duration = row['actual_seconds'] if seconds is None else _number(seconds, 'actual seconds', .001, 3600)
-        if self.now() + duration - row['position_seconds'] > slot['deadline']: return 'measured_duration_misses_deadline'
+        allowance = 0.0 if not grace else _number(grace, 'grace seconds', 0.0, 300.0)   # [#1191]
+        if self.now() + duration - row['position_seconds'] > slot['deadline'] + allowance: return 'measured_duration_misses_deadline'
         return ''
 
-    def validate_reservation(self, reservation_id, owner, *, token=None, seconds=None):
+    def validate_reservation(self, reservation_id, owner, *, token=None, seconds=None, grace=0.0):
         with self._lock, closing(self._connect()) as db:
             row = self._owned(db, reservation_id, owner, token)
-            reason = self._validate(db, row, seconds)
+            reason = self._validate(db, row, seconds, grace)          # [#1191]
             return {'allowed': not reason, 'reason': reason, 'reservation': row}
 
-    def mark_dispatched(self, reservation_id, owner, *, token=None, seconds=None):
+    def renew_reservation(self, reservation_id, owner, *, token=None, lease_seconds=300):
+        """[#1191] Extend an owned reservation lease - including one that has
+        ALREADY lapsed - when the slot is unchanged and nobody else holds it.
+
+        The air road reserves with a 300 s lease and then waits for the floor
+        and for the page's sold air; the lease was checked only at the
+        hand-over, so a wait the station itself imposed became
+        'reservation_lease_expired' and a written, rendered round was thrown
+        away. The id and token stay the same, so the proof the runtime's
+        closures and the entry's `_system2` copy carry stays valid. Answers
+        {'renewed', 'reason', 'reservation'}; refuses (never raises) for every
+        reason _validate would refuse except the lapsed lease."""
+        _number(lease_seconds, 'lease_seconds', 1, 3600)
+        with self._tx() as db:
+            row = self._owned(db, reservation_id, owner, token)
+            if row['state'] != 'reserved':
+                return {'renewed': False, 'reason': 'reservation_not_reserved', 'reservation': row}
+            slot = self._get(db, 's2_slots', row['slot_id'])
+            if not slot or slot['revision'] != row['revision']:
+                return {'renewed': False, 'reason': 'slot_revision_changed', 'reservation': row}
+            for raw in db.execute("SELECT body FROM s2_reservations WHERE slot_id=? AND state IN ('reserved','playing','suspended')", (row['slot_id'],)):
+                other = json.loads(raw[0])
+                if other['id'] == row['id']: continue
+                if other['state'] != 'reserved' or other['lease_until'] > self.now():
+                    return {'renewed': False, 'reason': 'slot_taken_by_another_performance', 'reservation': row}
+            candidate = self._get(db, 's2_candidates', row['candidate_id'])
+            if not candidate or candidate['signature'] != row['candidate']['signature']:
+                return {'renewed': False, 'reason': 'candidate_proof_changed', 'reservation': row}
+            if not self._slot_matches(candidate, slot):
+                return {'renewed': False, 'reason': 'candidate_target_changed', 'reservation': row}
+            reason = self._eligible(db, candidate, self.now(), own=row['id'])
+            if reason:
+                return {'renewed': False, 'reason': reason, 'reservation': row}
+            row['lease_until'] = self.now() + lease_seconds
+            row['renewed_at'] = self.now()
+            row['renewals'] = int(row.get('renewals') or 0) + 1
+            self._save(db, 's2_reservations', row, ('slot_id', 'candidate_id', 'state'))
+            return {'renewed': True, 'reason': '', 'reservation': row}
+
+    def mark_dispatched(self, reservation_id, owner, *, token=None, seconds=None, grace=0.0):
         with self._tx() as db:
             row = self._owned(db, reservation_id, owner, token)
             if row['state'] == 'playing': return row
             if row['state'] != 'reserved': raise System2Conflict('Only a fresh owned reservation can be dispatched.')
-            reason = self._validate(db, row, seconds)
+            # [#1191] THE SAME ALLOWANCE validate_reservation WAS GIVEN.
+            # A yes at the check and a System2Conflict here would raise
+            # THROUGH the hand-over, after the page delivery, which is
+            # worse than the refusal it replaces.
+            reason = self._validate(db, row, seconds, grace)
             slot = self._get(db, 's2_slots', row['slot_id'])
             if self.now() < slot['start']: reason = 'slot_has_not_started'
             if reason: raise System2Conflict(reason)

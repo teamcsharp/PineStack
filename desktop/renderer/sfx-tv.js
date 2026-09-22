@@ -201,6 +201,11 @@
   var fullBox = null;              // #1122: the box to go back to
   var badge = null;                // the "x3" / "7 to go" over the picture
   var askWrap = null;              // #1121's hold bubble, while it is up
+  var tl = null;                   // [#1219] the timeline along the bottom of the picture
+  var tlFill = null;               // [#1219] its fill
+  var tlClock = null;              // [#1219] its m:ss corner
+  var tlFrame = 0;                 // [#1219] the rAF driving it
+  var tlSecond = -1;               // [#1219] the second last printed
   var FULL_KEY = 'pineSfxTvFull';  // #1122: '1' when the next set opens full
   /* #1184: THE RIGHT-CLICK SHEET ON THE LISTEN TAB, AND WHAT IT CARRIES.
    *
@@ -332,6 +337,45 @@
 
   function api() { return root.pineDesktop; }
 
+  /* [#1216] A LEVEL CHANGE IS A RAMP, NOT A STEP - and only one at a time.
+   *
+   * Eight steps over 120 ms. Short enough that the operator's thumb owns
+   * it and long enough that it is not a click. A second change while one
+   * is running replaces it rather than racing it, and a ramp against an
+   * element that has left the tube stops on its own. */
+  var LEVEL_RAMP_MS = 120;
+  var LEVEL_RAMP_STEPS = 8;
+  var levelRun = null;
+
+  function levelRamp(el, want) {
+    if (levelRun) { clearInterval(levelRun.timer); levelRun = null; }
+    if (!el) return;
+    var from = Number(el.volume);
+    if (!isFinite(from)) from = want;
+    if (Math.abs(from - want) < 0.005) {
+      try { el.volume = want; } catch (err) { /* gone */ }
+      return;
+    }
+    var step = 0;
+    var run = {el: el, timer: 0};
+    run.timer = setInterval(function () {
+      step += 1;
+      if (levelRun !== run || el !== video) {
+        clearInterval(run.timer);
+        if (levelRun === run) levelRun = null;
+        return;
+      }
+      var at = from + (want - from) * (step / LEVEL_RAMP_STEPS);
+      try { el.volume = Math.max(0, Math.min(1, step >= LEVEL_RAMP_STEPS ? want : at)); }
+      catch (err) { /* the element went */ }
+      if (step >= LEVEL_RAMP_STEPS) {
+        clearInterval(run.timer);
+        if (levelRun === run) levelRun = null;
+      }
+    }, Math.max(8, Math.round(LEVEL_RAMP_MS / LEVEL_RAMP_STEPS)));
+    levelRun = run;
+  }
+
   /* #1112: is the hold sheet up on the set that is on screen? Checked
    * by parentage rather than a DOM query so a set that was swept by
    * build() or teardownNow() no longer counts as held. */
@@ -395,6 +439,57 @@
   }
 
   function now() { return Date.now(); }
+
+  /* [#1219] THE TIMELINE'S OWN CLOCK. rAF and not a timer: this WebView
+     suspends JS timers and keeps firing rAF (the note beside `fixedAt`
+     in play() has the measurement), and a strip that froze would read
+     as a stalled clip. `screen` is held the way every handler in play()
+     holds it - a set torn down and rebuilt under the loop simply stops
+     it, because `video` no longer is `screen`. Elapsed is floored,
+     the total rounded, so "0:04" is the same 0:04 the screenplay prints. */
+  function tlText(v, whole) {
+    var t = Math.max(0, whole ? Math.round(Number(v) || 0) : Math.floor(Number(v) || 0));
+    var m = Math.floor(t / 60), s = t % 60;
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+  function tlStop() {
+    if (tlFrame && typeof root.cancelAnimationFrame === 'function') {
+      try { root.cancelAnimationFrame(tlFrame); } catch (err) { /* gone */ }
+    }
+    tlFrame = 0;
+  }
+  function tlStart(screen) {
+    tlStop();
+    tlSecond = -1;
+    if (typeof root.requestAnimationFrame !== 'function') return;
+    var step = function () {
+      if (video !== screen || !tl || !tlFill || !tlClock) { tlFrame = 0; return; }
+      tlFrame = root.requestAnimationFrame(step);
+      var span = Number(screen.duration), at = Number(screen.currentTime);
+      if (!isFinite(span) || span <= 0 || !isFinite(at)) return;
+      tlFill.style.width = (Math.max(0, Math.min(1, at / span)) * 100).toFixed(2) + '%';
+      var sec = Math.floor(at);
+      if (sec !== tlSecond) {
+        tlSecond = sec;
+        tlClock.textContent = tlText(at, false) + ' / ' + tlText(span, true);
+      }
+    };
+    tlFrame = root.requestAnimationFrame(step);
+  }
+  /* [#1219] What the strip reads now, for the CDP probe in the D4-timeline
+     verification sheet. Reads, never paints. */
+  function tlRead() {
+    if (!tl || !tlFill || !video) return {on: false};
+    var wide = 0, of = 0;
+    try {
+      of = tl.clientWidth || 0;
+      wide = tlFill.getBoundingClientRect().width || 0;
+    } catch (err) { wide = 0; of = 0; }
+    return {on: true, at: Number(video.currentTime) || 0,
+      total: Number(video.duration) || 0, width: wide, of: of,
+      fraction: of ? (wide / of) : 0,
+      clock: (tlClock && tlClock.textContent) || ''};
+  }
 
   /* ---- the preference ------------------------------------------------ */
 
@@ -784,6 +879,23 @@
     badge.hidden = true;
     screen.appendChild(badge);
 
+    /* [#1219] "Show a timeline at the bottom while the animation ... is
+       playing." A 4px band along the bottom edge of the picture and a
+       small clock in its corner, driven by the tube's own currentTime on
+       requestAnimationFrame (tlStart, from the first frame). Inside the
+       picture, not around it - #1309b's rule stands. Built with
+       createElement, never innerHTML, so the stub DOM the tests run
+       this file in sees the same tree a browser does. */
+    tl = document.createElement('div');
+    tl.className = 'sfx-tv-time';
+    tlFill = document.createElement('i');
+    tlFill.className = 'sfx-tv-time-fill';
+    tlClock = document.createElement('b');
+    tlClock.className = 'sfx-tv-time-clock';
+    tl.appendChild(tlFill);
+    tl.appendChild(tlClock);
+    screen.appendChild(tl);
+
     /* #1121-#1124: THREE GESTURES ON THE PICTURE, TOLD APART.
      *
      *   a TAP        - down and up inside 300 ms, under 8 px of travel -
@@ -902,7 +1014,45 @@
        moment the pointer wanders - so a small press opens the sheet
        and a real drag moves the set. */
     drag(host, host);
-    return {shut: shut, flash: flash};
+    /* [#1212] The slot needs them again on the next seam, and building a
+       second set to get at them is the whole thing being avoided. */
+    host.__parts = {shut: shut, flash: flash};
+    return host.__parts;
+  }
+
+  /* [#1212] THE HAND-OVER THAT MOVES NOTHING.
+   *
+   * The warm element (#1411) is already inside the tube on screen, hidden
+   * at opacity 0 (see warmPark). A seam promotes it where it stands: the
+   * outgoing element is silenced, stripped and removed, the incoming one
+   * loses its hiding style, and the host, the glass, the vignette, the
+   * badge, the pad icon and every gesture wired in build() are untouched
+   * because nothing about them changed.
+   *
+   * Measured against the alternatives: rebuilding the host cost 187-264 ms
+   * on two joins in thirteen; moving the element between parents cost ~40
+   * ms on every join; this costs 4-23 ms (median 18) and has no tail. A
+   * <video> whose parent does not change keeps its decoder.
+   *
+   * A FRESH `shut`, because play() adds a click listener to it on every
+   * clip and the real one is a hidden button nothing ever presses - one
+   * per clip for the life of an endless set is a leak. `flash` is handed
+   * back as it is: it is only touched on the NON-seam reveal. */
+  function slotSwap(ready) {
+    var old = video;
+    try {
+      ready.removeAttribute('data-pine-warm');
+      ready.removeAttribute('style');
+    } catch (err) { /* it is still the picture */ }
+    video = ready;
+    try { host.classList.remove('waiting'); } catch (err) { /* already off */ }
+    try {
+      if (old && old !== ready) {
+        old.pause(); old.removeAttribute('src'); old.load();
+        if (old.parentNode) old.parentNode.removeChild(old);
+      }
+    } catch (err) { /* #1147: src first, node second - both tried */ }
+    return {shut: document.createElement('button'), flash: host.__parts.flash};
   }
 
   /* `mine` is the <video> the caller believes is on screen. Every timer
@@ -914,6 +1064,7 @@
    * anybody was reading. */
   function teardown(mine) {
     if (mine && video && video !== mine) return;   // a newer set owns the screen
+    floorRelease('tube');                          // [#1214] the mouth is free
     var going = mine || video;
     /* Removing a <video> from the document does NOT stop it, so the src
      * goes first and the node second. */
@@ -931,9 +1082,17 @@
         if (stray[i].parentNode) stray[i].parentNode.removeChild(stray[i]);
       }
     } catch (err) { /* nothing stray */ }
+    /* [#1212] the warm tube lives INSIDE the host now, so a host that has
+       gone takes it with it - a detached element has no decoder and must be
+       warmed again in the next tube rather than handed over dead. Both
+       teardown() and teardownNow() need it, which is why this is one edit
+       asserted against both of them. */
+    try { if (warm && warm.el && !document.contains(warm.el)) warmDrop(); }
+    catch (err) { /* it will be replaced on the next warmUp */ }
     host = video = tube = null;
     sheetForget(); curtain = null; owed = false;        /* #1112 / #1184 */
     rewind = null; badge = null; askWrap = null;        /* #1121 */
+    tlStop(); tl = tlFill = tlClock = null;             /* [#1219] */
     showing = false;
     setTimeout(next, 120);
   }
@@ -971,11 +1130,108 @@
       try { if (all[i].parentNode) all[i].parentNode.removeChild(all[i]); }
       catch (err) { /* already gone */ }
     }
+    /* [#1212] the warm tube lives INSIDE the host now, so a host that has
+       gone takes it with it - a detached element has no decoder and must be
+       warmed again in the next tube rather than handed over dead. Both
+       teardown() and teardownNow() need it, which is why this is one edit
+       asserted against both of them. */
+    try { if (warm && warm.el && !document.contains(warm.el)) warmDrop(); }
+    catch (err) { /* it will be replaced on the next warmUp */ }
     host = video = tube = null;
     sheetForget(); curtain = null; owed = false;        /* #1112 / #1184 */
     rewind = null; badge = null; askWrap = null;        /* #1121 */
+    tlStop(); tl = tlFill = tlClock = null;             /* [#1219] */
     showing = false;
   }
+
+  /* [#1214] THE ARBITER: one SFX clip sounds at a time on a page.
+   *
+   * Every road that can put an SFX picture on a page has its own tube -
+   * this set, the panel's twin (djVideoTv) in the same document on the
+   * tablet, the tune-in page's gallery stage, a sampler pad - and each
+   * stops only what it started. build() sweeps '.sfx-tv' hosts and
+   * teardown() the one it believes is on screen; a <video> that left the
+   * document is still playing (#1147's rule), and a page that loaded two
+   * roads had two soundtracks with nothing on it that could hear both.
+   *
+   * So there is ONE floor and every road claims it. Claiming hushes
+   * everything else that is an SFX picture AND audible - paused and
+   * muted, src left alone so its own road can resume it - and counts it,
+   * so the number is on the desk rather than in a comment. A muted
+   * element is a picture, not a sound, and is left alone: the listen
+   * wallpaper (#plBackVid) is muted by design (#1184). The warm element
+   * (#1411) has never been played and is skipped by identity.
+   *
+   * The floor never deadlocks: the last claimant wins and everybody else
+   * is silenced. The single refusal is a page road claiming while the
+   * NATIVE wall is showing, because a page cannot pause a native
+   * surface - there the page road yields and says nothing.
+   */
+  var SLOT_GRACE_MS = 750;         // the slot end, this long after the station's own moment
+  var SFX_SOUNDERS = 'video[data-pine-live="voice"], .sfx-tv video, .sfx-tv-tube video, ' +
+                     '#galleryStage video, video[data-pine-sfx], audio[data-pine-sfx]';
+  var hushed = {count: 0, at: 0, last: ''};
+  var floorHeld = {who: '', at: 0};
+
+  function audible(el) {
+    if (!el || el.paused) return false;
+    if (el.muted) return false;
+    var v = Number(el.volume);
+    return !(isFinite(v) && v <= 0);
+  }
+
+  function hushOthers(keep) {
+    var doc = root.document;
+    if (!doc || typeof doc.querySelectorAll !== 'function') return 0;
+    var all;
+    try { all = doc.querySelectorAll(SFX_SOUNDERS); } catch (err) { return 0; }
+    var n = 0;
+    for (var i = 0; i < all.length; i += 1) {
+      var el = all[i];
+      if (!el || el === keep) continue;
+      if (warm && el === warm.el) continue;
+      if (!audible(el)) continue;
+      try { el.muted = true; } catch (err) { /* a read-only stub */ }
+      try { el.pause(); } catch (err) { /* already still */ }
+      n += 1;
+      hushed.last = String(el.id || el.className || el.tagName || '?').slice(0, 40);
+    }
+    if (n) { hushed.count += n; hushed.at = now(); }
+    return n;
+  }
+
+  /* The native wall is showing AND therefore sounding: it is on, and the
+     page has not veiled it (veil() hides the wall through the bridge as
+     well, #1434). No page road may sound over it. */
+  function wallSounding() {
+    try { return !!(wallRunning() && !veiled); } catch (err) { return false; }
+  }
+
+  function floorClaim(who) {
+    who = String(who || 'unnamed');
+    if (who !== 'wall' && wallSounding()) return false;
+    hushOthers(who === 'tube' ? video : null);
+    floorHeld.who = who;
+    floorHeld.at = now();
+    return true;
+  }
+
+  function floorRelease(who) {
+    if (!who || floorHeld.who === String(who)) { floorHeld.who = ''; floorHeld.at = 0; }
+  }
+
+  root.PineSfxFloor = {
+    claim: floorClaim,
+    release: floorRelease,
+    owner: function () {
+      return {who: floorHeld.who, at: floorHeld.at, wall: wallSounding(),
+              hushed: hushed.count};
+    },
+    /* stop every other SFX sound now (keep = the element that may go on;
+       default the tube), and the count so far - a number, not a claim. */
+    hush: function (keep) { return hushOthers(keep || video); },
+    hushed: function () { return {count: hushed.count, at: hushed.at, last: hushed.last}; }
+  };
 
   /* ---- one clip ------------------------------------------------------ */
 
@@ -984,6 +1240,12 @@
        running. Checked here as well as at the poll because a clip can
        reach this through cut() and the replay road too. */
     if (clip && clip.endless && wallRunning()) return;
+    /* [#1214] AND NEITHER DOES ANYTHING ELSE while that surface is
+       showing. #1426 covered only the endless clips; a station sting
+       with a picture went out over the wall's own soundtrack, which is
+       two clips at once on the one machine. Claiming the floor also
+       hushes every other page road that is sounding. */
+    if (!floorClaim('tube')) return;
     /* #1184: whatever was in the tube is now the past, whichever road
        took it out - the clip ending, a seamless hand-over, the operator
        cutting, a run stepping on. One line here covers every one of
@@ -992,7 +1254,13 @@
     playing = clip;                                        /* #1306b */
     var tries = Number(clip.__tries) || 0;                 /* #1311d */
     var ready = warmTake(clip);                            /* #1411 */
-    var parts = build(clip.sting || clip.text || 'SFX', ready);
+    /* [#1212] the seam promotes the warm tube in place; everything else
+       builds a set, exactly as before. `host.__parts` is the tell that
+       this host was built by this version of build(). */
+    var slot = !!(clip.__seam && ready && host && tube && video
+                  && ready.parentNode === tube && host.__parts);
+    var parts = slot ? slotSwap(ready)
+                     : build(clip.sting || clip.text || 'SFX', ready);
     /* Held locally, because every handler and timer below can fire after
      * the module's own references have moved on. */
     var screen = video;
@@ -1161,6 +1429,7 @@
     var reveal = function () {
       if (shown || done) return;
       shown = true;
+      tlStart(screen);                                     /* [#1219] */
       try {
         host.classList.remove('waiting');
         if (!seam) {
@@ -1323,6 +1592,34 @@
          decoder look identical from here and deserve the same answer. */
       if (screen.paused || !Number(screen.currentTime)) failed();
     }, 12000);
+    /* [#1214] ONE SFX SOUND AT A TIME ON THIS PAGE - this is the moment
+       sound actually starts, so the hush is repeated here (the claim at
+       the top of play() can be seconds older on a slow decode). A
+       seamless hand-over is the same cut with the frame kept. */
+    hushOthers(screen);
+    /* [#1214] THE SLOT IS THE CLIP'S TIME, ON EVERY SURFACE. The station
+       rings the endless set as slots (clip.seconds); the tune-in stage
+       (tvPoll) and the tablet's wall move on at the slot end, and this
+       set played the FILE to its end - so a ten-minute clip rung into a
+       six-second slot held this tube for ten minutes while every other
+       surface cycled: "playing multiple clips at the same time",
+       measured 2026-09-16 11:03 as a frame nine and a half minutes old.
+       The slot end is an out point like `to`: ended() runs, and with the
+       switch on the seam hands over to the clip already warmed. A clip
+       the operator cut carries no `at` and is left to its own length. */
+    var slotEnd = null;
+    if (clip.endless && !(isFinite(to) && to > 0)) {
+      var slotMs = Number(clip.seconds) * 1000;
+      var atMs = Number(clip.at);
+      if (isFinite(slotMs) && slotMs > 0 && isFinite(atMs) && atMs > 0) {
+        slotEnd = setTimeout(function () {
+          slotEnd = null;
+          if (done || video !== screen || passed || over) return;
+          passed = true;
+          ended();
+        }, Math.max(0, atMs + slotMs + SLOT_GRACE_MS - now()));
+      }
+    }
     var started = screen.play();
     if (started && started.catch) {
       started.catch(function () {
@@ -2621,6 +2918,270 @@
    * over the LISTEN view's wallpaper, where this set is veiled and a
    * sheet inside it could be neither seen nor touched. Null means the
    * old road - inside the set, where it has always lived. */
+  /* ============ [#1243] GLUE, and [#1223] EDIT ====================== */
+
+  /* One join at a time. The station runs it on a thread and will happily
+     take a second; two joins of overlapping clips would race each other
+     to supersede the same original, and the second answer would win for
+     no reason anybody could name. */
+  var glueBusy = false;
+  var editorBox = null;
+  var editorGone = null;
+
+  function glueIcon(ref, label) {
+    return (typeof root.pineIcon === 'function'
+      ? root.pineIcon(ref, label) : '') || '';
+  }
+
+  /* The same road srcOf() takes: `base` is empty on the panel and on the
+     tune page, where the document IS the station, and set by the desktop
+     shell where it is not. */
+  function glueUrl(path) {
+    return base.replace(/\/+$/, '') + String(path || '');
+  }
+
+  function glueState(id) {
+    var bridge = api();
+    if (!id) return Promise.reject(new Error('no id on this clip'));
+    if (!bridge || !bridge.get) return Promise.reject(new Error('no bridge'));
+    return bridge.get('/api/sfx/glue/state?id=' + encodeURIComponent(id));
+  }
+
+  /* [#1243] The join runs at the station on its own thread, so this reads
+     its job rather than holding a request open across the tablet bridge -
+     which gives up at twenty seconds, and a re-encode of two clips took
+     eleven. `say` carries the station's own words the whole way. */
+  function glueWatch(jobId, say, land) {
+    var bridge = api();
+    var tries = 0;
+    if (!jobId || !bridge || !bridge.get) { say('the join has no job to watch'); return; }
+    var tick = function () {
+      tries += 1;
+      if (tries > 400) {
+        glueBusy = false;
+        say('the join is still running at the station - reopen this in a moment');
+        return;
+      }
+      bridge.get('/api/sfx/glue/job?id=' + encodeURIComponent(jobId)).then(
+        function (job) {
+          var state = String((job && job.state) || '');
+          say(String((job && job.say) || 'joining...'));
+          if (state === 'done') { land(job && job.clip); return; }
+          if (state === 'failed') { glueBusy = false; return; }
+          setTimeout(tick, 900);
+        },
+        function (err) {
+          glueBusy = false;
+          say(String((err && err.message) || err).slice(0, 48));
+        });
+    };
+    setTimeout(tick, 700);
+  }
+
+  function glueGo(clip, side, say, at, rail) {
+    var id = clipId(clip);
+    if (!id) { say('no id on this clip'); return; }
+    if (glueBusy) { say('one join at a time - the last one is still running'); return; }
+    glueBusy = true;
+    if (rail) rail.classList.add('working');
+    say(side === 'prev' ? 'gluing it to the one before...'
+                        : 'gluing it to the next one...');
+    var land = function (made) {
+      glueBusy = false;
+      if (!made || !made.id) {
+        say('the join finished but the station did not name the clip');
+        return;
+      }
+      /* "the popup then shows the glued clip" - the same door a strip
+         tile takes: through sheetClose() first, then open for the new
+         clip at the same place on the screen. */
+      sheetClose();
+      sheet({id: made.id, url: made.url, sting: made.sting,
+             seconds: made.seconds, video: true}, at);
+    };
+    post('/api/sfx/glue', {clip: id, direction: side}).then(function (got) {
+      if (!got || !got.ok) {
+        glueBusy = false;
+        if (rail) rail.classList.remove('working');
+        say(String((got && got.say) || 'it would not glue'));
+        return;
+      }
+      /* Idempotent at the station: the same pair pressed twice hands back
+         the clip that is already there instead of making a second one. */
+      if (got.clip) { land(got.clip); return; }
+      glueWatch(String(got.job || ''), say, land);
+    }, function (err) {
+      glueBusy = false;
+      if (rail) rail.classList.remove('working');
+      say(String((err && err.message) || err).slice(0, 48));
+    });
+  }
+
+  /* [#1243] The two rails. Pinned to the sheet's left and right edges,
+     which is where the operator drew them, and the sheet is given side
+     padding so they sit beside the button rows rather than over them. */
+  function glueRails(wrap, clip, say, at) {
+    var made = {};
+    ['prev', 'next'].forEach(function (side) {
+      var rail = document.createElement('button');
+      rail.type = 'button';
+      rail.className = 'sfx-tv-glue sfx-tv-glue-' + side;
+      rail.setAttribute('aria-disabled', 'true');
+      rail.dataset.ready = '';
+      rail.dataset.why = 'asking the station what is next door...';
+      rail.innerHTML = glueIcon(side === 'prev' ? 'c:caret--left' : 'c:caret--right',
+                                'Glue') + '<i>GLUE</i>';
+      rail.title = rail.dataset.why;
+      rail.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        /* Not `disabled`: a disabled button on a touch screen swallows the
+           tap AND its own title, so the reason never reaches the operator.
+           This one always answers. */
+        if (rail.dataset.ready !== '1') {
+          say(rail.dataset.why || 'nothing next door to glue to');
+          return;
+        }
+        glueGo(clip, side, say, at, rail);
+      });
+      wrap.appendChild(rail);
+      made[side] = rail;
+    });
+    wrap.classList.add('sfx-tv-hasglue');
+    var fail = function (why) {
+      ['prev', 'next'].forEach(function (side) {
+        made[side].dataset.why = why;
+        made[side].title = why;
+      });
+    };
+    glueState(clipId(clip)).then(function (got) {
+      if (!got || !got.ok) { fail(String((got && got.say) || 'the station would not say')); return; }
+      ['prev', 'next'].forEach(function (side) {
+        var rail = made[side];
+        var one = got[side] || {};
+        if (!one.ok) {
+          rail.dataset.ready = '';
+          rail.dataset.why = String(one.why || 'nothing that way in this folder');
+          rail.title = rail.dataset.why;
+          rail.classList.add('off');
+          rail.innerHTML = glueIcon('c:misuse', 'No clip that way') + '<i>NONE</i>';
+          return;
+        }
+        rail.dataset.ready = '1';
+        rail.setAttribute('aria-disabled', 'false');
+        rail.title = 'Glue this clip to ' + String(one.name || 'the clip that way')
+          + (one.seconds ? ' (' + Number(one.seconds).toFixed(1) + 's)' : '')
+          + ' - one longer clip. Neither original is deleted.'
+          + (one.done ? ' Those two are already glued; this opens it.' : '');
+        rail.innerHTML = glueIcon(side === 'prev' ? 'c:caret--left' : 'c:caret--right',
+                                  'Glue') + '<i>' + (one.done ? 'GLUED' : 'GLUE') + '</i>';
+      });
+      if (got.superseded) {
+        say('a longer clip already stands in front of this one');
+      }
+    }, function (err) {
+      fail(String((err && err.message) || err).slice(0, 60));
+    });
+    return made;
+  }
+
+  /* ---------------- [#1223] the editor over the set ------------------ */
+
+  function editorClose() {
+    if (editorGone) { try { editorGone(); } catch (err) { /* going */ } editorGone = null; }
+    if (editorBox && editorBox.parentNode) editorBox.parentNode.removeChild(editorBox);
+    editorBox = null;
+  }
+
+  function editorWindow(path, say, clip, after) {
+    editorClose();
+    var box = document.createElement('div');
+    box.className = 'sfx-tv-editor sfx-tv';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Edit this clip');
+    var bar = document.createElement('div');
+    bar.className = 'sfx-tv-editorbar';
+    var title = document.createElement('b');
+    title.textContent = String((clip && (clip.sting || clip.text)) || 'this clip');
+    var shut = document.createElement('button');
+    shut.type = 'button';
+    shut.textContent = 'Close editor';
+    shut.addEventListener('click', function (ev) {
+      ev.stopPropagation(); editorClose();
+    });
+    bar.appendChild(title);
+    bar.appendChild(shut);
+    var frame = document.createElement('iframe');
+    frame.className = 'sfx-tv-editorframe';
+    frame.title = 'Edit this clip';
+    frame.setAttribute('allow', 'autoplay; fullscreen');
+    frame.src = glueUrl(path);
+    box.appendChild(bar);
+    box.appendChild(frame);
+    box.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
+    document.body.appendChild(box);
+    editorBox = box;
+    /* The standing rule: 10% while an editing surface is open. #1172 is in
+       this station's history because this very editor was the one surface
+       that did not take the hold, and a clip played behind the window the
+       operator was editing a clip in. */
+    try {
+      var duck = root.PineDuck;
+      if (duck && typeof duck.hold === 'function') {
+        var off = duck.hold('sfx-clip-editor', 0.1, box);
+        editorGone = (typeof off === 'function') ? off : null;
+      }
+    } catch (err) { /* the editor still opens */ }
+    var heard = function (ev) {
+      if (!editorBox || ev.source !== frame.contentWindow) return;
+      var kind = ev.data && ev.data.type;
+      if (kind === 'pine-video-editor-close') { editorClose(); return; }
+      if (kind === 'pine-sfx-edit-saved') {
+        var detail = ev.data.detail || {};
+        say(String(detail.say || 'saved'));
+        editorClose();
+        if (after) after(detail);
+      }
+    };
+    root.addEventListener('message', heard);
+    var older = editorGone;
+    editorGone = function () {
+      root.removeEventListener('message', heard);
+      if (older) older();
+    };
+  }
+
+  /* [#1223] "an option for edit that brings up a pop-up window where I can
+     adjust the in and out points of the clip". The station adopts the clip
+     into its own video editor - the one mounted at /video-editor/ - and
+     answers with the sentence about where a save will land, which is the
+     honest part: most of these clips are on a share this container has
+     mounted read-only and cannot write to at all. */
+  function editClip(clip, say, at) {
+    var id = clipId(clip);
+    if (!id) { say('no id on this clip'); return; }
+    say('opening the editor on this clip...');
+    post('/api/sfx/edit/open', {clip: id}).then(function (got) {
+      if (!got || !got.ok || !got.editor_url) {
+        say(String((got && got.say) || 'the editor would not take this clip'));
+        return;
+      }
+      say(String(got.say || 'opening...'));
+      editorWindow(String(got.editor_url), say, clip, function (detail) {
+        var made = detail && detail.clip;
+        if (!made || !made.id) return;
+        /* An edit that landed BESIDE the original is a different clip, so
+           the sheet reopens on the one that will go out from now on. An
+           in-place save keeps the same id and the sheet simply stays. */
+        if (String(made.id) === String(id)) return;
+        sheetClose();
+        sheet({id: made.id, url: made.url, sting: made.sting,
+               seconds: made.seconds, video: made.video}, at);
+      });
+    }, function (err) {
+      say(String((err && err.message) || err).slice(0, 60));
+    });
+  }
+
   var sheetAt = null;
   function sheet(clip, at) {
     if (!host) return;
@@ -2715,6 +3276,15 @@
       b.innerHTML = icon(ref, label) + ' ' + b.textContent;
       return b;
     };
+    /* [#1223] THE EMPTY SLOT LEFT OF PATH, which is where he drew the
+       circle. Trim the in and out points and save it back: over the file
+       itself when the station owns it, beside it under the station's own
+       folder when the clip is on the read-only share - and the editor
+       says which BEFORE the save, rather than failing at it. */
+    marked(button(rowF, 'Edit', 'Trim the in and out points of this clip '
+                  + 'and save it back',
+                  function () { editClip(clip, say, at); }),
+           'c:edit', 'Edit');
     marked(button(rowF, 'Path', 'The real file path, in every spelling '
                   + 'the station knows, ready to copy',
                   function () { showPath(clip, wrap, say); }),
@@ -2833,6 +3403,10 @@
     rowE.appendChild(range);
     rowE.appendChild(count);
 
+    /* [#1243] the two glue rails, on the left and right edges of the
+       sheet. Added before the name so they are underneath every row in
+       paint order; the stylesheet pins them and pads the sheet aside. */
+    glueRails(wrap, clip, say, at);
     wrap.appendChild(name);
     /* #1184: the cycle's own picture, directly under the clip's name and
        above every button - "show thumbnails of the last 2 videos played
@@ -3029,10 +3603,80 @@
     return (got && got.href) || url;
   }
 
+
+  /* [#1200] A CLIP DELETED FROM THE LIBRARY leaves every place this set
+   * holds it: the queue, the strip, the warm slot - and the tube, if it is
+   * the one showing, through the same curtain the sheet's Close pulls. */
+  function withdrawClip(id) {
+    var key = String(id || '');
+    if (!key) return;
+    for (var i = queue.length - 1; i >= 0; i -= 1) {
+      if (clipId(queue[i]) === key) queue.splice(i, 1);
+    }
+    comingDrop(key);
+    if (warm && warm.clip && clipId(warm.clip) === key) warmDrop();
+    if (playing && clipId(playing) === key && curtain) {
+      try { curtain(); } catch (err) { /* the set is already going */ }
+    }
+  }
+  /* [#1212] A WARM ELEMENT THAT HAS TO MOVE IS NOT WARM.
+   *
+   * #1411's warm tube was a detached <video> with preload=auto. It has the
+   * bytes; it has no decoder, because Chromium stands one up for an
+   * element that is IN a document. Measured: two joins in thirteen sat at
+   * 187 and 264 ms with `playing` already fired and currentTime refusing
+   * to move. Parking it off screen in the document steadied that (max
+   * 132) and cost 40 ms at EVERY join instead, because re-parenting a
+   * <video> rebuilds its frame sink.
+   *
+   * So it is created INSIDE the tube that is on screen, hidden at opacity
+   * 0 behind the picture, and on the seam it is promoted where it stands
+   * (slotSwap). With no tube yet - the first clip of a set - it falls back
+   * to an off-screen holder, which is strictly better than detached and is
+   * the only case the operator can see a CRT expand on anyway.
+   *
+   * `data-pine-warm` marks it so nothing reading ".sfx-tv-tube video"
+   * mistakes the hidden one for the picture, and it is NOT inside a
+   * separate .sfx-tv, so teardownNow's sweep cannot take it on its own. */
+  var warmHost = null;
+
+  function warmHolder() {
+    if (warmHost && warmHost.parentNode) return warmHost;
+    try {
+      warmHost = document.createElement('div');
+      warmHost.className = 'sfx-tv-warm';
+      warmHost.setAttribute('style', 'position:fixed;left:-9999px;top:0;'
+        + 'width:2px;height:2px;overflow:hidden;opacity:0;pointer-events:none');
+      document.body.appendChild(warmHost);
+    } catch (err) { warmHost = null; }
+    return warmHost;
+  }
+
+  function warmPark(el) {
+    try {
+      el.setAttribute('data-pine-warm', '1');
+      if (tube) {
+        el.setAttribute('style', 'position:absolute;left:0;top:0;width:100%;'
+          + 'height:100%;object-fit:contain;opacity:0;pointer-events:none');
+        tube.appendChild(el);
+        return;
+      }
+    } catch (err) { /* the holder below */ }
+    var box = warmHolder();
+    try { if (box && el.parentNode !== box) box.appendChild(el); }
+    catch (err) { /* it warms detached, exactly as it did before */ }
+  }
+
+  function warmUnpark(el) {
+    try { if (el && el.parentNode) el.parentNode.removeChild(el); }
+    catch (err) { /* build() is about to move it anyway */ }
+  }
+
   function warmDrop() {
     if (!warm) return;
     var el = warm.el;
     warm = null;
+    warmUnpark(el);                                        /* [#1212] */
     try { el.pause(); el.removeAttribute('src'); el.load(); }
     catch (err) { /* already gone */ }
   }
@@ -3047,10 +3691,18 @@
       el.preload = 'auto';
       el.playsInline = true;
       el.controls = false;
+      /* [#1216] THE LEVEL BEFORE THE FIRST FRAME. This element becomes the
+         picture on the next seam; giving it the level here is what makes
+         the clip start at the right loudness instead of being corrected
+         once somebody's poll gets round to it. Muted as well, so a
+         decoder waking up early can never be heard. */
+      el.muted = true;                                     /* [#1212] */
+      el.volume = level;                                   /* [#1216] */
       el.src = heldSrc(head);                              /* #1421 */
       el.load();
     } catch (err) { return; }
     warm = {clip: head, el: el};
+    warmPark(el);                                          /* [#1212] */
   }
 
   function warmUp() {
@@ -3082,10 +3734,18 @@
     if (!warm || warm.clip !== clip) return null;
     var el = warm.el;
     warm = null;
+    /* [#1212] An element already in the tube on screen must NOT be moved -
+       that is the whole of the slot. Anything else is unparked so build()
+       can put it where it belongs. */
+    if (!(tube && el.parentNode === tube)) warmUnpark(el);
     if (el.error) {
       try { el.removeAttribute('src'); el.load(); } catch (err) {}
       return null;
     }
+    /* [#1212] it was muted for the warm and nothing else; [#1216] the
+       level is the one that is set NOW, not the one that was set when it
+       was warmed, and it is written before the element has been heard. */
+    try { el.muted = false; el.volume = level; } catch (err) { /* it plays */ }
     return el;
   }
 
@@ -3216,12 +3876,40 @@
     } catch (err) { /* likewise */ }
   }
 
+  /* [#1212] THE RUNWAY IS SECONDS, NOT ROWS.
+   *
+   * `if (queue.length > 4)` was written when a clip was a six-second
+   * sting. #1422 let the cycle hand out its clips at their own length and
+   * the library's shortest are 1.1 s, so four rows became four seconds of
+   * runway against a 2.5 s poll - and a seam needs the NEXT clip warmed
+   * before this one ends. The station already counts its own ring in
+   * seconds (SFX_CYCLE_AHEAD = 28 in app.py); this counts the same way,
+   * with a row cap left only so a library of quarter-second clips cannot
+   * grow the queue without bound. */
+  var QUEUE_AHEAD_S = 30;
+  var QUEUE_ROWS_MOST = 24;
+
+  function queueTrim() {
+    while (queue.length > QUEUE_ROWS_MOST) queue.shift();
+    var held = 0, i;
+    for (i = 0; i < queue.length; i += 1) {
+      held += Math.max(0.8, Number(queue[i].seconds) || 6);
+    }
+    /* Dropped from the FRONT, as it always was: the oldest rung clip is
+       the one whose moment has most nearly gone. Never below two rows, or
+       a seam has nothing to hand over to. */
+    while (queue.length > 2 && held > QUEUE_AHEAD_S) {
+      held -= Math.max(0.8, Number(queue[0].seconds) || 6);
+      queue.shift();
+    }
+  }
+
   function offer(clip) {
     if (!clip || !clip.url) return;
     if (marks[String(clip.ts || '') + '|' + String(clip.url)]) return;
     markOf(clip);
     queue.push(clip);
-    if (queue.length > 4) queue.splice(0, queue.length - 4);
+    queueTrim();                                           /* [#1212] */
     comingKeep(clip);                                       /* #1195 */
     /* #1411b: a clip that arrives while one is on screen is warmed at
        once if the one on screen already has what it needs. */
@@ -3259,6 +3947,49 @@
       try { return JSON.parse(got); } catch (err) { return null; }
     }
     return got;
+  }
+
+  /* #1435: THE ROWS THE RING HAS HANDED US, BY ID.
+   *
+   * The wall answers with an id and nothing else, and an id is not enough
+   * to paint with - the listen backdrop needs the url, and its signature
+   * cannot be invented here. The wall may also be showing a clip out of
+   * its own larder that has since fallen off the ring, so this remembers
+   * rows for longer than the ring holds them. Bounded: an endless set
+   * runs for days. */
+  var ringSeen = Object.create(null);
+  var ringOrder = [];
+
+  function ringRemember(rows) {
+    if (!rows || !rows.length) return;
+    for (var i = 0; i < rows.length; i += 1) {
+      var row = rows[i];
+      var id = row && row.id;
+      if (!id || ringSeen[id]) continue;
+      ringSeen[id] = row;
+      ringOrder.push(id);
+    }
+    while (ringOrder.length > 400) {
+      var gone = ringOrder.shift();
+      delete ringSeen[gone];
+    }
+  }
+
+  /* #1435: what the WALL says is on screen, as a clip this page can use.
+     Silent when the wall is not running, so a browser with no bridge -
+     a Tailscale viewer on the listen page - is untouched. */
+  function wallFollow() {
+    var bridge = api();
+    if (!wallHas || !bridge || typeof bridge.videoWall !== 'function') return;
+    bridge.videoWall('state').then(function (got) {
+      var st = wallState(got);
+      var id = st && st.playing;
+      if (!id || (st && st.veiled)) return;
+      var row = ringSeen[id];
+      if (!row) return;                      /* a larder clip we never saw */
+      if (playing && playing.id === id) return;
+      playing = row;                         /* #1435: the one source now */
+    })['catch'](function () { /* the wall will be asked again next poll */ });
   }
 
   /* The endless clips the page has queued are the wall's now - playing
@@ -3324,10 +4055,32 @@
        * not been patched yet simply never sends the key, `seamOn` stays
        * false, and every changeover is the CRT collapse it is today. */
       if (got && typeof got.seamless === 'boolean') seamOn = !!got.seamless;
+      /* [#1212] THE SWITCH FOLLOWS THE STATION, NOT THE OTHER WAY ROUND.
+       * `seamless` and `endless` have just been read off the answer this
+       * set already asks for; an open sheet is repainted from them, and
+       * the mode LINE is refreshed from /api/sfx/video/mode - only while
+       * the sheet is open, so a closed sheet costs no traffic at all.
+       * The screenshot behind this request shows the set ON and the
+       * switch reading SEAMLESS off: it had been painted once, when the
+       * sheet was built, and never again. */
+      if (sheetPaint) {
+        sheetPaint(null);
+        if (now() - sheetAsk > 2000) {
+          sheetAsk = now();
+          api().get('/api/sfx/video/mode').then(function (st) {
+            if (sheetPaint) sheetPaint(st);
+          }, function () { /* the switch still says what the ring said */ });
+        }
+      }
       if (got && typeof got.endless === 'boolean') {
         endlessPaint(got.endless);
         /* #1426: hand the set to the native surface where there is one. */
         if (nativeWall(got.endless) && got.endless) wallTakesOver();
+        /* #1435: and follow what it is showing, so the listen backdrop and
+           everything else downstream reads the picture that is on screen
+           rather than the last one this page played itself. */
+        ringRemember(got.clips);
+        wallFollow();
         if (!got.endless) {
           /* 2026-09-14: off means off - the rung-ahead copies go */
           for (var qi = queue.length - 1; qi >= 0; qi -= 1) { if (queue[qi].endless) queue.splice(qi, 1); }
@@ -3335,6 +4088,8 @@
           if (warm && warm.clip && warm.clip.endless) warmDrop();
         }
       }
+      /* [#1200] deleted from the library: gone from here as well */
+      ((got && got.withdrawn) || []).forEach(withdrawClip);
       ((got && got.clips) || []).forEach(function (clip) {
         seen = Math.max(seen, Number(clip.ts || 0));
         /* The station's clock, carried onto this one - the box and this
@@ -3720,8 +4475,17 @@
    * change posts to /api/sfx/video/mode, which is the station's held
    * setting, so it survives restarts and reaches every surface. */
   var sheetEl = null;
+  /* [#1212] set while the sheet is open; poll() calls it with the station's
+     own mode answer so the two switches and the line under them stay live. */
+  var sheetPaint = null;
+  var sheetAsk = 0;
+  var matchState = null;                              /* [#1251] */
   function endlessSheet() {
-    if (sheetEl && sheetEl.parentNode) { sheetEl.parentNode.removeChild(sheetEl); sheetEl = null; return; }
+    if (sheetEl && sheetEl.parentNode) {
+      sheetEl.parentNode.removeChild(sheetEl); sheetEl = null;
+      sheetPaint = null;                                   /* [#1212] */
+      return;
+    }
     if (!api() || !api().get) return;
     var box = document.createElement('div');
     box.id = 'sfxEndlessSheet';
@@ -3794,13 +4558,24 @@
     seam.title = 'Seamless: the next clip goes in on the frame this one '
       + 'ends, with no collapse and no gap. It needs the next clip to have '
       + 'finished arriving, so a very short clip still collapses.';
+    /* [#1212] "When seamless video is on, make the button say that seamless
+     * video is on. In fact, change the color to make it go from blue to
+     * green, indicating that seamless video is on."
+     *
+     * In those words, and in that colour, and painted from the STATION's
+     * answer rather than this browser's guess - poll() drives sheetPaint
+     * below every 2.5 s while the sheet is open. */
     var paintSeam = function (on) {
-      var word = on ? (endlessOn ? 'SEAMLESS on' : 'SEAMLESS armed')
-                    : 'SEAMLESS off';
+      var word = on ? 'SEAMLESS VIDEO IS ON' : 'SEAMLESS VIDEO IS OFF';
       seam.innerHTML = ((typeof root.pineIcon === 'function'
         ? root.pineIcon('c:repeat', 'Seamless') : '') || '') + ' ' + word;
       seam.style.background = on ? '#1d5a3a' : '#1d4d5a';
-      seam.style.opacity = (on && !endlessOn) ? '.78' : '1';
+      seam.style.borderColor = on ? '#3fae6a' : '#2c7a8c';
+      seam.style.color = on ? '#dff3e6' : '#dfe7ee';
+      /* On with the set off is still ON, because the station says on; the
+         mode line under the sliders is where "it takes effect when the
+         set is on" belongs, and it says exactly that. */
+      seam.style.opacity = (on && !endlessOn) ? '.82' : '1';
     };
     seam.addEventListener('click', function (ev) {
       ev.stopPropagation();
@@ -3826,8 +4601,118 @@
        switch rather than an empty button, and a station that never
        answers leaves a readable one behind. */
     paintSeam(seamOn);
+    /* [#1212] and from here on the STATION paints it. */
+    sheetPaint = function (st) {
+      try {
+        paintSw(!!endlessOn);
+        paintSeam(!!seamOn);
+        if (st && st.say) note.textContent = String(st.say);
+      } catch (err) { /* the sheet went */ }
+    };
     swRow.appendChild(sw);
     swRow.appendChild(seam);
+    /* [#1251] THE THIRD ROW: MATCH THE SET TO THE DIALOGUE.
+     *
+     * "i want to add a special mode to the sfx guy and endless video
+     *  mode to have him play clips appropriate to the statements being
+     *  said on the radio ... I want this to be something I can toggle
+     *  off and on."
+     *
+     * Its own row under #1184's pair, because it is a third thing the
+     * set can be doing and not a third caption on either of them. The
+     * SFX guy's STINGS have their own switch in "Where the clips come
+     * from" (script-page.js); this one is the endless set's.
+     *
+     * IT SAYS WHAT IT IS DOING. The station re-ranks only the clip it
+     * has not rung yet, and only when something in the library clears
+     * the strength floor - so the honest caption is not "on/off" but
+     * how many of the last picks were actually matched, which is what
+     * the line underneath reports. */
+    var matchRow = document.createElement('div');
+    matchRow.id = 'pineSfxMatchRow';
+    matchRow.setAttribute('style', 'display:flex;gap:8px;align-items:center;flex-wrap:wrap');
+    var matchBtn = document.createElement('button');
+    matchBtn.type = 'button';
+    matchBtn.id = 'pineSfxMatchBtn';
+    matchBtn.setAttribute('style', 'flex:1 1 58%;min-width:0;min-height:40px;border-radius:8px;'
+      + 'border:1px solid #2c7a8c;background:#1d4d5a;color:#dfe7ee;font-size:12px;'
+      + 'line-height:1.25;cursor:pointer');
+    matchBtn.title = 'The next clip - the one nothing has warmed yet - is chosen '
+      + 'to fit the line that will be sounding when it lights: loosely, by a noun, '
+      + 'a verb, or what its folder is about. Nothing already queued or on the tube '
+      + 'is touched, and when no clip fits the ordinary random draw runs, so the '
+      + 'set never stalls waiting for a match.';
+    var matchDial = document.createElement('input');
+    matchDial.type = 'range';
+    matchDial.id = 'pineSfxMatchDial';
+    matchDial.min = '0'; matchDial.max = '100'; matchDial.step = '5'; matchDial.value = '35';
+    matchDial.setAttribute('aria-label', 'How close a match has to be');
+    matchDial.setAttribute('style', 'flex:1 1 38%;min-width:90px');
+    var matchSay = document.createElement('div');
+    matchSay.id = 'pineSfxMatchSay';
+    matchSay.setAttribute('style', 'flex:1 1 100%;color:#9fb3c0;font-size:11px;min-height:14px');
+    var matchWord = function (n) {
+      n = Number(n) || 0;
+      if (n <= 10) return 'any loose connection';
+      if (n <= 40) return 'one uncommon word out of the line';
+      if (n <= 70) return 'two words, or one rare one';
+      return 'only a strong match';
+    };
+    var paintMatch = function (m) {
+      if (m) matchState = m;
+      var s = matchState || {};
+      var on = !!s.video;
+      var icon = '';
+      try {
+        if (typeof root.pineIcon === 'function') {
+          icon = root.pineIcon(on ? 'c:magic-wand--filled' : 'c:search',
+                               on ? 'Matching' : 'Not matching') || '';
+        }
+      } catch (err) { icon = ''; }
+      matchBtn.innerHTML = icon + ' ' + (on ? 'MATCHING the dialogue' : 'MATCH the dialogue');
+      matchBtn.style.background = on ? '#1d5a3a' : '#1d4d5a';
+      matchBtn.style.opacity = (on && !endlessOn) ? '.78' : '1';
+      matchBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      if (s.video_strength != null) matchDial.value = String(Number(s.video_strength));
+      matchSay.textContent = 'strength ' + matchDial.value + ' - '
+        + matchWord(matchDial.value) + '. '
+        + (s.available === false ? 'the matcher is not on this station.'
+           : !s.ready ? (s.building ? 'reading the clip names…'
+                         : 'the clip names are not indexed yet.')
+           : (String(s.clips || 0) + ' clip name(s) indexed, '
+              + String(s.wordy || 0) + ' of them carrying words; '
+              + String(s.picks || 0) + ' matched, '
+              + String(s.fell_back || 0) + ' fell back to the ordinary draw.'))
+        + (on && !endlessOn ? ' Armed - it takes effect when the set is on.' : '');
+    };
+    matchDial.addEventListener('input', function () {
+      matchSay.textContent = 'strength ' + matchDial.value + ' - '
+        + matchWord(matchDial.value) + '.';
+    });
+    matchDial.addEventListener('change', function (ev) {
+      ev.stopPropagation();
+      note.textContent = 'saving...';
+      api().post('/api/sfx/match', {video_strength: Number(matchDial.value)}).then(
+        function (got) { paintMatch(got || null); note.textContent = String((got && got.say) || 'saved'); },
+        function (err) { note.textContent = 'the station would not take it: '
+          + String((err && err.message) || err).slice(0, 60); });
+    });
+    matchBtn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var want = !(matchState && matchState.video);
+      note.textContent = 'saving...';
+      api().post('/api/sfx/match', {video: want}).then(
+        function (got) { paintMatch(got || null); note.textContent = String((got && got.say) || 'saved'); },
+        function (err) {
+          /* The station holds it, so a refusal means it did NOT change. */
+          note.textContent = 'the station would not take it: '
+            + String((err && err.message) || err).slice(0, 60);
+        });
+    });
+    matchRow.appendChild(matchBtn);
+    matchRow.appendChild(matchDial);
+    matchRow.appendChild(matchSay);
+    paintMatch(null);
     var close = document.createElement('button');
     close.type = 'button';
     close.textContent = 'Close';
@@ -3835,6 +4720,7 @@
     close.addEventListener('click', function (ev) { ev.stopPropagation(); endlessSheet(); });
     box.appendChild(head);
     box.appendChild(swRow);                                /* #1184 */
+    box.appendChild(matchRow);                             /* [#1251] */
     box.appendChild(note);
     document.body.appendChild(box);
     sheetEl = box;
@@ -3845,6 +4731,9 @@
          paints off and posting to it is what tells the operator so. */
       seamOn = !!(st && st.seamless);
       paintSeam(seamOn);
+      /* [#1251] sfx_video_mode_state carries the matcher, so the row
+         paints off the request the sheet already makes. */
+      paintMatch((st && st.match) || null);
       box.insertBefore(row('Pictures among the SFX guy\'s clips', 0, 100, 1, Number((st && st.dial) || 0),
         function (v) { return v + '% of his clips carry a picture (mp4 vs mp3)'; }, 'share'), note);
       box.insertBefore(row('Clip length the endless set aims for', 0, 60, 1, Number((st && st.length) || 0),
@@ -3867,6 +4756,7 @@
   root.PineSfxTv = {
     /* 2026-09-14: for the LISTEN view's backdrop - is the set on, and
        hide the floating set while the view shows the clip as wallpaper. */
+    timeline: function () { return tlRead(); },   /* [#1219] */
     endless: function () { return !!endlessOn; },
     veil: function (on) {
       veiled = !!on;
@@ -3910,13 +4800,48 @@
     },
     rebase: function (url) { base = String(url || ''); },
     /* The shell's master volume times the booth's share, handed over by
-     * applyAppVolume - this window has no mixer of its own. */
+     * applyAppVolume - this window has no mixer of its own.
+     *
+     * [#1216] "The audio volume of a video should be set before the video
+     * begins playing. I'm having the audio of the videos edited in the
+     * middle of the videos playing, so the audio just jumps sporadically."
+     *
+     * THIS was the editing. renderer.js calls applyAppVolume() on every
+     * view change, every route poll, every webview dom-ready and every
+     * did-finish-load, and each of those wrote `video.volume` on whatever
+     * clip happened to be on the tube - a step change, mid-picture,
+     * however many times it was asked, and with the same number every
+     * time. The panel's own pineMixerApply reaches the element from the
+     * other side.
+     *
+     * So this is the one door and it does three things it did not:
+     *
+     *   - A LEVEL THAT HAS NOT CHANGED WRITES NOTHING. Not the element,
+     *     not the warm tube, not the mute. That alone removes every
+     *     sporadic jump, because nothing was ever asking for a different
+     *     number - it was asking for the same one again.
+     *   - A CHANGE THAT IS REAL WALKS THERE, over 120 ms, because a step
+     *     in element volume is a click and the operator is dragging a
+     *     slider.
+     *   - THE WARM TUBE IS LEVELLED TOO, so the NEXT clip begins at the
+     *     level that is set now rather than the one set when it warmed.
+     *
+     * pineLevels (audio-law.js, #1187) is the bus that calls this. */
     level: function (value) {
-      level = Math.max(0, Math.min(1, Number(value)));
-      if (video) {
-        video.volume = level;
-        if (level > 0 && video.muted) video.muted = false;
+      var want = Math.max(0, Math.min(1, Number(value)));
+      if (!isFinite(want)) return;
+      if (Math.abs(want - level) < 0.001) {               /* [#1216] */
+        level = want;
+        return;                                /* nothing has changed */
       }
+      level = want;
+      /* The clip warming behind this one takes it at once: it is not
+         sounding, so there is nothing to ramp and nothing to hear. */
+      try { if (warm && warm.el) warm.el.volume = level; } catch (err) { /* gone */ }
+      if (!video) return;
+      var el = video;
+      if (level > 0 && el.muted) el.muted = false;
+      levelRamp(el, level);                                /* [#1216] */
     },
     stop: function () {
       if (timer) clearInterval(timer);
@@ -3932,6 +4857,12 @@
     waiting: function () { return queue.length; },
     on: function () { return showing; },
     offer: offer,
+    /* [#1214] the arbiter, on the desk. The same object as
+       window.PineSfxFloor - reachable from the set the operator already
+       has a handle on. */
+    floor: function () { return root.PineSfxFloor; },
+    hush: function (keep) { return hushOthers(keep || video); },
+    hushed: function () { return {count: hushed.count, at: hushed.at, last: hushed.last}; },
     /* #1322: "this clip has been dealt with here", for a caller that
        rang the station by some other road and does not want its own
        picture back. */
@@ -3990,8 +4921,17 @@
         try { clip.__cut = true; } catch (err) { /* frozen: no retry */ }
       }
       /* Down without waiting out the CRT collapse - the next picture
-         is the answer to the tap, not the animation. */
-      try { teardownNow(); } catch (err) { /* nothing was up */ }
+         is the answer to the tap, not the animation.
+         [#1212] ...UNLESS THE SEAM CAN USE THE SLOT. This line was the
+         whole of the 187-264 ms outliers: teardownNow() sweeps every
+         .sfx-tv out of the document, which detaches the warm element the
+         seam is about to play and throws away the decoder it had stood
+         up. On a seam whose warm tube is already inside the tube on
+         screen the host stays and play() promotes it where it stands. */
+      if (!(seam && host && tube && video && warm && warm.clip === clip
+            && warm.el && warm.el.parentNode === tube)) {
+        try { teardownNow(); } catch (err) { /* nothing was up */ }
+      }
       showing = true;
       try { play(clip); return true; }
       catch (err) { showing = false; return false; }
@@ -4047,6 +4987,13 @@
     if (root.document && root.setTimeout) {
       root.setTimeout(function () {
         try {
+          if (mounted) return;
+          /* [#1214] A PAGE WITH A GALLERY STAGE (the tune-in page, tvPoll)
+             already plays the ring on the stage; a second, floating set
+             here was the same clip twice, out of step, both audible. */
+          try {
+            if (root.document.getElementById && root.document.getElementById('galleryStage')) return;
+          } catch (err) { /* no such door: mount as before */ }
           if (mounted) return;
           if (/^https?:$/.test(String(root.location.protocol))) {
             root.PineSfxTv.mount({baseUrl: ''});

@@ -413,6 +413,7 @@
         who: row.name || row.who || "",
         kind: source.kind,
         srcId: row.id || "",
+        sfx: String(row.sfx || ""),     // [#1200] the clip, so a deletion can find the pad
         exact: got.exact,
         cut: got.cut,
         at: Date.now(),
@@ -3233,6 +3234,7 @@
   async function mount(host) {
     if (!host || mounted) return;
     layout = loadLayout();
+    watchDeleted();                                        // [#1200]
     /* BEFORE build(), not after. The toggles draw their lights from `modes`,
      * so restoring the operator's settings afterwards left every light
      * showing the default while the behaviour was already the remembered
@@ -3300,6 +3302,60 @@
     bootstrap();
   }
 
+
+  /* [#1200] A CLIP DELETED ANYWHERE LEAVES THE PADS HERE.
+   *
+   * The hold sheet clears this terminal's pads itself; a clip deleted on
+   * the other terminal is learned from /api/dj, which carries the last
+   * deletions as `sfx_deleted` and which the feed model already polls. */
+  function dropClip(want) {
+    const sfx = String((want && want.sfx) || "");
+    const line = String((want && want.line) || "");
+    if (!sfx && !line) return 0;
+    let count = 0;
+    for (let b = 0; b < layout.length; b += 1) {
+      const bankRow = layout[b] || [];
+      for (let p = 0; p < bankRow.length; p += 1) {
+        const meta = bankRow[p];
+        if (!meta) continue;
+        const hit = (sfx && (String(meta.sfx || "") === sfx
+                             || String(meta.url || "").indexOf("/sfx/" + sfx) >= 0))
+          || (line && String(meta.srcId || "") === line);
+        if (!hit) continue;
+        const key = padKey(b, p);
+        bankRow[p] = null;
+        count += 1;
+        try { if (engine().unload) engine().unload(key); } catch (err) { /* older engine */ }
+        try {
+          const face = root.PineSamplerFace;
+          if (face && typeof face.forgetPad === "function") face.forgetPad(key);
+          else if (face && typeof face.forgetPeaks === "function") face.forgetPeaks(key);
+        } catch (err) { /* no face on this surface */ }
+        try { Promise.resolve(dbDelete(key)).catch(() => {}); } catch (err) { /* never landed */ }
+      }
+    }
+    if (count) {
+      try { saveLayout(); } catch (err) { /* the layout store is optional */ }
+      try { paintPads(); } catch (err) { /* not mounted yet */ }
+    }
+    return count;
+  }
+
+  const deletedSeen = new Set();
+  let deletedWatch = null;
+  function watchDeleted() {
+    const feed = root.PineStationFeed;
+    if (!feed || typeof feed.subscribe !== "function" || deletedWatch) return;
+    deletedWatch = feed.subscribe((ev) => {
+      const rows = (ev && ev.station && ev.station.sfx_deleted) || [];
+      for (const r of rows) {
+        const sid = String((r && r.id) || "");
+        if (!sid || deletedSeen.has(sid)) continue;
+        deletedSeen.add(sid);
+        try { dropClip({ sfx: sid, line: "" }); } catch (err) { /* nothing held it */ }
+      }
+    });
+  }
   root.PineSampler = {
     mount,
     isMounted: () => mounted,
@@ -3341,6 +3397,12 @@
     /* "Put this somewhere" - used by the Listen view's grab pad, which has
      * no bank or pad in mind and wants the roll across banks for free. */
     putBytes: putBytesAnywhere,
+    /* [#1200] "deletes the file ... so it just gets rid of it permanently":
+     * every pad holding that clip goes with it. Matched by the clip's own
+     * id, by the feed row it was taken from, or by the URL a video pad
+     * kept. Synchronous on purpose - the count is the answer the hold
+     * sheet shows; the bytes leave the store in the background. */
+    dropClip: (want) => dropClip(want),
     forget: async (b, p) => {
       await dbDelete(padKey(b, p));
       engine().unload(padKey(b, p));

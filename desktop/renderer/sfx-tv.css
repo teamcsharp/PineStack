@@ -149,6 +149,33 @@
 }
 .sfx-tv-pad .pi-icon { width: 15px; height: 15px; }
 .sfx-tv-pad:hover { background: rgba(159, 216, 255, .2); }
+
+/* [#1219] THE TIMELINE ALONG THE BOTTOM EDGE OF THE PICTURE. A 4px band
+   and a small clock in the corner, over the glass and the vignette and
+   under the pad icon; inert to the pointer so the drag and the taps on
+   the picture are untouched. The panel's own tube (app.py, djTvShow)
+   carries the same rules. The clock sits 22px in so it clears the 18px
+   resize grip, which shares this corner. */
+.sfx-tv-time {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 4px; z-index: 4;
+  pointer-events: none;
+  /* NOT overflow:hidden - .sfx-tv-time-clock is a child of this 4px
+     band and sits above it, over the picture. */
+  background: rgba(255, 255, 255, .14);
+}
+.sfx-tv-time-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+  background: #65c7da;
+  box-shadow: 0 0 6px rgba(101, 199, 218, .6);
+}
+.sfx-tv-time-clock {
+  position: absolute; right: 22px; bottom: 6px; z-index: 4;
+  pointer-events: none;
+  font-weight: 600; font-size: 10px; line-height: 1; letter-spacing: .04em;
+  color: #dfe7ee; text-shadow: 0 1px 2px #000, 0 0 4px #000;
+  font-variant-numeric: tabular-nums;
+}
+.sfx-tv-time-clock:empty { display: none; }
 .sfx-tv-pad.said::after {
   content: attr(data-say);
   position: absolute;
@@ -318,4 +345,98 @@
   font-style: normal;
   display: block;
   overflow: hidden;
+}
+
+/* ---- [#1243] the two glue rails on the sheet's edges ---------------- */
+.sfx-tv-sheet.sfx-tv-hasglue { padding-left: 38px; padding-right: 38px; }
+.sfx-tv-sheet .sfx-tv-glue {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  width: 30px;
+  flex: none;                 /* the sheet's own button rule is flex: 1 1 auto */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 2px;
+  margin: 0;
+  border-radius: 7px;
+  border: 1px solid rgba(159, 216, 255, .34);
+  background: rgba(101, 199, 218, .12);
+  color: #bfe6f2;
+  cursor: pointer;
+  overflow: hidden;
+}
+.sfx-tv-sheet .sfx-tv-glue-prev { left: 4px; }
+.sfx-tv-sheet .sfx-tv-glue-next { right: 4px; }
+.sfx-tv-sheet .sfx-tv-glue:hover { background: rgba(101, 199, 218, .24); }
+.sfx-tv-sheet .sfx-tv-glue > i {
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: .14em;
+  line-height: 10px;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sfx-tv-sheet .sfx-tv-glue .pi-icon { width: 14px; height: 14px; flex: none; }
+/* Nothing next door. Not `disabled` - a disabled button on a touch screen
+   swallows the tap and its own title with it, and the reason never
+   reaches anybody. It stays tappable and says why. */
+.sfx-tv-sheet .sfx-tv-glue.off {
+  opacity: .45;
+  border-color: rgba(159, 216, 255, .18);
+  background: rgba(159, 216, 255, .05);
+  cursor: help;
+}
+.sfx-tv-sheet .sfx-tv-glue.working {
+  border-color: rgba(101, 199, 218, .8);
+  background: rgba(101, 199, 218, .3);
+  cursor: progress;
+}
+
+/* ---- [#1223] the clip editor, over the set ------------------------- */
+.sfx-tv-editor {
+  position: fixed;
+  left: 0; top: 0; right: 0; bottom: 0;
+  z-index: 2147483047;        /* one above the clip sheet that opened it */
+  display: flex;
+  flex-direction: column;
+  background: rgba(4, 7, 10, .97);
+}
+.sfx-tv-editorbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid rgba(159, 216, 255, .22);
+  color: #dcecf6;
+  font-size: 12px;
+}
+.sfx-tv-editorbar > b {
+  flex: 1 1 auto;
+  font-weight: 600;
+  letter-spacing: .04em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sfx-tv-editorbar > button {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(159, 216, 255, .3);
+  background: rgba(159, 216, 255, .08);
+  color: #dcecf6;
+  cursor: pointer;
+}
+.sfx-tv-editorbar > button:hover { background: rgba(159, 216, 255, .18); }
+.sfx-tv-editorframe {
+  flex: 1 1 auto;
+  width: 100%;
+  border: 0;
+  background: #05080b;
 }

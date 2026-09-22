@@ -28,15 +28,47 @@ test('initial empty store keeps zero until the first real event arrives', async 
   assert.equal(eventCursor({events: [{id:'first',seq:1}], next_after:1, latest_cursor:1, events_has_more:false}, empty), 1);
   assert.equal(eventCursor({events: [{id:'first',seq:1}], next_after:1, latest_cursor:101, events_has_more:true}, empty), 1);
 });
-test('desktop review opener selects Radio and sends the exact ID without a user-gesture playback grant', async () => {
+// [#1208] THE SMALLEST SHELL THE FRAMING TOUCHES. openDesktopRejectionReview
+// no longer walks to the Radio view; it raises the radio section where it
+// stands, which means a body class, one <style> in the head and a watcher on a
+// timer. The vm context grows exactly those so the two cases below still run
+// the real function out of renderer.js rather than a description of it.
+function shellStub() {
+  const inHead = new Map();
+  const classes = new Set();
+  const made = () => ({id: '', textContent: '', type: '', onclick: null, style: {}});
+  return {
+    createElement: made,
+    getElementById: (id) => inHead.get(id) || null,
+    addEventListener: () => {},
+    head: {append: (node) => { if (node && node.id) inHead.set(node.id, node); }},
+    body: {
+      append: () => {},
+      classList: {
+        toggle: (name, on) => { if (on) classes.add(name); else classes.delete(name); },
+        contains: (name) => classes.has(name)
+      }
+    }
+  };
+}
+
+test('[#1208] the desktop review opener raises the review in place and never changes the view', async () => {
   const desktop = fs.readFileSync(path.join(__dirname, '../desktop/renderer/renderer.js'), 'utf8');
   const script = desktop.slice(desktop.indexOf('let desktopRejectionOpenToken = 0;'), desktop.indexOf('function routeKeyFromState('));
   const calls = [], selected = [];
-  const context = {setTimeout, selectView: value => selected.push(value),
+  const document = shellStub();
+  const context = {setTimeout, document,
+    setInterval: () => 1, clearInterval: () => {},
+    selectView: value => selected.push(value),
     $: () => ({executeJavaScript: async (code, gesture) => {calls.push({code,gesture}); return true;}})};
   vm.createContext(context); vm.runInContext(script, context);
   await context.openDesktopRejectionReview('cut-"quoted\\identifier');
-  assert.deepEqual(selected, ['radio']);
+  // "Clicking this makes the viewport change when really I just need to pop up
+  //  the pop-up that this is related to."
+  assert.deepEqual(selected, [],
+    'the opener changed the view; the whole point of #1208 is that it must not');
+  assert.ok(document.body.classList.contains('pine-review-modal'),
+    'the review was not raised over what he was reading');
   assert.equal(calls.length, 1); assert.equal(calls[0].gesture, false);
   const guest = {window: {PineRejectionReview: {open: id => {guest.opened = id;}}}};
   await vm.runInNewContext(calls[0].code, guest);
@@ -48,7 +80,9 @@ test('desktop notification opener preserves the exact occurrence reference', asy
   const desktop = fs.readFileSync(path.join(__dirname, '../desktop/renderer/renderer.js'), 'utf8');
   const script = desktop.slice(desktop.indexOf('let desktopRejectionOpenToken = 0;'), desktop.indexOf('function routeKeyFromState('));
   const calls = [];
-  const context = {setTimeout,selectView(){},$:()=>({executeJavaScript:async(code,gesture)=>{calls.push({code,gesture});return true;}})};
+  // [#1208] same shell stub: the opener frames the review instead of walking to it.
+  const context = {setTimeout,document:shellStub(),setInterval:()=>1,clearInterval:()=>{},
+    selectView(){},$:()=>({executeJavaScript:async(code,gesture)=>{calls.push({code,gesture});return true;}})};
   vm.createContext(context);vm.runInContext(script,context);
   await context.openDesktopRejectionReview({id:'cut-quoted"',event_seq:417});
   const guest = {window:{PineRejectionReview:{open:value=>{guest.opened=value;}}}};

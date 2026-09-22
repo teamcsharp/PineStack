@@ -181,6 +181,10 @@
     var headRow = make('div', 'la-head-row');
     headRow.appendChild(make('b', '', 'What would you like to do with this?'));
     var votes = make('div', 'la-votes');
+    /* [#1200] THE TRASH CAN, for a sound effect only - left of the
+     * thumbs, where the finger was pointed. See sfxOf() below. */
+    var sfxRow = sfxOf(line);
+    if (sfxRow) votes.appendChild(binButton(line, sfxRow));
     votes.appendChild(voteButton(line, 'up', 'c:thumbs-up', 'I liked this'));
     votes.appendChild(voteButton(line, 'down', 'c:thumbs-down', 'This did not work'));
     headRow.appendChild(votes);
@@ -808,6 +812,170 @@
     return { id: line.id, text: line.said };
   }
 
+  /* [#1200] ------------------------------------------- the trash can */
+
+  /* "When I select sound effects, put a icon here of a trash can that I
+   * can tap that deletes the file locally on the system so it just gets
+   * rid of it permanently."
+   *
+   * THE CLIP BEHIND A LINE, or null when the line is not a sound effect.
+   * The feed row is the authority - it carries `sfx`, the clip's own id.
+   * The Script page's node carries the item the station composed, which
+   * names the clip's booth row (and, from #1200 on, the clip). A row that
+   * has rolled off the ring is still recognisable by what the script
+   * says about it; the station resolves the clip from the row id. */
+  function sfxOf(line) {
+    var row = feedRow(line);
+    if (row && (row.sfx || row.kind === 'sfx')) {
+      return { sfx: String(row.sfx || ''), line: String(line.id),
+               name: String(row.text || ''), deleted: !!row.deleted };
+    }
+    var item = line.node && line.node.pineItem;
+    if (item && (item.tag === 'sting' || item.sfx)) {
+      return { sfx: String(item.sfx || ''), line: String(item.line || line.id),
+               name: stingName(line.said), deleted: !!item.deleted };
+    }
+    if (/^A sting off the board:/.test(line.said)) {
+      return { sfx: '', line: String(line.id), name: stingName(line.said),
+               deleted: /- deleted from the library\.?(\s|$)/.test(line.said) };
+    }
+    return null;
+  }
+
+  /* "A sting off the board: 411 mixtape, bro (0:22)." -> "411 mixtape, bro".
+   * The speaker glyph the Script page paints in front of the name is a
+   * symbol, not a word, and goes with the length and the deleted note. */
+  function stingName(said) {
+    var m = /^A sting off the board:\s*([\s\S]*?)(?:\s*\(\d+:\d\d\))?(?:\s*-\s*deleted from the library)?\.?\s*$/
+      .exec(String(said || ''));
+    var name = m ? m[1] : String(said || '');
+    return name.replace(/^[\s\p{So}\p{Cf}️]+/u, '').trim().slice(0, 90);
+  }
+
+  function binButton(line, row) {
+    var b = make('button', 'la-vote la-bin');
+    b.type = 'button';
+    b.setAttribute('aria-label', 'Delete this sound effect from the library');
+    b.title = 'Delete this sound effect from the library';
+    b.appendChild(icon('c:trash-can', 'Delete this sound effect'));
+    if (row.deleted) {
+      b.disabled = true;
+      b.title = 'already deleted';
+      b.classList.add('on');
+    }
+    press(b, function () { askDelete(line, row); });
+    return b;
+  }
+
+  /* THE QUESTION, IN THE SHEET'S OWN BODY. The list folds away and the
+   * sentence with two buttons takes its place. Nothing is sent until the
+   * red one is pressed; Keep it puts the list back. */
+  function askDelete(line, row) {
+    if (!sheet || acting) return;
+    var list = sheet.querySelector('.la-list');
+    var shut = sheet.querySelector('.la-close');
+    if (!list || sheet.querySelector('.la-confirm')) return;
+    var ask = make('div', 'la-confirm');
+    ask.appendChild(make('p', 'la-confirm-say',
+      'Delete ‘' + (row.name || 'this clip') + '’ from the library '
+      + 'permanently? It will never be played again and the file is removed.'));
+    var buttons = make('div', 'la-confirm-row');
+    var yes = make('button', 'la-confirm-yes');
+    yes.type = 'button';
+    yes.appendChild(icon('c:trash-can'));
+    yes.appendChild(make('b', '', 'Delete it for good'));
+    var no = make('button', 'la-confirm-no', 'Keep it');
+    no.type = 'button';
+    buttons.appendChild(yes);
+    buttons.appendChild(no);
+    ask.appendChild(buttons);
+    list.classList.add('la-gone');
+    if (shut) shut.classList.add('la-gone');
+    list.parentNode.insertBefore(ask, list);
+    press(no, function () {
+      ask.remove();
+      list.classList.remove('la-gone');
+      if (shut) shut.classList.remove('la-gone');
+    });
+    press(yes, function () {
+      yes.disabled = true;
+      no.disabled = true;
+      yes.classList.add('la-busy');
+      deleteClip(line, row, ask);
+    });
+  }
+
+  /* One POST. The station bans the id, forgets the clip on every road that
+   * remembered it, and either removes the file or hands it to the desk's
+   * courier when the folder is a share this station can only read - its
+   * own sentence says which, and that sentence is the toast. */
+  function deleteClip(line, row, ask) {
+    var body = { id: row.sfx || '', line: row.line || String(line.id),
+                 name: row.name || '' };
+    laToast('deleting ‘' + (row.name || 'the clip') + '’…');
+    return Promise.resolve()
+      .then(function () { return api().post('/api/sfx/delete', body); })
+      .then(function (got) {
+        if (got && got.ok === false) {
+          throw new Error(String(got.say || got.why || got.detail || 'the station refused'));
+        }
+        var sid = String((got && got.deleted) || row.sfx || '');
+        markDeleted(line);
+        var pads = dropPads(sid, row.line || String(line.id));
+        var said = String((got && got.say) || 'deleted');
+        if (pads > 0) said += ' · ' + pads + ' pad' + (pads === 1 ? '' : 's') + ' cleared';
+        laToast(said);
+        close();
+        return got;
+      }, function (err) {
+        laToast('not deleted: ' + saidWhy(err), true);
+        if (ask && ask.parentNode) {
+          var yes = ask.querySelector('.la-confirm-yes');
+          var no = ask.querySelector('.la-confirm-no');
+          if (yes) { yes.disabled = false; yes.classList.remove('la-busy'); }
+          if (no) no.disabled = false;
+        }
+        return null;
+      });
+  }
+
+  /* THE REASON, NOT THE PLUMBING THAT CARRIED IT.
+   *
+   * The station refuses in words it wrote itself - "that line is not a
+   * sound effect", "2 clips are called 'twins' - delete it from the SFX
+   * desk". On the desk that sentence comes back through the bridge's
+   * fetchJson, which throws the `detail`, through ipcMain.handle, which
+   * Electron re-wraps as "Error invoking remote method 'agent:post':
+   * Error: <detail>". Put that in a toast and the operator reads a
+   * channel name where the answer should be. */
+  function saidWhy(err) {
+    var why = String((err && (err.message || err.detail)) || err || '');
+    why = why.replace(/^Error invoking remote method '[^']*':\s*/, '');
+    why = why.replace(/^(?:Error|TypeError):\s*/, '').trim();
+    return why || 'it would not';
+  }
+
+  /* The row the finger is on reads as gone at once, before any poll. */
+  function markDeleted(line) {
+    var node = line && line.node;
+    if (!node) return;
+    try {
+      node.classList.add('la-deleted');
+      if (!node.querySelector || !node.querySelector('.la-deleted-tag')) {
+        node.appendChild(make('span', 'la-deleted-tag', ' · deleted'));
+      }
+    } catch (err) { /* a node that has already been replaced */ }
+  }
+
+  /* Every pad on THIS terminal holding the clip is cleared. Other terminals
+   * learn it from /api/dj (`sfx_deleted`), which their sampler watches. */
+  function dropPads(sid, lineId) {
+    var sampler = root.PineSampler;
+    if (!sampler || typeof sampler.dropClip !== 'function') return 0;
+    try { return Number(sampler.dropClip({ sfx: sid, line: lineId })) || 0; }
+    catch (err) { return 0; }
+  }
+
   function toPad(line, stage) {
     var sampler = root.PineSampler;
     if (!sampler || typeof sampler.grab !== 'function') {
@@ -867,7 +1035,8 @@
     });
   }
 
-  root.PineLineActions = {start: start, open: open, close: close, lineAt: lineAt};
+  root.PineLineActions = {start: start, open: open, close: close, lineAt: lineAt,
+                          sfxOf: sfxOf, stingName: stingName};   /* [#1200] */
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = root.PineLineActions;
   }

@@ -1818,6 +1818,19 @@ body.immersive main {
 .stream-routes label.away select { color: var(--amber); }
 body.rail-compact .stream-routes { display: none; }
 
+/* [#1217] - the media / videos level. No route picker, so the middle column
+   is the slider itself and the number rides the end. */
+#mediaLevels label {
+  grid-template-columns: 78px minmax(0, 1fr) 40px;
+}
+#mediaLevels b {
+  font-size: 11px;
+  text-align: right;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+#mediaLevels label.hushed b { color: #6d8199; }
+
 /* #966 - A SEGMENT THAT IS READY SAYS SO, EVERY FEW SECONDS.
  *
  * "When a segment is a hundred percent ready and able to be played, I

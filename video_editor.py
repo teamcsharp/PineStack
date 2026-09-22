@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import hashlib                                              # [#1242]
+import hmac                                                 # [#1242]
 import io
 import json
 import math
@@ -28,6 +30,66 @@ MAX_DURATION = 20 * 60 + 5
 MAX_PIXELS = 4096 * 2160
 MAX_OVERLAY = 12 * 1024 * 1024
 ASSETS = {"video-editor.html", "video-editor.js", "video-editor.css", "video-edit-model.js"}
+
+
+# --- [#1242] A SAVE THAT CANNOT END IN THE WORD "UNAUTHORIZED" -------------
+#
+# WHERE THE EDITOR RUNS WITHOUT THE KEY. hot-corners.js openVideoEditor()
+# loads this station's /video-editor/?source=<32 hex> in an IFRAME. On the
+# PineTab the panel is the parent and is served from this same origin, so the
+# editor walks up to window.parent.pineDesktop and posts through the native
+# bridge, which carries the key. On the DESK the parent is a file:// Electron
+# document: the iframe is cross-origin, the preload is not injected into
+# subframes (no nodeIntegrationInSubFrames anywhere in main.js), and
+# window.__PINE_VIDEO_EDITOR_KEY — the last resort the page reaches for — is
+# never assigned in the whole tree. So the POST went out with no Authorization
+# header at all and this module answered 401 "Unauthorized", which the footer
+# printed verbatim. Same for any plain browser opening the page over the LAN.
+#
+# A SOURCE IDENTITY IS ALREADY A CAPABILITY. It is a uuid4 minted by an
+# authenticated upload, and everything READ about that source — the video, the
+# filmstrip, the waveform, the record — is already open on this station. The
+# permit therefore buys exactly one thing the open reads do not: the right to
+# spend a render slot on THAT source. It is bound to one source id, it expires,
+# and turning the API key over invalidates every one of them at once.
+SAVE_TOKEN_TTL = 6 * 3600
+SAVE_TOKEN_HEADER = "x-pine-save-token"
+
+
+def _save_secret() -> bytes:
+    return (os.environ.get("SPARK_AGENT_API_KEY") or "").encode()
+
+
+def _save_sign(source_id: str, expires: int) -> str:
+    secret = _save_secret()
+    if not secret:
+        return ""
+    body = f"ve1:{source_id}:{expires}".encode()
+    return hmac.new(secret, body, hashlib.sha256).hexdigest()[:32]
+
+
+def mint_save_token(source_id: str, ttl: int = SAVE_TOKEN_TTL) -> str:
+    """A short-lived permit to render ONE source. "" when nothing can sign."""
+    if not IDENTIFIER.fullmatch(str(source_id or "")):
+        return ""
+    expires = int(time.time() + max(60, int(ttl)))
+    sig = _save_sign(str(source_id), expires)
+    return f"ve1.{expires}.{sig}" if sig else ""
+
+
+def save_token_ok(token: str, source_id: str) -> bool:
+    """True when `token` is a live permit for exactly this source."""
+    raw = str(token or "")
+    if not raw.startswith("ve1.") or not IDENTIFIER.fullmatch(str(source_id or "")):
+        return False
+    try:
+        _, expires, sig = raw.split(".", 2)
+        if int(expires) < time.time():
+            return False
+        want = _save_sign(str(source_id), int(expires))
+        return bool(want) and hmac.compare_digest(want, sig)
+    except (ValueError, TypeError):
+        return False
 
 
 def number(value, name, low, high):
@@ -241,6 +303,87 @@ class VideoEditor:
             with self.lock:
                 self.processes.discard(process)
 
+    @staticmethod
+    def _tail(log) -> str:                                      # [#1207]
+        try:
+            return Path(log).read_text(encoding="utf-8", errors="replace")[-500:]
+        except OSError:
+            return "no detail was written"
+
+    def run_progress(self, command, seconds, report, timeout=1800, log=None):
+        """[#1207] The encoder's own clock, read off `-progress pipe:1`.
+
+        The operator asked for a bar that sweeps the footage in step with the
+        export. A bar has to be told the truth by something, and the only
+        thing that knows is ffmpeg: `out_time_us` counts microseconds of
+        OUTPUT written, so it is already measured against the trim rather than
+        against the whole recording. (`out_time_ms` is the same number in
+        microseconds — a long-standing ffmpeg misnomer — so both divide by
+        1e6.) stderr goes to a FILE, not a pipe: at -loglevel error it is
+        normally empty, and a pipe nobody drains is how a render deadlocks at
+        64 kB with the bar frozen and no reason on the wire."""
+        command = list(command)
+        command[1:1] = ["-progress", "pipe:1", "-nostats"]
+        if os.name != "nt" and shutil.which("nice"):
+            command = ["nice", "-n", "10"] + command
+        errors = open(log, "wb") if log else subprocess.DEVNULL
+        with self.lock:
+            if self.closed:
+                raise ValueError("Video processing was interrupted by a restart")
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
+            self.processes.add(process)
+        overran = []
+
+        def stop():
+            overran.append(True)
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+        killer = threading.Timer(max(30, timeout), stop)
+        killer.daemon = True
+        killer.start()
+        last = 0.0
+        try:
+            for raw in process.stdout:
+                line = raw.decode("utf-8", "replace").strip()
+                if not (line.startswith("out_time_us=")
+                        or line.startswith("out_time_ms=")):
+                    continue
+                try:
+                    done = int(line.split("=", 1)[1]) / 1e6
+                except ValueError:
+                    continue
+                share = done / seconds if seconds > 0 else 0.0
+                share = max(0.0, min(0.999, share))
+                now = time.monotonic()
+                if now - last >= 0.4:
+                    last = now
+                    try:
+                        report(share, done)
+                    except Exception:  # a bar is never worth a failed render
+                        pass
+            process.wait()
+        finally:
+            killer.cancel()
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+            if errors is not subprocess.DEVNULL:
+                errors.close()
+            with self.lock:
+                self.processes.discard(process)
+        if overran:
+            raise ValueError("Media processing took too long. Try a shorter clip.")
+        if process.returncode:
+            raise ValueError("Media processing failed: " + self._tail(log))
+        try:
+            report(1.0, seconds)
+        except Exception:
+            pass
+
     def probe(self, path):
         if not self.ffprobe:
             return self.probe_av(path)
@@ -398,11 +541,29 @@ class VideoEditor:
             self.write("exports", identifier, record)
 
             def render():
-                record["status"] = "working"
+                # [#1207] The record now carries a real reading of the render
+                # so the editor's scan bar can sweep to it. Every field here
+                # is written by the throttled reporter below, not guessed.
+                target = max(0.001, float(edit["out_s"] - edit["in_s"]))
+                began = time.time()
+                record.update(status="working", progress=0.0, progress_pct=0,
+                              rendered_s=0.0, target_s=round(target, 3),
+                              eta_s=0.0, started_at_ms=int(began * 1000))
                 self.write("exports", identifier, record)
                 temp = folder / "rendering.mp4"
-                self.run(export_command(self.folder("sources", source_id) / "original.mp4", temp,
-                                        edit, overlay, self.ffmpeg), timeout=1800)
+
+                def seen(share, done):
+                    spent = max(0.001, time.time() - began)
+                    record.update(progress=round(share, 4),
+                                  progress_pct=int(share * 100),
+                                  rendered_s=round(done, 3),
+                                  eta_s=round(max(0.0, spent / share - spent), 1)
+                                  if share > 0.02 else 0.0)
+                    self.write("exports", identifier, record)
+
+                self.run_progress(export_command(self.folder("sources", source_id) / "original.mp4", temp,
+                                                 edit, overlay, self.ffmpeg),
+                                  target, seen, timeout=1800, log=folder / "render.log")
                 verified = self.probe(temp)
                 if verified["has_audio"] != edit["include_audio"]:
                     raise ValueError("The exported audio track does not match the selection")
@@ -410,7 +571,8 @@ class VideoEditor:
                 if abs(verified["duration"] - expected) > .25:
                     raise ValueError("The exported duration does not match the selected trim")
                 os.replace(temp, folder / "edited.mp4")
-                record.update(status="complete", url=f"/api/video-editor/exports/{identifier}/file", **verified)
+                record.update(status="complete", progress=1.0, progress_pct=100,  # [#1207]
+                              url=f"/api/video-editor/exports/{identifier}/file", **verified)
                 self.write("exports", identifier, record)
             self.submit("exports", identifier, render)
             return record.copy()
@@ -430,6 +592,27 @@ def create_video_editor_router(root, assets, require_auth, require_read_auth):
             return editor.read(kind, identifier)
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+    def save_permit(request, source_id, body=None):
+        """[#1242] The key, or a live permit for THIS source — and when it is
+        neither, a refusal the operator can act on rather than the bare word
+        "Unauthorized" the editor used to print."""
+        try:
+            require_auth(request.headers.get("authorization"))
+            return
+        except HTTPException as exc:
+            if exc.status_code != 401:
+                raise            # a missing API key is a 500 and stays one
+        token = (request.headers.get(SAVE_TOKEN_HEADER)
+                 or request.query_params.get("save")
+                 or str((body or {}).get("save_token") or ""))
+        if save_token_ok(token, str(source_id or "")):
+            return
+        raise HTTPException(
+            401,
+            "This editor window has no live save permit, so the station will "
+            "not start the render. Reopen the recording from the panel to get "
+            "a fresh one, or keep the clip straight to this device instead.")
 
     @router.get("/video-editor/")
     async def page():
@@ -486,7 +669,7 @@ def create_video_editor_router(root, assets, require_auth, require_read_auth):
 
     @router.post("/api/video-editor/sources/{identifier}/retry")
     async def retry_source(identifier: str, request: Request):
-        require_auth(request.headers.get("authorization"))
+        save_permit(request, identifier)                            # [#1242]
         record = checked_read("sources", identifier)
         if record.get("status") != "failed":
             return record
@@ -503,7 +686,31 @@ def create_video_editor_router(root, assets, require_auth, require_read_auth):
     @router.get("/api/video-editor/sources/{identifier}")
     async def source(identifier: str, request: Request):
         require_read_auth(request.headers.get("authorization"))
-        return checked_read("sources", identifier)
+        record = dict(checked_read("sources", identifier))
+        # [#1242] The permit rides WITH the record, because the record is the
+        # one thing every surface already fetches on open — the desk's
+        # cross-origin iframe, the tablet, a phone on the LAN. Reads are open
+        # on this station, and the permit is worth no more than the reads it
+        # sits beside: it renders this source and nothing else.
+        token = mint_save_token(identifier)
+        if token:
+            record["save_token"] = token
+            record["save_token_ttl_s"] = SAVE_TOKEN_TTL
+        return record
+
+    @router.post("/api/video-editor/sources/{identifier}/save-token")
+    async def source_save_token(identifier: str, request: Request):
+        """[#1242] Minted by the page that OPENED the editor, which holds the
+        key, for the surface where the reads are locked and the iframe can
+        prove nothing for itself. hot-corners.js answers the editor's ask on
+        this road and posts the permit through."""
+        require_auth(request.headers.get("authorization"))
+        checked_read("sources", identifier)
+        token = mint_save_token(identifier)
+        if not token:
+            raise HTTPException(500, "No API key is configured, so nothing can be signed.")
+        return {"ok": True, "save_token": token, "ttl_s": SAVE_TOKEN_TTL,
+                "expires_ms": int(token.split(".")[1]) * 1000}
 
     @router.get("/api/video-editor/sources/{identifier}/{asset}")
     async def source_file(identifier: str, asset: str, request: Request):
@@ -520,7 +727,10 @@ def create_video_editor_router(root, assets, require_auth, require_read_auth):
 
     @router.post("/api/video-editor/exports")
     async def export(request: Request):
-        require_auth(request.headers.get("authorization"))
+        # [#1242] The body is read BEFORE the permit is checked, because the
+        # permit names a source and the source id is in the body. The same
+        # size bound guards it either way, so an unauthenticated caller can
+        # push no more bytes at this route than an authenticated one could.
         import asyncio
         raw = bytearray()
         async for chunk in request.stream():
@@ -531,6 +741,10 @@ def create_video_editor_router(root, assets, require_auth, require_read_auth):
             body = json.loads(raw)
             if not isinstance(body, dict):
                 raise ValueError("An edit object is required")
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        save_permit(request, str(body.get("source_id", "")), body)  # [#1242]
+        try:
             return await asyncio.to_thread(editor.start_export, body)
         except (ValueError, TypeError) as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -549,4 +763,9 @@ def create_video_editor_router(root, assets, require_auth, require_read_auth):
         return FileResponse(editor.folder("exports", identifier) / "edited.mp4", media_type="video/mp4",
                             filename=record["name"], headers={"Cache-Control": "private, max-age=86400"})
 
+    # [#1223] The editor travels with its router, so the station can hand it
+    # a file that is already on its own disk instead of uploading one to
+    # itself. app.py's /api/sfx/edit/open uses only the public methods the
+    # upload route above uses: folder(), write(), submit() and analyze().
+    router.pine_editor = editor
     return router

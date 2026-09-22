@@ -660,6 +660,327 @@
       ? !!mixReach[stream] : null;
   }
 
+  /* ================================================================== */
+  /* [#1192] [#1187] [#1217] pineLevels - THE ONE ROAD FOR THE FOUR       */
+  /* LISTENER LEVELS (voices, music, SFX, videos).                        */
+  /*                                                                      */
+  /* "I'm adjusting them but it doesn't update in real time as I'm        */
+  /*  adjusting these sliders."                                           */
+  /*                                                                      */
+  /* MEASURED ON THE TABLET, 2026-09-21, over CDP with the panel live:    */
+  /*                                                                      */
+  /*   pineInsideDesktopShell()            true   <- ON THE TABLET        */
+  /*   window.pineDesktop.clipboardReady   function                       */
+  /*   window.__pineDesktopVolume          undefined                      */
+  /*   pineMixer                     {voice:1, music:0.21, sfx:1, video:1}*/
+  /*   gains.music.node.gain              0.0399 at 3ms and at 33ms after */
+  /*                                      pineMixer.set({music:1})        */
+  /*                                                                      */
+  /* THREE THINGS WERE WRONG AND THIS IS THE ROAD THAT FIXES THEM.        */
+  /*                                                                      */
+  /* 1. THE VIDEOS ROW REACHED NOTHING THAT LASTS.  app.py's              */
+  /*    pineMixerApply skipped PineSfxTv.level() whenever                 */
+  /*    pineInsideDesktopShell() was true - and that test is              */
+  /*    `window.pineDesktop.clipboardReady is a function`, which the      */
+  /*    KIOSK bridge satisfies too.  So on the tablet, where the set IS   */
+  /*    in this document, the module level was never told.  The clip      */
+  /*    already on screen changed (a stray querySelectorAll caught it)    */
+  /*    and the NEXT clip came back at the old level, because play()      */
+  /*    writes `screen.volume = level` from that module variable.  That   */
+  /*    is exactly "it doesn't stay".                                     */
+  /*                                                                      */
+  /* 2. THE NATIVE WALL HAD NO LEVEL AT ALL.  Since 2026-09-21 13:06 the  */
+  /*    endless set is an ExoPlayer on a SurfaceView (PineVideoWall.kt),  */
+  /*    built with `p.volume = 1f` and no way to change it.  No slider    */
+  /*    in any document could ever have moved it.  The `level` op on      */
+  /*    window.pineDesktop.videoWall is the road, and the wall remembers  */
+  /*    the value across the watchdog's rebuilds.                         */
+  /*                                                                      */
+  /* 3. ON THE DESK EVERY PIXEL OF THE DRAG WAS THREE IPC CROSSINGS.      */
+  /*    renderer.js's pineMixer.set calls applyAppVolume(), which         */
+  /*    executeJavaScript()s a ~3KB script into controlFrame, radioFrame  */
+  /*    and guideFrame.  The modal called that from an `input` handler -  */
+  /*    once per pixel.  #1194 already learned this lesson for the mixing */
+  /*    drawer; this bus applies it to the mixer: the label and this      */
+  /*    document's own elements move synchronously, the crossings are     */
+  /*    coalesced onto one animation frame, and only the value under the  */
+  /*    thumb is ever sent.                                               */
+  /*                                                                      */
+  /* WHICH DOCUMENT EACH ELEMENT LIVES IN (measured, not assumed):        */
+  /*                                                                      */
+  /*   DESK, shell document  desktopRadioPlayer, PineSfxTv's set,         */
+  /*                         the sampler's Web Audio graph                */
+  /*   DESK, controlFrame    musicPlayer + its GainNode, djVoiceAudio0/1, */
+  /*                         djVideoTv's tube (never opens here), every   */
+  /*                         detached new Audio()                         */
+  /*   TABLET, one document  all of the above in the panel page, plus the */
+  /*                         injected views; the endless set is NATIVE    */
+  /*                         and reachable only through the bridge        */
+  /*                                                                      */
+  /* So the crossing on the desk is the one that already exists:          */
+  /* pineMixer.set -> applyAppVolume -> appVolumeScript, which carries    */
+  /* window.__pineDesktopMixer into every webview and is read by the      */
+  /* persistent hooks there (a MutationObserver, `play`,                  */
+  /* `loadedmetadata` and a one-second interval).  That is what makes     */
+  /* "everything created later" true without a second mechanism.         */
+  /* ================================================================== */
+
+  var LEVEL_KINDS = ['voice', 'music', 'sfx', 'video'];
+  /* A video's volume is a real element volume and cannot exceed 1; saying
+     150% on a control that saturates at 100% is the lie #1222 exists to
+     remove.  The other three ride a gain stage or a multiplier. */
+  var LEVEL_CEIL = {voice: 1.5, music: 1.5, sfx: 1.5, video: 1};
+  var LEVEL_KEY = 'pineMixer';
+
+  var lvlPending = null;        /* kind -> value, the thumb's latest */
+  var lvlBooked = false;        /* a flush is booked for the next frame */
+  var lvlWatchers = [];
+  var lvlShellSeen = {at: 0, is: false};
+  var lvlWallSent = null;       /* the last value the native wall was told */
+
+  function lvlNum(kind, value) {
+    var n = Number(value);
+    if (!isFinite(n)) return 1;
+    var top = LEVEL_CEIL[kind] || 1;
+    return n < 0 ? 0 : (n > top ? top : n);
+  }
+
+  /* IS THIS THE SHELL?  Not a build flag and not a user agent: the shell is
+     the document that HAS webviews.  The tablet's panel has none, a plain
+     browser has none, and the panel inside the desk is not this document at
+     all.  Cached for two seconds because this is asked on every input. */
+  function lvlShellDoc() {
+    var now = (root.Date && root.Date.now) ? root.Date.now() : 0;
+    if (now - lvlShellSeen.at < 2000) return lvlShellSeen.is;
+    var is = false;
+    try { is = !!(document.querySelector && document.querySelector('webview')); }
+    catch (err) { is = false; }
+    lvlShellSeen = {at: now, is: is};
+    return is;
+  }
+
+  function lvlStored() {
+    var m = {};
+    try { m = JSON.parse(root.localStorage.getItem(LEVEL_KEY) || '{}') || {}; }
+    catch (err) { m = {}; }
+    var out = {};
+    for (var i = 0; i < LEVEL_KINDS.length; i += 1) {
+      var k = LEVEL_KINDS[i];
+      out[k] = (m[k] === undefined || m[k] === null) ? 1 : lvlNum(k, m[k]);
+    }
+    return out;
+  }
+
+  /* WHAT THE OPERATOR SET.  The STORE, not a mixer's in-memory copy.
+     `pineMixer` IS this key - both implementations of it (app.py's panel one
+     and renderer.js's shell one) read and write localStorage.pineMixer - so
+     in the normal case they agree and the choice looks arbitrary.  It is not:
+     it is the only choice that cannot LOSE a level.  Read the mixer first and
+     any document whose mixer answers something else hands back a 1 nobody
+     chose, and the next apply() writes that 1 over what he really had.  The
+     desk's panel webview is exactly such a document - pineMixerRead() there
+     deliberately answers all ones, because inside the desktop app the shell
+     owns element volume (#1147) - and so is a build that has not loaded its
+     mixer yet.  Measured in the harness: set music to 150%, touch the voice
+     row, and music was back at 100%.  One record, and it is the stored one. */
+  function levelsGet() {
+    return lvlStored();
+  }
+
+  function levelsStore(m) {
+    try { root.localStorage.setItem(LEVEL_KEY, JSON.stringify(m)); }
+    catch (err) { /* private mode: this session still works */ }
+  }
+
+  /* Everything in THIS document, now, with no promise in the way.  Only
+     called where this document owns its own element volume - i.e. NOT in the
+     shell, where applyAppVolume is the single owner (#1147) and a write from
+     here would flutter against it twice a second. */
+  function lvlLocalNow(m) {
+    var touched = false;
+    try {
+      if (root.pineMixer && typeof root.pineMixer.set === 'function') {
+        root.pineMixer.set(m);
+        touched = true;
+      }
+    } catch (err) { /* the element writes below still stand */ }
+    if (typeof m.video === 'number') {
+      var v = lvlNum('video', m.video);
+      /* The SFX guy's set, through ITS OWN door - the module level, so the
+         NEXT clip is born at this level too.  E2 owns that function; this
+         only ever calls it. */
+      try {
+        if (root.PineSfxTv && typeof root.PineSfxTv.level === 'function'
+            && root.__pineDesktopVolume === undefined) {
+          root.PineSfxTv.level(v);
+          touched = true;
+        }
+      } catch (err) { /* no set on this page */ }
+      /* ...and any tube this document is holding that the set does not own
+         (the panel's own djVideoTv, a warmed spare). */
+      try {
+        var list = document.querySelectorAll('.sfx-tv-tube video, .sfx-tv-screen video');
+        for (var i = 0; i < list.length; i += 1) {
+          list[i].volume = v;
+          if (v > 0 && list[i].muted) list[i].muted = false;
+          touched = true;
+        }
+      } catch (err) { /* no tube up */ }
+    }
+    return touched;
+  }
+
+  /* THE NATIVE WALL.  Only the tablet has one; the bridge answers a promise
+     and the value is remembered on the Kotlin side across every rebuild the
+     #1440 watchdog does, so this is told once per change and not per clip.
+
+     ONE DOOR.  Where this document is the panel (the tablet), the panel's own
+     pineWallLevel() is that door - it holds the value latch and its own frame
+     coalescing, and pineMixerApply calls it too.  Two latches would be two
+     bridge calls for one drag. */
+  function lvlWall(v) {
+    var want = lvlNum('video', v);
+    try {
+      if (typeof root.pineWallLevel === 'function') return !!root.pineWallLevel(want);
+    } catch (err) { /* the direct road below */ }
+    var bridge = root.pineDesktop;
+    if (!bridge || typeof bridge.videoWall !== 'function') return false;
+    if (lvlWallSent !== null && Math.abs(lvlWallSent - want) < 0.005) return true;
+    lvlWallSent = want;
+    try {
+      var going = bridge.videoWall('level', {level: want});
+      if (going && typeof going['catch'] === 'function') {
+        going['catch'](function () { lvlWallSent = null; });
+      }
+    } catch (err) { lvlWallSent = null; return false; }
+    return true;
+  }
+
+  function lvlTell(m, roads) {
+    for (var i = 0; i < lvlWatchers.length; i += 1) {
+      try { lvlWatchers[i](m, roads); }
+      catch (err) { /* a painter must not stop the sound */ }
+    }
+  }
+
+  function lvlFlush() {
+    lvlBooked = false;
+    var want = lvlPending;
+    lvlPending = null;
+    if (!want) return;
+    if (lvlShellDoc()) {
+      /* ONE injection per frame, carrying the value that was under the thumb
+         when the frame came round - never one per pixel.  The shell reaches
+         its own television and every webview through applyAppVolume, and
+         there is no native wall in that window, which is why roads() says
+         'shell' and nothing else. */
+      try { if (root.pineMixer && root.pineMixer.set) root.pineMixer.set(want); }
+      catch (err) { /* the drawer label already moved */ }
+      return;
+    }
+    if (typeof want.video === 'number') lvlWall(want.video);
+  }
+
+  function lvlBook(values) {
+    lvlPending = lvlPending || {};
+    for (var k in values) {
+      if (Object.prototype.hasOwnProperty.call(values, k)) lvlPending[k] = values[k];
+    }
+    if (lvlBooked) return;
+    lvlBooked = true;
+    soon(lvlFlush);
+  }
+
+  /**
+   * SET ONE LEVEL AND MAKE IT TRUE EVERYWHERE, NOW.
+   *
+   *   pineLevels.apply('video', 0.3)
+   *
+   * `kind` is one of voice | music | sfx | video; `value` is a fraction
+   * where 1 is unity (videos stop at 1, the rest reach 1.5).  Returns the
+   * roads taken, synchronously, so a label can be honest in the same frame:
+   * 'local', 'shell', 'wall', or '' when there is nothing here to move.
+   */
+  function levelsApply(kind, value) {
+    var one = {};
+    if (LEVEL_CEIL[kind] === undefined) return '';
+    one[kind] = lvlNum(kind, value);
+    return levelsApplyAll(one);
+  }
+
+  /** Several at once - one store write, one crossing. */
+  function levelsApplyAll(values) {
+    var m = levelsGet();
+    var asked = {};
+    for (var k in values) {
+      if (!Object.prototype.hasOwnProperty.call(values, k)) continue;
+      if (LEVEL_CEIL[k] === undefined) continue;
+      m[k] = asked[k] = lvlNum(k, values[k]);
+    }
+    if (!Object.keys(asked).length) return '';
+    levelsStore(m);
+    var roads = [];
+    if (lvlShellDoc()) {
+      lvlBook(asked);
+      roads.push('shell');
+    } else {
+      if (lvlLocalNow(asked)) roads.push('local');
+      if (typeof asked.video === 'number'
+          && root.pineDesktop && typeof root.pineDesktop.videoWall === 'function') {
+        lvlBook({video: asked.video});
+        roads.push('wall');
+      }
+    }
+    lvlTell(m, roads);
+    return roads.join('+');
+  }
+
+  /** What apply() WILL reach from this document, asked as a question. */
+  function levelsRoads(kind) {
+    var out = [];
+    if (LEVEL_CEIL[kind] === undefined) return out;
+    if (lvlShellDoc()) { out.push('shell'); return out; }
+    try { if (root.pineMixer && root.pineMixer.set) out.push('local'); } catch (err) { /* none */ }
+    if (kind === 'video') {
+      try {
+        if (root.PineSfxTv && root.PineSfxTv.level
+            && root.__pineDesktopVolume === undefined) out.push('set');
+      } catch (err) { /* none */ }
+      if (root.pineDesktop && typeof root.pineDesktop.videoWall === 'function') out.push('wall');
+    }
+    return out;
+  }
+
+  function levelsWatch(fn) {
+    if (typeof fn !== 'function') return function () { /* nothing to undo */ };
+    lvlWatchers.push(fn);
+    return function () {
+      for (var i = 0; i < lvlWatchers.length; i += 1) {
+        if (lvlWatchers[i] === fn) { lvlWatchers.splice(i, 1); return; }
+      }
+    };
+  }
+
+  /* Named `pineLevels`, lower case, beside window.pineMixer and
+     window.pineDesktop, because it is a bus and not a view.  PineLevels
+     (capital P, pine-levels.js #1222) is the tablet's levels SHEET and is a
+     different thing; it calls this. */
+  if (!root.pineLevels) {
+    root.pineLevels = {
+      KINDS: LEVEL_KINDS,
+      CEIL: LEVEL_CEIL,
+      get: levelsGet,
+      apply: levelsApply,
+      applyAll: levelsApplyAll,
+      roads: levelsRoads,
+      onApply: levelsWatch,
+      /* For a level set somewhere else that must land here too - the shell
+         crossing into a panel, a future postMessage.  Same arithmetic, no
+         store write of its own beyond the merge. */
+      take: function (values) { return levelsApplyAll(values); }
+    };
+  }
+
   root.PineAudioLaw = {
     localMix: localMix,
     setLocalMix: setLocalMix,
@@ -679,6 +1000,8 @@
     setLevel: setLevel, setRoute: setRoute,
     talkOnly: talkOnly, isTalkOnly: isTalkOnly,
     localVolume: localVolume, setLocalVolume: setLocalVolume,
+    /* [#1192]: the four listener levels, wherever their owners are. */
+    levels: function () { return root.pineLevels; },
     clamp: clamp
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineAudioLaw;

@@ -61,7 +61,12 @@ from crystal_source import clean_repair_prompt_echo, strip_repair_prompt_echo
 from segment_contract import ad_sale_evidence
 from store_retention import retention_sweep, store_sizes
 import station_modifiers                 # #1169/#1170: the modifier desk
+import segment_prompts                   # [#1195] the segment prompt book: alternatives, modes, - speaker box -
+import paperwork_fields                  # [#1231] the inspector's editable boxes
 import track_talk_segment                # #1179: a record's talk desk
+import record_binding                    # #1237: a line bound to a record airs with it
+import phrase_trace                      # [#1241] where a phrase comes from, and the ban
+import recast_desk                        # [#1215]: the cupboard recast desk
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
                       director_lessons_clause, director_notes, director_path,
@@ -75,6 +80,11 @@ from director import (director_add, director_beats, director_beats_clause,
                       script_tint_note)
 from crystal_acceptance import evaluate_acceptance as crystal_editorial_acceptance
 from prompt_learning import PromptLearningStore, _patterns as crystal_learning_patterns
+from caller_topic import (  # [#1240/#1249] the storyline as direction, the caller's subject as spine
+    plot_act_direction, plot_label_scrub, topic_subject, topic_nouns,
+    topic_adherence, topic_words_dropped, topic_contract_clause,
+    fallback_call_script as _topic_fallback_call_script,
+    SKELETON_TELL as _TOPIC_SKELETON_TELL)
 from response_bank import ResponseBank, add_listening_responses
 from rap_battle import (COMBATANTS as RAP_COMBATANTS, RapBattle,
                         SEAT_NAMES as RAP_SEAT_NAMES)
@@ -156,6 +166,9 @@ DATA_DIR = Path(os.getenv("SPARK_AGENT_DATA_DIR", "/app/data")).expanduser()
 
 def data_path(*parts: str) -> Path:
     return DATA_DIR.joinpath(*parts)
+
+
+segment_prompts.install(globals(), DATA_DIR)      # [#1195] the book reads the station through this dict at call time
 
 
 # #1158: the shelves the Library watches. Both are already mounted - compose
@@ -1207,6 +1220,15 @@ DEFAULT_DJ = {
     # that the operator's own documents are never reworded.
     "speakbox_seat_spread": True,
     "speakbox_tint_passages": True,
+    # [#1233] Whether the opening/closing passage dials apply to the rounds
+    # System2 writes. Since #1070 made System2 the default engine every
+    # banter round has been written under a System2 job, and the three
+    # doors were gated `not _system2_job` - measured 2026-09-21: 0 of the
+    # 45 banter rounds authored in 24 h carried a head or a tail passage,
+    # and 45 of 45 were written under a job, against dials reading 49% and
+    # 68%. Under a job a passage is bounded to SPEAKBOX_S2_QUOTE_TURNS
+    # so the scene still fits its slot; the full reading stays held.
+    "speakbox_quotes_system2": True,
     # 2026-09-10: the roads the tint hold may never silence. The crystal
     # still tries them; it just never becomes the reason they do not air.
     # See tint_must_flow.
@@ -1273,6 +1295,18 @@ DEFAULT_DJ = {
     # endless video" - the clip length the book's pick aims for, in
     # seconds; 0 means any length the library holds.
     "sfx_video_len": 0,
+    # [#1251] "have him play clips appropriate to the statements being
+    # said on the radio ... not word for word but loosely ... either via
+    # the noun, verb, or context ... something I can toggle off and on".
+    # OFF by default, both of them: this changes what the operator hears
+    # and what his screens show, so it only ever starts by hand. The
+    # strength is the floor a match must clear to beat the random draw -
+    # 0 takes any loose connection, 35 wants one uncommon word out of the
+    # line in the clip's own name, 100 wants two rare ones.
+    "sfx_match_dialogue": False,
+    "sfx_match_strength": 35,
+    "sfx_video_match_dialogue": False,
+    "sfx_video_match_strength": 35,
     "sfx_every_units": 0,
     "sfxguy_every_units": 4,
     # #799: how often what he says is a freshly WARPED invention (0-100).
@@ -1515,6 +1549,13 @@ DEFAULT_DJ = {
     # The same for the phone line: each caller draws their own intensity
     # rather than every caller arriving at the same temperature.
     "dice_callers": False,
+    # [#1232] the director's weather. "fixed" leaves the six emotions
+    # where the events left them (zero most of the night); "random"
+    # re-rolls every seat inside its ranges at every round write and
+    # every caller arrival, seeded per round, and writes the roll into
+    # the round's paperwork. Ranges: {seat: {emotion: [lo, hi]}}.
+    "weather_mode": "fixed",
+    "weather_ranges": {},
     # #no-repeats: the hour. How long a run of words is off the air after it is
     # said — station-wide, and then longer for the SPEAKER who said it, which
     # is the per-character cooldown. 0 on both switches the engine off.
@@ -1996,6 +2037,43 @@ def validate_terminals(raw: Any) -> dict[str, Any]:
     return out
 
 
+# --- [#1232] the director's weather: the dial and the ranges ----------------
+# Mirrors EMOTION_DIMS (declared with the Conversation Director further
+# down); listed here because validate_settings() below runs before that
+# section of the module is reached.
+WEATHER_DIMS = ("amusement", "excitement", "confusion",
+                "irritation", "fatigue", "nervousness")
+WEATHER_SEATS = ("dj", "cohost", "third", "caller")
+WEATHER_RANGE_DEFAULT = (0.0, 0.6)
+WEATHER_MARK = "THE WEATHER IN THE ROOM THIS ROUND"
+
+
+def weather_ranges_clean(raw: Any) -> dict[str, dict[str, list[float]]]:
+    """[#1232] {seat: {emotion: [lo, hi]}} with 0 <= lo <= hi <= 1. Anything
+    else is dropped, and a missing pair reads as the 0-0.6 default."""
+    out: dict[str, dict[str, list[float]]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for seat, dims in raw.items():
+        seat = str(seat or "")[:24]
+        if seat not in WEATHER_SEATS or not isinstance(dims, dict):
+            continue
+        keep: dict[str, list[float]] = {}
+        for dim, pair in dims.items():
+            if dim not in WEATHER_DIMS:
+                continue
+            try:
+                lo, hi = float(pair[0]), float(pair[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            lo = max(0.0, min(1.0, lo))
+            hi = max(lo, min(1.0, hi))
+            keep[dim] = [round(lo, 3), round(hi, 3)]
+        if keep:
+            out[seat] = keep
+    return out
+
+
 def validate_settings(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Settings must be an object")
@@ -2260,6 +2338,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "speakbox_tint_passages": bool(raw_dj.get(
             "speakbox_tint_passages",
             DEFAULT_DJ["speakbox_tint_passages"])),
+        "speakbox_quotes_system2": bool(raw_dj.get(               # [#1233]
+            "speakbox_quotes_system2",
+            DEFAULT_DJ["speakbox_quotes_system2"])),
         "crystal_tint_must_flow": [
             str(name)[:40] for name in
             (raw_dj.get("crystal_tint_must_flow")
@@ -2333,6 +2414,18 @@ def validate_settings(data: Any) -> dict[str, Any]:
             DEFAULT_DJ["sfx_video_share"]))),
         "sfx_video_mode": bool(raw_dj.get("sfx_video_mode",
                                           DEFAULT_DJ["sfx_video_mode"])),
+        # [#1251] the dialogue matcher: two switches, two floors.
+        "sfx_match_dialogue": bool(raw_dj.get(
+            "sfx_match_dialogue", DEFAULT_DJ["sfx_match_dialogue"])),
+        "sfx_match_strength": max(0, min(100, int(
+            raw_dj.get("sfx_match_strength",
+                       DEFAULT_DJ["sfx_match_strength"]) or 0))),
+        "sfx_video_match_dialogue": bool(raw_dj.get(
+            "sfx_video_match_dialogue",
+            DEFAULT_DJ["sfx_video_match_dialogue"])),
+        "sfx_video_match_strength": max(0, min(100, int(
+            raw_dj.get("sfx_video_match_strength",
+                       DEFAULT_DJ["sfx_video_match_strength"]) or 0))),
         "sfxguy_warp": max(0, min(100, int(
             raw_dj.get("sfxguy_warp",
                        DEFAULT_DJ["sfxguy_warp"]) or 0))),
@@ -2597,6 +2690,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "guest_mode": bool(raw_dj.get("guest_mode")),
         "dice_hosts": bool(raw_dj.get("dice_hosts")),          # #676
         "dice_callers": bool(raw_dj.get("dice_callers")),      # #676
+        "weather_mode": ("random" if str(raw_dj.get("weather_mode") or "")
+                         .strip().lower() == "random" else "fixed"),  # [#1232]
+        "weather_ranges": weather_ranges_clean(
+            raw_dj.get("weather_ranges")),                    # [#1232]
         "guest_id": str(raw_dj.get("guest_id") or "")[:40],
         "drop_voice": str(raw_dj.get("drop_voice") or "")[:100],
         # #1164: this dict is a WHOLESALE REBUILD, so a key that is
@@ -9799,7 +9896,23 @@ def page_wedge_state() -> dict[str, Any]:
         quiet = (now - heard_at) if heard_at else PAGE_WEDGE_QUIET * 2
         out["quiet"] = round(quiet, 1)
         if not owner:
-            out["why"] = "nobody holds the air"
+            # [#1184] "NOBODY HOLDS THE AIR" IS NOT THE END OF A
+            # DIAGNOSIS. On 2026-09-15 07:58 this sentence was the whole
+            # verdict while seven listeners polled, the desktop was
+            # switched on, and nothing had been heard for 678 s. With no
+            # owner every page is SUPPOSED to sound (#1008), so a silent
+            # house in this state is a fault like any other - and it has
+            # its own cure, which is the `handover` rung. Say so, and let
+            # the wedge road open on the same evidence it would accept
+            # from a page that does hold the air.
+            out["why"] = ("nobody holds the air: %d listener(s) polling, "
+                          "%d clip(s) waiting, quiet %ds - the 'handover' "
+                          "rung gives it to a device that is switched on "
+                          "(#1184)"
+                          % (len(_listeners_live()), waiting, int(quiet)))
+            if (waiting >= PAGE_WEDGE_WAITING and stalls
+                    and quiet >= PAGE_WEDGE_QUIET and _listeners_live()):
+                out["wedged"] = True
             return out
         seen = float((_LISTENER_SEEN.get(owner) or {}).get("at") or 0)
         # #1208: A PAGE THAT HOLDS THE AIR AND ANSWERS NOBODY IS THE
@@ -14225,6 +14338,14 @@ def dialogue_row_ready(kind: str, row: Any) -> bool:
     """One authoritative zero-work-to-air predicate for scheduled stock."""
     try:
         if not isinstance(row, dict) or row.get("off_brief") or row.get("review_cancel_pending"):
+            return False
+        # [#1239] A PREPARED round already has its audio. Editing the
+        # words at the mouth would leave the recording saying the
+        # phrase, so a round that carries a banned one never leaves
+        # the shelf. The callable lookup keeps early module-load
+        # restoration safe, exactly as the call gate below does.
+        _phrase_gate = globals().get("phrase_ban_row_blocked")
+        if callable(_phrase_gate) and _phrase_gate(kind, row):
             return False
         entry = dialogue_entry(row)
         if entry is not None:
@@ -24332,6 +24453,183 @@ def admission_state(limit: int = 40) -> dict[str, Any]:
 
 
 # --- broadcast admission (2026-09-15) --- end
+# --- the linear playout sequencer (#1218, #1246) ---   # [#1218]
+#
+# WHY THERE IS A SECOND CONTROLLER BESIDE THE ADMISSION GATE.
+#
+# The gate answers WHAT and IN WHICH ORDER: it holds the committed
+# sequence, refuses a dispatch that is out of position, and proves a
+# round's audio is real before anything is committed. It has no opinion
+# at all about WHEN, and when is the whole of #1246.
+#
+# Measured on this station's own ledgers, the 24 hours to 2026-09-22
+# 02:02Z: a round waits a median of 52 s (p90 136 s, longest 271 s)
+# between the moment its lines are committed to the script ledger and the
+# moment its first line is heard. Nothing was reserving that wait. 416
+# filler rows - 335 interjections, 31 intros, 21 SFX-guy quips, 17
+# station ids, 12 banter lines - were heard INSIDE 111 rounds' waits; 31
+# rounds came back into the reading order behind lines written after them
+# (265 rows); and two committed rounds, blocks 6404 and 6408, overlapped
+# by 34.3 seconds because the second was stamped off the server's
+# estimate of when the first would end while the page was still playing
+# it.
+#
+# The sequencer is told four things - making, held, dispatched, heard -
+# and answers two: when the air is free ON THE LISTENER'S CLOCK, and
+# whether a filler road may go now. It never refuses audio: a queued
+# filler is STAMPED AFTER the committed round, which is what "append to
+# the end rather than cut in" means on a feed that is a ring of stamps.
+try:
+    import playout_sequencer as _playout_module
+except Exception:  # noqa: BLE001
+    _playout_module = None
+
+PLAYOUT_DIR = data_path("playout")
+PLAYOUT_MODE_FILE = PLAYOUT_DIR / "mode"
+_PLAYOUT: Any = None
+_PLAYOUT_WHY = ""
+
+
+def playout() -> Any:
+    """The one sequencer, or None. NEVER raises.
+
+    The blanket except is the same one `admission_controller` earned: a
+    controller that can take the station off the air is a worse fault
+    than the one it was installed to find. Every road into this module is
+    allowed to answer "no sequencer" and carry on exactly as the station
+    ran before the switch existed."""
+    global _PLAYOUT, _PLAYOUT_WHY
+    if _playout_module is None:
+        return None
+    if _PLAYOUT is not None:
+        return _PLAYOUT
+    try:
+        switch = _playout_module.PlayoutSwitch(PLAYOUT_DIR, env={},
+                                               clock=time.time)
+        _PLAYOUT = _playout_module.LinearSequencer(
+            clock=time.time, mode_reader=switch.mode,
+            events_path=PLAYOUT_DIR / "events.jsonl")
+        _PLAYOUT.switch = switch
+    except Exception as exc:  # noqa: BLE001
+        _PLAYOUT_WHY = "the playout sequencer could not be opened: %r" % (exc,)
+        return None
+    return _PLAYOUT
+
+
+def playout_mode() -> str:
+    """off | shadow | linear. `off` is the default and is INERT."""
+    seq = playout()
+    if seq is None:
+        return "off"
+    try:
+        return str(seq.mode())
+    except Exception:  # noqa: BLE001
+        return "off"
+
+
+def playout_tell(method: str, *args: Any, **kw: Any) -> Any:
+    """Tell the sequencer something. Swallows everything, always."""
+    seq = playout()
+    if seq is None:
+        return None
+    try:
+        return getattr(seq, method)(*args, **kw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def playout_floor(exclude_key: str = "") -> float:
+    """The earliest moment a new page clip may be stamped, or 0.0.
+
+    0.0 in every mode but `linear`, so the switch being off is provably
+    free of behaviour rather than merely believed to be."""
+    seq = playout()
+    if seq is None:
+        return 0.0
+    try:
+        return float(seq.page_floor(exclude_key=exclude_key) or 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def playout_round_key(entries: Any, occurrence: str = "") -> str:
+    """One stable name for a round across making, holding and dispatch:
+    the round's own sid where it has one, else the occurrence id."""
+    try:
+        for row in (entries or []):
+            sid = str((row or {}).get("sid") or "")
+            if sid:
+                return "sid:" + sid
+    except Exception:  # noqa: BLE001
+        pass
+    return "occ:" + str(occurrence or "")
+
+
+def playout_ask(road: str, kind: str = "", dialogue: Any = None,
+                priority: bool = False) -> dict[str, Any]:
+    """May this road put something on the air now? Always answers."""
+    seq = playout()
+    if seq is None:
+        return {"allow": True, "why": "", "enforced": False, "after": 0.0,
+                "queued": False, "mode": "off", "road": road}
+    try:
+        return dict(seq.ask_fill(road, dialogue=dialogue, priority=priority))
+    except Exception:  # noqa: BLE001
+        return {"allow": True, "why": "", "enforced": False, "after": 0.0,
+                "queued": False, "mode": "off", "road": road}
+
+
+def playout_state(limit: int = 12) -> dict[str, Any]:
+    seq = playout()
+    if seq is None:
+        return {"available": False, "mode": "off", "linear": False,
+                "verdict": "the playout sequencer is not loaded",
+                "why": _PLAYOUT_WHY or "playout_sequencer.py is not importable"}
+    try:
+        got = dict(seq.state(limit=limit))
+        got["available"] = True
+        return got
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "mode": "error", "linear": False,
+                "verdict": "the playout sequencer is unreadable",
+                "why": "%r" % (exc,)}
+
+
+# WHICH ROAD IS ASKING. The page door sees a clip, not a producer, and
+# the census is only worth reading if the roads have their own names.
+PLAYOUT_ROAD_BY_KIND = {
+    "sfx": "sting", "sfxguy": "sfxguy", "ad": "advert", "advert": "advert",
+    "station_id": "station_id", "intro": "intro", "interject": "interject",
+    "gold": "gold", "replay": "replay", "news": "news", "weather": "weather",
+    "banter": "banter", "manager": "manager", "rescue": "rescue",
+    "unheard": "unheard", "record": "record_talk", "upstairs": "upstairs",
+}
+# The sheet is OWED these (#1261's memo from upstairs, and the advert
+# log): they ask with priority and may go in front of a HELD round, never
+# in front of a sounding one - the floor sees to that.
+PLAYOUT_PRIORITY_KINDS = frozenset({"ad", "advert", "upstairs"})
+
+
+def playout_clip_road(clip: Any) -> tuple[str, bool]:
+    """(road, priority) for one page clip."""
+    kind = str((clip or {}).get("kind") or "")
+    road = PLAYOUT_ROAD_BY_KIND.get(kind) or (kind or "filler")
+    return road, kind in PLAYOUT_PRIORITY_KINDS
+
+
+def playout_is_committed_round(clip: Any) -> bool:
+    """A committed round arrives at the page door with its own cue sheet
+    and its own broadcast moment: it IS the sequence, not a filler."""
+    try:
+        stream = (clip or {}).get("stream")
+        if isinstance(stream, dict) and len(list(stream.get("rows") or [])) >= 2:
+            return True
+        return bool((clip or {}).get("ready_round"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# --- the linear playout sequencer (#1218, #1246) --- end
 # --- script production (2026-09-15) ---
 #
 # THE PRODUCER FOR `docs/notes/speaker-recording-and-script-assembly.md`.
@@ -24382,6 +24680,73 @@ else:
 _PRODUCTION: Any = None
 # The last few rounds' reference sets, for the incident capture. Bounded.
 _PRODUCTION_SEEN: list[dict[str, Any]] = []
+
+
+# --- #1184/#1246: THE READ-AHEAD BANK AND ITS PRODUCTION QUEUE ---
+#
+# "i dont know why these lines arent recorded and played in advance."
+# Measured on the next hour of the sheet, 2026-09-21 21:05: 3000 s owed,
+# 2734 s of written material bound to it, 98.2 s of finished audio. The
+# station could not SAY that before - there was no reader that walked the
+# coming hour line by line and named, per line, whether its audio exists.
+# `bank_readahead.bank_state()` is that reader and GET /api/bank serves it.
+#
+# The same module owns the production queue. `script_production_round`
+# ran only at the instant a round finished preparing, so 969 of 991 rounds
+# in the ledger carry no measured cue map and therefore no `body_frames` -
+# which is the one thing the sequencer must know before it may hold a
+# round. `bank_producer()` works that queue in AIR order, ahead of time.
+#
+# Imported in a try, like the producer above it and for the same reason: a
+# module that can throw out of here would be a new way for the station to
+# fail to reach the air, and this road exists to make it more certain.
+try:
+    import bank_readahead as _bank_module                      # [#1184]
+except Exception as _bank_import_error:  # noqa: BLE001
+    _bank_module = None
+    _BANK_WHY = "bank_readahead could not be imported: %r" % (
+        _bank_import_error,)
+else:
+    _BANK_WHY = ""
+# What the standing producer last did, for /api/bank and the console.
+_BANK_PRODUCER: dict[str, Any] = {"at": 0.0, "runs": 0, "made": 0,
+                                  "last": {}}                  # [#1184]
+# How many times a page has RE-TIMED a late clip rather than dropping it.
+_BANK_RETIMED: list[float] = [0.0, 0.0]        # [count, last at]  [#1184]
+
+
+def bank_view(minutes: int = 60) -> dict[str, Any]:            # [#1184]
+    """The next `minutes` of committed material, line by line. Never raises."""
+    if _bank_module is None:
+        return {"available": False, "minutes": int(minutes or 60),
+                "say": _BANK_WHY or "the read-ahead bank is not installed",
+                "slots": [], "totals": {},
+                "rendered_ahead_seconds": 0.0}
+    import sys as _sys
+    try:
+        got = dict(_bank_module.bank_state(_sys.modules[__name__],
+                                           int(minutes or 60)))
+        got["retimed"] = {"count": int(_BANK_RETIMED[0]),
+                          "last_at": round(float(_BANK_RETIMED[1]), 1)}
+        return got
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "minutes": int(minutes or 60),
+                "say": "the read-ahead bank could not be read (%s)"
+                       % type(exc).__name__,
+                "slots": [], "totals": {}, "rendered_ahead_seconds": 0.0}
+
+
+async def bank_produce_now(force: bool = True) -> dict[str, Any]:  # [#1184]
+    """Produce the head of the queue now. The console rung's one call."""
+    if _bank_module is None:
+        return {"ran": False, "why": _BANK_WHY or "the bank is not installed"}
+    import sys as _sys
+    try:
+        return dict(await _bank_module.production_pass(
+            _sys.modules[__name__], force=bool(force)))
+    except Exception as exc:  # noqa: BLE001
+        return {"ran": False, "why": "the production pass raised %s"
+                                     % type(exc).__name__}
 
 
 def script_producer() -> Any:
@@ -24451,7 +24816,8 @@ def _production_conversation(entry: dict[str, Any]) -> str:
 
 
 async def script_production_round(entry: dict[str, Any], plan: Any,
-                                  voices: Any, line_plan: Any = None) -> None:
+                                  voices: Any, line_plan: Any = None,
+                                  urgent: bool = False) -> None:  # [#1184]
     """Run the whole production flow over a round that has just become ready.
 
     OFFLOADED. It reads every take's bytes and runs ffmpeg once per strip
@@ -24468,10 +24834,21 @@ async def script_production_round(entry: dict[str, Any], plan: Any,
         return
     try:
         settings = producer.settings()
-        if settings.off or not producer.due(settings):
+        if settings.off:
+            return
+        # [#1184] URGENT: a round whose moment is inside the hour and which
+        # still has no measured cue map is produced OUT OF TURN. The pacing
+        # dial and the engine's relief both exist to spare the loop while
+        # there is time; when the round airs inside the hour there is not,
+        # and a round with no cue map has no `body_frames`, so the
+        # sequencer cannot hold it and it can never be next. Production
+        # welds pantry files the station already made (script_production:
+        # "nothing here renders"), so the cost is ffmpeg and disk, never
+        # the voice engine the relief is protecting.
+        if not urgent and not producer.due(settings):
             return
         try:
-            if prep_should_stop():
+            if not urgent and prep_should_stop():
                 return          # the air wants the room; this can wait
         except Exception:  # noqa: BLE001
             pass
@@ -26721,6 +27098,15 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
 _RADIO: dict[str, Any] = {
     "station": "", "queue": [], "now": None, "started": 0.0, "dj": True,
 }
+# [#1206] HOW LONG THE BOOTH REMEMBERS. Measured 2026-09-21: 240 rows was
+# 1,486 seconds of air — twenty-five minutes — and every "what made this
+# line" click older than that came back "no longer in the booth". The
+# number was written out 21 times; this is the one name for it. It is a
+# LOOP COST as well as a memory cost: airlog_keeper walks the whole ring
+# on the event loop every 10 s, so this is raised deliberately and only
+# to about an hour. Depth lives in data/air_log.jsonl (48 h), which the
+# provenance route now reads when the ring no longer holds a line.
+RADIO_CHAT_KEEP = int(os.getenv("RADIO_CHAT_KEEP", "600"))
 _RADIO_TASK: list[Any] = []
 VOICE_CLIP_FEED_KEEP = int(os.getenv("VOICE_CLIP_FEED_KEEP", "2000"))
 # A shared on-air instant gives each listener time to fetch a clip, then seek
@@ -27006,6 +27392,31 @@ def page_feed_append(clip: dict[str, Any]) -> str:
                         producer=_admission_producer(2))
             except Exception:  # noqa: BLE001
                 pass
+    # [#1218] THE FILLER GOES AFTER THE COMMITTED ROUND, NOT ON TOP OF IT.
+    #
+    # `page_feed_append` already chains a clip behind the air the page has
+    # been SOLD (_PAGE_AIR_UNTIL). A round that is rendered and waiting has
+    # sold nothing yet - it stamps its moment only when the paced road
+    # reaches it, a median of 52 s later - so a sting minted during that
+    # wait was stamped at the same instant and was heard first. That is
+    # #1218's "the lines are out of order" and #1246's "large swaths
+    # missing" (the round then reads as a hole where it was written).
+    #
+    # The clip is NEVER refused. It is stamped after the round it would
+    # have cut into, which on a feed that is a ring of stamps is exactly
+    # "append to the end". In `off` and `shadow` `after` is 0 and nothing
+    # moves.
+    if not reply and not playout_is_committed_round(clip):
+        _pl_road, _pl_priority = playout_clip_road(clip)
+        _pl = playout_ask(_pl_road, kind=kind, priority=_pl_priority)
+        if _pl.get("queued") and float(_pl.get("after") or 0) > 0:
+            try:
+                _pl_at = int(float(_pl["after"]) * 1000)
+                if _pl_at > int(float((clip or {}).get("broadcast_ms") or 0)):
+                    clip["broadcast_ms"] = _pl_at
+                    clip["playout_queued_why"] = str(_pl.get("why") or "")[:200]
+            except Exception:  # noqa: BLE001
+                pass
     ticket = admission_ticket(url, "", route="page", reply=reply, kind=kind,
                               text=str((clip or {}).get("text") or ""),
                               seconds=float((clip or {}).get("seconds") or 0.0),
@@ -27013,6 +27424,30 @@ def page_feed_append(clip: dict[str, Any]) -> str:
     if not ticket.get("allow"):
         return ""
     delivery = _page_feed_append_admitted(clip)
+    if delivery:                                              # [#1218]
+        # DISPATCHED, on the page route, at the moment the feed actually
+        # stamped - the number the browser will honour, not the one the
+        # producer asked for.
+        try:
+            _pl_stream = (clip or {}).get("stream") or {}
+            _pl_rows = list(_pl_stream.get("rows") or [])
+            playout_tell(
+                "dispatched",
+                str(ticket.get("occurrence_id") or "")
+                or ("delivery:" + str(delivery)),
+                route="page",
+                starts_at=float((clip or {}).get("broadcast_ms") or 0) / 1000.0,
+                seconds=(float(_pl_stream.get("length") or 0.0)
+                         or page_clip_seconds(clip)),
+                key=playout_round_key(_pl_rows),
+                producer=_admission_producer(2),
+                lane=str((clip or {}).get("kind") or ""),
+                label=str((clip or {}).get("text") or "")[:80],
+                media=str((clip or {}).get("url") or ""),
+                delivery_id=str(delivery),
+                lines=len(_pl_rows) or 1)
+        except Exception:  # noqa: BLE001
+            pass
     if delivery and ticket.get("occurrence_id") and isinstance(clip, dict):
         # The page's own rows can now be joined to the committed occurrence
         # without a wall clock in between.
@@ -27097,6 +27532,16 @@ def page_picture_append(clip: dict[str, Any], at_ms: int = 0) -> dict[str, Any]:
     }
     if clip.get("endless"):
         rung["endless"] = True             # 2026-09-14: the set may drop it
+    # [#1251] WHY THIS PICTURE. The matched pick's reason rides the same
+    # ring the sets already poll (/api/dj/video), so the page set, the
+    # desk and the tablet's native wall can all say "matched: 'raccoon',
+    # 'trash'" with no client change at all.
+    if clip.get("why"):
+        rung["why"] = str(clip.get("why"))[:200]
+        try:
+            rung["match_score"] = round(float(clip.get("match_score") or 0), 2)
+        except (TypeError, ValueError):
+            pass
     for edge in ("from", "to"):
         try:
             value = float(clip.get(edge))
@@ -27232,7 +27677,15 @@ def _acknowledge_delivery_lines(delivery_id: str, clip: dict[str, Any],
             # for every row in the window, so a burst was re-timed each
             # time any listener reported progress.
             air_at_set(live, time.time() - max(
-                0.0, position - float(row.get("from") or 0)))
+                0.0, position - float(row.get("from") or 0)),
+                # [#1218] A1's P2: THIS IS THE HEARING. The test that
+                # reaches this loop is the station's only one - audible
+                # above zero, progressed since the last ack, on a
+                # delivery the feed marked speech - and the arithmetic
+                # is the same one that writes heard_ack_at twenty lines
+                # up. Saying so here is what lets the stamp move off
+                # the estimate and onto the moment it sounded.
+                heard=True)
         if who not in ("dj", "cohost", "third", "caller", "caller2", "drop"):
             continue
         speech = True
@@ -27306,8 +27759,22 @@ def page_playback_ack(payload: Any, addr: str = "",
     """
     body = payload if isinstance(payload, dict) else {}
     event = str(body.get("event") or "").lower()
-    if event not in ("received", "canplay", "playing", "ended", "error"):
+    # [#1184] `retimed`: the page kept a late clip instead of throwing it
+    # away, and moved its air moment to now. It is NOT an error - it must
+    # not inflate the stall count the wedge road reads - and it changes no
+    # delivery state: the row stays `received`, which is the truth (it is
+    # still waiting to start) and is what keeps the reinitialise ladder
+    # able to SEE the backlog. Before this the page dropped such clips,
+    # `waiting` collapsed to zero, and the ladder's only road was shut.
+    if event not in ("received", "canplay", "playing", "ended", "error",
+                     "retimed"):
         raise ValueError("unknown playback acknowledgment")
+    if event == "retimed":
+        try:
+            _BANK_RETIMED[0] = float(_BANK_RETIMED[0]) + 1.0
+            _BANK_RETIMED[1] = time.time()
+        except Exception:  # noqa: BLE001
+            pass
     listener = re.sub(r"[^A-Za-z0-9_.:-]", "", str(
         body.get("listener_id") or body.get("listener") or ""))[:64]
     delivery_id = re.sub(r"[^A-Za-z0-9_-]", "", str(
@@ -27406,6 +27873,20 @@ def page_playback_ack(payload: Any, addr: str = "",
           and not (delivery.get("state") == "canplay" and event == "received")):
         delivery["state"] = event
         (delivery.get("clip") or {})["delivery_state"] = event
+    try:                                                      # [#1218]
+        # THE LISTENER'S CLOCK. `playing` with a progressing position
+        # moves the end of the sounding clip onto the ear; `ended`
+        # finishes it. Everything the sequencer says about when the air is
+        # free comes from here and not from the server's idea of a render.
+        if event in ("playing", "ended"):
+            playout_tell("heard", delivery_id=delivery_id, event=event,
+                         position_s=position, audible=audible,
+                         listener=listener, at=now)
+        if event in ("ended", "error") and delivery.get("state") in ("ended", "error"):
+            playout_tell("ended", delivery_id=delivery_id,
+                         why="the page reported " + event)
+    except Exception:  # noqa: BLE001
+        pass
     station_flow_event(event, event, f"{listener}: {event}", one,
                        trace_id=delivery_id,
                        from_node={"received": "publish", "canplay": "received",
@@ -27535,7 +28016,8 @@ def line_was_heard(row: Any) -> bool:
     return line_heard_at(row) > 0
 
 
-def air_at_set(row: dict[str, Any], when: float) -> bool:
+def air_at_set(row: dict[str, Any], when: float,
+               heard: bool = False) -> bool:        # [#1218]
     """Stamp a line's air time, unless it has already been heard.
 
     #1288: eight paths write `air_at`, and they kept rewriting it after
@@ -27559,9 +28041,33 @@ def air_at_set(row: dict[str, Any], when: float) -> bool:
 
     Returns whether the stamp was taken."""
     try:
-        if str(row.get("aired") or "") in AIR_PUBLICATION_STATES and row.get("air_at"):
-            return False                 # it sounded when it sounded
+        # [#1218] A1's P2: FREEZE ON A HEARING, NOT ON A PUBLICATION.
+        #
+        # #1288 froze `air_at` the moment `aired` entered
+        # AIR_PUBLICATION_STATES - and `page_delivery_apply` puts a row in
+        # `published` at HAND-OVER, which is the render estimate. So the
+        # stamp the whole document is ordered by was frozen minutes before
+        # the clip sounded. Measured over the heard rows of the last two
+        # hours of 2026-09-21: `heard_ack_at - air_at` median 62.6 s, p90
+        # 116 s, max 201 s; over the day, median 56.5 s, p90 137 s, max
+        # 318 s. Every interjection and sting published inside that lead
+        # was drawn in the wrong place against the conversation it
+        # actually interrupted.
+        #
+        # So the EAR may correct the estimate, exactly once, and after
+        # that nothing may move it - which is #1288's rule applied to the
+        # fact #1288 meant rather than the one it could reach. `air_at_by`
+        # is how a later caller tells the two apart; without it a second
+        # listener starting the same clip an hour later would overwrite
+        # the first hearing, which is the case #1288 was written for.
+        if str(row.get("air_at_by") or "") == "heard" and row.get("air_at"):
+            return False                 # the ear has answered; it is answered
+        if not heard:
+            if str(row.get("aired") or "") in AIR_PUBLICATION_STATES and row.get("air_at"):
+                return False             # it sounded when it sounded
         row["air_at"] = float(when)
+        if heard:
+            row["air_at_by"] = "heard"
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -27831,7 +28337,11 @@ def banned_words(active: bool = True) -> list[dict[str, Any]]:
     out = []
     for row in rows:
         try:
-            if active and float(row.get("until") or 0) < now:
+            # [#1239] A WORD ban is a mood with a clock on it; a PHRASE
+            # ban is "have it not said by the host anymore", which has
+            # no clock. `forever` rows stand until they are lifted.
+            if (active and not row.get("forever")
+                    and float(row.get("until") or 0) < now):
                 continue
             out.append(row)
         except Exception:
@@ -27885,6 +28395,17 @@ def strip_banned(text: str) -> str:
     for row in banned_words():
         word = str(row.get("word") or "").strip()
         if not word:
+            continue
+        # [#1239] A PHRASE ban takes the whole SENTENCE. Blanking the
+        # words of "the dimming light is the part I cannot shake"
+        # leaves "the is the part I cannot shake" on the air, which is
+        # worse than the phrase was. A scoped ban is enforced on its
+        # own road, at the shelf and at the tint, where the road is
+        # known; the mouth knows only the words.
+        if row.get("phrase") or " " in word:
+            if str(row.get("scope") or "everywhere") != "everywhere":
+                continue
+            out, _cut = phrase_trace.strip_sentences(out, word)
             continue
         try:
             out = re.sub(rf"\b{re.escape(word)}\w*\b", "", out,
@@ -28452,6 +28973,317 @@ def state_decay_all() -> None:
         state_bump(who, {})
 
 
+# --- [#1232] THE DIRECTOR'S WEATHER, ROLLED --------------------------------
+#
+# Request #1232 (2026-09-19): "I want to switch to randomize these values so
+# that way it's random every time this instance comes up or the situations
+# come up." The six emotions per seat live in _RADIO["speaker_state"], were
+# moved only by events (a box outage, a furious caller, the 32% macro dice on
+# live rounds) and cooled by every record, so the "How this line came to be"
+# modal showed 0.0 across the board - measured live 2026-09-21, all 24 zero.
+#
+# weather_mode "random" re-rolls every seat of a round at the round's write
+# (dj_banter), the caller seat at arrival (dj_caller), and the speaking seat
+# for every solo line written on the spot (ads, IDs, intros). One seed per
+# roll; the same numbers go into the prompt (weather_clause /
+# weather_directive), onto the round's entry ("weather") and onto every chat
+# row's trace, so the delivery reads what the wording was written under. A
+# banked round does NOT touch the live state when it is written (a keeper in
+# the background must not change the weather of the round on the air): its
+# roll rides the entry, the prep render reads it through performance_vector
+# (state=...) and _banter_air puts it into the state the moment it airs.
+# A macro set BY HAND on a seat stands - that seat is not rolled (the
+# operator's override lane, section 55); an auto macro from the dice rides on
+# top of the roll as it always did.
+_WEATHER_LAST: dict[str, dict[str, Any]] = {}   # seat -> the roll it is under
+WEATHER_ARRIVAL_KEEP_S = 300.0    # a caller rolled at arrival keeps that roll
+
+
+def weather_mode() -> str:
+    try:
+        return ("random" if str(dj_settings().get("weather_mode") or "")
+                == "random" else "fixed")
+    except Exception:  # noqa: BLE001
+        return "fixed"
+
+
+def weather_range(seat: str, dim: str) -> tuple[float, float]:
+    """The [lo, hi] set for this seat and emotion, else 0-0.6. A seat with
+    no ranges of its own (the manager on the phone, caller2) borrows the
+    caller's."""
+    try:
+        table = dj_settings().get("weather_ranges") or {}
+    except Exception:  # noqa: BLE001
+        table = {}
+    key = seat if seat in WEATHER_SEATS else "caller"
+    pair = (table.get(key) or {}).get(dim)
+    try:
+        lo, hi = float(pair[0]), float(pair[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        lo, hi = WEATHER_RANGE_DEFAULT
+    lo = max(0.0, min(1.0, lo))
+    return lo, max(lo, min(1.0, hi))
+
+
+def weather_macro_by_hand(seat: str) -> str:
+    """A macro the operator set (not one the dice drew) - it outranks the
+    roll on that seat."""
+    macro = str((_RADIO.get("speaker_macro") or {}).get(seat) or "")
+    if macro and not (_RADIO.get("macro_auto") or {}).get(seat):
+        return macro
+    return ""
+
+
+def weather_roll_seat(seat: str, rng: random.Random) -> dict[str, float]:
+    return {dim: round(rng.uniform(*weather_range(seat, dim)), 2)
+            for dim in EMOTION_DIMS}
+
+
+def weather_apply(rec: dict[str, Any] | None) -> None:
+    """Put a roll into the live state - at the roll itself for a live round,
+    and again the moment a banked round airs, so the delivery reads the
+    numbers the wording was written under."""
+    if not isinstance(rec, dict) or not rec.get("seats"):
+        return
+    for seat, dims in (rec.get("seats") or {}).items():
+        if not isinstance(dims, dict) or weather_macro_by_hand(seat):
+            continue
+        state = speaker_state(seat)
+        for dim in EMOTION_DIMS:
+            try:
+                state[dim] = max(0.0, min(1.0, float(dims.get(dim) or 0.0)))
+            except (TypeError, ValueError):
+                state[dim] = 0.0
+        _WEATHER_LAST[seat] = {
+            "seed": rec.get("seed"), "at": float(rec.get("at") or time.time()),
+            "why": str(rec.get("why") or ""), "forced": bool(rec.get("forced")),
+            "rolled": {d: float(dims.get(d) or 0.0) for d in EMOTION_DIMS}}
+    _RADIO["weather_now"] = rec
+
+
+def weather_roll_round(seats: list[str], why: str = "", *,
+                       force: bool = False, apply: bool = True,
+                       seed: int | None = None) -> dict[str, Any]:
+    """Roll the weather for these seats. {} when the dial is "fixed" and
+    nothing forced it. `apply=False` (a banked write) leaves the live state
+    alone and hands the record back for the entry."""
+    if not force and weather_mode() != "random":
+        return {}
+    now = time.time()
+    seed = int(seed if seed is not None else random.getrandbits(32))
+    rng = random.Random(seed)
+    rolled: dict[str, dict[str, float]] = {}
+    held: dict[str, str] = {}
+    for seat in [str(s or "") for s in (seats or []) if s]:
+        if seat in rolled or seat in held:
+            continue
+        macro = weather_macro_by_hand(seat)
+        if macro:
+            held[seat] = macro          # a hand-set macro outranks the dice
+            continue
+        last = _WEATHER_LAST.get(seat) or {}
+        if (not force and seat in ("caller", "caller2") and last.get("rolled")
+                and now - float(last.get("at") or 0) < WEATHER_ARRIVAL_KEEP_S):
+            # rolled at arrival a moment ago: the round keeps that roll
+            rolled[seat] = {d: round(float(last["rolled"].get(d) or 0.0), 2)
+                            for d in EMOTION_DIMS}
+            continue
+        rolled[seat] = weather_roll_seat(seat, rng)
+    rec = {"mode": "random", "seed": seed, "at": now,
+           "why": str(why or "")[:80], "seats": rolled, "held": held,
+           "forced": bool(force)}
+    if apply:
+        weather_apply(rec)
+    try:
+        pipeline_log("perf", "weather rolled for %s (seed %d) - %s" % (
+            ", ".join(rolled) or "nobody", seed, why or "on demand"),
+            extra=json.dumps(rec, default=str)[:1500])
+    except Exception:  # noqa: BLE001
+        pass
+    return rec
+
+
+def weather_state_for(rec: dict[str, Any] | None,
+                      who: str) -> dict[str, float] | None:
+    """The roll a prepared round carries for this seat, or None (read the
+    live state, as before)."""
+    try:
+        dims = ((rec or {}).get("seats") or {}).get(who)
+    except Exception:  # noqa: BLE001
+        dims = None
+    return dict(dims) if isinstance(dims, dict) and dims else None
+
+
+def weather_words(dims: dict[str, Any], most: int = 2) -> str:
+    """The strongest emotions with their numbers - "fatigue 0.51, amusement
+    0.22" - or "level" when nothing reaches 0.1."""
+    try:
+        top = sorted(((d, float(dims.get(d) or 0.0)) for d in EMOTION_DIMS),
+                     key=lambda p: -p[1])
+    except Exception:  # noqa: BLE001
+        return "level"
+    top = [p for p in top if p[1] >= 0.1][:most]
+    return ", ".join("%s %.2f" % p for p in top) or "level"
+
+
+def weather_clause(rec: dict[str, Any] | None, caller_seat: str = "caller",
+                   third: bool = False) -> str:
+    """The round's weather as writing instructions - the same numbers the
+    delivery reads. Empty when nothing was rolled."""
+    if not isinstance(rec, dict) or not (rec.get("seats") or rec.get("held")):
+        return ""
+    letters = [("dj", "A"), ("cohost", "B")]
+    if third:
+        letters.append(("third", "D"))
+    letters += [(str(caller_seat or "caller"), "C"), ("caller2", "E")]
+    parts: list[str] = []
+    for seat, letter in letters:
+        dims = (rec.get("seats") or {}).get(seat)
+        macro = (rec.get("held") or {}).get(seat)
+        if isinstance(dims, dict) and dims:
+            parts.append("%s %s" % (letter, weather_words(dims)))
+        elif macro:
+            parts.append("%s is %s (set by hand)" % (letter, macro))
+    if not parts:
+        return ""
+    return (" Underneath whatever else they are playing, " + WEATHER_MARK
+            + " (rolled; 0 = none, 1 = the full send): " + "; ".join(parts)
+            + ". It colours their pacing, their word choice and what they "
+              "choose to react to. Perform it; never name it.")
+
+
+def weather_directive(who: str) -> str:
+    """A solo line's share of the weather, for dj_line's `direct` channel."""
+    last = _WEATHER_LAST.get(who) or {}
+    dims = last.get("rolled") or {}
+    if not dims or (weather_mode() != "random" and not last.get("forced")):
+        return ""
+    words = weather_words(dims)
+    if words == "level":
+        return ""
+    return (" Your weather right now (rolled; 0 = none, 1 = the full send): "
+            + words + " - let it colour the pacing and the word choice; "
+            "never name it.")
+
+
+def weather_stamp(who: str) -> dict[str, Any]:
+    """What the weather WAS for this line, on the line's own paperwork."""
+    try:
+        last = _WEATHER_LAST.get(who) or {}
+        state = (_RADIO.get("speaker_state") or {}).get(who) or {}
+        macro = str((_RADIO.get("speaker_macro") or {}).get(who) or "")
+        mode = weather_mode()
+        out: dict[str, Any] = {
+            "mode": mode,
+            "state": {d: round(float(state.get(d) or 0.0), 3)
+                      for d in EMOTION_DIMS}}
+        if macro:
+            out["macro"] = macro
+            out["by_hand"] = bool(weather_macro_by_hand(who))
+        if last.get("rolled") and (mode == "random" or last.get("forced")):
+            out.update({"seed": last.get("seed"), "at": last.get("at"),
+                        "why": last.get("why"),
+                        "rolled": {d: round(float(last["rolled"].get(d) or 0.0), 2)
+                                   for d in EMOTION_DIMS}})
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def weather_desk() -> dict[str, Any]:
+    """The dial, the ranges (defaults filled in) and the last rolls, for
+    /api/director/state and the desk."""
+    return {"mode": weather_mode(),
+            "ranges": {seat: {dim: list(weather_range(seat, dim))
+                              for dim in EMOTION_DIMS}
+                       for seat in WEATHER_SEATS},
+            "default": list(WEATHER_RANGE_DEFAULT),
+            "seats": list(WEATHER_SEATS), "dims": list(EMOTION_DIMS),
+            "now": _RADIO.get("weather_now") or {},
+            "last": {seat: dict(rec) for seat, rec in _WEATHER_LAST.items()}}
+
+
+def weather_mood_input() -> dict[str, Any]:
+    """The live reading for scene_inputs' mood card: rolled or fixed, and
+    the whole of it behind the fold."""
+    st = _RADIO.get("speaker_state") or {}
+    mac = {a: b for a, b in (_RADIO.get("speaker_macro") or {}).items() if b}
+    mode = weather_mode()
+    now = _RADIO.get("weather_now") or {}
+    macro_txt = ", ".join("%s: %s" % (a, b) for a, b in mac.items()) \
+        or "no macro set"
+    if mode == "random" and now.get("seats"):
+        value = "rolled for this round · seed %s%s · %s" % (
+            now.get("seed"),
+            (" · " + str(now.get("why"))) if now.get("why") else "",
+            " · ".join("%s: %s" % (s, weather_words(d))
+                            for s, d in (now.get("seats") or {}).items()))
+        roll: dict[str, Any] = {"mode": "random", "seed": now.get("seed"),
+                                "at": now.get("at"), "why": now.get("why"),
+                                "macro": macro_txt if mac else ""}
+        why = ("; re-rolled at every round write and every caller arrival "
+               "inside the ranges on the Director desk")
+    elif mode == "random":
+        value = "random · nothing rolled yet · " + macro_txt
+        roll = {"mode": "random", "macro": macro_txt if mac else ""}
+        why = "; the first round written from now on rolls it"
+    else:
+        value = "fixed · " + macro_txt
+        roll = {"mode": "fixed", "macro": macro_txt if mac else ""}
+        why = ("; fixed - switch the Director desk to random to roll it "
+               "every round")
+    detail = json.dumps({"mode": mode, "state": st, "macros": mac,
+                         "roll": now}, default=str)[:1600]
+    return {"on": bool(mac or st), "value": value, "detail": detail,
+            "roll": roll, "why": why}
+
+
+def weather_inputs_for_row(inputs: list[dict[str, Any]],
+                           row: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The modal reads the LIVE weather; a line's own roll is on its row.
+    Swap the mood card for the row's stamp when the row carries one, so
+    "How this line came to be" shows the numbers this line was written
+    under rather than whatever the state is when the window is opened."""
+    try:
+        stamp = ((row or {}).get("trace") or {}).get("weather")
+        if not isinstance(stamp, dict) or not stamp:
+            return inputs
+        who = str((row or {}).get("who") or "")
+        for i in inputs:
+            if i.get("key") != "mood":
+                continue
+            rolled = stamp.get("rolled")
+            if isinstance(rolled, dict) and rolled:
+                i["value"] = ("rolled for this round · seed %s%s · "
+                              "%s: %s" % (
+                                  stamp.get("seed"),
+                                  (" · " + str(stamp.get("why")))
+                                  if stamp.get("why") else "",
+                                  who or "seat", weather_words(rolled)))[:300]
+                i["roll"] = {"mode": "random", "seed": stamp.get("seed"),
+                             "at": stamp.get("at"), "why": stamp.get("why"),
+                             "macro": stamp.get("macro") or ""}
+            else:
+                i["value"] = ("fixed · " + (
+                    ("macro %s" % stamp.get("macro")) if stamp.get("macro")
+                    else "no macro set"))[:300]
+                i["roll"] = {"mode": str(stamp.get("mode") or "fixed"),
+                             "macro": stamp.get("macro") or ""}
+            i["detail"] = json.dumps(
+                {"who": who, "this_line": stamp,
+                 "live_now": _RADIO.get("speaker_state") or {}},
+                default=str)[:1600]
+            i["on"] = bool(rolled or stamp.get("macro")
+                           or any(float(v or 0) > 0 for v in
+                                  (stamp.get("state") or {}).values()))
+            i["why"] = ("the emotional state per speaker leans on the "
+                        "delivery and the wording; these are the line's own "
+                        "numbers, not the live reading")
+        return inputs
+    except Exception:  # noqa: BLE001
+        return inputs
+
+
 # CALLER_STATES are prose ("furious", "half asleep and losing the
 # thread"); the vector needs numbers. Keyword sightings seed the dims —
 # crude, and enough.
@@ -28550,7 +29382,9 @@ def _compose_signature(sig: dict[str, Any],
     return out
 
 
-def performance_vector(who: str, voice: str = "") -> dict[str, float]:
+def performance_vector(who: str, voice: str = "",
+                       state: dict[str, float] | None = None
+                       ) -> dict[str, float]:                # [#1232]
     """Signature baseline + emotional state + macro + master strength.
     Identity (or near it) comes back as {} so the plain path stays exactly
     the plain path — most lines cost one dict compare."""
@@ -28598,7 +29432,10 @@ def performance_vector(who: str, voice: str = "") -> dict[str, float]:
             vec["energy"] += 0.3 * (float(sig["energy"]["dynamics"]) - 0.5)
         except Exception:
             pass                        # a malformed signature reads plain
-    state = speaker_state(who)
+    if state is None:              # [#1232] a prepared round hands in
+        state = speaker_state(who)  # the roll it was written under
+    else:
+        state = {d: float(state.get(d) or 0.0) for d in EMOTION_DIMS}
     vec["pace"] *= 1 + 0.12 * state["excitement"] - 0.10 * state["fatigue"]
     vec["pitch_var"] *= 1 + 0.2 * state["excitement"]
     vec["filler"] += 0.3 * state["confusion"] + 0.2 * state["nervousness"]
@@ -29388,6 +30225,7 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                        ("speakbox_append_rate", "Closing passage rate", "range", 0, 100, 1),
                        ("speakbox_full_swath_rate", "Uninterrupted swath rate", "range", 0, 100, 1),
                        ("speakbox_full_swath_chars", "Uninterrupted swath length", "number", 300, 6000, 100),
+                       ("speakbox_quotes_system2", "Opening/closing quotes under System2", "checkbox", 0, 0, 0),   # [#1233]
                        # #1042: how long a passage rests before either
                        # shelf may hand it out again. Zero turns the
                        # cooldown off entirely.
@@ -30222,7 +31060,9 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
                    checked: bool = False, remember_text: str = "",
-                   round_as: str = "", sid: str = "") -> str:
+                   round_as: str = "", sid: str = "",
+                   bound: dict[str, Any] | None = None,   # [#1237]
+                   bound_part: str = "") -> str:
     """#1146: the floor door for single lines. A cover, a news line or an
     interjection waits for the round that has the air instead of landing
     in the middle of it. Re-entrant: the recovery road inside a round is
@@ -30235,7 +31075,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
             checked=checked, remember_text=remember_text, round_as=round_as,
-            sid=sid)
+            sid=sid, bound=bound, bound_part=bound_part)   # [#1237]
     _owned = await _floor_take(f"a {kind} line from {who}")
     try:
         return await _dj_speak_floorless(
@@ -30243,7 +31083,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
             checked=checked, remember_text=remember_text, round_as=round_as,
-            sid=sid)
+            sid=sid, bound=bound, bound_part=bound_part)   # [#1237]
     finally:
         _floor_drop(_owned)
 
@@ -30257,7 +31097,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
                    checked: bool = False, remember_text: str = "",
-                   round_as: str = "", sid: str = "") -> str:
+                   round_as: str = "", sid: str = "",
+                   bound: dict[str, Any] | None = None,   # [#1237]
+                   bound_part: str = "") -> str:
     """Say it, log it to the chat channel so the panel can show the patter.
     `who` is "dj" or "cohost" — the co-host has his own voice so the two are
     told apart by ear, not only by the transcript. `source` is the speakbox
@@ -30275,7 +31117,25 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # and the pipeline noise all belong to a line that is not going out.
     if radio_paused() and not by_hand:
         return ""
+    if not line and not by_hand:
+        # [#1232] a line written here is its own instance of the weather
+        weather_roll_round([who], why="a %s line from %s" % (kind, who))
     vec = performance_vector(who, voice or "")
+    # [#1237] THE BINDING, BEFORE ANY WORK. A line written about a record
+    # may only go out while that record is where the line says it is;
+    # a live write is a model visit, and it is not spent on a record
+    # that cannot carry the words by the time they exist.
+    if bound:
+        _bound_ok, _bound_why = record_bound_check(
+            bound, bound_part, live=not bool(line))
+        if not _bound_ok:
+            record_bound_note("", bound, bound_part, False, _bound_why,
+                              "before the write" if not line
+                              else "before the render", who, line)
+            if line:
+                record_bound_withdraw(bound, bound_part, who, kind,
+                                      line, _bound_why)
+            return ""
     if vec and (vec.get("_macro") or random.random() < 0.2):
         # Behind the glass, the DELIVERY machinery explains itself (#402):
         # what shapes the intonation and who does the shaping.
@@ -30316,7 +31176,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         spoken = spoken_text(await _floor_lend(
             f"a {kind} line from {who} (back from its write)",
             dj_line(kind, track, extra, seed,
-                    direct=perf_directive(vec) + note)))
+                    direct=perf_directive(vec) + weather_directive(who)
+                    + note)))                              # [#1232]
         if not by_hand:
             spoken = inject_disfluencies(spoken, vec, seed=who)
     # A line with no letters in it is not a line. An interruption written as
@@ -30550,7 +31411,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             }
             page_delivery_apply(_busy_entry, page_delivery)
             _RADIO["chat"].append(_busy_entry)
-            del _RADIO["chat"][:-240]
+            del _RADIO["chat"][:-RADIO_CHAT_KEEP]
         else:
             note_drop(who, spoken, "the box was answering someone")
         return ""
@@ -30654,6 +31515,25 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         _sfx_cadence_release(_sfx_stream.get("rows") or [])
         return ""
 
+    # [#1237] THE BINDING GATE, at the last door before a speaker. The
+    # render above took minutes on a loaded engine and the deck may have
+    # moved on; measured, that is how half the introductions came to be
+    # spoken over the wrong record. A refusal here is the whole cure for
+    # the photograph; the words are filed for the record's next play.
+    if bound:
+        _bound_ok, _bound_why = record_bound_check(
+            bound, bound_part, float((clip or {}).get("seconds") or 0))
+        if not _bound_ok:
+            record_bound_note(line_id, bound, bound_part, False,
+                              _bound_why, "before the air", who, spoken)
+            record_bound_withdraw(bound, bound_part, who, kind, spoken,
+                                  _bound_why, clip)
+            _sfx_cadence_release(_sfx_stream.get("rows") or [])
+            return ""
+        record_bound_note(line_id, bound, bound_part, True, _bound_why,
+                          "airs", who, spoken)
+        record_bound_publish(line_id, bound, bound_part)
+
     # The page hears it the MOMENT it is rendered (#502, #505), never gated on
     # the box: in here/both mode the browser feed gets the clip now, in
     # parallel with the box attempt below — SFX always reach the page, so DJ
@@ -30678,6 +31558,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # and the real one are the same row.
     if len(_sfx_stream.get("rows") or []) <= 1:
         _speaking_now_set(line_id, who, kind, spoken, name, forced or "", engine)
+        if bound:
+            _SPEAKING_NOW["bound"] = dict(bound)                 # [#1237]
     # #778: and kept HERE, in a local. _SPEAKING_NOW is one global slot that
     # _speaking_now_set clears unconditionally, so an ad read, a bulletin or
     # any second dj_speak starting while this line is still out replaces it —
@@ -30995,7 +31877,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                 "name": booth_actor_name(who, name),
                 "aired": "held", "id": line_id,
             })
-            del _RADIO["chat"][:-240]
+            del _RADIO["chat"][:-RADIO_CHAT_KEEP]
             _speaking_now_clear(line_id)
             return ""
     # #770: the moment this line STARTED sounding. dj_speak writes its entry
@@ -31032,6 +31914,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         # Absent by default: an entry without a sid is what every
         # other caller of this road has always produced.
         **({"sid": str(sid)} if sid else {}),
+        # [#1237] the record this line was written about.
+        **({"bound": dict(bound), "bound_part": str(bound_part or "")}
+           if bound else {}),
     }
     # #696: the rest of the provenance, on the line rather than scattered
     # across three feeds that only ever describe the LAST render. Hovering
@@ -31072,6 +31957,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                    if clip else {}),
         "written": (_made or {}),
         "chars": len(spoken),
+        "weather": weather_stamp(who),                    # [#1232]
         "kind": kind,
     }
     # Which swath the vector index handed over for this line, if it was a
@@ -31246,7 +32132,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             _PAGE_ACKED_LINES.add(line_id)
         if who in ("dj", "cohost", "third", "caller", "caller2", "drop") and kind != "reply":
             talk_said_now("box", line_id, 1.0)
-    del _RADIO["chat"][:-240]          # bounded — this runs for hours
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]          # bounded — this runs for hours
     return spoken
 
 
@@ -32022,6 +32908,10 @@ def dj_state() -> dict[str, Any]:
     # Older/pre-rendered rows can predate the cast binding and arrive without
     # a voice field. Repair the display contract at the API boundary too: a
     # named host or co-host must never be represented as "engine default".
+    # [#1200] which clips have been deleted, read ONCE for the whole
+    # window - both reads are memoised on the ledger file's own stamp,
+    # but the set is rebuilt per call, and this loop runs 240 times.
+    _gone_ids, _gone_lines = sfx_deleted_ids(), sfx_deleted_lines()
     chat_rows: list[dict[str, Any]] = []
     for raw in _RADIO["chat"][-240:]:
         row = dict(raw)
@@ -32040,6 +32930,9 @@ def dj_state() -> dict[str, Any]:
                 render["voice"] = cast_voice
                 trace["render"] = render
                 row["trace"] = trace
+        if (str(row.get("sfx") or "") in _gone_ids           # [#1200]
+                or str(row.get("id") or "") in _gone_lines):
+            row["deleted"] = True
         chat_rows.append(row)
     return {
         **base,
@@ -32114,6 +33007,7 @@ def dj_state() -> dict[str, Any]:
         # the glass hangs on /api/generations/image/ — so the operator can
         # actually SEE the media being sold instead of reading about it.
         "selling_now": selling_now(),
+        "sfx_deleted": sfx_deleted_recent(),                     # [#1200]
         # Whether the box is actually carrying audio, so the booth/header can
         # show "not reaching the box" and a "the box is back" prompt (#490,
         # #498, #500, #507). down = breaker open OR lines piling up unplayed.
@@ -32482,6 +33376,329 @@ def remember_played(track: dict[str, Any]) -> None:
 RECORD_TALK_BUDGET = float(os.getenv("PINE_RECORD_TALK_BUDGET", "40"))
 
 
+
+# --- #1237: A LINE BOUND TO A RECORD AIRS WITH THAT RECORD -----------
+#
+# The operator, at the Script view: "when a song is associated with a
+# particular dialogue, that song is playing whenever that basic dialogue
+# is playing."  The account, with the numbers, is at the head of
+# record_binding.py: 40 of 79 introductions in 48 hours went out over a
+# record other than the one they name, not one went out before its
+# record, and the photographed one went out 88 s after its record had
+# ended.  Every one took the live road - needle, then a model visit, a
+# tint round, a render and the floor - and nothing looked at the deck
+# again.
+#
+# These wrappers are the station's side: they read _RADIO and the rings
+# and hand plain facts to the pure module.  Nothing here may take the
+# station off the air - a wrapper that cannot answer says "let it air".
+_RECORD_BOUND_LINES: dict[str, dict[str, Any]] = {}   # line id -> its record
+_RECORD_BOUND_RECENT: list[dict[str, Any]] = []       # the last verdicts
+_RECORD_BOUND_CUTS: list[dict[str, Any]] = []         # {row_id, at}: cut clips
+
+
+def record_bound_snapshot(track: Any) -> dict[str, Any]:
+    """The identity a line carries for the record it was written about."""
+    try:
+        return record_binding.snapshot(track)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def record_bound_deck() -> dict[str, Any]:
+    """The deck, as the pure rule wants it."""
+    try:
+        return record_binding.deck(
+            _RADIO.get("now") or {}, float(_RADIO.get("started") or 0),
+            _RADIO.get("coming") or {}, _RADIO.get("history") or [],
+            _RADIO.get("queue") or [], time.time())
+    except Exception:  # noqa: BLE001
+        return record_binding.deck({}, 0.0, {}, [], [], time.time())
+
+
+def record_bound_check(bound: Any, part: Any, clip_seconds: float = 0.0,
+                       live: bool = False) -> tuple[bool, str]:
+    """May a line bound to this record go out now?  (ok, why).  A gate
+    that cannot answer lets the line air and says so."""
+    if not isinstance(bound, dict) or not bound.get("id"):
+        return True, ""
+    try:
+        return record_binding.check(bound, part, record_bound_deck(),
+                                    clip_seconds, live)
+    except Exception as exc:  # noqa: BLE001
+        return True, ("the binding could not be read (%s) - the line airs"
+                      % type(exc).__name__)
+
+
+def record_bound_note(line_id: str, bound: Any, part: Any, ok: bool,
+                      why: str, stage: str, who: str = "",
+                      text: str = "") -> None:
+    """Write the verdict down where the desk and the log can read it."""
+    try:
+        row = record_binding.verdict_row(time.time(), line_id, bound, part,
+                                         ok, why, stage, who, text)
+        _RECORD_BOUND_RECENT.append(row)
+        del _RECORD_BOUND_RECENT[:-record_binding.RECENT_KEEP]
+        pipeline_log("air" if ok else "drop", "(#1237) " + str(row["say"]),
+                     extra=str(text or "")[:400])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_bound_publish(line_id: str, bound: Any, part: Any) -> None:
+    """The line is going out bound to this record: remember which."""
+    try:
+        if not line_id or not isinstance(bound, dict) or not bound.get("id"):
+            return
+        _RECORD_BOUND_LINES[str(line_id)] = {
+            **record_binding.snapshot(bound), "part": str(part or ""),
+            "at": time.time()}
+        if len(_RECORD_BOUND_LINES) > record_binding.LINES_KEEP:
+            for key in sorted(_RECORD_BOUND_LINES, key=lambda k: float(
+                    _RECORD_BOUND_LINES[k].get("at") or 0))[:100]:
+                _RECORD_BOUND_LINES.pop(key, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_bound_withdraw(bound: Any, part: Any, who: str, kind: str,
+                          text: str, why: str,
+                          clip: dict[str, Any] | None = None) -> str:
+    """A bound line the deck refused: a `withdrawn` row in the feed with
+    the reason on it (the panel, the script page and the segment
+    inspector already draw that state), the words filed on the record's
+    library seat so the next time it is cued the introduction is already
+    written (#1061), and the drop log told.  Returns the row id, or ""
+    when nothing had been written yet (there is nothing to show)."""
+    name = record_binding.label(bound)
+    said = " ".join(str(text or "").split())
+    if not said:
+        return ""
+    rid = uuid.uuid4().hex
+    try:
+        entry = {
+            "id": rid, "ts": int(time.time()), "air_at": time.time(),
+            "who": str(who or "dj"), "kind": str(kind or "intro"),
+            "round": ("track_talk" if str(part) in ("intro", "outro")
+                      else airlog_round_for(str(kind or ""), str(who or ""))),
+            "text": said, "name": booth_actor_name(str(who or "dj"), ""),
+            "aired": "withdrawn",
+            "withdrawn_why": ("bound to %s: %s" % (name, why))[:240],
+            "bound": record_binding.snapshot(bound),
+            "bound_part": str(part or ""),
+        }
+        _RADIO["chat"].append(entry)
+        del _RADIO["chat"][:-RADIO_CHAT_KEEP]
+    except Exception:  # noqa: BLE001
+        pass
+    if str(part) in ("intro", "outro") and len(said) >= 12:
+        try:
+            track_read_keep(
+                {"id": str(bound.get("id") or ""),
+                 "title": str(bound.get("title") or ""),
+                 "artist": str(bound.get("artist") or "")},
+                str(part), {"text": said,
+                            "key": str((clip or {}).get("key") or ""),
+                            "voice": str((clip or {}).get("voice") or ""),
+                            "at": time.time()})
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        note_drop(str(who or "dj"), said,
+                  "(#1237) %s bound to %s withdrawn: %s"
+                  % (part or "line", name, why))
+    except Exception:  # noqa: BLE001
+        pass
+    return rid
+
+
+def record_bound_cut(track: Any, why: str) -> int:
+    """#1237(d): the record is leaving the deck - every introduction or
+    round still queued or sounding for it goes with it.  The page is
+    told WHICH clips by id (never by epoch), so the queue behind them
+    stands; the clips come off the feed for pages yet to ask.  Returns
+    how many clips were cut."""
+    tid = (str((track or {}).get("id") or "")
+           if isinstance(track, dict) else "")
+    if not tid:
+        return 0
+    try:
+        ids = record_binding.cut_ids(_RECORD_BOUND_LINES, tid, time.time())
+    except Exception:  # noqa: BLE001
+        return 0
+    if not ids:
+        return 0
+    now = time.time()
+    hit: list[str] = []
+    try:
+        keep: list[dict[str, Any]] = []
+        for clip in list(_RADIO.get("voice_clips") or []):
+            rid = str((clip or {}).get("row_id") or "")
+            if rid in ids:
+                hit.append(rid)
+                continue
+            keep.append(clip)
+        if hit:
+            _RADIO["voice_clips"] = keep
+            for rid in hit:
+                _RECORD_BOUND_CUTS.append({"row_id": rid, "at": now})
+            del _RECORD_BOUND_CUTS[:-100]
+        for line_id in ids:
+            row = _RECORD_BOUND_LINES.get(line_id)
+            if row is not None:
+                row["cut_at"] = now
+            if line_id not in hit:
+                continue
+            for entry in (_RADIO.get("chat") or []):
+                if str((entry or {}).get("id") or "") == line_id:
+                    entry["cut_why"] = ("(#1237) cut with its record: %s"
+                                        % why)[:240]
+            record_bound_note(line_id, row or {"id": tid},
+                              (row or {}).get("part"), False,
+                              "cut with its record: " + str(why), "cut")
+    except Exception:  # noqa: BLE001
+        return len(hit)
+    return len(hit)
+
+
+def record_bound_cut_ids() -> list[str]:
+    """The clip ids a page should drop, for /api/dj/voice."""
+    try:
+        return record_binding.fresh_cuts(_RECORD_BOUND_CUTS, time.time())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def record_bound_sweep(why: str) -> dict[str, Any]:
+    """The rung: every queued bound line whose record is not where the
+    line says it is, cut now; then the desk's report."""
+    cut = 0
+    try:
+        deck = record_bound_deck()
+        stale: list[str] = []
+        for row in list(_RECORD_BOUND_LINES.values()):
+            if row.get("cut_at"):
+                continue
+            ok, _why = record_binding.check(row, row.get("part"), deck)
+            if not ok and str(row.get("id") or "") not in stale:
+                stale.append(str(row.get("id") or ""))
+        for tid in stale:
+            cut += record_bound_cut({"id": tid}, why)
+    except Exception:  # noqa: BLE001
+        pass
+    report = record_bound_report()
+    report["cut"] = cut
+    return report
+
+
+def record_bound_to_block(block: Any) -> dict[str, Any] | None:
+    """#1237(c): THE SEQUENCER'S HOOK.  The record a script block must
+    play with, or None.  Built for GET /api/playout (A2): hand it a block
+    number, a ledger row, a screenplay element or an inspector dict and
+    it answers with the record (id, title, artist, seconds, url), which
+    line bound it, whether it is on the deck now, and where it stands in
+    the queue.  Read-only; record_bound_cue is the lever."""
+    def _lookup(line_id: str) -> dict[str, Any] | None:
+        got = _RECORD_BOUND_LINES.get(str(line_id))
+        if got:
+            return got
+        for entry in reversed(_RADIO.get("chat") or []):
+            if (str((entry or {}).get("id") or "") == str(line_id)
+                    and isinstance(entry.get("bound"), dict)):
+                return {**entry["bound"],
+                        "part": str(entry.get("bound_part") or "")}
+        try:
+            row = airlog_row(str(line_id)) or {}
+            if isinstance(row.get("bound"), dict):
+                return {**row["bound"],
+                        "part": str(row.get("bound_part") or "")}
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    try:
+        got = record_binding.resolve(block, script_ledger_rows, _lookup,
+                                     music_track)
+    except Exception:  # noqa: BLE001
+        return None
+    if not got:
+        return None
+    tid = str(got.get("id") or "")
+    try:
+        got["url"] = "/music/%s?t=%s" % (tid, media_sign(tid))
+        got["on_deck"] = str((_RADIO.get("now") or {}).get("id") or "") == tid
+        got["next"] = str((_RADIO.get("coming") or {}).get("id") or "") == tid
+        queue_ids = [str((t or {}).get("id") or "")
+                     for t in (_RADIO.get("queue") or [])]
+        got["queued_at"] = (queue_ids.index(tid) + 1
+                            if tid in queue_ids else None)
+    except Exception:  # noqa: BLE001
+        pass
+    return got
+
+
+def record_bound_cue(track_id: str, why: str = "") -> dict[str, Any]:
+    """#1237(c): put a bound record at the head of the queue so the block
+    bound to it and the record go out together.  The sequencer calls
+    this just before it airs the block; dj_next_track then picks exactly
+    this record.  Requests still outrank the queue - `ahead` says how
+    many stand in front."""
+    tid = str(track_id or "").strip()
+    full = music_track(tid) if tid else None
+    if not full:
+        return {"ok": False, "id": tid,
+                "why": "that record is not in the library"}
+    name = record_binding.label(full)
+    now_id = str((_RADIO.get("now") or {}).get("id") or "")
+    coming_id = str((_RADIO.get("coming") or {}).get("id") or "")
+    if tid == now_id:
+        return {"ok": True, "id": tid, "record": name,
+                "position": "on the deck"}
+    if tid == coming_id:
+        return {"ok": True, "id": tid, "record": name, "position": "next"}
+    line = [t for t in (_RADIO.get("queue") or [])
+            if str((t or {}).get("id") or "") != tid]
+    _RADIO["queue"] = [dict(full)] + line
+    ahead = len(_RADIO.get("requests") or [])
+    try:
+        pipeline_log("lookahead", "(#1237) %s cued to the head of the queue"
+                     "%s: %s" % (name, (" behind %d request(s)" % ahead)
+                                 if ahead else "",
+                                 why or "a block is bound to it"))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "id": tid, "record": name,
+            "position": "head of the queue", "ahead": ahead, "why": why}
+
+
+def record_bound_report() -> dict[str, Any]:
+    """GET /api/record-binding: the rule, the deck, the last verdicts."""
+    deck = record_bound_deck()
+    recent = list(_RECORD_BOUND_RECENT)
+    counts = {"aired": sum(1 for r in recent if r.get("ok")),
+              "withdrawn": sum(1 for r in recent
+                               if not r.get("ok") and r.get("stage") != "cut"),
+              "cut": sum(1 for r in recent if r.get("stage") == "cut")}
+    now_name = record_binding.label(deck.get("now"))
+    line = ("the deck is on %s, %.0fs of %.0fs"
+            % (now_name, float(deck.get("elapsed") or 0),
+               float(deck.get("length") or 0))
+            if now_name else "the deck is empty")
+    return {"at": time.time(),
+            "rule": ("a line bound to a record airs only while that record "
+                     "is where the line says it is: an introduction on the "
+                     "deck with time left (or next), a send-off after it, "
+                     "a round over it"),
+            "deck": {"now": now_name, "elapsed": deck.get("elapsed"),
+                     "length": deck.get("length"),
+                     "coming": record_binding.label(deck.get("coming")),
+                     "just_gone": (deck.get("history_ids") or [""])[-1]},
+            "bound_lines": len(_RECORD_BOUND_LINES),
+            "counts": counts, "recent": recent[-40:],
+            "cuts": list(_RECORD_BOUND_CUTS)[-20:],
+            "say": record_binding.say(line, counts)}
+
+
 def _talk_late(task: Any) -> None:
     """A record's intro that finished after the needle dropped.
 
@@ -32505,6 +33722,12 @@ def dj_on_air(track: dict[str, Any]) -> None:
     moment `elapsed` starts counting from."""
     previous = _RADIO.get("now")
     if previous and previous.get("id") != track.get("id"):
+        # [#1237] talk bound to the record leaving the deck goes with it -
+        # a skip or its own end, the one lever either way.
+        try:
+            record_bound_cut(previous, "its record left the deck")
+        except Exception:  # noqa: BLE001
+            pass
         _RADIO["history"].append({
             **{k: v for k, v in previous.items()
                if k in ("id", "title", "artist", "album", "seconds")},
@@ -32616,7 +33839,9 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
                            # introduction can be traced to this record.
                            # "" off.  (RECTALK1179Z9)
                            sid=record_talk_ride(track, "intro",
-                                                _ahead_intro))
+                                                _ahead_intro),
+                           bound=record_bound_snapshot(track),   # [#1237]
+                           bound_part="intro")
         except Exception:  # noqa: BLE001
             pass
     else:
@@ -32629,6 +33854,7 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
             # all today, and it is the one that costs the dead air.
             # (RECTALK1179Z9)
             sid=record_talk_ride(track, "intro"),
+            bound=record_bound_snapshot(track), bound_part="intro",   # [#1237]
             note=(" The record is ALREADY turning underneath you — "
                   "you are talking over its opening, so name it and "
                   "get out of the way rather than announcing "
@@ -32672,7 +33898,9 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
                                # question the air log can answer.
                                # (RECTALK1179Z9)
                                sid=record_talk_ride(_gone, "outro",
-                                                    _back))
+                                                    _back),
+                               bound=record_bound_snapshot(_gone),   # [#1237]
+                               bound_part="outro")
                 await asyncio.sleep(0.8)
     except Exception:  # noqa: BLE001
         pass
@@ -34923,12 +36151,362 @@ async def _seat_cast() -> dict[str, str]:
     return cast
 
 
+# --- #1215: THE CUPBOARD RE-RECORDS ITSELF, AND KEEPS AIRING ---------
+#
+# "When I change hosts, I immediately want the orchestrator to begin
+# re-recording and updating the dialogue that is recorded and stored in
+# the cupboard, while playing out and airing and finalizing the footage
+# that IS in the cupboard, while it makes the new footage."
+#
+# #974 above answered the first half of that and broke the second. It
+# reopened a round by DELETING the stale takes, which is correct about
+# what has to be re-recorded and fatal about what may air meanwhile: the
+# round falls below made == chunks, dialogue_audio_ready() refuses it,
+# and the seat's whole cupboard goes dark until the recording room
+# reaches it. Measured on 2026-09-21, five hours after one such change:
+# 364 of 399 banked rounds short of their takes, 2,811 lines missing,
+# five rounds still airable.
+#
+# So the recast is now a SHADOW take-set standing BESIDE the takes -
+# entry["recast"], kept by recast_desk.py - and never a hole cut into
+# them. Three rules follow, and they are the whole feature:
+#
+#   the old takes are untouched, so the round stays READY and airs as
+#     recorded while its replacement is being made;
+#   the new lines are recorded behind the live road, a couple per pass,
+#     through prep_render_line - which already yields to relief, to a
+#     busy engine and to prep_should_stop() between every single line;
+#   the swap is one dict operation with no await in it, so a round
+#     changes voice between two airings and never during one.
+#
+# A round the desk is working on is marked entry["recast_needed"], and
+# both retirement desks (cupboard_rotate, coord_retire) refuse to bin a
+# marked round: the old audio is still on the air and the new audio is
+# half made. After the swap the round carries entry["recast_done"] with
+# the OLD keys for an hour, which _row_clip_keys() walks, so nothing
+# prunes a clip a staged performance may still be holding.
+
+_RECAST_JOBS: list[dict[str, Any]] = []
+_RECAST_TICK: dict[str, Any] = {"at": 0.0, "lines": 0, "swaps": 0,
+                                "reads": 0, "why": ""}
+RECAST_TICK_REST = 4.0          # no faster than this, whoever presses it
+RECAST_LINES_PER_TICK = 2       # the live road always has the engine first
+RECAST_RUNG_LINES = 12          # what the operator's rung is allowed to do
+_RECAST_NAMES: dict[str, Any] = {"at": 0.0, "map": {}}
+RECAST_NAMES_TTL = 60.0
+
+
+def _recast_key_fn(text: str, voice: str) -> str:
+    """(text, voice) -> the pantry key prep_render_line will file it under.
+
+    The same three parts, in the same order: engine, voice, stripped
+    text. The key is a RENDER address, not a rewrite - which is why a
+    recast never visits the model and why a line already spoken in the
+    new voice anywhere on the station is free."""
+    try:
+        said = str(text or "").strip()
+        want = str(voice or "")
+        if not said or not want:
+            return ""
+        return pantry_key(said, want, voice_engine_for(want))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _recast_have_fn(key: str) -> dict[str, Any] | None:
+    try:
+        return pantry_get(str(key or "")) if key else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _recast_voice_name(voice: str) -> str:
+    """A voice id as the operator wrote it on the cast bar."""
+    want = str(voice or "")
+    if not want:
+        return "nobody"
+    bare = want.split(":", 1)[-1]
+    try:
+        now = time.time()
+        if now - float(_RECAST_NAMES.get("at") or 0) > RECAST_NAMES_TTL:
+            _RECAST_NAMES["map"] = {
+                str(m.get("id") or ""): str(m.get("name") or "")
+                for m in read_voices() if m.get("id")}
+            _RECAST_NAMES["at"] = now
+        got = str((_RECAST_NAMES.get("map") or {}).get(bare) or "")
+        if got:
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    return bare
+
+
+def _recast_cast_now() -> dict[str, str]:
+    """Who is in each seat, by the settings the cast bar writes.
+
+    _seat_cast() above is the same question asked of session_voices(),
+    and is what the sweep uses. This one is used only to decide whether
+    a finished job was CANCELLED (the operator put the old voice back),
+    so it reads the settings directly and cannot be caught mid-draw."""
+    cast: dict[str, str] = {}
+    try:
+        dj = dj_settings()
+        for field, seat in recast_desk.SETTINGS_SEATS:
+            got = str(dj.get(field) or "")
+            if got:
+                cast[seat] = got
+    except Exception:  # noqa: BLE001
+        pass
+    return cast
+
+
+def _recast_piles() -> list[tuple[str, dict[str, Any], dict[str, Any] | None]]:
+    """(kind, row, entry-or-None) for everything the desk may shadow -
+    the larder, every shelf round, and the single-line reads."""
+    piles: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = []
+    try:
+        for entry in list(_LARDER):
+            if isinstance(entry, dict):
+                piles.append(("banter", entry, entry))
+        for kind in list(_SHELF):
+            for row in list(_SHELF.get(kind) or []):
+                if not isinstance(row, dict):
+                    continue
+                held = row.get("entry")
+                piles.append((str(kind), row,
+                              held if isinstance(held, dict) else None))
+    except Exception:  # noqa: BLE001
+        pass
+    return piles
+
+
+def _recast_shadow_round(entry: dict[str, Any], cast: dict[str, str]) -> int:
+    """[#1215] Open (or refresh) the shadow on one banked round. Returns
+    the number of lines that now want recording. Never removes a take."""
+    try:
+        if (entry.get("system2_guest") or {}).get("voice"):
+            cast = {**cast, "third": entry["system2_guest"]["voice"]}
+        got = recast_desk.open_round(entry, cast, _recast_key_fn,
+                                     _recast_have_fn)
+        shadow = recast_desk.shadow_of(entry)
+        if shadow is None:
+            # No shadow, for one of three reasons: the seats never moved,
+            # the operator put the old voice back, or the round is short
+            # of takes and belongs to the recording room rather than to
+            # this desk. Any mark left on it is a lie now - #974 left
+            # `recast_at` standing on 354 rounds it had already gutted -
+            # so it is cleared rather than left for a log line to quote.
+            for gone in ("recast_needed", "recast_seats", "recast_at"):
+                entry.pop(gone, None)
+            return 0
+        entry["recast_needed"] = True
+        entry["recast_seats"] = sorted(shadow.get("seats") or {})
+        entry["recast_at"] = float(shadow.get("at") or time.time())
+        return int(got.get("opened") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _recast_shadow_read(row: dict[str, Any], who: str,
+                        cast: dict[str, str]) -> int:
+    """[#1215] The same for a single-line read - an advert, a station ID.
+    Its key and voice are left alone, so it keeps airing as recorded."""
+    try:
+        got = int(recast_desk.open_read(row, str(who), cast,
+                                        _recast_key_fn, _recast_have_fn))
+        if recast_desk.shadow_of(row) is not None:
+            row["recast_needed"] = True
+        else:
+            row.pop("recast_needed", None)
+        return got
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _recast_after_swap(kind: str, row: dict[str, Any],
+                       entry: dict[str, Any] | None) -> None:
+    """The new take set IS the round now. Refresh what the retirement
+    desks and the cupboard read off the row, and clear the mark."""
+    try:
+        target = entry if isinstance(entry, dict) else row
+        for gone in ("recast_needed", "recast_seats", "recast_at"):
+            target.pop(gone, None)
+        row.pop("recast_needed", None)
+        if isinstance(entry, dict):
+            entry["partial"] = False
+            row["seconds"] = float(entry.get("seconds")
+                                   or row.get("seconds") or 0)
+        # #1057's stamp: this footage is the CURRENT cast's now, and a
+        # row left carrying the old signature would be rotated out as
+        # stale the moment after we finished re-recording it.
+        sign = cast_signature()
+        if row.get("cast"):
+            row["cast"] = sign
+        if isinstance(entry, dict) and entry.get("cast"):
+            entry["cast"] = sign
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _recast_first_ids() -> set[str]:
+    """What the four-hour desk has already promised to the air. Read from
+    the cached plan only - recomputing one here would make a background
+    recorder the most expensive thing on the loop."""
+    try:
+        plan = _INVENTORY_PLAN.get("plan") or {}
+        return {str(s) for s in (plan.get("selected_ids") or [])}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+async def recast_tick(budget: int = 0, force: bool = False) -> dict[str, Any]:
+    """[#1215] Record the shadow lines, behind the live road, and swap in
+    every round whose shadow is whole.
+
+    Rate limiting is deliberately layered and every layer is somebody
+    else's rule: a rest between passes, a hard line budget per pass, and
+    prep_should_stop() re-asked between every single line - the same
+    question the recording room asks itself. prep_render_line() refuses
+    outright under render_relief() and when the engine budget is spent,
+    so a recast can never be the reason the station is late."""
+    out: dict[str, Any] = {"lines": 0, "swaps": 0, "reads": 0, "why": ""}
+    now = time.time()
+    if not force and now - float(_RECAST_TICK.get("at") or 0) < RECAST_TICK_REST:
+        out["why"] = "resting"
+        return out
+    _RECAST_TICK["at"] = now
+    want = int(budget or RECAST_LINES_PER_TICK)
+    try:
+        piles = _recast_piles()
+        # First, and free: everything whose shadow is already whole. A
+        # pantry hit can complete a round without any engine at all.
+        for kind, row, entry in piles:
+            try:
+                if entry is not None:
+                    if recast_desk.swap_round(entry):
+                        out["swaps"] += 1
+                        _recast_after_swap(kind, row, entry)
+                elif recast_desk.swap_read(row):
+                    out["swaps"] += 1
+                    out["reads"] += 1
+                    _recast_after_swap(kind, row, None)
+            except Exception:  # noqa: BLE001
+                pass
+        if render_relief():
+            out["why"] = "the live road has the engine"
+        else:
+            out["why"] = prep_should_stop()
+        if not out["why"]:
+            first = _recast_first_ids()
+            work = recast_desk.worklist(
+                piles, first_ids=first,
+                sid_fn=lambda k, r: str(alt_sid(str(k), r) or ""))
+            for item in work:
+                if out["lines"] >= want:
+                    break
+                stop = prep_should_stop()
+                if stop:
+                    out["why"] = stop
+                    break
+                kind = str(item.get("kind") or "")
+                row = item["row"]
+                if item.get("read"):
+                    made = await prep_render_line(
+                        str(row.get("text") or ""), str(item.get("who") or ""),
+                        str(item.get("voice") or ""), kind=kind)
+                    if not made:
+                        continue
+                    recast_desk.read_made(row, made)
+                    out["lines"] += 1
+                    if recast_desk.swap_read(row):
+                        out["swaps"] += 1
+                        out["reads"] += 1
+                        _recast_after_swap(kind, row, None)
+                    continue
+                entry = item["entry"]
+                for take in (item.get("takes") or []):
+                    if out["lines"] >= want or prep_should_stop():
+                        break
+                    made = await prep_render_line(
+                        str(take.get("text") or ""), str(take.get("who") or ""),
+                        str(take.get("voice") or ""), kind=kind)
+                    if not made:
+                        break           # the engine said no; next pass
+                    recast_desk.line_made(entry, int(take.get("i") or 0), made)
+                    out["lines"] += 1
+                if recast_desk.swap_round(entry):
+                    out["swaps"] += 1
+                    _recast_after_swap(kind, row, entry)
+        if out["lines"] or out["swaps"]:
+            try:
+                _larder_save()
+                _pantry_save(True)
+            except Exception:  # noqa: BLE001
+                pass
+        if out["swaps"]:
+            pipeline_log("voice",
+                         "the recast desk swapped %d banked round(s) over to "
+                         "the new voice%s - the old recordings aired right up "
+                         "to the moment the new ones were finished (#1215)"
+                         % (int(out["swaps"]),
+                            (" and %d read(s)" % int(out["reads"]))
+                            if out["reads"] else ""))
+            note_action("the cupboard was re-recorded in the new voice",
+                        "%d round(s) swapped, %d line(s) recorded"
+                        % (int(out["swaps"]), int(out["lines"])))
+    except Exception:  # noqa: BLE001
+        out["why"] = out["why"] or "the recast desk stumbled"
+    _RECAST_TICK.update({"lines": int(out["lines"]), "swaps": int(out["swaps"]),
+                         "reads": int(out["reads"]), "why": str(out["why"])})
+    return out
+
+
+def recast_status() -> dict[str, Any]:
+    """[#1215] What the recast desk is doing, per seat that changed."""
+    try:
+        cen = recast_desk.census(_recast_piles())
+        out = recast_desk.status(cen, _RECAST_JOBS, _recast_cast_now(),
+                                 speed=1.0, name_fn=_recast_voice_name)
+    except Exception as err:  # noqa: BLE001
+        return {"at": time.time(), "live": False, "jobs": [], "seat": "",
+                "old": "", "new": "", "rounds_total": 0, "done": 0,
+                "in_flight": 0, "eta_s": 0.0,
+                "say": "the recast desk could not be read: %s"
+                       % type(err).__name__}
+    out["tick"] = dict(_RECAST_TICK)
+    return out
+
+
+@app.get("/api/cast/recast")
+async def cast_recast_api() -> dict[str, Any]:
+    """[#1215] The recast desk's readout.
+
+    `rounds_total` is how many banked rounds the seat's change reaches,
+    `done` how many have been swapped over, `in_flight` how many have
+    some of their new audio already, and `eta_s` what the rest will take
+    at the station's own measured render rate (2.97s + 1.05x the audio).
+    Every one of those rounds is still airable in the old voice while
+    this runs; that is the point of the road."""
+    return recast_status()
+
+
 def _recast_round(entry: dict[str, Any], cast: dict[str, str]) -> int:
     """Reopen one banked round for the seats that have changed hands.
 
     Pure dict surgery: no awaits, no engine, and idempotent - it returns
     0 and changes nothing when the cast still matches, which is what
     makes it safe on every keeper pass."""
+    # [#1215] THE ROUND IS NO LONGER CUT OPEN. Everything the #974
+    # body below decides is still right - which takes are stale, and
+    # that only those go back to the microphone - and one thing it
+    # does is wrong: deleting them takes the round off the air for
+    # however long the recording room needs, which was measured at
+    # five hours and counting. The shadow desk reaches the same
+    # decision and records BESIDE the takes instead, so the round
+    # keeps airing as recorded until its replacement is whole.
+    return _recast_shadow_round(entry, cast)
+    # --- #974's body follows and is deliberately unreached; it is
+    # the record of why only the changed seat is ever re-recorded.
     try:
         takes = list(entry.get("takes") or [])
         if not takes:
@@ -34978,6 +36556,11 @@ def _recast_line_row(row: dict[str, Any], who: str,
     block skips a row that has a key, so a row with text and no key is
     re-voiced next pass, one line at a time, in the cheapest block there
     is."""
+    # [#1215] and the read keeps its key and its voice while the new
+    # one is cut, so an advert or a station ID goes on airing as
+    # recorded rather than going silent the moment a seat changes.
+    return _recast_shadow_read(row, who, cast)
+    # --- #904's body follows and is deliberately unreached.
     try:
         if row.get("produced"):
             return 0        # a finished mp3 under /ads-audio, not ours
@@ -35012,7 +36595,11 @@ async def recast_sweep() -> dict[str, int]:
             if got:
                 out["rounds"] += 1
                 out["lines"] += got
-        for kind in ("manager", "caller", "gallery", "news"):
+        # [#1215] EVERY shelf kind, not four of them. The named four
+        # missed `recap` outright - five banked rounds the sweep has
+        # never once looked at - and would miss the next road anyone
+        # adds. Rows with no `entry` fall out one line down.
+        for kind in list(_SHELF):
             for row in list(_SHELF.get(kind) or []):
                 held = row.get("entry")
                 if not isinstance(held, dict) or held.get("preparing"):
@@ -36270,7 +37857,9 @@ async def larder_prepare(entry: dict[str, Any],
             # The same effects the live road would have drawn for this
             # seat — a real random draw, baked in now instead of then.
             fx = dict(voice_effect_pick())
-            if vec_for := performance_vector(who, voice):
+            if vec_for := performance_vector(                  # [#1232]
+                    who, voice,
+                    state=weather_state_for(entry.get("weather"), who)):
                 fx["perf"] = vec_for
             strip = str(dj.get(f"strip_{who}") or "")
             if strip:
@@ -39507,6 +41096,15 @@ async def pantry_keeper() -> None:
             # in a voice that is no longer in its seat. Wrapped, because
             # _seat_cast can reach the voice catalogue on a cold draw and
             # a raise here would cost the whole keeper pass.
+            # [#1215] and then RECORD what the sweep just opened, a
+            # couple of lines at a time, behind the live road. The
+            # sweep only marks the work; this is what closes it, and
+            # it runs on the same six-second clock rather than on a
+            # task of its own so it can never outrun the keeper.
+            try:
+                await recast_tick()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 await recast_sweep()
             except Exception:  # noqa: BLE001
@@ -44112,6 +45710,14 @@ def cupboard_rotate() -> dict[str, Any]:
                 # the road's last-resort fallbacks. "Any segment
                 # that is stored needs to be played and ran on the
                 # air before it's deleted."
+                # [#1215] and never a round the recast desk is part
+                # way through. It reads as cast-stale precisely
+                # BECAUSE it is being re-recorded; binning it throws
+                # away audio that is still on the air tonight and the
+                # half-made replacement with it.
+                if recast_desk.in_flight(row):
+                    out["kept"] += 1
+                    continue
                 if not resort_may_drop(kind, row, _rk):
                     out["kept"] += 1
                     continue
@@ -49160,6 +50766,7 @@ def coord_retire() -> int:
                 sid = alt_sid(str(kind), row)
                 if (sid in keep_ids or target.get("preparing")
                         or target.get("tinting")
+                        or recast_desk.in_flight(row)      # [#1215]
                         or not resort_may_drop(str(kind), row, _rk)):
                     kept.append(row)
                     continue
@@ -49177,6 +50784,7 @@ def coord_retire() -> int:
             sid = alt_sid("banter", entry)
             if (sid in keep_ids or entry.get("preparing")
                     or entry.get("tinting")
+                    or recast_desk.in_flight(entry)        # [#1215]
                     or row_unaired(entry)          # #1141: never unheard
                     or gold_locked("banter", entry)):   # #1157: never rhymed
                 larder.append(entry)
@@ -56518,7 +58126,8 @@ def prep_context_now() -> str:
 
 
 def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
-                     timed: bool = True) -> str:
+                     timed: bool = True, dial: bool = True,
+                     stamp: bool = True) -> str:  # [#1195] dial=, stamp=
     """The entry's prompt, dressed as the instruction it is.
 
     #906: and a TIMED APPLICATION speaks first. If the operator has put a
@@ -56531,13 +58140,33 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
     #897's generate road wants: the words the operator has just typed into
     the box must not be quietly swapped for a window's while he is looking
     at them."""
+    _won = False                            # [#1195] a window outranks the book
     if timed:
         try:
             window = prompt_window_text(slot)
             if window:
                 text = window
+                _won = True
         except Exception:                      # noqa: BLE001
             pass                # the entry's own prompt still governs it
+    # [#1195/#1245] THE SEGMENT PROMPT BOOK.  After the timed window and
+    # before the shelf text: the alternative this kind's mode dials, then
+    # the commands (- speaker box -, {{speakbox:..}}, {{topic}}, {{caller}},
+    # {{plot}}) expanded in whichever text won.  Memoised per occurrence
+    # inside the module, so the poll that reads schedule_take() cannot
+    # re-roll the segment on air.  dial=False is the operator looking at
+    # his own words (#897, the editor); stamp=False is a preview that
+    # must not spend a draw or write paperwork.
+    try:
+        _occ = str(slot.get("occurrence")
+                   or (_RADIO.get("sched_pos") or {}).get("occurrence") or "")
+        text = segment_prompts.govern(
+            str(slot.get("kind") or ""), text,
+            segment_prompts.memo_key(str(slot.get("kind") or ""),
+                                     str(slot.get("id") or ""), _occ),
+            dial=bool(dial) and not _won, stamp=bool(stamp))
+    except Exception:                          # noqa: BLE001
+        pass                    # the book never silences the entry
     note = str(slot.get("notes") or "").strip()[:300]
     named = str(slot.get("label") or slot.get("kind") or "")[:80]
     # #924: the operator NAMES these entries — "Pine News Coverage", not
@@ -56586,7 +58215,61 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
                 occurrence=str(slot.get("occurrence")
                                or (_RADIO.get("sched_pos") or {}).get(
                                    "occurrence") or ""))
-            + director_lessons_clause(str(slot.get("kind") or "")))
+            + director_lessons_clause(str(slot.get("kind") or ""))
+            # [#1240/#1249] AND THE STORY AS A STAGE DIRECTION, and the
+            # phone's subject for a caller entry. Here, for the reason
+            # the director's notes are here: this clause is the one choke
+            # point every scheduled round passes through - System2 builds
+            # its per-slot prompt from it and the legacy chain reads the
+            # same string back off sched_prompt.
+            + schedule_story_clause(str(slot.get("kind") or "")))
+
+
+def schedule_story_clause(kind: str) -> str:
+    """[#1240/#1249] What every scheduled round is told about the story.
+
+    #1240: "the people shouldn't say literally Act 1, Act 2, Act 3. That
+    was me specifying how the story plotline plays out." The operator
+    writes the plotline as "Act 1: ...", "Act 2: ..." and the pair read
+    the label out loud - measured on the air log, 53 spoken lines ("Is
+    Act 2 tonight - the police sent in and seduced by the rent?"). So
+    the story arrives here as a STAGE DIRECTION, label off, with the rule
+    that nobody says act, scene or chapter aloud.
+
+    #1249: and for a CALLER entry, the subject the phone is on tonight,
+    so the round is written about what the caller rang about.
+
+    Never raises: colour may not take the station off the air."""
+    try:
+        bits = ""
+        act = ""
+        row = plot_owns_air()
+        if row:
+            act = plot_act_now(row)[0]
+        if act:
+            bits += ("\n\nRIGHT NOW, IN THE STORY (#1240): " + str(act)[:600]
+                     + " That is a STAGE DIRECTION to the pair - what is "
+                     "happening in the world they are broadcasting from - "
+                     "and never a line to read out. Nobody on air says "
+                     "'act', 'act one', 'act two', 'act three', 'scene', "
+                     "'chapter', 'storyline' or 'plot': the people in this "
+                     "story do not know they are in one.")
+        if str(SCHED_PREP_KIND.get(str(kind or ""), kind) or "") == "caller":
+            theme = active_theme()
+            subject = topic_subject(str((theme or {}).get("text") or ""))
+            source = "the caller theme"
+            if not subject and act:
+                subject, source = topic_subject(act), "the storyline on air"
+            if subject:
+                bits += ("\n\nTHE PHONE'S SUBJECT TONIGHT, from " + source
+                         + " (#1249): " + subject[:400]
+                         + " Whoever rings this entry rang about THAT; they "
+                         "say so in their own words, and the hosts talk about "
+                         "THAT with them - by name, turn after turn - until "
+                         "the sign-off.")
+        return bits
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def rap_battle_clause(up_next: str = "") -> str:
@@ -56994,7 +58677,8 @@ def schedule_take() -> dict[str, Any]:
         # in the same breath.
         _RADIO["sched_prompt"] = (
             _schedule_clause(name, slot, text)
-            if (text or slot.get("notes") or prompt_window_text(slot))
+            if (text or slot.get("notes") or prompt_window_text(slot)
+                or segment_prompts.has_alternatives(str(slot.get("kind") or "")))  # [#1195]
             else "")
         # #853: the writing room is told WHAT it is about to write, so it
         # can be given room and temperament to suit the job.
@@ -60654,7 +62338,7 @@ async def schedule_segment_generate_api(
             brief = _schedule_clause(
                 str(preset),
                 rows[at] if at is not None else {"kind": slot_kind},
-                brief_raw, timed=False)
+                brief_raw, timed=False, dial=False)  # [#1245] his words win
         except Exception:  # noqa: BLE001
             brief = brief_raw       # undressed is still better than nothing
         # A brief worth writing with once is worth having again (#909).
@@ -60847,6 +62531,14 @@ def schedule_segment_prompt(hour: str = "", slot_id: str = "",
         slot = next((s for s in rows
                      if str(s.get("id") or "") == want), {})
     slot_kind = str(slot.get("kind") or kind or "banter")
+    # [#1245] A LEDGER ROUND NAMED AFTER A SPEAKER BOX DOCUMENT (fmn1.md)
+    # is a seed, not a road.  Asked for one, answer for the road that
+    # wrote it - the box was empty because nothing is, or could be, on a
+    # shelf called fmn1.md.
+    seed_doc = ""
+    if not slot and segment_prompts.is_doc(slot_kind):
+        seed_doc = slot_kind
+        slot_kind = segment_prompts.road_of(slot_kind, SCHEDULE_KIND_NAMES)
     if not slot:
         # Asked by KIND without naming an entry — the picker still wants
         # to see the shelf, so answer for a bare one of that kind.
@@ -60878,8 +62570,35 @@ def schedule_segment_prompt(hour: str = "", slot_id: str = "",
         text = str(window.get("text") or text)
         source = ("a timed prompt owns every " + slot_kind + " entry — "
                   + str(window.get("says") or ""))
+    # [#1245] THE SEGMENT PROMPT BOOK speaks before the shelf (a timed
+    # window still outranks it), and the box is NEVER EMPTY: book, then
+    # the shelf, then the station's seed, then a seed built from what the
+    # station already says this kind is.  What is shown is what the
+    # writing room would be handed for the next segment of this kind.
+    _alts = segment_prompts.entry_view(slot_kind)
+    _dialled = segment_prompts.dial_preview(slot_kind)
+    if not window and _dialled:
+        text = str(_dialled.get("text") or text)
+        source = str(_dialled.get("says") or source)
+    if not str(text or "").strip():
+        text = str(SCHEDULE_PROMPT_SEED.get(slot_kind) or "")
+        source = ("the station's own seed for this kind - nothing has "
+                  "been saved for it yet")
+    if not str(text or "").strip():
+        text = segment_prompts.seed_for(
+            slot_kind, str(slot.get("label") or slot_kind),
+            next((str(k.get("blurb") or "") for k in SCHEDULE_KINDS
+                  if k.get("kind") == slot_kind), ""),
+            str((SEGMENT_BRIEF.get(slot_kind) or {}).get("want") or ""))
+        source = ("a plain instruction built from what the station says "
+                  "this kind is - nothing has been saved for it yet")
+    if seed_doc:
+        source = ("this round was seeded from the speaker box document "
+                  + seed_doc + "; the instruction it wrote with is the "
+                  + slot_kind + " road's - " + source)
     try:
-        clause = _schedule_clause(str(preset), slot, text, timed=False)
+        clause = _schedule_clause(str(preset), slot, text, timed=False,
+                                  dial=False, stamp=False)
     except Exception:                          # noqa: BLE001
         clause = ""
     return {
@@ -60907,6 +62626,14 @@ def schedule_segment_prompt(hour: str = "", slot_id: str = "",
                       and not alt_refusal(slot_kind),
         "why": alt_refusal(slot_kind),
         "scopes": dict(PROMPT_SCOPE_SAYS),
+        # [#1245] the book, the road, the seed document and the grammar
+        "road": slot_kind,
+        "seed_doc": seed_doc or None,
+        "alternatives": _alts,
+        "dialled": ({"id": _dialled.get("id"), "name": _dialled.get("name")}
+                    if _dialled else None),
+        "grammar": segment_prompts.grammar(),
+        "uses": segment_prompts.uses_for(slot_kind, 6),
     }
 
 
@@ -61095,6 +62822,7 @@ async def prompt_book_apply_api(
     if at is not None:
         kind = str(rows[at].get("kind") or kind)
         label = str(rows[at].get("label") or kind)
+    kind = segment_prompts.road_of(kind, SCHEDULE_KIND_NAMES) if kind else kind  # [#1245] a seeded segment names its document
     if kind not in SCHEDULE_KIND_NAMES:
         raise HTTPException(
             status_code=400,
@@ -61193,6 +62921,185 @@ async def schedule_prompts_save_api(
     _RADIO["sched_prompt"] = ""
     note_action("🗓 schedule prompts saved (#843)")
     return prompts
+
+
+# --- #1195 / #1245: THE SEGMENT PROMPT BOOK ------------------------------------
+# "When looking at the system prompt for each segment, the segment system
+# prompt shows and then it disappears. I need it to stay so I can edit it
+# and make alternative ones ... dialed back and forth and randomised
+# between the segments, but every segment needs a system prompt that I'm
+# able to edit" (#1245).  "Type in - speaker box - and basically trigger
+# this to use a random chunk of speaker box text" (#1195).
+#
+# The book itself is segment_prompts.py; these are its doors.  The writing
+# room reads it through _schedule_clause (one choke point, both engines),
+# never through these routes.  Saving here changes the NEXT segment of the
+# kind - the memo for the entry on air is dropped so it re-reads - and
+# nothing here ever takes the show off air: a broken book answers empty.
+
+
+def _segprompt_kind_arg(kind: str) -> str:
+    """The road a request names.  A document name (fmn1.md) is a seed, not
+    a road, and is keyed on the road of the newest round it seeded."""
+    got = segment_prompts.kind_key(kind)
+    if not got:
+        raise HTTPException(status_code=400, detail="name the kind of segment")
+    return segment_prompts.road_of(got, SCHEDULE_KIND_NAMES)
+
+
+@app.get("/api/segment/prompts")
+async def segment_prompts_book_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1245: the whole book - every kind's alternatives and mode, the last
+    sixty picks, and the command grammar the writing room expands."""
+    require_read_auth(authorization)
+    return segment_prompts.book_view()
+
+
+@app.get("/api/segment/prompts/uses")
+async def segment_prompts_uses_api(
+    kind: str = "",
+    most: int = 40,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1245: which alternative each recent segment was written with, and
+    what every command in it expanded to."""
+    require_read_auth(authorization)
+    return {"kind": segment_prompts.kind_key(kind) or None,
+            "uses": segment_prompts.uses_for(kind, max(1, min(300, int(most))))}
+
+
+@app.post("/api/segment/prompts/preview")
+async def segment_prompts_preview_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1195: what the words in the box become when the writing room
+    expands their commands - a look, not a draw: nothing is stamped on
+    the chunk ledger and no pick is recorded."""
+    require_read_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    kind = segment_prompts.kind_key(payload.get("kind"))
+    text = str(payload.get("text") or "")[:4000]
+    out, expanded = segment_prompts.expand(text, kind, stamp=False)
+    return {"kind": kind, "text": out, "expanded": expanded,
+            "grammar": segment_prompts.grammar()}
+
+
+@app.get("/api/segment/prompts/{kind}")
+async def segment_prompts_kind_api(
+    kind: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1245: one kind's shelf, plus everything the editor pop-up shows
+    (the same answer as /api/schedule/segment/prompt?kind=)."""
+    require_read_auth(authorization)
+    return schedule_segment_prompt("", "", _segprompt_kind_arg(kind))
+
+
+@app.post("/api/segment/prompts/{kind}/alternative")
+async def segment_prompts_put_api(
+    kind: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1245: SAVE one alternative for a kind, or rewrite the one `id` names.
+
+    {"id": "sa-..", "name": "the hard sell", "text": "...", "weight": 2,
+     "on": true}
+
+    Leave `id` out to mint a new one.  The first alternative a kind gets
+    becomes its fixed choice; the mode is otherwise untouched.  The next
+    segment of this kind reads it - the one on air is left alone."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    road = _segprompt_kind_arg(kind)
+    try:
+        row = segment_prompts.put_alternative(road, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    note_action("📝 segment prompt saved: " + road + " — "
+                + str(row.get("name") or "")[:40] + " (#1245)")
+    pipeline_log("lookahead", "the “" + str(row.get("name") or "") + "” "
+                 "alternative is on the " + road + " prompt shelf - "
+                 + segment_prompts.mode_says(segment_prompts.entry(road))
+                 + " (#1245)")
+    return {"ok": True, "kind": road, "alternative": row,
+            "book": segment_prompts.entry_view(road)}
+
+
+@app.post("/api/segment/prompts/{kind}/alternative/{aid}")
+async def segment_prompts_patch_api(
+    kind: str,
+    aid: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1245: flip one alternative's switch, weight, name or words.
+    {"on": false} | {"weight": 3} | {"name": ".."} | {"text": ".."}"""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    road = _segprompt_kind_arg(kind)
+    try:
+        row = segment_prompts.patch_alternative(road, aid, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "kind": road, "alternative": row,
+            "book": segment_prompts.entry_view(road)}
+
+
+@app.delete("/api/segment/prompts/{kind}/alternative/{aid}")
+async def segment_prompts_drop_api(
+    kind: str,
+    aid: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1245: take one alternative off the shelf.  The last one going
+    takes the kind's entry with it, so the old shelf and the seed govern
+    again - nothing is ever left pointing at words that are gone."""
+    require_auth(authorization)
+    road = _segprompt_kind_arg(kind)
+    if not segment_prompts.drop_alternative(road, aid):
+        raise HTTPException(status_code=404,
+                            detail="no alternative %r on the %s shelf" % (aid, road))
+    note_action("📝 segment prompt dropped: " + road + " (#1245)")
+    return {"ok": True, "kind": road, "book": segment_prompts.entry_view(road)}
+
+
+@app.post("/api/segment/prompts/{kind}/mode")
+async def segment_prompts_mode_api(
+    kind: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1245: how the kind picks between its alternatives.
+    {"mode": "fixed:<id>" | "cycle" | "random"}"""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    road = _segprompt_kind_arg(kind)
+    try:
+        mode = segment_prompts.set_mode(road, payload.get("mode"))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    says = segment_prompts.mode_says(segment_prompts.entry(road))
+    note_action("📝 " + road + " prompts: " + says + " (#1245)")
+    pipeline_log("lookahead", "the " + road + " entry now writes with its "
+                 "alternatives " + says + " (#1245)")
+    return {"ok": True, "kind": road, "mode": mode, "says": says,
+            "book": segment_prompts.entry_view(road)}
 
 
 # --- #1169/#1170: the modifier desk ---------------------------------------
@@ -61545,7 +63452,7 @@ def plot_advance() -> str:
             row["done"], row["active"] = True, False
             plot_write(rows)
             return ""
-        act = acts[i]
+        act = plot_act_direction(acts[i])      # [#1240]
         row["act_idx"] = i + 1
         final = i + 1 >= len(acts)
         if final:
@@ -61659,7 +63566,7 @@ def plot_act_now(row: dict[str, Any]) -> tuple[str, int, int]:
     # answer to "which act is due"; only the ruler changed.
     if plotline_span_seconds(row) > 0:
         _span_at = plotline_act_index(row, len(acts))
-        return acts[_span_at], _span_at + 1, len(acts)
+        return plot_act_direction(acts[_span_at]), _span_at + 1, len(acts)  # [#1240]
     at = 0
     try:
         began, _end = plot_half_bounds(str(row.get("half_hour") or ""))
@@ -61670,7 +63577,7 @@ def plot_act_now(row: dict[str, Any]) -> tuple[str, int, int]:
     except Exception:  # noqa: BLE001
         at = int(row.get("act_idx") or 0)
     at = max(0, min(len(acts) - 1, at))
-    return acts[at], at + 1, len(acts)
+    return plot_act_direction(acts[at]), at + 1, len(acts)  # [#1240]
 
 
 def plot_clause() -> str:
@@ -61696,7 +63603,8 @@ def plot_clause() -> str:
         return (
             "\n\nTHE AIR IS UNDER A STORYLINE (#907/#1157) — \""
             + title + "\". This is act " + str(at) + " of " + str(of)
-            + ", and what happens in it is: " + str(act)[:600]
+            + ". RIGHT NOW, IN THE STORY - and this is DIRECTION to you, "
+            "never a line to say (#1240): " + str(act)[:600]
             + " EVERY segment of this stretch of the show is inside that "
             "story and "
             "is coloured by it — the booth talk, the calls that come in, "
@@ -61706,7 +63614,10 @@ def plot_clause() -> str:
             "know that. Work it into what you were going to say anyway, "
             "stay in character, and never announce it as a script or read "
             "this instruction out loud. Treat what earlier acts "
-            "established as shared memory."
+            "established as shared memory. Nobody says 'act', 'act one', "
+            "'act two', 'act three', 'scene', 'chapter', 'storyline' or "
+            "'plot' on air - the people in this story do not know they "
+            "are in one (#1240)."
             + (" This is the FINAL act — land the ending before the "
                "story's time is out." if at >= of else "")
             + plotline_run_clause(row)
@@ -62240,7 +64151,7 @@ async def plotline_so_far_write(plot_id: str) -> str:
             "You keep the continuity notes for a live radio serial. The "
             f"story is \"{str(row.get('title') or 'untitled')[:120]}\". Its "
             "acts, as they were written down beforehand, are:\n- "
-            + "\n- ".join(a[:220] for a in acts[:12])
+            + "\n- ".join(plot_act_direction(a)[:220] for a in acts[:12])   # [#1240]
             + f"\n\nIt is now act {at + 1} of {len(acts)}.\n\nWhat has "
             "ACTUALLY gone out on air so far, in order:\n- "
             + "\n- ".join(heard)
@@ -62256,7 +64167,9 @@ async def plotline_so_far_write(plot_id: str) -> str:
                               mark={"kind": "plot so far",
                                     "for": "the running account of the "
                                            "storyline on air"})
-        said = _plotline_so_far_parse(str(raw or ""))
+        # [#1240] the running account is read into the caller angle and
+        # the booth clause; a label echoed here becomes a spoken one.
+        said = plot_label_scrub(_plotline_so_far_parse(str(raw or "")))
         if len(said) < 40:
             return ""
         with _PLOT_LOCK:
@@ -62317,12 +64230,13 @@ def plotline_tint_clause(cap: int = 340) -> str:
             return ""
         title = str(row.get("title") or "untitled")[:70]
         say = ("AND THIS IS HAPPENING IN THE WORLD RIGHT NOW: \"" + title
-               + "\", act " + str(at) + " of " + str(of) + " - "
+               + "\", stage " + str(at) + " of " + str(of) + " - "  # [#1240]
                + str(act)[:cap]
                + " The line you are treating is being said BY someone "
                "inside that, so let it know: an image, a name, a turn of "
                "phrase out of the story is worth more than a general one. "
-               "Never explain the story and never announce it.")
+               "Never explain the story and never announce it, and never "
+               "say 'act', 'scene' or 'chapter' in the bar (#1240).")
         return say
     except Exception:  # noqa: BLE001
         return ""
@@ -62426,12 +64340,13 @@ def plotline_line_clause(cap: int = 420, min_left: float = 0.0) -> str:
             return ""
         return ("\n\nTHE STATION IS IN THE MIDDLE OF A STORY TONIGHT - \""
                 + str(row.get("title") or "untitled")[:100]
-                + "\", act " + str(at) + " of " + str(of) + ": "
+                + "\", stage " + str(at) + " of " + str(of) + ": "  # [#1240]
                 + str(act)[:cap]
                 + " Whatever you are writing is happening WHILE that is "
                 "going on, and the people in it know it. Let it colour this, "
                 "in character, in one natural touch - never announce it, "
-                "never explain it, never read this out.")
+                "never explain it, never read this out, never say 'act', "
+                "'scene' or 'chapter' aloud (#1240).")
     except Exception:  # noqa: BLE001
         return ""                # colour never stops the broadcast
 
@@ -62482,9 +64397,12 @@ def plotline_call_want(row: Any) -> str:
         act, at, of = plot_act_now(row)
         if not act:
             return ""
-        return (f"what is going on out there right now - {str(act)[:400]}"
-                f" (act {at} of {of} of "
-                f"\"{str((row or {}).get('title') or '')[:80]}\")")[:600]
+        # [#1240] the premise IS the direction - no prompt wrapper, no act
+        # label: this string becomes call_meta['topic'], and the emergency
+        # skeleton pastes the topic into two spoken turns. Measured on the
+        # air: "What made you call about what's going on out there right
+        # now; Act 2 - the police are sent in..." went out word for word.
+        return plot_act_direction(act)[:600]
     except Exception:  # noqa: BLE001
         return ""
 
@@ -62514,7 +64432,8 @@ def plotline_caller_angle(row: Any) -> str:
         title = str((row or {}).get("title") or "untitled")[:120]
         said = (
             "\n\nTHIS CALLER IS INSIDE THE STORY (#1157). The station is "
-            f"living through \"{title}\", and this is act {at} of {of}: "
+            f"living through \"{title}\", and right now in the story "
+            f"(stage {at} of {of} - direction, not dialogue): "  # [#1240]
             f"{str(act)[:600]} The person on the line is an ORDINARY MEMBER "
             "OF THE PUBLIC caught up in that - not a narrator, not a "
             "reporter, not somebody who has merely heard about it. They ring "
@@ -62526,7 +64445,10 @@ def plotline_caller_angle(row: Any) -> str:
             "that nobody has reported yet, and they never merely restate "
             "what is already known. The hosts take it as NEWS of the story: "
             "they react to it, ask what happened next, and treat it as "
-            "established fact from here on.")
+            "established fact from here on. Nobody on this call says 'act', "
+            "'act one', 'act two', 'act three', 'scene', 'chapter', "
+            "'storyline' or 'plot' - they are living it, not reading it "
+            "(#1240).")
         so_far = plotline_so_far(row)
         if so_far:
             said += (" What the station already knows, and must not be told "
@@ -63257,7 +65179,7 @@ def ad_booth_row(text: str, product: str = "", who: str = "dj",
                 row["media"] = key
                 row["sig"] = str(sig or "")
         _RADIO["chat"].append(row)
-        del _RADIO["chat"][:-240]
+        del _RADIO["chat"][:-RADIO_CHAT_KEEP]
         return row
     except Exception:  # noqa: BLE001
         return {}
@@ -63946,7 +65868,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
         "page_id": str(made.get("id") or ""),
         "page_audio": name, "page_sig": sig,
     })
-    del _RADIO["chat"][:-240]
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     # #1339: committed before (c). Whichever way `voice_to` is set, one
     # of the two roads below carries it, so there is no withdrawal here -
     # the only way this one does not air is an exception, and an
@@ -65409,7 +67331,7 @@ def song_analysis_ready(track: dict[str, Any], analysis: str) -> None:
         "query": str(_proc.get("query") or ""),
         "aired": "analysis",
     })
-    del _RADIO["chat"][:-240]
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     pipeline_log("model", "song analysis ready — "
                  f"{track.get('title') or track_id}")
 
@@ -65999,7 +67921,7 @@ def image_analysis_ready(name: str, analysis: str, model: str = "",
         "image": name, "model": model, "ms": int(ms or 0),
         "prompt": str(prompt or ""), "aired": "analysis",
     })
-    del _RADIO["chat"][:-240]
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
 
 
 async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None,
@@ -71229,6 +73151,23 @@ def sfx_folders() -> list[Path]:
                 if folder not in out:
                     out.append(folder)
             break
+    # [#1243] AND THE STATION'S OWN TWO FOLDERS, ALWAYS.
+    #
+    # A glued clip (#1243) and an edited copy of a share clip (#1223) are
+    # written by the station, into the station's own data directory, and
+    # they are exactly the clips it most wants to play - a glued clip
+    # exists because the two shorts it replaces were too short to be a
+    # slot.  Naming them here is the one place that decides what a shelf
+    # is, so both the pool walk the SFX guy draws from and the clip book
+    # the endless set draws from pick them up with no second mechanism.
+    # is_dir() so a station that has never glued anything sees no change
+    # at all, and the lookup is wrapped like every other one above it.
+    for mine in (SFX_GLUE_DIR, SFX_EDITED_DIR):
+        try:
+            if mine.is_dir() and mine not in out:
+                out.append(mine)
+        except OSError:
+            continue
     return out
 
 
@@ -73319,6 +75258,18 @@ def sfx_by_id(wanted: str) -> Path | None:
             return got
     except Exception:  # noqa: BLE001
         pass
+    # [#1243] THE CLIP BOOK, for a clip no share walk will ever see.
+    #
+    # A glued clip lives under data/sfx/glued and an edited copy under
+    # data/sfx/edited.  Both are in sfx_folders() now, so the pool finds
+    # them once it has walked - but the walk is minutes long after a
+    # restart and the memo above is empty until something hashes the path,
+    # and in that window the clip's own url answered 404.  The book holds
+    # sid -> path on local disk behind an index, so this is microseconds
+    # and it is true the moment the row is written.
+    got = sfx_db_path_of(wanted)
+    if got is not None:
+        return got
     # #1265: the indexed map, not a walk-and-hash of the whole pool.
     got = sfx_id_map().get(wanted)
     if got is not None:
@@ -73347,8 +75298,13 @@ def sfx_history_add(path: Path, who: str = "") -> None:
                 rows = rows if isinstance(rows, list) else []
             except Exception:  # noqa: BLE001
                 rows = []
-            rows.append({"ts": int(time.time()), "id": sfx_id(path),
-                         "name": path.name, "who": who[:24]})
+            row = {"ts": int(time.time()), "id": sfx_id(path),
+                   "name": path.name, "who": who[:24]}
+            rows.append(row)
+            # [#1224] The tail stays at 2,000 because it is rewritten
+            # whole on every sting and json holds the GIL.  The DEPTH the
+            # operator scrolls into is one appended line, below.
+            _sfx_history_archive_put(row, rows)
             del rows[:-2000]
             SFX_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = SFX_HISTORY_PATH.with_suffix(".tmp")
@@ -73364,6 +75320,108 @@ def sfx_history_rows() -> list[dict[str, Any]]:
         return rows if isinstance(rows, list) else []
     except Exception:  # noqa: BLE001
         return []
+
+
+# --- #1224: THE DEEP HISTORY, APPEND-ONLY -------------------------------
+#
+# "Allow me to scroll even further into history."
+#
+# The tail above is capped at 2,000 rows because it is rewritten whole on
+# every airing.  MEASURED 2026-09-21: exactly 2,000 rows, 67.9 hours, and
+# the strip's "scroll back for more" ran out there.  This archive is the
+# same rows written one line at a time and never rewritten, so the depth
+# costs an append and the cap costs nothing.
+SFX_HISTORY_ARCHIVE_PATH = data_path("sfx_history.jsonl")
+
+
+def _sfx_history_archive_put(row: dict[str, Any],
+                             tail: list[dict[str, Any]]) -> None:
+    """[#1224] One line, appended.  Called inside _SFX_HISTORY_LOCK.
+
+    The first call after the file appears seeds it from the hot tail
+    instead of writing `row` alone - `tail` already has `row` on the end at
+    that point - so the two stores meet with no hole between them."""
+    try:
+        path = SFX_HISTORY_ARCHIVE_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            seed = path.stat().st_size <= 0
+        except OSError:
+            seed = True
+        with path.open("a", encoding="utf-8") as fh:
+            if seed:
+                for old in tail:
+                    fh.write(json.dumps(old) + "\n")
+            else:
+                fh.write(json.dumps(row) + "\n")
+    except Exception:  # noqa: BLE001
+        pass                      # a ledger must never cost a sting
+
+
+def sfx_history_archive_bytes() -> int:
+    """[#1224] How deep the archive is, in bytes - a stat, not a read."""
+    try:
+        return int(SFX_HISTORY_ARCHIVE_PATH.stat().st_size)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def sfx_history_archive_page(before: int,
+                             want: int) -> tuple[list[dict[str, Any]], bool]:
+    """[#1224] Airings at or before `before` (0 = from the newest end),
+    NEWEST FIRST, at most `want` of them, and whether anything strictly
+    older than the last one exists.
+
+    Walks the file backwards in 64 KB blocks and stops as soon as it has
+    `want` + 1 rows, so the cost is the page and not the archive.  `before`
+    is INCLUSIVE for the same reason #1200 made the route's cursor
+    inclusive: a ts is whole seconds and two clips can air inside one, and
+    the caller dedupes on (ts, id) anyway."""
+    path = SFX_HISTORY_ARCHIVE_PATH
+    want = max(1, int(want))
+    mark = max(0, int(before or 0))
+    try:
+        size = int(path.stat().st_size)
+    except Exception:  # noqa: BLE001
+        return [], False
+    if size <= 0:
+        return [], False
+    rows: list[dict[str, Any]] = []
+    older = False
+    try:
+        with path.open("rb") as fh:
+            pos = size
+            carry = b""
+            while pos > 0 and not older:
+                step = min(65536, pos)
+                pos -= step
+                fh.seek(pos)
+                chunk = fh.read(step) + carry
+                parts = chunk.split(b"\n")
+                # Everything before the first newline of this block may be
+                # the back half of a line that starts in the block before
+                # it - unless we are at the very front of the file, where
+                # it is a whole line.
+                carry = parts.pop(0) if pos > 0 else b""
+                for raw in reversed(parts):
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        got = json.loads(line.decode("utf-8"))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(got, dict):
+                        continue
+                    if mark and int(got.get("ts") or 0) > mark:
+                        continue
+                    if len(rows) >= want:
+                        older = True
+                        break
+                    rows.append(got)
+    except Exception:  # noqa: BLE001
+        return rows, older
+    return rows, older
 
 
 SFX_BANS_PATH = data_path("sfx_bans.json")
@@ -73445,10 +75503,15 @@ def _sting_draw_sets() -> tuple:
     and the weights, and all three were recomputed on every roll -
     fourteen thousand sha1 and a fourteen-thousand-string list, on the
     event loop, three seconds apart."""
-    banned = sfx_bans()
+    # [#1243] a clip that has been glued into a longer one is not banned -
+    # the file is untouched and the operator can undo the join - but it
+    # must not be drawn while something stands in front of it, or the SFX
+    # guy plays the 0.7 s short AND the joined clip that contains it.
+    banned = sfx_bans() | sfx_superseded()
     weights = sfx_weights()
     sig = (_SFX_POOL_AT[0], len(_SFX_POOL_CACHE),
-           _sfx_file_sig(SFX_BANS_PATH), _sfx_file_sig(SFX_WEIGHTS_PATH))
+           _sfx_file_sig(SFX_BANS_PATH), _sfx_file_sig(SFX_WEIGHTS_PATH),
+           _sfx_file_sig(SFX_GLUE_PATH))            # [#1243]
     if _STING_DRAW_MEMO.get("sig") == sig:
         return (_STING_DRAW_MEMO["pool"], _STING_DRAW_MEMO["names"],
                 _STING_DRAW_MEMO["fresh"])
@@ -74635,16 +76698,18 @@ SFX_CYCLE_AHEAD = 28.0           # keep this much picture rung ahead of now
 SFX_CYCLE_QUEUE = 16             # (#1417: was 3, #1422 made 2 too few)
 
 
-def sfx_cycle_request(sample: Path, who: str = "") -> bool:
+def sfx_cycle_request(sample: Path, who: str = "",
+                      why: str = "") -> bool:       # [#1251] why this clip
     """#1417: the SFX guy hands the cycle a clip to ring in turn."""
     asked = _SFX_CYCLE.setdefault("requests", [])
     if len(asked) >= 4:
         return False
-    asked.append((sample, str(who or "")))
+    asked.append((sample, str(who or ""), str(why or "")))
     return True
 
 
-def _sfx_cycle_note(sample: Path, seconds: float, start: float, who: str) -> None:
+def _sfx_cycle_note(sample: Path, seconds: float, start: float, who: str,
+                    why: str = "") -> None:            # [#1251] why this clip
     """The bookkeeping dj_sting did for a sting it rang itself."""
     key = sfx_id(sample)
     _RADIO["chat"].append({
@@ -74653,8 +76718,9 @@ def _sfx_cycle_note(sample: Path, seconds: float, start: float, who: str) -> Non
         "sfx_dir": sample.parent.name or "sfx", "video": True,
         "seconds": round(float(seconds or 0), 2),
         "url": "/sfx/%s?t=%s" % (key, media_sign(key)), "aired": "airing",
+        **({"match_why": str(why)[:240]} if why else {}),   # [#1251]
         "endless": True})                          # #1417: rung by the cycle, after the tube's clip
-    del _RADIO["chat"][:-240]
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     note_activity("sting", sample.stem)
     try:
         sfx_history_add(sample, who)
@@ -74787,7 +76853,13 @@ async def sfx_video_cycle() -> None:
             now = time.time()
             # Forget what has already played; what is left is the queue the
             # set is holding.
-            plan = [p for p in plan if p["end"] > now]
+            plan = [p for p in plan if p["end"] > now]     # played
+            # [#1200] a clip deleted from the library leaves the plan
+            # too, so a replacement is rung into the hole instead of a
+            # withdrawn clip being counted as runway.
+            _gone = _SFX_CYCLE.get("dropped") or []
+            if _gone:
+                plan = [p for p in plan if str(p.get("id") or "") not in _gone]
             last_end = plan[-1]["end"] if plan else now
             if plan and (last_end - now >= SFX_CYCLE_AHEAD or len(plan) >= SFX_CYCLE_QUEUE):
                 _SFX_CYCLE.update({"queued": len(plan), "until": last_end,
@@ -74797,16 +76869,54 @@ async def sfx_video_cycle() -> None:
             # #1417: the SFX guy's own clip first, if he has handed one in.
             asked = _SFX_CYCLE.setdefault("requests", [])
             asked_who = ""
+            _match_why, _match_score = "", 0.0            # [#1251]
             if asked:
-                pick, asked_who = asked.pop(0)
+                # [#1251] A THIRD FIELD. Unpacked by index rather than by
+                # shape: a request handed in before this deploy can still
+                # be sitting in the list, and a two-field tuple must ring
+                # rather than raise.
+                _req = asked.pop(0)
+                pick, asked_who = _req[0], _req[1]
+                _match_why = str(_req[2]) if len(_req) > 2 else ""
                 seconds = await asyncio.to_thread(sfx_seconds, pick)
             else:
                 # The book first - instant, and full the moment the process
                 # is up - and #1433: not a clip that has been on this tube
                 # inside the hour.
-                got = await sfx_video_fresh_pick()
-                pick = got[0] if got else None
-                seconds = float(got[1]) if got else 0.0
+                # [#1251] THE NEXT CLIP, AGAINST THE LINE IT WILL LAND ON.
+                #
+                # "the DJ is matching the videos that are being played to
+                # the things that are being said" - and "the goal will be
+                # to still be able to play the video seamlessly no matter
+                # what". Both halves live in WHERE this sits.
+                #
+                # This is the moment the cycle decides what goes at the
+                # END of the plan: a clip that has not been rung, has not
+                # been warmed, is not on any tube and no surface has ever
+                # heard of. Re-ranking it costs nobody a seek and nobody a
+                # frame. It is matched against the line that will be
+                # SOUNDING at its own broadcast_ms - the start stamped a
+                # few lines below - not against the line in the room now,
+                # because the set runs up to SFX_CYCLE_AHEAD seconds ahead
+                # of the clock.
+                #
+                # Below the strength floor it answers None and the
+                # ordinary draw runs untouched, so the set can never stall
+                # on a line with nothing to match.
+                _matched = await sfx_match_video_pick_async(
+                    int(max(now, last_end) * 1000))
+                if _matched:
+                    pick = _matched[0]
+                    seconds = float(_matched[1] or 0)
+                    _match_why, _match_score = str(_matched[2]), _matched[3]
+                    got = (pick, seconds)
+                else:
+                    # The book first - instant, and full the moment the process
+                    # is up - and #1433: not a clip that has been on this tube
+                    # inside the hour.
+                    got = await sfx_video_fresh_pick()
+                    pick = got[0] if got else None
+                    seconds = float(got[1]) if got else 0.0
             if pick is None:
                 # The old road, for the minutes after a fresh install only.
                 pick = sfx_deck_take()
@@ -74868,17 +76978,25 @@ async def sfx_video_cycle() -> None:
                 "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
                 "sting": pick.stem, "id": key, "seconds": seconds,
                 "length": real,            # 2026-09-15 (#1173)
+                # [#1251] and why it was chosen, on the ring every surface
+                # polls - page, desk, and the tablet's native wall.
+                **({"why": _match_why, "match_score": _match_score}
+                   if _match_why else {}),
                 "endless": True},          # 2026-09-14: withdrawable
                 at_ms=int(start * 1000))
             plan.append({"sting": pick.stem, "start": start,
-                         "end": start + seconds})
+                         "end": start + seconds, "id": key})   # [#1200]
             # #1433: EVERY clip the cycle rings, not only the SFX guy's.
             # _sfx_cycle_note below runs `if asked_who`, so the set's own
             # picks - almost all of them - were going out unrecorded, and a
             # cooldown with nothing written down to read is not a cooldown.
             sfx_video_note_played(key)
             if asked_who:
-                _sfx_cycle_note(pick, seconds, start, asked_who)      # #1417
+                _sfx_cycle_note(pick, seconds, start, asked_who,
+                                _match_why)                          # #1417/[#1251]
+            if _match_why:
+                pipeline_log("air", "(#1251) the endless set matched %s to "
+                             "the line - %s" % (pick.stem, _match_why))
             _SFX_CYCLE.update({"at": now, "until": plan[-1]["end"],
                                "rung": int(_SFX_CYCLE.get("rung") or 0) + 1,
                                "clip": plan[0]["sting"], "queued": len(plan),
@@ -74904,6 +77022,7 @@ def sfx_video_mode_state() -> dict[str, Any]:
             "queued": int(cycle.get("queued") or 0),
             "asked": len(cycle.get("requests") or []),        # #1417: the SFX guy's clips waiting their turn
             "cooldown": sfx_video_cooldown_state(),           # #1433
+            "match": sfx_match_state(),                       # [#1251]
             # #1420: and what the leveller has done, so "some of them are
             # too quiet" is a reading and not an impression.
             "levelled": {"target_db": round(SFX_VIDEO_MEAN_DB, 1),
@@ -75301,7 +77420,7 @@ def sfx_soundboard_state() -> dict[str, Any]:
             "say": say}
 
 
-def sting_due() -> Path | None:
+def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     """Whether to drop one now, and which. Spontaneous means unpredictable,
     not constant: a roll of the dice, and never twice inside the gap."""
     dj = dj_settings()
@@ -75347,33 +77466,66 @@ def sting_due() -> Path | None:
     # A side with nothing in it is not narrowed to - a library of pure
     # mp3 still plays, at any setting of the dial.
     _share = sfx_video_share()
+    _want_video = None       # [#1251] the side the share actually took
     if 0 < _share < 100 or _share in (0, 100):
         _want_video = random.random() * 100.0 < _share
         _side = [n for n in names_pool if sfx_is_video(n) == _want_video]
+        if not _side:
+            _want_video = None  # [#1251] that side is empty - no narrowing
         if _side:
             names_pool = _side
             _sided = {str(p) for p in _side}
             pool = [p for p in pool if str(p) in _sided] or pool
             fresh = {n for n in fresh if n in _sided}
+    # [#1251] MATCHED TO THE LINE, WHEN THE SWITCH IS ON.
+    #
+    # Above the three preference roads because "appropriate to the
+    # statements being said" is a stronger promise than freshness or
+    # never-heard - but below the picture share, because that decides the
+    # POPULATION and this decides the order within it.
+    #
+    # It cannot stall the show and it cannot narrow it: sfx_match_sting_pick
+    # applies the bans, the per-clip weights and the same `unrepeated` ring
+    # this function's own roads use, and returns None whenever nothing
+    # clears the strength floor - which on a library where two clips in
+    # three are named "1965 clip" is most lines. Then everything below runs
+    # exactly as it did before the switch existed.
+    if sfx_match_on(False):
+        try:
+            _matched = sfx_match_sting_pick(
+                after, want_video=_want_video)
+        except Exception:  # noqa: BLE001
+            _matched = None          # a matcher that throws is a matcher off
+        if _matched:
+            return _matched[0]
     # #1251: NEVER HEARD GOES FIRST. Ahead of the fresh road, because
     # "each and every clip" is a stronger promise than "the new ones
     # first" and the two only disagree while there are still clips that
     # have never been drawn at all.
     _unheard = _STING_DRAW_MEMO.get("unheard") or set()
-    if _unheard and random.random() < SFX_UNHEARD_SHARE:
+    if _unheard and len(_unheard) >= STING_SUBPOOL_MIN and random.random() < SFX_UNHEARD_SHARE:   # [#1188]
         _pool = [n for n in names_pool if n in _unheard] or sorted(_unheard)
         _pick = unrepeated(_pool, "sting",
                            keep=sting_keep(len(set(_pool))))   # #1223
         if _pick:
+            try:
+                _STING_DRAW_MEMO.get("unheard", set()).discard(_pick)   # [#1188] drawn = heard
+            except Exception:  # noqa: BLE001
+                pass
             pipeline_log("air", "(#1251) a clip nobody has ever heard: %s "
                          "(%d of %d in the pool still unheard)"
                          % (Path(_pick).name, len(_unheard), len(pool)))
             return Path(_pick)
-    if fresh and random.random() < SFX_FRESH_SHARE:
+    if fresh and len(fresh) >= STING_SUBPOOL_MIN and random.random() < SFX_FRESH_SHARE:   # [#1188]
         fresh_pool = [n for n in names_pool if n in fresh] or sorted(fresh)
         names = unrepeated(fresh_pool, "sting",
                            keep=sting_keep(len(set(fresh_pool))))  # #1223
         if names:
+            try:
+                _STING_DRAW_MEMO.get("fresh", set()).discard(names)     # [#1188] drawn = not fresh
+                fresh.discard(names)
+            except Exception:  # noqa: BLE001
+                pass
             pipeline_log("air", f"(#1062) a fresh sample drawn ahead of "
                          f"the rotation: {Path(names).name} "
                          f"({len(fresh)} fresh of {len(pool)} in the pool)")
@@ -75450,6 +77602,17 @@ async def _sfx_verdict(about: str) -> None:
 # already clamps this to len(pool) - 2 (#1176's "leave two"), so a generous
 # number here can never empty the pool - it degrades to "all but two".
 STING_KEEP_MOST = int(os.getenv("PINE_STING_KEEP", "600"))
+# [#1188] A SUB-POOL THIS SMALL CANNOT ROTATE. The never-heard road (#1251)
+# and the fresh road (#1062) each narrow the draw to a subset, and
+# unrepeated() clamps its memory to len(pool) - 2: three never-heard clips
+# left is a memory of ONE and the same two clips alternate for a minute -
+# measured 2026-09-16 01:55-01:58 (report 328901417209972865): eight
+# stings, three media, daedf778a5837026 three times and twice back to back
+# on the air. Below this many candidates the subset is skipped and the
+# ordinary draw (thousands of clips, a ring of dozens) takes over; a drawn
+# clip also leaves the subset at once instead of waiting up to a minute
+# for the memo to notice it has been heard.
+STING_SUBPOOL_MIN = int(os.getenv("PINE_STING_SUBPOOL_MIN", "6"))
 
 
 def sting_keep(count: int) -> int:
@@ -76485,7 +78648,10 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # gone away would otherwise hold up the whole event loop mid-show.
     # #1034: unless the caller chose the sample (a door behind an exit).
     if sample is None:
-        sample = await asyncio.to_thread(sting_due)
+        # [#1251] `after` is the line that has just been said, which is
+        # exactly what the matcher wants and what nothing else ever
+        # passed it. Ignored unless the switch is on.
+        sample = await asyncio.to_thread(sting_due, after)
     if sample is None and force:
         sample = await asyncio.to_thread(_sfx_any)
     if sample is None:
@@ -76534,6 +78700,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     is_video = sfx_is_video(sample)
     if is_video:
         to_box = False
+    _sting_why, _sting_score = sfx_match_why_for(sample)      # [#1251]
     # #1417: IN ENDLESS MODE THE TUBE BELONGS TO THE CYCLE. "Whenever endless
     # video mode is active, don't have the SFX guy play a clip during a clip
     # he is already playing. Have him do it after." A video sting rung here
@@ -76545,7 +78712,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # cadence after the set has nothing planned.
     if sfx_video_mode_on():
         if is_video:
-            return "queued" if sfx_cycle_request(sample, who) else ""
+            return ("queued" if sfx_cycle_request(
+                sample, who, _sting_why) else "")            # [#1251]
         if time.time() < float(_SFX_CYCLE.get("until") or 0):
             return ""
     # On the record like any spoken line (#269): which sample, from which
@@ -76565,9 +78733,15 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         "seconds": round(sfx_seconds(sample), 2),
         "url": f"/sfx/{key}?t={signature}",
         "aired": "airing",
+        # [#1251] WHY THIS CLIP. Stamped on the booth row, which is what
+        # airlog_row_from copies into data/air_log.jsonl - so the segment
+        # modal reads "matched: 'raccoon', 'trash'" off the durable
+        # ledger rather than off a ring that holds four minutes.
+        **({"match_why": _sting_why, "match_score": _sting_score}
+           if _sting_why else {}),
     }
     _RADIO["chat"].append(_sting_row)
-    del _RADIO["chat"][:-240]
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     note_activity("sting", sample.stem)
     # #862: write it down — the operator rules on the rotation from this.
     sfx_history_add(sample, who)
@@ -81194,7 +83368,7 @@ async def continuity_air(reason: str = "") -> bool:
                 "clip_sig": clip["sig"], "clip_from": offset, "clip_until": offset + seconds})
             offset += seconds
         _RADIO.setdefault("chat", []).extend(rows)
-        del _RADIO["chat"][:-240]
+        del _RADIO["chat"][:-RADIO_CHAT_KEEP]
         _CONTINUITY_STATE.update(last_air=time.time(), why=reason or "Emergency host continuity")
         to_box = (_RADIO.get("voice_to") or "box") in ("box", "both") and box_talk_ok()
         went = False
@@ -83928,6 +86102,26 @@ CALLER_BEHAVIORS = {
 def _fallback_call_script(caller_name: str, topic: str = "",
                           speakerbox_text: str = "",
                           line: str = "") -> str:
+    """[#1249] the emergency skeleton, about what the caller rang about.
+
+    Measured on the live shelf 2026-09-21: 140 of 150 caller rounds were
+    this skeleton, and its host turns were about its own furniture (the
+    "loose labels", the "curled receipt") while the caller's subject was
+    pasted raw into two turns - wrapper, act label and all.
+
+    caller_topic.fallback_call_script: the caller states the subject, every
+    host turn after the greeting names a piece of it, and no act label or
+    prompt wrapper reaches a spoken line (#1240). The old skeleton stays
+    below as _fallback_call_script_legacy; nothing calls it."""
+    try:
+        return _topic_fallback_call_script(caller_name, topic, speakerbox_text, line)
+    except Exception:  # noqa: BLE001
+        return _fallback_call_script_legacy(caller_name, topic, speakerbox_text, line)
+
+
+def _fallback_call_script_legacy(caller_name: str, topic: str = "",
+                                 speakerbox_text: str = "",
+                                 line: str = "") -> str:
     """#805: the guarantee behind every rung phone — when the model's call
     write dies (exception or fragment-bin), this minimal script airs
     instead of silence. Short, honest, and it completes: intro, the point,
@@ -84048,6 +86242,13 @@ def _fallback_call_script(caller_name: str, topic: str = "",
 # was drawn, spent on a prompt and forgotten, so the only evidence the deck
 # was weighted at all was the callers themselves.
 _PHONE_DRAWS: list[dict[str, Any]] = []
+
+# [#1249] THE LAST CALLER ROUNDS' TOPIC CONTRACTS. The prep shelf holds
+# only rounds that have NOT aired - a taken row is gone from it - so the
+# grade had to live somewhere the paperwork can still reach after the
+# round has gone out. Bounded at 40; nothing depends on it surviving a
+# restart.
+_TOPIC_CONTRACTS: list[dict[str, Any]] = []
 
 
 def phone_draw_note(card: str, deck: list[tuple[str, int]], roll: float) -> None:
@@ -87506,7 +89707,7 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
                     "round": "caller", "repeat": True,
                     "text": f"On {line_say}: {name} - back on the line from "
                             "earlier tonight (a re-air)"})
-                del _RADIO["chat"][:-240]
+                del _RADIO["chat"][:-RADIO_CHAT_KEEP]
             for r in rows:
                 try:
                     _entry = {
@@ -87530,7 +89731,7 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
                         _PAGE_ACKED_LINES.add(str(r.get("id") or ""))
                 except Exception:  # noqa: BLE001
                     pass
-            del _RADIO["chat"][:-240]
+            del _RADIO["chat"][:-RADIO_CHAT_KEEP]
             if box_played:
                 talk_said_now("box", str(sig), 1.0)
             try:
@@ -87730,7 +89931,7 @@ def call_ended(name: str, line_say: str, started: float,
             "rule": outcome, "rule_id": str(rule.get("id") or ""),
             "seconds": round(ran, 1),
         })
-        del _RADIO["chat"][:-240]
+        del _RADIO["chat"][:-RADIO_CHAT_KEEP]
         call_log_add({
             "id": live["id"],
             "ts": int(ended), "name": name, "line": line_say,
@@ -87756,7 +89957,7 @@ def call_ended(name: str, line_say: str, started: float,
         "rule_id": str(rule.get("id") or ""),
         "seconds": round(ran, 1),
     })
-    del _RADIO["chat"][:-240]
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     call_log_add({
         "id": live["id"],
         "ts": int(ended), "name": name, "line": line_say,
@@ -88910,6 +91111,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # The prose state seeds the caller's emotion vector, so "furious" is
     # not just a stage direction — it bends the pace, the pauses and the
     # stumbles of every line they say tonight (§30, §107).
+    weather_roll_round(["caller"], why="a caller arriving")   # [#1232]
     state_bump("caller", state_from_text(state))
     # A persona pinned to the row outranks the dice: its macro and
     # emotions arrive before the first line is written.
@@ -89595,6 +91797,11 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         f"Format the caller's lines as 'C: ...' — C is {caller['name']}, "
         "who speaks in full sentences and gives as good as they get."
         + approach_clause(approach_pick())                     # #752
+        # [#1249] and the subject the caller rang about as the spine of
+        # the round - this road writes about half the calls in a
+        # canonical hour and had no topic contract of any kind.
+        + topic_contract_clause(str(_call_meta.get("topic") or topic),
+                                str(caller.get("name") or ""))
     )
     call_started = time.time()
     call_line_take(str(caller["name"]), _call_meta)    # one line, one caller
@@ -90482,7 +92689,7 @@ def _desk_sound(label: str, seconds: float = 0.0,
         "seconds": round(seconds, 2),
         "air_at": float(air_at or now),
     })
-    del _RADIO["chat"][:-240]
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
 
 
 async def play_phone_ring() -> None:
@@ -91003,6 +93210,75 @@ _WITHDRAWN_LAST: dict[str, Any] = {"at": 0.0, "why": "", "sid": "", "rows": 0,
 _HANDOFF_NO: dict[str, Any] = {"at": 0.0, "why": ""}      # 2026-09-14: can_handoff's reason
 
 
+# [#1191] THE BOOK OF REFUSED ROUNDS.
+#
+# "Why did this fail? It doesn't make sense for this to fail." Four
+# gallery lines written, voiced, levelled and welded into one 33.16 s
+# file, and then withdrawn at the door - and the only record of it
+# anywhere was a sentence on a feed row that the ring throws away within
+# the hour, plus _WITHDRAWN_LAST, which holds exactly one round and only
+# until the process restarts. By the time the operator asked, four days
+# later, nothing on this machine could name the round, the reason or
+# where the work had gone.
+#
+# It had gone nowhere: commit() is the only thing that takes a row off
+# the shelf, and a System2 candidate is offered again at the next
+# dispatch (measured on the store: the Segment 11032 candidate
+# gallery-b466e7cbef was offered 14 times, refused 9 and completed 5).
+# That is worth WRITING DOWN, because "withdrawn" was read as "deleted".
+#
+# One line per refused round, pruned by count on every two hundredth
+# write, so it cannot grow without end.
+WITHDRAWN_BOOK_KEEP = int(os.getenv("PINE_WITHDRAWN_BOOK_KEEP", "2000"))
+_WITHDRAWN_BOOK_STATE: dict[str, Any] = {"written": 0, "last": 0.0}
+
+
+def withdrawn_book_path() -> Path:
+    return data_path("withdrawn_rounds.jsonl")
+
+
+def _withdrawn_book_save(path: Path, row: dict[str, Any]) -> None:
+    """[#1191] Append one line and prune. Sync - meant for a thread."""
+    airlog_jsonl_append(path, row)
+    _WITHDRAWN_BOOK_STATE["written"] = int(_WITHDRAWN_BOOK_STATE.get("written") or 0) + 1
+    _WITHDRAWN_BOOK_STATE["last"] = time.time()
+    if int(_WITHDRAWN_BOOK_STATE["written"]) % 200:
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > WITHDRAWN_BOOK_KEEP:
+            path.write_text("\n".join(lines[-WITHDRAWN_BOOK_KEEP:]) + "\n",
+                            encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass                    # a forgetful book never stops the air
+
+
+def withdrawn_book_write(row: dict[str, Any]) -> None:
+    """[#1191] One refused round onto the durable book, OFF THE LOOP.
+
+    The same shape as airlog_append_bg: a receipt is not worth the event
+    loop (#1325), and a refusal is not worth one either."""
+    path = withdrawn_book_path()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        _withdrawn_book_save(path, row)
+        return
+    try:
+        fire_and_forget(asyncio.to_thread(_withdrawn_book_save, path, row))
+    except Exception:  # noqa: BLE001
+        _withdrawn_book_save(path, row)
+
+
+def withdrawn_book_rows(since: float = 0.0, limit: int = 40) -> list[dict[str, Any]]:
+    """[#1191] The refused rounds since `since`, newest last."""
+    try:
+        rows = airlog_jsonl_read(withdrawn_book_path(), since, key="at")
+    except Exception:  # noqa: BLE001
+        return []
+    return rows[-max(1, int(limit)):]
+
+
 def _burst_withdraw(entries: list[dict[str, Any]], why: str) -> None:
     """2026-09-14: A ROUND THE STATION REFUSED IS NOT ON THE AIR.
 
@@ -91054,14 +93330,69 @@ def _burst_withdraw(entries: list[dict[str, Any]], why: str) -> None:
         if str(e.get("aired") or "prepared") in ("prepared", ""):
             e["aired"] = "withdrawn"
             e["withdrawn_why"] = str(why)[:240]
+            # [#1218] ...AND ITS ESTIMATED AIR STAMP GOES WITH IT.
+            # A withdrawn row kept `air_at` - a render-time guess
+            # (`_est0 + offset`) that then anchored the heard lines
+            # around it in the screenplay. Measured 2026-09-21: 90
+            # ghost rows standing on the page in hour 13, 68 of them
+            # withdrawn, across six blocks. A round that was refused
+            # has no air time, because it never went on the air.
+            e.pop("air_at", None)
+            e.pop("air_at_by", None)
+            e["withdrawn_at"] = time.time()
             n += 1
     _BANTER_WHY.update({"at": time.time(), "why": str(why)})
+    try:                                                  # [#1218]
+        # The sequencer stops holding a slot for a round that is
+        # not coming: otherwise every filler waits behind a wait
+        # that will never end. (`evict_stale` would catch it in
+        # 240 s; being told is better than being timed out.)
+        playout_tell("forget", playout_round_key(entries),
+                     why=str(why)[:160])
+    except Exception:  # noqa: BLE001
+        pass
     if n:
         _WITHDRAWN_LAST.update({"at": time.time(), "why": str(why), "sid": sid,
                                 "rows": n, "kind": kind})
+        # [#1191] AND WHERE THE WORK WENT, written down. `shelf` is how
+        # many rounds of this kind are standing on the shelf at this
+        # instant - the number that turns "withdrawn" from a disposal
+        # into a deferral, and the one to watch if it ever reads 0.
+        _shelf = -1
         try:
-            pipeline_log("drop", "a %s round was refused at hand-over and its %d "
-                                 "line(s) withdrawn from the feed: %s" % (kind or "?", n, why))
+            _shelf = len(shelf_rows(kind)) if kind else -1
+        except Exception:  # noqa: BLE001
+            _shelf = -1
+        try:
+            withdrawn_book_write({
+                "at": round(time.time(), 3), "sid": sid, "kind": kind,
+                "rows": n, "why": str(why)[:300], "shelf": _shelf,
+                # The proof lives on the ready META, not always on the
+                # feed rows, so the reason text is the second witness.
+                "system2": bool(any(isinstance(e, dict) and e.get("_system2")
+                                    for e in entries or [])
+                                or "System2" in str(why)),
+                "ids": [str(e.get("id") or "") for e in entries or []
+                        if isinstance(e, dict)][:12],
+                "texts": [" ".join(str(e.get("text") or "").split())[:120]
+                          for e in entries or [] if isinstance(e, dict)][:12],
+                # The cue span when the row has one, its own length
+                # otherwise: this is the finished audio being put back.
+                "seconds": round(sum(
+                    max(0.0, float(e.get("clip_until") or 0)
+                             - float(e.get("clip_from") or 0))
+                    or float(e.get("seconds") or 0)
+                    for e in entries or [] if isinstance(e, dict)), 2),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            pipeline_log("drop", "a %s round was refused at hand-over and its %d "     # [#1191]
+                                 "line(s) withdrawn from the feed - the work is NOT "
+                                 "deleted, %s round(s) of this kind stand on the "
+                                 "shelf: %s"
+                         % (kind or "?", n,
+                            ("?" if _shelf < 0 else str(_shelf)), why))
         except Exception:  # noqa: BLE001
             pass
 
@@ -91094,9 +93425,40 @@ def _burst_refusal_why(ready_meta: Any, length: float, start_at: float | None = 
                         "the round is longer than the time the sheet gives it"
                         % (kind, int(float(length or 0)), int(max(0.0, left)), int(grace)))
         if callable(can_handoff) and not can_handoff():
+            # [#1191] NEVER ANONYMOUS. Three checks reach this line - the
+            # cupboard's own can_handoff (which writes _HANDOFF_NO), the
+            # System2 runtime's validate() and System2Media's allowed()
+            # wrapper - and until 2026-09-21 only the first ever said why.
+            # Segment 11032 (2026-09-16 08:36:30Z, four gallery lines,
+            # every one "the caller's own check said no") was the System2
+            # road refusing with its mouth shut: the store's deadline test
+            # missed by 3.50 s while THIS road's own test, which carries
+            # #1166's 45 s of grace, said the round fitted with 39 s to
+            # spare. The reason is read from the register first, then off
+            # the callable itself, and when neither has one the check is
+            # NAMED (qualname, file:line) so the next silent refusal
+            # points at its own code. Every reason ends with what happens
+            # to the round, because "refused" read as "deleted" and it
+            # never was: the shelf row is only removed by commit().
             _h = (str(_HANDOFF_NO.get("why") or "")
                   if time.time() - float(_HANDOFF_NO.get("at") or 0) < 5 else "")
-            return "the hand-off was refused: " + (_h or "the caller's own check said no (can_handoff)")
+            if not _h:
+                _own = getattr(can_handoff, "why", None)
+                try:
+                    _h = str((_own() if callable(_own) else _own) or "")
+                except Exception:  # noqa: BLE001
+                    _h = ""
+            if not _h:
+                _code = getattr(can_handoff, "__code__", None)
+                _h = ("%s said no and recorded no reason (%s:%s)"
+                      % (getattr(can_handoff, "__qualname__", None)
+                         or repr(can_handoff)[:40],
+                         os.path.basename(str(getattr(_code, "co_filename", "") or "?")),
+                         getattr(_code, "co_firstlineno", 0)))
+            _kept = ("System2 offers the round again at its next dispatch"
+                     if (ready_meta or {}).get("_system2")
+                     else "the round stays on the shelf for the next sweep")
+            return "the hand-off was refused: " + _h[:200] + " - " + _kept
     except Exception as exc:  # noqa: BLE001
         return "the station would not put it out (%s)" % exc
     return "the station would not put it out"
@@ -91154,6 +93516,15 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     # is an answer the trace has to be able to give (#1239).
     try:
         modifiers_ride_round(_round_sid)
+    except Exception:  # noqa: BLE001
+        pass
+    # [#1195] and the alternative the round was written with rides it too:
+    # a prepared round names its own brief, a live one is the entry on air.
+    try:
+        _rm0 = dict(ready_takes[0].get("round") or {}) if ready_takes else {}
+        segment_prompts.ride(_round_sid,
+                             brief=str(_rm0.get("prompt") or _rm0.get("brief") or ""),
+                             kind=str(_rm0.get("prep_kind") or ""))
     except Exception:  # noqa: BLE001
         pass
     dj = dj_settings()
@@ -92350,7 +94721,19 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                               "sfx_sample_id") or ""),
                           "scripted": True}
                          for _r, (_w, _c, _s) in enumerate(transcript)],
-                        str(ready_meta.get("prep_kind") or source or ""))
+                        # [#1245] THE ROAD, not the document.  `source` is the
+                        # speaker box file the round was seeded from, and
+                        # filing the round under it made every seeded booth
+                        # round a kind of its own ("fmn1.md") that no shelf,
+                        # no seed and no entry on the sheet could answer for.
+                        # The air log stamps the same rows with
+                        # airlog_round_now(); so does the script now.
+                        str(ready_meta.get("prep_kind")
+                            or airlog_round_now(
+                                "", "",
+                                caller_name if caller_seat == "caller" else "")
+                            or ""),
+                        source=str(source or ""))
                 except Exception:  # noqa: BLE001
                     # A round must never fail to air because the document
                     # could not be written.
@@ -92440,6 +94823,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             if 0 <= _ti < len(aired_items) else {},
                             "written": _model_call_for(chunk),
                             "chars": len(chunk),
+                            "weather": weather_stamp(who),   # [#1232]
                             "kind": "burst",
                             "burst": len(transcript),
                         },
@@ -92491,7 +94875,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # #770: 160 here against 240 everywhere else meant a busy
                 # round amputated up to eighty entries the panel had never
                 # been shown — "conversation moments not showing" outright.
-                del _RADIO["chat"][:-240]
+                del _RADIO["chat"][:-RADIO_CHAT_KEEP]
                 # The turns were measured BEFORE the concat, which loudness-
                 # normalises and can lay texture under the join, so the sum
                 # drifts from the finished clip. Scale to what was actually
@@ -92616,6 +95000,59 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         _e4["admission_occurrence"] = _round_occurrence
                     except Exception:  # noqa: BLE001
                         pass
+                # [#1218] HELD, AND THE AUDIO GATE.
+                #
+                # The file is welded, `rows` is its cue sheet after the
+                # loudness pass, `length` is what the mixer produced, and
+                # the gate one line above has just verified the audio
+                # exists and the offsets are known. That is the note's own
+                # precondition - "verify that its final audio is available
+                # and its ordered line/cue offsets are known BEFORE
+                # committing" - and it is the first moment a round may be
+                # called NEXT. From here it reserves its slot, so nothing
+                # minted during its wait is stamped on top of it.
+                #
+                # A round that cannot answer yes is not held at all: it
+                # stays on the making shelf with the reason, reserves
+                # nothing, and cannot be the head.
+                _pl_key = playout_round_key(_entries, _round_occurrence)
+                try:
+                    _pl_block = 0
+                    try:
+                        _pl_order = script_ledger_order()
+                        for _e5 in _entries:
+                            _pl_got = _pl_order.get(str(_e5.get("id") or ""))
+                            if _pl_got:
+                                _pl_block = int(_pl_got[0])
+                                break
+                    except Exception:  # noqa: BLE001
+                        _pl_block = 0
+                    # The measured cue map's own body, where the production
+                    # road made this round. A map that cannot say how long
+                    # its body is has already been refused upstream
+                    # (production_cue_windows); this carries the number
+                    # into the census so the reading can prove it.
+                    _pl_body = 0.0
+                    try:
+                        _pl_map = production_cue_map(ready_meta) or {}
+                        _pl_body = float(_pl_map.get("body_frames") or 0.0)
+                    except Exception:  # noqa: BLE001
+                        _pl_body = 0.0
+                    _pl_ready = bool(rows) and float(length or 0) > 0
+                    playout_tell(
+                        "hold", _pl_key, seconds=float(length or 0),
+                        lines=len(_entries), media=str(one.get("path") or ""),
+                        sid=str(_round_sid or ""),
+                        road=str(ready_meta.get("prep_kind") or source or "round"),
+                        kind=str(ready_meta.get("prep_kind") or "round"),
+                        label=str(caller_name or "")[:80],
+                        block=_pl_block, occurrence=str(_round_occurrence or ""),
+                        audio_ready=_pl_ready, body_frames=_pl_body,
+                        cues=len(list(rows or [])),
+                        why_not_ready=("" if _pl_ready else
+                                       "the mixer produced no cue sheet for it"))
+                except Exception:  # noqa: BLE001
+                    pass
                 # # --- broadcast admission (2026-09-15) --- end
                 # Deliver the ONE clip on the routing the DJ voice is set to,
                 # mirroring to the page when the box is down (#536).
@@ -92653,7 +95090,18 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # producer may have sold air this round's local
                     # clock knows nothing about.
                     _pstart = max(time.time() + _plead, _paged_until,
-                                  float(_PAGE_AIR_UNTIL[0] or 0))
+                                  float(_PAGE_AIR_UNTIL[0] or 0),
+                                  # [#1218] ...AND THE LISTENER'S CLOCK. The
+                                  # three above are the SERVER'S estimate of
+                                  # when the page will be free. Blocks 6404
+                                  # and 6408 overlapped by 34.3 s on
+                                  # 2026-09-21 because the page had stalled
+                                  # and the estimate had not; the
+                                  # acknowledgements say where the sounding
+                                  # clip actually is. `exclude_key` is this
+                                  # round's own reservation - a round does
+                                  # not wait for itself.
+                                  playout_floor(exclude_key=_pl_key))
                     _pwait = (_pstart - _plead - PAGED_ANNOUNCE_EARLY
                               - time.time())
                     while _pwait > 0 and not radio_paused():
@@ -92706,6 +95154,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # can lag behind the server handoff.
                 if to_box:
                     _stream_now_set(rows, length)
+                    playout_tell(                          # [#1218]
+                        "dispatched", str(_round_occurrence or "")
+                        or ("box:" + str(one.get("sig") or "")),
+                        route="box", starts_at=time.time(),
+                        seconds=float(length or 0), key=_pl_key,
+                        producer="_speak_turns_floorless", lane="speech",
+                        media=str(one.get("path") or ""),
+                        sid=str(_round_sid or ""), lines=len(_entries))
                 # #778: NOW the receiver going down can be placed — at the end
                 # of the clip it is at the end of, rather than at the moment
                 # the mix was assembled.
@@ -93475,6 +95931,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
         elif autos.get(host) and random.random() < 0.5:
             _RADIO.setdefault("speaker_macro", {})[host] = ""
             autos[host] = False
+    # [#1232] THE WEATHER IS ROLLED HERE, once per round write, for every
+    # seat in the round. The same numbers go into the prompt below and
+    # onto the entry, so the delivery reads what the wording was written
+    # under. A banked round leaves the live state alone (apply=False):
+    # its roll rides the entry and _banter_air applies it when it airs.
+    _weather = weather_roll_round(
+        list(hosts) + ([caller_seat] if caller_name else [])
+        + (["caller2"] if caller2_name else []),
+        why=("a %s round" % ("caller" if caller_name else "banter"))
+        + (" (banked)" if bank else ""),
+        apply=not bank)
     # Up the talk dial (#304), rounds open with a monologue out of the
     # speakbox to break the ice — random stuff off the shelf, delivered
     # cold, then argued about.
@@ -94201,7 +96668,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             f"{playing}{only_song}{aside}"
             f"{show_memory(own_material=own_material)}{call_flow}"
             f"{crystal_clause(bank)}{avoid_reruns()}"
-            f"{approach_clause(_approach)}\n\n"
+            f"{approach_clause(_approach)}"
+            f"{weather_clause(_weather, caller_seat, bool(third))}\n\n"  # [#1232]
             # #842: the banked round is told it is being PRE-RECORDED, so
             # the model spends the room it has been given on more lines
             # rather than on a tighter version of the same six.
@@ -94282,6 +96750,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # conversation (six turns), not an essay.
     _needs_rewrite = False
     _call_report: dict[str, Any] = {}
+    _topic_regenerated = False                              # [#1249]
     if _system2_budget and not caller_name:
         _needs_rewrite = not system2_scene_complete(banter_turns(script), _judge_lines)
     elif _judge_lines >= 8 and not caller_name:
@@ -94343,6 +96812,24 @@ async def dj_banter(track: dict[str, Any] | None = None,
                   if isinstance((call_meta or {}).get("plot"), dict)
                   else None))                                     # #1157
         _needs_rewrite = not bool(_call_report.get("ok"))
+        # [#1249] THE TOPIC CONTRACT, graded on the words: the hosts must
+        # address what the caller rang about. Measured before this, over
+        # 150 shelved caller rounds: 22% of host turns did, and 8.7% over
+        # the last twenty. A failed draft gets the ONE rewrite this road
+        # already pays for, with the contract in its prompt; the rewrite
+        # itself is not refused for topic alone.
+        try:
+            _topic_ad = topic_adherence(
+                _turns_seen, str((call_meta or {}).get("topic") or ""))
+        except Exception:  # noqa: BLE001
+            _topic_ad = {}
+        if _topic_ad.get("checked") and not _topic_ad.get("ok"):
+            _call_report = dict(_call_report)
+            _call_report["faults"] = (list(_call_report.get("faults") or [])
+                                      + list(_topic_ad.get("faults") or []))
+            _call_report["ok"] = False
+            _needs_rewrite = True
+            _topic_regenerated = True
     _draft_entry = {"script": script, "prep_kind": "caller" if caller_name else "banter",
                     "caller_name": caller_name, "caller2_name": caller2_name,
                     "caller_voice": caller_voice, "caller2_voice": caller2_voice,
@@ -94377,6 +96864,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     "details C just revealed; C answers each. Build one earned "
                     "rapport callback, carry the database theme throughout, "
                     "and end with C finishing and a host clearly signing off. "
+                    + topic_contract_clause(                          # [#1249]
+                        str((call_meta or {}).get("topic") or ""), caller_name)
                     + ("Mid-call C introduces this new Speakerbox subject in "
                        "their own rhetoric, preserving at least two concrete "
                        "anchor words; the next host repeats an anchor and "
@@ -94458,6 +96947,48 @@ async def dj_banter(track: dict[str, Any] | None = None,
         except Exception:
             pass                    # the draft stands; bank it as written
 
+    # [#1240] NO ACT LABEL REACHES A SPOKEN LINE: the plot is direction, and
+    # "Act 3" said aloud is the direction leaking. Every round, every road.
+    try:
+        script = plot_label_scrub(script)
+    except Exception:  # noqa: BLE001
+        pass
+    # [#1249] the round's topic contract, graded on the words that will air,
+    # carried on the call meta and kept in a small ring so the paperwork can
+    # still show it after the shelf row has been taken and aired.
+    if caller_name and isinstance(call_meta, dict):
+        try:
+            _topic_final = topic_adherence(
+                banter_turns(script or "", caller_name, caller2_name),
+                str(call_meta.get("topic") or ""))
+            _topic_tc = {
+                "subject": topic_subject(str(call_meta.get("topic") or "")),
+                "nouns": list(_topic_final.get("nouns") or []),
+                "adherence": float(_topic_final.get("score") or 0.0),
+                "addressing": int(_topic_final.get("addressing") or 0),
+                "host_turns": int(_topic_final.get("host_turns") or 0),
+                "caller_states": bool(_topic_final.get("caller_states")),
+                "ok": bool(_topic_final.get("ok")),
+                "checked": bool(_topic_final.get("checked")),
+                "regenerated": bool(_topic_regenerated),
+                "skeleton": bool(_TOPIC_SKELETON_TELL in str(script or "")),
+                "at": time.time(),
+            }
+            call_meta["topic_contract"] = dict(_topic_tc)
+            _TOPIC_CONTRACTS.append(
+                {**_topic_tc, "caller": caller_name,
+                 "words": " ".join(str(script or "").split()).lower()[:4000]})
+            del _TOPIC_CONTRACTS[:-40]
+            pipeline_log(
+                "call", "(#1249) topic contract for %s: %d of %d host turns "
+                "address the subject%s%s" % (
+                    caller_name, _topic_tc["addressing"],
+                    _topic_tc["host_turns"],
+                    " after the topic rewrite was asked for" if _topic_regenerated else "",
+                    " (emergency skeleton)" if _topic_tc["skeleton"] else ""),
+                extra=str(_topic_tc["subject"])[:300])
+        except Exception:  # noqa: BLE001
+            pass
     _seed_forced = False                                    # #862
     _seed_put = ""
     if not _system2_job and not caller_name and seed.get("text"):
@@ -94546,9 +97077,63 @@ async def dj_banter(track: dict[str, Any] | None = None,
         _dealt.append(["head", "A", _seed_put.strip()])
         if not _tint_passages:
             _verbatim.append(["head", _seed_put.strip()])
+    # [#1233] THE QUOTE LEDGER. Every door below used to be one boolean
+    # expression that short-circuited on `not _system2_job`, so under the
+    # default engine the dice were never thrown and nothing recorded that
+    # they were not. Now each door first decides whether the dial APPLIES
+    # to this round (and why not), then rolls, then writes both down on
+    # the round itself - entry["quotes"] - which is what the "How this
+    # line came to be" paperwork reads (speakbox_quote_paperwork).
+    _quotes: dict[str, dict[str, Any]] = {}
+    _s2_quotes = bool(_sb.get("speakbox_quotes_system2", True))
+
+    def _quote_door(door: str, rate_key: str, lift: float = 0.0,
+                    s2_ok: bool = True) -> bool:
+        """Does this dial apply to this round, and did the dice say yes."""
+        try:
+            rate = float(_sb.get(rate_key) or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        rec: dict[str, Any] = {
+            "door": door, "rate": round(rate, 3), "lift": round(float(lift or 0), 3),
+            "applies": True, "why": "", "roll": None, "hit": False,
+            "file": "", "text": "", "turns": 0,
+            "bounded": bool(_system2_job), "at": time.time()}
+        if caller_name:
+            rec.update(applies=False, why="a call is written to the caller's own material; no passage is stapled to it")
+        elif own_material:
+            rec.update(applies=False, why="this round is written off its own material (a wire, a memo, a painting, the hour's log); no passage is stapled to it (2026-09-08)")
+        elif _system2_job and not s2_ok:
+            rec.update(applies=False, why="held under System2: a whole reading cannot fit a scene written for 90 seconds")
+        elif _system2_job and not _s2_quotes:
+            rec.update(applies=False, why="held under System2 by the 'quotes under System2' switch on the speakerbox desk")
+        elif rate <= 0:
+            rec.update(applies=True, why="the dial is at 0%")
+        if rec["applies"] and rate > 0:
+            roll = random.random()
+            rec["roll"] = round(roll, 3)
+            rec["hit"] = bool(roll < min(1.0, rate + float(lift or 0)))
+        _quotes[door] = rec
+        return bool(rec["hit"])
+
+    def _quote_note(door: str, drawn: dict[str, Any], text: str, turns: int) -> None:
+        """What the door actually put in: the document, the passage, the turns."""
+        rec = _quotes.setdefault(door, {"door": door, "applies": True, "hit": True})
+        rec.update(file=str((drawn or {}).get("file") or "")[:120],
+                   mind=str((drawn or {}).get("mind") or "")[:40],
+                   text=" ".join(str(text or "").split())[:300],
+                   chars=len(" ".join(str(text or "").split())),
+                   turns=int(turns or 0))
+
+    def _s2_bound(text: str) -> str:
+        """Under a System2 job a passage is SPEAKBOX_S2_QUOTE_TURNS spoken turns."""
+        if not _system2_job:
+            return text
+        pieces = _swath_pieces(text)
+        return " ".join(pieces[:max(1, int(SPEAKBOX_S2_QUOTE_TURNS))]) if pieces else ""
+
     full_swath: dict[str, Any] = {}
-    if (not _system2_job and not caller_name and not own_material and random.random() < float(
-            _sb.get("speakbox_full_swath_rate") or 0)):
+    if _quote_door("full", "speakbox_full_swath_rate", s2_ok=False):   # [#1233]
         full_swath = await speakbox_quote(
             # #1078: was 30, and THIRTY LINES is what capped this, not
             # the operator's dial. Gems are capped at 200 characters
@@ -94574,6 +97159,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 _turns = _block.count("\n")
                 lines += _turns
                 speakbox_remember(full_swath)
+                _quote_note("full", full_swath, _full_text, _turns)    # [#1233]
                 pipeline_log("speakbox", "full swath dealt across the room "
                              f"({len(_full_text)} chars, {_turns} turns)")
     # #609/#612: PRE-PEND a fresh verbatim swath to the FRONT of the round (an
@@ -94596,25 +97182,24 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # cancelled by a third. "If the sliders are up for the speaker box
     # rhetoric, there is nothing that can stop it." The budget is what
     # gets expanded to fit, not the material that gets dropped.
-    if not _system2_job and not caller_name and not own_material and random.random() < min(1.0, float(
-            _sb.get("speakbox_prepend_rate") or 0) + _lift):
+    if _quote_door("prepend", "speakbox_prepend_rate", lift=_lift):    # [#1233]
         head = await _fresh_swath()
         if head.get("text"):
-            _head_text = " ".join(str(head["text"]).split())
+            _head_text = _s2_bound(" ".join(str(head["text"]).split()))   # [#1233]
             _block = _place(_head_text, "head")
             if _block:
                 script = _block + script.lstrip()
                 lines += _block.count("\n")
                 speakbox_remember(head)
+                _quote_note("prepend", head, _head_text, _block.count("\n"))   # [#1233]
     tail: dict[str, Any] = {}
-    if not _system2_job and not caller_name and not own_material and random.random() < min(1.0, float(   # #867
-            _sb.get("speakbox_append_rate") or 0) + _lift):
+    if _quote_door("append", "speakbox_append_rate", lift=_lift):   # #867 [#1233]
         tail = await _fresh_swath()
         if tail.get("text"):
             # #786: terminal punctuation, or the #168 truncation gate reads
             # a verbatim un-punctuated swath as token exhaustion and deletes
             # the operator's own material off the end of the round.
-            _tail_text = " ".join(str(tail["text"]).split()).rstrip()
+            _tail_text = _s2_bound(" ".join(str(tail["text"]).split())).rstrip()   # [#1233]
             if not re.search(r"[.!?…—»\"')\]]$", _tail_text):
                 _tail_text += "."
             _block = _place(_tail_text, "tail")
@@ -94622,6 +97207,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 script = script.rstrip() + "\n" + _block.rstrip()
                 lines += _block.count("\n")
                 speakbox_remember(tail)
+                _quote_note("append", tail, _tail_text, _block.count("\n"))   # [#1233]
     # #844: THE SLIDER IS A GUARANTEE AT THE TOP OF ITS RANGE. Every
     # speakbox control was a probability on the DRAW, and nothing ever
     # checked that the model used what it was handed — so at 100% the
@@ -94740,13 +97326,14 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 if _placed_words and not (_placed_words & _closing):
                     _again = await _fresh_swath()
                     if _again.get("text"):
-                        _again_text = " ".join(
-                            str(_again["text"]).split())
+                        _again_text = _s2_bound(" ".join(          # [#1233]
+                            str(_again["text"]).split()))
                         _block = _place(_again_text, "reseed")
                         if _block:
                             script = script.rstrip() + "\n" + _block.rstrip()
                             lines += _block.count("\n")
                             speakbox_remember(_again)
+                            _quote_note("reseed", _again, _again_text, _block.count("\n"))   # [#1233]
                             pipeline_log(
                                 "speakbox",
                                 "the round drifted off the material it was "
@@ -94782,6 +97369,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # went to, so the booth and the director's room can show the
         # material as it was actually dealt rather than as it was drawn.
         "dealt": _dealt,
+        # [#1233] every door's decision: did the dial apply, what did the
+        # dice say, and what went in. Read by speakbox_quote_paperwork.
+        "quotes": _quotes,
         "swaths": [s for s in (seed, comeback, jab, tail) if s],
         "seek_verdict": seek_verdict,
         "caller_name": caller_name, "caller_voice": caller_voice,
@@ -94793,6 +97383,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         "whole": bool(whole),                  # #859
 
         "feel": feel,                                          # #750
+        "weather": _weather,                                   # [#1232]
         "profile": _larder_profile_signature(),
         # #987/#992: WHERE THIS SCRIPT CAME FROM, carried with it.
         #
@@ -95644,6 +98235,7 @@ async def _banter_air(entry: dict[str, Any],
                     str(entry.get("caller_voice") or ""))
             except Exception:  # noqa: BLE001
                 pass
+    weather_apply(entry.get("weather"))                    # [#1232]
     spoken = await speak_turns(banter_turns(entry["script"],
                                             entry.get("caller_name", ""),
                                             entry.get("caller2_name", "")),
@@ -96968,7 +99560,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
                                  + (" - back on the line from earlier "
                                     "tonight (a repeat)" if _prep_again
                                     else "")})
-                    del _RADIO["chat"][:-240]
+                    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
                     pipeline_log("call", f"{_prep_who} on the request line — "
                                  + ("a call that went out earlier tonight, "
                                     "going out again (#1033)" if _prep_again
@@ -97090,7 +99682,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
             _RADIO["chat"].append({"ts": int(time.time()), "who": "host",
                                    "kind": "call",
                                    "text": f"On {line_say}: {_cname}"})
-            del _RADIO["chat"][:-240]
+            del _RADIO["chat"][:-RADIO_CHAT_KEEP]
             pipeline_log("call", f"{_cname} on {line_say} — the request line")
         except Exception:  # noqa: BLE001
             pass
@@ -97171,6 +99763,12 @@ async def dj_caller(track: dict[str, Any] | None = None,
         return heat_lines
     want = (random.choice(wants)[:160] if wants else
             str((_themed or {}).get("text") or "the active subject")[:160])
+    # [#1249] A THEMED CALL RINGS ABOUT THE THEME. The prompt used to name a
+    # random listener request as "what got them on the air" while the graded
+    # topic was the theme text - two subjects in one call, and the topic
+    # grade could only fail. One subject, the one on _call_meta.
+    if _themed and str((_themed or {}).get("text") or "").strip():
+        want = str(_themed.get("text") or "")[:400]
     # #1157: THE CALLER OUT OF THE CURRENT ACT. While a storyline owns
     # the air, a share of the calls are ordinary people inside it - the
     # premise, the topic and the reason for ringing all come out of the
@@ -97186,6 +99784,11 @@ async def dj_caller(track: dict[str, Any] | None = None,
     _want_say = (f"What got {_cname} on the air is one of the listener's "
                  "own past requests, which they want read back to them: "
                  f"\"{want}\".")
+    if _themed and str((_themed or {}).get("text") or "").strip():   # [#1249]
+        _want_say = (f"What got {_cname} on the air is tonight's subject, "
+                     "and it has happened to THEM, tonight, in their own "
+                     f"house: \"{str(_themed.get('text') or '')[:400]}\".")
+    _call_meta["topic"] = str(want)[:700]   # [#1249] the prompt's subject IS the graded subject
     if _pline:
         _pline_want = plotline_call_want(_pline)
         if _pline_want:
@@ -97352,6 +99955,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
         f"NAME. "
         + _want_say                                                # #1157
         + _pline_bit                                               # #1157
+        + topic_contract_clause(str(_call_meta.get("topic") or want), _cname)   # [#1249]
         + _plot
         + _seed_bit                                                # #1033
         + _mono_bit                                                # #1254
@@ -99318,6 +101922,12 @@ async def ask_model(prompt: str, limit: int = 300,
         _row.update(_mark)
     except Exception:  # noqa: BLE001
         pass
+    try:                                                    # [#1195]
+        _sp = segment_prompts.find_in(str(prompt or ""))
+        if _sp:
+            _row["segprompt"] = _sp
+    except Exception:  # noqa: BLE001
+        pass
     _MODEL_CALLS.append(_row)
     try:                                                    # #1020 (G1)
         airlog_model_call(_row, {**_spent, "prompt_eval_count":
@@ -100530,6 +103140,14 @@ async def api_put_settings(
         _cast_keys = ("voice", "cohost_voice", "third_voice", "drop_voice")
         if any(str(_old_dj.get(k) or "") != str(_new_dj.get(k) or "")
                for k in _cast_keys):
+            # [#1215] open the recast job on the spot, so the cast bar
+            # can say what is happening before the keeper's next pass
+            # finds it. The sweep is still a STATE COMPARISON and is
+            # still what does the work - this only names the moment.
+            try:
+                recast_desk.note_change(_RECAST_JOBS, _old_dj, _new_dj)
+            except Exception:  # noqa: BLE001
+                pass
             _TALK_CUT[0] += 1
             note_action("🎙 cast change — cutting to the new voices now")
             pipeline_log("voice", "cast changed in settings — current round "
@@ -102428,6 +105046,7 @@ async def director_state(
         "dims": list(EMOTION_DIMS),
         "perf": dj["perf"],
         "perf_strength": dj["perf_strength"],
+        "weather": weather_desk(),                          # [#1232]
     }
 
 
@@ -102461,6 +105080,37 @@ async def director_state_set(
     return {"who": who, "state": speaker_state(who),
             "macro": str((_RADIO.get("speaker_macro") or {}).get(who)
                          or "")}
+
+
+@app.post("/api/director/weather/roll")
+async def director_weather_roll(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1232] Roll the weather NOW, by hand, whatever the dial says - every
+    seat, or the one named in {"who": "dj"}. The roll goes into the live
+    state and is what every line written from here reads until the next
+    round rolls again."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    who = str((payload or {}).get("who") or "").strip()[:24] \
+        if isinstance(payload, dict) else ""
+    seats = [who] if who else list(WEATHER_SEATS)
+    try:
+        if not who and not str(dj_settings().get("third_name") or ""):
+            seats = [s for s in seats if s != "third"]
+    except Exception:  # noqa: BLE001
+        pass
+    rec = weather_roll_round(seats, why="by hand", force=True)
+    note_action("the director's weather was rolled by hand (seed %s)"
+                % rec.get("seed"))
+    return {"ok": True, "roll": rec,
+            "speakers": _RADIO.get("speaker_state") or {},
+            "macros": _RADIO.get("speaker_macro") or {},
+            "weather": weather_desk()}
 
 
 # --- voice-lab proxy and harvest -------------------------------------------
@@ -105362,6 +108012,21 @@ def crystal_prompt_contract(text: str) -> dict[str, Any]:
     contract = crystal_source_contract(text)
     contract["rhyme_assistance"] = crystal_rhyme_assistance(text, contract)
     contract["crystal_landings"] = crystal_landing_pairs(text)
+    # [#1249] the caller's subject words in this line are names to retain:
+    # crystal_prompts reads contract["names"] into names_to_retain, so the
+    # rewrite is told to keep them, and tint_evaluate below refuses a bar
+    # that drops one. asyncio.to_thread copies the context, so the entry on
+    # the line-review context is visible from the worker thread.
+    try:
+        for word in _tint_topic_nouns():
+            if not re.search(r"\b" + re.escape(word), text, re.I):
+                continue
+            names = contract.setdefault("names", [])
+            if not any(str((n or {}).get("normalized") or "").lower() == word.lower()
+                       for n in names if isinstance(n, dict)):
+                names.append({"text": word, "normalized": word.lower()})
+    except Exception:  # noqa: BLE001
+        pass
     return contract
 
 
@@ -105786,6 +108451,21 @@ def _tint_ngrams(text: Any, n: int = 6) -> set[str]:
     return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
 
 
+def _tint_topic_nouns() -> list[str]:
+    """[#1249] the caller's subject words for the round being tinted, read
+    off the line-review context (the entry rides on it through
+    _line_review_scoped), or [] when this is not a call."""
+    try:
+        ctx = _LINE_REVIEW_CONTEXT.get() or {}
+        entry = ctx.get("entry") or {}
+        if not isinstance(entry, dict) or not entry.get("caller_name"):
+            return []
+        topic = str((entry.get("call") or {}).get("topic") or "")
+        return topic_nouns(topic)[:12] if topic else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _tint_boilerplate() -> set[str]:
     """2026-09-08: the station's own name ("Chicken Tendo Little Pine Box FM
     Station") is written into a source by the prompt, not said by anyone; a
@@ -105871,6 +108551,12 @@ SPEAKBOX_TURN_CHARS = 260
 # character reading is a segment, not a round, and the rest of the hour
 # still has to happen.
 SPEAKBOX_TURN_MOST = 8
+# [#1233] Under a System2 job a stapled passage is this many spoken turns.
+# System2 writes a scene for at most 90 s (system2_runtime.settings_for_work)
+# into a slot of typically 180 s; one 260-character turn is ~16 s, so an
+# opening AND a closing quote still leave the scene inside its slot. The
+# legacy road (no job) is unbounded, as it always was.
+SPEAKBOX_S2_QUOTE_TURNS = 1
 _SPEAKBOX_SENTENCE = re.compile(r"(?<=[.!?…])\s+")
 
 
@@ -106033,6 +108719,21 @@ def tint_evaluate(source: Any, candidate: Any,
             semantic_ok = semantic_ok and bool(_semantic["call_contract"].get("ok"))
         except Exception:
             semantic_ok = False
+    # [#1249] THE TINT MAY NOT DROP THE CALLER'S SUBJECT WORDS. A subject
+    # noun the source line carries must survive the bar; a dropped one is
+    # reported under `missing`, which the repass quotes back as "put back
+    # these source words". Read off the round's own paperwork.
+    try:
+        _topic_keep = _tint_topic_nouns()
+        if _topic_keep:
+            _topic_dropped = topic_words_dropped(plain, made, _topic_keep)
+            if _topic_dropped:
+                _semantic["topic_dropped"] = list(_topic_dropped)
+                _semantic["missing"] = sorted(set(
+                    list(_semantic.get("missing") or []) + list(_topic_dropped)))
+                semantic_ok = False
+    except Exception:  # noqa: BLE001
+        pass
     _semantic["ok"] = semantic_ok
 
     rhyme = _rhyme_pairs(dst, answering)
@@ -106411,6 +109112,7 @@ def _tint_out_clean(text: Any) -> str:
     out = re.sub(r"\s+,", ",", out)
     out = re.sub(r"([.!?;:])\s*,", r"\1", out)
     out = re.sub(r"([.!?;:])\s*;", r"\1", out)
+    out = plot_label_scrub(out)                    # [#1240]
     return " ".join(out.split()).strip().strip('"')
 
 
@@ -108938,6 +111640,7 @@ async def crystal_tint(script: str, kind: str = "",
                            or any(r.get("operator_accepted") for r in _evaluations)):
                 out["ok"] = True
                 out["script"] = tinted
+                phrase_ban_tint_guard(out, kind)          # [#1230]
                 out["approved_lines"] = [hashlib.sha1(" ".join(
                     str(r.get("text") or "").split()).lower().encode("utf-8", "ignore")).hexdigest()
                     for r in _progress_turns
@@ -109151,6 +111854,7 @@ async def crystal_tint(script: str, kind: str = "",
             return out
         out["ok"] = True
         out["script"] = tinted
+        phrase_ban_tint_guard(out, kind)                  # [#1230]
         out["approved_lines"] = [hashlib.sha1(" ".join(
             str(s or "").split()).lower().encode("utf-8", "ignore")).hexdigest()
             for i, (_m, s) in enumerate(made_units) if i in selected_ix]
@@ -111998,12 +114702,15 @@ async def dj_voice_api(
     # banked from a dead process - the server-side filter alone cannot
     # reach clips already sitting in a browser's queue.
     return {"server_ms": server_ms, "cut_ms": _cut_ms, "clips": clips,
+            "cut_ids": record_bound_cut_ids(),                  # [#1237]
             "reservation_updates": reservation_updates}
 
 
 @app.get("/api/dj/video")
 async def dj_video_api(
     since: int = 0,
+    t: str = "",                                            # [#1244]
+    lag: str = "",                                          # [#1244]
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """#1263: the stings that have a PICTURE, and nothing else.
@@ -112019,15 +114726,48 @@ async def dj_video_api(
 
     A clip that has missed its moment is NOT offered: the set coming on
     over whatever is airing now is worse than the clip being missed."""
-    require_read_auth(authorization)
+    # [#1244] A GUEST ON A SHARED LINK MAY ASK FOR THE PICTURE.
+    #
+    # This is the only door onto the video ring now, and it is the door
+    # the tune page uses. Reads are open by default (LOCK_READS is
+    # false), so this changes nothing today - but the moment reads are
+    # locked, a listener holding nothing but a tune-in link would lose
+    # the picture while keeping the sound, which is the fault this
+    # request is about. `lag` is a STRING for the same reason dj_status
+    # takes `lean` as one: a listener who sends nonsense gets the
+    # default, not a 422 on his only picture route.
+    if str(t or "").strip():
+        require_listen_auth(t, authorization)
+    else:
+        require_read_auth(authorization)        # [#1244] the door as it was
     server_ms = int(time.time() * 1000)
     cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
+    # [#1244] AND ONLY A CALLER THAT ASKED FOR THEM PAYS FOR THEM.
+    #
+    # `videos` is a dozen small rows and this answer is polled every
+    # 2.5 s by the desk, the tablet and the page alike - see the #1000
+    # note on what a poll costs a phone. A caller that sends `lag`, or a
+    # guest on a tune-in link, is the LATE listener this list exists
+    # for; sfx-tv.js sends neither and its payload is byte-for-byte what
+    # it has always been.
+    late: dict[str, Any] = {}
+    if str(t or "").strip() or lag != "":
+        try:
+            lag_ms = int(max(0.0, min(180.0, float(lag or 0))) * 1000)
+        except (TypeError, ValueError):
+            lag_ms = 0
+        late = {"videos": dj_video_late(server_ms, lag_ms),
+                "burst_s": dj_video_burst_s()}
     # 2026-09-14: "allow me to use endless video mode even if the station
     # is on pause ... endless video mode as a screensaver" while the rooms
     # bank the show. The pause gate stands for the station's own stings;
     # the endless set is the operator's explicit choice and rolls on.
     if radio_paused() and not sfx_video_mode_on():
         return {"clips": [], "server_ms": server_ms,
+                # [#1244] a listener thirty seconds behind live is
+                # still hearing the minute before the pause, so the late
+                # list is honest even here.
+                **late,
                 "cut_ms": cut_ms, "paused": True, "endless": False,
                 "seamless": sfx_video_seam_on()}       # 2026-09-15 (#1184)
     out = []
@@ -112044,6 +114784,16 @@ async def dj_video_api(
             continue
         out.append({**clip, "broadcast_ms": broadcast})
     return {"clips": out, "server_ms": server_ms, "cut_ms": cut_ms,
+            # [#1244] `late` is the same ring held open long enough for a
+            # listener who is deliberately behind live to reach it, plus
+            # the burst that says how far behind that is. The tune page
+            # reads `videos` first (tvPoll, #1414); every other surface
+            # reads `clips`, asks for neither, and is untouched.
+            **late,
+            # [#1200] clips deleted in the last quarter hour: a set holding
+            # one in its queue, its warm slot or its tube drops it.
+            "withdrawn": [r["id"] for r in
+                          sfx_deleted_recent(12, SFX_DELETED_WITHDRAW_S)],
             "endless": sfx_video_mode_on(),         # 2026-09-14
             # 2026-09-15 (#1184): the hand-over style, on the poll the set
             # already makes. The station does nothing with this; it is the
@@ -113147,9 +115897,94 @@ def _provenance_material(prompt: str) -> list[dict[str, Any]]:
     return out
 
 
+# [#1206] WHEN THE PAPERWORK HAS LEFT THE RING, GO AND GET IT OFF DISK.
+#
+# Measured 2026-09-21: _RADIO["chat"] held 240 rows spanning 1,486 s.
+# Twenty-five minutes, and a restart empties it (dj_start). The durable
+# air log keeps the same rows under the SAME id for 48 h, so the only
+# thing missing was the second look.
+
+
+def _booth_ring_row(want: str) -> dict[str, Any]:
+    """The live booth row, newest match first. The ring is authoritative
+    while it holds the line: it carries the trace the log does not."""
+    for candidate in reversed(_RADIO.get("chat") or []):
+        if str(candidate.get("id") or "") == want:
+            return dict(candidate)
+    return {}
+
+
+def _booth_ledger_row(want: str = "", text: str = "",
+                      at: float = 0.0) -> tuple[dict[str, Any], str]:
+    """The durable row for a line the ring has dropped — by id first,
+    then by exact text nearest the moment the caller says it aired.
+    Returns (row, how) with how in {"", "id", "text"}."""
+    try:
+        if want:
+            got = airlog_row(want)
+            if got:
+                return dict(got), "id"
+        probe = " ".join(str(text or "").split())[:600].casefold()
+        if not probe:
+            return {}, ""
+        best: dict[str, Any] = {}
+        gap = 1.0e18
+        with _AIRLOG_LOCK:              # the keeper thread writes it
+            rows = list(_AIRLOG_INDEX.values())
+        for row in rows:
+            if " ".join(str(row.get("text") or "").split()).casefold() \
+                    != probe:
+                continue
+            when = float(row.get("air_at") or row.get("ts") or 0)
+            apart = abs(when - float(at or 0)) if at else 0.0
+            if apart < gap:
+                best, gap = dict(row), apart
+        # Without a time to aim at, the nearest exact text is the best
+        # anyone can do; with one, refuse a match an hour off the mark.
+        if best and (not at or gap <= 3600.0):
+            return best, "text"
+    except Exception:  # noqa: BLE001
+        return {}, ""
+    return {}, ""
+
+
+def _booth_picture(row: dict[str, Any], text: str = "") -> dict[str, Any]:
+    """[#1206] The picture behind an analysis row, and how it was made.
+
+    The file name is on the row since this patch; older ledger rows only
+    have the sentence, which names the file in so many words. The making
+    of the PICTURE (as against the making of the line about it) is in
+    data/generations.jsonl — the request, the checkpoint, the seconds."""
+    name = str(row.get("image") or "").strip()
+    if not name and str(row.get("kind") or "") == "image_analysis":
+        hit = re.match(r"^\s*Image analysis complete:\s*(.+?)\s*$",
+                       str(text or ""))
+        name = hit.group(1).strip() if hit else ""
+    if not name:
+        return {}
+    made: dict[str, Any] = {}
+    try:
+        for rec in reversed(_read_all_generations()):
+            if name in [str(f) for f in (rec.get("files") or [])]:
+                stats = dict(rec.get("stats") or {})
+                made = {"at": rec.get("ts"),
+                        "request": str(rec.get("request") or "")[:400],
+                        "model": str(rec.get("model") or ""),
+                        "kind": str(rec.get("kind") or ""),
+                        "seconds": stats.get("duration_s"),
+                        "device": str(stats.get("device") or "")[:80]}
+                break
+    except Exception:  # noqa: BLE001
+        made = {}
+    return {"name": name, "url": "/api/generations/image/" + quote(name),
+            "made": made}
+
+
 @app.get("/api/dj/provenance/{line_id}")
 async def dj_provenance_api(
     line_id: str,
+    text: str = "",
+    at: float = 0.0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """#888/#889: where one booth line CAME FROM. Right-click any entry.
@@ -113169,12 +116004,17 @@ async def dj_provenance_api(
     require_read_auth(authorization)
     _ensure_chat_ids()
     want = str(line_id or "").strip()
-    row: dict[str, Any] = {}
-    for candidate in reversed(_RADIO.get("chat") or []):
-        if str(candidate.get("id") or "") == want:
-            row = dict(candidate)
-            break
+    # [#1206] the ring first — while it holds the line it carries the
+    # trace, which the durable log does not — then the 48 h ledger.
+    said_hint = " ".join(str(text or "").split())[:600]
+    row = _booth_ring_row(want)
+    ledger = ""
     if not row:
+        row, ledger = _booth_ledger_row(want, said_hint, float(at or 0))
+    if not row:
+        # Nothing in the ring and nothing in two days of ledger. This
+        # wording is load-bearing: desktop/renderer/script-lineage.js
+        # matches it verbatim to tell "gone" from "broken".
         raise HTTPException(status_code=404,
                             detail="That line is no longer in the booth")
 
@@ -113241,6 +116081,14 @@ async def dj_provenance_api(
                 row["text"] = str(one.get("text") or "")
                 row["lines"] = list(one.get("lines") or [])
                 break
+        # [#1233] "quoted" was the FILE NAME in the prompt, which no round
+        # ever writes; the passage itself is what a prompt can carry.
+        try:
+            _passage = " ".join(str(row.get("text") or "").split())[:60]
+            if prompt and _passage and _passage in " ".join(prompt.split()):
+                row["quoted"] = True
+        except Exception:  # noqa: BLE001
+            pass
         documents.append(row)
 
     _doc(row.get("source"), "the swath this line was seeded from")
@@ -113265,6 +116113,10 @@ async def dj_provenance_api(
     except Exception:  # noqa: BLE001
         followed = False
 
+    try:                                                   # [#1249]
+        _topic_contract = await asyncio.to_thread(topic_contract_for_line, row)
+    except Exception:  # noqa: BLE001
+        _topic_contract = {}
     return {
         "ok": True,
         "id": want,
@@ -113276,7 +116128,9 @@ async def dj_provenance_api(
                           # and the exact span it occupies inside it
                           "clip_media", "clip_from", "clip_until",
                           "clip_tail",
-                          "product", "track_id", "analysis", "seconds")},
+                          "product", "track_id", "analysis", "seconds",
+                          # [#1206] the analysis desk's own fields
+                          "image", "ms", "round")},
         "render": render,
         "written": {k: v for k, v in written.items()
                     if k in ("model", "ms", "chars", "temp", "budget",
@@ -113284,6 +116138,7 @@ async def dj_provenance_api(
                              "prompt", "script")},
         "prepared": prepared,
         "how": how,
+        "topic_contract": _topic_contract,                   # [#1249]
         "material": _provenance_material(prompt),
         "documents": documents,
         "crystal": crystal,
@@ -113293,6 +116148,10 @@ async def dj_provenance_api(
             "prompt": str(written.get("sched") or ""),
             "kind_now": str(_RADIO.get("sched_kind") or ""),
             "prompt_now": str(_RADIO.get("sched_prompt") or "")[:900],
+            # [#1195] which alternative of the segment prompt book governed
+            # the call that wrote this line, and what its commands became.
+            "alternative": (written.get("segprompt")
+                            if isinstance(written.get("segprompt"), dict) else None),
         },
         # #983: TWO PROMPTS, REPORTED AS TWO. `entry` is the PINE
         # AGENT's armed prompt; it governs the assistant and, since #983,
@@ -113312,6 +116171,13 @@ async def dj_provenance_api(
         },
         "burst": int(trace.get("burst") or 0),
         "requests": (request_history().get("top") or [])[:6],
+        # [#1206] WHICH RECORD IS THIS. "" means the live booth ring;
+        # "id"/"text" mean the line had already scrolled out and this was
+        # read back off data/air_log.jsonl, which is a narrower record and
+        # must be labelled as one rather than quietly passed off as live.
+        "from_ledger": bool(ledger),
+        "recovered_by": ledger,
+        "picture": _booth_picture(row, text),
     }
 
 
@@ -116101,6 +118967,766 @@ def tablet_step(action: str, host: str = "") -> dict[str, Any]:
                         detail="the tablet doctor cannot " + action)
 
 
+# --- [#1241] / [#1239] / [#1230]: WHERE A PHRASE COMES FROM, AND HOW TO KILL IT
+#
+# #1241 "I want an icon here for tracing a typed phrase through the prompts,
+#  the data crystal, the topics, the scripts, and find the source of where a
+#  scripted phrase is coming from. I need to be able to completely remove and
+#  delete and trace a phrase or saying from the dialogue and future
+#  scripting."
+# #1239 "I want the ability to have a trash can so that whenever I search for
+#  [a phrase] I'm able to delete [it] from the database and have it not said
+#  by the host anymore."
+# #1230 "Whenever I search for a word, I want the ability to block it or
+#  remove it from being spoken. They are saying that somewhere a system
+#  prompt is making it say that."
+#
+# MEASURED FIRST, on the live station, 2026-09-21 - the three phrases the
+# operator actually searched:
+#
+#   "sliding magnets"      67 airings/48h over 49 distinct lines. Written in
+#                          exactly ONE place in the entire station: the
+#                          `objects` deck inside _fallback_call_script (this
+#                          file). From there it had spread to 124 gold bars,
+#                          214 call-log turns, 56 said-lines, 41 pantry rows,
+#                          16 larder rows and 2 director rewrites.
+#   "dimming light"       105 airings/48h over 70 distinct lines. The SAME
+#                          one line of code. 166 gold bars, 348 call-log
+#                          turns, 113 said-lines - and once inside a prepared
+#                          round's OWN PROMPT ("the DJ held the floor last
+#                          and said ..."), which is the loop that keeps it
+#                          alive after the code is fixed.
+#   "wanted us to explore" 42 airings/48h, and the popup told the operator
+#                          "ONE VOICE: Skip says it 100% of the time. That is
+#                          a persona or a prompt for that seat." IT IS NOT.
+#                          That phrase is in no persona, no prompt, no
+#                          document and no line of code. It is the TINT'S
+#                          RHYME LANDING for _fallback_call_script's "wanted
+#                          us to discuss." - four System2 traces show the
+#                          same rewrite, door/war/floor/more -> explore.
+#                          Searching the prompts for it would have found
+#                          nothing, forever.
+#
+# So: four layers, each source named by store AND key, and - when a phrase is
+# written nowhere at all - the tracer drops its last word and walks again,
+# which is how "wanted us to explore" ends up pointing at the one line of
+# code that really writes it.
+#
+# The walk parses several megabytes. It runs on a thread, behind a memo, and
+# never on the loop (memory: event-loop-starvation-watchdog).
+
+PHRASE_TRACE_TTL = 45.0
+PHRASE_TRACE_MOST = 24
+_PHRASE_TRACE_MEMO = phrase_trace.Memo(ttl=PHRASE_TRACE_TTL, most=24)
+_PHRASE_CODE_MEMO: dict[str, Any] = {}
+_PHRASE_FILE_MEMO: dict[str, Any] = {}
+_PHRASE_BAN_LOCK = RLock()
+_PHRASE_KEY_MEMO: dict[str, Any] = {"stamp": None, "key": "", "set": False}
+
+# layer, store, file under data/, what a tick does, what the operator is
+# looking at.  Filenames, not constants: several of these desks live in
+# other modules and only the file is common ground.
+PHRASE_TRACE_STORES: tuple[tuple[str, str, str, str, str], ...] = (
+    ("prompts", "personas", "personas.json", "strip", "a persona"),
+    ("prompts", "prompt_book", "prompt_book.json", "strip", "the prompt book"),
+    ("prompts", "schedule", "schedule.json", "strip", "a schedule entry's standing instruction"),
+    ("prompts", "director_notes", "director_notes.json", "drop", "a director's note"),
+    ("prompts", "director_scripts", "director_scripts.json", "drop", "a director's rewrite"),
+    ("prompts", "approaches", "approaches.json", "drop", "an approach"),
+    ("prompts", "manager_memos", "manager_memos.json", "drop", "a memo from upstairs"),
+    ("prompts", "vision_prompts", "vision_prompts.json", "strip", "a vision prompt"),
+    ("prompts", "cast", "cast.json", "strip", "the cast"),
+    ("prompts", "segment_prompts", "segment_prompts.json", "strip", "a segment prompt"),
+    ("crystal", "crystals", "crystals.json", "strip", "a crystal"),
+    ("crystal", "crystal_notes", "crystal_notes.json", "strip", "a crystal note"),
+    ("crystal", "rhyme_families", "rhyme_families.json", "drop", "a rhyme family"),
+    ("crystal", "speakbox_gems", "speakbox_gems.json", "drop", "a speakerbox gem"),
+    ("topics", "caller_themes", "caller_themes.json", "drop", "a caller theme"),
+    ("topics", "banter_topics", "banter_topics.json", "drop", "a booth topic"),
+    ("topics", "plotlines", "plotlines.json", "drop", "a plotline"),
+    ("topics", "caller_stories", "caller_stories.json", "drop", "a caller story"),
+    ("topics", "caller_cases", "caller_cases.json", "drop", "a caller case"),
+    ("topics", "converse_seeds", "converse_seeds.json", "drop", "a conversation seed"),
+    ("topics", "requests", "requests.json", "drop", "a request on the book"),
+    ("scripts", "said_lines", "said_lines.json", "forget", "a line already said"),
+    ("scripts", "call_log", "call_log.json", "no_rerun", "a call in the log"),
+    ("scripts", "response_bank", "response_bank.json", "drop", "a banked response"),
+    ("scripts", "banter_saved", "banter_saved.json", "drop", "a saved round"),
+)
+
+# Directories of documents. Nothing here can be edited from the popup - the
+# ban covers them at the mouth and the writer is told which file it is.
+PHRASE_TRACE_DOCS: tuple[tuple[str, str, str], ...] = (
+    ("prompts", "brief_prompts", "brief_prompts"),
+    ("crystal", "minds", "minds"),
+    ("crystal", "crystal_docs", "crystals"),
+)
+
+# The stores that only exist in memory while the station runs. Reading them
+# from disk would be both slower and out of date.
+PHRASE_LIVE_STORES = ("larder", "shelf", "gold")
+
+PHRASE_SPOKEN_KEYS = ("script_tinted", "script", "script_plain", "text",
+                      "chunk", "said", "line")
+# What WROTE a round, as opposed to what it says. These are read for the
+# trace and never for the gate.
+PHRASE_PROMPT_KEYS = ("prompt", "armed", "system", "angle", "brief", "seed")
+
+
+def phrase_label_of(path: list[Any], parent: Any) -> str:
+    """What to call the entry a leaf belongs to, in the operator's words."""
+    if isinstance(parent, dict):
+        for k in ("name", "title", "label", "who", "caller_name", "kind",
+                  "topic", "id", "word"):
+            got = parent.get(k)
+            if isinstance(got, str) and got.strip():
+                return got.strip()[:80]
+    for seg in reversed(path):
+        if isinstance(seg, str) and seg not in PHRASE_SPOKEN_KEYS:
+            return seg[:80]
+    return phrase_trace.path_text(path)[:80]
+
+
+def phrase_row_spoken(row: Any) -> str:
+    """Everything a banked round would SAY. NOT its prompt and NOT its desk:
+    a phrase quoted in the prompt that wrote a round is a reason to look at
+    the prompt, never a reason to refuse the round."""
+    if not isinstance(row, dict):
+        return ""
+    out: list[str] = []
+    seen = 0
+    stack: list[Any] = [row.get("entry") if isinstance(row.get("entry"), dict) else None, row]
+    while stack and seen < 400:
+        cur = stack.pop()
+        if not isinstance(cur, dict):
+            continue
+        for k in PHRASE_SPOKEN_KEYS:
+            got = cur.get(k)
+            if isinstance(got, str) and got:
+                out.append(got)
+                seen += 1
+        for k in ("turns", "lines", "chunks", "script_turns", "prep_turns"):
+            got = cur.get(k)
+            if isinstance(got, list):
+                for it in got[:80]:
+                    if isinstance(it, dict):
+                        stack.append(it)
+                    elif isinstance(it, str):
+                        out.append(it)
+                        seen += 1
+    return "\n".join(out)[:40000]
+
+
+def phrase_row_prompt(row: Any) -> str:
+    """What was PUT IN FRONT of the writer of this round - its desk prompt,
+    its armed system prompt, its angle. Read for the trace only.
+
+    This is where #1230's "somewhere a system prompt is making it say that"
+    turns out to be literally true and nobody could see it: the battle clause
+    quotes the last line that AIRED back into the next round's prompt
+    ("ANSWER THIS. the DJ held the floor last and said ..."), so a phrase the
+    station says once is handed back to it as an instruction. Measured on the
+    live shelf: 16 larder rows and one prepared gallery round carried
+    "dimming light" in their PROMPT and not one of them in their script."""
+    if not isinstance(row, dict):
+        return ""
+    out: list[str] = []
+    for src in (row, row.get("entry"), row.get("desk"),
+                (row.get("entry") or {}).get("desk") if isinstance(row.get("entry"), dict) else None):
+        if not isinstance(src, dict):
+            continue
+        for k in PHRASE_PROMPT_KEYS:
+            got = src.get(k)
+            if isinstance(got, str) and got:
+                out.append(got)
+    return "\n".join(out)[:60000]
+
+
+def phrase_ban_rows() -> list[dict[str, Any]]:
+    """Every ACTIVE ban that is a phrase: more than one word, or marked one
+    when it was written. A single word is still handled by #642's list."""
+    out = []
+    for row in banned_words():
+        word = str(row.get("word") or "").strip()
+        if word and (row.get("phrase") or " " in word):
+            out.append(row)
+    return out
+
+
+def phrase_ban_key() -> str:
+    """A stamp for the active phrase bans, so the hot gate below can answer
+    from a row's own paperwork instead of re-scanning it every poll."""
+    stamp = _BANNED_MEMO.get("stamp")
+    if _PHRASE_KEY_MEMO.get("set") and _PHRASE_KEY_MEMO.get("stamp") == stamp:
+        return str(_PHRASE_KEY_MEMO.get("key") or "")
+    key = "|".join(sorted(
+        "%s@%s" % (str(r.get("word") or ""), str(r.get("scope") or "everywhere"))
+        for r in phrase_ban_rows()))
+    _PHRASE_KEY_MEMO.update({"stamp": stamp, "key": key, "set": True})
+    return key
+
+
+def phrase_ban_hit(text: Any, kind: str = "") -> str:
+    """The first banned phrase this text carries, or "". A scoped ban is
+    only in force on its own road; everywhere is everywhere."""
+    if not text:
+        return ""
+    for row in phrase_ban_rows():
+        scope = str(row.get("scope") or "everywhere")
+        if scope not in ("", "everywhere") and kind and scope != str(kind):
+            continue
+        if phrase_trace.hits(row.get("word"), text):
+            return str(row.get("word") or "")
+    return ""
+
+
+def phrase_ban_strip(text: Any, kind: str = "") -> tuple[str, int]:
+    """Every sentence carrying a banned phrase, gone. Used at the mouth and
+    on the tint's way out."""
+    out = str(text or "")
+    cut = 0
+    for row in phrase_ban_rows():
+        scope = str(row.get("scope") or "everywhere")
+        if scope not in ("", "everywhere") and kind and scope != str(kind):
+            continue
+        out, n = phrase_trace.strip_sentences(out, row.get("word"))
+        cut += n
+    return out, cut
+
+
+def phrase_ban_row_blocked(kind: str, row: Any) -> bool:
+    """#1239: a banked round that carries a banned phrase is NOT ready.
+
+    This is the half strip_banned cannot reach. A prepared round already has
+    its audio on the shelf; editing the words at the mouth would leave the
+    recording saying the phrase anyway. So the row never leaves the shelf,
+    and phrase_ban_sweep retires the ones that exist at ban time.
+
+    The verdict is written onto the row against the ban list's stamp, so the
+    panel's poll re-reads paperwork instead of re-scanning 40 kB per row.
+    With no phrase banned - the normal state - this costs one memoised
+    dict lookup."""
+    try:
+        key = phrase_ban_key()
+        if not key or not isinstance(row, dict):
+            return False
+        got = row.get("phrase_ban")
+        if isinstance(got, dict) and str(got.get("key") or "") == key:
+            return bool(got.get("hit"))
+        hit = phrase_ban_hit(phrase_row_spoken(row), str(kind))
+        row["phrase_ban"] = {"key": key, "hit": hit, "at": round(time.time())}
+        return bool(hit)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def phrase_ban_tint_guard(out: dict[str, Any], kind: str = "") -> None:
+    """#1230: the tint is where a banned phrase is INVENTED.
+
+    "wanted us to explore" exists because the rewrite needed a rhyme for
+    door, and no prompt and no gate was ever going to see that coming. The
+    pass's own output is therefore held to the ban: the sentence goes, and a
+    rewrite that is nothing but the banned sentence is refused outright so
+    the plain version airs instead."""
+    try:
+        text = str(out.get("script") or "")
+        if not text:
+            return
+        clean, cut = phrase_ban_strip(text, str(kind))
+        if not cut:
+            return
+        if len(clean.split()) < 3:
+            out["ok"] = False
+            out["script"] = ""
+            out["why"] = ("the tint landed on a banned phrase and there was "
+                          "nothing else left of it")
+            return
+        out["script"] = clean
+        out["phrase_ban_cut"] = int(cut)
+        pipeline_log("speakbox", "the tint rhymed its way onto a banned "
+                     "phrase - %d sentence(s) taken out of the rewrite "
+                     "(#1230)" % cut, extra=text[:220])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def phrase_code_files() -> list[Any]:
+    """app.py first, then every module beside it."""
+    try:
+        here = Path(__file__).resolve().parent
+        rest = sorted(p for p in here.glob("*.py")
+                      if p.is_file() and p.name != "app.py")
+        head = [here / "app.py"] if (here / "app.py").is_file() else []
+        return head + rest
+    except OSError:
+        return []
+
+
+def phrase_live_sources(needle: str, most: int) -> tuple[list[dict[str, Any]], int, int]:
+    """The banked stores, out of memory - they are current there and stale
+    on disk, and the prepared shelf is 28 MB. These are the rows a ban
+    RETIRES, so a source's key is the sid the retirement desk uses.
+
+    Returns (sources, prepared rounds carrying it, gold bars carrying it) -
+    the counts are complete even though the sources are capped, because the
+    confirm sheet has to name the real consequence, not the first 24."""
+    out: list[dict[str, Any]] = []
+    prompts: list[dict[str, Any]] = []
+    rounds = bars = 0
+    piles: list[tuple[str, str, list[Any]]] = [("larder", "banter", list(_LARDER))]
+    try:
+        for kind, rows in list(_SHELF.items()):
+            piles.append(("shelf", str(kind), list(rows or [])))
+    except Exception:  # noqa: BLE001
+        pass
+    for store, kind, rows in piles:
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            said = phrase_row_spoken(row)
+            if not phrase_trace.hits(needle, said):
+                # It is not in what this round SAYS - but it may be in what
+                # was said TO it. That is a prompt, and it belongs in the
+                # prompts layer where the operator is looking for it.
+                asked = phrase_row_prompt(row)
+                if len(prompts) < most and phrase_trace.hits(needle, asked):
+                    prompts.append(phrase_trace.make_source(
+                        "prompts", store + "_prompt",
+                        str(row.get("sid") or retire_id(kind, row)), asked, needle, "",
+                        what="the prompt that wrote a prepared round",
+                        round=kind, label="%s: the prompt it was written from"
+                                          % (retire_label(kind, row) or retire_kind_label(kind)),
+                        why=("the station quotes what it last said back into the "
+                             "next round's prompt, so an aired phrase becomes an "
+                             "instruction - banning it breaks that loop")))
+                continue
+            rounds += 1
+            if len(items) < most:
+                items.append({"key": str(row.get("sid") or retire_id(kind, row)),
+                              "text": said, "round": kind,
+                              "what": retire_kind_label(kind),
+                              "label": retire_label(kind, row) or retire_kind_label(kind),
+                              "aired": int(row.get("aired") or 0)})
+        out += phrase_trace.text_sources(needle, items, "scripts", store,
+                                         "retire", most=most)
+    try:
+        items = []
+        for r in _gold_rows():
+            if not phrase_trace.hits(needle, r.get("text")):
+                continue
+            bars += 1
+            if len(items) < most:
+                items.append({"key": str(r.get("key") or ""),
+                              "text": str(r.get("text") or ""),
+                              "who": str(r.get("who") or ""),
+                              "label": str(r.get("who") or "a bar"),
+                              "what": "a gold bar", "aired": int(r.get("fired") or 0)})
+        out += phrase_trace.text_sources(needle, items, "scripts", "gold",
+                                         "drop", most=most)
+    except Exception:  # noqa: BLE001
+        pass
+    return out + prompts, rounds, bars
+
+
+def phrase_trace_walk(needle: str, most: int = PHRASE_TRACE_MOST) -> dict[str, Any]:
+    """Every place the phrase is written, by layer. THREAD ONLY. [#1241]"""
+    began = time.time()
+    found: list[dict[str, Any]] = []
+    read: list[str] = []
+    live, rounds, bars = phrase_live_sources(needle, most)
+    found += live
+    for layer, store, fn, kill, what in PHRASE_TRACE_STORES:
+        try:
+            data = phrase_trace.file_json(data_path(fn), _PHRASE_FILE_MEMO)
+        except Exception:  # noqa: BLE001
+            data = None
+        if data is None:
+            continue
+        read.append(fn)
+        found += phrase_trace.json_sources(needle, data, layer, store, kill,
+                                           most=most, label=phrase_label_of,
+                                           file=fn, what=what)
+    for layer, store, dirname in PHRASE_TRACE_DOCS:
+        try:
+            base = data_path(dirname)
+            files = phrase_trace.text_files(base, most=800)
+        except Exception:  # noqa: BLE001
+            continue
+        found += phrase_trace.document_sources(needle, files, _PHRASE_FILE_MEMO,
+                                               layer, store, base=base, most=most)
+    files = phrase_code_files()
+    code = phrase_trace.code_sources(needle, files, _PHRASE_CODE_MEMO, most=most)
+    found += code
+    # THE KIN WALK. A phrase that is written nowhere was still written by
+    # something: drop its last word and look again, because the tint rhymes
+    # the end of a line and leaves the rest of it exactly as the code wrote
+    # it. This is the only reason "wanted us to explore" can be traced.
+    kin = ""
+    if not code:
+        words = phrase_trace.normalize(needle).split()
+        while len(words) > 2 and not code:
+            words = words[:-1]
+            code = phrase_trace.code_sources(" ".join(words), files,
+                                             _PHRASE_CODE_MEMO, most=most)
+        if code:
+            kin = " ".join(words)
+            for s in code:
+                s["kin"] = kin
+                s["kill"] = "code"
+                s["kill_label"] = phrase_trace.KILLS["code"]
+                s["why"] = ("the phrase itself is written nowhere; this line "
+                            "writes \u201c%s\u201d and the tint rhymes the rest"
+                            % kin)
+            found += code
+    layers = phrase_trace.group(found)
+    prompts = [s for s in found if s.get("layer") == "prompts"]
+    prompts.sort(key=lambda s: -int(s.get("count") or 0))
+    banned = ""
+    for row in phrase_ban_rows():
+        if phrase_trace.normalize(row.get("word")) == phrase_trace.normalize(needle):
+            banned = str(row.get("word") or "")
+    removable = sum(1 for s in found
+                    if s.get("kill") in ("strip", "drop", "deactivate"))
+    return {"q": needle, "layers": layers, "sources": len(found),
+            "kin": kin, "stores_read": len(read),
+            "verdict_source": prompts[0] if prompts else None,
+            "banned": bool(banned), "rounds": rounds, "bars": bars,
+            "removable": removable,
+            "confirm": phrase_trace.confirm_text(needle, rounds + bars, removable),
+            "ms": int((time.time() - began) * 1000)}
+
+
+async def phrase_trace_answer(needle: str, fresh: bool = False) -> dict[str, Any]:
+    """The trace, on a thread, memoised - an operator tapping twice pays
+    once, and the loop pays nothing at all."""
+    key = phrase_trace.normalize(needle)
+    if not fresh:
+        got = _PHRASE_TRACE_MEMO.get(key)
+        if got is not None:
+            return {**got, "memo": True}
+    got = await asyncio.to_thread(phrase_trace_walk, key)
+    _PHRASE_TRACE_MEMO.put(key, got)
+    return {**got, "memo": False}
+
+
+def phrase_ban_add(phrase: str, scope: str = "everywhere", reason: str = "",
+                   hours: float = 0.0, by: str = "operator") -> dict[str, Any]:
+    """#1239: the ban itself, in #642's own list so every gate that already
+    reads it enforces this too - the prompt clause, the mouth, the tint.
+
+    A WORD ban is a mood with a clock on it. A PHRASE ban is not: "have it
+    not said by the host anymore" is permanent until it is lifted, so the
+    row is written `forever` and banned_words() honours that."""
+    phrase = " ".join(str(phrase or "").split())[:120]
+    if len(phrase) < 2:
+        raise ValueError("give me a phrase")
+    with _PHRASE_BAN_LOCK, _BANNED_LOCK:
+        rows = [r for r in banned_words(active=False)
+                if str(r.get("word", "")).lower() != phrase.lower()]
+        row = {"word": phrase, "phrase": True, "at": time.time(),
+               "forever": not hours, "by": str(by or "operator")[:40],
+               "scope": str(scope or "everywhere")[:40],
+               "reason": str(reason or "")[:300],
+               "until": (time.time() + max(0.25, min(720.0, float(hours))) * 3600
+                         if hours else 0)}
+        rows.append(row)
+        try:
+            BANNED_WORDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            BANNED_WORDS_PATH.write_text(json.dumps(rows[-120:]))
+        except OSError:
+            pass
+        _BANNED_MEMO.update({"looked": 0.0, "stamp": None})
+        _PHRASE_KEY_MEMO.update({"set": False})
+    return row
+
+
+def phrase_ban_lift(phrase: str) -> bool:
+    phrase = " ".join(str(phrase or "").split())
+    with _PHRASE_BAN_LOCK, _BANNED_LOCK:
+        rows = banned_words(active=False)
+        keep = [r for r in rows if str(r.get("word", "")).lower() != phrase.lower()]
+        if len(keep) == len(rows):
+            return False
+        try:
+            BANNED_WORDS_PATH.write_text(json.dumps(keep))
+        except OSError:
+            return False
+        _BANNED_MEMO.update({"looked": 0.0, "stamp": None})
+        _PHRASE_KEY_MEMO.update({"set": False})
+    return True
+
+
+def phrase_ban_scan(phrase: str, scope: str = "everywhere") -> list[dict[str, Any]]:
+    """THREAD ONLY. Which prepared rounds would have said it.
+
+    The prepared shelf is 28 MB and the larder 8 MB; a regex over both is a
+    third of a second, which is a dead-air stall if it runs on the loop
+    (memory: event-loop-starvation-watchdog). So the READING happens here,
+    on a thread, and hands back nothing but ids - the retiring itself is a
+    handful of dict lookups and belongs on the loop, where no list is being
+    mutated underneath the walk."""
+    out: list[dict[str, Any]] = []
+    piles: list[tuple[str, list[Any]]] = [("banter", list(_LARDER))]
+    try:
+        for kind, rows in list(_SHELF.items()):
+            piles.append((str(kind), list(rows or [])))
+    except Exception:  # noqa: BLE001
+        pass
+    for kind, rows in piles:
+        if scope not in ("", "everywhere") and scope != kind:
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if not phrase_trace.hits(phrase, phrase_row_spoken(row)):
+                continue
+            out.append({"kind": kind, "sid": str(row.get("sid") or retire_id(kind, row)),
+                        "label": retire_label(kind, row),
+                        "text": retire_text(kind, row)[:160]})
+    return out
+
+
+def phrase_ban_sweep(phrase: str, carriers: list[dict[str, Any]]) -> dict[str, Any]:
+    """LOOP. Retire the rounds phrase_ban_scan found, then burn the gold
+    bars. Without this the ban only covers what has not been written yet,
+    and a fortnight of prepared radio still says it."""
+    gone: list[dict[str, Any]] = []
+    why = "phrase banned: \u201c%s\u201d" % phrase
+    for got in carriers or []:
+        sid = str(got.get("sid") or "")
+        if not sid:
+            continue
+        try:
+            kind, row = _retire_find(sid)
+        except Exception:  # noqa: BLE001
+            kind, row = "", None
+        if not row:
+            gone.append({**got, "removed": False, "why": "it had already left the shelf"})
+            continue
+        try:
+            retire_forced(kind or str(got.get("kind") or ""), row, why)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            out = retire_remove_now(kind or str(got.get("kind") or ""), row)
+        except Exception:  # noqa: BLE001
+            out = False
+        gone.append({**got, "kind": kind or got.get("kind"), "removed": bool(out)})
+    # The gold bank LAST. retire_forced harvests a retired round's accepted
+    # bars into gold on its way out (#1157), so purging gold first would put
+    # the banned phrase straight back into the bank it was taken from.
+    bars = 0
+    try:
+        rows = _gold_rows()
+        keep = [r for r in rows if not phrase_trace.hits(phrase, r.get("text"))]
+        bars = len(rows) - len(keep)
+        if bars:
+            rows[:] = keep
+            _gold_save()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"rounds": sum(1 for g in gone if g.get("removed")),
+            "found": len(gone), "bars": bars, "retired": gone[:60]}
+
+
+def phrase_source_kill(needle: str, sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """[#1241] The ticked SOURCES, removed from the desks they live on. Every file
+    is backed up beside itself first; a document that has moved under the
+    trace is refused rather than guessed at."""
+    done: list[dict[str, Any]] = []
+    by_store: dict[str, list[dict[str, Any]]] = {}
+    for s in sources:
+        store = str(s.get("store") or "")
+        if store in PHRASE_LIVE_STORES or store == "code":
+            done.append({"id": s.get("id"), "store": store, "ok": False,
+                         "why": ("the ban covers this at the mouth; a banked "
+                                 "round is retired, not edited")
+                         if store in PHRASE_LIVE_STORES
+                         else "this is written into the code - the ban covers it"})
+            continue
+        by_store.setdefault(store, []).append(s)
+    fmap = {store: fn for _l, store, fn, _k, _w in PHRASE_TRACE_STORES}
+    for store, rows in by_store.items():
+        fn = fmap.get(store)
+        if not fn:
+            for s in rows:
+                done.append({"id": s.get("id"), "store": store, "ok": False,
+                             "why": "a document on disk - the ban covers it at the mouth"})
+            continue
+        path = data_path(fn)
+        try:
+            data = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            for s in rows:
+                done.append({"id": s.get("id"), "store": store, "ok": False,
+                             "why": "that desk could not be read"})
+            continue
+        changed = 0
+        for s in phrase_trace.kill_order(rows):
+            key = s.get("key")
+            if not isinstance(key, list):
+                done.append({"id": s.get("id"), "store": store, "ok": False,
+                             "why": "that source has no path to remove"})
+                continue
+            ok, said = phrase_trace.apply_kill(data, key, str(s.get("kill") or ""), needle)
+            changed += 1 if ok else 0
+            done.append({"id": s.get("id"), "store": store, "ok": bool(ok),
+                         "why": said, "label": s.get("label")})
+        if not changed:
+            continue
+        try:
+            back = path.with_suffix(path.suffix + ".bak-1241")
+            if not back.exists():
+                back.write_text(path.read_text())
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False))
+            tmp.replace(path)
+        except OSError as exc:
+            for row in done:
+                if row.get("store") == store and row.get("ok"):
+                    row.update(ok=False, why="the desk could not be written: %s" % exc)
+    return {"killed": sum(1 for d in done if d.get("ok")), "rows": done}
+
+
+def phrase_ban_apply(phrase: str, scope: str = "everywhere", reason: str = "",
+                     hours: float = 0.0,
+                     carriers: list[dict[str, Any]] | None = None,
+                     killed: dict[str, Any] | None = None) -> dict[str, Any]:
+    """LOOP. The trash can, whole: block it, retire what would have said it,
+    count the sources the thread already removed, and write it in the
+    judgment book so the ban is answerable later."""
+    phrase = " ".join(str(phrase or "").split())[:120]
+    row = phrase_ban_add(phrase, scope, reason, hours)
+    sweep = phrase_ban_sweep(phrase, carriers or [])
+    killed = killed if isinstance(killed, dict) else {"killed": 0, "rows": []}
+    _PHRASE_TRACE_MEMO.drop()
+    _PHRASE_FILE_MEMO.clear()
+    say = ("\u201c%s\u201d is banned - %d prepared round(s) retired, %d gold "
+           "bar(s) burnt, %d source(s) removed"
+           % (phrase, sweep["rounds"], sweep["bars"], killed.get("killed") or 0))
+    try:
+        judgment_note("a phrase was banned",
+                      "the operator banned \u201c%s\u201d" % phrase,
+                      say, "phrase_ban:%s" % scope,
+                      str(reason or "")[:400], False)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pipeline_log("drop", say + " (#1239)", extra=str(reason or "")[:200])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "ban": row, "sweep": sweep, "sources": killed, "say": say}
+
+
+@app.get("/api/phrase/trace")                                  # [#1241]
+async def phrase_trace_api(
+    q: str = "",
+    fresh: int = 0,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """#1241: where a phrase is written - prompts, the crystal, topics,
+    scripts - with the file, the key, a snippet and what killing it means."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    needle = " ".join(str(q or "").lower().split())
+    if len(needle) < 2:
+        raise HTTPException(status_code=400, detail="give me a phrase")
+    got = await phrase_trace_answer(needle, fresh=bool(fresh))
+    counts = {layer["layer"]: layer["count"] for layer in got["layers"]}
+    bits = [f"{layer['label']} {layer['count']}" for layer in got["layers"]
+            if layer["count"]]
+    if got.get("kin"):
+        bits.append("written nowhere: the tint rhymes it out of "
+                    "\u201c%s\u201d" % got["kin"])
+    return {**got, "counts": counts,
+            "say": ("%d source(s) - %s" % (got["sources"], "; ".join(bits)))
+                   if got["sources"] else
+                   "that phrase is not written in any desk the station reads"}
+
+
+@app.post("/api/phrase/ban")                                   # [#1239]
+async def phrase_ban_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """#1239/#1230: never say it again. Blocks it in the prompt, strips the
+    sentence at the mouth, refuses it on the tint's way out, holds every
+    prepared round that carries it off the air and retires them, burns the
+    gold bars, and optionally removes the ticked sources."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    phrase = " ".join(str(payload.get("phrase") or payload.get("q") or "").split())
+    if len(phrase) < 2:
+        raise HTTPException(status_code=400, detail="give me a phrase")
+    scope = str(payload.get("scope") or "everywhere")
+    ids = payload.get("sources")
+    ids = {str(x) for x in ids} if isinstance(ids, list) else set()
+    try:
+        hours = float(payload.get("hours") or 0)
+    except (TypeError, ValueError):
+        hours = 0.0
+    # Everything that READS goes to a thread; only the writes - a handful of
+    # dict lookups and three small files - happen on the loop.
+    killed: dict[str, Any] = {"killed": 0, "rows": []}
+    if ids:
+        trace = await phrase_trace_answer(phrase)
+        picked = [s for layer in (trace.get("layers") or [])
+                  for s in (layer.get("sources") or [])
+                  if str(s.get("id")) in ids]
+        if picked:
+            killed = await asyncio.to_thread(phrase_source_kill, phrase, picked)
+    carriers = await asyncio.to_thread(phrase_ban_scan, phrase, scope)
+    return phrase_ban_apply(phrase, scope, str(payload.get("reason") or ""),
+                            hours, carriers, killed)
+
+
+@app.delete("/api/phrase/ban")                                 # [#1239]
+async def phrase_unban_api(
+    q: str = "",
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """Lift it. What was retired stays retired - the desk has the record."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_auth(authorization)
+    phrase = " ".join(str(q or "").split())
+    if len(phrase) < 2:
+        raise HTTPException(status_code=400, detail="give me a phrase")
+    lifted = phrase_ban_lift(phrase)
+    _PHRASE_TRACE_MEMO.drop()
+    return {"ok": True, "lifted": bool(lifted), "phrase": phrase,
+            "say": ("\u201c%s\u201d may be said again" % phrase) if lifted
+                   else "that phrase was not banned"}
+
+
+@app.get("/api/phrase/bans")                                   # [#1239]
+async def phrase_bans_api(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """Every phrase the operator has struck out, with why and by whom."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+    rows = [{"phrase": str(r.get("word") or ""), "scope": str(r.get("scope") or "everywhere"),
+             "reason": str(r.get("reason") or ""), "at": float(r.get("at") or 0),
+             "forever": bool(r.get("forever")), "until": float(r.get("until") or 0)}
+            for r in phrase_ban_rows()]
+    return {"bans": rows, "count": len(rows),
+            "say": "%d phrase(s) may not be said" % len(rows)}
+
+
 @app.get("/api/said/search")
 async def said_search_api(
     q: str = "",
@@ -116309,9 +119935,7 @@ def scene_inputs(kind: str = "", who: str = "") -> list[dict[str, Any]]:
         put("topic", "Topics in the bank", fresh,
             ("%d waiting, %d dropped" % (len(fresh), len(rows) - len(fresh)))
             if rows else "empty",
-            "\n".join("- " + str(r.get("text") or "")[:160]
-                      + (" (used)" if r.get("used") else "")
-                      for r in rows[:12]), "Topics",
+            paperwork_fields.topic_block(rows), "Topics",   # [#1231] one drawing, so an edit can be matched back to the bank
             "a planted topic is dropped into a round when the writing room "
             "reaches for one")
     except Exception:  # noqa: BLE001
@@ -116353,6 +119977,21 @@ def scene_inputs(kind: str = "", who: str = "") -> list[dict[str, Any]]:
                        "taking it over")
     except Exception:  # noqa: BLE001
         pass
+    try:                                                   # [#1249]
+        tc = caller_topic_contract_state(8)
+        put("topic_contract", "The caller's subject (the topic contract)",
+            tc.get("subject"),
+            (str(tc.get("subject") or "")[:120]
+             + ((" \u00b7 adherence %.0f%% over %d rounds"
+                 % (100.0 * float(tc.get("mean_adherence") or 0),
+                    int(tc.get("graded") or 0)))
+                if tc.get("graded") else " \u00b7 no graded round yet"))
+            if tc.get("subject") else "no subject on the phone",
+            tc.get("say") or "", "Callers",
+            "the caller states the subject and every host turn addresses it; "
+            "a draft that wanders is regenerated once (#1249)")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         ons = crystal_active()
         put("crystal", "Crystals", ons,
@@ -116378,20 +120017,132 @@ def scene_inputs(kind: str = "", who: str = "") -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001
         pass
     try:
-        st = _RADIO.get("speaker_state") or {}
-        mac = _RADIO.get("speaker_macro") or {}
-        put("mood", "The director's weather", mac or st,
-            ", ".join("%s: %s" % (a, b) for a, b in mac.items())
-            or "no macro set", json.dumps(st, default=str)[:1200],
-            "Director", "the emotional state per speaker leans on the "
-                        "delivery and the wording")
+        _wm = weather_mood_input()                            # [#1232]
+        put("mood", "The director's weather", _wm["on"], _wm["value"],
+            _wm["detail"], "Director",
+            "the emotional state per speaker leans on the delivery and "
+            "the wording" + str(_wm.get("why") or ""))
+        out[-1]["roll"] = _wm["roll"]
     except Exception:  # noqa: BLE001
         pass
+    # [#1231] where a tap on each box would land, or why it cannot.
+    for _i in out:
+        try:
+            _i["edit"] = paperwork_edit_meta(str(_i.get("key") or ""), k,
+                                           str(who or ""))
+        except Exception:  # noqa: BLE001
+            _i["edit"] = {"scope": "", "key": "", "applies": [],
+                          "why": "the station could not say where this box is kept"}
     return out
 
 
 def _pretty_key(k: str) -> str:
     return str(k).replace("_", " ")
+
+
+# [#1233] Which roads never staple a passage, and why - so the paperwork
+# can say "does not apply" instead of "nothing quoted" with a red dot.
+QUOTE_ROAD_NOTES = {
+    "ad": "an advert is written off ONE passage drawn outright (ad_write_fresh); nothing is prepended or appended to it",
+    "station_id": "a station ident is a line from the ident book",
+    "sfx": "the board plays clips, it does not quote",
+    "sfxguy": "the SFX guy speaks his own quips",
+    "interject": "a single line written by dj_line; a quote rides only a round",
+    "intro": "a track introduction is a single line written by dj_line",
+    "reply": "a reply to the room is a single line",
+    "image_analysis": "a picture is described, not quoted",
+    "song_analysis": "the record is the material",
+    "hangup": "a hang-up line",
+    "marker": "a marker, not speech",
+    "gold": "a gold bar is replayed as it was recorded",
+    "upstairs": "the memo is the material",
+    "track_talk": "track talk is written off the record (own material)",
+    "recap": "the recap is written off the hour's log (own material)",
+}
+QUOTE_DOORS = (
+    ("prepend", "speakbox_prepend_rate", "prepend a quote", "a quoted passage before the brief"),
+    ("append", "speakbox_append_rate", "append a quote", "a quoted passage after the brief"),
+    ("full", "speakbox_full_swath_rate", "uninterrupted swath", "one whole reading dealt at the head of the round"),
+)
+
+
+def speakbox_quote_paperwork(row: dict[str, Any], dj: dict[str, Any],
+                             kind: str = "", entry: dict[str, Any] | None = None,
+                             ) -> list[tuple[str, str, str, str, Any, str]]:
+    """[#1233] The three passage dials, judged against ONE line's round.
+
+    Returns (key, label, value, governs, applied, how) rows. `entry` is the
+    round the line lives in (round_of_line), or None when it is no longer on
+    a shelf. A round written since #1233 carries entry["quotes"] - the
+    door's decision, the dice and the passage; an older round only has its
+    dealt rows, which say what went in but not whether the dice were thrown.
+    Roads that never staple a passage are said to be that, in grey."""
+    road = str(row.get("round") or row.get("kind") or kind or "").split("/")[-1].strip().lower()
+    quotes = dict((entry or {}).get("quotes") or {}) if isinstance(entry, dict) else {}
+    dealt = list((entry or {}).get("dealt") or []) if isinstance(entry, dict) else []
+    out: list[tuple[str, str, str, str, Any, str]] = []
+    for door, key, label, governs in QUOTE_DOORS:
+        try:
+            pct = "%d%%" % round(float(dj.get(key) or 0) * 100)
+        except (TypeError, ValueError):
+            pct = str(dj.get(key))
+        rec = quotes.get(door) if isinstance(quotes.get(door), dict) else None
+        applied: Any = None
+        value = pct
+        how = ""
+        # A road that never staples a passage says so in grey, whether or
+        # not its round can still be found on a shelf - "nothing quoted"
+        # in red was the complaint (#1233).
+        note = ""
+        if road in QUOTE_ROAD_NOTES:
+            note = "does not apply to the %s road · %s" % (road, QUOTE_ROAD_NOTES[road])
+        elif road in ("caller", "call"):
+            note = "does not apply to a call · a call is written to the caller's own material"
+        elif road in ("news", "manager", "gallery"):
+            note = "does not apply to the %s road · it is written off its own material (a wire, a memo, a painting); no passage is stapled to it" % road
+        if rec is not None:
+            # MEASURED: this round wrote down what the door decided.
+            if not rec.get("applies"):
+                value = pct + " · does not apply"
+                how = str(rec.get("why") or note or "no passage is stapled to this round")
+            elif rec.get("hit"):
+                applied = True
+                roll = rec.get("roll")
+                value = "%s · rolled %s → yes" % (pct, ("%.2f" % float(roll)) if isinstance(roll, (int, float)) else "-")
+                text = " ".join(str(rec.get("text") or "").split())
+                how = "passage: “%s%s” · from %s · dealt as %d turn(s)%s%s" % (
+                    text[:60], "…" if len(text) > 60 else "",
+                    rec.get("file") or "the shelf", int(rec.get("turns") or 0),
+                    " · bounded to one turn under System2" if rec.get("bounded") else "",
+                    (" · pressure +%d%%" % round(float(rec.get("lift") or 0) * 100)) if float(rec.get("lift") or 0) >= 0.005 else "")
+            else:
+                roll = rec.get("roll")
+                if roll is None:
+                    value = pct + " · not rolled"
+                    how = str(rec.get("why") or "the dial is at 0%")
+                else:
+                    applied = False
+                    value = "%s · rolled %.2f → no" % (pct, float(roll))
+                    how = "the dice said no on this round (rolled %.2f against %d%%)" % (float(roll), round((float(rec.get("rate") or 0) + float(rec.get("lift") or 0)) * 100))
+        elif note:
+            how = note
+        elif isinstance(entry, dict):
+            # An older round: the dealt rows say what went in, but not
+            # whether the dice were thrown.
+            where = "tail" if door == "append" else "head"
+            pieces = [d for d in dealt if isinstance(d, (list, tuple)) and len(d) >= 3 and str(d[0]) == where]
+            if pieces:
+                applied = True
+                text = " ".join(str(pieces[0][2] or "").split())
+                how = "passage: “%s%s” · %d turn(s) · from the dealt rows: this round was written before the roll ledger" % (
+                    text[:60], "…" if len(text) > 60 else "", len(pieces))
+            else:
+                how = ("no passage at the %s of this round · written before the roll ledger, so whether the dice were thrown is not on record"
+                       % ("end" if where == "tail" else "head"))
+        else:
+            how = "this line's round is no longer on a shelf, so its roll cannot be read"
+        out.append((key, label, value, governs, applied, how))
+    return out
 
 
 def admin_options_for_line(row: dict[str, Any], prov: dict[str, Any]) -> list[dict[str, Any]]:
@@ -116456,10 +120207,20 @@ def admin_options_for_line(row: dict[str, Any], prov: dict[str, Any]) -> list[di
     quoted = [d for d in docs if d.get("quoted")]
     put("speakbox_rate", "started from the speakbox", "%d%%" % round(float(dj.get("speakbox_rate") or 0) * 100),
         "whether a passage seeds the round", bool(docs), ("seeded from %s" % ", ".join(str(d.get("file")) for d in docs[:2])) if docs else "no passage on this line")
-    put("speakbox_prepend_rate", "prepend a quote", "%d%%" % round(float(dj.get("speakbox_prepend_rate") or 0) * 100),
-        "a quoted passage before the brief", bool(quoted), "a passage was quoted in the prompt" if quoted else "nothing quoted")
-    put("speakbox_append_rate", "append a quote", "%d%%" % round(float(dj.get("speakbox_append_rate") or 0) * 100),
-        "a quoted passage after the brief", bool(quoted), "a passage was quoted in the prompt" if quoted else "nothing quoted")
+    # [#1233] The passage dials are judged against the ROUND's own ledger,
+    # not against the prompt: a prepended or appended passage is stapled
+    # into the script after the model has written, so it is never in the
+    # prompt, and "quoted" above was the file name in the prompt besides.
+    try:
+        _rk, _rnd = round_of_line(row)
+        _rentry = dialogue_entry(_rnd) or (_rnd if isinstance(_rnd, dict) else None)
+    except Exception:  # noqa: BLE001
+        _rk, _rentry = "", None
+    for _key, _lbl, _val, _gov, _ap, _how in speakbox_quote_paperwork(row, dj, _rk, _rentry):
+        put(_key, _lbl, _val, _gov, _ap, _how)
+    if quoted:
+        put("speakbox_quoted", "passage in the prompt", ", ".join(str(d.get("file")) for d in quoted[:2]),
+            "the seed passage as sent to the writer", True, "its words are in the prompt as sent")
     # the crystal
     shards = [c for c in crystal if c.get("in_prompt")]
     put("crystal", "crystal tint", ", ".join(str(c.get("name") or c.get("id")) for c in crystal_active()) or "off",
@@ -116517,6 +120278,13 @@ async def dj_scenario_api(
             if isinstance(c, dict) and str(c.get("id") or "") == want:
                 row = dict(c)
                 break
+        if not row:
+            # [#1233] past the booth's 240-row ring the air log still
+            # knows the line - the same road /api/said/why takes.
+            try:
+                row = await asyncio.to_thread(line_row_of, want)
+            except Exception:  # noqa: BLE001
+                row = {}
     trace = dict(row.get("trace") or {})
     written = dict(trace.get("written") or {})
     kind = (str(written.get("kind") or "") if row
@@ -116525,7 +120293,8 @@ async def dj_scenario_api(
     brief = (str(written.get("sched") or "") if row
              else str(_RADIO.get("sched_prompt") or ""))
     who = str(row.get("who") or "")
-    inputs = await asyncio.to_thread(scene_inputs, kind, who)
+    inputs = weather_inputs_for_row(                        # [#1232]
+        await asyncio.to_thread(scene_inputs, kind, who), row)
     on = [i for i in inputs if i["on"]
           and i["key"] not in ("schedule", "prompt", "persona", "station")]
     label = scene_kind_label(kind) if kind else "the show as it runs"
@@ -116543,7 +120312,19 @@ async def dj_scenario_api(
                 "brief": brief[:900],
                 "since": float(row.get("ts") or 0) if row else 0.0,
                 "where": "the schedule desk"}
+    # [#1249] the provenance call above already carried it for a line
+    # still in the booth; only fall back to the lookup.
+    _topic: dict[str, Any] = dict((prov or {}).get("topic_contract") or {})
+    if not _topic and row:
+        try:
+            _topic = await asyncio.to_thread(topic_contract_for_line, row)
+        except Exception:  # noqa: BLE001
+            _topic = {}
+    if _topic.get("subject"):
+        scenario["topic"] = str(_topic.get("subject") or "")[:200]
+        scenario["topic_adherence"] = _topic.get("adherence")
     return {"ok": True, "scenario": scenario, "inputs": inputs, "admin": admin,
+            "topic_contract": _topic,
             "line": {"id": want, "kind": row.get("kind"),
                      "round": row.get("round"), "who": who,
                      "name": row.get("name")},
@@ -116807,6 +120588,522 @@ async def line_liked_api(
     return {"count": len(rows), "rows": rows[:200]}
 
 
+# --- #1231: TAP A BOX, TYPE, AND IT LANDS ON THE STORE IT WAS DRAWN FROM ----
+#
+# "in Any text field, allow me to tap on it and type inside of it and begin
+#  making edits there."
+#
+# The inspector's boxes are READINGS of stores that already have writers:
+# the topic bank (data/banter_topics.json), the director's weather
+# (_RADIO["speaker_macro"] and speaker_state - in memory, gone at restart),
+# the station's disposition and the seats' characters (settings["dj"]), the
+# per-kind prompt shelf (schedule.json), the caller theme
+# (data/caller_themes.json), the seated guest (data/guests.json), a speakbox
+# document (data/speakbox), and a banked round's own turns - the writers
+# room's director_edit_turn, which COPIES a kept round (director_fork_kept)
+# and re-records one line. One door, PUT /api/paperwork/field, dispatches to
+# those writers by scope. Nothing is refused silently: every card
+# scene_inputs draws carries an `edit` note saying where a tap would land or
+# why it cannot, /api/said/why says whether the line's round is banked, and
+# every refusal here is a sentence for the strip under the box. The parsing
+# and the merges are in paperwork_fields.py, tested without the station.
+PAPERWORK_SCOPES = ("topic", "mood", "station", "persona", "prompt", "theme",
+                    "guest", "turn", "script", "passage")
+PAPERWORK_SEAT_KEY = {"dj": "persona", "cohost": "cohost_persona",
+                      "third": "third_persona"}
+PAPERWORK_SEAT_SAY = {"dj": "host", "cohost": "co-host", "third": "third seat"}
+PAPERWORK_ROUND_SCOPES = ("topic", "station", "persona", "prompt", "theme",
+                          "guest")
+# WHICH BOX ON A CARD IS THE STORE. A scene card draws two: the head line
+# (`value`) and "the whole of it" (`detail`). For nearly every card the
+# value is a SUMMARY - "41 waiting, 40 dropped", a guest's name, the
+# disposition cut at 120 characters with an ellipsis - and typing into a
+# summary would write the summary back over the store. The weather is the
+# exception: its value line IS its whole notation ("dj: flustered"), and
+# its detail is the same state as raw dims, both of which parse_mood reads.
+PAPERWORK_CARD_BOX = {"mood": ["value", "detail"]}
+
+
+def paperwork_edit_meta(key: str, kind: str, who: str) -> dict[str, Any]:
+    """[#1231] For one scene card: the scope a tap edits, or why it cannot."""
+    def can(scope: str, k: str, label: str, how: str,
+            round_too: bool = True) -> dict[str, Any]:
+        return {"scope": scope, "key": k, "label": label, "how": how,
+                "boxes": list(PAPERWORK_CARD_BOX.get(scope, ["detail"])),
+                "applies": ["future", "round"] if round_too else ["future"],
+                "why": ""}
+
+    def cannot(why: str) -> dict[str, Any]:
+        return {"scope": "", "key": "", "applies": [], "boxes": [],
+                "why": why}
+
+    if key == "topic":
+        return can("topic", "", "the topics in the bank",
+                   "reword a line and the bank is reworded; blank a line to "
+                   "take that topic out; add a line to plant one. Ids and "
+                   "(used) counts are kept.")
+    if key == "mood":
+        return can("mood", "", "the director's weather",
+                   "one speaker per entry - 'dj: flustered, cohost: nervous' "
+                   "- or 'no macro set' to clear; the weather can be "
+                   + ", ".join(sorted(MACRO_STATES)), round_too=False)
+    if key == "station":
+        return can("station", "", "the station's disposition",
+                   "the standing instructions every seat writes under, from "
+                   "the next round")
+    if key == "persona":
+        seat = _seat_of(who)
+        if seat not in PAPERWORK_SEAT_KEY:
+            return cannot("this line has no seat to write a character for")
+        return can("persona", seat, "the %s's character" % PAPERWORK_SEAT_SAY[seat],
+                   "the seat's character instructions, in every prompt for "
+                   "that voice from the next round")
+    if key == "prompt":
+        if kind and any(k.get("kind") == kind for k in SCHEDULE_KINDS):
+            return can("prompt", kind, "the %s road's system prompt" % kind,
+                       "the armed variant on the prompt shelf; every %s entry "
+                       "writes from it on its next round" % kind)
+        if not kind:
+            return cannot("this line names no schedule kind, so there is no "
+                          "shelf to edit")
+        return cannot("the %s road has no prompt shelf of its own - what "
+                      "shapes it is the seat's character and the station's "
+                      "disposition, both editable on this sheet" % kind)
+    if key == "theme":
+        try:
+            active = str(themes_read().get("active") or "")
+        except Exception:  # noqa: BLE001
+            active = ""
+        if not active or active in ("-", "—"):
+            return cannot("the callers roam - pick a theme on the Callers "
+                          "desk first, then its words can be edited here")
+        return can("theme", active, "what the callers are calling about",
+                   "the theme's words; 'report: <doc>' on its own line cites "
+                   "a report, an empty one lets them roam the shelf")
+    if key == "guest":
+        try:
+            dj = dj_settings()
+            gid = str(dj.get("guest_id") or "") if dj.get("guest_mode") else ""
+        except Exception:  # noqa: BLE001
+            gid = ""
+        if not gid:
+            return cannot("nobody is seated - seat a guest on the Guest desk "
+                          "first")
+        return can("guest", gid, "the guest in the studio",
+                   "first line: who they are; the lines after: why they came")
+    if key == "plot":
+        return cannot("the plotline is written act by act on the Plot desk; "
+                      "this box is the tick's reading of it")
+    if key == "crystal":
+        return cannot("crystals are switched on and weighed on the Crystal desk")
+    if key == "tint":
+        return cannot("the tint's switches live on the Crystal desk")
+    if key == "schedule":
+        # The brief. Measured, not guessed: `_RADIO["sched_prompt"]` is the
+        # slot's own words, and schedule_take() rewrites that key off the
+        # running order - and /api/dj reaches schedule_take() on EVERY poll
+        # (the #904 comment beside interject_prompt says so in as many
+        # words). A rewrite landed here would be wiped out seconds later,
+        # which is the one thing an edit surface must never do.
+        return cannot("this is the brief the running order hands the writing "
+                      "room, and the Calendar rewrites it into the station "
+                      "on every poll - a rewrite here would be wiped out "
+                      "seconds later. Change the slot on the Calendar desk. "
+                      "The road's system prompt, the card below, is the "
+                      "standing text this sheet can write.")
+    return cannot("this box is a reading, not a store")
+
+
+def paperwork_round_of(row: dict[str, Any]) -> dict[str, Any]:
+    """[#1231] The banked round a heard line lives in, if any, and which of
+    its turns the line is. Found the way the vote finds it - by the clip
+    the line was cut from (round_of_line) - because the chat row's own
+    `sid` is the AIR-TIME round id, which no shelf answers to (measured
+    2026-09-21: 0 of 26 recent chat sids resolved via /api/director/script)."""
+    out: dict[str, Any] = {"banked": False, "sid": "", "kind": "",
+                           "kept": False, "index": -1, "turns": 0, "why": ""}
+    if not isinstance(row, dict) or not row:
+        out["why"] = "no line to look up"
+        return out
+    try:
+        kind, rnd = round_of_line(row)
+    except Exception:  # noqa: BLE001
+        kind, rnd = "", None
+    if rnd is None:
+        out["why"] = ("this line's round is not on any shelf - it was made "
+                      "live, or its round has been retired since - so there "
+                      "is no banked script to rewrite")
+        return out
+    entry = dialogue_entry(rnd) or {}
+    try:
+        sid = alt_sid(kind, rnd)
+    except Exception:  # noqa: BLE001
+        sid = ""
+    turns = banter_turns(str(entry.get("script") or ""),
+                         str(entry.get("caller_name") or ""))
+    index = paperwork_fields.locate_turn(turns, str(row.get("text") or ""),
+                                         row.get("turn"), spoken=spoken_text)
+    out.update({"banked": True, "sid": sid, "kind": str(kind), "index": index,
+                "turns": len(turns),
+                "kept": bool(entry.get("frozen") or rnd.get("aired")
+                             or rnd.get("aired_at") or entry.get("aired_at"))})
+    if not sid:
+        out["why"] = "the banked round has no id the writers room answers to"
+    elif not turns:
+        out["why"] = "the banked round holds no script"
+    elif index < 0:
+        out["why"] = ("this line's words are not in the banked script as it "
+                      "stands - the tint or a later edit rewrote it; open the "
+                      "writers room to edit the banked words")
+    return out
+
+
+def paperwork_field_apply(scope: str, key: str, value: str, was: str,
+                          line_id: str) -> dict[str, Any]:
+    """[#1231] One edited box, landed on its store. Runs on a thread; every
+    refusal is an HTTPException whose detail is the sentence for the strip."""
+    scope = str(scope or "").strip().lower()
+    key = str(key or "").strip()
+    value = str(value or "")
+    was = str(was or "")
+    if scope not in PAPERWORK_SCOPES:
+        raise HTTPException(400, "no box called '%s' can be written - the "
+                                 "ones that can are %s"
+                            % (scope[:24], ", ".join(PAPERWORK_SCOPES)))
+    now = time.time()
+    if scope == "topic":
+        with _BOMBSHELL_LOCK:
+            rows = read_bombshells()
+            try:
+                rows, changes = paperwork_fields.merge_topic_block(
+                    rows, was, value, int(now), lambda: uuid.uuid4().hex[:8])
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            if changes:
+                write_bombshells(rows)
+        if not changes:
+            return {"ok": True, "scope": scope, "changed": False,
+                    "label": "the topics in the bank",
+                    "say": "nothing changed in the bank"}
+        ops: dict[str, int] = {}
+        for c in changes:
+            ops[c["op"]] = ops.get(c["op"], 0) + 1
+        said = ", ".join("%d %s" % (n, w) for w, n in
+                         (("reworded", ops.get("reword", 0)),
+                          ("taken out", ops.get("remove", 0)),
+                          ("planted", ops.get("add", 0))) if n)
+        note_action("topics edited in the inspector (#1231): " + said)
+        return {"ok": True, "scope": scope, "changed": True, "changes": changes,
+                "label": "the topics in the bank",
+                "say": said + " - the writing room reaches for the bank as it "
+                              "is now"}
+    if scope == "mood":
+        try:
+            got = paperwork_fields.parse_mood(value, MACRO_STATES, EMOTION_DIMS)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        macros = _RADIO.setdefault("speaker_macro", {})
+        if got.get("clear"):
+            macros.clear()
+        else:
+            if got.get("replace"):
+                macros.clear()
+            for who_, m in (got.get("macros") or {}).items():
+                if m:
+                    macros[who_] = m
+                else:
+                    macros.pop(who_, None)
+            for who_, dims in (got.get("dims") or {}).items():
+                st = speaker_state(who_)
+                for dim, val in dims.items():
+                    st[dim] = float(val)
+        weather = (", ".join("%s: %s" % (a, b) for a, b in macros.items() if b)
+                   or "no macro set")
+        return {"ok": True, "scope": scope, "changed": True,
+                "label": "the director's weather", "macros": dict(macros),
+                "say": "the weather is now %s - the next lines rendered feel "
+                       "it; it lives in memory until a restart" % weather}
+    if scope == "station":
+        settings = load_settings()
+        dj = settings.setdefault("dj", {})
+        ov = dj.get("radio_prompt_overrides")
+        if not isinstance(ov, dict):
+            ov = {}
+            dj["radio_prompt_overrides"] = ov
+        ov["station_system"] = value[:4000]
+        save_settings(settings)
+        on = bool(dj_settings().get("follow_prompt")) \
+            and radio_prompt_enabled("station_system")
+        note_action("the station's disposition rewritten in the inspector (#1231)")
+        return {"ok": True, "scope": scope, "changed": True, "in_force": on,
+                "label": "the station's disposition",
+                "say": "saved - " + ("every seat writes under it from the next "
+                                     "round" if on else
+                                     "but the station's disposition switch is "
+                                     "off on the Radio prompt desk, so nothing "
+                                     "reads it until that is on")}
+    if scope == "persona":
+        seat = _seat_of(key)
+        if seat not in PAPERWORK_SEAT_KEY:
+            raise HTTPException(400, "which seat? dj, cohost or third")
+        settings = load_settings()
+        settings.setdefault("dj", {})[PAPERWORK_SEAT_KEY[seat]] = value[:6000]
+        save_settings(settings)
+        note_action("the %s's character rewritten in the inspector (#1231)"
+                    % PAPERWORK_SEAT_SAY[seat])
+        return {"ok": True, "scope": scope, "changed": True,
+                "label": "the %s's character" % PAPERWORK_SEAT_SAY[seat],
+                "say": "saved - the %s writes as this from the next round"
+                       % PAPERWORK_SEAT_SAY[seat]}
+    if scope == "prompt":
+        kind = key[:40]
+        if not kind or not any(k.get("kind") == kind for k in SCHEDULE_KINDS):
+            raise HTTPException(400, "the %s road has no prompt shelf of its "
+                                     "own" % (kind or "?"))
+        with _SCHEDULE_LOCK:
+            store = schedule_read()
+            prompts = dict(store.get("prompts") or {})
+            blob = _sched_prompt_blob(prompts.get(kind)) or {"active": 0,
+                                                             "variants": []}
+            variants = list(blob.get("variants") or [])
+            if variants:
+                variants[int(blob.get("active") or 0) % len(variants)]["text"] = value[:4000]
+            else:
+                variants = [{"id": f"pv-{uuid.uuid4().hex[:10]}",
+                             "name": "from the inspector", "text": value[:4000]}]
+            prompts[kind] = {"active": int(blob.get("active") or 0),
+                             "variants": variants}
+            store["prompts"] = prompts
+            schedule_write(store)
+        _RADIO["sched_prompt"] = ""
+        try:
+            window = (prompt_windows_view() or {}).get(kind)
+        except Exception:  # noqa: BLE001
+            window = None
+        note_action("%s prompt rewritten in the inspector (#1231)" % kind)
+        say = (("saved on the shelf - a timed prompt owns every %s entry right "
+                "now (%s); yours takes over when it ends"
+                % (kind, str(window.get("says") or ""))) if window else
+               ("saved - every %s entry writes from it on its next round" % kind))
+        return {"ok": True, "scope": scope, "changed": True,
+                "label": "the %s road's system prompt" % kind, "say": say}
+    if scope == "theme":
+        rows = themes_read()
+        active = str(rows.get("active") or "")
+        if not active or active in ("-", "—"):
+            raise HTTPException(409, "the callers roam - pick a theme on the "
+                                     "Callers desk first")
+        text, doc = paperwork_fields.split_theme(value)
+        if not text:
+            raise HTTPException(400, "a theme needs some words")
+        themes = list(rows.get("themes") or [])
+        row = next((t for t in themes if str(t.get("name")) == active), None)
+        if row is None:
+            raise HTTPException(404, "the active theme '%s' is not on the "
+                                     "shelf" % active[:40])
+        row["text"] = text[:600]
+        if doc is not None:
+            if doc:
+                known = {p.name for p in speakbox_all(mind_id(""))}
+                if doc not in known:
+                    raise HTTPException(404, "no report called '%s' on the "
+                                             "shelf" % doc[:60])
+            rows["doc"] = doc
+        rows["themes"] = themes
+        themes_write(rows)
+        pipeline_log("theme", "theme '%s' reworded in the inspector (#1231)"
+                     % active[:40])
+        return {"ok": True, "scope": scope, "changed": True,
+                "label": "what the callers are calling about",
+                "say": "saved - the next caller rings in about it as written"}
+    if scope == "guest":
+        dj = dj_settings()
+        seated = str(dj.get("guest_id") or "") if dj.get("guest_mode") else ""
+        gid = key or seated
+        if not gid:
+            raise HTTPException(409, "nobody is seated - seat a guest on the "
+                                     "Guest desk first")
+        try:
+            who_, why_ = paperwork_fields.split_guest(value)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        rows = read_guests()
+        g = next((r for r in rows if str(r.get("id")) == gid), None)
+        if g is None:
+            raise HTTPException(404, "no guest answers to that id")
+        g["who"] = who_[:400]
+        g["why"] = why_[:800]
+        write_guests(rows)
+        if gid == seated:
+            set_guest(g)        # the third seat's character is drawn from the guest
+        note_action("the guest '%s' rewritten in the inspector (#1231)"
+                    % str(g.get("name") or "")[:40])
+        return {"ok": True, "scope": scope, "changed": True,
+                "label": "the guest in the studio",
+                "say": "saved - %s is written into the next round as this"
+                       % (g.get("name") or "the guest")}
+    if scope == "passage":
+        name = key
+        if not SPEAKBOX_NAME.match(name):
+            raise HTTPException(400, "which document? the passage's file name "
+                                     "is needed")
+        if not was.strip():
+            raise HTTPException(400, "the passage as shown is needed to find "
+                                     "it in the document")
+        path = speakbox_path(name)
+        if not path.is_file():
+            for _row in speakbox_minds():
+                _cand = speakbox_path(name, _row["id"])
+                if _cand.is_file():
+                    path = _cand
+                    break
+        if not path.is_file():
+            raise HTTPException(404, "no document called %s on the speakbox "
+                                     "shelf" % name)
+        text = path.read_text()
+        if text.count(was) == 1:
+            new_text = text.replace(was, value, 1)
+        else:
+            # the swath was cut and joined from the file's lines: look for
+            # it whitespace-blind before giving up
+            pat = re.compile(r"\s+".join(re.escape(w) for w in was.split()))
+            found = pat.findall(text)
+            if len(found) != 1:
+                raise HTTPException(
+                    409, ("that passage is not in %s word for word as shown - "
+                          "edit the document on the Speakbox desk" % name)
+                    if not found else
+                    ("that passage appears %d times in %s - edit the document "
+                     "on the Speakbox desk" % (len(found), name)))
+            new_text = pat.sub(lambda m: value, text, count=1)
+        path.write_text(new_text)
+        note_action("a passage of %s rewritten in the inspector (#1231)" % name)
+        return {"ok": True, "scope": scope, "changed": True, "file": name,
+                "label": "a speakbox passage",
+                "say": "saved into %s - the next round that draws on it reads "
+                       "your words; the vector index catches up on its own "
+                       "sweep" % name}
+    # turn / script: the writers room. A kept round is FORKED there
+    # (director_fork_kept) and only the changed line re-records.
+    row = line_row_of(line_id)
+    if not row:
+        raise HTTPException(404, "that line is in neither the booth nor the "
+                                 "air log")
+    rnd = paperwork_round_of(row)
+    if not rnd["banked"]:
+        raise HTTPException(409, rnd["why"])
+    kind, rrow = alt_find(rnd["sid"])
+    if rrow is None:
+        raise HTTPException(409, "the banked round could not be found again "
+                                 "by its id")
+    entry = dialogue_entry(rrow) or {}
+    caller_name = str(entry.get("caller_name") or "")
+    turns = banter_turns(str(entry.get("script") or ""), caller_name)
+    if scope == "turn":
+        index = int(rnd["index"])
+        said_new = value
+        if index < 0:
+            raise HTTPException(409, rnd["why"])
+    else:
+        try:
+            change = paperwork_fields.script_single_change(
+                banter_turns(was, caller_name), banter_turns(value, caller_name))
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if change is None:
+            return {"ok": True, "scope": scope, "changed": False,
+                    "label": "the round's script", "say": "nothing changed"}
+        _i, old, said_new = change
+        index = paperwork_fields.locate_turn(turns, old, _i, spoken=spoken_text)
+        if index < 0:
+            raise HTTPException(409, "the banked script reads differently from "
+                                     "this paperwork - the tint or a later edit "
+                                     "rewrote it; open the writers room to edit "
+                                     "the banked words")
+    expect = turns[index][1] if 0 <= index < len(turns) else ""
+    got = director_edit_turn("", index, said_new, expect, rnd["sid"])
+    got.update({"scope": scope, "sid": rnd["sid"], "round_kind": str(kind),
+                "index": index, "label": "the round's script"})
+    return got
+
+
+@app.get("/api/paperwork/field")
+async def paperwork_field_get_api(
+    line_id: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1231] Where an edit to this line's own words would land: the banked
+    round behind it (shelf id, kind, the turn it is) or why there is none."""
+    require_read_auth(authorization)
+    want = str(line_id or "").strip()
+    row = await asyncio.to_thread(line_row_of, want) if want else {}
+    rnd = await asyncio.to_thread(paperwork_round_of, row)
+    if want and not row:
+        rnd["why"] = "that line is in neither the booth nor the air log"
+    banked = bool(rnd.get("banked")) and int(rnd.get("index", -1)) >= 0
+    return {"ok": True,
+            "line": {"id": want, "who": row.get("who"), "turn": row.get("turn"),
+                     "text": str(row.get("text") or "")[:300]},
+            "round": rnd, "scopes": list(PAPERWORK_SCOPES),
+            "say": ("this line's round is banked as %s/%s, turn %d of %d - a "
+                    "rewrite forks a kept round and re-records one line"
+                    % (rnd["kind"], rnd["sid"], int(rnd["index"]) + 1,
+                       int(rnd["turns"]))) if banked else str(rnd.get("why") or "")}
+
+
+@app.put("/api/paperwork/field")
+@app.post("/api/paperwork/field")
+async def paperwork_field_put_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1231] {scope, key, value, was, line_id, apply}: one edited box,
+    landed on the store it was drawn from. `apply` is "future" (the store
+    only - the next round is written with it) or "round" - the store, and
+    then this line's banked round back through the writing room with the
+    change as its note (a kept round is forked; only changed lines
+    re-record). The turn and script scopes always act on the round."""
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    scope = str(payload.get("scope") or "")
+    key = str(payload.get("key") or "")
+    value = payload.get("value")
+    value = "" if value is None else str(value)
+    was = str(payload.get("was") or "")
+    line_id = str(payload.get("line_id") or payload.get("id") or "").strip()
+    apply_to = str(payload.get("apply") or "future").strip().lower()
+    got = await asyncio.to_thread(paperwork_field_apply, scope, key, value,
+                                  was, line_id)
+    if apply_to == "round" and got.get("ok") \
+            and str(scope).lower() in PAPERWORK_ROUND_SCOPES:
+        row = await asyncio.to_thread(line_row_of, line_id) if line_id else {}
+        rnd = await asyncio.to_thread(paperwork_round_of, row)
+        if rnd.get("banked") and rnd.get("sid"):
+            note = ("%s changed - rewrite this script to fit it: %s"
+                    % (str(got.get("label") or scope),
+                       " ".join(value.split())[:500]))
+            try:
+                rev = await api_director_script_revise(
+                    rnd["sid"], {"note": note, "standing": False})
+                got["round"] = {"sid": rnd["sid"], "kind": rnd.get("kind"),
+                                "turns": rev.get("turns"),
+                                "recorded": rev.get("recorded"),
+                                "to_record": rev.get("to_record")}
+                got["say"] = "%s; this round too - %s" % (
+                    got.get("say") or "saved", rev.get("say") or "rewritten")
+            except HTTPException as exc:
+                got["round"] = {"sid": rnd["sid"], "why": str(exc.detail)}
+                got["say"] = "%s; this round could not be rewritten: %s" % (
+                    got.get("say") or "saved", exc.detail)
+        else:
+            got["round"] = {"why": rnd.get("why") or "not banked"}
+            got["say"] = "%s; future rounds only - %s" % (
+                got.get("say") or "saved",
+                rnd.get("why") or "this round is not banked")
+    return got
+
+
 @app.get("/api/said/why/{line_id}")
 async def said_why_api(
     line_id: str,
@@ -116842,7 +121139,8 @@ async def said_why_api(
     kind = (str(sched.get("kind") or "").split("/")[-1]
             or str(row.get("kind") or ""))
     who = str(row.get("who") or "")
-    inputs = await asyncio.to_thread(scene_inputs, kind, who)
+    inputs = weather_inputs_for_row(                        # [#1232]
+        await asyncio.to_thread(scene_inputs, kind, who), row)
     by_key = {i["key"]: i for i in inputs}
     properties: list[dict[str, Any]] = [
         {"name": "the road",
@@ -117015,6 +121313,7 @@ async def said_why_api(
                  "withdrawn_why", "clip_media", "clip_from", "clip_until",
                  "source", "aired")
                 if row.get(k) not in (None, "")}
+    edit_meta = await asyncio.to_thread(paperwork_round_of, row)   # [#1231]
     return {"ok": True, "id": want, "said": str(row.get("text") or "")[:400],
             "who": who, "name": row.get("name"), "kind": row.get("kind"),
             "round": row.get("round"), "voice": row.get("voice"),
@@ -117027,6 +121326,7 @@ async def said_why_api(
             "seconds": row.get("seconds"), "air_at": row.get("air_at"),
             "withdrawn_why": row.get("withdrawn_why") or "",
             "prompt": prompt, "systems": systems, "provenance_ok": bool(prov),
+            "edit": edit_meta,   # [#1231] the banked round behind this line, if any
             "say": "%s on the %s road; %d thing(s) set it"
                    % (row.get("name") or who,
                       row.get("round") or row.get("kind") or "?",
@@ -117187,6 +121487,100 @@ def hour_contract_delivered(since: float, until: float) -> dict[str, Any]:
     return out
 
 
+# [#1194] ------------------------------------------------------------------
+def _replay_sfx_key(row: dict[str, Any], text: str, air_at: float) -> str:
+    """THE SAMPLE BEHIND A STING ROW.
+
+    The ring row carries `sfx` (the id the /sfx/ route serves). The durable
+    air-log row did not, until airlog_row_from learned to carry it (#1194),
+    so a sting older than the four-minute ring had no way back to its file.
+    The sting history (#862: one row per airing, name + moment) is that
+    way back: the same stem, nearest in time. "" when nothing matches -
+    said, never guessed."""
+    key = str(row.get("sfx") or row.get("sfx_sample_id") or "")
+    if re.fullmatch(r"[a-f0-9]{16}", key):
+        return key
+    want = " ".join(str(text or "").replace("\U0001F50A", " ").split())
+    if not want:
+        return ""
+    best, gap = "", float("inf")
+    try:
+        for h in reversed(sfx_history_rows()):
+            name = str(h.get("name") or "")
+            stem = name.rsplit(".", 1)[0] if "." in name else name
+            if stem != want:
+                continue
+            d = (abs(float(h.get("ts") or 0) - float(air_at or 0))
+                 if air_at else 0.0)
+            if d < gap:
+                gap, best = d, str(h.get("id") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+    return best if re.fullmatch(r"[a-f0-9]{16}", best or "") else ""
+
+
+def _segment_line_handles(r: dict[str, Any], got: dict[str, Any],
+                          lid: str) -> dict[str, Any]:
+    """[#1194] WHAT A TAP CAN DO WITH ONE LINE OF A SEGMENT.
+
+    The inspector printed the line; the operator wants to PLAY it and to
+    ask what it is made of. So beside every line: where its audio is (its
+    own clip, or the span of the welded round it was cut from), the play
+    road, the sample behind a sting, the take it was rendered from (the
+    pantry key - engine, voice and words hashed, the name the render cache
+    knows it by), the delivery it rode, and whether it is itself a replay.
+    Absent is None, as everywhere in this report."""
+    out: dict[str, Any] = {"media": None, "clip_media": None,
+                           "clip_from": None, "clip_until": None,
+                           "sfx": None, "url": None, "video": None,
+                           "take": None, "delivery_id": None,
+                           "replay": None, "replay_of": None}
+    try:
+        got = got if isinstance(got, dict) else {}
+        kind = str(r.get("kind") or got.get("kind") or "")
+        # The ring row knows the sample and the delivery; the durable row
+        # knows the clip. One ring scan, only for the rows that need it.
+        ring = _booth_row(lid) if (kind == "sfx" or not got) else {}
+        ring = ring if isinstance(ring, dict) else {}
+        for k in ("media", "clip_media"):
+            v = str(got.get(k) or ring.get(k) or "")
+            out[k] = v or None
+        for k in ("clip_from", "clip_until"):
+            v = got.get(k) if got.get(k) is not None else ring.get(k)
+            try:
+                out[k] = round(float(v), 3) if v is not None else None
+            except (TypeError, ValueError):
+                out[k] = None
+        key = str(ring.get("sfx") or ring.get("sfx_sample_id")
+                  or got.get("sfx") or "")
+        if kind == "sfx" and not re.fullmatch(r"[a-f0-9]{16}", key):
+            key = _replay_sfx_key(
+                ring or got, str(r.get("text") or got.get("text") or ""),
+                float(got.get("air_at") or ring.get("air_at") or 0))
+        out["sfx"] = key or None
+        url = airlog_clip_url(got) if got else ""
+        if not url:
+            url = str(ring.get("url") or "")
+        if not url and key:
+            url = "/sfx/%s?t=%s" % (key, media_sign(key))
+        out["url"] = url or None
+        out["video"] = True if (ring.get("video") or got.get("video")) else None
+        voice = str(got.get("voice") or ring.get("voice") or "")
+        text = str(r.get("text") or "")
+        if voice and text and kind != "sfx":
+            engine = str(got.get("engine") or "") or voice_engine_for(voice)
+            out["take"] = pantry_key(text, voice, engine)
+        out["delivery_id"] = str(got.get("delivery_id")
+                                 or ring.get("delivery_id") or "") or None
+        if got.get("replay") or ring.get("replay"):
+            out["replay"] = True
+            out["replay_of"] = str(got.get("replay_of")
+                                   or ring.get("replay_of") or "") or None
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def segment_inspect(block: int) -> dict[str, Any]:
     """2026-09-15 (#1168): EVERY ASPECT OF HOW ONE SEGMENT WAS COMPOSED.
 
@@ -117246,6 +121640,32 @@ def segment_inspect(block: int) -> dict[str, Any]:
                 air[rid] = row
     except Exception:  # noqa: BLE001
         air = {}
+    # [#1245] A ROUND FILED UNDER ITS SEED DOCUMENT.  Rows written before
+    # the commit carried the road have `round` = "fmn1.md"; the air log
+    # knows the road those same lines went out under.  So the road is the
+    # air log's, the document is named for what it is, and the prompt
+    # pop-up is answered for a shelf that exists.  New rows carry both.
+    try:
+        out["seed_doc"] = str(first.get("source") or "") or None
+        out["prompt"] = first.get("prompt") if isinstance(first.get("prompt"), dict) else None
+        if segment_prompts.is_doc(road):
+            out["seed_doc"] = out["seed_doc"] or road
+            _aroad = ""
+            for _lr in led:
+                _ar = air.get(str(_lr.get("line_id") or "")) or {}
+                if _ar.get("round") and not segment_prompts.is_doc(_ar.get("round")):
+                    _aroad = str(_ar.get("round"))
+                    break
+            road = _aroad or segment_prompts.road_of(road, SCHEDULE_KIND_NAMES)
+            out["prompt_kind"] = road
+            out["round"]["road"] = road
+        out["round"]["seed_doc"] = out["seed_doc"]
+        if out["prompt"] is None:
+            out["prompt_say"] = ("the ledger does not record which instruction "
+                                 "this round was written with - rounds "
+                                 "committed since the book shipped do")
+    except Exception:  # noqa: BLE001
+        pass
     heard_at: list[float] = []
     _published_at: list[float] = []     # 2026-09-15: the other question
     _any_heard = False
@@ -117303,10 +121723,21 @@ def segment_inspect(block: int) -> dict[str, Any]:
             "heard_at": _heard_when or None,
             "published": aired in AIR_PUBLICATION_STATES,
             "withdrawn_why": str(got.get("withdrawn_why") or "") or None,
+            # [#1237] the record the line was bound to, as a person names it
+            "bound_to": (record_binding.label(got.get("bound"))
+                         if isinstance(got.get("bound"), dict) else None),
+            "bound": (got.get("bound")
+                      if isinstance(got.get("bound"), dict) else None),
+            "cut_why": str(got.get("cut_why") or "") or None,
+            # [#1251] "matched: 'raccoon', 'trash'" on the line's card.
+            "match_why": str(got.get("match_why") or "") or None,
             "voice": str(got.get("voice") or "") or None,
             "engine": str(render.get("engine") or got.get("engine") or "") or None,
             "model": str((trace.get("written") or {}).get("model") or "") or None,
             "source": str(got.get("source") or "") or None,
+            # [#1194] what a tap can DO with the line: where its
+            # audio is, the sample behind a sting, the take.
+            **_segment_line_handles(r, got, lid),
         })
     # Who took part, and for how long.
     seats: dict[str, dict[str, Any]] = {}
@@ -117481,6 +121912,26 @@ def segment_inspect(block: int) -> dict[str, Any]:
     return out
 
 
+def script_media_ident(name: Any) -> str:
+    """[#1189] The identity behind a clip's name - the fold the Script view applies.
+
+    `/media/<32hex>.wav?br=64` and `<32hex>.mp3` are the 32-hex media key; `/sfx/<16hex>?t=`
+    and the levelled cache's `<16hex>-v2-v<vol>-<mtime>.wav` / `<16hex>-<mtime>-src.wav` /
+    `<16hex>-<mark>-<mtime>.<ext>` (sfx_levelled_name, _as_wav, sfx_video_levelled) are the
+    16-hex sample id. Anything else answers to its basename."""
+    raw = str(name or "").split("?")[0].replace("\\", "/")
+    base = raw.rsplit("/", 1)[-1].lower()
+    if not base:
+        return ""
+    got = re.match(r"^([0-9a-f]{32})(?:\.[a-z0-9]{1,4})?$", base)
+    if got:
+        return got.group(1)
+    got = re.match(r"^([0-9a-f]{16})(?:-[^/]*)?(?:\.[a-z0-9]{1,4})?$", base)
+    if got:
+        return got.group(1)
+    return base
+
+
 def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict[str, Any]:
     """Passive incident context from bounded in-memory records, never a repair.
 
@@ -117523,11 +121974,45 @@ def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict
                          omitted_rows=max(0, len(nearby) - 32))
     feed = list(_RADIO.get("chat") or [])
     relevant = [r for r in feed if isinstance(r, dict) and str(r.get("id") or "") in wanted]
+    # [#1189] THE FIELDS THE VIEW IS JUDGED BY.
+    #
+    # A board sting's ring row carries NO `media` and no `clip_media` at all -
+    # `sfx: <16hex>` and `url: /sfx/<16hex>?t=<sig>` are its only names (the
+    # row is built at 76557-76575). The report therefore could not show
+    # whether the view failed to mark a sounding sting through its own fault
+    # or because the row it had to match carried nothing to match on. That is
+    # #1188, #1197, #1228 and #1234, and the analyzer printed "path aliases
+    # require review" over every one of them.
+    #
+    # `air_at` is the render ESTIMATE, frozen the moment the row is published
+    # (27112-27128 / 27561); `heard_ack_at` is the ear (27200-27203), a median
+    # 62.6s later over 589 heard rows measured 2026-09-21. The page is ordered
+    # by the first and the operator hears the second, which is the whole of
+    # "why did this jump like this": the analyzer can now say the number.
+    #
+    # (block, ord) is the script's own order, off the ledger - read here
+    # WITHOUT script_ledger_order(), which rebuilds a module cache as a side
+    # effect, because this path is an observation and must not change state.
+    _ledger_seat: dict[str, tuple[int, int]] = {}
+    try:
+        for _lr in script_ledger_rows():
+            _lid = str(_lr.get("line_id") or "")
+            if _lid:
+                _ledger_seat[_lid] = (int(_lr.get("block") or 0), int(_lr.get("ord") or 0))
+    except Exception:  # noqa: BLE001
+        _ledger_seat = {}
+    _feed_rows: list[dict[str, Any]] = []
+    for _fr in relevant[-80:]:
+        _row = pick(_fr, ("id", "sid", "kind", "aired", "air_at", "ts", "media",
+                          "clip_media", "clip_from", "clip_until", "delivery_id",
+                          "withdrawn_why", "sfx", "url", HEARD_STAMP, "heard_ack_by"))
+        _seat = _ledger_seat.get(str((_fr or {}).get("id") or ""))
+        if _seat:
+            _row["block"], _row["ord"] = _seat[0], _seat[1]
+        _feed_rows.append(_row)
     out["feed"] = {"total": len(feed), "matched": len(relevant),
                    "omitted_rows": max(0, len(relevant) - 80),
-                   "rows": [pick(r, ("id", "sid", "kind", "aired", "air_at", "ts", "media",
-                                     "clip_media", "clip_from", "clip_until", "delivery_id", "withdrawn_why"))
-                            for r in relevant[-80:]]}
+                   "rows": _feed_rows}
     clips = list(_RADIO.get("voice_clips") or [])
     pending = []
     for clip in clips:
@@ -117588,6 +122073,36 @@ def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict
             out["admission"]["reader_position"] = _admission_map.get("reader_position")
             out["admission"]["counts"] = _admission_map.get("counts")
             out["admission"]["recent_refusals"] = _admission_map.get("refusals")
+            # [#1189] THE STATION'S OWN READING of the file and offset the page
+            # observed, beside the page's: does an admitted occurrence name it,
+            # which cue does the offset land on, and - when the exact spelling
+            # is not admitted - does an occurrence name the same clip under
+            # another (the /sfx/<id> - levelled cache - clip_media aliases).
+            try:
+                _aud = snapshot.get("audio") if isinstance(snapshot.get("audio"), dict) else {}
+                _file = str(_aud.get("file") or "")
+                if _file:
+                    _pos = _aud.get("position_s")
+                    _pos = float(_pos) if isinstance(_pos, (int, float)) and not isinstance(_pos, bool) else None
+                    _rec = _admission_now.reconcile(media=_file, position_s=_pos)
+                    _seen = {k: _rec.get(k) for k in ("agreed", "reason", "occurrence_id",
+                                                      "position", "state", "media") if k in _rec}
+                    _cue = _rec.get("cue") if isinstance(_rec.get("cue"), dict) else None
+                    if _cue:
+                        _seen["cue"] = {k: _cue.get(k) for k in ("line_id", "ordinal", "start_s",
+                                                                 "end_s", "position") if k in _cue}
+                    if not _rec.get("occurrence_id"):
+                        _want = script_media_ident(_file)
+                        for _occ in list(_admission_map.get("occurrences") or [])[::-1]:
+                            _named = str(((_occ or {}).get("audio") or {}).get("media") or "")
+                            if _want and _named and script_media_ident(_named) == _want:
+                                _seen["alias"] = {"occurrence_id": _occ.get("occurrence_id"),
+                                                  "media": _named[:120], "origin": _occ.get("origin"),
+                                                  "position": _occ.get("position")}
+                                break
+                    out["admission"]["reconcile"] = _seen
+            except Exception as _rec_exc:  # noqa: BLE001
+                out["admission"]["reconcile"] = {"error": ("%r" % (_rec_exc,))[:200]}
     except Exception as _admission_exc:  # noqa: BLE001
         out["admission"] = {"available": False, "why": "%r" % (_admission_exc,)}
     # # --- broadcast admission (2026-09-15) --- end
@@ -117613,6 +122128,63 @@ def script_diagnostic_context(view: dict[str, Any], since_ms: float = 0) -> dict
         out["hour_contract"] = hour_contract_delivered(_now - 3600.0, _now + 1.0)
     except Exception as _hc_exc:  # noqa: BLE001
         out["hour_contract"] = {"available": False, "why": "%r" % (_hc_exc,)}
+    # [#1222] WHAT THE SFX GUY HAD ON. Report 239255791960230016
+    # (2026-09-18 04:11:13Z, "I was interested in this video ... it's
+    # hidden somewhere so I need it") captured a paused script page and
+    # not one word about the picture on the tube: four client samples,
+    # every one audio.source "unavailable", mapping_rows_total 0, and a
+    # server page queue whose newest row was 6 h 17 m older than the tap.
+    # By the time it was read, the air log, the sting history and the
+    # plays ledger had all rotated past that hour and the only surviving
+    # artifact from it was the SFX folder pin. The capture now carries
+    # the tube's clip(s) for this moment, the last stings, the folder pin
+    # and the endless cycle - ids AND paths - read off memory only (the
+    # reverse id map; never a share walk).
+    try:
+        _now_ms = int(now * 1000)
+
+        def _sfx_where(_key: str) -> dict[str, Any]:
+            _p = _SFX_ID_REVERSE.get(str(_key or "")) if _key else None
+            if not _p:
+                return {}
+            try:
+                return {"path": str(_p)[:240],
+                        "host_path": str(share_path_of(Path(str(_p))))[:240]}
+            except Exception:  # noqa: BLE001
+                return {"path": str(_p)[:240]}
+
+        _tube: list[dict[str, Any]] = []
+        for _c in list(_RADIO.get("voice_clips") or [])[-160:]:
+            if not isinstance(_c, dict) or not _c.get("video"):
+                continue
+            _b = int(_c.get("broadcast_ms") or _c.get("ts") or 0)
+            _len_ms = max(5.0, float(_c.get("length") or _c.get("seconds") or 0)) * 1000.0
+            if _b - 2000 <= _now_ms <= _b + _len_ms + 2000:
+                _row = pick(_c, ("id", "sting", "url", "broadcast_ms", "ts", "seconds",
+                                 "length", "endless", "delivery_id"))
+                _row.update(_sfx_where(str(_c.get("id") or "")))
+                _tube.append(_row)
+        _recent: list[dict[str, Any]] = []
+        for _r in reversed(list(_RADIO.get("chat") or [])):
+            if (not isinstance(_r, dict) or str(_r.get("kind") or "") != "sfx"
+                    or _r.get("sid")):
+                continue
+            _row = pick(_r, ("id", "text", "sfx", "sfx_dir", "url", "air_at", "ts",
+                             "aired", "seconds", "video"))
+            _row.update(_sfx_where(str(_r.get("sfx") or "")))
+            _recent.append(_row)
+            if len(_recent) >= 8:
+                break
+        _cyc = dict(_SFX_CYCLE)
+        out["sfx"] = {
+            "tube": _tube[-4:], "recent_stings": _recent,
+            "pin": sfx_pin_view(), "endless": bool(sfx_video_mode_on()),
+            "cycle": {k: _cyc.get(k) for k in ("clip", "queued", "until", "rung", "why")},
+            "say": ("%d picture(s) rung for this moment, %d recent sting(s) named with their paths"
+                    % (len(_tube), len(_recent))),
+        }
+    except Exception as _sfx_exc:  # noqa: BLE001
+        out["sfx"] = {"available": False, "why": "%r" % (_sfx_exc,)}
     return out
 
 
@@ -117760,6 +122332,204 @@ async def segment_inspect_api(
     return await asyncio.to_thread(segment_inspect, int(block))
 
 
+# [#1194] ------------------------------------------------------------------
+# REPLAY ONE LINE OF THE SCRIPT ON THE BROADCAST.
+#
+# "Allow me to tap each one in order to play its sound on the broadcast."
+# The Script view's Segment window lists every line of a block; a tap on a
+# row must be heard by every listener - the page feed (the desktop app, the
+# tablet, the tune page and the public door all drain it) and the box - not
+# only by the tablet that was tapped. The hold sheet's own "Play it" stays
+# what it was: here, ducked, for one pair of ears.
+#
+# Two roads, one per kind of row, and neither invents a transport:
+#   a sting        the exact body of POST /api/dj/sfx/play (#1339: admitted,
+#                  appended to the page feed, handed to the box);
+#   a spoken line  its own audio, cut EXACTLY as GET /api/booth/clip cuts it
+#                  (this turn out of the welded round, or its one-line clip),
+#                  copied into the media room under a fresh key so both
+#                  transports are handed a file they can serve and measure
+#                  (/media/<key>), admitted, published, handed to the box.
+#
+# The replay is a ROW OF THE LEDGER in its own right: a fresh id on the
+# ring, marked `replay: True` with `replay_of` naming the line it repeats,
+# which airlog_row_from carries into the durable log. It is not a ledger
+# BLOCK - nothing was written; something was said again.
+async def _replay_media_for(row: dict[str, Any]) -> tuple[str, str, float]:
+    """(media key, signature, seconds) for a spoken row's exact audio, or
+    ("", "", 0.0). The cut is the booth's own (booth_cut); it is copied
+    into the media room under a fresh key so /media/<key> can serve it to
+    the page and the box alike and _clip_seconds can measure it."""
+    own = str(row.get("media") or "")
+    if own and MEDIA_KEY_SHAPE.match(own) and (VOICE_MEDIA_DIR / own).is_file():
+        secs = await asyncio.to_thread(_clip_seconds, str(VOICE_MEDIA_DIR / own))
+        return own, media_sign(own), float(secs or row.get("seconds") or 0)
+    key = str(row.get("clip_media") or "")
+    if not (key and MEDIA_KEY_SHAPE.match(key)):
+        return "", "", 0.0
+    src = VOICE_MEDIA_DIR / key
+    if not src.is_file():
+        return "", "", 0.0
+    try:
+        lo = max(0.0, float(row.get("clip_from") or 0.0))
+        hi = max(lo, float(row.get("clip_until") or 0.0))
+        tail = max(0.0, float(row.get("clip_tail") or 0.0))
+    except (TypeError, ValueError):
+        return "", "", 0.0
+    if hi - lo <= 0.08:
+        return "", "", 0.0
+    span = hi - lo - tail
+    if span < 0.2:
+        span = hi - lo                 # a very short turn keeps its beat
+    cut = await booth_cut(str(src), lo, span)
+    if not cut:
+        return "", "", 0.0
+    fresh = uuid.uuid4().hex + ".mp3"
+
+    def _copy() -> str:
+        try:
+            VOICE_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(cut, VOICE_MEDIA_DIR / fresh)
+            return fresh
+        except OSError:
+            return ""
+
+    made = await asyncio.to_thread(_copy)
+    if not made:
+        return "", "", 0.0
+    return made, media_sign(made), round(span, 2)
+
+
+async def script_line_replay(line_id: str, block: int = 0) -> dict[str, Any]:
+    """[#1194] Say one line again, on the broadcast. See the note above."""
+    line_id = str(line_id or "").strip()
+    if not line_id:
+        raise HTTPException(status_code=400, detail="name a line")
+    row = await asyncio.to_thread(_booth_row, line_id)
+    row = row if isinstance(row, dict) else {}
+    if not row:
+        known = False
+        try:
+            known = any(str(x.get("line_id") or "") == line_id
+                        for x in await asyncio.to_thread(script_ledger_rows))
+        except Exception:  # noqa: BLE001
+            known = False
+        raise HTTPException(status_code=404, detail=(
+            "the station holds the words of that line but no longer holds "
+            "its audio" if known else
+            "no line with that id is in the booth or the air log"))
+    kind = str(row.get("kind") or "")
+    who = str(row.get("who") or "")
+    name = str(row.get("name") or "")
+    text = " ".join(str(row.get("text") or "").split())
+    air_at = float(row.get("air_at") or row.get("ts") or 0)
+    now = time.time()
+    new_id = uuid.uuid4().hex
+    entry: dict[str, Any] = {
+        "id": new_id, "ts": int(now), "air_at": now,
+        "who": who, "name": name, "kind": kind, "text": text,
+        "voice": str(row.get("voice") or ""),
+        "source": str(row.get("source") or ""),
+        "round": str(row.get("round") or ""),
+        "aired": "published", "replay": True, "replay_of": line_id,
+        "replay_block": int(block or 0),
+    }
+    sting = kind == "sfx" or bool(row.get("sfx") or row.get("sfx_sample_id"))
+    if sting:
+        key = await asyncio.to_thread(_replay_sfx_key, row, text, air_at)
+        path = await asyncio.to_thread(sfx_by_id, key) if key else None
+        if path is None:
+            raise HTTPException(status_code=404, detail=(
+                "the station no longer knows which sample that sting was"))
+        key = sfx_id(path)
+        sig = media_sign(key)
+        admission_admit_line({"path": f"/sfx/{key}", "sig": sig},
+                             who="board", kind="sfx", text=path.stem,
+                             name=path.stem, line_id=new_id,
+                             producer="script_line_replay")
+        delivery = page_feed_append({
+            "url": f"/sfx/{key}?t={sig}", "text": "", "sting": path.stem,
+            "replay": True, "replay_of": line_id})
+        secs = float(row.get("seconds") or 0) or float(
+            await asyncio.to_thread(_clip_seconds, str(path)) or 0)
+        entry.update({"who": "board", "kind": "sfx", "text": path.stem,
+                      "sfx": key, "sfx_dir": path.parent.name or "sfx",
+                      "url": f"/sfx/{key}?t={sig}",
+                      "seconds": round(secs, 2)})
+        if row.get("video"):
+            entry["video"] = True
+        box_path, box_sig = f"/sfx/{key}", sig
+        _STING_AT[0] = time.time()
+    else:
+        media, sig, secs = await _replay_media_for(row)
+        if not media:
+            raise HTTPException(status_code=410, detail=(
+                "the audio behind that line has been pruned - the words "
+                "remain, the sound is gone"))
+        admission_admit_line({"path": f"/media/{media}", "sig": sig},
+                             who=who, kind=kind or "dialogue", text=text,
+                             name=name, line_id=new_id,
+                             producer="script_line_replay")
+        delivery = page_feed_append({
+            "url": f"/media/{media}?t={sig}", "text": text, "who": who,
+            "name": name, "kind": kind or "dialogue", "seconds": secs,
+            "voice": entry["voice"], "speech": True,
+            "replay": True, "replay_of": line_id})
+        entry.update({"media": media, "sig": sig, "seconds": round(secs, 2)})
+        box_path, box_sig = f"/media/{media}", sig
+    if delivery:
+        page_delivery_apply(entry, delivery)
+    else:
+        entry["aired"] = "withdrawn"
+        entry["withdrawn_why"] = "the broadcast gate refused the replay"
+    _RADIO["chat"].append(entry)
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
+    note_action("replayed from the script: " + entry["text"][:50])
+    box = ""
+    if (_RADIO.get("voice_to") or "box") in ("box", "both"):
+        # Off the request: the box call blocks for the clip's whole length.
+        async def _to_box() -> None:
+            try:
+                got = await _play_on_box(box_path, box_sig, replay=True)
+                if got:
+                    entry["aired"] = ("both" if entry.get("aired") == "stream"
+                                      else "box")
+            except Exception:  # noqa: BLE001
+                pass
+
+        asyncio.create_task(_to_box())
+        box = "handed to the box"
+    say = ("said again on every page" if delivery else
+           "the page feed refused it (%s)" % entry.get("withdrawn_why"))
+    if box:
+        say += " and " + box
+    return {"ok": True, "replayed": new_id, "of": line_id,
+            "kind": entry["kind"], "who": entry["who"], "name": name,
+            "text": entry["text"], "seconds": entry.get("seconds"),
+            "url": entry.get("url") or (
+                "/media/%s?t=%s" % (entry.get("media"), entry.get("sig"))
+                if entry.get("media") else ""),
+            "page": delivery or "", "box": box, "say": say}
+
+
+@app.post("/api/script/line/replay")
+async def script_line_replay_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1194] Say one line of the script again, on the broadcast - the
+    page feed every listener drains, and the box. `line_id` is the ledger's
+    line id (the booth row's id); `block` is only written down."""
+    require_auth(authorization)
+    payload = await request.json()
+    try:
+        block = int(payload.get("block") or 0)
+    except (TypeError, ValueError):
+        block = 0
+    return await script_line_replay(
+        str(payload.get("line_id") or payload.get("id") or ""), block)
+
+
 @app.get("/api/hour/contract")
 async def hour_contract_api(
     hours: float = 1.0,
@@ -117771,6 +122541,35 @@ async def hour_contract_api(
     now = time.time()
     span = max(0.1, min(12.0, float(hours or 1.0))) * 3600.0
     return await asyncio.to_thread(hour_contract_delivered, now - span, now + 1.0)
+
+
+@app.get("/api/playout")                                  # [#1218]
+async def playout_api(limit: int = Query(default=12, ge=1, le=120),
+                      authorization: str | None = Header(default=None)) -> Any:
+    """THE SEQUENCE, AND WHO TRIED TO GET IN FRONT OF IT (#1218, #1246).
+
+    `verdict` is one line for the Script view's header. `sounding` names
+    the occurrence, its (block, ord), the file and how far into it the
+    LISTENER says the playhead is - `position_basis` says whether that is
+    an ear or an estimate. `next` is the script ledger's next committed
+    occurrence and `next_audio_ready` says whether its whole audio
+    exists. `waiting` is every round behind it with the reason in a
+    sentence. `jumpers` is every road that asked to go now and was queued
+    behind the committed round instead, with counts - in `shadow` those
+    are `would_queue`, which is the census to read before enforcing."""
+    require_read_auth(authorization)
+    payload = playout_state(limit)
+    payload["mode_file"] = str(PLAYOUT_MODE_FILE)
+    payload["how_to_enforce"] = (
+        "write ONE word into the mode file: 'off' (the default - the "
+        "sequencer is inert and changes nothing), 'shadow' to evaluate and "
+        "count every verdict while enforcing none, or 'linear' to hold the "
+        "committed sequence: the script ledger's next committed occurrence "
+        "plays next, nothing else starts while it is sounding, and a filler "
+        "road is stamped after it instead of on top of it. One token only - "
+        "a file holding a sentence reads as off. Re-read within three "
+        "seconds; no restart.")
+    return payload
 
 
 @app.get("/api/admission")
@@ -117821,6 +122620,43 @@ async def script_production_api(limit: int = Query(default=12, ge=1, le=200),
         "round it will attempt. It is re-read within three seconds; no "
         "restart.")
     return payload
+
+
+@app.get("/api/bank")
+async def api_bank(minutes: int = Query(default=60, ge=5, le=360),
+                   authorization: str | None = Header(default=None)
+                   ) -> dict[str, Any]:
+    """#1184/#1246: THE READ-AHEAD LEDGER - the next hour, line by line.
+
+    "i dont know why these lines arent recorded and played in advance ...
+    large swaths missing."  The station had no answer to that because
+    nothing walked the coming hour and asked, of each committed line,
+    whether its audio exists yet.  Every other reader answers in SECONDS
+    of stock, which is how 2734 s of bound material and 98 s of finished
+    audio could read as a nearly full hour.
+
+    Per entry on the sheet, and per LINE inside each bound item:
+
+      rendered  the clip is on the pantry shelf - zero work to air
+      written   the words exist, the audio does not
+      live      a caller's own line, drawn at air time by design
+      missing   nothing is written at all
+
+    plus `rendered_ahead_seconds` (the figure to plot over time), the
+    production queue - ready rounds that still lack a MEASURED cue map, so
+    the sequencer cannot hold them - and what the standing producer last
+    did.  Read-only; it runs nothing and starts nothing."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(bank_view, int(minutes))    # [#1184]
+
+
+@app.post("/api/bank/produce")
+async def api_bank_produce(authorization: str | None = Header(default=None)
+                           ) -> dict[str, Any]:
+    """#1184: produce the head of the production queue now, out of turn."""
+    require_auth(authorization)
+    got = await bank_produce_now(force=True)
+    return {"ok": True, "produced": got, "bank": bank_view(60)}
 
 
 # --- script production (2026-09-15) --- end
@@ -119424,15 +124260,55 @@ def pinelink_ladder() -> dict[str, Any]:
     # 4. stream
     why = str(got.get("why") or "")
     last_why = [l for l in why.strip().splitlines() if l.strip()]
-    rung("stream", "Pull the picture (RTSP)",
-         "ok" if live else ("bad" if state == "dropped"
-                            else ("wait" if state == "joining" else "unknown")),
-         "streaming" if live else (last_why[-1][:160] if last_why else "no stream"),
+    # #1250b: A NAMED FAULT, NOT A LOG EXCERPT. This rung used to print
+    # the last line of `why`, and `why` had been cut to 400 characters
+    # from the FRONT of a four-line tail - so what it printed was
+    # always ffmpeg's two harmless start-up warnings about timestamps,
+    # and the line that named the fault had been thrown away on the
+    # host. The supervisor now classifies the end of every stream and
+    # writes it here: the class, the transport in force, the lifetimes
+    # of the last runs, and the real last line.
+    strm = dict(got.get("stream") or {})
+    try:
+        lives = [round(float(x), 1) for x in (strm.get("lives") or [])][-8:]
+    except Exception:  # noqa: BLE001
+        lives = []
+    s_cls = str(strm.get("class") or "")
+    s_say = str(strm.get("say") or "")
+    s_port = str(strm.get("transport") or "")
+    if live and len(lives) >= 3 and max(lives) < 60:
+        # A cut-out that repeats is a row of short lifetimes. Say it
+        # while the link is UP, because that is when nobody looks.
+        s_detail = ("streaming on %s - but the last %d runs lasted only "
+                    "%s" % (s_port or "?", len(lives),
+                            ", ".join("%gs" % x for x in lives)))
+        s_state = "wait"
+    elif live:
+        s_detail = "streaming on %s" % (s_port or "?")
+        s_state = "ok"
+    else:
+        s_state = ("bad" if state == "dropped"
+                   else ("wait" if state == "joining" else "unknown"))
+        s_detail = (("%s - %s" % (s_cls, s_say))[:200] if s_say
+                    else (last_why[-1][:160] if last_why else "no stream"))
+    rung("stream", "Pull the picture (RTSP)", s_state, s_detail,
          {"rtsp": got.get("rtsp"), "state": state, "fresh": fresh,
+          "transport": s_port, "fault": s_cls,
+          "last_life_s": strm.get("life_s"), "lives_s": lives,
+          "exit": strm.get("exit"), "noise_lines": strm.get("noise"),
+          "next_transport": strm.get("next_transport"),
           "why": why[-600:]}, connect,
          ["the camera allows ONE viewer: close any phone app watching it",
-          "'no new frame for 20s' means the camera stalled - move closer "
-          "or wake it",
+          "'session-cut' is the camera ending the session itself - it "
+          "does that to an interleaved TCP session at thirty seconds, so "
+          "the link runs on UDP and changes transport by itself if that "
+          "stops holding",
+          "'stalled' means no new frame for 20 s with ffmpeg still up - "
+          "move the camera closer or wake it",
+          "'decode' means packets are arriving damaged - that is the "
+          "radio link, not the camera",
+          "ffmpeg's timestamp warnings are printed once at start-up and "
+          "mean nothing; they are counted here, not shown",
           "the supervisor retries every 15 s by itself; Reconnect only "
           "hurries it"])
     # 5. frames
@@ -120524,9 +125400,21 @@ _SPARK_ASSET_DIR = Path("/app/desktop/renderer")
 # Captures are edited on a bounded background worker; the station's audio
 # players and scheduler are never involved in a video edit.
 from video_editor import create_video_editor_router
-app.include_router(create_video_editor_router(
+# [#1223] THE ROUTER IS KEPT, not thrown away at include time.
+#
+# "I had an option for edit that brings up a pop-up window where I can
+#  adjust the in and out points of the clip."  That window already exists -
+# it is this editor - and the alternative to holding on to the object here
+# was a second editor with its own worker, its own queue and its own idea
+# of what an export is.  create_video_editor_router hangs the VideoEditor
+# it built on the router as `pine_editor`, and /api/sfx/edit/* below hands
+# clips to that one instance, so an SFX edit and a screen-recording edit
+# queue behind each other on the same single worker, which is the whole
+# point of that worker being single.
+VIDEO_EDITOR_ROUTER = create_video_editor_router(
     data_path("video_edits"), Path(__file__).resolve().parent / "desktop" / "renderer",
-    require_auth, require_read_auth))
+    require_auth, require_read_auth)
+app.include_router(VIDEO_EDITOR_ROUTER)
 
 _SPARK_ASSETS = {
     "spark-overlays.js": "application/javascript; charset=utf-8",
@@ -124976,6 +129864,42 @@ async def api_orch_notes(
     }
 
 
+# [#1237] the record-binding desk, and the sequencer's hook over HTTP.
+@app.get("/api/record-binding")
+async def record_binding_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The rule, the deck, the last verdicts (aired / withdrawn / cut)."""
+    require_read_auth(authorization)
+    return record_bound_report()
+
+
+@app.get("/api/record-binding/block/{block}")
+async def record_binding_block_api(
+    block: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """record_bound_to_block() over HTTP: the record a script block must
+    play with, or none."""
+    require_read_auth(authorization)
+    got = record_bound_to_block(block)
+    return {"block": block, "bound": got,
+            "say": ("bound to " + record_binding.label(got)) if got
+            else "no record is bound to this block"}
+
+
+@app.post("/api/record-binding/cue")
+async def record_binding_cue_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Put a bound record at the head of the queue: {id, why}."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    return record_bound_cue(str((payload or {}).get("id") or ""),
+                            str((payload or {}).get("why") or "cued by hand"))
+
+
 @app.get("/api/track-reads")
 async def api_track_reads() -> dict[str, Any]:
     """#1061: THE TRACK LIBRARY - which records have a read on file.
@@ -125923,7 +130847,20 @@ def director_fork_kept(kind: str, row: dict[str, Any],
         fork_row["expires_at"] = stock_expires_at(kind, fork_row)
     except Exception:                              # noqa: BLE001
         fork_row.pop("expires_at", None)
-    _SHELF.setdefault(str(kind), []).append(fork_row)
+    if str(kind) == "banter":
+        # [#1231] A booth round's shelf IS the larder (alt_candidates reads
+        # _LARDER for "banter"); a fork appended to _SHELF["banter"] - the
+        # vestigial empty key the rescue-roads note warns about - was never
+        # offered to the air, so a banter rewrite was accepted and lost.
+        # Stamped with today's contract as the recast road stamps its
+        # copies, or _larder_current retires the fork unheard.
+        try:
+            fork_entry["profile"] = _larder_profile_signature()
+        except Exception:                          # noqa: BLE001
+            pass
+        _LARDER.append(fork_row)
+    else:
+        _SHELF.setdefault(str(kind), []).append(fork_row)
     try:
         alt_sid(str(kind), fork_row)               # stamp its new identity
     except Exception:                              # noqa: BLE001
@@ -126534,8 +131471,131 @@ def director_why(kind: str) -> dict[str, Any]:
             said.append("%d never reach the pool at all (spent, resting, "
                         "untinted, unrecorded or written for another cast)"
                         % pool["dropped"])
+    if kind == "caller":                                   # [#1249]
+        try:
+            out["topic_contract"] = caller_topic_contract_state()
+            if out["topic_contract"].get("say"):
+                said.append(str(out["topic_contract"]["say"]))
+        except Exception as exc:                           # noqa: BLE001
+            out["topic_contract"] = {"error": type(exc).__name__}
     out["say"] = "; ".join(said)
     return out
+
+
+def caller_topic_contract_state(most: int = 12) -> dict[str, Any]:
+    """[#1249] the subject the phone is on and how the last caller rounds
+    honoured it - what GET /api/director/why/caller carries."""
+    theme = active_theme()
+    subject = topic_subject(str((theme or {}).get("text") or ""))
+    source = ("theme: " + str((theme or {}).get("name") or "")) if subject else ""
+    plot_subject = ""
+    try:
+        row = plot_owns_air()
+        if row:
+            plot_subject = topic_subject(plot_act_now(row)[0])
+    except Exception:  # noqa: BLE001
+        plot_subject = ""
+    if not subject and plot_subject:
+        subject, source = plot_subject, "the storyline on air"
+    recent: list[dict[str, Any]] = []
+    for tc in list(_TOPIC_CONTRACTS)[-most:]:
+        recent.append({
+            "name": str(tc.get("caller") or ""),
+            "subject": str(tc.get("subject") or "")[:120],
+            "graded": bool(tc.get("checked")),
+            "adherence": tc.get("adherence"),
+            "addressing": tc.get("addressing"),
+            "host_turns": tc.get("host_turns"),
+            "ok": tc.get("ok"), "skeleton": tc.get("skeleton"),
+            "regenerated": tc.get("regenerated"), "at": tc.get("at")})
+    if not recent:
+        # Nothing written since the restart: read what is still shelved.
+        for row in list(_SHELF.get("caller") or [])[-most:]:
+            try:
+                entry = dialogue_entry(row) or {}
+                call = entry.get("call") or {}
+                tc = dict(call.get("topic_contract") or {})
+                recent.append({
+                    "name": str(entry.get("caller_name") or ""),
+                    "subject": topic_subject(str(call.get("topic") or ""))[:120],
+                    "graded": bool(tc),
+                    "adherence": tc.get("adherence"),
+                    "addressing": tc.get("addressing"),
+                    "host_turns": tc.get("host_turns"),
+                    "ok": tc.get("ok"), "skeleton": tc.get("skeleton"),
+                    "regenerated": tc.get("regenerated"), "at": tc.get("at")})
+            except Exception:  # noqa: BLE001
+                continue
+    graded = [r for r in recent if r.get("graded")]
+    mean = (sum(float(r["adherence"] or 0) for r in graded) / len(graded)) if graded else None
+    skel = sum(1 for r in graded if r.get("skeleton"))
+    say = ""
+    if subject:
+        say = "the phone's subject is \"%s\" (%s)" % (subject[:80], source)
+        if graded:
+            say += ("; the last %d graded rounds address it in %.0f%% of host turns"
+                    " (%d emergency skeleton%s, %d asked for a topic rewrite)"
+                    % (len(graded), 100.0 * mean, skel, "" if skel == 1 else "s",
+                       sum(1 for r in graded if r.get("regenerated"))))
+        else:
+            say += "; no caller round written since the deploy has been graded yet"
+    return {"subject": subject, "source": source, "plot_subject": plot_subject,
+            "theme": str((theme or {}).get("name") or ""),
+            "nouns": topic_nouns(subject)[:10] if subject else [],
+            "recent": recent, "graded": len(graded),
+            "mean_adherence": (round(mean, 2) if mean is not None else None),
+            "skeleton_share": (round(skel / len(graded), 2) if graded else None),
+            "say": say}
+
+
+def topic_contract_for_line(row: dict[str, Any]) -> dict[str, Any]:
+    """[#1249] the topic contract of the caller round a booth line belongs
+    to: by the line's own words inside the round's script (the ring, then
+    the shelf), else the round's sid, else the newest round for the name."""
+    try:
+        full = " ".join(str((row or {}).get("text") or "").split()).lower()
+        text = full[:50]
+        want_name = str((row or {}).get("caller") or (row or {}).get("name") or "")
+        by_name: dict[str, Any] = {}
+        named: dict[str, Any] = {}
+        for tc in reversed(_TOPIC_CONTRACTS):
+            got = {k: v for k, v in tc.items() if k != "words"}
+            who = str(tc.get("caller") or "")
+            if text and len(text) >= 24 and text in str(tc.get("words") or ""):
+                return got
+            if want_name and not by_name and who == want_name:
+                by_name = got
+            # A HOST turn of a caller round carries the host's name,
+            # not the caller's, and the words it airs are the TINTED
+            # ones - the ring holds the plain script. The prompt makes
+            # the hosts greet the caller by name; that is the way in.
+            if not named and len(who) > 2 and who.lower() in full:
+                named = got
+        if by_name or named:
+            return by_name or named
+        want_sid = str((row or {}).get("sid") or "")
+        for shelf_row in reversed(list(_SHELF.get("caller") or [])):
+            entry = dialogue_entry(shelf_row) or {}
+            call = entry.get("call") or {}
+            tc = dict(call.get("topic_contract") or {})
+            if not tc:
+                continue
+            tc["subject"] = tc.get("subject") or topic_subject(str(call.get("topic") or ""))
+            words = " ".join((str(entry.get("script") or "") + " "
+                              + str(entry.get("script_plain") or "")).split()).lower()
+            if text and len(text) >= 24 and text in words:
+                return tc
+            try:
+                sid = alt_sid_of("caller", shelf_row)
+            except Exception:  # noqa: BLE001
+                sid = ""
+            if want_sid and sid and sid == want_sid:
+                return tc
+            if want_name and not by_name and str(entry.get("caller_name") or "") == want_name:
+                by_name = tc
+        return by_name
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 @app.post("/api/director/air-now/{kind}")
@@ -128508,7 +133568,7 @@ async def response_bank_play_api(
                             "clip_until": offset + seconds, "clip_tail": 0.0})
             offset += seconds
         _RADIO.setdefault("chat", []).extend(entries)
-        del _RADIO["chat"][:-240]
+        del _RADIO["chat"][:-RADIO_CHAT_KEEP]
         delivery = page_feed_append({"url": f"{clip['path']}?t={clip['sig']}",
             "text": "Recorded response audition", "kind": "response_audition",
             "speech": True, "seconds": offset, "stream": {"length": offset, "rows": rows}})
@@ -131188,6 +136248,86 @@ def courier_pending() -> list[dict[str, Any]]:
     return out
 
 
+@app.post("/api/video-editor/exports/{identifier}/courier")
+async def video_editor_export_courier(
+    identifier: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[#1242] "There should be no reason that I'm not able to save a clip
+    ever."
+
+    The editor's last resort. The copy is already rendered and sitting in
+    data/video_edits/exports/<id>/edited.mp4; this copies it into the export
+    pile under its own name and puts it on the courier's ledger, so the desk
+    carries it to the folder the operator named. The tablet needs this because
+    an `<a download>` is inert inside its WebView; the desk uses it when the
+    save window has been refused or the operator would rather it went to the
+    share than through a dialog.
+
+    Authorised by the key, or by the save permit for the source this export
+    was made from — a surface that was allowed to render the copy is allowed
+    to post it."""
+    from video_editor import save_token_ok
+
+    if not re.fullmatch(r"[0-9a-f]{32}", str(identifier or "")):
+        raise HTTPException(status_code=400, detail="Invalid export identity")
+    folder = data_path("video_edits") / "exports" / identifier
+    try:
+        record = json.loads((folder / "record.json").read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            raise ValueError("not a record")
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=404,
+                            detail="No such edited copy") from None
+    try:
+        require_auth(authorization)
+    except HTTPException as exc:
+        token = (request.headers.get("x-pine-save-token")
+                 or request.query_params.get("save") or "")
+        if exc.status_code != 401 or not save_token_ok(
+                token, str(record.get("source_id") or "")):
+            raise
+    if str(record.get("status") or "") != "complete":
+        raise HTTPException(
+            status_code=409,
+            detail="That copy is not finished yet, so there is nothing to carry.")
+    made = folder / "edited.mp4"
+    if not made.is_file():
+        raise HTTPException(status_code=404,
+                            detail="The edited copy is no longer on disk.")
+    dest = export_desk_dir()
+    if not dest:
+        try:
+            dest = export_dir_windows(
+                str(pinelink_prefs_read().get("export_dir") or ""))
+        except Exception:  # noqa: BLE001
+            dest = ""
+    if not dest:
+        raise HTTPException(
+            status_code=409,
+            detail=("No export folder is set, so the desk has nowhere to "
+                    "carry it. Name one in the Station drawer, or keep the "
+                    "copy straight to this device instead."))
+    # Every export is called edited.mp4 inside its own folder; the courier
+    # carries by NAME, so it gets the record's name before it leaves.
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_",
+                  str(record.get("name") or ""))[:120].strip("._")
+    if not safe:
+        safe = "pine-edited-%s.mp4" % identifier[:8]
+    if not safe.lower().endswith(".mp4"):
+        safe += ".mp4"
+    pile = data_path("exports")
+    pile.mkdir(parents=True, exist_ok=True)
+    target = pile / safe
+    await asyncio.to_thread(shutil.copyfile, made, target)
+    row = courier_add(target, dest, "video-edit")
+    note_action("an edited clip was handed to the courier for %s" % dest)
+    return {"ok": True, "id": row["id"], "name": safe, "dest": dest,
+            "bytes": row.get("bytes", 0),
+            "detail": "%s is on the courier's ledger for %s" % (safe, dest)}
+
+
 @app.put("/api/export/upload")
 async def export_upload_api(
     request: Request,
@@ -131332,6 +136472,374 @@ def export_where_view() -> dict[str, Any]:
             "recent": [{k: r.get(k) for k in ("name", "dest", "state", "delivered",
                                               "why", "at", "done_at")}
                        for r in rows[-8:]]}
+
+
+# --- #1220: DOWNLOAD THE WHOLE SEGMENT -------------------------------------
+#
+# "I want to be able to download an entire segment, offer an option to
+#  download the whole segment and export it to Pinebox for recordings as a
+#  segment."
+#
+# A segment is a block of the script ledger (#1330): every line the round
+# wrote, in the order it was heard, stings included. The audio behind those
+# lines is the round's own welded file - one wav per burst, every turn's
+# window written onto its air row (#908) - so the whole segment is a handful
+# of exact cuts joined back together, with the records and adverts that
+# dropped inside it at their clock slot. The planning and the ffmpeg live in
+# segment_export.py; this is the gathering, the job and the routes. The file
+# lands in export_dir like every other cut and rides the courier (#1114) to
+# the Windows folder the operator named, with a screenplay .md and a .json
+# cue sheet beside it.
+#
+# "As it aired" is the same stretch cut from the broadcast shelf's full mix
+# (#667): records underneath, gaps as they were. Nothing in this station
+# RECORDS the stream - station_stream keeps a burst ring for late joiners
+# and the desk's screen ring holds ten minutes at most - so the mixed twin
+# is the only durable record of how a stretch sounded, and it exists only
+# once the episode holding it has been sealed (every episode_minutes). An
+# unsealed stretch is refused by name, with `can_seal`; `seal: true` seals
+# first, which is what the spoken broadcast export (#1025) already does.
+_SEG_EXPORT_JOBS: dict[str, dict[str, Any]] = {}
+_SEG_EXPORT_LOCK = RLock()
+_SEG_EXPORT_KEEP = 30
+SEG_EXPORT_RECORD_MODES = ("full", "short", "none")
+
+
+def _seg_export_job_set(job: str, **fields: Any) -> dict[str, Any]:
+    with _SEG_EXPORT_LOCK:
+        row = _SEG_EXPORT_JOBS.setdefault(job, {"job": job})
+        row.update(fields)
+        return dict(row)
+
+
+def _seg_export_job_get(job: str) -> dict[str, Any] | None:
+    with _SEG_EXPORT_LOCK:
+        row = _SEG_EXPORT_JOBS.get(job)
+        return dict(row) if row else None
+
+
+def _seg_export_deps() -> Any:
+    """The station's own roads, handed to segment_export so it never has
+    to import this file (#1220)."""
+    import segment_export as segx
+
+    def media_path(key: str) -> str:
+        key = str(key or "")
+        if not MEDIA_KEY_SHAPE.match(key):
+            return ""
+        p = VOICE_MEDIA_DIR / key
+        return str(p) if p.is_file() else ""
+
+    def ad_path(key: str) -> str:
+        key = str(key or "")
+        if not AD_AUDIO_SHAPE.match(key):
+            return ""
+        p = PRODUCED_ADS_DIR / key
+        return str(p) if p.is_file() else ""
+
+    def record_path(row: dict[str, Any]) -> str:
+        track = None
+        try:
+            track = music_track(str(row.get("id") or ""))
+        except Exception:  # noqa: BLE001
+            track = None
+        hot = music_hot_file(track) if track else None
+        if hot:
+            return str(hot)
+        for cand in ((track or {}).get("path"), row.get("path")):
+            try:
+                if cand and Path(str(cand)).is_file():
+                    return str(cand)
+            except OSError:
+                continue
+        return ""
+
+    return segx.Deps(media_path=media_path, ad_path=ad_path, record_path=record_path,
+                     shelf=_booth_index_build, clip_seconds=_clip_seconds,
+                     box_tail=box_tail_seconds(), concat_keep=CONCAT_KEEP,
+                     published=tuple(AIR_PUBLICATION_STATES))
+
+
+def _seg_export_gather(block: int) -> dict[str, Any]:
+    """The block's ledger rows, the air rows around them, the records and
+    the produced spots of the same stretch - one read of each ledger."""
+    led = [r for r in script_ledger_rows() if int(r.get("block") or -1) == int(block)]
+    if not led:
+        raise LookupError("no block %d is in the script ledger - it holds the last "
+                          "48 hours, so an older segment is gone" % int(block))
+    led.sort(key=lambda r: int(r.get("ord") or 0))
+    at = float(led[0].get("at") or 0) or time.time()
+    air = airlog_rows(at - 1800.0, at + 7200.0, quiet=True)
+    ids = {str(r.get("line_id") or "") for r in led}
+    try:
+        records = _music_log_rows(at - 1800.0, at + 7200.0)
+    except Exception:  # noqa: BLE001
+        records = []
+    ads: list[dict[str, Any]] = []
+    try:
+        spots = [r for r in air if r.get("ad_audio") and str(r.get("id") or "") not in ids]
+        book = ad_airings() if spots else []
+        for r in spots:
+            key = str(r.get("ad_audio") or "")
+            if not AD_AUDIO_SHAPE.match(key) or not (PRODUCED_ADS_DIR / key).is_file():
+                continue
+            when = float(r.get("air_at") or r.get("ts") or 0)
+            label = ""
+            for b in book:
+                if abs(float(b.get("ts") or 0) - when) <= 8.0 and b.get("product"):
+                    label = str(b.get("product"))
+                    break
+            ads.append({"at": when, "id": str(r.get("id") or ""), "path": str(PRODUCED_ADS_DIR / key),
+                        "seconds": float(r.get("seconds") or 0) or _clip_seconds(str(PRODUCED_ADS_DIR / key)),
+                        "label": label or " ".join(str(r.get("text") or "").split())[:60]})
+    except Exception:  # noqa: BLE001
+        ads = []
+    return {"led": led, "air": air, "records": records, "ads": ads}
+
+
+def _seg_export_mix_for(lo: float, hi: float) -> tuple[str, float, str] | None:
+    """The shelved full mix covering [lo, hi]: (path, its lo, name)."""
+    try:
+        sidecars = sorted(BROADCASTS_DIR.glob("*_fullmix.json"))
+    except OSError:
+        return None
+    for js in sidecars:
+        try:
+            meta = json.loads(js.read_text())
+            mlo, mhi = float(meta.get("lo") or 0), float(meta.get("hi") or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        mp3 = js.with_suffix(".mp3")
+        if mlo <= lo and mhi >= hi and mp3.is_file():
+            return str(mp3), mlo, mp3.name
+    return None
+
+
+def _seg_export_sealed_until() -> float:
+    """The latest moment the sealed episodes' marks reach - what the
+    broadcast mix can see (#774: the open episode is invisible to it)."""
+    hi = 0.0
+    try:
+        for js in (RADIO_CACHE / "episodes").glob("*.json"):
+            try:
+                for mark in json.loads(js.read_text()):
+                    hi = max(hi, float(mark.get("t") or 0) + float(mark.get("dur") or 0))
+            except Exception:  # noqa: BLE001
+                continue
+    except OSError:
+        pass
+    return hi
+
+
+def _seg_export_run(job: str, block: int, opts: dict[str, Any]) -> None:
+    """The job, on its own thread: gather, plan, cut, write the sidecars,
+    hand the three files to the courier. Never raises - the job row says."""
+    source = str(opts.get("source") or "welded")
+    fmt = "wav" if str(opts.get("format") or "") == "wav" else "mp3"
+    try:
+        import imageio_ffmpeg
+        import segment_export as segx
+        _seg_export_job_set(job, state="building", step="reading the ledger", pct=2)
+        deps = _seg_export_deps()
+        got = _seg_export_gather(block)
+        led, air, records, ads = got["led"], got["air"], got["records"], got["ads"]
+        mix_scratch: list[Path] = []
+        if source == "aired":
+            lo, hi, _lines = segx.window_of(led, air, deps)
+            found = _seg_export_mix_for(lo, hi)
+            if not found:
+                sealed_until = _seg_export_sealed_until()
+                if hi <= sealed_until + 0.5 or opts.get("seal"):
+                    if hi > sealed_until + 0.5:
+                        _seg_export_job_set(job, step="sealing the open episode first", pct=5)
+                        _episode_finalize()
+                    levels = mix_levels()
+                    _seg_export_job_set(job, step="mixing the stretch off the shelf, records underneath", pct=10)
+                    mixed = _broadcast_mix(lo, hi,
+                                           max(0.0, min(2.0, levels["music"] / 100)),
+                                           max(0.0, min(0.9, levels["duck"] / 100)),
+                                           max(0.25, min(2.0, levels["voice"] / 100)),
+                                           tag="_seg%s" % job)
+                    mix_scratch.append(RADIO_CACHE / ("_bmix_seg%s" % job))
+                    if not mixed:
+                        raise RuntimeError("the shelf could not mix that stretch - see the pipeline log")
+                    mix_scratch.append(Path(mixed))
+                    found = (str(mixed), lo, "a mix rendered for this segment")
+                else:
+                    ep = _RADIO.get("episode") or {}
+                    try:
+                        mins = int(dj_settings().get("episode_minutes") or 15) or 15
+                    except Exception:  # noqa: BLE001
+                        mins = 15
+                    due = float(ep.get("started") or time.time()) + mins * 60
+                    _seg_export_job_set(
+                        job, state="failed", pct=0, can_seal=True,
+                        next_seal_at=due,
+                        say=("this stretch has not been sealed yet - the shelf seals every "
+                             "%d minutes (next at about %s); build the welded segment now, "
+                             "or seal the shelf and build the aired one"
+                             % (mins, time.strftime("%H:%M", time.localtime(due)))),
+                        error="unsealed", done_at=time.time())
+                    return
+            plan = segx.plan_aired(block, led, air, records, deps, mix_path=found[0],
+                                   mix_lo=found[1], lo=lo, hi=hi, fmt=fmt, mix_name=found[2])
+        else:
+            plan = segx.plan_welded(block, led, air, records, ads, deps,
+                                    records_mode=str(opts.get("records") or "short"),
+                                    fmt=fmt, edges=bool(opts.get("edges", True)))
+        dest_dir = export_dir_path()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        base = dest_dir / segx.file_stem(plan, station_slug())
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+        def progress(pct: float, step: str) -> None:
+            _seg_export_job_set(job, pct=round(float(pct), 1), step=str(step)[:120])
+
+        stats = segx.render(plan, base, exe, progress)
+        for scratch in mix_scratch:
+            try:
+                if scratch.is_dir():
+                    shutil.rmtree(scratch, ignore_errors=True)
+                elif scratch.is_file():
+                    scratch.unlink()
+            except OSError:
+                pass
+        out = Path(stats["path"])
+        try:
+            station = str(dj_settings().get("station_name") or "").strip() or "Pine Box FM"
+        except Exception:  # noqa: BLE001
+            station = "Pine Box FM"
+        meta = {"station": station,
+                "scene": screenplay_scene_slug(plan.road, plan.first_air_at),
+                "hour": screenplay_hour_key(plan.first_air_at),
+                "file": out.name, "built_at": time.time(),
+                "built_at_local": time.strftime("%Y-%m-%d %H:%M:%S")}
+        _seg_export_job_set(job, pct=96, step="writing the screenplay and the cue sheet")
+        md = base.with_suffix(".md")
+        js = base.with_suffix(".json")
+        md.write_text(segx.markdown(plan, meta), encoding="utf-8")
+        js.write_text(segx.to_json(plan, meta), encoding="utf-8")
+        desk = export_desk_dir()
+        carried: list[str] = []
+        if desk:
+            for p in (out, md, js):
+                try:
+                    carried.append(courier_add(p, desk, "segment")["id"])
+                except Exception:  # noqa: BLE001
+                    pass
+        landed = (desk.rstrip("\\") + "\\" + out.name) if desk else share_path_of(out)
+        heard = sum(1 for e in plan.lines if not e.get("skip_why"))
+        say = ("segment %d %s: %s (%s, %d of %d line(s)%s) - %s"
+               % (int(block), "as it aired" if source == "aired" else "welded", out.name,
+                  segx.mmss(plan.total_seconds), heard, len(plan.lines),
+                  (", %d record(s)/advert(s)" % sum(1 for c in plan.cues if c.get("kind") in ("record", "advert"))
+                   if source != "aired" else ""),
+                  ("the desk carries it to " + desk) if desk
+                  else ("it stays at " + share_path_of(out) + " - no export folder is set")))
+        _seg_export_job_set(job, state="ready", pct=100, step="done", name=out.name,
+                            path=str(out), share_path=share_path_of(out), dest=desk,
+                            landed=landed, courier=carried, carried=bool(carried),
+                            seconds=plan.total_seconds, lines_seconds=plan.lines_seconds,
+                            pieces=stats.get("pieces"), cues=len(plan.cues),
+                            heard=heard, lines=len(plan.lines),
+                            skipped=plan.skipped, notes=plan.notes,
+                            sidecars=[md.name, js.name], bytes=stats.get("bytes"),
+                            say=say, done_at=time.time())
+        pipeline_log("air", say + " (#1220)")
+    except Exception as exc:  # noqa: BLE001
+        empty = type(exc).__name__ in ("SegmentEmpty", "LookupError")
+        _seg_export_job_set(job, state="empty" if empty else "failed", pct=0,
+                            error=str(exc)[:300], done_at=time.time(),
+                            say=(str(exc)[:300] if empty
+                                 else "the segment could not be built: " + str(exc)[:200]))
+        pipeline_log("drop", "segment %d export %s: %s (#1220)"
+                     % (int(block), "empty" if empty else "failed", str(exc)[:200]))
+
+
+@app.post("/api/export/segment")
+async def export_segment_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1220: build ONE file for a segment (a script-ledger block) and hand
+    it to the courier. Body: {block, source: welded|aired, records:
+    full|short|none, format: mp3|wav, edges: bool, seal: bool}. Answers
+    at once with a job id; GET /api/export/segment/{job} is the progress."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    try:
+        block = int(body.get("block") or 0)
+    except (TypeError, ValueError):
+        block = 0
+    if block <= 0:
+        raise HTTPException(status_code=400,
+                            detail="name a block - a segment is its block in the "
+                                   "script ledger (#1330)")
+    source = "aired" if str(body.get("source") or "").lower() == "aired" else "welded"
+    records = str(body.get("records") or "short").lower()
+    if records not in SEG_EXPORT_RECORD_MODES:
+        raise HTTPException(status_code=400,
+                            detail="records must be one of full, short, none")
+    fmt = "wav" if str(body.get("format") or "").lower() == "wav" else "mp3"
+    opts = {"source": source, "records": records, "format": fmt,
+            "edges": bool(body.get("edges", True)), "seal": bool(body.get("seal"))}
+    with _SEG_EXPORT_LOCK:
+        # a second press while the first is still building joins it
+        for row in _SEG_EXPORT_JOBS.values():
+            if (int(row.get("block") or 0) == block and row.get("source") == source
+                    and row.get("state") in ("queued", "building")):
+                return {"ok": True, "already": True, **row}
+        job = "seg-" + uuid.uuid4().hex[:8]
+        if len(_SEG_EXPORT_JOBS) >= _SEG_EXPORT_KEEP:
+            done = sorted((k for k, v in _SEG_EXPORT_JOBS.items()
+                           if v.get("state") not in ("queued", "building")),
+                          key=lambda k: float(_SEG_EXPORT_JOBS[k].get("started") or 0))
+            for k in done[:max(1, len(_SEG_EXPORT_JOBS) - _SEG_EXPORT_KEEP + 1)]:
+                _SEG_EXPORT_JOBS.pop(k, None)
+        _SEG_EXPORT_JOBS[job] = {"job": job, "block": block, "source": source,
+                                 "records": records, "format": fmt, "state": "queued",
+                                 "pct": 0, "step": "queued", "started": time.time(),
+                                 "say": ""}
+    Thread(target=_seg_export_run, args=(job, block, opts), name="segment-export",
+           daemon=True).start()
+    return {"ok": True, "job": job, "block": block, "source": source, "records": records,
+            "format": fmt, "state": "queued", "pct": 0,
+            "say": "building segment %d%s" % (block, " as it aired" if source == "aired" else "")}
+
+
+@app.get("/api/export/segment/{job}")
+async def export_segment_job_api(
+    job: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1220: how one segment build is going - state queued | building |
+    ready | empty | failed, pct, step, and once ready the file, where it
+    landed and the courier rows that carry it."""
+    require_read_auth(authorization)
+    row = _seg_export_job_get(job)
+    if not row:
+        raise HTTPException(status_code=404, detail="no such segment export")
+    return {"ok": True, **row}
+
+
+@app.get("/api/export/segment")
+async def export_segment_jobs_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1220: the recent segment builds, newest first."""
+    require_read_auth(authorization)
+    with _SEG_EXPORT_LOCK:
+        rows = sorted((dict(v) for v in _SEG_EXPORT_JOBS.values()),
+                      key=lambda r: -float(r.get("started") or 0))
+    return {"ok": True, "jobs": rows[:_SEG_EXPORT_KEEP],
+            "export_dir": str(export_dir_path()), "desk_dir": export_desk_dir()}
+
+
+# --- #1220 end -------------------------------------------------------------
 
 
 @app.get("/api/export/where")
@@ -132580,6 +138088,15 @@ async def _startup_clip_book() -> None:
     except Exception as exc:  # noqa: BLE001
         print("[sfx-db] could not start the indexer: %s" % exc,
               flush=True)
+    # [#1251] and the keyword index over the names the book holds. A
+    # second of thread time against a book that is already written; on a
+    # first run it finds nothing and the walk above kicks it again when
+    # it finishes.
+    try:
+        sfx_match_kick()
+    except Exception as exc:  # noqa: BLE001
+        print("[sfx-match] could not start the indexer: %s" % exc,
+              flush=True)
 
 
 @app.on_event("startup")
@@ -133144,7 +138661,7 @@ async def dj_shout(
     _RADIO.setdefault("chat", []).append({
         "ts": int(time.time()), "who": "host", "kind": "callin",
         "text": f"📣 {who}: {text}"})
-    del _RADIO["chat"][:-240]
+    del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     note_action(f"📣 {who} shouted at the booth")
     # And the pair deal with it on air.
     if _RADIO.get("on"):
@@ -133156,12 +138673,23 @@ async def dj_shout(
     return {"heard": text, "on_air": bool(_RADIO.get("on"))}
 
 
-@app.get("/api/dj/video")
-async def dj_video_now(
-    t: str = "",
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """The clip with a PICTURE that is on air, or about to be (#1263).
+# [#1244] NOT A ROUTE ANY MORE, BECAUSE IT NEVER WAS ONE.
+#
+# This carried a second @app.get("/api/dj/video") twenty-one thousand
+# lines below the first. Starlette matches the FIRST route registered, so
+# every request in the life of this file went to dj_video_api and this
+# handler never ran - while /openapi.json advertised THIS function,
+# because the schema is built from a dict keyed on the path and the last
+# writer wins. Measured 2026-09-21: the answer on :8096, on the public
+# door and over the funnel carried "clips" and no "videos" key at all.
+#
+# What it computes is still the thing a LATE listener cannot do without.
+# The live door keeps a clip for max(5, seconds) after its air instant;
+# a stream listener rides a 30 s join burst, so his ear arrives at that
+# instant half a minute after it has gone. So this stops pretending to
+# be a route and becomes the helper the one live door calls.
+def dj_video_late(now_ms: int, lag_ms: int = 0) -> list[dict[str, Any]]:
+    """The clips with a PICTURE a LATE listener still needs (#1263).
 
     Deliberately tiny and deliberately separate from /api/dj/voice. The
     stream road does not pull the voice feed at all - that feed announces
@@ -133175,12 +138703,18 @@ async def dj_video_now(
     stream listener is deliberately behind live and the picture has to
     land on the sound.
     """
-    require_listen_auth(t, authorization)
-    now_ms = int(time.time() * 1000)
+    heard = now_ms - max(0, min(180000, int(lag_ms or 0)))   # [#1244]
     out: list[dict[str, Any]] = []
     try:
         cut = int(_RADIO.get("voice_cut_ms") or 0)
-        for clip in list(_RADIO.get("voice_clips") or [])[-40:]:
+        # [#1244] forty rows was the whole ring when a picture was a rare
+        # sting. The endless set rings 28 s AHEAD in slots as short as
+        # 0.8 s, so forty rows can be less than a minute of air and none
+        # of it old enough for an ear thirty seconds behind live. The
+        # ring itself keeps two thousand (VOICE_CLIP_FEED_KEEP) and the
+        # window below throws away everything older than three minutes,
+        # so this only stops the walk being the thing that loses them.
+        for clip in list(_RADIO.get("voice_clips") or [])[-240:]:
             if not clip.get("video"):
                 continue
             ts = int(clip.get("ts") or 0)
@@ -133202,7 +138736,39 @@ async def dj_video_now(
             })
     except Exception:  # noqa: BLE001
         pass
-    return {"server_ms": now_ms, "videos": out[-6:]}
+    # [#1244] THE CLIP THE EAR IS INSIDE, AND A SHORT RUNWAY AFTER IT.
+    #
+    # The old tail took the newest six, which is the wrong six for
+    # exactly the listener this exists for: with the endless set ringing
+    # 28 s ahead (SFX_CYCLE_AHEAD) and slots as short as 0.8 s
+    # (SFX_CYCLE_SHORTEST), the newest six are all still in the future
+    # while the one his ear is on is twenty clips back. So the list is
+    # anchored on HIS instant, not on the station's.
+    out.sort(key=lambda row: row["broadcast_ms"])
+    first = max(0, len(out) - 12)
+    for index, row in enumerate(out):
+        if row["broadcast_ms"] + int(row["seconds"] * 1000) >= heard - 2000:
+            first = index
+            break
+    return out[first:first + 12]
+
+
+def dj_video_burst_s() -> float:
+    """[#1244] How far behind live a stream listener is BY DESIGN.
+
+    The page cannot work this out for itself. `buffered.end -
+    currentTime` is only what the decoder still holds, and the mp3
+    socket is paced at exactly 1x, so the burst handed out at connect
+    stops being visible there within seconds: measured over the funnel
+    at 6-9 s, dipping to 0.000006, against a real burst of 30. The
+    station knows the number, so the station says it, on the poll the
+    set already makes.
+    """
+    try:
+        from station_stream import JOIN_BURST_SECONDS
+        return round(float(JOIN_BURST_SECONDS), 1)
+    except Exception:  # noqa: BLE001
+        return 30.0
 
 
 @app.get("/api/dj/reacts")
@@ -135033,6 +140599,231 @@ async def sfx_ban_api(
     return {"id": sid, "banned": sid in bans, "total": len(bans)}
 
 
+# [#1200] --- the trash can on the hold sheet ---------------------------------
+#
+# "When I select sound effects, put a icon here of a trash can that I can tap
+#  that deletes the file locally on the system so it just gets rid of it
+#  permanently."
+#
+# POST /api/sfx/delete already removes the file - or, for the QuickSwap share
+# this container can only read, bans the id and hands the paths to the desk's
+# courier (#703, #1114). What it did NOT do was tell every other road that
+# remembers the clip: the draw history (recent_picks.json, #1225), the tube's
+# cooldown ledger (#1433), the endless set's queue - both the ring it is rung
+# into and the cycle's own plan (#1395) - the SFX guy's hand-ins (#1417), the
+# booth's chat rows, the levelled copies and the poster. Each of those could
+# hand the clip back after the file was gone, and the feed and the script had
+# no way to say the row was deleted. This block is the one place that forgets
+# a clip everywhere, plus a small ledger so the surfaces can say so.
+SFX_DELETED_PATH = data_path("sfx_deleted.json")
+SFX_DELETED_MOST = 2000
+SFX_DELETED_WITHDRAW_S = 900.0        # how long /api/dj/video keeps naming it
+_SFX_DELETED_LOCK = RLock()
+
+
+def _sfx_deleted_read() -> list[dict[str, Any]]:
+    """The file itself, for the writer - never the memo, which is throttled
+    to one stat a second and would let two deletions inside a second lose
+    the first."""
+    try:
+        rows = json.loads(SFX_DELETED_PATH.read_text())
+    except Exception:  # noqa: BLE001
+        return []
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def sfx_deleted_rows() -> list[dict[str, Any]]:
+    """The deletions, oldest first (memoised on the file's own stamp, the
+    same way the bans are - every surface polls the roads that read this)."""
+    return _sfx_file_memo(
+        SFX_DELETED_PATH,
+        lambda rows: ([r for r in rows if isinstance(r, dict)]
+                      if isinstance(rows, list) else []),
+        [])
+
+
+def sfx_deleted_ids() -> set[str]:
+    return {str(r.get("id") or "") for r in sfx_deleted_rows()} - {""}
+
+
+def sfx_deleted_lines() -> set[str]:
+    """The booth row ids the deletions were made from - the air log does not
+    carry the clip id, so the script marks its rows by these."""
+    out: set[str] = set()
+    for r in sfx_deleted_rows():
+        for line in (r.get("lines") or []):
+            if line:
+                out.add(str(line))
+    return out
+
+
+def sfx_deleted_recent(most: int = 24, within: float = 0.0) -> list[dict[str, Any]]:
+    """Newest first, for the surfaces that poll: the sampler drops pads
+    holding one of these, the set drops it from its queue."""
+    rows = sfx_deleted_rows()
+    if within > 0:
+        floor = time.time() - float(within)
+        rows = [r for r in rows if float(r.get("at") or 0) >= floor]
+    return [{"id": str(r.get("id") or ""), "name": str(r.get("name") or ""),
+             "at": r.get("at"), "lines": list(r.get("lines") or [])}
+            for r in rows[-max(1, int(most)):]][::-1]
+
+
+def sfx_deleted_add(sid: str, name: str, lines: list[str], files: list[str],
+                    carried: list[str]) -> dict[str, Any]:
+    row = {"id": str(sid), "name": str(name)[:120], "at": time.time(),
+           "lines": list(dict.fromkeys(str(x) for x in lines if x))[:40],
+           "files": [str(x) for x in files][:12],
+           "carried": [str(x) for x in carried][:12]}
+    with _SFX_DELETED_LOCK:
+        rows = [r for r in _sfx_deleted_read()
+                if str(r.get("id") or "") != str(sid)]
+        rows.append(row)
+        rows = rows[-SFX_DELETED_MOST:]
+        try:
+            SFX_DELETED_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SFX_DELETED_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows, indent=1))
+            tmp.replace(SFX_DELETED_PATH)
+        except OSError:
+            pass
+        _SFX_FILE_MEMO.pop(str(SFX_DELETED_PATH), None)   # the next read is fresh
+    return row
+
+
+def sfx_id_of_line(line_id: str) -> tuple[str, str]:
+    """(clip id, or why not) for a line the hold sheet named.
+
+    The booth's ring carries `sfx` on a sting row; the air log did not
+    (it does from #1200 on), so a row that has rolled off the ring is
+    matched by its stem in the clip book - and only when exactly one clip
+    answers to that stem, because '95 clip' exists in a dozen folders."""
+    row = line_row_of(line_id)
+    if not row:
+        return "", "that line is not in the booth's memory any more"
+    got = str(row.get("sfx") or "")
+    if got:
+        return got, ""
+    if (str(row.get("kind") or "") != "sfx"
+            and str(row.get("who") or "") not in ("board", "drop")):
+        return "", "that line is not a sound effect"
+    stem = " ".join(str(row.get("text") or "").split())
+    if not stem:
+        return "", "the line names no clip"
+    hits: list[Any] = []
+    try:
+        con = sfx_db_reader()
+        if con is not None:
+            with _SFX_DB_LOCK:
+                hits = con.execute(
+                    "SELECT path FROM clips WHERE name = ? LIMIT 3",
+                    (stem,)).fetchall()
+    except Exception:  # noqa: BLE001
+        hits = []
+    if len(hits) == 1:
+        return sfx_id(Path(str(hits[0][0]))), ""
+    if not hits:
+        return "", "no clip in the book is called '%s'" % stem[:60]
+    return "", ("%d clips are called '%s' - delete it from the SFX desk, "
+                "where the folder is shown" % (len(hits), stem[:60]))
+
+
+def sfx_forget_everywhere(sid: str, mates: list[Path]) -> dict[str, Any]:
+    """Every road that could hand the clip back after the file is gone.
+    The ban (the caller's) stops the draw; this clears what was already
+    drawn, planned or remembered. Each step is its own try: a road that
+    cannot be cleared must not stop the next one."""
+    names = {str(p) for p in mates}
+    ids = {str(sid)}
+    for p in mates:
+        try:
+            ids.add(sfx_id(p))
+        except Exception:  # noqa: BLE001
+            pass
+    out: dict[str, Any] = {"recent": 0, "cooldown": 0, "ring": 0,
+                           "requests": 0, "chat": [], "levelled": 0,
+                           "poster": 0}
+    # the draw history (#1225): both roads that write it read this book
+    try:
+        _recent_load()
+        book = _RADIO.get("recent") or {}
+        for _key, rows in list(book.items()):
+            if not isinstance(rows, list):
+                continue
+            kept = [r for r in rows if str(r) not in names]
+            if len(kept) != len(rows):
+                out["recent"] += len(rows) - len(kept)
+                rows[:] = kept
+        if out["recent"]:
+            with _RECENT_LOCK:
+                _recent_save()
+    except Exception:  # noqa: BLE001
+        pass
+    # the tube's cooldown ledger (#1433)
+    try:
+        _sfx_video_played_load()
+        for key in ids:
+            if _SFX_VIDEO_PLAYED.pop(key, None) is not None:
+                out["cooldown"] += 1
+        if out["cooldown"]:
+            _sfx_video_played_save()
+    except Exception:  # noqa: BLE001
+        pass
+    # the endless set: what is rung ahead in the ring (every set polls it),
+    # the cycle's own plan (read in its loop), and the SFX guy's hand-ins
+    try:
+        ring = _RADIO.get("voice_clips") or []
+        before = len(ring)
+        ring[:] = [c for c in ring
+                   if not (isinstance(c, dict)
+                           and (str(c.get("id") or "") in ids
+                                or any(("/sfx/%s" % k) in str(c.get("url") or "")
+                                       for k in ids)))]
+        out["ring"] = before - len(ring)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        asked = _SFX_CYCLE.setdefault("requests", [])
+        kept_asks = [a for a in asked if str(a[0]) not in names]
+        out["requests"] = len(asked) - len(kept_asks)
+        asked[:] = kept_asks
+        dropped = _SFX_CYCLE.setdefault("dropped", [])
+        for key in ids:
+            if key not in dropped:
+                dropped.append(key)
+        del dropped[:-50]
+    except Exception:  # noqa: BLE001
+        pass
+    # the booth's rows: the feed and the script can say so
+    try:
+        _ensure_chat_ids()
+        for row in _RADIO.get("chat") or []:
+            if isinstance(row, dict) and str(row.get("sfx") or "") in ids:
+                row["deleted"] = True
+                out["chat"].append(str(row.get("id") or ""))
+    except Exception:  # noqa: BLE001
+        pass
+    # the levelled copies and the poster: derived files of a gone original
+    try:
+        for key in ids:
+            for old in SFX_LEVELLED.glob(key + "-*"):
+                try:
+                    old.unlink()
+                    out["levelled"] += 1
+                except OSError:
+                    pass
+            poster = SFX_POSTER_DIR / (key + ".jpg")
+            try:
+                if poster.is_file():
+                    poster.unlink()
+                    out["poster"] += 1
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 @app.post("/api/sfx/delete")
 async def sfx_delete_api(
     request: Request,
@@ -135046,7 +140837,20 @@ async def sfx_delete_api(
     require_auth(authorization)
     payload = await request.json() if await request.body() else {}
     sid = str(payload.get("id") or "")
+    line_id = str(payload.get("line") or "")                      # [#1200]
+    if not sid and line_id:
+        # the hold sheet names the booth row, not the clip
+        sid, _why = sfx_id_of_line(line_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail=_why or "No such sample")
     path = sfx_by_id(sid)
+    if sid and sid in sfx_deleted_ids() and not (path and path.is_file()):
+        # [#1200] pressed twice, or the desk has already carried it away
+        _old = next((r for r in sfx_deleted_rows()
+                     if str(r.get("id") or "") == sid), {})
+        return {"deleted": sid, "name": str(_old.get("name") or ""),
+                "already": True, "removed": [], "carried": [], "job": None,
+                "say": "%s was already deleted" % (_old.get("name") or "that clip")}
     if not path or not path.is_file():
         raise HTTPException(status_code=404, detail="No such sample")
     name = path.name
@@ -135090,17 +140894,25 @@ async def sfx_delete_api(
         except Exception:  # noqa: BLE001
             pass
     sfx_db_forget([str(p) for p in mates])
+    forgot = await asyncio.to_thread(sfx_forget_everywhere, sid, mates)   # [#1200]
     job = None
     if carried:
         job = courier_add_delete(carried, name)
     pipeline_log("air", "sample deleted from the shelf — %s%s%s (#703)"
                  % (name, (" removed: " + ", ".join(removed)) if removed else "",
                     (" - the desk removes: " + ", ".join(carried)) if carried else ""))
-    say = ("deleted" if not carried else
-           "banned now; the desk deletes %d file(s) from the share within "
-           "half a minute" % len(carried))
+    # [#1200] the ledger the script and the feed read, and a sentence the
+    # hold sheet shows as its toast.
+    _lines = ([line_id] if line_id else []) + list(forgot.get("chat") or [])
+    sfx_deleted_add(sid, path.stem, _lines, [str(p) for p in mates], carried)
+    say = (("%s is deleted - gone from the library, and it will never be "
+            "played again" % path.stem) if not carried else
+           ("%s is banned now; the desk deletes %d file(s) from the share "
+            "within half a minute, and it will never be played again"
+            % (path.stem, len(carried))))
     return {"deleted": sid, "name": name, "removed": removed,
-            "carried": carried, "job": (job or {}).get("id"), "say": say}
+            "carried": carried, "job": (job or {}).get("id"), "say": say,
+            "forgot": forgot, "lines": list(dict.fromkeys(_lines))}
 
 
 @app.get("/api/sfx/review")
@@ -135271,27 +141083,74 @@ async def sfx_history_api(
         if mark > 0:
             window = [r for r in rows if int(r.get("ts") or 0) <= mark]
         page = window[-want:]
+        # [#1224] AND PAST THE TAIL, INTO THE ARCHIVE.
+        #
+        # The tail is 2,000 rows - 67.9 hours, measured - and the operator
+        # scrolled off the end of it.  Everything the tail can answer is
+        # answered from the tail, exactly as before; the archive is only
+        # opened when the page could not be filled or when the tail cannot
+        # prove that something older exists.  So the first pages, which is
+        # every ask the strip makes before he has flicked back three days,
+        # read no extra bytes at all.
+        picked = list(reversed(page))          # newest first, as the wire wants
+        oldest = int(page[0].get("ts") or 0) if page else 0
+        more = bool(oldest and any(
+            int(r.get("ts") or 0) < oldest for r in window))
+        deep = 0
+        if len(picked) < want or not more:
+            seen = {(int(r.get("ts") or 0), str(r.get("id") or ""))
+                    for r in picked}
+            need = want - len(picked)
+            back, older = sfx_history_archive_page(
+                (int(picked[-1].get("ts") or 0) if picked else mark),
+                need + len(seen) + 1)
+            for r in back:
+                key = (int(r.get("ts") or 0), str(r.get("id") or ""))
+                if key in seen:
+                    continue
+                if deep >= need:
+                    older = True
+                    break
+                seen.add(key)
+                picked.append(r)
+                deep += 1
+            if deep or not more:
+                more = bool(older)
+            if picked:
+                oldest = int(picked[-1].get("ts") or 0)
+        # A row the tail no longer holds would otherwise read "0 plays".
+        # sfx_plays() is the durable per-clip counter and is memoised on
+        # the file's own (mtime, size), so this costs nothing on the pages
+        # that never reach the archive.
+        plays_deep = sfx_plays() if deep else {}
         out = []
-        for r in reversed(page):
+        for r in picked:
             sid = str(r.get("id") or "")
-            out.append({**r, "plays": counts.get(sid, 0),
+            seen_n = counts.get(sid, 0)
+            if not seen_n and plays_deep:
+                try:
+                    seen_n = int((plays_deep.get(sid) or {}).get("plays") or 0)
+                except Exception:  # noqa: BLE001
+                    seen_n = 0
+            out.append({**r, "plays": seen_n,
                         "weight": float(weights.get(sid, 1.0)),
                         "banned": sid in banned,
                         # #1200: the station answers the picture question.
                         "video": sfx_is_video(str(r.get("name") or "")),
                         "url": f"/sfx/{sid}?t={media_sign(sid)}"})
-        oldest = int(page[0].get("ts") or 0) if page else 0
-        # Strictly older than the oldest row handed back — so a caller is
-        # told the end of the ledger and never has to infer it from a short
-        # page, which is a different thing and reads the same.
-        more = bool(oldest and any(
-            int(r.get("ts") or 0) < oldest for r in window))
+        # [#1224] `oldest` and `more` are settled above, across BOTH
+        # stores - the tail and the archive - because a floor that is only
+        # the tail's floor is exactly what the operator ran into.
         pool = len(_SFX_POOL_CACHE)
         return {"rows": out, "distinct": len(counts), "total": len(rows),
                 "before": mark, "limit": want,
-                "oldest": oldest, "newest": (int(page[-1].get("ts") or 0)
-                                             if page else 0),
+                "oldest": oldest, "newest": (int(picked[0].get("ts") or 0)
+                                             if picked else 0),
                 "more": more, "shown": len(out), "window": len(window),
+                # [#1224] how many of these rows came out of the deep
+                # archive rather than the 2,000-row tail, and how deep
+                # that archive now is.
+                "deep": deep, "archive_bytes": sfx_history_archive_bytes(),
                 "pool": pool, "folders": [str(f) for f in sfx_folders()],
                 # #1062: what is new, and how the draw favours it.
                 "fresh": len(sfx_fresh_paths(list(_SFX_POOL_CACHE))),
@@ -138342,6 +144201,12 @@ BROADCAST_STEPS: list[dict[str, str]] = [
      "say": "Four checks - is the station making audio, is the page "
             "taking it, is anything sounding, who holds the air. "
             "Changes nothing.", "tone": "look"},
+    {"key": "keeper", "label": "Is anything watching the door?",
+     "say": "A restart that aborts leaves this container stopped and "
+            "`unless-stopped` will not undo it - that is how the station "
+            "lost 2h24m on 2026-09-21. Reads the host keeper's ledger and "
+            "says whether it is installed and when it last had to start "
+            "something. Changes nothing.", "tone": "look"},
     {"key": "onair", "label": "Put it back on air",
      "say": "Lifts a pause. The booth banks material while the door is "
             "shut, so there is always something to say on the way back.",
@@ -138363,6 +144228,17 @@ BROADCAST_STEPS: list[dict[str, str]] = [
     {"key": "skip", "label": "Jump to the next line",
      "say": "Drops ONLY the clip at the head of the queue and keeps "
             "everything behind it.", "tone": "do"},
+    {"key": "handover", "label": "Give the air to a device that is on",
+     "say": "The opposite of Release. Finds a device the operator has "
+            "switched on with a listener actually at it, lifts any rest "
+            "it is serving for taking nothing, and hands it the air. "
+            "For the night the air was held by nobody with seven "
+            "listeners polling (#1184).", "tone": "do"},
+    {"key": "produce", "label": "Bank the next round now",
+     "say": "Assembles the next committed round out of turn and measures "
+            "its cue map, which is the one thing the sequencer must know "
+            "before it may hold a round. Costs ffmpeg and disk, never "
+            "the voice engine (#1184/#1246).", "tone": "do"},
     {"key": "release", "label": "Let every player sound",
      "say": "Releases the exclusive. Heard in the wrong room beats not "
             "heard at all (#738).", "tone": "do"},
@@ -138394,6 +144270,10 @@ BROADCAST_STEPS: list[dict[str, str]] = [
             "page reload cannot be - the WebView's network stack dies with "
             "the app process, so reloading hands the new page the same "
             "dead stack.", "tone": "do"},
+    {"key": "rebind", "label": "Cut talk about a record that is gone",   # [#1237]
+     "say": "Withdraws every queued introduction whose record is no "
+            "longer on the deck and reports the last binding verdicts. "
+            "Touches only clips that could not be right.", "tone": "do"},
     {"key": "floor", "label": "Take the floor back",
      "say": "A round that took the floor and never gave it back deadlocks "
             "every other one behind it (#1316). Nothing else the operator "
@@ -138420,6 +144300,25 @@ BROADCAST_STEPS: list[dict[str, str]] = [
             "big and what is over its cap. Deletes nothing that the "
             "retention rules would not have deleted anyway.",
      "tone": "deep"},
+    {"key": "recast", "label": "Re-record the cupboard in the new voice",
+     "say": "A seat changed actors, so every banked round recorded in "
+            "the old voice is re-recorded in the new one - in the "
+            "background, while the old recordings go on airing and "
+            "finishing. Says how far along it is, and pushes it "
+            "along.", "tone": "do"},
+    {"key": "playout_linear", "label": "Hold the script in order",   # [#1218]
+     "say": "Reads the playout sequencer - what is sounding, what the "
+            "script ledger says goes next, whether its audio is ready, "
+            "and every road that tried to get in front of it. Turns the "
+            "linear hold ON if it is only watching, and frees a sequence "
+            "stuck on a clip nobody has acknowledged for longer than any "
+            "clip runs.", "tone": "air"},
+    {"key": "handoff", "label": "Why was a round refused at hand-over?",
+     "say": "Names the last round the booth wrote, voiced and then refused "
+            "at the hand-over - which check said no, in numbers - and the "
+            "last hour's withdrawn lines by reason. The round is never "
+            "deleted: it stays on the shelf, and 'Air something unheard' "
+            "puts it out now. Changes nothing.", "tone": "look"},   # [#1191]
     {"key": "restart", "label": "Restart the station",
      "say": "Last resort. The show stops for about twenty seconds and "
             "every page reconnects to a clean feed.", "tone": "danger"},
@@ -138489,7 +144388,34 @@ async def broadcast_step(step: str) -> dict[str, Any]:
     now = time.time()
     changed = False
 
+    # #1441: the one check that is about the door rather than the air.
+    if step == "keeper":
+        got = keeper_state()
+        said.append("$ keeper")
+        said.append("  installed  %s" % ("yes" if got.get("installed")
+                                         else "NO - nothing is watching"))
+        said.append("  guard      %ss after a stop signal this process leaves"
+                    % got.get("guard", {}).get("seconds"))
+        for row in (got.get("rows") or [])[-6:]:
+            said.append("  %s  %s %s %s" % (str(row.get("iso") or "")[:19],
+                                            row.get("name"), row.get("what"),
+                                            str(row.get("detail") or "")[:70]))
+        said.append("")
+        said.append(str(got.get("say") or ""))
+        return {"ok": True, "step": step, "lines": said, "changed": False,
+                "keeper": got}
+
     # #1240: name the fault, and - for `repair` - run its cure.
+    if step == "rebind":                                     # [#1237]
+        got = record_bound_sweep("the rebind rung was pressed")
+        said.append("$ rebind")
+        said.append("  " + str(got.get("say") or "")[:130])
+        said.append("  cut %d queued clip(s) whose record is gone"
+                    % int(got.get("cut") or 0))
+        for row in (got.get("recent") or [])[-8:]:
+            said.append("  " + str(row.get("say") or "")[:130])
+        return {"ok": True, "step": step, "lines": said,
+                "changed": bool(got.get("cut"))}
     if step in ("triangulate", "repair"):
         got = broadcast_triangulate()
         said.append("$ triangulate")
@@ -138701,6 +144627,36 @@ async def broadcast_step(step: str) -> dict[str, Any]:
             said.append("  cut set to %d - that clip and anything older "
                         "goes, the rest stands" % _RADIO["voice_cut_ms"])
 
+    elif step == "handover":                                   # [#1184]
+        said.append("$ hand the air to a device that is on")
+        said.append("  holder  %s" % (str(state.get("owner") or "nobody")))
+        said.append("  polling %d listener(s)" % len(_listeners_live()))
+        got = air_handover("the wedge console")
+        for row in (got.get("lifted") or []):
+            said.append("  lifted the deaf rest on %s - it was starved, "
+                        "not deaf (#1184)" % row)
+        said.append("  " + str(got.get("why") or ""))
+        changed = bool(got.get("ok"))
+        if changed:
+            said.append("  every other page gags itself for it within a "
+                        "poll; it starts the next clip it is handed")
+
+    elif step == "produce":                                    # [#1184]
+        said.append("$ produce the next round out of turn")
+        view = bank_view(60)
+        production = dict(view.get("production") or {})
+        said.append("  bank    " + str(view.get("say") or "")[:150])
+        said.append("  queued  %d round(s) ready with no measured cue map"
+                    % int(production.get("queued") or 0))
+        got = await bank_produce_now(force=True)
+        if got.get("ok"):
+            changed = True
+            said.append("  made %s in %ss - the sequencer can hold it now"
+                        % (str(got.get("sid") or "")[:12],
+                           got.get("cost_s")))
+        else:
+            said.append("  nothing was made: " + str(got.get("why") or "?"))
+
     elif step == "release":
         said.append("$ release the exclusive")
         was = str(state.get("owner") or "")
@@ -138822,6 +144778,74 @@ async def broadcast_step(step: str) -> dict[str, Any]:
                     "force-stop and relaunch the kiosk")
         said.append("  the one cure a page reload cannot be: the net "
                     "stack dies with the process")
+
+    elif step == "playout_linear":                        # [#1218]
+        # #1218/#1246: THE READING ORDER, AND THE RUNG THAT HOLDS IT.
+        #
+        # Standing rule: every hand-applied cure becomes a rung. The cure
+        # here is two things an operator would otherwise do by hand - read
+        # /api/playout, and write one word into <data>/playout/mode - plus
+        # the one recovery the sequencer cannot do for itself. A clip that
+        # was dispatched and never acknowledged holds the line for ever,
+        # because "the air is free" is computed from the listener and the
+        # listener has gone quiet; `force_end` declares it over so the
+        # next committed round may go.
+        said.append("$ hold the script in order")
+        _pl_state = playout_state(12)
+        if not _pl_state.get("available"):
+            said.append("  " + str(_pl_state.get("why") or "no sequencer"))
+        else:
+            said.append("  " + str(_pl_state.get("verdict") or ""))
+            _pl_next = _pl_state.get("next") or {}
+            if _pl_next:
+                said.append("  next      %s round, block %s, %d line(s), %ds "
+                            "- audio ready"
+                            % (_pl_next.get("road") or "?",
+                               _pl_next.get("block") or "-",
+                               int(_pl_next.get("lines") or 0),
+                               int(float(_pl_next.get("seconds") or 0))))
+            for _pl_w in (_pl_state.get("waiting") or [])[:6]:
+                said.append("  waiting   %s %s - %s"
+                            % (_pl_w.get("road") or "?",
+                               ("block %s" % _pl_w["block"]) if _pl_w.get("block") else "",
+                               str(_pl_w.get("why") or "")[:90]))
+            for _pl_road, _pl_ask in sorted(
+                    (_pl_state.get("jumpers") or {}).items()):
+                said.append("  queued    %s x%d (would have: %d) - %s"
+                            % (_pl_road, int(_pl_ask.get("queued") or 0),
+                               int(_pl_ask.get("would_queue") or 0),
+                               str(_pl_ask.get("last_why") or "")[:70]))
+            if (_pl_state.get("sounding") or {}).get("stalled"):
+                said.append("  the sounding clip has not moved for longer "
+                            "than a clip runs - freeing the sequence")
+                _pl_freed = playout_tell(
+                    "force_end", "the wedge console: nothing was heard for "
+                                 "longer than any clip runs")
+                if _pl_freed:
+                    changed = True
+                    said.append("  freed %s entr(y/ies); the next committed "
+                                "round may go" % _pl_freed)
+        _pl_mode = playout_mode()
+        if _pl_mode == "linear":
+            said.append("  the linear hold is ON")
+        else:
+            _pl_seq = playout()
+            _pl_switch = getattr(_pl_seq, "switch", None) if _pl_seq else None
+            if _pl_switch is None:
+                said.append("  the switch is %s and this rung cannot reach it "
+                            "- write 'linear' into %s"
+                            % (_pl_mode, PLAYOUT_MODE_FILE))
+            else:
+                try:
+                    _pl_now = _pl_switch.write("linear")
+                    changed = True
+                    said.append("  the linear hold was %s and is now %s"
+                                % (_pl_mode, _pl_now))
+                    said.append("  the script ledger's next committed "
+                                "occurrence plays next; a filler road is "
+                                "stamped after it, never on top of it")
+                except Exception as err:  # noqa: BLE001
+                    said.append("  the switch would not move: %s" % err)
 
     elif step == "floor":
         # #1331: TAKE THE FLOOR BACK.
@@ -139225,6 +145249,116 @@ async def broadcast_step(step: str) -> dict[str, Any]:
             else:
                 said.append("  no area is over the cap the operator set")
 
+    elif step == "recast":
+        # [#1215] the operator's rung for the cupboard's own re-recording.
+        said.append("$ re-record the cupboard in the new voice")
+        _rc = recast_status()
+        _jobs = _rc.get("jobs") or []
+        if not _jobs:
+            said.append("  " + str(_rc.get("say") or "nothing to re-record"))
+        for _job in _jobs[:4]:
+            said.append("  %-7s %s" % (str(_job.get("seat") or "")[:7],
+                                       str(_job.get("say") or "")[:120]))
+        if _rc.get("live"):
+            said.append("  the old recordings are still airing while this "
+                        "runs - that is the whole point of the road")
+            _ran = await recast_tick(budget=RECAST_RUNG_LINES, force=True)
+            said.append("  pushed  %d line(s) recorded, %d round(s) swapped "
+                        "in%s" % (int(_ran.get("lines") or 0),
+                                  int(_ran.get("swaps") or 0),
+                                  (" - " + str(_ran.get("why")))
+                                  if _ran.get("why") else ""))
+            changed = bool(_ran.get("lines") or _ran.get("swaps"))
+            said.append("  now     " + str(recast_status().get("say") or ""))
+        else:
+            said.append("  nothing is waiting - every banked line is in the "
+                        "voice its seat holds")
+
+    elif step == "handoff":
+        # [#1191] WHY WAS A ROUND REFUSED AT HAND-OVER - the rung for the
+        # fault behind Segment 11032: a written, rendered round withdrawn
+        # at the door with no reason anybody could read. Everything here
+        # is a read of registers the refusal already writes; the cure is
+        # the existing `stock` rung, because the round never left the
+        # shelf. Numbers, not adjectives: seconds ago, lines, counts.
+        said.append("$ why was a round refused at hand-over?")
+        _wl = dict(_WITHDRAWN_LAST)
+        if float(_wl.get("at") or 0) > 0:
+            said.append("  last     %s round, %d line(s), %ds ago, sid %s"
+                        % (str(_wl.get("kind") or "?"), int(_wl.get("rows") or 0),
+                           int(now - float(_wl.get("at") or now)),
+                           str(_wl.get("sid") or "-")))
+            said.append("  why      " + str(_wl.get("why") or "")[:220])
+        else:
+            said.append("  no round has been refused at hand-over since "
+                        "the process started")
+        if float(_HANDOFF_NO.get("at") or 0) > 0:
+            said.append("  check    %ds ago: %s"
+                        % (int(now - float(_HANDOFF_NO.get("at") or now)),
+                           str(_HANDOFF_NO.get("why") or "")[:200]))
+        if float(_READY_SHELF_WHY.get("at") or 0) > 0:
+            said.append("  shelf    %ds ago (%s): %s"
+                        % (int(now - float(_READY_SHELF_WHY.get("at") or now)),
+                           str(_READY_SHELF_WHY.get("kind") or "?"),
+                           str(_READY_SHELF_WHY.get("why") or "")[:160]))
+        try:
+            _book = await asyncio.to_thread(withdrawn_book_rows, now - 86400, 400)
+        except Exception:  # noqa: BLE001
+            _book = []
+        if _book:
+            _by_why: dict[str, int] = {}
+            for _b in _book:
+                _by_why[str(_b.get("why") or "no reason recorded")[:110]] = (
+                    _by_why.get(str(_b.get("why") or "no reason recorded")[:110], 0) + 1)
+            said.append("  the book of refused rounds, last 24 h: %d round(s), "
+                        "%d line(s), %.0fs of finished audio"
+                        % (len(_book), sum(int(_b.get("rows") or 0) for _b in _book),
+                           sum(float(_b.get("seconds") or 0) for _b in _book)))
+            for _k, _n in sorted(_by_why.items(), key=lambda kv: -kv[1])[:6]:
+                said.append("  %4dx  %s" % (_n, _k))
+            _last = _book[-1]
+            said.append("  newest   %s round, %d line(s), %ds ago, %s round(s) of "
+                        "that kind were on the shelf when it was refused"
+                        % (str(_last.get("kind") or "?"), int(_last.get("rows") or 0),
+                           int(now - float(_last.get("at") or now)),
+                           str(_last.get("shelf"))))
+        else:
+            said.append("  the book of refused rounds is empty for the last 24 h")
+        _by: dict[str, int] = {}
+        for _r in list(_RADIO.get("chat") or []):
+            if (isinstance(_r, dict) and str(_r.get("aired") or "") == "withdrawn"
+                    and float(_r.get("air_at") or _r.get("ts") or 0) >= now - 3600):
+                _k = str(_r.get("withdrawn_why") or "no reason recorded")[:110]
+                _by[_k] = _by.get(_k, 0) + 1
+        if _by:
+            said.append("  withdrawn lines in the ring from the last hour, by reason:")
+            for _k, _n in sorted(_by.items(), key=lambda kv: -kv[1])[:6]:
+                said.append("  %4dx  %s" % (_n, _k))
+        else:
+            said.append("  no withdrawn line in the ring from the last hour")
+        try:
+            _rt = globals().get("_system2")
+            _rt = _rt() if callable(_rt) else None
+            _ref = dict(getattr(_rt, "_refused", {}) or {})
+            _rows = sorted(_ref.items(),
+                           key=lambda kv: -float((kv[1] or {}).get("said") or 0))[:5]
+            if _rows:
+                said.append("  System2's own refusal book (slot, candidate: why):")
+                for _key, _v in _rows:
+                    _slot, _cand = ((list(_key) + ["", ""])[:2]
+                                    if isinstance(_key, (tuple, list))
+                                    else (str(_key), ""))
+                    said.append("  %4ds ago  %s %s: %s"
+                                % (int(now - float((_v or {}).get("said") or now)),
+                                   str(_slot)[:12], str(_cand)[:12],
+                                   str((_v or {}).get("why") or "")[:110]))
+        except Exception:  # noqa: BLE001
+            pass
+        said.append("  the refused round was not deleted - it stays on the "
+                    "shelf and is offered again on its own")
+        said.append("  cure     press 'Air something unheard' (stock) to put "
+                    "it out now, out of turn")
+
     elif step == "restart":
         said.append("$ restart the station")
         said.append("  the show stops for about twenty seconds")
@@ -139277,6 +145411,16 @@ AIR_LADDER: list[tuple[float, str, str]] = [
     # about: the rooms are building hours nobody can hear yet.
     (90.0, "relieve",
      "stood the preparation rooms down so the loop can serve the air"),
+    # [#1184] BEFORE THE FLUSH, because the flush is the destructive one
+    # and this one is free. 2026-09-15 07:58: seven listeners polling,
+    # the desktop switched on, and "the air is held by nobody" for 678
+    # seconds - with no rung anywhere on this ladder that gives the air
+    # to a device that is present and on. `release` is its opposite (it
+    # takes the exclusive AWAY); `terminals` only flips switches that are
+    # already all off. Nothing walked the device table looking for a
+    # listener to hand the air to, so nothing ever did.
+    (105.0, "handover",
+     "gave the air to a device that is switched on and present"),
     (120.0, "flush", "dropped whatever the pages were stuck on"),
     (180.0, "release", "released the exclusive so every player may sound"),
     (240.0, "reload", "asked every page to reload itself"),
@@ -139494,6 +145638,24 @@ def air_watch_evidence(quiet: float, waiting: int,
         got["consumer_aired"] = 0
         got["consumer_walks"] = 0
         got["consumer_why"] = ""
+    # [#1218] AND WHAT THE SEQUENCE IS DOING. A room goes quiet
+    # when the thing that should be sounding is waiting on
+    # something, and until now the ladder's evidence could not say
+    # so: it knew the air was quiet and not why. This is a READING
+    # - one in-memory dict, no walk of anything - and the ladder is
+    # free to ignore it; `playout_linear` is the rung that acts.
+    try:
+        _pl = playout_state(3)
+        got["playout_mode"] = str(_pl.get("mode") or "off")
+        got["playout_verdict"] = str(_pl.get("verdict") or "")[:200]
+        got["playout_next_ready"] = bool(_pl.get("next_audio_ready"))
+        got["playout_waiting"] = len(_pl.get("waiting") or [])
+        got["playout_queued"] = int(_pl.get("jumped_total") or 0)
+        got["playout_stalled"] = bool(
+            (_pl.get("sounding") or {}).get("stalled"))
+    except Exception:  # noqa: BLE001
+        got["playout_mode"] = "off"
+        got["playout_verdict"] = ""
     return got
 
 
@@ -139691,6 +145853,99 @@ def air_fix_note(row: dict[str, Any]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001
         pass
+
+
+def air_handover(why: str = "") -> dict[str, Any]:              # [#1184]
+    """#1184: GIVE THE AIR TO A DEVICE THAT IS SWITCHED ON AND PRESENT.
+
+    2026-09-15 07:58, from the operator's own ladder report: "listeners:
+    7 polling - the air is held by nobody - switches: pinetab=OFF,
+    desktop=on", and "heard 678s ago". Every ingredient of a cure was
+    present - a device the operator had switched on, seven live
+    listeners - and no rung on this ladder could put them together.
+
+    Three ways the air ends up held by nobody while a device is on, and
+    this answers all three:
+
+      * the device is resting. #1332/#1337 drop an owner that holds the
+        air and acknowledges no clip, and bar its DEVICE for
+        OWNER_DEAF_REST. That is right when the page is deaf and exactly
+        wrong when the page was starved - which is what the page was on
+        the 15th, because it was abandoning every late clip (#1184's
+        page half). A rest that outlives its own cause is lifted here.
+      * the row's `listener` id is stale. A listener id is minted fresh
+        on every page load; _listener_for_terminal resolves the row by
+        ADDRESS, which survives a reload.
+      * the device has no row at all. Then the longest-present live
+        listener is nominated - because one page sounding is the point,
+        and audio_owner() already returns "" (everybody sounds) when
+        there is nobody to nominate, which is the state this is curing.
+
+    Returns what it did. Changes nothing when a live owner already holds
+    the air: this rung is for silence, not for tidiness."""
+    out: dict[str, Any] = {"ok": False, "owner": "", "was": "",
+                           "lifted": [], "why": ""}
+    try:
+        was = str(_AUDIO_OWNER.get("who") or "")
+        out["was"] = was
+        if was and _listener_live(was):
+            out["why"] = "%s already holds the air and is polling" % was
+            out["owner"] = was
+            return out
+        live = set(_listeners_live())
+        if not live:
+            out["why"] = "nobody is polling - there is no page to hand it to"
+            return out
+        # The operator's own table first, fallback rows last, exactly as
+        # audio_owner() reads it - but lifting the deaf rest on the way.
+        rows = terminal_rows()
+        for want_fallback in (False, True):
+            for name, row in rows.items():
+                if not (row or {}).get("play"):
+                    continue
+                if bool((row or {}).get("fallback")) != want_fallback:
+                    continue
+                got = _listener_for_terminal(row)
+                if not got:
+                    continue
+                key = _owner_deaf_key(got)
+                if _OWNER_DEAF.pop(key, None):
+                    out["lifted"].append(str((row or {}).get("name") or name))
+                _AUDIO_OWNER.clear()
+                _AUDIO_OWNER.update({"who": got, "at": time.time()})
+                out.update(ok=True, owner=got, why=(
+                    "%s is switched on and present - it has the air"
+                    % (str((row or {}).get("name") or name))))
+                pipeline_log("air", out["why"] + " (#1184)"
+                             + ((" - " + why) if why else ""))
+                return out
+        # No device on the list is here. Nominate the longest-present
+        # live listener rather than leave the house with no owner at all.
+        # `first` is the stamp listener_note lays down the first time a
+        # page is seen, so the EARLIEST one is the page that has been here
+        # longest - the least likely to be a tab somebody just opened and
+        # is about to close.
+        best, best_at = "", 0.0
+        for who in sorted(live):
+            seen = _LISTENER_SEEN.get(who) or {}
+            at = float(seen.get("first") or seen.get("at") or 0)
+            if not at:
+                continue
+            if not best or at < best_at:
+                best, best_at = who, at
+        if not best:
+            best = sorted(live)[0]
+        _OWNER_DEAF.pop(_owner_deaf_key(best), None)
+        _AUDIO_OWNER.clear()
+        _AUDIO_OWNER.update({"who": best, "at": time.time()})
+        out.update(ok=True, owner=best, why=(
+            "no device on the list is present, so %s - the longest-present "
+            "listener - has the air" % best))
+        pipeline_log("air", out["why"] + " (#1184)")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = "could not hand the air over: %s" % type(exc).__name__
+        return out
 
 
 def pages_reload(why: str = "") -> int:
@@ -139921,6 +146176,21 @@ async def air_watch() -> None:
 @app.on_event("startup")
 async def _startup_air_watch() -> None:
     fire_and_forget(air_watch())
+
+
+@app.on_event("startup")
+async def _startup_bank_producer() -> None:                    # [#1184]
+    """#1184/#1246: keep finished, MEASURED rounds ahead of the air.
+
+    The only road to a measured cue map used to be the instant a round
+    finished preparing - paced, and stood down whenever the engine was
+    busy - so 969 of 991 rounds in the ledger have none and can never be
+    held by the sequencer. This works the queue in AIR order instead,
+    urgently for anything due inside the hour, on air and paused alike."""
+    if _bank_module is None:
+        return
+    import sys as _sys
+    fire_and_forget(_bank_module.bank_producer(_sys.modules[__name__]))
 
 
 @app.on_event("startup")
@@ -141591,7 +147861,12 @@ def sfx_db_index(limit_seconds: float = 0.0) -> dict[str, Any]:
         con = sfx_db()
         folders = sfx_folders()
         _SFX_DB_SCAN["folders"] = len(folders)
-        banned = sfx_bans()
+        # [#1243] a superseded short is skipped exactly as a banned one is.
+        # Without this the walk would UPDATE its row, and the update does
+        # playable=MAX(excluded, clips.playable) - so a rebuild would hand
+        # the shorts their playable flag back and the glue would quietly
+        # come undone the next time the book was rewritten.
+        banned = sfx_bans() | sfx_superseded()
         for ix, folder in enumerate(folders):
             _SFX_DB_SCAN.update({"folder": folder.name, "done": ix})
             if limit_seconds and time.time() - started > limit_seconds:
@@ -141669,6 +147944,13 @@ def sfx_db_index(limit_seconds: float = 0.0) -> dict[str, Any]:
     finally:
         _SFX_DB_SCAN.update({"running": False, "seen": seen, "added": added,
                              "finished": time.time()})
+        # [#1251] REFRESHED WITH THE WALK. The keyword index is a view
+        # of this book; the walk that adds a folder is what must put its
+        # clips within the matcher's reach, not a restart.
+        try:
+            sfx_match_kick()
+        except Exception:  # noqa: BLE001
+            pass
     return dict(_SFX_DB_SCAN)
 
 
@@ -141686,6 +147968,631 @@ def sfx_db_kick(force: bool = False) -> bool:
     _SFX_DB_THREAD[0] = thread
     thread.start()
     return True
+
+
+# --- #1251: THE CLIPS, MATCHED TO WHAT IS BEING SAID ---------------------
+#
+# "i want to add a special mode to the sfx guy and endless video mode to
+#  have him play clips appropriate to the statements being said on the
+#  radio ... able to analyze and read all the file names of all the SFX
+#  clips he has at his disposal and to be able to see the script and the
+#  words that are being said ... not word for word but loosely ... either
+#  via the noun, verb, or context. The goal will be to still be able to
+#  play the video seamlessly no matter what."
+#
+# WHAT THE LIBRARY ACTUALLY HOLDS (measured 2026-09-21 on this box's own
+# sfx_clips.db): 307,402 playable clips across 62 folders. 53,886 of them
+# carry words in their names - they are named after their own first words
+# ("1065 dying for some", "1148 boo I hate", "37 Austria. As a") - and the
+# rest are "1965 clip" or "58 clip-27" and carry nothing to match at all.
+# The FOLDER names carry the source instead (simp, koth, dbz, chappelle,
+# rasslin, casino), which is context rather than words.
+#
+# So the matcher scores two things, and sfx_match.py (a pure module, no
+# station imports, no I/O) holds all of it: the words a clip's NAME shares
+# with the line, weighted by how rare the word is across the library, and
+# the THEME of the clip's folder, capped so a theme can never outscore a
+# real word. Below the strength floor there is no match and the ORDINARY
+# DRAW RUNS UNCHANGED - which is the whole of "play the video seamlessly
+# no matter what": this road can only ever swap one clip for another, and
+# it never adds a wait, a retry or a decision the picture has to survive.
+#
+# The index costs 1.2 seconds to build over all 307,402 rows (measured)
+# and 0.5 ms to score one line against, so it is built once on a thread
+# beside the clip book's own walk and asked on the pick's own thread.
+try:                                                            # [#1251]
+    import sfx_match as _sfx_match
+except Exception as _sfx_match_err:  # noqa: BLE001
+    _sfx_match = None            # a missing module only turns the mode off
+    print("[sfx-match] module not loaded: %s" % _sfx_match_err, flush=True)
+
+SFX_KEYWORDS_PATH = data_path("sfx_keywords.json")       # [#1251]
+SFX_MATCH_RING_KEEP = 40                 # the last picks, for the modals
+SFX_MATCH_LIMIT = 64                     # candidates scored per pick
+_SFX_MATCH_LOCK = RLock()
+_SFX_MATCH: dict[str, Any] = {
+    "index": None, "at": 0.0, "building": False, "why": "",
+    "rows": 0, "ms": 0, "stats": {}, "kicks": 0,
+    "picks": 0, "matched": 0, "fell_back": 0}
+_SFX_MATCH_THREAD: list[Any] = [None]
+_SFX_MATCH_RING: list[dict[str, Any]] = []
+# The reason the last matched sting draw gave. sting_due() returns a
+# Path like it always has - every one of its five callers reads a Path
+# and two of them are tests - so the reason is left here for dj_sting
+# to pick up off the sample it was handed, rather than widening a
+# return type that four roads depend on.
+_SFX_MATCH_LAST: dict[str, Any] = {"path": "", "why": "", "score": 0.0,
+                                   "at": 0.0}
+_SFX_KEYWORDS: dict[str, Any] = {"at": 0.0, "book": {}}
+
+
+def sfx_match_on(video: bool = False) -> bool:
+    """#1251: the two switches. Off by default, both of them - this
+    changes what the operator hears and what his screens show."""
+    try:
+        dj = dj_settings() or {}
+        key = "sfx_video_match_dialogue" if video else "sfx_match_dialogue"
+        return bool(dj.get(key)) and _sfx_match is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def sfx_match_strength(video: bool = False) -> int:
+    try:
+        dj = dj_settings() or {}
+        key = "sfx_video_match_strength" if video else "sfx_match_strength"
+        return max(0, min(100, int(dj.get(key) or 0)))
+    except Exception:  # noqa: BLE001
+        return 35
+
+
+def sfx_match_floor(video: bool = False) -> float:
+    if _sfx_match is None:
+        return 99.0
+    return float(_sfx_match.threshold(sfx_match_strength(video)))
+
+
+# --- the folder keyword book ---------------------------------------------
+#
+# The only part of the index worth writing down. The postings over the
+# clip names are derived from the book and rebuild in a second; the
+# folder themes are a JUDGEMENT - a glossary this file ships with, plus
+# whatever the local model was asked to add, plus anything the operator
+# typed - and a judgement that a restart throws away is one nobody will
+# make twice.
+def sfx_keywords_read(force: bool = False) -> dict[str, Any]:
+    """{folder: {"words": [...], "from": "glossary|model|hand", "at": ts}}"""
+    warm = time.time() - float(_SFX_KEYWORDS.get("at") or 0) < 30.0
+    if warm and not force and _SFX_KEYWORDS.get("book"):
+        return dict(_SFX_KEYWORDS["book"])
+    book: dict[str, Any] = {}
+    try:
+        got = json.loads(SFX_KEYWORDS_PATH.read_text(encoding="utf-8"))
+        for name, row in (got.get("folders") or {}).items():
+            if isinstance(row, dict):
+                book[str(name)] = {
+                    "words": [str(w) for w in (row.get("words") or [])][:24],
+                    "from": str(row.get("from") or "glossary"),
+                    "at": float(row.get("at") or 0)}
+    except Exception:  # noqa: BLE001
+        book = {}                       # a first run, or a file somebody broke
+    _SFX_KEYWORDS.update({"book": book, "at": time.time()})
+    return dict(book)
+
+
+def sfx_keywords_write(book: dict[str, Any]) -> bool:
+    try:
+        SFX_KEYWORDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        body = {"version": 1, "at": time.time(), "folders": book}
+        tmp = SFX_KEYWORDS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(body, indent=1), encoding="utf-8")
+        tmp.replace(SFX_KEYWORDS_PATH)
+        _SFX_KEYWORDS.update({"book": dict(book), "at": time.time()})
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def sfx_keywords_set(folder: str, words: Any, source: str = "hand") -> dict[str, Any]:
+    """Replace one folder's theme words, on disk and in the live index."""
+    name = str(folder or "").strip()
+    if not name or _sfx_match is None:
+        return {}
+    if isinstance(words, str):
+        words = _sfx_match.parse_keywords(words, most=16)
+    stems: list[str] = []
+    for word in list(words or [])[:24]:
+        for stem in _sfx_match.tokens(word):
+            if stem not in stems:
+                stems.append(stem)
+    book = sfx_keywords_read(force=True)
+    book[name] = {"words": stems, "from": str(source or "hand")[:12],
+                  "at": time.time()}
+    sfx_keywords_write(book)
+    index = _SFX_MATCH.get("index")
+    if index is not None:
+        try:
+            index.set_folder_keywords(name, stems)     # live, no rebuild
+        except Exception:  # noqa: BLE001
+            pass
+    return book[name]
+
+
+# --- the index ------------------------------------------------------------
+
+def sfx_match_build() -> dict[str, Any]:
+    """Read every playable clip's name out of the book and index it.
+
+    On a daemon thread, never on the loop. One pass over the clip book's
+    own covering index; `nap` hands the GIL back every few thousand rows
+    so this cannot hold the loop the way #1373's walk could.
+    """
+    began = time.time()
+    _SFX_MATCH.update({"building": True, "why": ""})
+    try:
+        if _sfx_match is None:
+            _SFX_MATCH["why"] = "sfx_match.py is not on this station"
+            return dict(_SFX_MATCH)
+        con = sfx_db_reader()
+        rows = con.execute(
+            "SELECT rowid, name, folder, video, seconds FROM clips "
+            "WHERE playable = 1").fetchall()
+        book = sfx_keywords_read(force=True)
+        given = {name: (row.get("words") or [])
+                 for name, row in book.items() if row.get("words")}
+        index = _sfx_match.ClipIndex().build(
+            ((r[0], r[1], r[2], r[3], r[4]) for r in rows),
+            folder_keywords=given,
+            nap=lambda: time.sleep(0.002), nap_every=4000)
+        index.built_at = time.time()
+        # Every folder the walk found, written down with the seed words it
+        # got, so the operator can read and correct them and the model road
+        # knows which ones nobody has looked at yet.
+        wrote = False
+        for fid, folder in enumerate(index.folders):
+            if folder in book:
+                continue
+            book[folder] = {"words": list(index.folder_keywords.get(fid) or []),
+                            "from": "glossary", "at": time.time()}
+            wrote = True
+        if wrote:
+            sfx_keywords_write(book)
+        with _SFX_MATCH_LOCK:
+            _SFX_MATCH.update({
+                "index": index, "at": time.time(), "rows": len(rows),
+                "ms": int((time.time() - began) * 1000),
+                "stats": index.stats(), "why": ""})
+        print("[sfx-match] indexed %d clip(s), %d with words, %d folder(s) "
+              "in %d ms" % (len(rows), index.wordy, len(index.folders),
+                            _SFX_MATCH["ms"]), flush=True)
+    except Exception as err:  # noqa: BLE001
+        # SAID OUT LOUD - the clip book's own note (#1362) is about exactly
+        # this: a build that dies quietly leaves a mode that says nothing.
+        _SFX_MATCH["why"] = str(err)[:200]
+        print("[sfx-match] index failed: %s" % err, flush=True)
+    finally:
+        _SFX_MATCH["building"] = False
+    return dict(_SFX_MATCH)
+
+
+def sfx_match_kick(force: bool = False) -> bool:
+    """Build it in the background, one at a time, never on the loop."""
+    if _sfx_match is None:
+        return False
+    if _SFX_MATCH.get("building") and not force:
+        return False
+    thread = _SFX_MATCH_THREAD[0]
+    if thread is not None and thread.is_alive():
+        return False
+    thread = Thread(target=sfx_match_build, name="sfx-match-index", daemon=True)
+    _SFX_MATCH_THREAD[0] = thread
+    _SFX_MATCH["kicks"] = int(_SFX_MATCH.get("kicks") or 0) + 1
+    thread.start()
+    return True
+
+
+def sfx_match_ready() -> bool:
+    return _SFX_MATCH.get("index") is not None
+
+
+# --- what is being said ---------------------------------------------------
+
+def sfx_match_heard(at_ms: int = 0) -> dict[str, Any]:
+    """The spoken line that will be sounding at `at_ms` (0 = now).
+
+    THE PAGE VOICE FEED IS THE TIMELINE. Every line the station puts out
+    goes through page_feed_append, which stamps an honest `broadcast_ms`
+    and chains it behind whatever audio the page has already been
+    promised (#1147) - so this ring is not "what was said", it is WHEN
+    each thing is heard, on the same clock the endless set stamps its own
+    clips with. That is what lets the set re-rank a clip that will light
+    twenty-eight seconds from now against the sentence that will be in
+    the room when it does.
+
+    Falls back down the ladder rather than answering nothing: the row
+    covering the instant, else the last row before it, else the last row
+    with any words in it at all.
+    """
+    want = int(at_ms or 0) or int(time.time() * 1000)
+    rows = []
+    try:
+        for clip in list(_RADIO.get("voice_clips") or [])[-80:]:
+            text = " ".join(str((clip or {}).get("text") or "").split())
+            if len(text) < 4:
+                continue
+            start = int((clip or {}).get("broadcast_ms") or 0)
+            if not start:
+                continue
+            try:
+                span = max(0.0, min(600.0, float(clip.get("seconds") or 0)))
+            except (TypeError, ValueError):
+                span = 0.0
+            if span <= 0:
+                span = max(2.5, len(text) / 14.0)
+            rows.append((start, start + int(span * 1000), text,
+                         str(clip.get("who") or "")))
+    except Exception:  # noqa: BLE001
+        rows = []
+    if not rows:
+        # The page feed can be empty while the box carries the show, and
+        # the booth ring always has the words either way.
+        try:
+            for entry in list(_RADIO.get("chat") or [])[-60:]:
+                text = " ".join(str((entry or {}).get("text") or "").split())
+                if len(text) < 4 or str(entry.get("kind") or "") == "sfx":
+                    continue
+                at = float(entry.get("air_at") or entry.get("ts") or 0)
+                if at <= 0:
+                    continue
+                span = 0.0
+                try:
+                    span = max(0.0, float(entry.get("seconds") or 0))
+                except (TypeError, ValueError):
+                    span = 0.0
+                if span <= 0:
+                    span = max(2.5, len(text) / 14.0)
+                rows.append((int(at * 1000), int((at + span) * 1000), text,
+                             str(entry.get("who") or "")))
+        except Exception:  # noqa: BLE001
+            pass
+    if not rows:
+        return {"line": "", "context": "", "who": "", "at_ms": want,
+                "source": "nothing is being said"}
+    rows.sort()
+    hit = -1
+    for ix, row in enumerate(rows):
+        if row[0] <= want < row[1]:
+            hit = ix
+    if hit < 0:
+        before = [ix for ix, row in enumerate(rows) if row[0] <= want]
+        hit = before[-1] if before else len(rows) - 1
+    line, who = rows[hit][2], rows[hit][3]
+    # THE ROUND, AS CONTEXT. Two lines of drift either side plus the
+    # storyline's own title: "loosely connected to the things that are
+    # being said" is about the conversation, not about one sentence, and
+    # a context word is scored at half a spoken one so it can colour a
+    # pick without ever deciding it on its own.
+    near = [rows[ix][2] for ix in range(max(0, hit - 2), hit)]
+    try:
+        plot = plotline_now() or {}
+        title = str(plot.get("title") or "").strip()
+        if title:
+            near.append(title)
+    except Exception:  # noqa: BLE001
+        pass
+    covered = rows[hit][0] <= want < rows[hit][1]
+    return {"line": line[:600], "context": " ".join(near)[:600], "who": who,
+            "at_ms": want,
+            "source": ("what is being said at that moment" if covered
+                       else "the last thing said before that moment")}
+
+
+def sfx_match_note(kind: str, sting: str, why: str, score: float,
+                   line: str = "") -> None:
+    """The last few picks, so the modals can show their working."""
+    try:
+        _SFX_MATCH_RING.append({
+            "at": round(time.time(), 2), "kind": str(kind)[:12],
+            "sting": str(sting or "")[:120], "why": str(why or "")[:200],
+            "score": round(float(score or 0), 2),
+            "line": " ".join(str(line or "").split())[:160]})
+        del _SFX_MATCH_RING[:-SFX_MATCH_RING_KEEP]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def sfx_match_rows(cands: Any, most: int = SFX_MATCH_LIMIT) -> list[tuple]:
+    """Resolve the matcher's rowids to (path, seconds, cand) - ONE indexed
+    query over the reader connection, never one per candidate."""
+    rows = list(cands or [])[:max(1, int(most))]
+    if not rows:
+        return []
+    try:
+        con = sfx_db_reader()
+        marks = ",".join("?" * len(rows))
+        found = con.execute(
+            "SELECT rowid, path, seconds FROM clips WHERE rowid IN (%s)" % marks,
+            tuple(int(c.rowid) for c in rows)).fetchall()
+        by_id = {int(r["rowid"]): (str(r["path"]), float(r["seconds"] or 0))
+                 for r in found}
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[tuple] = []
+    for cand in rows:
+        got = by_id.get(int(cand.rowid))
+        if got:
+            out.append((Path(got[0]), got[1], cand))
+    return out
+
+
+def sfx_match_score(line: str, context: str = "", *, video: bool | None = None,
+                    floor: float = 0.0, cap: float = 0.0,
+                    limit: int = SFX_MATCH_LIMIT) -> list:
+    """The ranked candidates for one line. Pure; never raises."""
+    index = _SFX_MATCH.get("index")
+    if index is None or _sfx_match is None:
+        return []
+    try:
+        return index.score(line, context, video=video, floor=floor,
+                           cap=cap, limit=limit)
+    except Exception as err:  # noqa: BLE001
+        _SFX_MATCH["why"] = "score: %s" % str(err)[:160]
+        return []
+
+
+def sfx_match_video_pick(at_ms: int = 0) -> Any:
+    """#1251: the endless set's NEXT clip, re-ranked against the line that
+    will be sounding when it lights.
+
+    ONLY the clip that has not been rung yet. The cycle calls this exactly
+    where it used to call sfx_video_fresh_pick - at the moment it decides
+    what to put at the END of the plan - so nothing already queued, warmed
+    or on the tube is touched, and no surface is ever asked to re-seek.
+    Returns the same (Path, seconds) the ordinary pick returns, or None,
+    and the caller falls straight back to the ordinary pick.
+    """
+    if not sfx_match_on(True) or not sfx_match_ready():
+        return None
+    said = sfx_match_heard(at_ms)
+    if not str(said.get("line") or "").strip():
+        return None
+    floor = sfx_match_floor(True)
+    # The same two narrowings the ordinary pick applies, so the dial and
+    # the pin keep meaning what they mean while the mode is on.
+    aim = 0.0
+    try:
+        aim = float((dj_settings() or {}).get("sfx_video_len") or 0)
+    except Exception:  # noqa: BLE001
+        aim = 0.0
+    cands = sfx_match_score(said["line"], said.get("context") or "",
+                            video=True,
+                            floor=aim * 0.6 if aim > 0 else 0.0,
+                            cap=aim * 1.6 if aim > 0 else 0.0)
+    tied = _sfx_match.peers(cands, floor)
+    if not tied:
+        _SFX_MATCH["fell_back"] = int(_SFX_MATCH.get("fell_back") or 0) + 1
+        return None
+    pin = sfx_pin_prefix()
+    banned = sfx_bans()
+    for path, seconds, cand in sfx_match_rows(tied):
+        if pin and not str(path).startswith(pin):
+            continue
+        key = sfx_id(path)
+        if key in banned:
+            continue
+        if sfx_video_on_cooldown(key):          # #1433: the hour still holds
+            continue
+        why = _sfx_match.explain(cand)
+        _SFX_MATCH["picks"] = int(_SFX_MATCH.get("picks") or 0) + 1
+        _SFX_MATCH["matched"] = int(_SFX_MATCH.get("matched") or 0) + 1
+        sfx_match_note("endless", path.stem, why, cand.score, said["line"])
+        return (path, float(seconds or 0), why, round(float(cand.score), 2))
+    _SFX_MATCH["fell_back"] = int(_SFX_MATCH.get("fell_back") or 0) + 1
+    return None
+
+
+def sfx_match_sting_pick(after: str = "", want_video: Any = None) -> Any:
+    """#1251: the SFX guy's sting, matched to the line it punctuates.
+
+    `after` is the line that has just been said - dj_speak hands it to
+    dj_sting already, which is why this is the one road that needs no
+    guess at all about what it is decorating.
+
+    THE STATION'S OWN RULES STILL DECIDE. The matcher only proposes an
+    ORDER; the bans, the per-clip weights (#645), the picture share and
+    the unrepeated ring (#1223/#1225, the one recency memory that
+    survives a restart) are all applied here, on the survivors. Nothing
+    clears the floor - which is most of the time on a library where two
+    clips in three are named "1965 clip" - and this returns None and
+    sting_due goes on exactly as it did before.
+    """
+    if not sfx_match_on(False) or not sfx_match_ready():
+        return None
+    line = " ".join(str(after or "").split())
+    said = {"line": line, "context": ""}
+    if len(line) < 6:
+        said = sfx_match_heard(0)
+    if not str(said.get("line") or "").strip():
+        return None
+    if not said.get("context"):
+        try:
+            said["context"] = str((sfx_match_heard(0) or {}).get("context") or "")
+        except Exception:  # noqa: BLE001
+            said["context"] = ""
+    floor = sfx_match_floor(False)
+    cands = sfx_match_score(said["line"], said.get("context") or "",
+                            video=(None if want_video is None else bool(want_video)))
+    tied = _sfx_match.peers(cands, floor)
+    if not tied:
+        _SFX_MATCH["fell_back"] = int(_SFX_MATCH.get("fell_back") or 0) + 1
+        return None
+    banned = sfx_bans()
+    weights = sfx_weights() or {}
+    survivors: list[str] = []
+    why_by_path: dict[str, tuple] = {}
+    for path, _seconds, cand in sfx_match_rows(tied):
+        key = sfx_id(path)
+        if key in banned:
+            continue
+        if float(weights.get(key, 1.0) or 0) <= 0.05:
+            continue                          # marked all the way down (#645)
+        survivors.append(str(path))
+        why_by_path[str(path)] = (_sfx_match.explain(cand), cand.score)
+    if not survivors:
+        _SFX_MATCH["fell_back"] = int(_SFX_MATCH.get("fell_back") or 0) + 1
+        return None
+    # THE STATION'S OWN RECENCY RING, under the station's own key. #1223
+    # sized it and #1225 made it survive a restart; a matcher with a
+    # rotation of its own would be a fifth road fighting those four.
+    got = unrepeated(survivors, "sting",
+                     keep=sting_keep(len(set(survivors))))         # #1223
+    if not got:
+        _SFX_MATCH["fell_back"] = int(_SFX_MATCH.get("fell_back") or 0) + 1
+        return None
+    why, score = why_by_path.get(got, ("", 0.0))
+    _SFX_MATCH_LAST.update({"path": got, "why": why, "score": score,
+                            "at": time.time()})
+    _SFX_MATCH["picks"] = int(_SFX_MATCH.get("picks") or 0) + 1
+    _SFX_MATCH["matched"] = int(_SFX_MATCH.get("matched") or 0) + 1
+    sfx_match_note("sting", Path(got).stem, why, score, said["line"])
+    pipeline_log("air", "(#1251) a clip matched to the line: %s - %s"
+                 % (Path(got).name, why))
+    return (Path(got), why, round(float(score or 0), 2))
+
+
+def sfx_match_why_for(sample: Any) -> tuple:
+    """The matched reason for this sample, if it is the one just drawn."""
+    try:
+        if (str(sample) == str(_SFX_MATCH_LAST.get("path") or "")
+                and time.time() - float(_SFX_MATCH_LAST.get("at") or 0) < 120.0):
+            return (str(_SFX_MATCH_LAST.get("why") or ""),
+                    float(_SFX_MATCH_LAST.get("score") or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    return ("", 0.0)
+
+
+async def sfx_match_video_pick_async(at_ms: int = 0) -> Any:
+    """sfx_match_video_pick, on the clip book's own worker.
+
+    #1362f: asyncio.to_thread hands work to the default pool, which the
+    whole file competes for; the book keeps one worker that nothing else
+    uses so a pick is never standing in a queue. A re-rank is one scored
+    line and one indexed read, and it belongs on that same thread.
+    """
+    if not sfx_match_on(True) or not sfx_match_ready():
+        return None
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            _SFX_DB_EXEC, sfx_match_video_pick, int(at_ms or 0))
+    except Exception:  # noqa: BLE001
+        return None            # a re-rank that fails is an ordinary draw
+
+
+def sfx_match_state() -> dict[str, Any]:
+    """Cheap enough for the 2.5 s poll: dict reads, no database."""
+    stats = dict(_SFX_MATCH.get("stats") or {})
+    on_sting, on_video = sfx_match_on(False), sfx_match_on(True)
+    return {
+        "available": _sfx_match is not None,
+        "stings": on_sting, "video": on_video,
+        "strength": sfx_match_strength(False),
+        "video_strength": sfx_match_strength(True),
+        "floor": round(sfx_match_floor(False), 2),
+        "video_floor": round(sfx_match_floor(True), 2),
+        "ready": sfx_match_ready(), "building": bool(_SFX_MATCH.get("building")),
+        "built_at": float(_SFX_MATCH.get("at") or 0),
+        "build_ms": int(_SFX_MATCH.get("ms") or 0),
+        "clips": int(stats.get("clips") or 0),
+        "wordy": int(stats.get("wordy") or 0),
+        "words": int(stats.get("tokens") or 0),
+        "folders": int(stats.get("folders") or 0),
+        "folders_named": int(stats.get("folders_with_keywords") or 0),
+        "picks": int(_SFX_MATCH.get("picks") or 0),
+        "fell_back": int(_SFX_MATCH.get("fell_back") or 0),
+        "why": str(_SFX_MATCH.get("why") or ""),
+        "recent": list(_SFX_MATCH_RING[-12:]),
+        "say": (
+            "the matcher is not on this station"
+            if _sfx_match is None else
+            ("reading %d clip name(s) - the mode starts working the moment "
+             "it finishes" % int(stats.get("clips") or 0))
+            if _SFX_MATCH.get("building") and not sfx_match_ready() else
+            ("nothing is indexed yet%s"
+             % ((" - " + str(_SFX_MATCH.get("why"))) if _SFX_MATCH.get("why") else ""))
+            if not sfx_match_ready() else
+            ("%d clip name(s) indexed, %d of them carrying words, over %d "
+             "folder(s)%s%s"
+             % (int(stats.get("clips") or 0), int(stats.get("wordy") or 0),
+                int(stats.get("folders") or 0),
+                (" - his stings are matched to the line" if on_sting else
+                 " - his stings are drawn as usual"),
+                (" and the endless set is matched too" if on_video else
+                 " and the endless set draws as usual"))))}
+
+
+# --- one local-model call per folder --------------------------------------
+#
+# The names say what a clip SAYS; nothing in the library says what a folder
+# IS. sfx_match.py ships a glossary for the sixty-odd folders this station
+# holds today, and this is how a folder nobody wrote a line for gets one:
+# a single, bounded ask per folder, cached for ever in sfx_keywords.json,
+# run by hand from the popup rather than on a clock. It is never on the air
+# road - a keyword that arrives tomorrow costs today's pick nothing.
+async def sfx_keywords_learn(most: int = 6, again: bool = False) -> dict[str, Any]:
+    """Ask the small local model to name what a folder's clips are about."""
+    if _sfx_match is None or not sfx_match_ready():
+        return {"ok": False, "asked": 0,
+                "say": "the clip names are not indexed yet"}
+    index = _SFX_MATCH["index"]
+    book = sfx_keywords_read(force=True)
+    want = [f for f in index.folders
+            if again or str((book.get(f) or {}).get("from") or "") != "model"]
+    asked = learned = 0
+    for folder in want[:max(1, min(24, int(most)))]:
+        fid = index.folder_ix.get(folder)
+        if fid is None:
+            continue
+        names: list[str] = []
+        try:
+            con = sfx_db_reader()
+            rows = con.execute(
+                "SELECT name FROM clips WHERE folder = ? AND playable = 1 "
+                "LIMIT 400", (folder,)).fetchall()
+            for row in rows:
+                name = str(row["name"] or "")
+                if not _sfx_match.is_bare_name(name) and _sfx_match.tokens(name):
+                    names.append(name)
+                if len(names) >= 10:
+                    break
+        except Exception:  # noqa: BLE001
+            names = []
+        asked += 1
+        try:
+            answer = await ask_model(
+                _sfx_match.keyword_prompt(folder, names), limit=180, spice=0.2,
+                model=str((dj_settings() or {}).get("model_fast")
+                          or (dj_settings() or {}).get("model") or ""),
+                mark={"kind": "sfx folder keywords",
+                      "for": "what a clip folder is about (#1251)"})
+        except Exception:  # noqa: BLE001
+            answer = ""
+        words = _sfx_match.parse_keywords(answer, most=10)
+        if not words:
+            continue
+        # The glossary's seed is kept alongside what the model added: the
+        # model does not know this station and the glossary does not know
+        # the folder somebody dropped in last night.
+        seed = list(_sfx_match.folder_seed_keywords(folder))
+        merged = seed + [w for w in words if w not in seed]
+        sfx_keywords_set(folder, merged[:16], source="model")
+        learned += 1
+    return {"ok": True, "asked": asked, "learned": learned,
+            "left": max(0, len(want) - asked),
+            "say": ("asked the model about %d folder(s) and wrote %d of them "
+                    "down%s" % (asked, learned,
+                                (" - %d still to go" % max(0, len(want) - asked))
+                                if len(want) > asked else ""))}
 
 
 @app.get("/api/sfx/db")
@@ -141720,6 +148627,119 @@ async def sfx_db_rebuild_api(
                     if started else
                     "a walk is already running - it commits per folder, so "
                     "the book is filling while you watch")}
+
+
+@app.get("/api/sfx/match")
+async def sfx_match_get_api(                                   # [#1251]
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1251: are his clips being matched to the dialogue, and how well."""
+    require_read_auth(authorization)
+    return sfx_match_state()
+
+
+@app.post("/api/sfx/match")
+async def sfx_match_set_api(                                   # [#1251]
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1251: the two switches and their two dials.
+
+    {"stings": true}          - the SFX guy's stings follow the line
+    {"strength": 35}          - how close a match has to be to win (0-100)
+    {"video": true}           - the endless set follows the line too
+    {"video_strength": 35}    - its own dial, because a picture that only
+                                loosely fits is still something to watch
+    {"rebuild": true}         - read the clip names again
+    {"learn": 6}              - ask the local model about 6 more folders
+    {"folder": "simp", "words": "homer, donut"} - write one by hand
+
+    Held settings, like every other dial on this road, so a restart finds
+    the mode exactly as it was left.
+    """
+    require_auth(authorization)
+    body = payload or {}
+    changed: dict[str, Any] = {}
+    if "stings" in body:
+        changed["sfx_match_dialogue"] = bool(body.get("stings"))
+    if body.get("strength") is not None:
+        changed["sfx_match_strength"] = max(0, min(100, int(body.get("strength") or 0)))
+    if "video" in body:
+        changed["sfx_video_match_dialogue"] = bool(body.get("video"))
+    if body.get("video_strength") is not None:
+        changed["sfx_video_match_strength"] = max(0, min(100, int(
+            body.get("video_strength") or 0)))
+    if changed:
+        settings = load_settings()
+        dj = dict(settings.get("dj") or {})
+        dj.update(changed)
+        save_settings({**settings, "dj": dj})
+        note_action("you %s" % (
+            ("turned dialogue matching %s for his stings"
+             % ("on" if changed["sfx_match_dialogue"] else "off"))
+            if "sfx_match_dialogue" in changed else
+            ("turned dialogue matching %s for the endless set"
+             % ("on" if changed["sfx_video_match_dialogue"] else "off"))
+            if "sfx_video_match_dialogue" in changed else
+            "moved the dialogue-matching dial"))
+        # A switch that has just been turned on wants the index, and the
+        # index is a second of thread time - so ask for it here rather
+        # than making the first pick of the night the one that waits.
+        if (changed.get("sfx_match_dialogue")
+                or changed.get("sfx_video_match_dialogue")):
+            sfx_match_kick()
+    out: dict[str, Any] = {"ok": True, "changed": changed}
+    if body.get("folder"):
+        out["folder"] = sfx_keywords_set(
+            str(body.get("folder")), body.get("words") or [], source="hand")
+    if body.get("rebuild"):
+        out["rebuilding"] = sfx_match_kick(force=False)
+    if body.get("learn"):
+        out["learn"] = await sfx_keywords_learn(int(body.get("learn") or 6))
+    out.update(sfx_match_state())
+    return out
+
+
+@app.get("/api/sfx/match/try")
+async def sfx_match_try_api(                                   # [#1251]
+    line: str = "",
+    context: str = "",
+    video: int = 1,
+    most: int = 8,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1251: what WOULD he play over this line - a dry run that changes
+    nothing, so the mode can be read before it is trusted with the air.
+
+    With no `line` it answers for the sentence in the room right now,
+    which is also how the endless set asks the question."""
+    require_read_auth(authorization)
+    said = sfx_match_heard(0)
+    want = " ".join(str(line or "").split()) or str(said.get("line") or "")
+    ctx = " ".join(str(context or "").split()) or str(said.get("context") or "")
+    if not sfx_match_ready():
+        sfx_match_kick()
+        return {"ok": False, "line": want, "ready": False,
+                "say": "the clip names are being read - ask again in a moment"}
+    floor = sfx_match_floor(bool(video))
+    cands = sfx_match_score(want, ctx, video=bool(video))
+    rows = []
+    for path, seconds, cand in sfx_match_rows(cands, most=max(1, min(40, int(most)))):
+        rows.append({"name": path.stem, "folder": cand.folder,
+                     "seconds": round(float(seconds or 0), 2),
+                     "score": round(float(cand.score), 2),
+                     "over_floor": bool(cand.score >= floor),
+                     "why": _sfx_match.explain(cand) if _sfx_match else ""})
+    over = [r for r in rows if r["over_floor"]]
+    return {"ok": True, "ready": True, "line": want, "context": ctx,
+            "heard": said, "floor": round(floor, 2),
+            "strength": sfx_match_strength(bool(video)),
+            "scored": len(cands), "clips": rows,
+            "say": ("%d clip(s) clear the floor of %.2f - the best is %s (%s)"
+                    % (len(over), floor, over[0]["name"], over[0]["why"])
+                    if over else
+                    "nothing clears the floor of %.2f, so the ordinary draw "
+                    "would run" % floor)}
 
 
 @app.post("/api/sfx/video/cue")
@@ -141861,7 +148881,7 @@ async def sfx_video_cue_api(
                 "video": True, "seconds": seconds,
                 "url": clip["url"], "aired": "airing",
             })
-            del _RADIO["chat"][:-240]
+            del _RADIO["chat"][:-RADIO_CHAT_KEEP]
             note_activity("sting", pick.stem)
             sfx_history_add(pick, str(body.get("who") or "operator"))
         except Exception:  # noqa: BLE001
@@ -141901,6 +148921,569 @@ def sfx_db_forget(paths: list[str]) -> int:
                 con.close()
     except Exception:  # noqa: BLE001
         return 0
+
+
+# --- #1243 GLUE, and #1223 EDIT ------------------------------------------
+#
+# Two roads onto one clip, both of which end in a NEW file that the station
+# owns and a line in a ledger that says what it stands in front of.
+#
+#   Glue  joins this clip to the one next door in its folder and writes the
+#         join to data/sfx/glued.  The two originals are marked superseded,
+#         not deleted: the files stay exactly where they are and one line
+#         out of data/sfx_glue.json puts them back on the air.
+#   Edit  hands the clip to the station's own video editor and, when the
+#         operator saves, writes the answer back - over the clip itself if
+#         it lives under data/, beside it under data/sfx/edited if it is on
+#         the read-only samples share, which is most of them.
+#
+# Everything that is a command builder or bookkeeping lives in sfx_glue.py
+# so it can be tested with no station, no share and no ffmpeg; what is left
+# here is the part that needs the clip book, the ids and the routes.
+import sfx_glue as _sfx_glue                        # [#1243]
+
+SFX_GLUE_DIR = data_path(*_sfx_glue.GLUED_UNDER)        # data/sfx/glued
+SFX_EDITED_DIR = data_path(*_sfx_glue.EDITED_UNDER)     # data/sfx/edited
+SFX_GLUE_PATH = data_path("sfx_glue.json")
+_SFX_GLUE_LOCK = RLock()
+# One job per press, so a join that takes eleven seconds can say so while it
+# runs instead of holding the request open across the tablet bridge, which
+# gives up at twenty.
+_SFX_GLUE_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def sfx_glue_book() -> dict[str, Any]:
+    """The glue ledger, memoised on the file's own stamp like the bans are."""
+    return _sfx_file_memo(SFX_GLUE_PATH, _sfx_glue.ledger_clean,
+                          _sfx_glue.ledger_empty())
+
+
+def sfx_glue_save(book: dict[str, Any]) -> None:
+    with _SFX_GLUE_LOCK:
+        _sfx_glue.write_book(SFX_GLUE_PATH, book)
+    # The memo is keyed on (mtime_ns, size) and re-reads on the next call,
+    # so nothing else has to be told.
+
+
+def sfx_superseded() -> set[str]:
+    """Every clip id that something longer now stands in front of.
+
+    Read by the sting draw and by the clip book's index.  Never raises: a
+    ledger that will not parse must not stop the station drawing clips."""
+    try:
+        return _sfx_glue.ledger_superseded(sfx_glue_book())
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def sfx_db_path_of(sid: str) -> Path | None:
+    """sid -> path, off the clip book's own index. Local disk, microseconds."""
+    sid = str(sid or "")
+    if not sid:
+        return None
+    try:
+        con = sfx_db_reader()
+        if con is None:
+            return None
+        with _SFX_DB_LOCK:
+            row = con.execute("SELECT path FROM clips WHERE sid = ? LIMIT 1",
+                              (sid,)).fetchone()
+        if row is None:
+            return None
+        found = Path(str(row[0]))
+        return found if found.is_file() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sfx_db_write_row(path: Path, seconds: float, playable: int = 1) -> bool:
+    """Put one clip in the book by hand.
+
+    The walk writes the book a folder at a time and takes minutes; a clip
+    the operator just made must be drawable the second it exists, so it is
+    written here with the length that was MEASURED off the finished file
+    rather than guessed from the parts."""
+    try:
+        st = path.stat()
+        with _SFX_DB_LOCK:
+            con = sfx_db()
+            con.execute(
+                "INSERT INTO clips (path, sid, name, folder, video, bytes,"
+                " mtime, seconds, playable, seen_at) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(path) DO UPDATE SET sid=excluded.sid,"
+                " name=excluded.name, folder=excluded.folder,"
+                " video=excluded.video, bytes=excluded.bytes,"
+                " mtime=excluded.mtime, seconds=excluded.seconds,"
+                " playable=excluded.playable, seen_at=excluded.seen_at",
+                (str(path), sfx_id(path), path.stem, path.parent.name,
+                 1 if sfx_is_video(path) else 0, int(st.st_size),
+                 float(st.st_mtime), float(seconds), int(playable),
+                 time.time()))
+            con.commit()
+        return True
+    except Exception as err:  # noqa: BLE001
+        print("[sfx-glue] could not write the book: %s" % err, flush=True)
+        return False
+
+
+def sfx_db_stand_down(sids: list[str]) -> int:
+    """Mark these clips unplayable in the book WITHOUT touching their files.
+
+    This is what makes the endless set draw the join instead of the shorts:
+    its pick is one indexed query with `playable = 1` in the where clause,
+    so a zero here is immediate and needs no restart and no rebuild."""
+    rows = [str(s) for s in sids if str(s or "")]
+    if not rows:
+        return 0
+    try:
+        with _SFX_DB_LOCK:
+            con = sfx_db()
+            cur = con.executemany(
+                "UPDATE clips SET playable = 0 WHERE sid = ?",
+                [(s,) for s in rows])
+            con.commit()
+            return int(cur.rowcount or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def sfx_glue_clip(path: Path, seconds: float) -> dict[str, Any]:
+    """One clip in the shape every surface of this station already reads."""
+    key = sfx_id(path)
+    return {"id": key, "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
+            "sting": path.stem, "text": "", "video": sfx_is_video(path),
+            "seconds": round(float(seconds or 0), 2)}
+
+
+def sfx_glue_job_new(what: str) -> dict[str, Any]:
+    job = {"id": uuid.uuid4().hex[:12], "state": "working", "say": what,
+           "at": time.time(), "clip": None, "why": ""}
+    with _SFX_GLUE_LOCK:
+        _SFX_GLUE_JOBS[job["id"]] = job
+        if len(_SFX_GLUE_JOBS) > 60:
+            for old in sorted(_SFX_GLUE_JOBS.values(),
+                              key=lambda r: float(r.get("at") or 0))[:20]:
+                _SFX_GLUE_JOBS.pop(str(old.get("id")), None)
+    return job
+
+
+def sfx_glue_work(job_id: str, first: Path, second: Path,
+                  part_ids: list[str]) -> None:
+    """The join, on its own thread. Never raises: a job carries its own bad news."""
+    job = _SFX_GLUE_JOBS.get(job_id) or {}
+
+    def note(text: str) -> None:
+        job["say"] = str(text)[:160]
+
+    try:
+        SFX_GLUE_DIR.mkdir(parents=True, exist_ok=True)
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        got = _sfx_glue.join(first, second, SFX_GLUE_DIR, exe,
+                             names=(first.stem, second.stem), progress=note)
+        if not got.get("ok"):
+            job.update(state="failed", why=str(got.get("why") or "it would not join"),
+                       say="they would not join: " + str(got.get("why") or "")[:120])
+            return
+        made = Path(str(got["path"]))
+        seconds = float(got.get("seconds") or 0)
+        sid = sfx_id(made)
+        note("writing it into the clip book...")
+        sfx_db_write_row(made, seconds, 1)
+        # Everything underneath, however many joins deep: gluing (A+B) onto
+        # C must stand A, B, C AND the A+B join down, or the set plays the
+        # same sound from two files. `stack` is the whole tower, `flatten`
+        # is only the real files off the share, which is what a report
+        # wants to name.
+        book = sfx_glue_book()
+        under: list[str] = []
+        roots: list[str] = []
+        for part in part_ids:
+            for one in _sfx_glue.ledger_stack(book, str(part)):
+                if one not in under:
+                    under.append(one)
+            for one in _sfx_glue.ledger_flatten(book, str(part)):
+                if one not in roots:
+                    roots.append(one)
+        record = {"id": sid, "path": str(made), "name": made.stem,
+                  "seconds": round(seconds, 3), "mode": str(got.get("mode") or ""),
+                  "why": str(got.get("why") or ""), "made": int(time.time()),
+                  "kind": "glue", "part_ids": [str(p) for p in part_ids],
+                  "part_paths": [str(first), str(second)],
+                  "glued_from": roots, "supersedes": under}
+        sfx_glue_save(_sfx_glue.ledger_add(book, record))
+        sfx_db_stand_down(under)
+        job.update(state="done", clip=sfx_glue_clip(made, seconds),
+                   say="%s - %.1fs, %s" % (made.stem, seconds, got.get("why") or ""))
+        pipeline_log("air", "clips glued into one - %s (%.2fs, %s) (#1243)"
+                     % (made.name, seconds, got.get("mode")))
+        note_action("glued %s - now %.1fs" % (made.stem[:48], seconds))
+    except Exception as err:  # noqa: BLE001
+        job.update(state="failed", why=str(err)[:200],
+                   say="the join failed: " + type(err).__name__)
+
+
+async def sfx_glue_side(sid: str, direction: str,
+                        authorization: str | None) -> dict[str, Any]:
+    """The clip next door, asked of the station's OWN neighbour answer.
+
+    #1243 must never grow a second opinion about what "the next clip in the
+    folder" is: the Prev and Next buttons on this very sheet already have
+    one, it is answered off the clip book because an iterdir() over the
+    18,570-file grabbed-clips folder times the tablet's bridge out, and it
+    skips banned clips and wraps at the ends.  So this calls it."""
+    try:
+        return await sfx_video_neighbour_api(
+            id=sid, dir=("prev" if str(direction).startswith("p") else "next"),
+            authorization=authorization)
+    except HTTPException:
+        raise
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "clip": None,
+                "say": "the folder would not answer: " + type(err).__name__}
+
+
+@app.get("/api/sfx/glue/state")
+async def sfx_glue_state_api(
+    id: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the two edge buttons should say, and why one of them is off.
+
+    A disabled button with no reason on it is the thing this station treats
+    as a fault in its own right, so each side comes back with either a
+    neighbour and its length or a sentence saying what is in the way."""
+    require_read_auth(authorization)
+    here = sfx_by_id(str(id or ""))
+    if here is None:
+        raise HTTPException(status_code=404, detail="No such clip")
+    book = sfx_glue_book()
+    out: dict[str, Any] = {
+        "ok": True, "id": str(id), "name": here.stem,
+        "folder": here.parent.name,
+        "superseded": str(id) in _sfx_glue.ledger_superseded(book),
+        "glued": bool(_sfx_glue.ledger_by_id(book, str(id))),
+    }
+    for side in ("prev", "next"):
+        got = await sfx_glue_side(str(id), side, authorization)
+        clip = (got or {}).get("clip") or {}
+        if not (got or {}).get("ok") or not clip.get("id"):
+            out[side] = {"ok": False, "why": str((got or {}).get("say")
+                                                 or "nothing else in that folder")}
+            continue
+        ids = ([str(id), str(clip["id"])] if side == "next"
+               else [str(clip["id"]), str(id)])
+        done = _sfx_glue.ledger_find(book, ids)
+        out[side] = {"ok": True, "id": str(clip["id"]),
+                     "name": str(clip.get("sting") or ""),
+                     "seconds": float(clip.get("seconds") or 0),
+                     "done": bool(done and Path(str(done.get("path") or "")).is_file()),
+                     "why": ""}
+        if str(clip["id"]) == str(id):
+            out[side] = {"ok": False,
+                         "why": "it is the only clip in " + here.parent.name}
+    return out
+
+
+@app.post("/api/sfx/glue")
+async def sfx_glue_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Join this clip to the one before or after it, into one longer clip.
+
+    Idempotent: pressing Glue twice on the same pair hands back the clip
+    that is already there rather than making a second copy of it.  And
+    chainable, because the answer is itself a clip in the same folder road:
+    glue A to B, then glue the result to C, and the ledger records A, B and
+    C underneath it so none of the three comes back on the air."""
+    require_auth(authorization)
+    body = payload or {}
+    sid = str(body.get("clip") or body.get("id") or "")
+    direction = "prev" if str(body.get("direction") or "next").startswith("p") else "next"
+    here = sfx_by_id(sid)
+    if here is None or not here.is_file():
+        raise HTTPException(status_code=404, detail="No such clip")
+    got = await sfx_glue_side(sid, direction, authorization)
+    clip = (got or {}).get("clip") or {}
+    if not (got or {}).get("ok") or not clip.get("id"):
+        return {"ok": False, "job": "", "clip": None,
+                "say": str((got or {}).get("say") or "nothing next door to glue to")}
+    other_id = str(clip["id"])
+    if other_id == sid:
+        return {"ok": False, "job": "", "clip": None,
+                "say": "that is the only clip in " + here.parent.name}
+    other = sfx_by_id(other_id)
+    if other is None or not other.is_file():
+        return {"ok": False, "job": "", "clip": None,
+                "say": "the clip next door is not on the shelf any more"}
+    first, second = ((here, other) if direction == "next" else (other, here))
+    part_ids = [sfx_id(first), sfx_id(second)]
+    book = sfx_glue_book()
+    done = _sfx_glue.ledger_find(book, part_ids)
+    if done and Path(str(done.get("path") or "")).is_file():
+        made = Path(str(done["path"]))
+        return {"ok": True, "job": "", "already": True,
+                "clip": sfx_glue_clip(made, float(done.get("seconds") or 0)),
+                "say": "those two are already glued - %s, %.1fs"
+                       % (made.stem, float(done.get("seconds") or 0))}
+    job = sfx_glue_job_new("joining %s and %s..." % (first.stem[:28], second.stem[:28]))
+    Thread(target=sfx_glue_work, name="sfx-glue",
+           args=(job["id"], first, second, part_ids), daemon=True).start()
+    return {"ok": True, "job": job["id"], "clip": None, "already": False,
+            "say": job["say"]}
+
+
+@app.get("/api/sfx/glue/job")
+async def sfx_glue_job_api(
+    id: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """How the join is getting on. working / done / failed, and a sentence."""
+    require_read_auth(authorization)
+    job = _SFX_GLUE_JOBS.get(str(id or ""))
+    if job is None:
+        raise HTTPException(status_code=404, detail="No such job")
+    return dict(job)
+
+
+@app.post("/api/sfx/glue/undo")
+async def sfx_glue_undo_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Put the originals back on the air. The joined file is left on disk."""
+    require_auth(authorization)
+    sid = str((payload or {}).get("clip") or (payload or {}).get("id") or "")
+    book = sfx_glue_book()
+    row = _sfx_glue.ledger_by_id(book, sid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Nothing was glued to make that")
+    after = _sfx_glue.ledger_drop(book, sid)
+    sfx_glue_save(after)
+    # Only the clips nothing else stands in front of come back. Undo the
+    # OUTER join of a chain and the inner one is still there, so the two
+    # shorts inside it must stay down - the ledger says so now that the
+    # superseded map is derived from the rows rather than stored beside them.
+    still = _sfx_glue.ledger_superseded(after)
+    touched = [str(one) for one in (row.get("supersedes")
+                                    or row.get("glued_from") or [])]
+    back = [one for one in touched if one not in still]
+    for one in back:
+        found = sfx_by_id(one)
+        if found is not None and found.is_file():
+            sfx_db_write_row(found, float(sfx_seconds(found) or 0), 1)
+    sfx_db_stand_down([sid])          # the join itself is not the head now
+    return {"ok": True, "restored": back, "still_down": sorted(still & set(touched)),
+            "say": "the %d original clip(s) are back on the air; the joined "
+                   "file is still on disk" % len(back)}
+
+
+# --- #1223: the Edit button, and the editor that already exists -----------
+
+def sfx_edit_editor() -> Any:
+    """The one VideoEditor instance the station stood up at import."""
+    editor = getattr(globals().get("VIDEO_EDITOR_ROUTER"), "pine_editor", None)
+    if editor is None:
+        raise HTTPException(status_code=503,
+                            detail="The video editor is not mounted here")
+    return editor
+
+
+def sfx_edit_plan_for(path: Path) -> dict[str, Any]:
+    return _sfx_glue.edit_plan(path, DATA_DIR, SFX_EDITED_DIR,
+                               audio_only=not sfx_is_video(path))
+
+
+@app.get("/api/sfx/edit/where")
+async def sfx_edit_where_api(
+    id: str = "",
+    source: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What Save over the original is going to do, said before it is pressed.
+
+    Asked by the clip sheet with a clip id, and by the editor page itself
+    with the source id it was opened on, so the sentence the operator reads
+    in the editor is the station's own answer and not the page's guess."""
+    require_read_auth(authorization)
+    path: Path | None = None
+    name = ""
+    if source:
+        record = sfx_edit_editor().read("sources", str(source))
+        mine = record.get("pine_sfx") or {}
+        if not mine:
+            raise HTTPException(status_code=404,
+                                detail="That recording is not a library clip")
+        path = Path(str(mine.get("path") or ""))
+        name = str(mine.get("name") or "")
+    else:
+        path = sfx_by_id(str(id or ""))
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="No such clip")
+    plan = sfx_edit_plan_for(path)
+    audio_only = bool(plan.get("audio_only"))
+    supports = ("in and out points, crop and rotate, brightness, contrast "
+                "and saturation, and drawing on the picture")
+    if audio_only:
+        supports = ("in and out points on the waveform. This clip is sound "
+                    "only, so the station draws its waveform as the picture "
+                    "to trim against; the crop, rotate and drawing tools "
+                    "have nothing to work on and what is saved is the sound "
+                    "again, in the format it arrived in")
+    return {"ok": True, "clip": sfx_id(path), "name": name or path.stem,
+            "in_place": bool(plan.get("in_place")), "audio_only": audio_only,
+            "target": str(plan.get("target") or ""), "supports": supports,
+            "say": str(plan.get("say") or "")}
+
+
+@app.post("/api/sfx/edit/open")
+async def sfx_edit_open_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Hand this clip to the station's video editor and say where it opened.
+
+    The clip is INGESTED on the editor's own single worker - the same one a
+    screen recording is analysed on - so an edit never competes with the
+    broadcast for CPU and two of them queue behind each other."""
+    require_auth(authorization)
+    sid = str((payload or {}).get("clip") or (payload or {}).get("id") or "")
+    path = sfx_by_id(sid)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="No such clip")
+    editor = sfx_edit_editor()
+    plan = sfx_edit_plan_for(path)
+    audio_only = bool(plan.get("audio_only"))
+    identifier = uuid.uuid4().hex
+    folder = editor.folder("sources", identifier)
+    folder.mkdir(parents=True, exist_ok=True)
+    seconds = 0.0
+    try:
+        seconds = float(sfx_seconds(path) or 0)
+    except Exception:  # noqa: BLE001
+        seconds = 0.0
+    record = {"id": identifier, "source_id": identifier, "status": "processing",
+              "name": path.stem[:160], "created_at_ms": int(time.time() * 1000),
+              "bytes": 0, "audio_capture": {},
+              "editor_url": "/video-editor/?source=%s&sfx=1" % identifier,
+              # [#1223] the editor never learns a file path from the page:
+              # the clip this source came from is remembered HERE, so Save
+              # over the original takes an export id and nothing else.
+              "pine_sfx": {"id": sfx_id(path), "path": str(path),
+                           "name": path.stem, "audio_only": audio_only,
+                           "seconds": round(seconds, 3)}}
+
+    def _ingest() -> None:
+        media = folder / "original.mp4"
+        suffix = path.suffix.lower()
+        if not audio_only and suffix in _sfx_glue.COPY_CONTAINERS:
+            shutil.copyfile(path, media)
+        else:
+            ok, why = _sfx_glue.run(
+                _sfx_glue.adopt_command(path, media, editor.ffmpeg,
+                                        audio_only, seconds), timeout=600)
+            if not ok:
+                raise ValueError("The clip could not be opened here: " + why)
+        editor.analyze(identifier)
+
+    try:
+        editor.write("sources", identifier, record)
+        editor.submit("sources", identifier, _ingest)
+    except ValueError as exc:
+        editor.discard_new("sources", identifier)
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    return {"ok": True, "source": identifier,
+            "editor_url": record["editor_url"],
+            "in_place": bool(plan.get("in_place")), "audio_only": audio_only,
+            "say": str(plan.get("say") or "")}
+
+
+def sfx_edit_land(export_id: str) -> dict[str, Any]:
+    """Put a finished export back into the library. Runs on a thread."""
+    editor = sfx_edit_editor()
+    record = editor.read("exports", str(export_id))
+    if str(record.get("status") or "") != "complete":
+        raise HTTPException(status_code=409, detail="That edit is not finished")
+    source_id = str(record.get("source_id") or "")
+    source = editor.read("sources", source_id)
+    mine = source.get("pine_sfx") or {}
+    if not mine:
+        raise HTTPException(status_code=400,
+                            detail="That edit did not come from a library clip")
+    original = Path(str(mine.get("path") or ""))
+    if not original.is_file():
+        raise HTTPException(status_code=404,
+                            detail="The original clip is not on the shelf any more")
+    edited = editor.folder("exports", str(export_id)) / "edited.mp4"
+    if not edited.is_file():
+        raise HTTPException(status_code=404, detail="The edited file is missing")
+    plan = sfx_edit_plan_for(original)
+    target = Path(str(plan["target"]))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    audio_only = bool(plan.get("audio_only"))
+    staging = target.with_name(target.name + ".part")
+    if audio_only:
+        # The editor works in pictures; a sound-only clip goes back as the
+        # sound it was, in the format it arrived in, because the sampler
+        # pads and the satellite expect the file they had.
+        ok, why = _sfx_glue.run(
+            _sfx_glue.sound_back_command(edited, staging, editor.ffmpeg), timeout=600)
+        if not ok:
+            raise HTTPException(status_code=500,
+                                detail="The sound could not be written back: " + why)
+    else:
+        shutil.copyfile(edited, staging)
+    os.replace(staging, target)
+    try:
+        import imageio_ffmpeg
+        made = _sfx_glue.probe(target, imageio_ffmpeg.get_ffmpeg_exe())
+        seconds = float(made.get("seconds") or 0)
+    except Exception:  # noqa: BLE001
+        seconds = 0.0
+    if seconds <= 0:
+        try:
+            seconds = float(sfx_seconds(target) or 0)
+        except Exception:  # noqa: BLE001
+            seconds = 0.0
+    sfx_db_write_row(target, seconds, 1)
+    replaced: list[str] = []
+    if not plan.get("in_place"):
+        book = sfx_glue_book()
+        under = _sfx_glue.ledger_stack(book, sfx_id(original))
+        roots = _sfx_glue.ledger_flatten(book, sfx_id(original))
+        row = {"id": sfx_id(target), "path": str(target), "name": target.stem,
+               "seconds": round(seconds, 3), "mode": "edit", "kind": "edit",
+               "why": "edited copy of a clip on the read-only share",
+               "made": int(time.time()), "part_ids": [sfx_id(original)],
+               "part_paths": [str(original)], "glued_from": roots,
+               "supersedes": under}
+        sfx_glue_save(_sfx_glue.ledger_add(book, row))
+        sfx_db_stand_down(under)
+        replaced = under
+        say = ("saved as %s and it is what goes on the air now; the original "
+               "is untouched on the share" % target.name)
+    else:
+        say = "saved over %s - %.1fs now" % (target.name, seconds)
+    pipeline_log("air", "clip edited - %s (%.2fs, %s) (#1223)"
+                 % (target.name, seconds,
+                    "in place" if plan.get("in_place") else "copy + supersede"))
+    return {"ok": True, "in_place": bool(plan.get("in_place")),
+            "superseded": replaced, "target": str(target),
+            "clip": sfx_glue_clip(target, seconds), "say": say}
+
+
+@app.post("/api/sfx/edit/save")
+async def sfx_edit_save_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Save an edit back over the clip it came from - or beside it, honestly."""
+    require_auth(authorization)
+    export_id = str((payload or {}).get("export") or (payload or {}).get("id") or "")
+    if not export_id:
+        raise HTTPException(status_code=400, detail="Which edit?")
+    return await asyncio.to_thread(sfx_edit_land, export_id)
 
 
 @app.get("/api/sfx/video/neighbour")
@@ -144841,6 +152424,18 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
         # ring - the panel's tooltip and the script report read it back.
         **({"withdrawn_why": str(entry.get("withdrawn_why"))[:240]}
            if entry.get("withdrawn_why") else {}),
+        # [#1237] the record this line was written about, and a cut.
+        **({"bound": record_binding.snapshot(entry.get("bound")),
+            "bound_part": str(entry.get("bound_part") or "")[:8]}
+           if isinstance(entry.get("bound"), dict) else {}),
+        **({"cut_why": str(entry.get("cut_why"))[:240]}
+           if entry.get("cut_why") else {}),
+        # [#1251] and why the matcher chose this clip. The segment
+        # inspector, the hour contract and the script report all read the
+        # durable row, not the ring - so a reason that only lived in the
+        # ring would be gone four minutes after it was heard.
+        **({"match_why": str(entry.get("match_why"))[:240]}
+           if entry.get("match_why") else {}),
         # #1201: WHERE THIS LINE SITS IN ITS SCRIPT. Without these,
         # "line 7 played before line 6" was not a checkable statement -
         # `round` is the road, not the conversation, and nothing carried
@@ -144873,6 +152468,20 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
         "clip_tail": round(float(entry.get("clip_tail") or 0), 3),
         "seconds": round(seconds, 2),
     }
+    # [#1222] THE CLIP'S IDENTITY OUTLIVES THE RING. A sting row carried
+    # only its stem here ("95 clip"), which names a file in a dozen
+    # folders; the id, the folder and the URL were on the ring row and
+    # nowhere durable. The operator asked for "the video that was
+    # playing" four days later and nothing on this machine could say
+    # which file it had been - measured: air_log.jsonl reaches back two
+    # days, sfx_plays.json three, sfx_history.json three, and
+    # sfx_video_played.json is pruned to the last hour by design.
+    if kind in ("sfx", "sting", "sfxguy") or entry.get("sfx"):
+        for _k in ("sfx", "sfx_dir", "url"):
+            if entry.get(_k):
+                row[_k] = str(entry.get(_k))[:200]
+        if entry.get("video"):
+            row["video"] = True
     # #1169: the modifiers that shaped the segment this line belongs
     # to, so a heard line can name what was going on when it went out.
     # Absent when nothing was standing, which is the normal state and
@@ -144883,8 +152492,37 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
             row["mods"] = _mods
     except Exception:  # noqa: BLE001
         pass
-    if entry.get("ad_audio"):
+    # [#1206] THE ANALYSIS DESK'S PAPERWORK, KEPT WITH THE ROW.
+    #
+    # The gallery's vision pass writes a booth row carrying the picture,
+    # the prompt as sent, the description that came back, the model and
+    # how long it looked (image_analysis_ready). None of that reached the
+    # durable shape, so twenty-five minutes later the only thing left of
+    # it anywhere was the sentence "Image analysis complete: <file>" — and
+    # "what made this line" had nothing to answer with. Bounded hard: an
+    # analysis row costs about 3 kB, and there are ~280 of them in 48 h.
+    if kind in ("image_analysis", "song_analysis"):
+        for _key, _cap in (("analysis", 1600), ("image", 200),
+                           ("model", 80), ("prompt", 1200)):
+            _got = " ".join(str(entry.get(_key) or "").split())[:_cap]
+            if _got:
+                row[_key] = _got
+        try:
+            if entry.get("ms"):
+                row["ms"] = int(float(entry.get("ms") or 0))
+        except Exception:  # noqa: BLE001
+            pass
+    if entry.get("ad_audio"):  # [#1206] the analysis paperwork sits above
         row["ad_audio"] = str(entry.get("ad_audio"))
+    # [#1194] the sample behind a sting, and a replay's mark, survive the
+    # ring: without `sfx` a sting older than four minutes could not be
+    # played again by anyone, and without `replay` the ledger could not
+    # tell a line said twice from a line said once.
+    if entry.get("sfx"):
+        row["sfx"] = str(entry.get("sfx"))[:16]
+    if entry.get("replay"):
+        row["replay"] = True
+        row["replay_of"] = str(entry.get("replay_of") or "")[:48]
     if entry.get("images"):
         try:
             row["images"] = [str(i) for i in entry["images"]][:3]
@@ -144892,6 +152530,8 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
             pass
     if entry.get("replay"):
         row["replay"] = True
+    if entry.get("sfx"):                                   # [#1200]
+        row["sfx"] = str(entry.get("sfx"))[:16]
     return row
 
 
@@ -144909,7 +152549,8 @@ def airlog_row_hash(row: dict[str, Any]) -> str:
         bits = (row.get("aired"), row.get("air_at"), row.get("text"),
                 row.get(HEARD_STAMP),
                 row.get("clip_from"), row.get("clip_until"), row.get("media"),
-                row.get("round"), len(row.get("images") or []))
+                row.get("round"), len(row.get("images") or []),
+                row.get("cut_why"))                          # [#1237]
         return hashlib.sha1(repr(bits).encode("utf-8")).hexdigest()[:16]
     except Exception:  # noqa: BLE001
         return ""
@@ -145056,6 +152697,57 @@ def airlog_compact_all() -> dict[str, int]:
     return out
 
 
+def sfx_airing_settle(rows: Any) -> int:                 # [#1218]
+    """A1's P5: THE STINGS THAT STAY `airing` FOR EVER.
+
+    `_sfx_cycle_note` writes a sting row the instant the endless set is
+    told to ring a clip, with `aired: "airing"` and an air stamp about
+    eleven seconds in the FUTURE (the set plays the tube's clip first).
+    Nothing ever comes back to change it: the row is not a page delivery,
+    so no acknowledgement names it, and `dj_sting`'s own flip is on a
+    road the cycle does not take. Measured on 2026-09-21: 221 of the
+    day's 271 sting rows were still `airing`, and `airing` is inside
+    AIR_PUBLICATION_STATES - so each one counted as a heard line, took a
+    block number from the catch-up, and anchored the document at a moment
+    that had not happened yet. #1218's three stings are this class.
+
+    A row settles when its own window has passed, and it settles into
+    what the house can actually vouch for: `page` when a listener
+    acknowledged audible playout inside that window, `unconfirmed` when
+    nobody did. Neither is a guess dressed as a fact, which is the whole
+    complaint behind AIR_PUBLICATION_STATES' rename.
+
+    Returns how many were settled. Called from the keeper, before the
+    catch-up asks which rows deserve a written position."""
+    now = time.time()
+    done = 0
+    try:
+        heard_at = max(float(_DIALOGUE_HEARD[0] or 0),
+                       float((_TALK_ACK or {}).get("at") or 0))
+    except Exception:  # noqa: BLE001
+        heard_at = 0.0
+    for row in (rows or []):
+        try:
+            if str(row.get("aired") or "") != "airing":
+                continue
+            if str(row.get("kind") or "") != "sfx":
+                continue
+            start = float(row.get("air_at") or row.get("ts") or 0)
+            ends = start + max(1.0, float(row.get("seconds") or 0))
+            if not start or now < ends + 5.0:
+                continue                  # it may still be sounding
+            row["aired"] = ("page" if heard_at >= start - 30.0
+                            else "unconfirmed")
+            if row["aired"] == "page" and not row.get(HEARD_STAMP):
+                row[HEARD_STAMP] = start
+                row[HEARD_STAMP_BY] = "set"
+            row["settled_at"] = now
+            done += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return done
+
+
 async def airlog_keeper() -> None:
     """#1023: the one hook that catches all twenty-five ring append sites
     and every later mutation. Every AIRLOG_TICK it gives id-less rows an
@@ -145074,6 +152766,14 @@ async def airlog_keeper() -> None:
         try:
             _ensure_chat_ids()
             # #1339: anything that reached the air without a written
+            # [#1218] ...and a sting the endless set left `airing` for
+            # ever settles first, so the catch-up cannot file it at a
+            # moment in the future. Cheap: one walk of the ring, in
+            # memory, no file and no network.
+            try:
+                sfx_airing_settle(list(_RADIO.get("chat") or []))
+            except Exception:  # noqa: BLE001
+                pass
             # position gets one here, before the screenplay is asked
             # to order it. Off the loop - it appends to a file.
             try:
@@ -145194,6 +152894,14 @@ def airlog_clip_url(row: dict[str, Any]) -> str:
         ad = str(row.get("ad_audio") or "")
         if ad and AD_AUDIO_SHAPE.match(ad) and (PRODUCED_ADS_DIR / ad).is_file():
             return f"/api/booth/clip?line={rid}"
+    except Exception:  # noqa: BLE001
+        return ""
+    # [#1194] a sting names its sample, not a media file: the /sfx/ route
+    # is its play road, signed the way every set already fetches it.
+    try:
+        key = str(row.get("sfx") or "")
+        if re.fullmatch(r"[a-f0-9]{16}", key):
+            return "/sfx/%s?t=%s" % (key, media_sign(key))
     except Exception:  # noqa: BLE001
         return ""
     return ""
@@ -145476,6 +153184,10 @@ def airlog_model_call(row: dict[str, Any], spent: dict[str, Any] | None,
             "eval_ms": int(float(spent.get("eval") or 0) * 1000),
             "tinted": str(row.get("tinted") or ""),
             "armed": str(row.get("armed") or "")[:80],
+            # [#1195] which alternative governed this call and what every
+            # command in it expanded to - the paperwork for the book.
+            **({"segprompt": row["segprompt"]}
+               if isinstance(row.get("segprompt"), dict) else {}),
         }
         airlog_append_bg(MODEL_CALLS_PATH, out)
     except Exception:  # noqa: BLE001
@@ -145669,6 +153381,7 @@ def airlog_heat_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 async def api_airlog(
     since: float = 0.0, until: float = 0.0, who: str = "",
     kinds: str = "", rounds: str = "", most: int = 600, quiet: int = 0,
+    q: str = "",                                            # [#1206]
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """#1023: the durable air log over a window (default: the last hour),
@@ -145682,6 +153395,14 @@ async def api_airlog(
     def _read() -> list[dict[str, Any]]:
         rows = airlog_rows(since, until, who or None, kinds or None,
                            rounds or None, bool(quiet))
+        # [#1206] SEARCH THE LEDGER. The desktop's "what made this line"
+        # window offers this on the text when a row is gone for good, so
+        # the answer to "where did it go" is never a dead end.
+        probe = " ".join(str(q or "").split()).casefold()
+        if probe:
+            rows = [r for r in rows
+                    if probe in " ".join(
+                        str(r.get("text") or "").split()).casefold()]
         rows = rows[-most:]
         for r in rows:
             r["url"] = airlog_clip_url(r)
@@ -145827,7 +153548,7 @@ def _script_block_next() -> int:
 
 
 def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
-                         round_kind: str = "") -> int:
+                         round_kind: str = "", source: str = "") -> int:  # [#1245] source=
     """Write one round down, in the order it will be heard.
 
     Returns the block, or 0 if nothing was written - and a failure here
@@ -145843,6 +153564,10 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
         _mods = modifiers_for_sid(str(sid or ""))
     except Exception:  # noqa: BLE001
         _mods = []
+    try:                                        # [#1195]
+        _pk = segment_prompts.for_sid(str(sid or ""))
+    except Exception:  # noqa: BLE001
+        _pk = None
     out: list[str] = []
     for ord_, row in enumerate(rows):
         out.append(json.dumps({
@@ -145860,10 +153585,19 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
             # could have been read in advance.
             "cue": str(row.get("cue") or ""),
             "scripted": bool(row.get("scripted", True)),
+            # [#1237] the record this line was bound to
+            **({"bound": dict(row["bound"])}
+               if isinstance(row.get("bound"), dict) else {}),
             # #1169: the modifiers that shaped this round. An id list,
             # never a copy of the thing - guests.json, banter_topics.json,
             # plotlines.json and caller_themes.json stay the truth.
             **({"mods": _mods} if _mods else {}),
+            # [#1245] the speaker box document the round was seeded from -
+            # a SEED, kept apart from the road now (it used to BE the round).
+            **({"source": str(source or "")[:120]} if source else {}),
+            # [#1195] which alternative of the segment prompt book the round
+            # was written with, and what its commands expanded to.
+            **({"prompt": _pk} if _pk else {}),
         }))
     try:
         with _SCRIPT_LEDGER_LOCK:
@@ -145941,7 +153675,14 @@ def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
         rid = str((row or {}).get("id") or "")
         if not rid or rid in known:
             continue
-        if str(row.get("aired") or "") not in AIR_PUBLICATION_STATES:
+        # [#1218] A1's P5: THE STRICT SET. `published` is a hand-over,
+        # and `airing` is a sting row written before the set rang it -
+        # 221 of 271 of them on 2026-09-21 were still `airing` hours
+        # later with an air stamp eleven seconds in the future. Giving
+        # those a block number files them in the document at a moment
+        # nothing happened at, and the block numbers around them then
+        # read as a conversation re-entering the order.
+        if not screenplay_was_heard(row):
             continue          # not heard yet; it may still be written
         kind = str(row.get("kind") or "")
         if kind in SCREENPLAY_SKIP_KINDS:
@@ -145954,7 +153695,7 @@ def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
     # In the order they were HEARD, so the blocks ascend the way the
     # hour did. air_at is frozen once heard (#1288), so this is stable
     # and a later pass cannot file the same line somewhere else.
-    want.sort(key=lambda r: (float(r.get("air_at") or r.get("ts") or 0),
+    want.sort(key=lambda r: (screenplay_when_heard(r),    # [#1218]
                              str(r.get("id") or "")))
     caught = 0
     for row in want[:200]:            # a bounded bite per tick
@@ -145970,7 +153711,10 @@ def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
               # NOT scripted: nothing wrote this down in advance, and
               # a reader is entitled to know which lines were planned
               # and which the station reached for.
-              "scripted": False}],
+              "scripted": False,
+              # [#1237] a single line published bound to a record keeps it
+              **({"bound": dict(row["bound"])}
+                 if isinstance(row.get("bound"), dict) else {})}],
             str(row.get("round") or ""))
         if got:
             caught += 1
@@ -146864,6 +154608,7 @@ def _screenplay_actions(d: dict[str, Any], since: float,
             "The Gazette goes to press"
             + (f" - \"{pg['headline']}\"" if pg.get("headline") else "")
             + f" ({pg.get('stories') or 0} stories).", "paper")
+    _deleted_lines, _deleted_ids = sfx_deleted_lines(), sfx_deleted_ids()   # [#1200]
     for row in d.get("air") or []:
         kind = str(row.get("kind") or "")
         who = str(row.get("who") or "")
@@ -146876,12 +154621,18 @@ def _screenplay_actions(d: dict[str, Any], since: float,
             # viewer had to destroy the node instead of keeping it -
             # 46 `ac-` removals measured over 35 minutes, with the row
             # disappearing under the operator's finger.
+            # [#1200] a clip deleted from the library says so on its row.
+            _gone = (str(row.get("id") or "") in _deleted_lines
+                     or (str(row.get("sfx") or "") or "-") in _deleted_ids
+                     or bool(row.get("deleted")))
             add(at, f"ac-sting-{row.get('id')}",
                 f"A sting off the board: {got or 'a cue'}"
                 + (f" ({screenplay_mmss(row.get('seconds'))})"
-                   if float(row.get("seconds") or 0) >= 1 else "") + ".",
+                   if float(row.get("seconds") or 0) >= 1 else "")
+                + (" - deleted from the library" if _gone else "") + ".",
                 "sting", line=str(row.get("id") or ""),
-                url=str(row.get("url") or ""))
+                url=str(row.get("url") or ""),
+                sfx=str(row.get("sfx") or ""), deleted=_gone)
         elif kind == "marker":
             got = " ".join(str(row.get("text") or "").split())
             if got:
@@ -146889,6 +154640,46 @@ def _screenplay_actions(d: dict[str, Any], since: float,
                     got if got[-1] in ".!?…" else got + ".", "marker")
     out.sort(key=lambda e: (e["at"], e["id"]))
     return out
+
+
+# [#1218] A1's P1/P5: WHAT "HEARD" MEANS TO THE DOCUMENT.
+#
+# AIR_PUBLICATION_STATES holds six words and two of them are not
+# hearings. `published` is a hand-over to a browser that may be muted,
+# backgrounded or absent - the tuple's own note says so in capitals.
+# `airing` is a row the endless set wrote BEFORE it rang the clip: 221 of
+# 271 sting rows on 2026-09-21 were still `airing` hours later, each with
+# an air stamp about eleven seconds in the FUTURE, and every one of them
+# counted as a heard line for the compose anchors and for the catch-up.
+#
+# This is the strict set: a transport that carried it, or a listener's
+# own acknowledgement. `line_heard_at` is the second fact laid beside the
+# state (#1422b) and it outranks the state.
+SCREENPLAY_HEARD_STATES = ("stream", "both", "box", "page")
+
+
+def screenplay_was_heard(row: Any) -> bool:            # [#1218]
+    """Did this line come out of a speaker? Strictly."""
+    try:
+        if line_heard_at(row) > 0:
+            return True
+        return str((row or {}).get("aired") or "") in SCREENPLAY_HEARD_STATES
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def screenplay_when_heard(row: Any) -> float:          # [#1218]
+    """The moment this line SOUNDED: the ear's stamp where there is one,
+    then the (now ear-corrected) air stamp, then the moment it was
+    written. A1 measured the first two a median of 62.6 s apart, which is
+    how far every hanger in the document was out of place."""
+    try:
+        got = line_heard_at(row)
+        if got > 0:
+            return got
+        return float((row or {}).get("air_at") or (row or {}).get("ts") or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def screenplay_compose(since: float, until: float, d: dict[str, Any],
@@ -146918,7 +154709,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             continue
         speech.append(row)
     actions = _screenplay_actions(d, since, until)
-    events = ([{"at": float(r.get("air_at") or r.get("ts") or 0),
+    events = ([{"at": screenplay_when_heard(r),           # [#1218]
                 "sort": 1, "row": r, "what": "line"} for r in speech]
               + [{"at": e["at"], "sort": 0, "row": e, "what": "action"}
                  for e in actions])
@@ -146948,6 +154739,36 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     except Exception:  # noqa: BLE001
         _ord_early = {}
 
+    # [#1218] WHICH BLOCKS WERE HEARD AT ALL.
+    #
+    # By BLOCK and not by row, deliberately. A burst's rows flip to heard
+    # one at a time as the playhead crosses them, so a round that is on
+    # the air RIGHT NOW is half heard and half prepared; tiering it by row
+    # would split a sounding conversation in two and drop its tail to the
+    # bottom of the page - the exact fault #1343 was written to cure. A
+    # block counts as heard from its FIRST heard line, and a block every
+    # one of whose rows was withdrawn is a round that never happened.
+    _heard_blocks: set[int] = set()
+    _withdrawn_blocks: set[int] = set()
+    try:
+        _blk_states: dict[int, set[str]] = {}
+        for _e in events:
+            if _e.get("what") != "line":
+                continue
+            _r = _e.get("row") or {}
+            _got = _ord_early.get(str(_r.get("id") or ""))
+            if not _got:
+                continue
+            _b = int(_got[0])
+            if screenplay_was_heard(_r):
+                _heard_blocks.add(_b)
+            _blk_states.setdefault(_b, set()).add(str(_r.get("aired") or ""))
+        for _b, _states in _blk_states.items():
+            if _b not in _heard_blocks and _states and _states <= {"withdrawn"}:
+                _withdrawn_blocks.add(_b)
+    except Exception:  # noqa: BLE001
+        _heard_blocks, _withdrawn_blocks = set(), set()
+
     # #1308: A LINE THAT HAS NOT BEEN SAID IS NOT PART OF WHAT WAS SAID.
     #
     # The `at` above is air_at OR ts. For a row that aired that is an
@@ -146975,7 +154796,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             _r = _e.get("row") or {}
             if _e.get("what") != "line":
                 continue
-            if str(_r.get("aired") or "") in AIR_PUBLICATION_STATES:
+            if screenplay_was_heard(_r):                 # [#1218]
                 _floor = max(_floor, float(_e["at"] or 0))
         if _floor:
             # The latest air time each conversation actually reached.
@@ -146984,7 +154805,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 if _e.get("what") != "line":
                     continue
                 _r = _e.get("row") or {}
-                if str(_r.get("aired") or "") not in AIR_PUBLICATION_STATES:
+                if not screenplay_was_heard(_r):             # [#1218]
                     continue
                 _sid = str(_r.get("sid") or "")
                 if not _sid:
@@ -146997,9 +154818,21 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 if _e.get("what") != "line":
                     continue
                 _r = _e.get("row") or {}
-                if str(_r.get("aired") or "") in AIR_PUBLICATION_STATES:
+                if screenplay_was_heard(_r):                 # [#1218]
                     continue
-                if str(_r.get("id") or "") in _ord_early:
+                # [#1218] ...AND THE LEDGER ONLY PLACES IT IF THAT PLACE
+                # WAS HEARD. #1343 exempted every ledgered row from the
+                # trail so a live burst would not fall to the bottom of
+                # the page while it was sounding - correct, and it also
+                # exempted rounds that were refused or are still banked,
+                # which then sat ABOVE every block written after them
+                # (90 ghost rows in one hour, six blocks). The exemption
+                # now asks whether the row's own BLOCK has been heard,
+                # which keeps the live round whole and lets an unheard
+                # one trail.
+                if (str(_r.get("id") or "") in _ord_early
+                        and int((_ord_early.get(str(_r.get("id") or ""))
+                                 or (0, 0))[0]) in _heard_blocks):
                     continue          # #1343: the ledger places it
                 _sid = str(_r.get("sid") or "")
                 _anchor = _heard.get(_sid)
@@ -147327,16 +155160,42 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         _row = _e.get("row") or {}
         # The stamp the air log kept, never the one this function has
         # been rewriting.
-        _raw_of[_ix] = float(_row.get("air_at") or _row.get("ts")
-                             or _e.get("at") or 0)
+        # [#1218] A1's P1.3: THE EAR'S STAMP WHERE THERE IS ONE.
+        # This one line moves every hanger - an advert, a record
+        # drop, a phone call, a sting off the board - off the render
+        # estimate and onto the moment it sounded, a median of 62.6 s
+        # later.
+        _raw_of[_ix] = (screenplay_when_heard(_row)
+                        or float(_e.get("at") or 0))
         _got = _ord_of(_ord, _row) if _ord else None          # 2026-09-14
         if _got and len(_got) > 2 and (_got[2] or _blocksize.get(int(_got[0]), 0) >= 2):
-            _spine.append((int(_got[0]), int(_got[1]), _ix))
+            # [#1218] A1's P1.1: THREE TIERS, AND ONLY THE FIRST IS THE SHOW.
+            #
+            # A script is a sequence, and (block, ord) is that sequence -
+            # but a block is numbered when a round is WRITTEN, before the
+            # hand-over that can refuse it. A round that was then refused,
+            # or that is still banked, kept the number and therefore kept
+            # its place ABOVE every block written after it, including
+            # blocks that aired. Measured 2026-09-21: 90 ghost rows
+            # standing on the page in hour 13 (68 withdrawn, 22 prepared)
+            # across six blocks; 131 of the day's 151 prepared ids were
+            # never heard at all.
+            #
+            # So the spine is built from what was HEARD. A block nobody
+            # has heard trails below the last heard row, in its own order,
+            # because the operator wants to see what is coming - below the
+            # live line, not above it. A block that was withdrawn leaves
+            # the spine entirely and sits under everything, which is where
+            # a round that never happened belongs.
+            _b0 = int(_got[0])
+            _tier = (0 if _b0 in _heard_blocks else
+                     2 if _b0 in _withdrawn_blocks else 1)
+            _spine.append((_tier, _b0, int(_got[1]), _ix))
     _spine.sort()
 
     if _spine:
         _pos: dict[int, tuple] = {}
-        for _rank, (_b, _o, _ix) in enumerate(_spine):
+        for _rank, (_t, _b, _o, _ix) in enumerate(_spine):   # [#1218]
             _pos[_ix] = (_rank, 0, 0.0, _ix)
         # Each hanger goes after the last spine row that had already
         # been said when it happened. Binary search over the spine in
@@ -147355,10 +155214,17 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         # An unheard row still keeps its place in the spine - that is
         # what (block, ord) is for. It simply does not get to say where
         # anything else goes until it has been said.
+        # [#1218] A1's P1.2: A ROW ANCHORS ONLY IF IT WAS HEARD.
+        # #1343b tested `air_at > 0`, and EVERY prepared row has one -
+        # the burst stamps `_est0 + offset` on each turn as it is
+        # written. So a ghost round's estimates were anchoring the
+        # hangers around real speech (#1189: a station id at 692 drawn
+        # before turn 0, an intro at 744 drawn after turn 6, quips at
+        # 754 and 758 drawn after turn 8).
         _anchorable = [(_raw_of[_ix], _rank)
-                       for _rank, (_b, _o, _ix) in enumerate(_spine)
-                       if float((events[_ix].get("row") or {}).get(
-                           "air_at") or 0) > 0]
+                       for _rank, (_t, _b, _o, _ix) in enumerate(_spine)
+                       if _t == 0 and screenplay_was_heard(
+                           events[_ix].get("row") or {})]
         _anchorable.sort()
         _times = [_t for _t, _r in _anchorable]
         _ranks = [_r for _t, _r in _anchorable]
@@ -147658,6 +155524,10 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
              round=round_kind, kind=str(row.get("kind") or ""),
              seconds=round(float(row.get("seconds") or 0), 2),
              aired=str(row.get("aired") or ""), clip=clip, tinted=tinted,
+             # [#1237] the record the line is bound to rides to the page
+             **({"bound": dict(row["bound"]),
+                 "bound_to": record_binding.label(row["bound"])}
+                if isinstance(row.get("bound"), dict) else {}),
              engine=str((one.get("voice") or {}).get("engine")
                         or row.get("engine") or ""),
              model=str((one.get("wrote") or {}).get("model") or ""),
@@ -154937,6 +162807,145 @@ async def _paper_clock_start() -> None:
     fire_and_forget(paper_clock())
 
 
+# --- #1441: THE DOOR CLOSES -------------------------------------------------
+# A restart that cannot finish is a restart that can abort, and an aborted
+# restart leaves the container stopped with `hasBeenManuallyStopped` set,
+# which `restart: unless-stopped` will not undo. That is how this station
+# lost 2h24m of air on 2026-09-21.
+#
+# uvicorn now catches SIGTERM (compose `exec`s it, so it is PID 1) and its
+# graceful phase is bounded at ten seconds. What is NOT bounded is what comes
+# after: `concurrent.futures.thread._python_exit` joins every worker of the
+# default executor at interpreter shutdown, and this station's workers sit in
+# CIFS stat() calls for minutes. Measured with py-spy during a stop:
+# music-scan in _music_walk, sfx-db-index in sfx_seconds_held, a pool worker
+# in mutagen's _openfile. Docker gave up at thirty seconds and forced it.
+#
+# The guard is the last word. Everything durable here is written atomically
+# as it changes, not at exit, so leaving immediately costs nothing that the
+# SIGKILL was not already taking.
+EXIT_GUARD_SECONDS = 6.0
+_EXIT_GUARD: dict[str, Any] = {"armed": 0.0, "fired": 0.0}
+
+
+def _exit_guard_wait() -> None:
+    """Sleep out the grace, then leave. Daemon: it never delays an exit that
+    happens on its own."""
+    time.sleep(EXIT_GUARD_SECONDS)
+    _EXIT_GUARD["fired"] = time.time()
+    print("[exit] the graceful shutdown did not finish in %.0fs - leaving so "
+          "the restart can complete (#1441)" % EXIT_GUARD_SECONDS, flush=True)
+    try:
+        import sys as _sys
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(0)
+
+
+@app.on_event("startup")
+async def _startup_exit_guard() -> None:
+    """Chain a guard onto whatever handler uvicorn installed for SIGTERM.
+
+    Registered at startup, AFTER uvicorn has installed its own handlers, and
+    it calls the previous handler rather than replacing it - the graceful
+    shutdown still runs, and still wins whenever it can finish."""
+    import signal
+    try:
+        previous = signal.getsignal(signal.SIGTERM)
+    except Exception:  # noqa: BLE001
+        return
+
+    def _on_term(sig: int, frame: Any) -> None:
+        if not _EXIT_GUARD["armed"]:
+            _EXIT_GUARD["armed"] = time.time()
+            try:
+                Thread(target=_exit_guard_wait, name="exit-guard",
+                       daemon=True).start()
+            except Exception:  # noqa: BLE001
+                pass
+        if callable(previous):
+            previous(sig, frame)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_term)
+        print("[exit] the door has a guard: %.0fs after a stop signal this "
+              "process leaves whatever its threads are doing (#1441)"
+              % EXIT_GUARD_SECONDS, flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print("[exit] could not arm the guard: %s" % exc, flush=True)
+
+
+# --- #1441: THE KEEPER, AS THE STATION SEES IT ------------------------------
+# The keeper runs on the HOST (a 30-second systemd timer), because a station
+# that is down cannot press its own rung. All this side can do is read what
+# the keeper wrote and say whether anything is watching the door - which is
+# the question worth being able to ask.
+KEEPER_LEDGER = data_path("keeper.jsonl")
+KEEPER_QUIET_HOURS = 6.0
+
+
+def keeper_state() -> dict[str, Any]:
+    """Is anything watching the door, and when did it last have to act."""
+    rows: list[dict[str, Any]] = []
+    try:
+        raw = KEEPER_LEDGER.read_text(encoding="utf-8", errors="ignore")
+        for line in raw.splitlines()[-40:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    except FileNotFoundError:
+        rows = []
+    except Exception:  # noqa: BLE001
+        rows = []
+    acted = [r for r in rows if str(r.get("what") or "") in
+             ("starting", "started", "restarting", "start-failed",
+              "restart-failed")]
+    last = acted[-1] if acted else None
+    installed = bool(rows)
+    age = (time.time() - float(last.get("at") or 0)) if last else 0.0
+    if not installed:
+        say = ("Nothing on the box is watching the door. If a restart aborts, "
+               "the station stays down until somebody notices - which is what "
+               "happened on 2026-09-21 for 2h24m. Install the keeper: "
+               "sudo systemctl enable --now pinebox-keeper.timer")
+    elif last is None:
+        say = "The keeper is installed and has never had to start anything."
+    else:
+        when = ("%.0f min" % (age / 60.0) if age < 5400
+                else "%.1f hours" % (age / 3600.0))
+        say = ("The keeper is installed. It last had to act %s ago: %s %s %s"
+               % (when, last.get("name"), last.get("what"),
+                  last.get("detail")))
+    return {
+        "installed": installed,
+        "ledger": str(KEEPER_LEDGER),
+        "rows": rows[-12:],
+        "last_action": last,
+        "last_action_age_s": round(age, 1) if last else None,
+        "quiet": bool(last is None or age > KEEPER_QUIET_HOURS * 3600.0),
+        "guard": {"seconds": EXIT_GUARD_SECONDS,
+                  "armed_at": _EXIT_GUARD.get("armed") or None},
+        "say": say,
+    }
+
+
+@app.get("/api/keeper")
+async def keeper_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1441: is anything watching the door?"""
+    require_read_auth(authorization)
+    return keeper_state()
+
+
 # --- the typesetter --------------------------------------------------------
 import math  # G3: the pie, the cloud and the plexus need it here
 # G3 (#1037 #1042 #1043 #1023 #1029 #1020 #1030): two typesetters behind one
@@ -160661,8 +168670,8 @@ def screenplay_pdf_bytes(elements: list[dict[str, Any]],
         pdf.add_page()
         state["page"] += 1
         state["y"] = SCRIPT_PDF_TOP
-        if state["page"] > 1:
-            label = f"{state['page']}."
+        if state["page"] > 2:   # [#1236] the title page is not a page of the script:
+            label = f"{state['page'] - 1}."   # the first is unnumbered, as on the window
             pdf.set_font("courier", "", 12)
             pdf.set_text_color(20, 20, 20)
             pdf.text(SCRIPT_PDF_RIGHT - pdf.get_string_width(label), 12.7, label)
@@ -160755,8 +168764,11 @@ def screenplay_pdf_bytes(elements: list[dict[str, Any]],
         else:
             put(text, "action")
             blank()
-    blank()
-    put("FADE OUT.", "transition", caps=True, align="right")
+    if not any(str(x.get("type") or "") == "transition"
+               and "FADE OUT" in str(x.get("text") or "").upper()
+               for x in (elements or [])[-3:]):   # [#1236] the hour's own FADE OUT. stands
+        blank()
+        put("FADE OUT.", "transition", caps=True, align="right")
     out = pdf.output()
     return bytes(out) if out is not None else None
 
@@ -166181,6 +174193,25 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   position: absolute; inset: 0; pointer-events: none;
   background: #fff; opacity: 0;
 }
+/* [#1219] the timeline along the bottom edge of the picture (the set's
+   twin in desktop/renderer/sfx-tv.css carries the same rules). The m:ss is
+   a CHILD of the 4px band and sits above it, over the picture, so the band
+   must not clip; 22px in clears the resize grip in the same corner. */
+.sfx-tv-time {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 4px; z-index: 4;
+  pointer-events: none; background: rgba(255,255,255,.14);
+}
+.sfx-tv-time-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+  background: #65c7da; box-shadow: 0 0 6px rgba(101,199,218,.6);
+}
+.sfx-tv-time-clock {
+  position: absolute; right: 22px; bottom: 6px; z-index: 4; pointer-events: none;
+  font-weight: 600; font-size: 10px; line-height: 1; letter-spacing: .04em;
+  color: #dfe7ee; text-shadow: 0 1px 2px #000, 0 0 4px #000;
+  font-variant-numeric: tabular-nums;
+}
+.sfx-tv-time-clock:empty { display: none; }
 @keyframes sfxTvOn {
   0%   { transform: scale(.004, .004); filter: brightness(4); opacity: 1; }
   34%  { transform: scale(1, .006);    filter: brightness(3.4); opacity: 1; }
@@ -180913,7 +188944,16 @@ async function djProvenanceShow(line, event) {
     got = await api("/api/dj/provenance/"
       + encodeURIComponent(String(line.id || "")));
   } catch (err) {
-    waiting.textContent = err.message;
+    /* [#1206] A SENTENCE, NOT A STATUS. The booth answers off its live
+     * ring and off the durable air log behind it; past both there is
+     * nothing left to show, and saying so beats printing "404". */
+    waiting.textContent = /404|no longer in the booth/i.test(
+      String((err && err.message) || ""))
+      ? "That line is no longer in the booth. The booth answers for the "
+        + "lines it still holds and for two days of air log behind them, "
+        + "and this one is past both, so its paperwork is gone."
+      : "the booth could not answer for that line: "
+        + String((err && err.message) || "");
     return;
   }
   if (!pop.isConnected) return;
@@ -180932,6 +188972,18 @@ async function djProvenanceShow(line, event) {
   said.style.cssText = "font-style:italic;font-size:10.5px;opacity:.78;"
     + "margin-bottom:7px";
   pop.appendChild(said);
+  if (got.topic_contract && got.topic_contract.subject) {  // [#1249]
+    const tc = got.topic_contract;
+    const tcLine = el("div", "muted",
+      "topic: " + String(tc.subject).slice(0, 140)
+      + " \u00b7 adherence: " + (tc.host_turns
+        ? (tc.addressing + "/" + tc.host_turns + " host turns")
+        : "not graded")
+      + (tc.skeleton ? " \u00b7 emergency skeleton" : "")
+      + (tc.regenerated ? " \u00b7 topic rewrite asked" : ""));
+    tcLine.style.cssText = "font-size:10.5px;opacity:.85;margin-bottom:6px";
+    pop.appendChild(tcLine);
+  }
 
   const facts = el("div", "", "");
   djProvRow(facts, "Who said it",
@@ -184042,6 +192094,12 @@ function djTalkRowInner(line) {
       const chip = el("span", "sfx-chip", "");
       chip.appendChild(el("span", "sfx-chip-em", sfxEmojiFor(line.text)));
       chip.appendChild(el("span", "", " " + (line.text || "sample")));
+      // [#1200] a clip deleted from the library reads as gone, here too.
+      if (line.deleted) {
+        chip.style.textDecoration = "line-through";
+        chip.style.opacity = ".5";
+        chip.appendChild(el("span", "muted", " \u00b7 deleted"));
+      }
       // #714: the bell is not a sample off the shelf — it is MADE, so
       // sfxInspect had nothing to open and the chip did nothing. It has a
       // workshop of its own now: hear it, take a copy, bend it, keep it.
@@ -184211,6 +192269,15 @@ function djTalkRowInner(line) {
     }
     said.appendChild(who);
     said.appendChild(document.createTextNode(line.text || ""));
+    /* [#1237] the record this line was written for, on the row itself */
+    if (line.bound && (line.bound.title || line.bound.artist)) {
+      const bt = el("span", "", " bound to: "
+        + [line.bound.artist, line.bound.title].filter(Boolean).join(" - "));
+      bt.title = (line.cut_why ? line.cut_why + " - " : "")
+        + "Written for that record; it airs only while the record is where the line says it is (#1237)";
+      bt.style.cssText = "font-size:10px;opacity:.6;margin-left:4px";
+      said.appendChild(bt);
+    }
     // Every spoken line wears its delivery status (#430): out of the
     // speaker, queued, or page-only.
     // #748: caller2 and drop were missing. The second person on a call is
@@ -184813,20 +192880,80 @@ function pineMixerVoiceLevel(el_, base) {
   const sting = !!(el_ && el_.dataset && el_.dataset.pineSting === "1");
   return Math.max(0, Math.min(1, Number(base) * (sting ? m.sfx : m.voice)));
 }
+/* [#1192]: THE TABLET'S ENDLESS SET IS NATIVE, AND NO SLIDER COULD REACH IT.
+ *
+ * Since 2026-09-21 the endless video set on the PineTab is an ExoPlayer on a
+ * SurfaceView (PineVideoWall.kt), not a <video> in this document - so every
+ * road in this file that walks "audio,video" misses it by construction, and
+ * the player was built with a hard-coded volume of 1.  This is the door: a
+ * new `level` op on the kiosk bridge, which the wall remembers across the
+ * #1440 watchdog's rebuilds.
+ *
+ * COALESCED AND LATCHED, because it is called from an `input` handler.  A
+ * drag books ONE crossing on the next animation frame carrying the value
+ * that was under the thumb when the frame came round, and a value that has
+ * not really changed is not sent at all.  (rAF and not a timer: on the
+ * tablet the WebView's timer queue can suspend while rAF keeps firing -
+ * memory note pinetab-timers-freeze.)
+ *
+ * It is THE one door: window.pineLevels (audio-law.js) delegates to it where
+ * this document is the panel, so a level set from the Levels sheet, the
+ * Script view's dot, the Listen desk or the panel itself all arrive here. */
+let pineWallWant = null;
+let pineWallBooked = false;
+let pineWallSent = null;
+function pineWallLevel(value) {
+  const want = Math.max(0, Math.min(1, Number(value)));
+  if (!Number.isFinite(want)) return false;
+  const bridge = window.pineDesktop;
+  if (!bridge || typeof bridge.videoWall !== "function") return false;
+  pineWallWant = want;
+  if (pineWallBooked) return true;
+  pineWallBooked = true;
+  const send = () => {
+    pineWallBooked = false;
+    const v = pineWallWant;
+    if (v === null) return;
+    if (pineWallSent !== null && Math.abs(pineWallSent - v) < 0.005) return;
+    pineWallSent = v;
+    try {
+      const going = bridge.videoWall("level", {level: v});
+      if (going && typeof going.catch === "function") {
+        going.catch(() => { pineWallSent = null; });
+      }
+    } catch (e) { pineWallSent = null; }
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(send);
+  else setTimeout(send, 16);
+  return true;
+}
+
 function pineMixerApply() {
   const m = pineMixerRead();
   try { djApplyGain(); } catch (e) { /* the sliders may not be built yet */ }
   try {
-    document.querySelectorAll(".sfx-tv-tube video").forEach((v) => {
+    /* [#1192]: .sfx-tv-screen too - sfx-tv.js's own set names its element
+     * that way, and only the panel's little CRT set uses .sfx-tv-tube. */
+    document.querySelectorAll(".sfx-tv-tube video, .sfx-tv-screen video").forEach((v) => {
       v.volume = Math.max(0, Math.min(1, m.video));
+      if (m.video > 0 && v.muted) v.muted = false;
     });
   } catch (e) { /* no tube up */ }
   try {
+    /* [#1192]: THE TEST THAT USED TO GET THIS WRONG.
+     * It was `!pineInsideDesktopShell()` - i.e. "window.pineDesktop has a
+     * clipboardReady function" - and the TABLET's kiosk bridge has one too.
+     * Measured on the tablet: pineInsideDesktopShell() === true while the
+     * set was plainly in this document, so the module level was never told
+     * and every clip after the drag came back at the old level.  The real
+     * question is who owns element volume HERE, and that has exactly one
+     * answer everywhere else in this file. */
     if (window.PineSfxTv && window.PineSfxTv.level
-        && !(typeof pineInsideDesktopShell === "function" && pineInsideDesktopShell())) {
+        && window.__pineDesktopVolume === undefined) {
       window.PineSfxTv.level(Math.max(0, Math.min(1, m.video)));
     }
   } catch (e) { /* no set on this page */ }
+  try { pineWallLevel(m.video); } catch (e) { /* no wall on this build */ }   /* [#1192] */
 }
 if (!window.pineMixer) {
   window.pineMixer = {
@@ -184860,7 +192987,12 @@ function djApplyGain() {
     const target = level.music
       * ((djSpeaking || adPreviewUrl) ? (1 - level.duck) : 1)
       * pineMixerRead().music;                                     /* #1419 */
-    music.node.gain.setTargetAtTime(target, music.context.currentTime, 0.12);
+    /* [#1192]: 0.12 was a THIRD of a second to arrive and measurably nothing
+     * at all for the first 33 ms - "I'm adjusting them but it doesn't update
+     * in real time".  A click needs a step change measured in samples; 0.03 s
+     * is 63% of the way in 30 ms and 95% in 90 ms, which is ~1400 samples of
+     * ramp at 48 kHz and still silent. */
+    music.node.gain.setTargetAtTime(target, music.context.currentTime, 0.03);
   }
   // The DJ-voice <audio> elements play directly (not through the mixer), so
   // the level slider must drive their .volume (audit #3/#15/#17/#18: the old
@@ -191319,6 +199451,70 @@ function djVoiceUnstick() {
  * page keeps the strict law so it is in step on the day it is handed
  * the air. The server offers late clips for exactly this long
  * (VOICE_LATE_OFFER_MS); the two must agree. */
+/* [#1184] THE PAGE NEVER ABANDONS A CLIP IT WAS HANDED.
+ *
+ * 2026-09-15 07:58. Seven listeners polling, the desktop switched on,
+ * and the ladder's own report reads: "page 0 clip(s) handed over and not
+ * started, 22 stall/interrupt report(s) | heard 678s ago | error
+ * abandoned after 1 tries | error clip became stale before playback".
+ * Zero waiting AND twenty-two failures is not a page with nothing to do;
+ * it is a page that threw away everything it was given.
+ *
+ * And throwing it away is what hid the fault. The only road into
+ * AIR_LADDER needs PAGE_WEDGE_WAITING clips WAITING; a page that
+ * abandons them holds none, so the wedge road was shut and the ladder
+ * sat on one rung for ninety minutes (air_fixes.jsonl: a reload at
+ * 06:26:53, then nothing at all until 07:57:20).
+ *
+ * So: while the station is ON (the CLOCK says so, not this page), not
+ * paused, and this page is the one that sounds - it owns the air, or
+ * nobody does and every page sounds - a late clip is RE-TIMED rather
+ * than dropped. Its air moment becomes now, it keeps its place in line,
+ * it plays through from its first word, and the server is told (the
+ * `retimed` ack, which is not an error and leaves the delivery
+ * `received`, so the ladder can still see the backlog). Latency, not a
+ * hole - which is #1396's rule carried the rest of the way.
+ *
+ * TWO THINGS STILL KILL A CLIP, and both are the SERVER'S word rather
+ * than this page's arithmetic:
+ *   - the feed cut (voice_cut_ms): a pause, a boot, the `flush` rung.
+ *     The server is the only clock, and this is how it speaks.
+ *   - VOICE_KEEP_MS, an outer bound far beyond any stall this station
+ *     has ever produced, so a tab that slept all night still cannot
+ *     wake up and play yesterday.
+ * A gagged page keeps the strict old law, exactly as #1396 left it, so
+ * it is in step on the day it is handed the air. */
+const VOICE_KEEP_MS = 600000;                                 /* [#1184] */
+function djVoiceKeeps(clip) {                                 /* [#1184] */
+  try {
+    if (pineAirPaused) return false;
+    if (pineClockPaused !== false) return false;   /* the SERVER's clock */
+    if (!djLatePlay()) return false;               /* gagged: old law */
+    /* From the clip's FIRST moment, never the re-timed one - re-timing
+     * rewrites broadcastAt, so a bound read off broadcastAt could never
+     * expire and this wall would be decorative. */
+    const since = Number(clip.keptSince || clip.broadcastAt || Date.now());
+    return Date.now() - since <= VOICE_KEEP_MS;
+  } catch (e) { return false; }
+}
+function djVoiceHoldLate(clip, lateNow) {                     /* [#1184] */
+  if (!clip.keptSince) {
+    clip.keptSince = Number(clip.broadcastAt || Date.now());
+  }
+  clip.retimes = Number(clip.retimes || 0) + 1;
+  clip.lateBy = Math.round(Number(lateNow || 0));
+  clip.broadcastAt = Date.now();
+  /* retryAt is LEFT ALONE: a transport that has just failed is still in
+   * its backoff, and zeroing it here would spend all six tries in a
+   * second. A fresh broadcastAt is enough - when the backoff fires, the
+   * clip is no longer late and simply plays. */
+  try {
+    djVoiceAck(clip, "retimed", null,
+               "re-timed " + clip.lateBy + "s late (" + clip.retimes
+               + "x) - the page keeps what it was handed while the "
+               + "station is on (#1184)");
+  } catch (e) { /* the clip still plays */ }
+}
 const VOICE_LATE_PLAY_MS = 45000;
 function djLatePlay() {
   /* Not gagged = this page owns the air, or no owner is set at all
@@ -191452,6 +199648,27 @@ function djVideoTv(clip) {
   try {
     if (pineInsideDesktopShell()) return;
   } catch (e) { /* a plain browser: the set is this page's */ }
+  /* [#1214] ONE SFX MOUTH PER PAGE. "this report isn't playing
+   * logically, it's playing multiple clips at the same time."
+   *
+   * The line above is a DUCK TEST - it asks whether pineDesktop has a
+   * clipboardReady method - and it is the only thing that has ever kept
+   * this tube and desktop/renderer/sfx-tv.js's set off the same page.
+   * Measured on the PineTab today: both roads are loaded in this one
+   * document (window.PineSfxTv true, this function defined, the kiosk
+   * bridge answering clipboardReady), so one bridge method going away
+   * is two pictures and two soundtracks. And the tablet now runs the
+   * endless set on a NATIVE surface as well, which no page road can
+   * pause.
+   *
+   * So the tube asks the one arbiter instead: PineSfxFloor, defined in
+   * sfx-tv.js beside the set that does the hushing. It answers false
+   * when another road - the shell's set, the native wall - is sounding
+   * a clip, and true when this page's mouth is free. A page with no
+   * sfx-tv.js has no floor and behaves exactly as it does today. */
+  try {
+    if (window.PineSfxFloor && !window.PineSfxFloor.claim("panel-tv")) return;
+  } catch (e) { /* no arbiter on this page: carry on as before */ }
   /* Two roads reach here - the voice feed when the show is routed to
    * this page, and djVideoPoll when it is routed to the box - and both
    * see the same clip. One mark, so the set comes on once. */
@@ -191459,7 +199676,17 @@ function djVideoTv(clip) {
   if (djVoiceMarks.has(mark)) return;
   djVoiceMarks.add(mark);
   djTvQueue.push(clip);
-  if (djTvQueue.length > 4) djTvQueue.splice(0, djTvQueue.length - 4);
+  /* [#1212] THE RUNWAY IS SECONDS, NOT ROWS. Four rows was four seconds
+     once #1422 let the endless cycle hand out clips at their own length,
+     and a seam needs the next one decoded before this one ends. The
+     station keeps 28 s of picture rung ahead; this holds the same. */
+  let djTvHeld = 0;
+  for (const row of djTvQueue) djTvHeld += Math.max(0.8, Number(row.seconds) || 6);
+  while (djTvQueue.length > 2 && (djTvHeld > 30 || djTvQueue.length > 24)) {
+    djTvHeld -= Math.max(0.8, Number(djTvQueue[0].seconds) || 6);
+    djTvQueue.shift();
+  }
+  try { djTvWarmUp(); } catch (e) { /* no tube up yet */ }   /* [#1212] */
   djTvNext();
 }
 
@@ -191469,6 +199696,10 @@ function djTvLate(clip) {
 
 function djTvRelease() {
   djTvOn = false;
+  /* [#1214] the mouth is free again - see the claim in djVideoTv. */
+  try {
+    if (window.PineSfxFloor) window.PineSfxFloor.release("panel-tv");
+  } catch (e) { /* no arbiter on this page */ }
   /* The duck belongs to whatever is still sounding. Releasing it while a
    * line is mid-word is how the music jumps back over a presenter. */
   if (!djVoiceLive && !djVoiceQueue.length) { djSpeaking = false; djApplyGain(); }
@@ -191501,70 +199732,239 @@ function djTvNext() {
   djTvShow(clip);
 }
 
-function djTvShow(clip) {
-  let win = null;
-  /* Any set still standing is torn down THROUGH its own hook, so its
-   * clip is silenced. pineWin's own one-frame-per-key close is silent by
-   * design, and a video element goes on playing after it leaves the DOM. */
-  try { pineWinClose("sfxTv", true); } catch (e) {}
-  djTvOn = true;          // ...and that hook releases the flag we hold
+/* [#1212] THE PANEL'S SET, WITH A SEAM.
+ *
+ * "Make sure that when this is on, it causes videos to play seamlessly,
+ *  transitioning from video to video without an intermission in between."
+ *
+ * This surface only ever draws a picture in a PLAIN BROWSER: inside the
+ * desktop app djVideoTv returns at pineInsideDesktopShell() and sfx-tv.js
+ * owns the set, and on the tablet the kiosk bridge answers clipboardReady
+ * too, so the same line sends it to the native wall. But a plain browser
+ * is a real surface - the operator opens the panel on a laptop - and it
+ * had NO seam at all: every hand-over was 520 ms of CRT collapse, then a
+ * 120 ms rest in djTvRelease, then a whole new frame, a new element and a
+ * fetch from zero before a first frame existed. Better than a second and
+ * a half of nothing, and still an intermission he can see.
+ *
+ * So the run keeps its frame, its tube and its timeline strip, the next
+ * clip is warmed INSIDE that tube behind the picture, and the hand-over
+ * is driven by the clip's own `ended` - not by a timer and not by the
+ * ring's next broadcast_ms, because the clip finishing IS the moment.
+ * Measured on sfx-tv.js, which is the same arrangement: 43 consecutive
+ * joins, median 19 ms, none of them over 100.
+ *
+ * WHAT THE FRAME OWNS AND WHAT THE CLIP OWNS. The window, the tube,
+ * #1219's strip and the warm element belong to the RUN and are held in
+ * djTvWin / djTvTube / djTvStrip / djTvWarm; everything below the
+ * `djTvOn = true` line belongs to one clip and is built fresh for each.
+ * That division is the whole patch: build the clip's half twice and you
+ * get two strips stacked in one window.
+ *
+ * [#1216] and the warm element is given its level when it is created,
+ * before it has a first frame, so a clip never begins at one loudness and
+ * is corrected to another once somebody's poll comes round.
+ */
+let djTvWin = null;                      // the frame this run is using
+let djTvTube = null;                     // its tube
+let djTvStrip = null;                    // {tl, fill, clock} - #1219's strip
+let djTvWarm = null;                     // {clip, el} warming inside the tube
+let djTvSeam = false;                    // the station's switch (djVideoPoll)
+
+function djTvVideoLevel() {
+  try { return Math.max(0, Math.min(1, pineMixerRead().video)); }
+  catch (e) { return 1; }
+}
+
+function djTvWarmDrop() {
+  const held = djTvWarm;
+  djTvWarm = null;
+  if (!held) return;
+  try { held.el.pause(); held.el.removeAttribute("src"); held.el.load(); }
+  catch (e) { /* already gone */ }
+  try { if (held.el.parentNode) held.el.parentNode.removeChild(held.el); }
+  catch (e) { /* already gone */ }
+}
+
+function djTvForget() {
+  djTvWarmDrop();
+  djTvWin = null;
+  djTvTube = null;
+  djTvStrip = null;
+}
+
+/* The next clip, decoded and waiting, in the tube that is on screen. A
+   <video> that has to be moved between parents rebuilds its frame sink,
+   which is the cost this exists to avoid - so it is born where it will
+   play. Muted while it warms; nothing must be heard twice. */
+function djTvWarmUp() {
+  if (!djTvSeam || !djTvTube || !djTvTube.parentNode) return;
+  const next = djTvQueue[0];
+  if (!next || !next.url) return;
+  if (djTvWarm && djTvWarm.clip === next) return;
+  djTvWarmDrop();
+  let el = null;
   try {
-    win = pineWin("sfxTv", String(clip.sting || clip.text || "SFX"),
-                  {width: 420, height: 272, minWidth: 200, minHeight: 140});
-  } catch (e) { win = null; }
-  if (!win) {
-    djVoiceAck(clip, "error", null, "the set would not open");
-    djTvRelease();
-    return;
+    el = document.createElement("video");
+    el.playsInline = true;
+    el.preload = "auto";
+    el.controls = false;
+    el.dataset.pineLive = "voice";
+    el.dataset.pineWarm = "1";
+    el.muted = true;
+    el.volume = djTvVideoLevel();                          /* [#1216] */
+    el.setAttribute("style", "position:absolute;left:0;top:0;width:100%;"
+      + "height:100%;object-fit:contain;opacity:0;pointer-events:none");
+    djTvTube.appendChild(el);
+    el.src = next.url;
+    el.load();
+  } catch (e) { return; }
+  djTvWarm = {clip: next, el: el};
+}
+
+function djTvSeamReady(clip) {
+  if (!djTvSeam || !clip || !djTvWarm || djTvWarm.clip !== clip) return false;
+  if (!djTvWin || !djTvTube || !djTvTube.parentNode) return false;
+  try { if (djTvWarm.el.error) return false; } catch (e) { return false; }
+  return djTvWarm.el.parentNode === djTvTube;
+}
+
+function djTvShow(clip) {
+  /* [#1212] A SEAM REUSES THE FRAME AND THE ELEMENT; ANYTHING ELSE OPENS
+     ONE. Every part of the reuse is checked against the document rather
+     than against a flag, because a frame the operator closed is gone and
+     a set that believed otherwise would play a picture nobody can see. */
+  const seamIn = djTvSeamReady(clip);
+  let win = seamIn ? djTvWin : null;
+  let tube = seamIn ? djTvTube : null;
+  let video = null;
+
+  if (seamIn) {
+    const held = djTvWarm;
+    djTvWarm = null;
+    video = held.el;
+    let old = null;
+    try { old = tube.querySelector('video:not([data-pine-warm])'); }
+    catch (e) { old = null; }
+    try {
+      video.removeAttribute("data-pine-warm");
+      video.removeAttribute("style");
+      video.muted = false;
+      video.volume = djTvVideoLevel();                     /* [#1216] */
+    } catch (e) { /* it is still the picture */ }
+    /* #1147's rule: the src goes first and the node second, or a clip
+       that has left the document goes on sounding. */
+    try {
+      if (old && old !== video) {
+        old.pause(); old.removeAttribute("src"); old.load();
+        if (old.parentNode) old.parentNode.removeChild(old);
+      }
+    } catch (e) { /* both tried */ }
+    /* [#1219]'s strip belongs to the frame, so it is reset rather than
+       rebuilt - a second one appended per clip would stack up all run. */
+    try {
+      if (djTvStrip) {
+        djTvStrip.fill.style.width = "0%";
+        djTvStrip.clock.textContent = "";
+      }
+    } catch (e) { /* the strip is not the picture */ }
+    /* pineWin hands back `title` as the caption node it made; a build
+       that ever stops doing so leaves the old name up, which is the
+       harmless half of this. */
+    try {
+      const cap = win.title;
+      if (cap && typeof cap === "object" && "textContent" in cap) {
+        cap.textContent = String(clip.sting || clip.text || "SFX");
+      }
+    } catch (e) { /* the caption is not the picture */ }
+  } else {
+    /* Any set still standing is torn down THROUGH its own hook, so its
+     * clip is silenced. pineWin's own one-frame-per-key close is silent by
+     * design, and a video element goes on playing after it leaves the DOM. */
+    djTvForget();                                          /* [#1212] */
+    try { pineWinClose("sfxTv", true); } catch (e) {}
+    djTvOn = true;        // ...and that hook releases the flag we hold
+    try {
+      win = pineWin("sfxTv", String(clip.sting || clip.text || "SFX"),
+                    {width: 420, height: 272, minWidth: 200, minHeight: 140});
+    } catch (e) { win = null; }
+    if (!win) {
+      djVoiceAck(clip, "error", null, "the set would not open");
+      djTvRelease();
+      return;
+    }
+    tube = document.createElement("div");
+    tube.className = "sfx-tv-tube";
+    video = document.createElement("video");
+    video.playsInline = true;
+    video.preload = "auto";
+    video.controls = false;
+    /* #789/#981: the desktop shell owns live element volume and the booth
+     * monitor switch governs anything tagged pine-live; #1008's solo gate
+     * reads "audio,video" and reaches this too. A sting that skipped the
+     * tag would be the one sound on the page nobody could turn down. */
+    video.dataset.pineLive = "voice";
+    /* [#1216] BEFORE THE SRC, AND SO BEFORE THE FIRST FRAME. */
+    try { video.volume = djTvVideoLevel(); } catch (e) {}   /* #1419 */
+    /* No br=: that road is an AUDIO transcode (#1210). The signature in
+     * the url is what gets it past the guard, so it is passed through
+     * exactly as the station wrote it. */
+    video.src = clip.url;
+    tube.appendChild(video);
+    const glass = document.createElement("div");
+    glass.className = "sfx-tv-glass";
+    const vignette = document.createElement("div");
+    vignette.className = "sfx-tv-vignette";
+    const flash = document.createElement("div");
+    flash.className = "sfx-tv-flash";
+    win.host.appendChild(tube);
+    win.host.appendChild(glass);
+    win.host.appendChild(vignette);
+    win.host.appendChild(flash);
+    tube.classList.add("on");              // dot -> line -> picture
+    flash.classList.add("pop");
+    /* [#1219] "Show a timeline at the bottom while the animation ... is
+     * playing." A 4px band along the bottom edge of the picture and a small
+     * clock in its corner, driven by the tube's own currentTime on
+     * requestAnimationFrame from the first frame. rAF and not a timer: a
+     * WebView suspends JS timers and keeps firing rAF, and a strip that
+     * froze would read as a stalled clip.
+     * [#1212] It is built HERE, with the frame, and reset on a seam - it
+     * outlives the clip exactly the way the window does. */
+    const tl = document.createElement("div");
+    tl.className = "sfx-tv-time";
+    const tlFill = document.createElement("i");
+    tlFill.className = "sfx-tv-time-fill";
+    const tlClock = document.createElement("b");
+    tlClock.className = "sfx-tv-time-clock";
+    tl.appendChild(tlFill);
+    tl.appendChild(tlClock);
+    win.host.appendChild(tl);
+    djTvWin = win;                                         /* [#1212] */
+    djTvTube = tube;                                       /* [#1212] */
+    djTvStrip = {tl: tl, fill: tlFill, clock: tlClock};    /* [#1212] */
   }
 
-  const tube = document.createElement("div");
-  tube.className = "sfx-tv-tube";
-  const video = document.createElement("video");
-  video.playsInline = true;
-  video.preload = "auto";
-  video.controls = false;
-  /* #789/#981: the desktop shell owns live element volume and the booth
-   * monitor switch governs anything tagged pine-live; #1008's solo gate
-   * reads "audio,video" and reaches this too. A sting that skipped the
-   * tag would be the one sound on the page nobody could turn down. */
-  video.dataset.pineLive = "voice";
-  try { video.volume = Math.max(0, Math.min(1, pineMixerRead().video)); } catch (e) {}   /* #1419 */
-  /* No br=: that road is an AUDIO transcode (#1210). The signature in
-   * the url is what gets it past the guard, so it is passed through
-   * exactly as the station wrote it. */
-  video.src = clip.url;
-  tube.appendChild(video);
-  const glass = document.createElement("div");
-  glass.className = "sfx-tv-glass";
-  const vignette = document.createElement("div");
-  vignette.className = "sfx-tv-vignette";
-  const flash = document.createElement("div");
-  flash.className = "sfx-tv-flash";
-  win.host.appendChild(tube);
-  win.host.appendChild(glass);
-  win.host.appendChild(vignette);
-  win.host.appendChild(flash);
-  tube.classList.add("on");              // dot -> line -> picture
-  flash.classList.add("pop");
-
+  djTvOn = true;
   let finished = false;
   const quiet = () => {
     try { video.pause(); video.removeAttribute("src"); video.load(); }
     catch (e) {}
   };
-  /* The operator's own ✕ takes the frame away under us: stop the clip
-   * and let the queue move on, with no animation to run on a box that
-   * is already gone. */
+  /* The operator's own close button takes the frame away under us: stop
+   * the clip and let the queue move on, with no animation to run on a box
+   * that is already gone. */
   win.onClosed = () => {
     if (finished) return;
     finished = true;
     quiet();
+    djTvForget();                                          /* [#1212] */
     djTvRelease();
   };
   const closeSet = () => {
     if (finished) return;
     finished = true;
+    djTvWarmDrop();                                        /* [#1212] */
     try {
       tube.classList.remove("on");
       void tube.offsetWidth;             // restart the animation, not resume it
@@ -191574,9 +199974,28 @@ function djTvShow(clip) {
      * silenced FIRST so a tail cannot outlive the picture. */
     setTimeout(() => {
       quiet();
+      djTvForget();                                        /* [#1212] */
       try { win.close(false); } catch (e) {}
       djTvRelease();
     }, 520);
+  };
+
+  /* [#1219] the strip's own loop, per clip, against the frame's nodes. */
+  let tlFrame = 0;
+  let tlSecond = -1;
+  const tlStep = () => {
+    if (finished || !djTvStrip) { tlFrame = 0; return; }
+    tlFrame = requestAnimationFrame(tlStep);
+    const span = Number(video.duration);
+    const at = Number(video.currentTime);
+    if (!isFinite(span) || span <= 0 || !isFinite(at)) return;
+    djTvStrip.fill.style.width =
+      (Math.max(0, Math.min(1, at / span)) * 100).toFixed(2) + "%";
+    const sec = Math.floor(at);
+    if (sec !== tlSecond) {
+      tlSecond = sec;
+      djTvStrip.clock.textContent = djClock(sec) + " / " + djClock(span);
+    }
   };
 
   video.onplaying = () => {
@@ -191584,12 +200003,26 @@ function djTvShow(clip) {
     djSpeaking = true; djApplyGain();
     clip.ackAt = 0;
     djVoiceAck(clip, "playing", video);
+    if (!tlFrame) tlFrame = requestAnimationFrame(tlStep);    /* [#1219] */
+    try { djTvWarmUp(); } catch (e) { /* the collapse still works */ }
   };
   video.ontimeupdate = () => {
     if (!finished && !video.paused) djVoiceAck(clip, "playing", video);
   };
   video.onended = () => {
     djVoiceAck(clip, "ended", video);
+    /* [#1212] THE CLIP'S OWN END IS THE SLOT, not a timer and not the
+       ring's next broadcast_ms: back to back is what was asked for. A
+       clip whose moment has genuinely gone is still skipped. */
+    const next = djTvQueue[0];
+    if (!finished && next && djTvSeamReady(next)
+        && !pineAirPaused && !window.cacheHold
+        && djTvLate(next) <= DJ_TV_LATE) {
+      djTvQueue.shift();
+      finished = true;                   // this clip is done; no collapse
+      try { djTvShow(next); return; }
+      catch (e) { finished = false; }
+    }
     closeSet();
   };
   video.onerror = () => {
@@ -191621,6 +200054,10 @@ function djTvShow(clip) {
     djVoiceAck(clip, "error", video, e);
     closeSet();
   });
+  /* [#1212] and the one after it starts arriving now, not when this one
+     is nearly over: a seam needs the next clip decoded, and a two-second
+     clip has two seconds to get there. */
+  try { djTvWarmUp(); } catch (e) { /* the collapse still works */ }
 }
 
 /* The set's own poll. In the ordinary arrangement here the DJs talk out
@@ -191640,6 +200077,11 @@ async function djVideoPoll() {
   try {
     const data = await api("/api/dj/video?since=" + djVideoSeen);
     const serverMs = Number(data.server_ms || Date.now());
+    /* [#1212] the station's hand-over style, on the poll this set already
+       makes - no second request, and the desk, the tablet and this page
+       cannot disagree about it. A station that has not been patched never
+       sends the key and every changeover is the collapse it is today. */
+    if (typeof data.seamless === "boolean") djTvSeam = !!data.seamless;
     (data.clips || []).forEach((clip) => {
       djVideoSeen = Math.max(djVideoSeen, Number(clip.ts || 0));
       clip.broadcastAt = Date.now()
@@ -191973,14 +200415,25 @@ function djVoiceNext() {
      * VOICE_LATE_PLAY_MS and plays it through; a gagged page keeps the
      * old law so it stays in step for the day it is handed the air. */
     const lateBound = djLatePlay() ? VOICE_LATE_PLAY_MS / 1000 : 15;
-    const hopeless = (clip.keepWhole
+    /* [#1184] the server's word and this page's arithmetic, apart. */
+    const cutUnder = (Number(clip.ts || 0) > 0
+                      && Number(clip.ts || 0) <= djVoiceCut);
+    const tooLate = (clip.keepWhole
       ? lateNow > 120 + streamLen
       : ((streamLen > 0 && lateNow >= Math.max(streamLen, lateBound))
          || (clip.sting && lateNow > 3)
-         || (!clip.stream && !clip.sting && lateNow > lateBound)))
-      || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= djVoiceCut);
+         || (!clip.stream && !clip.sting && lateNow > lateBound)));
+    const hopeless = tooLate || cutUnder;
     if (!hopeless) break;
-    djVoiceAck(clip, "error", null, "clip became stale before playback");
+    /* [#1184] late, but the station is on and this page is the air:
+     * re-time it and play it. A hole is worse than a late line. */
+    if (!cutUnder && djVoiceKeeps(clip)) {
+      djVoiceHoldLate(clip, lateNow);
+      break;
+    }
+    djVoiceAck(clip, "error", null, cutUnder
+      ? "the server cut the feed under this clip (#1184)"
+      : "clip became stale before playback");
     djVoiceQueue.shift();
     clip = djVoiceQueue[0];
   }
@@ -192078,9 +200531,17 @@ function djVoiceNext() {
     /* #1207: the three ways a clip has run out of road - too many tries
      * at the head, the operator flushed the feed under it, or its air
      * moment is two minutes gone. Any of them and the round moves on. */
+    /* [#1184] the 120s give-up is the page judging the clock. While the
+     * station is on and this page is the air, only the SERVER may end a
+     * clip: the feed cut, or the outer keep bound. The try count stands -
+     * a transport that has failed six times is a transport fault, not a
+     * late line - but a clip that simply arrived late is re-timed above
+     * and comes back here with its moment reset. */
+    const keeping = djVoiceKeeps(clip);                       /* [#1184] */
     const spent = clip.retry >= VOICE_HEAD_TRIES
       || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= djVoiceCut)
-      || Date.now() - Number(clip.broadcastAt || 0) > VOICE_GIVE_UP_MS;
+      || (!keeping
+          && Date.now() - Number(clip.broadcastAt || 0) > VOICE_GIVE_UP_MS);
     if (spent) {
       djVoiceAck(clip, "error", null,
                  "abandoned after " + clip.retry + " tries - the "
@@ -192169,6 +200630,7 @@ function djVoiceNext() {
     if (handed || staleEpoch()) return;
     started = true;
     djVoiceNow = {text: String(clip.text || ""), ts: clip.ts || 0,
+                  row_id: String(clip.row_id || ""),   /* [#1237] */
                   sting: !!clip.sting, at: Date.now()};
     djTalkMarkLive();
     clip.ackAt = 0;
@@ -192362,6 +200824,34 @@ async function djVoicePoll(immediate) {
         djApplyGain();
         djTalkMarkLive();
         setTimeout(djVoiceNext, 50);   // the fresh backlog must not wait
+      }
+    }
+    /* [#1237] A TARGETED CUT. The station names clips that died with
+     * their record - an introduction whose record was skipped or ended.
+     * Only those are dropped; the queue behind them stands. */
+    const cutIds = Array.isArray(data.cut_ids) ? data.cut_ids.map(String) : [];
+    if (cutIds.length) {
+      for (let i = djVoiceQueue.length - 1; i >= 0; i -= 1) {
+        if (cutIds.indexOf(String(djVoiceQueue[i].row_id || "")) >= 0) {
+          djVoiceQueue.splice(i, 1);
+        }
+      }
+      if (djVoiceNow && cutIds.indexOf(String(djVoiceNow.row_id || "")) >= 0) {
+        djVoiceEpoch += 1;
+        (djVoiceEls || []).forEach((a) => {
+          if (a && a.src) {
+            try { a.pause(); a.removeAttribute("src"); a.load(); } catch (e) {}
+          }
+        });
+        djVoiceBusy = false;
+        djVoiceLive = 0;
+        djVoiceNow = null;
+        djStreamNow = null;
+        djStreamLiveId = "";
+        djSpeaking = false;
+        djApplyGain();
+        djTalkMarkLive();
+        setTimeout(djVoiceNext, 50);
       }
     }
     clips.forEach((clip) => {
@@ -203934,6 +212424,27 @@ function djStarVoice(which) {
   djLoadSettings();                    // redraw both lists with the new star
 }
 
+/* [#1215] and once they have saved, the cupboard starts re-recording
+   itself in the new voice while the old recordings keep airing. The
+   cast bar says so, and keeps saying it while it happens, because the
+   whole promise of the road is that nothing goes quiet in between. */
+async function djRecastToast(left) {
+  const status = document.getElementById("djVoiceStatus");
+  if (!status) return;
+  let got = null;
+  try { got = await api("/api/cast/recast"); } catch (err) { return; }
+  if (!got) return;
+  const job = (got.jobs || [])[0];
+  if (got.live || got.finished_recently) {
+    status.textContent = got.say || "";
+  } else if (job && !job.finished_at) {
+    status.textContent = "on their next line \u00b7 counting the cupboard\u2026";
+  }
+  if ((got.live || (job && !job.finished_at)) && Number(left || 0) > 0) {
+    setTimeout(() => { djRecastToast(Number(left) - 1); }, 5000);
+  }
+}
+
 /* The two dropdowns at the top of the panel save on the spot — nobody wants
    to open Customize and press Save to change who is talking (#198). */
 async function djSetVoices() {
@@ -203947,6 +212458,7 @@ async function djSetVoices() {
     });
     await api("/api/settings", {method: "PUT", body: JSON.stringify(settings)});
     status.textContent = "on their next line";
+    djRecastToast(24);                  // [#1215]
   } catch (error) { status.textContent = error.message; }
 }
 
@@ -208911,7 +217423,7 @@ function scriptClose() {
 function scriptKeys(ev) {
   if (!scriptBox) return;
   if (ev.key === "Escape") {
-    const composer = document.querySelector(".sp-compose");
+    const composer = document.querySelector(".scp-compose");   // [#1236]
     if (composer) { composer.remove(); return; }
     scriptClose();
   }
@@ -208933,63 +217445,129 @@ function scriptMmss(seconds) {
 
 /* The sheet's own type. A screenplay is a fixed measure in a fixed font;
  * everything here is in `ch` so the indents land where they do on paper. */
-const SCRIPT_CSS = ""
-  + ".sp-sheet{background:#f4f0e4;color:#14140f;padding:44px 34px 90px;"
-  + "font:13px/1.5 'Courier New',Courier,ui-monospace,monospace;"
-  + "min-height:100%;box-sizing:border-box}"
-  + ".sp-page{max-width:64ch;margin:0 auto}"
-  + ".sp-scene{font-weight:700;text-transform:uppercase;margin:26px 0 4px;"
-  + "letter-spacing:.02em;cursor:pointer}"
-  + ".sp-sub{text-transform:uppercase;margin:0 0 14px;font-size:11px;"
-  + "letter-spacing:.09em;color:#7d7663;cursor:pointer}"
-  + ".sp-action{margin:0 0 12px;white-space:pre-wrap}"
-  + ".sp-block{margin:0 0 12px}"
-  + ".sp-char{margin:12px 0 0 22ch;font-weight:700;text-transform:uppercase}"
-  + ".sp-paren{margin:0 0 0 16ch;max-width:26ch;color:#3f3c33}"
-  + ".sp-dia{margin:0 0 0 10ch;max-width:34ch;white-space:pre-wrap}"
-  + ".sp-trans{margin:18px 0 12px;text-align:right;text-transform:uppercase;"
-  + "font-weight:700}"
-  + ".sp-note{margin:8px 0 12px 4ch;padding:6px 9px;border-left:3px solid #b5892f;"
-  + "background:#efe6cd;max-width:56ch;white-space:pre-wrap}"
-  + ".sp-note.crit{border-left-color:#a33b2c;background:#f0dfd8}"
-  + ".sp-ins{border-left:3px solid #2f6fb5;padding-left:8px;background:#e6ecf3}"
-  + ".sp-char.sp-ins{background:none;color:#1d4a7d}"
-  + ".sp-drop{font:10px PineIcons, PineIcons, ui-monospace, Consolas, monospace;padding:1px 7px;"
-  + "border:1px solid #a08243;background:#e3d3ab;color:#3a2f14;"
-  + "border-radius:3px;cursor:pointer;margin-top:5px}"
-  + ".sp-ctl{margin:2px 0 0 4ch;display:flex;gap:4px;align-items:center;"
-  + "flex-wrap:wrap;font:10px/1.4 PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#6a675c}"
-  + ".sp-ctl button,.sp-ctl a{font:10px/1 PineIcons, PineIcons, ui-monospace, Consolas, monospace;"
-  + "padding:2px 5px;border:1px solid #c3bba4;background:#e9e3d2;color:#2c2a22;"
-  + "border-radius:4px;cursor:pointer;text-decoration:none}"
-  + ".sp-ctl button:hover,.sp-ctl a:hover{background:#dcd4bd}"
-  + ".sp-tint{color:#7a4a12;border:1px solid #c9a35f;background:#f3e6c8;"
-  + "border-radius:3px;padding:1px 5px;font-weight:700}"
-  + ".sp-tree{margin:6px 0 12px 4ch;max-width:58ch;background:#ece6d6;"
-  + "border:1px solid #cdc4ab;border-radius:5px;padding:8px 10px;"
-  + "font:11px/1.5 PineIcons, PineIcons, ui-monospace, Consolas, monospace;color:#2b2920;"
+const SCRIPT_CSS = ""   /* [#1236] paper on a desk */
+  /* THE DESK is the only theme-aware surface: the panel's own --bg pulled
+   * towards a neutral grey, so the white sheet reads as paper lying on it
+   * in every theme, dark or light. */
+  + ".scp-desk{background:#2e2f33;"
+  + "background:color-mix(in srgb,var(--bg,#0a0c10) 72%,#8a8a8e);"
+  + "padding:26px 12px 70px;container-type:inline-size;box-sizing:border-box}"
+  + ".scp-sheet{margin:0 auto;max-width:100%}"
+  /* THE PAPER: a US-Letter sheet at twelve-point Courier, six lines to the
+   * inch - 85ch wide, 66 lines tall, 1.5in at the left and 1in elsewhere.
+   * White paper, black ink, because that is what a script is printed on.
+   * Everything below is in ch and em so the measures scale with the type
+   * and land where they land on a printed page.
+   * --l is ONE LINE as an ABSOLUTE length, NOT `1em`: the strip sets its
+   * own type at 10px, and a custom property holding `1em` resolves against
+   * the font of whoever USES it - `1em` here would have made the strip
+   * 10px tall and cost the page a fifth of a line under every speech. The
+   * expression is the paper's own font-size, written twice; where min() or
+   * cqw are not understood both declarations drop together and the sheet
+   * falls back to a flat 16px.
+   * PineIcons is deliberately NOT in this stack, against the usual rule:
+   * `ch` is measured from the element's first available font, and the whole
+   * geometry - 85ch wide, the 22ch/16ch/10ch indents - is Courier's. */
+  + ".scp-paper{--l:min(16px,calc((100cqw - 24px) / 51));"
+  + "position:relative;width:85ch;min-height:66em;"
+  + "padding:6em 10ch 6em 15ch;box-sizing:border-box;margin:0 auto 28px;"
+  + "background:#fff;color:#000;"
+  + "font:16px/1 'Courier New',Courier,'Cutive Mono',ui-monospace,monospace;"
+  + "font-size:min(16px,calc((100cqw - 24px) / 51));"
+  + "box-shadow:0 1px 2px rgba(0,0,0,.35),0 14px 34px rgba(0,0,0,.3);"
+  + "overflow-wrap:break-word}"
+  + ".scp-paper *{box-sizing:border-box}"
+  + ".scp-pageno{position:absolute;top:3em;right:10ch;font-variant-numeric:tabular-nums}"
+  + ".scp-pageno+*{margin-top:0!important}"
+  + ".scp-title{text-align:center;text-transform:uppercase;font-weight:700;margin:0 0 1em}"
+  + ".scp-by{text-align:center;margin:0 0 1em}"
+  + ".scp-by+.scp-in{margin-top:3em}"
+  + ".scp-in{margin:0;text-transform:uppercase}"
+  + ".scp-scene{font-weight:700;text-transform:uppercase;margin:2em 0 0;"
+  + "cursor:pointer;white-space:pre-wrap}"
+  + ".scp-sub{text-transform:uppercase;margin:1em 0 0;cursor:pointer;white-space:pre-wrap}"
+  + ".scp-action{margin:1em 0 0;white-space:pre-wrap;cursor:pointer}"
+  + ".scp-char{margin:1em 0 0 22ch;text-transform:uppercase;white-space:pre-wrap}"
+  + ".scp-paren{margin:0 0 0 16ch;max-width:22ch;white-space:pre-wrap}"
+  + ".scp-dia{margin:0 0 0 10ch;max-width:35ch;white-space:pre-wrap;cursor:pointer}"
+  + ".scp-trans{margin:1em 0 0;text-align:right;text-transform:uppercase;white-space:pre-wrap}"
+  + ".scp-note{margin:1em 0 0;max-width:60ch;font-style:italic;white-space:pre-wrap}"
+  + ".scp-note.crit{color:#8a1c12}"
+  /* the strip IS the blank line after a speech: what follows it needs none */
+  + ".scp-ctl+.scp-char,.scp-ctl+.scp-action,.scp-ctl+.scp-sub,"
+  + ".scp-ctl+.scp-trans,.scp-ctl+.scp-note{margin-top:0}"
+  + ".scp-ctl+.scp-scene{margin-top:1em}"
+  /* the operator's own lines carry a revision asterisk in the right margin,
+   * the way a revised page marks what was not in the shooting draft */
+  + ".scp-ins{position:relative}"
+  + ".scp-ins:after{content:'*';position:absolute;top:0;left:62ch}"
+  + ".scp-dia.scp-ins:after{left:52ch}.scp-char.scp-ins:after{left:40ch}"
+  /* THE QUIET STRIP: small grey type on the blank line under a speech, one
+   * line high, invisible until the pointer is on the speech or the strip,
+   * a tap opens it (.open), a keyboard focus opens it; never wraps, never
+   * moves the text. PineIcons leads the stack so the play and download
+   * glyphs set in Carbon. */
+  + ".scp-ctl{margin:0 0 0 4ch;height:var(--l);display:flex;align-items:center;gap:.7ch;"
+  + "white-space:nowrap;overflow:hidden;"
+  + "font:10px/1 PineIcons,system-ui,'Segoe UI',Roboto,sans-serif;"
+  + "color:#8a8a86;opacity:0;transition:opacity .15s}"
+  + ".scp-dia:hover+.scp-ctl,.scp-action:hover+.scp-ctl,.scp-ctl:hover,"
+  + ".scp-ctl:focus-within,.scp-ctl.open{opacity:1}"
+  + "@media (hover:none){.scp-ctl{opacity:.38}}"
+  + ".scp-ctl button,.scp-ctl a{font:10px/1 PineIcons,system-ui,'Segoe UI',Roboto,sans-serif;"
+  + "height:calc(var(--l) - 2px);padding:0 6px;border:1px solid #cfcdc4;border-radius:3px;"
+  + "background:#f1efe8;color:#4a4a46;cursor:pointer;text-decoration:none;"
+  + "display:inline-flex;align-items:center;gap:3px}"
+  + ".scp-ctl button:hover,.scp-ctl a:hover{background:#e3e0d6;color:#1c1c1a}"
+  + ".scp-ctl svg,.scp-drop svg{width:11px;height:11px;fill:currentColor;flex:none;"
+  + "transition:transform .15s}"
+  + ".scp-ctl button.open svg{transform:rotate(90deg)}"
+  + ".scp-tint{display:inline-flex;align-items:center;gap:3px;color:#6b4a12;"
+  + "border:1px solid #d4c08a;background:#f4ecd3;border-radius:3px;padding:0 5px;"
+  + "height:calc(var(--l) - 2px);font-weight:700;text-transform:uppercase}"
+  + ".scp-drop{font:10px/1 PineIcons,system-ui,'Segoe UI',Roboto,sans-serif;padding:2px 7px;"
+  + "border:1px solid #cfcdc4;background:#f1efe8;color:#4a4a46;border-radius:3px;"
+  + "cursor:pointer;margin-top:4px}"
+  /* the provenance tree, the making-of diagram and the note box are pinned
+   * under their line; a page grows to hold them (min-height, never height) */
+  + ".scp-tree{margin:6px 0 12px 4ch;max-width:58ch;background:#f1efe8;"
+  + "border:1px solid #d8d5cb;border-radius:5px;padding:8px 10px;"
+  + "font:11px/1.5 PineIcons,PineIcons,ui-monospace,Consolas,monospace;color:#2b2920;"
   + "white-space:pre-wrap;word-break:break-word}"
-  + ".sp-tree b{color:#101008}"
-  + ".sp-tree .k{color:#6d6552}"
-  + ".sp-tree pre{margin:3px 0 8px;padding:6px;background:#e2dbc7;"
+  + ".scp-tree b{color:#101008}"
+  + ".scp-tree .k{color:#6d6552}"
+  + ".scp-tree pre{margin:3px 0 8px;padding:6px;background:#e8e5db;"
   + "border-radius:4px;white-space:pre-wrap;max-height:190px;overflow:auto}"
-  + ".sp-flow{margin:6px 0 12px 0;background:#0b1018;overflow-x:auto;"
-  + "border:1px solid #22304a;border-radius:6px;padding:6px}"
-  + ".sp-head{font-size:11px;color:#6a675c;margin:0 0 18px;text-align:center;"
-  + "text-transform:uppercase;letter-spacing:.08em}"
-  + ".sp-compose{margin:6px 0 12px 4ch;max-width:56ch;background:#e9e3d2;"
-  + "border:1px solid #c3bba4;border-radius:5px;padding:8px}"
-  + ".sp-compose textarea{width:100%;min-height:64px;font:12px/1.4 "
-  + "'Courier New',monospace;background:#f7f4ea;color:#14140f;"
-  + "border:1px solid #c3bba4;border-radius:4px;padding:6px;box-sizing:border-box}"
-  + ".sp-compose .row{display:flex;gap:6px;margin-top:6px;align-items:center;"
-  + "font:11px PineIcons, PineIcons, ui-monospace, monospace;color:#4a4638}"
-  + ".sp-compose select,.sp-compose input{font:11px PineIcons, PineIcons, ui-monospace, monospace;"
-  + "background:#f7f4ea;color:#14140f;border:1px solid #c3bba4;"
+  + ".scp-flow{margin:6px 0 12px 0;background:#0b1018;overflow-x:auto;"
+  + "border:1px solid #22304a;border-radius:6px;padding:6px;font-size:12px}"
+  + ".scp-wait{color:#6b6b66;text-transform:uppercase;text-align:center;margin:0}"
+  + ".scp-compose{margin:6px 0 12px 4ch;max-width:56ch;background:#f1efe8;"
+  + "border:1px solid #d8d5cb;border-radius:5px;padding:8px}"
+  /* PineIcons FIRST in every chrome stack that carries operator or ledger
+   * text - #1264: declared last, iOS slips Apple Color Emoji in ahead of
+   * the tail and the same markup goes colourful on one device only. */
+  + ".scp-compose textarea{width:100%;min-height:64px;font:12px/1.4 "
+  + "PineIcons,PineIcons,'Courier New',Courier,monospace;background:#fff;color:#14140f;"
+  + "border:1px solid #cfcdc4;border-radius:4px;padding:6px;box-sizing:border-box}"
+  + ".scp-compose .row{display:flex;gap:6px;margin-top:6px;align-items:center;"
+  + "font:11px PineIcons,PineIcons,system-ui,'Segoe UI',Roboto,sans-serif;color:#4a4638}"
+  + ".scp-compose select,.scp-compose input{"
+  + "font:11px PineIcons,PineIcons,system-ui,'Segoe UI',Roboto,sans-serif;"
+  + "background:#fff;color:#14140f;border:1px solid #cfcdc4;"
   + "border-radius:4px;padding:3px 5px}"
-  + ".sp-compose button{font:11px PineIcons, PineIcons, ui-monospace, monospace;padding:3px 9px;"
-  + "border:1px solid #c3bba4;background:#dcd4bd;color:#2c2a22;"
-  + "border-radius:4px;cursor:pointer}";
+  + ".scp-compose button{"
+  + "font:11px PineIcons,PineIcons,system-ui,'Segoe UI',Roboto,sans-serif;padding:3px 9px;"
+  + "border:1px solid #cfcdc4;background:#e3e0d6;color:#2c2a22;"
+  + "border-radius:4px;cursor:pointer}"
+  /* ON PAPER FOR REAL (the print fallback when the station has no PDF
+   * writer): the desk goes, each sheet is a page, the number sits in a
+   * quarter-inch band above the text, the strip and the panels stay off. */
+  + "@media print{.scp-desk{background:#fff!important;padding:0}.scp-sheet{max-width:none}"
+  + ".scp-paper{box-shadow:none;margin:0;width:auto;min-height:0;padding:1.5em 0 0;"
+  + "font-size:12pt;break-after:page;page-break-after:always}"
+  + ".scp-paper:last-child{break-after:auto;page-break-after:auto}"
+  + ".scp-pageno{top:0;right:0}"
+  + ".scp-ctl,.scp-tree,.scp-flow,.scp-compose,.scp-drop{display:none!important}}";
 
 async function screenplayOpen() {
   if (scriptBox) { scriptClose(); return; }
@@ -209036,8 +217614,9 @@ async function screenplayOpen() {
   box.appendChild(scriptShelf);
 
   const scroll = el("div", "", "");
-  scroll.style.cssText = "flex:1;min-height:0;overflow:auto;background:#2a271f";
-  scriptSheet = el("div", "sp-sheet", "");
+  scroll.className = "scp-desk";   // [#1236] the desk the paper lies on
+  scroll.style.cssText = "flex:1;min-height:0;overflow:auto";
+  scriptSheet = el("div", "scp-sheet", "");
   const style = document.createElement("style");
   style.textContent = SCRIPT_CSS;
   scroll.appendChild(style);
@@ -209063,9 +217642,9 @@ async function scriptRefresh() {
   if (want) await scriptShow(want);
   else if (scriptSheet) {
     scriptSheet.innerHTML = "";
-    const page = el("div", "sp-page", "");
-    page.appendChild(el("div", "sp-scene", "NOTHING ON THE SHELF YET"));
-    page.appendChild(el("p", "sp-action",
+    const page = scriptPaperNew(1);   // [#1236]
+    page.appendChild(el("div", "scp-scene", "NOTHING ON THE SHELF YET"));
+    page.appendChild(el("p", "scp-action",
       "The air log fills as the station talks. Give it an hour and this "
       + "window will have a script to show you."));
     scriptSheet.appendChild(page);
@@ -209105,16 +217684,16 @@ async function scriptShow(hourKey, fresh) {
   scriptHour = hourKey;
   scriptPaintShelf();
   scriptSheet.innerHTML = "";
-  const wait = el("div", "sp-page", "");
-  wait.appendChild(el("div", "sp-head", "reading the ledgers…"));
+  const wait = scriptPaperNew(1);   // [#1236]
+  wait.appendChild(el("div", "scp-wait", "reading the ledgers…"));
   scriptSheet.appendChild(wait);
   try {
     scriptData = await api("/api/screenplay/" + encodeURIComponent(hourKey)
       + (fresh ? "?fresh=1" : ""));
   } catch (e) {
     scriptSheet.innerHTML = "";
-    const bad = el("div", "sp-page", "");
-    bad.appendChild(el("p", "sp-action", String(e.message || e)));
+    const bad = scriptPaperNew(1);   // [#1236]
+    bad.appendChild(el("p", "scp-action", String(e.message || e)));
     scriptSheet.appendChild(bad);
     return;
   }
@@ -209131,20 +217710,99 @@ function scriptPaint() {
       + (c.tinted ? ", " + c.tinted + " tinted" : "")
       + (d.live ? " · still on air" : "");
   }
+  /* [#1236] One sheet first: the title block, FADE IN, every element in
+   * order. Then the sheet is measured once and cut into US-Letter pages. */
   scriptSheet.innerHTML = "";
-  const page = el("div", "sp-page", "");
-  const head = el("div", "sp-head",
-    (d.station || "Pine Box FM") + " · " + (d.title || d.hour_key));
-  page.appendChild(head);
-  page.appendChild(el("div", "sp-scene", "FADE IN:"));
+  scriptBlk = 0;
+  scriptPrev = "";
+  const page = scriptPaperNew(1);
+  page.appendChild(el("div", "scp-title", d.title || d.hour_key || "AN HOUR"));
+  page.appendChild(el("div", "scp-by", "broadcast by"));
+  page.appendChild(el("div", "scp-by", d.station || "Pine Box FM"));
+  page.appendChild(el("div", "scp-in", "FADE IN:"));
   (d.elements || []).forEach((e) => scriptPaintElement(page, e));
   scriptSheet.appendChild(page);
+  scriptPaginate(page);
 }
 
-function scriptPaintElement(page, e) {
+/* [#1236] THE PAGE BREAKS. A screenplay page holds 54 lines between its
+ * margins - six lines to the inch, the arithmetic the PDF writer uses too -
+ * so the sheet is laid out once, measured once, and cut into papers with
+ * the page number top right. A block (a cue, its parentheticals, the first
+ * speech under it and the strip below) is never split, and a scene heading
+ * never ends a page. The papers are min-heights: a making-of or a note box
+ * opened under a line grows its page; the rest keep their places. */
+const SCRIPT_PAGE_LINES = 54;
+
+function scriptPaperNew(no) {
+  const paper = el("div", "scp-paper", "");
+  if (no > 1) paper.appendChild(el("div", "scp-pageno", no + "."));
+  return paper;
+}
+
+function scriptPaginate(first) {
+  if (!first || !first.parentNode) return;
+  const nodes = Array.from(first.children)
+    .filter((n) => !n.classList.contains("scp-pageno"));
+  if (nodes.length < 2) return;
+  const line = parseFloat(getComputedStyle(first).fontSize) || 16;
+  const room = SCRIPT_PAGE_LINES * line + 0.5;
+  const tops = nodes.map((n) => n.offsetTop);
+  const ends = nodes.map((n, i) => tops[i] + n.offsetHeight);
+  const heading = (n) => n.classList.contains("scp-scene")
+    || n.classList.contains("scp-sub");
+  const pages = [];
+  let start = 0;
+  for (let i = 1; i < nodes.length; i++) {
+    if (ends[i] - tops[start] <= room) continue;
+    let j = i;
+    const blk = nodes[i].dataset.blk;
+    while (j > start + 1 && blk && nodes[j - 1].dataset.blk === blk) j -= 1;
+    while (j > start + 1 && heading(nodes[j - 1])) j -= 1;
+    pages.push(nodes.slice(start, j));
+    start = j;
+    i = j;
+  }
+  pages.push(nodes.slice(start));
+  const sheet = first.parentNode;
+  pages.slice(1).forEach((run, k) => {
+    const paper = scriptPaperNew(k + 2);
+    run.forEach((n) => paper.appendChild(n));
+    sheet.appendChild(paper);
+  });
+}
+
+/* [#1236] Every node on the paper carries the block it belongs to, so the
+ * page breaks can keep a name with its words. */
+let scriptBlk = 0;
+let scriptPrev = "";
+
+function scriptTag(node, joins) {
+  if (!joins) scriptBlk += 1;
+  node.dataset.blk = String(scriptBlk);
+  return node;
+}
+
+function scriptIcon(name) {
+  try {
+    if (typeof pineIcon === "function") return pineIcon(name) || "";
+  } catch (e) { /* the sprite is optional */ }
+  return "";
+}
+
+function scriptStripButton(label, icon, title) {
+  const b = el("button", "", "");
+  b.innerHTML = scriptIcon(icon) + "<span>" + callerDossierEsc(label) + "</span>";
+  if (title) b.title = title;
+  return b;
+}
+
+function scriptPaintElement(page, e) {   /* [#1236] set on paper */
   const kind = String(e.type || "action");
+  const under = scriptPrev === "character" || scriptPrev === "parenthetical";
+  scriptPrev = kind;
   if (kind === "scene") {
-    const row = el("div", "sp-scene", e.text || "");
+    const row = scriptTag(el("div", "scp-scene", e.text || ""));
     row.id = "sp-" + e.id;
     row.onclick = () => scriptCompose(e.id, "note", row);
     row.title = "Click to leave a note on this scene";
@@ -209152,15 +217810,16 @@ function scriptPaintElement(page, e) {
     return;
   }
   if (kind === "transition") {
-    page.appendChild(el("div", "sp-trans", e.text || ""));
+    page.appendChild(scriptTag(el("div", "scp-trans", e.text || "")));
     return;
   }
   if (kind === "note") {
-    const row = el("div", "sp-note" + (e.kind === "critique" ? " crit" : ""),
-      e.text || "");
+    const row = scriptTag(el("div",
+      "scp-note" + (e.kind === "critique" ? " crit" : ""),
+      "[[ " + (e.text || "") + " ]]"));
     const bar = el("div", "", "");
     bar.style.cssText = "margin-top:4px";
-    const drop = el("button", "sp-drop", "remove");
+    const drop = el("button", "scp-drop", "remove");
     drop.onclick = () => scriptNoteDrop(e.note_id);
     bar.appendChild(drop);
     row.appendChild(bar);
@@ -209168,7 +217827,7 @@ function scriptPaintElement(page, e) {
     return;
   }
   if (kind === "subheader") {
-    const row = el("div", "sp-sub", e.text || "");
+    const row = scriptTag(el("div", "scp-sub", e.text || ""));
     row.id = "sp-" + e.id;
     row.title = "Click to leave a note on this stretch of the running order";
     row.onclick = () => scriptCompose(e.id, "note", row);
@@ -209177,15 +217836,15 @@ function scriptPaintElement(page, e) {
   }
   if (kind === "action" || kind !== "dialogue" && kind !== "character"
       && kind !== "parenthetical") {
-    const row = el("p", "sp-action" + (e.insert ? " sp-ins" : ""),
-      e.text || "");
+    const row = scriptTag(el("p", "scp-action" + (e.insert ? " scp-ins" : ""),
+      e.text || ""));
     row.id = "sp-" + e.id;
     row.title = e.insert ? "The operator's own line — this never aired"
       : "Click to leave a note here";
     if (!e.insert) row.onclick = () => scriptCompose(e.id, "note", row);
     page.appendChild(row);
     if (e.clip) {
-      const ctl = el("div", "sp-ctl", "");
+      const ctl = scriptTag(el("div", "scp-ctl", ""), true);
       ctl.style.marginLeft = "0";
       scriptClipControls(ctl, e);
       page.appendChild(ctl);
@@ -209193,19 +217852,22 @@ function scriptPaintElement(page, e) {
     return;
   }
   if (kind === "character") {
-    const row = el("div", "sp-char" + (e.insert ? " sp-ins" : ""), e.text || "");
-    page.appendChild(row);
+    page.appendChild(scriptTag(el("div",
+      "scp-char" + (e.insert ? " scp-ins" : ""), e.text || "")));
     return;
   }
   if (kind === "parenthetical") {
-    page.appendChild(el("div", "sp-paren", e.text || ""));
+    page.appendChild(scriptTag(el("div", "scp-paren", e.text || ""), under));
     return;
   }
-  /* dialogue */
-  const row = el("div", "sp-dia" + (e.insert ? " sp-ins" : ""), e.text || "");
+  /* dialogue: the speech, then the quiet strip on the blank line under it */
+  const row = scriptTag(el("div", "scp-dia" + (e.insert ? " scp-ins" : ""),
+    e.text || ""), under);
   row.id = "sp-" + e.id;
   page.appendChild(row);
-  const ctl = el("div", "sp-ctl", "");
+  const ctl = scriptTag(el("div", "scp-ctl", ""), true);
+  row.title = "Tap for this line's controls";
+  row.onclick = () => ctl.classList.toggle("open");
   if (e.insert) {
     ctl.appendChild(el("span", "", "the operator's own line — never aired"));
     page.appendChild(ctl);
@@ -209215,17 +217877,21 @@ function scriptPaintElement(page, e) {
     + (e.seconds ? " · " + Number(e.seconds).toFixed(1) + "s" : "")));
   scriptClipControls(ctl, e);
   if (e.tinted) {
-    const mark = el("span", "sp-tint", "◆ TINTED");
+    const mark = el("span", "scp-tint", "");
+    mark.innerHTML = scriptIcon("c:diamond--outline") + "tinted";
     mark.title = "The crystal rewrote this round before it aired";
     ctl.appendChild(mark);
   }
-  const tree = el("button", "", "▸ provenance");
+  const tree = scriptStripButton("provenance", "c:caret--right",
+    "Where the line came from: the round, the chunk, the crystal, the writer, the voice");
   tree.onclick = () => scriptToggleTree(e, page, ctl, tree, "tree");
   ctl.appendChild(tree);
-  const flow = el("button", "", "▸ the making of");
+  const flow = scriptStripButton("the making of", "c:caret--right",
+    "The diagram of how this line was made");
   flow.onclick = () => scriptToggleTree(e, page, ctl, flow, "flow");
   ctl.appendChild(flow);
-  const add = el("button", "", "＋ note");
+  const add = scriptStripButton("note", "c:add",
+    "A note, a critique, or a line of your own under this one");
   add.onclick = () => scriptCompose(e.id, "note", ctl);
   ctl.appendChild(add);
   page.appendChild(ctl);
@@ -209255,11 +217921,11 @@ async function scriptToggleTree(e, page, after, btn, which) {
   const open = document.getElementById(holder);
   if (open) {
     open.remove();
-    btn.textContent = btn.textContent.replace("▾", "▸");
+    btn.classList.remove("open");   // [#1236] the caret turns back
     return;
   }
-  btn.textContent = btn.textContent.replace("▸", "▾");
-  const host = el("div", which === "flow" ? "sp-flow" : "sp-tree", "loading…");
+  btn.classList.add("open");
+  const host = el("div", which === "flow" ? "scp-flow" : "scp-tree", "loading…");
   host.id = holder;
   after.parentNode.insertBefore(host, after.nextSibling);
   try {
@@ -209400,9 +218066,9 @@ function scriptTreeHtml(p) {
 /* The note / critique / insert composer. Lands under whatever it is
  * pinned to, so the mark is never in doubt. */
 function scriptCompose(targetId, kind, after) {
-  const gone = document.querySelector(".sp-compose");
+  const gone = document.querySelector(".scp-compose");   // [#1236]
   if (gone) gone.remove();
-  const host = el("div", "sp-compose", "");
+  const host = el("div", "scp-compose", "");
   const area = document.createElement("textarea");
   area.placeholder = targetId
     ? "A note on this element — or a line of your own to insert here."
@@ -209448,7 +218114,8 @@ function scriptCompose(targetId, kind, after) {
   if (after && after.parentNode) {
     after.parentNode.insertBefore(host, after.nextSibling);
   } else if (scriptSheet) {
-    scriptSheet.appendChild(host);
+    // [#1236] a note on the hour lands on the last page, not on the desk
+    (scriptSheet.lastElementChild || scriptSheet).appendChild(host);
   }
   area.focus();
 }
@@ -209520,17 +218187,17 @@ async function scriptExport(what) {
 
 /* No PDF writer on this build: print the sheet itself, which is already
  * a real screenplay on a US-Letter measure. */
-function scriptPrint() {
+function scriptPrint() {   /* [#1236] the same sheet, on real pages */
   if (!scriptSheet) return;
   const win = window.open("", "_blank");
   if (!win) { setStatus("The browser blocked the print window.", true); return; }
   win.document.write("<!doctype html><html><head><title>"
     + callerDossierEsc((scriptData && scriptData.title) || scriptHour)
     + "</title><style>" + SCRIPT_CSS
-    + "@page{size:letter;margin:1in 1in 1in 1.5in}"
-    + ".sp-ctl,.sp-tree,.sp-flow,.sp-compose{display:none!important}"
-    + "body{margin:0;background:#fff}.sp-sheet{background:#fff;padding:0}"
-    + "</style></head><body>" + scriptSheet.innerHTML + "</body></html>");
+    + "@page{size:letter;margin:.75in 1in .9in 1.5in}"
+    + "body{margin:0;background:#fff}"
+    + "</style></head><body><div class='scp-sheet'>" + scriptSheet.innerHTML
+    + "</div></body></html>");
   win.document.close();
   setTimeout(() => { try { win.print(); } catch (e) {} }, 350);
 }
@@ -211299,6 +219966,30 @@ async function orchPaint(force) {
        + Math.round(Number(data.next_due || 0) / 3600) + "h")
     : ("nothing to decide \u00b7 next standing check in "
        + Math.round(Number(data.next_due || 0) / 3600) + "h");
+  /* [#1215] the recast desk, whenever a seat has changed actors: the
+   * cupboard is being re-recorded and the old recordings are still
+   * going out. It is above the questions because it is the one thing
+   * on this panel that is happening rather than waiting. */
+  try {
+    const recast = await api("/api/cast/recast");
+    if (recast && (recast.live || recast.finished_recently)) {
+      const tint = recast.live ? "#ffd76f" : "#6fdc8c";
+      const line = el("div", "",
+        (recast.live ? "\u21bb " : "\u2713 ") + (recast.say || ""));
+      line.style.cssText = "font-size:11px;line-height:1.5;margin:0 0 9px;"
+        + "padding:7px 9px;border-radius:6px;background:rgba(255,255,255,.05);"
+        + "border-left:3px solid " + tint;
+      body.appendChild(line);
+      if (recast.live && Number(recast.rounds_total || 0) > 0) {
+        const bar = el("div", "muted",
+          Number(recast.done || 0) + " of " + Number(recast.rounds_total || 0)
+          + " re-recorded \u00b7 " + Number(recast.in_flight || 0)
+          + " under way \u00b7 the old takes are still on the air");
+        bar.style.cssText = "font-size:10px;margin:-6px 0 9px;padding-left:12px";
+        body.appendChild(bar);
+      }
+    }
+  } catch (recastErr) { /* the panel never dies for a status line */ }
   if (!rows.length) {
     const done = el("div", "muted",
       "The orchestrator has nothing it cannot decide for itself.");
@@ -215207,6 +223898,109 @@ function studioSettingsTab(host) {
       dj.emotion_persistence != null ? dj.emotion_persistence : 0.65,
       (v) => Math.round(v * 100) + "%", null,
       (value) => { dj.emotion_persistence = value; pushSettings(); });
+    // [#1232] THE WEATHER DIAL. "fixed" is the station as it was: the six
+    // emotions sit where the events left them, which is zero most of the
+    // night. "random" re-rolls every seat inside its ranges at every round
+    // write and every caller arrival, seeded per round, and the roll is
+    // written into the round's paperwork.
+    (function weatherDesk() {
+      const seats = [["dj", "host"], ["cohost", "co-host"],
+                     ["third", "third seat"], ["caller", "caller"]];
+      const dims = ["amusement", "excitement", "confusion", "irritation",
+                    "fatigue", "nervousness"];
+      const wrap = el("div", "", "");
+      wrap.style.cssText = "margin-top:8px;border-top:1px solid "
+        + "rgba(255,255,255,.08);padding-top:6px;";
+      const head = el("div", "muted", "");
+      head.innerHTML = pineIcon("c:shuffle") + " the director's weather";
+      wrap.appendChild(head);
+      studioPick(wrap, "weather",
+        [["fixed", "fixed - as the events leave it"],
+         ["random", "random - re-rolled every round and every caller"]],
+        dj.weather_mode === "random" ? "random" : "fixed",
+        (value) => { dj.weather_mode = value; pushSettings(); paintNow(); });
+      const ranges = (dj.weather_ranges && typeof dj.weather_ranges === "object")
+        ? dj.weather_ranges : {};
+      dj.weather_ranges = ranges;
+      const grid = el("div", "", "");
+      grid.style.cssText = "display:grid;grid-template-columns:92px repeat(4,"
+        + " 1fr);gap:2px 6px;font-size:11px;align-items:center;";
+      grid.appendChild(el("span", "muted", "min - max"));
+      for (const [, label] of seats) grid.appendChild(el("span", "muted", label));
+      for (const dim of dims) {
+        grid.appendChild(el("span", "", dim));
+        for (const [seat] of seats) {
+          const cell = el("div", "", "");
+          cell.style.cssText = "display:flex;gap:3px;";
+          const pair = (ranges[seat] && ranges[seat][dim]) || [0, 0.6];
+          const lo = document.createElement("input");
+          const hi = document.createElement("input");
+          for (const [box, at] of [[lo, 0], [hi, 1]]) {
+            box.type = "number"; box.min = 0; box.max = 1; box.step = 0.05;
+            box.value = Number(pair[at]); box.style.cssText = "width:52px;";
+            box.title = seat + " " + dim + (at ? " max" : " min");
+            box.onchange = () => {
+              ranges[seat] = ranges[seat] || {};
+              const a = Math.max(0, Math.min(1, Number(lo.value) || 0));
+              let b = Math.max(0, Math.min(1, Number(hi.value) || 0));
+              if (b < a) { b = a; hi.value = b; }
+              ranges[seat][dim] = [a, b];
+              dj.weather_ranges = ranges;
+              pushSettings();
+            };
+            cell.appendChild(box);
+          }
+          grid.appendChild(cell);
+        }
+      }
+      const fold = document.createElement("details");
+      const sum = document.createElement("summary");
+      sum.className = "muted";
+      sum.textContent = "ranges per seat (0 to 1, default 0 to 0.6)";
+      fold.appendChild(sum); fold.appendChild(grid);
+      wrap.appendChild(fold);
+      const row = el("div", "studio-srow", "");
+      const roll = el("button", "", "");
+      roll.innerHTML = pineIcon("c:renew") + " roll now";
+      roll.title = "roll every seat's weather this instant, whatever the dial says";
+      roll.onclick = async () => {
+        try {
+          const got = await api("/api/director/weather/roll",
+            {method: "POST", body: JSON.stringify({})});
+          studioSay("weather rolled - seed " + ((got.roll || {}).seed || "?"));
+          paintNow(got);
+        } catch (error) { studioSay(error.message, true); }
+      };
+      row.appendChild(roll);
+      const now = el("span", "muted", "");
+      now.style.cssText = "flex:1;font-size:11px;overflow-wrap:anywhere;";
+      row.appendChild(now);
+      wrap.appendChild(row);
+      director.appendChild(wrap);
+      function paintNow(state) {
+        const paint = (s) => {
+          const w = (s && s.weather) || {};
+          const rec = w.now || {};
+          const bits = [];
+          for (const [seat, label] of seats) {
+            const st = (s && s.speakers && s.speakers[seat]) || null;
+            if (!st) continue;
+            const top = dims.map((d) => [d, Number(st[d] || 0)])
+              .filter((p) => p[1] >= 0.1).sort((a, b) => b[1] - a[1]).slice(0, 2);
+            bits.push(label + ": " + (top.length
+              ? top.map((p) => p[0] + " " + p[1].toFixed(2)).join(", ")
+              : "level"));
+          }
+          now.textContent = (w.mode === "random"
+            ? ("rolled" + (rec.seed != null ? " - seed " + rec.seed : "")
+               + (rec.why ? " - " + rec.why : ""))
+            : "fixed") + (bits.length ? " | " + bits.join(" | ") : "");
+        };
+        if (state) paint(state);
+        else api("/api/director/state").then(paint).catch(() => {});
+      }
+      paintNow();
+    })();
     function pushSettings() {
       settings.dj = dj;
       if (settings.voice_out) delete settings.voice_out.ha_token;
@@ -220573,6 +229367,10 @@ the library files untouched">📶 quality</label>
 
   <div class="patter" id="patter"></div>
   <div class="note" id="note"></div>
+  <!-- [#1244] the endless set, in words. The stage shows artwork both
+       when the set is off and between two clips, so "is it on?" is not
+       answerable by looking at it. -->
+  <div class="note" id="tvState" style="opacity:.7;font-size:12px"></div>
   <div class="note" id="build" style="opacity:.45;font-size:11px"></div>
 </div>
 
@@ -221306,29 +230104,93 @@ function renderGallery(state) {
 let tvNow = null;            /* the clip currently on the set */
 let tvSkew = 0;              /* server clock - this clock, in ms */
 let tvSeen = 0;
+/* [#1244] the station's own join burst, off the poll the set already
+ * makes, and the instant this element was handed its socket. Both are
+ * read by tvLagSeconds; neither can be worked out in the browser. */
+let tvBurst = 0;
+let streamStartMs = 0;
+/* [#1244] THE SET, IN WORDS, ON THE PAGE THE OPERATOR IS LISTENING ON.
+ * "videos play on the station whenever endless video mode is on" is not
+ * checkable from a stage that shows artwork either way: the set being
+ * off and the gap between two clips look exactly the same. */
+let tvEndless = false, tvStateAt = 0, tvStateClip = "";
+
+function tvSayState() {
+  tvStateAt = Date.now();
+  const line = document.getElementById("tvState");
+  if (!line) return;
+  if (tvEndless) {
+    line.textContent = "endless set: on \u2014 showing "
+      + (tvStateClip || "nothing yet");
+  } else if (tvStateClip) {
+    line.textContent = "endless set: off \u2014 showing " + tvStateClip;
+  } else {
+    line.textContent = "endless set: off";
+  }
+}
 
 function tvLagSeconds() {
   /* How far behind live this listener is.
    *
-   * On the stream road it is not a guess: `buffered.end - currentTime` is
-   * audio that has ARRIVED and not yet been played, which is precisely
-   * the distance between what the station is doing and what this car is
-   * hearing. On the synchronised road there is no such gap. */
+   * On the synchronised road there is no such gap and this is zero.
+   * [#1244]: on the stream road it IS a guess, and the paragraph that
+   * used to stand here - "`buffered.end - currentTime` is precisely the
+   * distance between what the station is doing and what this car is
+   * hearing" - was wrong by twenty seconds. See below. */
   if (!streamMode || !radio) return 0;
+  let best = 0;
   try {
     const b = radio.buffered;
-    if (!b || !b.length) return 0;
-    const ahead = b.end(b.length - 1) - Number(radio.currentTime || 0);
-    return (isFinite(ahead) && ahead > 0) ? Math.min(ahead, 120) : 0;
-  } catch (e) { return 0; }
+    if (b && b.length) {
+      const ahead = b.end(b.length - 1) - Number(radio.currentTime || 0);
+      if (isFinite(ahead) && ahead > 0) best = ahead;
+    }
+  } catch (e) { /* an engine with no buffered ranges keeps the model */ }
+  /* [#1244] THE BURST IS THE LAG, AND `buffered` DOES NOT KNOW IT.
+   *
+   * Measured over the funnel 2026-09-21: /api/stream/state reports
+   * join_burst_s 30.0 while this returned 6-9 s and dipped to
+   * 0.000006 between reads. Twenty seconds of error puts the picture up
+   * before the sound it belongs to, and makes a short clip land against
+   * a completely different moment of the show.
+   *
+   * `buffered` is only what the DECODER still holds; the socket is
+   * paced at exactly 1x and Chromium trims what it has played, so the
+   * burst stops being visible there within seconds of connecting. The
+   * arithmetic does not go away: the audio at `currentTime` is the mix
+   * the station made `burst` seconds before this element started, plus
+   * every second this element has since spent stalled. So the honest
+   * lag is burst + (wall time since the socket opened - playhead), and
+   * `buffered` is kept as a FLOOR under it rather than as the answer. */
+  if (tvBurst > 0 && streamStartMs) {
+    const played = Number(radio.currentTime || 0);
+    const wall = (Date.now() - streamStartMs) / 1000;
+    const modelled = tvBurst + Math.max(0, wall - played);
+    if (modelled > best) best = modelled;
+  }
+  return Math.min(Math.max(0, best), 180);
 }
 
 async function tvPoll() {
-  if (!playing) { tvHide(); return; }
+  /* [#1244] the state line paints whether or not this page is tuned in,
+   * but slowly when it is not: a page nobody is listening to has no
+   * business asking every 2.5 s (see the #1000 note on this page's
+   * bandwidth). */
+  if (!playing && Date.now() - tvStateAt < 10000) { tvHide(); return; }
   let data;
   try {
-    data = await api("/api/dj/video");
+    /* [#1244] tell the station how far behind live this ear is, so it
+     * can answer with the clip that ear is INSIDE rather than the one
+     * the station is airing this instant. Whole seconds, so identical
+     * polls still share a flight (see api() above). */
+    data = await api("/api/dj/video?lag=" + Math.round(tvLagSeconds()));
   } catch (e) { return; }
+  if (typeof data.burst_s === "number" && data.burst_s > 0) {
+    tvBurst = data.burst_s;                                /* [#1244] */
+  }
+  tvEndless = !!data.endless;                              /* [#1244] */
+  tvSayState();                                            /* [#1244] */
+  if (!playing) { tvHide(); return; }
   tvSkew = Number(data.server_ms || Date.now()) - Date.now();
   const lagMs = tvLagSeconds() * 1000;
   const now = Date.now();
@@ -221365,12 +230227,22 @@ function tvShow(v, into) {
     /* #1416: at the SFX slider's level. The listener pressed play to get
      * here, so an unmuted clip is allowed; if the engine still refuses,
      * the picture goes up muted rather than not at all. */
-    el.muted = sfxLevel <= 0;
-    el.volume = Math.max(0, Math.min(1, sfxLevel));
-    el.src = clipUrl ? v.url : v.url;
+    /* [#1244] ...AND SILENT ON THE STREAM ROAD, ALWAYS.
+     *
+     * setLevels has said so since #1265 - "the mixer resolves /sfx/ and
+     * the sting is already in the broadcast, so a picture with audio is
+     * the same sting heard twice a few seconds apart" - but this line
+     * runs AFTER it, on every new clip, and put the level straight back.
+     * Measured over the funnel 2026-09-21 with streamMode true: muted
+     * false, volume 0.6. */
+    el.muted = streamMode || sfxLevel <= 0;
+    el.volume = streamMode ? 0 : Math.max(0, Math.min(1, sfxLevel));
+    el.src = v.url;
     el.currentTime = Math.max(0, into);
     el.play().catch(() => { el.muted = true; el.play().catch(() => {}); });
     if (cap) cap.textContent = v.name || v.sting || "";          /* #1414 */
+    tvStateClip = v.name || v.sting || "a clip";                 /* [#1244] */
+    tvSayState();                                                /* [#1244] */
     stage.classList.add("show");
     stage.classList.add("tv");
   } else {
@@ -221406,6 +230278,8 @@ function tvHide() {
   const img = document.getElementById("galleryImage");
   if (!stage || !el || tvNow === null) return;
   tvNow = null;
+  tvStateClip = "";                                          /* [#1244] */
+  tvSayState();                                              /* [#1244] */
   if (tvHanding) tvHanding();
   const kind = TUNE_TRANSITIONS[Math.floor(Math.random() * TUNE_TRANSITIONS.length)];
   const cls = "sl-t-" + kind;
@@ -221597,6 +230471,26 @@ async function pollOnce() {
         voiceNext();
       }
     }
+    /* [#1237] the station names clips that died with their record */
+    const cutIds = Array.isArray(data.cut_ids) ? data.cut_ids.map(String) : [];
+    if (cutIds.length) {
+      for (let i = voiceQueue.length - 1; i >= 0; i -= 1) {
+        if (cutIds.indexOf(String(voiceQueue[i].row_id || "")) >= 0) {
+          voiceRelease(voiceQueue[i].url);
+          voiceQueue.splice(i, 1);
+        }
+      }
+      if (voiceNowTs && voiceCurrentClip
+          && cutIds.indexOf(String(voiceCurrentClip.row_id || "")) >= 0) {
+        voiceAck(voiceCurrentClip, "error", "cut with its record (#1237)");
+        voiceEpoch += 1;
+        try { voice.pause(); voice.removeAttribute("src"); voice.load(); } catch (e) {}
+        voiceBusy = false;
+        voiceNowTs = 0;
+        if (ducking) { ducking = false; applyLevels(); }
+        voiceNext();
+      }
+    }
     (data.clips || []).forEach((clip) => {
       voiceSeen = Math.max(voiceSeen, clip.ts);
       clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
@@ -221728,6 +230622,34 @@ function voiceRelease(url) {
   });
 }
 
+/* [#1184] the listener page keeps what it was handed, on the same law as
+ * the panel: the station is on (the clock said so), this listener has
+ * pressed play, and it is not gagged for another device. Only the
+ * server's feed cut, or the outer keep bound, ends a clip. */
+const VOICE_KEEP_MS = 600000;                                 /* [#1184] */
+function voiceKeeps(clip) {                                   /* [#1184] */
+  try {
+    if (stationPaused || !playing) return false;
+    if (window.__pineGagged) return false;
+    const since = Number(clip.keptSince || clip.broadcastAt || Date.now());
+    return Date.now() - since <= VOICE_KEEP_MS;
+  } catch (e) { return false; }
+}
+function voiceHoldLate(clip, lateNow) {                       /* [#1184] */
+  if (!clip.keptSince) {
+    clip.keptSince = Number(clip.broadcastAt || Date.now());
+  }
+  clip.retimes = Number(clip.retimes || 0) + 1;
+  clip.lateBy = Math.round(Number(lateNow || 0));
+  clip.broadcastAt = Date.now();
+  try {
+    voiceAck(clip, "retimed",
+             "re-timed " + clip.lateBy + "s late (" + clip.retimes
+             + "x) - the page keeps what it was handed while the "
+             + "station is on (#1184)");
+  } catch (e) { /* the clip still plays */ }
+}
+
 function voiceNext() {
   /* #1253: in stream mode the mix arrives already made. Letting this
    * road run as well is the show played twice, a few seconds apart. */
@@ -221745,14 +230667,25 @@ function voiceNext() {
     const lateNow = (Date.now() - Number(clip.broadcastAt || Date.now())) / 1000;
     const streamLen = clip.stream ? Number(clip.stream.length || 0) : 0;
     /* #1207: a round may die of old age too - generously, but it may. */
-    const hopeless = (clip.keepWhole
+    /* [#1184] ...unless this page IS the air. See the panel's
+     * djVoiceKeeps for the whole reasoning; the law is the same here so
+     * the two pages cannot disagree about what is still playable. */
+    const cutUnder = (Number(clip.ts || 0) > 0
+                      && Number(clip.ts || 0) <= voiceCut);
+    const tooLate = (clip.keepWhole
       ? lateNow > 120 + streamLen
       : ((streamLen > 0 && lateNow >= streamLen)
          || (clip.sting && lateNow > 3)
-         || (!clip.stream && !clip.sting && lateNow > 15)))
-      || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= voiceCut);
+         || (!clip.stream && !clip.sting && lateNow > 15)));
+    const hopeless = tooLate || cutUnder;
     if (!hopeless) break;
-    voiceAck(clip, "error", new Error("clip became stale before playback"));
+    if (!cutUnder && voiceKeeps(clip)) {
+      voiceHoldLate(clip, lateNow);
+      break;
+    }
+    voiceAck(clip, "error", new Error(cutUnder
+      ? "the server cut the feed under this clip (#1184)"
+      : "clip became stale before playback"));
     voiceQueue.shift();
     voiceRelease(clip.url);
     clip = voiceQueue[0];
@@ -221833,10 +230766,12 @@ function voiceNext() {
     try { voice.pause(); voice.removeAttribute("src"); voice.load(); } catch (e) {}
     /* #1207: too many tries at the head, a flush under it, or an air
      * moment two minutes gone - any of them and the show moves on. */
+    const keeping = voiceKeeps(clip);                         /* [#1184] */
     const spent = clip.retry >= VOICE_HEAD_TRIES
       || (Number(clip.ts || 0) > 0 && Number(clip.ts || 0) <= voiceCut)
-      || Date.now() - Number(clip.broadcastAt || 0) > VOICE_GIVE_UP_MS;
-    if (!spent && (clip.keepWhole || clip.retry <= 4)) {
+      || (!keeping
+          && Date.now() - Number(clip.broadcastAt || 0) > VOICE_GIVE_UP_MS);
+    if (!spent && (clip.keepWhole || clip.retry <= 4 || keeping)) {
       voiceQueue.unshift(clip);
     } else {
       voiceAck(clip, "error", "abandoned after " + clip.retry
@@ -222127,6 +231062,11 @@ function streamElement() {
   buildSplitGraph(radio);
   radio.onplaying = () => {
     streamTries = 0;
+    /* [#1244] the socket has started feeding this element. A fresh src
+     * (a first tune-in, or a reconnect) resets the playhead, and the
+     * station hands out a new burst with it - so the clock this lag is
+     * measured against restarts here and nowhere else. */
+    if (Number(radio.currentTime || 0) < 1) streamStartMs = Date.now();
     const note = document.getElementById("note");
     if (note) note.textContent = "streaming — this stays on until you stop it";
   };

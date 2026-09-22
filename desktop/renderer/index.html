@@ -307,6 +307,24 @@
                  data-stream="reply" title="Volume for this stream">
         </label>
       </div>
+      <!-- [#1217]: "Also add a volume slider for media slash videos here."
+           The one level for everything with a picture: the SFX guy's
+           television in this window, the panel's little CRT tube inside the
+           controlFrame webview, and the endless set. Written through
+           window.pineLevels (audio-law.js, #1192), which is the same number
+           the Script view's Levels sheet and the Listen desk show, kept in
+           this machine's localStorage under `pineMixer`.
+           No route picker: the station has no road that sends a video
+           somewhere else, and three dead options would be worse than none. -->
+      <div id="mediaLevels" class="stream-routes">
+        <label for="vol_video"
+               title="How loud videos play in this app - the SFX set and the panel's own tube. Remembered on this machine. A video cannot play louder than itself, so this stops at 100%.">
+          <span>Media / videos</span>
+          <input id="vol_video" class="stream-vol" type="range"
+                 min="0" max="100" step="1" value="100" data-kind="video">
+          <b id="vol_videoValue">100%</b>
+        </label>
+      </div>
       <!-- #1007: "I do not want the device's volume affected when i set it
            on the device." Off, the station never calls volume_set on the
            box - the physical dial is the only owner of that number. -->

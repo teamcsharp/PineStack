@@ -76,6 +76,19 @@ function makeNode(tag) {
       for (const fn of [...(self.handlers[type] || [])]) fn(event || {});
     },
     appendChild: (child) => { child.parentNode = self; self.children.push(child); return child; },
+    /* [#1186] reconcile() puts a node back in its place rather than rebuilding
+       the list, so the fake DOM has to be able to hold an order. */
+    insertBefore: (child, mark) => {
+      self.children = self.children.filter((one) => one !== child);
+      const at = mark ? self.children.indexOf(mark) : -1;
+      if (at < 0) self.children.push(child); else self.children.splice(at, 0, child);
+      child.parentNode = self;
+      return child;
+    },
+    contains: (other) => {
+      for (let walk = other; walk; walk = walk.parentNode) if (walk === self) return true;
+      return false;
+    },
     removeChild: (child) => {
       self.children = self.children.filter((one) => one !== child);
       child.parentNode = null;
@@ -87,8 +100,20 @@ function makeNode(tag) {
        reason. */
     querySelector: (sel) => findByClass(self, String(sel).replace(/^\./, ''))[0] || null
   };
+  /* [#1186] AN innerHTML THAT MEANS SOMETHING. refold() asks "is this body the
+     same body" by comparing innerHTML, and the old getter handed back a stored
+     string that is '' for every node built by appendChild - so every body would
+     have compared equal and the reconcile cases below would have passed while
+     doing nothing at all. This serialises what is actually there. */
+  function shape(node) {
+    return node.children.map((c) => '<' + c.tag
+      + ' c="' + String(c.className || '') + '"'
+      + ' f="' + String(c.getAttribute('data-fold') || '') + '"'
+      + ' h="' + (c.hidden ? 1 : 0) + '"'
+      + '>' + String(c.textContent || '') + shape(c) + '</' + c.tag + '>').join('');
+  }
   Object.defineProperty(self, 'innerHTML', {
-    get: () => self.innerHTML_,
+    get: () => (self.innerHTML_ ? self.innerHTML_ : shape(self)),
     set: (v) => {
       self.innerHTML_ = String(v);
       if (String(v) === '') { for (const c of self.children) c.parentNode = null; self.children = []; }
@@ -392,21 +417,129 @@ test('an empty register says why it is empty instead of looking idle', async () 
   glass.close();
 });
 
-test('pressing Glyphy steps through what he is saying and why', async () => {
+test('the SAYING line steps through what he is saying and why', async () => {
+  /* [#1213] the stepping moved off the face when the face became the fold. */
   const {body} = world();
   station(payload());
   const glass = load();
   glass.open();
   await wait(30);
   const node = findByClass(body, 'og')[0];
-  const avatar = findByClass(node, 'og-avatar')[0];
+  const say = findByClass(node, 'og-say')[0];
   const text = findByClass(node, 'og-say-text')[0];
   assert.equal(String(text.textContent), 'Writing the next one.');
-  avatar.fire('click', {});
+  say.fire('click', {});
   assert.equal(String(text.textContent), 'the writing desk has a round on the go',
-    'pressing him must show the MEASUREMENT that put him in this mood');
-  avatar.fire('click', {});
+    'pressing the line must show the MEASUREMENT that put him in this mood');
+  say.fire('click', {});
   assert.equal(String(text.textContent), 'the shelf is short on callers');
+  glass.close();
+});
+
+test('[#1213] pressing his face folds the panel to the pill, and it is remembered', async () => {
+  const {body, store} = world();
+  station(payload());
+  const glass = load();
+  glass.open();
+  await wait(30);
+  const node = findByClass(body, 'og')[0];
+  const avatar = findByClass(node, 'og-avatar')[0];
+  const list = findByClass(node, 'og-main')[0];
+
+  assert.equal(glass.isFolded(), false, 'it must open out, not folded');
+  assert.ok(list.children.length > 0, 'the list should be drawn before it folds');
+
+  avatar.fire('click', {});
+  assert.equal(glass.isFolded(), true, 'pressing his face must fold the panel');
+  assert.ok(node.classes.has('og-min'), 'the pill needs its class');
+  assert.equal(list.hidden, true, 'a folded panel must not show the list');
+  assert.equal(store.get('pineOrchGlassMin'), '1', 'the fold must be remembered');
+  /* The face, the badges and the one line he is saying all stay. */
+  assert.equal(findByClass(node, 'og-say-text').length, 1);
+  assert.equal(findByClass(node, 'og-face').length, 1);
+
+  avatar.fire('click', {});
+  assert.equal(glass.isFolded(), false, 'pressing again must open him out');
+  assert.equal(list.hidden, false);
+  assert.equal(store.get('pineOrchGlassMin'), '0');
+  glass.close();
+});
+
+test('[#1186] a newer pass above an open one does not close it or replace it', async () => {
+  const {body} = world();
+  const first = payload();
+  station(first);
+  const glass = load();
+  glass.open();
+  await wait(30);
+
+  const order = foldNamed(body, 'what it has been doing, in order');
+  press(order);
+  const row = findByClass(order, 'og-fold')[0];
+  const key = row.getAttribute('data-fold');
+  press(row);
+  assert.ok(row.classes.has('open'), 'the pass should be open before the poll');
+
+  /* A newer pass arrives at the TOP of the list, which is what `recent`
+     always does. Under the old index-keyed id every row below it changed
+     key and closed. */
+  const next = payload();
+  next.recent = [
+    {keeper: 'sfx_guy_watch', turn: 2001, at: (Date.now() / 1000) - 1, ms: 12,
+     say: 'a newer pass, above the one he was reading', steps: [], systems: []}
+  ].concat(first.recent);
+  station(next);
+  /* the triangle he just pressed holds the panel for five seconds; the rest
+     timer lets the update in as soon as that is up. */
+  await wait(glass.EVERY_MS + 2600);
+
+  const again = foldNamed(body, 'what it has been doing, in order');
+  const rows = findByClass(again, 'og-fold');
+  assert.equal(rows.length, 2, 'both passes should be listed, saw ' + rows.length);
+  const kept = rows.filter((one) => one.getAttribute('data-fold') === key)[0];
+  assert.ok(kept, 'the pass he was reading lost its identity when one arrived above it');
+  assert.ok(kept.classes.has('open'),
+    'the pass he had open closed itself when a newer one arrived above it');
+  assert.equal(kept, row, 'the open pass was rebuilt rather than kept');
+  glass.close();
+});
+
+test('[#1186] a hand inside the panel holds the update, and the panel says so', async () => {
+  const {body} = world();
+  station(payload());
+  const glass = load();
+  glass.open();
+  await wait(30);
+  const node = findByClass(body, 'og')[0];
+  const held = findByClass(node, 'og-held')[0];
+  assert.ok(held, 'there must be a line that can admit the panel is behind');
+  assert.equal(held.hidden, true, 'nothing is waiting yet');
+
+  /* The pointer comes to rest inside the box. */
+  node.fire('pointerenter', {});
+  assert.equal(glass._held().inside, true, 'the panel did not notice the hand');
+
+  const moved = payload();
+  moved.face = Object.assign({}, moved.face, {say: 'something else entirely'});
+  moved.recent = [];
+  station(moved);
+  await wait(glass.EVERY_MS + 400);
+
+  assert.equal(glass._held().waiting, true, 'the payload should be held, not drawn');
+  assert.ok(glass._held().pending >= 1, 'the held payloads should be counted');
+  assert.equal(held.hidden, false, 'the panel must say it is holding something');
+  assert.match(String(held.textContent), /paused while you read/);
+  /* ...and the list he is reading is untouched: the register still has the
+     pass in it, although the newest payload has none. */
+  const order = foldNamed(body, 'what it has been doing, in order');
+  assert.match(String(findByClass(order, 'og-tri-sum')[0].textContent), /passes/,
+    'the list was rebuilt under his hand');
+
+  /* The hand leaves, and the diff goes in. */
+  node.fire('pointerleave', {});
+  await wait(300);
+  assert.equal(glass._held().waiting, false, 'the held update never arrived');
+  assert.equal(held.hidden, true);
   glass.close();
 });
 

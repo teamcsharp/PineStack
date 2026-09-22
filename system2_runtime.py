@@ -1003,25 +1003,111 @@ class System2Runtime:
                     entry["_ready_slot"]["deadline"] = min(slot["deadline"], track_position["deadline"])
                 handed = False
 
+                def _no(why):
+                    # [#1191] THE REASON, ON THE HOST'S REGISTER. app.py's
+                    # _burst_refusal_why reads _HANDOFF_NO when it is fresh;
+                    # this check answered a bare False for six different
+                    # reasons and Segment 11032 (2026-09-16 08:36:30Z) was
+                    # withdrawn as "the caller's own check said no".
+                    try:
+                        h._HANDOFF_NO.update({"at": time.time(), "why": str(why)[:220]})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return False
+
+                def _grace():
+                    # [#1191] THE AIR ROAD'S OWN ALLOWANCE, handed to the
+                    # store. #1166: "a finished segment may run past the
+                    # fold rather than not run at all" - app.py measures
+                    # that with segment_overrun() and the store measured
+                    # nothing, which is the 3.50 s that lost Segment 11032.
+                    # Same function, same moment, so they cannot disagree.
+                    try:
+                        return max(0.0, min(300.0, float(
+                            h.segment_overrun(float(slot.get("deadline") or 0), kind))))
+                    except Exception:  # noqa: BLE001
+                        return 0.0
+
                 def validate():
-                    if not self.enabled or h.radio_paused() or not h._RADIO.get("on"):
-                        return False
+                    if not self.enabled:
+                        return _no("System2 is switched off")
+                    if h.radio_paused() or not h._RADIO.get("on"):
+                        return _no("the station is paused" if h.radio_paused() else "the station is off")
                     if kind == "track_talk":
                         current_position = self._track_position()
                         if not current_position or any(current_position[key] != track_position[key] for key in ("track_id", "started", "part")):
-                            return False
+                            return _no("the record moved on - this talk was written for %s (%s)"
+                                       % (str(track_position.get("track_id") or "?")[:24],
+                                          str(track_position.get("part") or "?")))
                         if time.time() + resolved["seconds"] > min(slot["deadline"], current_position["deadline"]):
-                            return False
+                            return _no("the talk runs %ds and its record has %ds left"
+                                       % (int(resolved["seconds"]),
+                                          int(max(0.0, min(slot["deadline"], current_position["deadline"]) - time.time()))))
                     current = self.media.resolve(kind, row)
-                    if not current["ready"] or self.media.signature(current) != self.media.signature(resolved):
-                        return False
-                    return self.store.validate_reservation(proof["reservation_id"], proof["owner"], token=proof["token"])["allowed"]
+                    if not current["ready"]:
+                        return _no("the recording is no longer ready: "
+                                   + "; ".join(current.get("why") or ["no reason given"])[:120])
+                    if self.media.signature(current) != self.media.signature(resolved):
+                        return _no("the recording changed between staging and delivery "
+                                   "(a take's text, voice, key or audio hash differs)")
+                    allow = _grace()
+                    got = self.store.validate_reservation(
+                        proof["reservation_id"], proof["owner"], token=proof["token"], grace=allow)
+                    if got["allowed"]:
+                        return True
+                    reason = str(got.get("reason") or "not allowed")
+                    res = got.get("reservation") or {}
+                    held = int(time.time() - float(res.get("reserved_at") or time.time()))
+                    lease = int(float(res.get("lease_until") or 0) - float(res.get("reserved_at") or 0))
+                    if reason == "reservation_lease_expired":
+                        # [#1191] A WAIT MUST NOT COST THE ROUND. The lease
+                        # ran out while the round waited for the floor and
+                        # for the page's sold air - a wait the station
+                        # imposed. Renew (same id, same token) and go on.
+                        try:
+                            renewed = self.store.renew_reservation(
+                                proof["reservation_id"], proof["owner"],
+                                token=proof["token"], lease_seconds=300)
+                        except Exception as exc:  # noqa: BLE001
+                            renewed = {"renewed": False,
+                                       "reason": type(exc).__name__ + ": " + str(exc)[:80]}
+                        if renewed.get("renewed"):
+                            try:
+                                h.pipeline_log("system2", "the %ds reservation lease had run out %ds "
+                                               "after it was taken; renewed at the hand-over and the "
+                                               "round goes out (#1191)" % (lease, held))
+                            except Exception:  # noqa: BLE001
+                                pass
+                            return True
+                        reason = ("reservation_lease_expired and it could not be renewed: "
+                                  + str(renewed.get("reason") or "?"))
+                    left = float(slot.get("deadline") or 0) - time.time()
+                    if reason == "measured_duration_misses_deadline":
+                        # [#1191] IN NUMBERS, because this is the one that
+                        # threw away written and rendered work: the round's
+                        # own length against the room left, and the grace
+                        # the air road already allowed it.
+                        return _no("the %s round runs %.1fs, its entry has %.1fs left and %.0fs of grace, "
+                                   "so it overruns by %.1fs - it fitted with %.0fs to spare when it was "
+                                   "reserved %ds ago and the wait since is what cost it"
+                                   % (kind, float(resolved.get("seconds") or 0), max(0.0, left), allow,
+                                      max(0.0, float(resolved.get("seconds") or 0) - left - allow),
+                                      max(0.0, float(slot.get("deadline") or 0)
+                                          - float(res.get("reserved_at") or 0)
+                                          - float(resolved.get("seconds") or 0)),
+                                      held))
+                    return _no("System2's reservation is no longer valid (%s) - reserved %ds ago with a "
+                               "%ds lease, the entry has %ds left" % (reason, held, lease, int(max(0.0, left))))
 
                 def handoff():
                     nonlocal handed
                     if handed:
                         return
-                    self.store.mark_dispatched(proof["reservation_id"], proof["owner"], token=proof["token"])
+                    # [#1191] the same allowance validate() was given, or
+                    # mark_dispatched raises System2Conflict THROUGH the
+                    # hand-over for a deadline validate() had accepted.
+                    self.store.mark_dispatched(proof["reservation_id"], proof["owner"],
+                                               token=proof["token"], grace=_grace())
                     self._dispatched[(slot["id"], candidate["id"])] = proof
                     handed = True
 

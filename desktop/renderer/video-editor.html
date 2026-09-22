@@ -15,6 +15,8 @@
       <button id="undo" class="quiet" disabled aria-label="Undo edit">Undo</button>
       <button id="redo" class="quiet" disabled aria-label="Redo edit">Redo</button>
       <button id="save" class="primary" disabled>Save copy</button>
+      <!-- [#1223] only for a clip out of the station's library -->
+      <button id="saveOver" class="primary" hidden disabled>Save over the original</button>
     </header>
     <section class="viewer" id="viewer" aria-label="Video preview">
       <video id="video" playsinline preload="auto"></video>
@@ -30,6 +32,8 @@
       <label class="audio-toggle"><input id="audio" type="checkbox" disabled> <span id="audioLabel">Include audio</span></label>
     </div>
     <p id="audioNotice" class="audio-notice" role="note" hidden></p>
+    <!-- [#1223] where a save will land, said before it is pressed -->
+    <p id="sfxNotice" class="audio-notice" role="note" hidden></p>
     <section class="timeline-section" aria-label="Trim video">
       <div class="timeline" id="timeline">
         <div id="frames" class="frames"></div>

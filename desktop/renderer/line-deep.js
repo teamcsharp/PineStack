@@ -88,6 +88,335 @@
    * window, because it names a road on a line that is no longer on screen. */
   var openStage = null;
 
+  /* ======================================== #1231: TAP A BOX AND TYPE IN IT
+   *
+   * "in Any text field, allow me to tap on it and type inside of it and
+   *  begin making edits there."
+   *
+   * EVERY BOX HERE IS A READING OF SOMETHING. Some of those things are
+   * stores the station can be told to change - the topics in the bank, the
+   * director's weather, the station disposition, a seat's character, a
+   * road's system prompt, the caller theme, the seated guest, a speakbox
+   * passage, a crystal shard, and the round's own turns. The rest are
+   * records of what already happened, and a record cannot be rewritten
+   * after the fact. A box of the second kind still answers the tap, with
+   * the reason on a strip under it: a control that does nothing at all is
+   * worse than one that refuses out loud.
+   *
+   * ONE DOOR. PUT /api/paperwork/field {scope, key, value, was, line_id,
+   * apply} - the station decides which store a scope names, keeps the
+   * (used) flags and the ids of a reworded topic, sends a round's turn
+   * through the writers room (a kept round is COPIED and only the changed
+   * line re-records), and answers with the sentence that goes on the
+   * strip. The client never guesses which box is writable: every scene
+   * card carries an `edit` note from scene_inputs() naming the scope,
+   * which of the card's two boxes is the store, and why when it is
+   * neither.
+   *
+   * NOTHING REPAINTS UNDER AN OPEN EDITOR. While a field is dirty or holds
+   * the caret, paint() returns, open() will not rebuild the sheet, and a
+   * tap outside will not dismiss it - the whole point of typing into a box
+   * is that the box is still there when you look up. Esc cancels. BLUR DOES
+   * NOT: on a tablet the soft keyboard steals focus constantly, and a blur
+   * that threw the words away would make this unusable.
+   *
+   * THE SOFT KEYBOARD. Android shrinks the VISUAL viewport and leaves the
+   * layout viewport alone, so a fixed, centred window stays centred on a
+   * viewport that is no longer on the glass - the modal simply slides off
+   * the screen the moment you tap into it. While an editor is open the box
+   * is re-centred on window.visualViewport at every resize and scroll, and
+   * the caret is put back in view.
+   */
+  var edits = [];                /* [#1231] every editor open on this sheet */
+  var vvWatch = null;
+  var closeAsk = 0;
+
+  var READING_ONLY =
+    'this box is the record of what happened, not a store the station can be '
+    + 'told to change. The boxes that can be typed in are the ones with a '
+    + 'dotted underline.';
+
+  function editsDirty() {                                      // [#1231]
+    for (var i = 0; i < edits.length; i += 1) {
+      if (edits[i].dirty) return true;
+    }
+    return false;
+  }
+
+  function editsBusy() {                                       // [#1231]
+    for (var i = 0; i < edits.length; i += 1) {
+      if (edits[i].dirty) return true;
+      if (edits[i].area && edits[i].area === document.activeElement) return true;
+    }
+    return false;
+  }
+
+  /* The flag and the shout. Local to this modal, as asked - but other
+   * surfaces poll the same page, so the state is also readable
+   * (body[data-pine-editing]) and announced once per change. */
+  function markBusy() {                                        // [#1231]
+    var on = editsBusy();
+    try {
+      if (on) document.body.setAttribute('data-pine-editing', 'line-deep');
+      else if (document.body.getAttribute('data-pine-editing') === 'line-deep') {
+        document.body.removeAttribute('data-pine-editing');
+      }
+      root.dispatchEvent(new CustomEvent('pine-edit-busy',
+        {detail: {busy: on, where: 'line-deep'}}));
+    } catch (e) { /* an old view: the flag is a courtesy, the guard is above */ }
+    return on;
+  }
+
+  function fitViewport() {                                     // [#1231]
+    var vv = root.visualViewport;
+    if (!box || !vv) return;
+    box.style.maxHeight = Math.max(200, Math.round(vv.height) - 16) + 'px';
+    box.style.top = Math.round(vv.offsetTop + vv.height / 2) + 'px';
+  }
+
+  function keyboardWatch(on) {                                 // [#1231]
+    var vv = root.visualViewport;
+    if (!vv) return;
+    if (on && !vvWatch) {
+      vvWatch = function () { fitViewport(); };
+      vv.addEventListener('resize', vvWatch);
+      vv.addEventListener('scroll', vvWatch);
+      fitViewport();
+    } else if (!on && vvWatch) {
+      vv.removeEventListener('resize', vvWatch);
+      vv.removeEventListener('scroll', vvWatch);
+      vvWatch = null;
+      if (box) { box.style.maxHeight = ''; box.style.top = ''; }
+    }
+  }
+
+  /* A strip under a box: why it cannot be typed in, or what the station
+   * said when it was. It replaces its own previous strip rather than
+   * stacking, so tapping a refusing box twice does not build a wall. */
+  function note(node, words, bad) {                            // [#1231]
+    var host = node && node.parentNode;
+    if (!host) return;
+    var after = node.nextSibling;
+    if (after && after.classList
+        && after.classList.contains('ld-edit-strip')) after.remove();
+    var strip = make('div', 'ld-edit-strip' + (bad ? ' bad' : ''));
+    strip.appendChild(make('span', 'ld-edit-say', String(words || READING_ONLY)));
+    var ok = make('button', 'ld-edit-btn', 'got it');
+    ok.type = 'button';
+    ok.addEventListener('click', function (e) {
+      e.stopPropagation();
+      strip.remove();
+    });
+    strip.appendChild(ok);
+    host.insertBefore(strip, node.nextSibling);
+  }
+
+  function grow(area) {                                        // [#1231]
+    try {
+      area.style.height = 'auto';
+      area.style.height = Math.max(64, Math.min(320, area.scrollHeight + 4)) + 'px';
+    } catch (e) { /* no layout yet */ }
+  }
+
+  /* Mark a box as a field. `spec` with a scope opens an editor; `spec`
+   * without one answers the tap with spec.why. */
+  function editable(node, spec) {                              // [#1231]
+    if (!node || node.getAttribute('data-ld-edit') === '1') return node;
+    node.setAttribute('data-ld-edit', '1');
+    if (spec && spec.scope) {
+      node.classList.add('ld-tap');
+      node.title = 'tap to type in it';
+    }
+    node.addEventListener('click', function (e) {
+      var sel = root.getSelection ? root.getSelection() : null;
+      if (sel && String(sel).length > 1) return;   /* selecting, not tapping */
+      e.stopPropagation();
+      openEditor(node, spec);
+    });
+    return node;
+  }
+
+  function openEditor(node, spec) {                            // [#1231]
+    spec = spec || {};
+    if (!spec.scope) { note(node, spec.why); return; }
+    var host = node.parentNode;
+    if (!host) return;
+    var after = node.nextSibling;
+    if (after && after.classList
+        && after.classList.contains('ld-edit-strip')) after.remove();
+
+    var was = node.textContent;
+    var wrap = make('div', 'ld-edit');
+    var area = document.createElement('textarea');
+    area.className = 'ld-edit-area';
+    area.value = was;
+    area.spellcheck = false;
+    area.setAttribute('aria-label', String(spec.label || 'this box'));
+    wrap.appendChild(area);
+
+    var strip = make('div', 'ld-edit-strip');
+    var say = make('span', 'ld-edit-say', String(spec.how || spec.label || ''));
+    strip.appendChild(say);
+
+    /* "applies to: future rounds / this round too" only where BOTH are
+     * meaningful. Where only one is, it is stated rather than offered as a
+     * choice that is not one. */
+    var applies = (spec.applies && spec.applies.length) ? spec.applies : ['future'];
+    var pick = null;
+    if (applies.length > 1) {
+      pick = make('select', 'ld-edit-applies');
+      pick.setAttribute('aria-label', 'what this edit applies to');
+      var optF = make('option', '', 'applies to: future rounds');
+      optF.value = 'future';
+      pick.appendChild(optF);
+      var optR = make('option', '', 'applies to: this round too');
+      optR.value = 'round';
+      pick.appendChild(optR);
+      strip.appendChild(pick);
+    } else {
+      strip.appendChild(make('i', 'ld-edit-only', applies[0] === 'round'
+        ? 'applies to: this round' : 'applies to: future rounds'));
+    }
+
+    var save = make('button', 'ld-edit-btn save', 'Save');
+    save.type = 'button';
+    var cancel = make('button', 'ld-edit-btn', 'Cancel');
+    cancel.type = 'button';
+    strip.appendChild(save);
+    strip.appendChild(cancel);
+    wrap.appendChild(strip);
+
+    var rec = {area: area, wrap: wrap, node: node, dirty: false};
+    edits.push(rec);
+    host.replaceChild(wrap, node);
+    grow(area);
+    keyboardWatch(true);
+
+    function shut(text) {
+      var at = edits.indexOf(rec);
+      if (at >= 0) edits.splice(at, 1);
+      rec.dirty = false;
+      if (text !== undefined && text !== null) node.textContent = text;
+      if (wrap.parentNode) wrap.parentNode.replaceChild(node, wrap);
+      if (!edits.length) keyboardWatch(false);
+      markBusy();
+    }
+
+    function fail(words) {
+      save.disabled = false;
+      cancel.disabled = false;
+      strip.classList.add('bad');
+      say.textContent = String(words || 'the station refused it');
+      try { area.focus(); } catch (e) { /* gone */ }
+    }
+
+    function send() {
+      var body = {scope: String(spec.scope), key: String(spec.key || ''),
+        value: area.value, was: was, line_id: String(spec.lineId || ''),
+        apply: pick ? pick.value : applies[0]};
+      save.disabled = true;
+      cancel.disabled = true;
+      strip.classList.remove('bad');
+      say.textContent = 'saving...';
+      var door = api();
+      var call = (typeof door.put === 'function')
+        ? door.put('/api/paperwork/field', body)
+        : door.post('/api/paperwork/field', body);
+      call.then(function (got) {
+        got = got || {};
+        if (got.ok === false) {
+          fail(got.detail || got.say || 'the station refused it');
+          return;
+        }
+        shut(got.changed === false ? was : area.value);
+        note(node, String(got.say || 'saved'), false);
+      }, function (err) {
+        fail((err && err.message) || String(err));
+      });
+    }
+
+    area.addEventListener('input', function () {
+      rec.dirty = area.value !== was;
+      grow(area);
+      markBusy();
+    });
+    area.addEventListener('focus', function () {
+      markBusy();
+      setTimeout(function () {
+        try { area.scrollIntoView({block: 'center'}); }
+        catch (e) { area.scrollIntoView(); }
+        fitViewport();
+      }, 220);
+    });
+    /* Blur keeps the words. See the header: the tablet takes focus away
+     * every time the keyboard opens or closes. */
+    area.addEventListener('blur', function () { markBusy(); });
+    area.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' || e.keyCode === 27) {
+        e.preventDefault();
+        e.stopPropagation();
+        shut();
+      } else if ((e.ctrlKey || e.metaKey)
+                 && (e.key === 'Enter' || e.keyCode === 13)) {
+        e.preventDefault();
+        send();
+      }
+    });
+    cancel.addEventListener('click', function (e) { e.stopPropagation(); shut(); });
+    save.addEventListener('click', function (e) { e.stopPropagation(); send(); });
+    wrap.addEventListener('click', function (e) { e.stopPropagation(); });
+    try { area.focus(); } catch (e) { /* gone */ }
+    markBusy();
+  }
+
+  /* The window. A DIRTY editor is not thrown away by a stray tap outside
+   * or by the close button: the strip says what to do instead, and a
+   * second press within four seconds discards it on purpose. */
+  function closeAsked() {                                      // [#1231]
+    if (!editsDirty()) { close(); return; }
+    var now = Date.now();
+    if (now - closeAsk < 4000) { close(); return; }
+    closeAsk = now;
+    var open_ = null;
+    for (var i = 0; i < edits.length; i += 1) {
+      if (edits[i].dirty) { open_ = edits[i]; break; }
+    }
+    if (!open_) { close(); return; }
+    var strip = open_.wrap && open_.wrap.querySelector('.ld-edit-strip');
+    if (strip) {
+      strip.classList.add('bad');
+      var words = strip.querySelector('.ld-edit-say');
+      if (words) {
+        words.textContent = 'there is an edit open here - Save it or Cancel '
+          + 'it. Close again to throw it away.';
+      }
+    }
+    try {
+      open_.wrap.scrollIntoView({block: 'center'});
+      open_.area.focus();
+    } catch (e) { /* gone */ }
+  }
+
+  /* The scene card's own note, read into a spec for one of its two boxes.
+   * `which` is 'value' (the head line) or 'detail' ("the whole of it"). */
+  function cardSpec(i, which) {                                // [#1231]
+    var meta = (i && i.edit) || {};
+    var boxes = meta.boxes || [];
+    if (meta.scope && boxes.indexOf(which) >= 0) {
+      return {scope: String(meta.scope), key: String(meta.key || ''),
+        label: String(meta.label || i.label || ''),
+        how: String(meta.how || ''),
+        applies: meta.applies || ['future'],
+        lineId: openFor ? String(openFor.id || '') : ''};
+    }
+    if (meta.scope) {
+      return {scope: '', why: 'the head line is the station summary of this '
+        + 'box, not the box - open "the whole of it" below and type in there.'};
+    }
+    return {scope: '', why: String(meta.why || READING_ONLY)};
+  }
+
+
   /* What a hand-over state means, in the operator's words rather than the
    * row's. Read by the "handed over" step and by the on-air road. */
   var ROADS = {
@@ -259,6 +588,9 @@
   /* ------------------------------------------------------------ the shell */
 
   function close() {
+    edits.length = 0;            // [#1231] the window is going; so are its fields
+    keyboardWatch(false);        // [#1231] before the box leaves the document
+    markBusy();                  // [#1231]
     if (scene && scene.stop) { try { scene.stop(); } catch (e) { /* gone */ } }
     scene = null;
     openFor = null;
@@ -267,6 +599,9 @@
   }
 
   function open(line) {
+    /* [#1231] A second swipe of the corner, or another tap on the feed,
+     * must not throw away words that are half typed. */
+    if (editsDirty()) { closeAsked(); return; }
     close();
     openFor = line;
     box = make('div', 'ld-box');
@@ -287,12 +622,25 @@
       + '<div class="ld-body"></div>';
     document.body.appendChild(box);
     if (root.PineDuck) root.PineDuck.hold('line-deep', root.PineDuck.REPORT, box);   /* 2026-09-14: a diagnostic ducks the broadcast */
-    box.querySelector('.ld-said').textContent = String(line.said || '').slice(0, 300);
+    /* [#1231] The WHOLE line, not 300 characters of it: this box is now
+     * an editor, and an editor showing a truncation would save one. The
+     * stylesheet caps its height instead. */
+    box.querySelector('.ld-said').textContent = String(line.said || '').slice(0, 4000);
     box.querySelector('.ld-close').addEventListener('click', function (e) {
       e.stopPropagation();
-      close();
+      closeAsked();              // [#1231] a dirty field is asked about first
     });
-    if (root.PineDismiss) root.PineDismiss.watch(box, close, []);
+    if (root.PineDismiss) root.PineDismiss.watch(box, closeAsked, []);   // [#1231]
+    /* [#1231] Any box nobody wired still answers the tap, with the reason.
+     * Delegated, so a panel drawn later by a road or a step is covered too. */
+    box.addEventListener('click', function (e) {
+      var hit = e.target && e.target.closest
+        ? e.target.closest('.ld-pre, .ld-scene-value') : null;
+      if (!hit || hit.getAttribute('data-ld-edit') === '1') return;
+      var sel = root.getSelection ? root.getSelection() : null;
+      if (sel && String(sel).length > 1) return;
+      note(hit, READING_ONLY);
+    });
 
     var body = box.querySelector('.ld-body');
     body.appendChild(make('p', 'ld-wait', 'asking the station…'));
@@ -347,6 +695,9 @@
   }
 
   function paint(line, all) {
+    /* [#1231] replaceChildren() below would take the box the operator is
+     * typing into out of the document with their words still in it. */
+    if (editsBusy()) return;
     var body = box.querySelector('.ld-body');
     body.replaceChildren();
 
@@ -372,6 +723,32 @@
      * be broadcasted and all the parameters pertaining to it." At the TOP,
      * before the admin options, because it is the answer to the question
      * the corner swipe asked. */
+    /* [#1231] The line itself is a box too, and the most useful one: tap
+     * it and you are editing that turn of the round it belongs to. The
+     * station said whether there IS one - /api/said/why answers `edit`
+     * with the shelf id and which turn this line is - so a line made live,
+     * or one whose round has been retired, says so rather than failing at
+     * the Save. */
+    var saidBox = box.querySelector('.ld-said');
+    var rnd = (all.why && all.why.ok && all.why.edit) || null;
+    if (saidBox) {
+      if (rnd && rnd.banked && Number(rnd.index) >= 0) {
+        editable(saidBox, {scope: 'turn', key: '',
+          label: 'this line, in the round it belongs to',
+          how: 'turn ' + (Number(rnd.index) + 1) + ' of ' + rnd.turns
+            + ' in the banked ' + (rnd.kind || 'round') + ' ' + rnd.sid
+            + (rnd.kept
+              ? ' - it has already aired, so the round is COPIED and only '
+                + 'this line re-records'
+              : ' - only this line re-records'),
+          applies: ['round'], lineId: String(line.id || '')});
+      } else {
+        editable(saidBox, {scope: '', why: (rnd && rnd.why)
+          || 'the station holds no banked round behind this line, so there '
+             + 'are no written words to rewrite'});
+      }
+    }
+
     section(body, 'how this line came to be broadcast, step by step', flowNode(line, all));
     section(body, 'admin options - what reached this line', adminNode(all));   /* 2026-09-14 */
     section(body, 'how often it has gone out', timesNode(line, all));
@@ -573,6 +950,26 @@
    * line-actions.js (which builds its line from a DOM node) cannot. Opened
    * from a held line, the hand-over step says the page was not handed the
    * reason rather than pretending there was none. */
+  /* [#1195] Which alternative of the segment prompt book governed the
+     call that wrote this line, and what every command in it became -
+     one line, so the card can say "written with the hard sell, and the
+     speaker box handed it fmn1.md" without a fold. */
+  function altSay(alt) {
+    if (!alt || typeof alt !== 'object') return '';
+    var out = alt.name ? ('\u201c' + String(alt.name) + '\u201d')
+      : (alt.source === 'shelf' ? 'the shelf text, as it stands' : '');
+    if (alt.mode) out += ' (' + String(alt.mode) + (alt.of ? ' of ' + alt.of : '') + ')';
+    var ex = alt.expanded || [];
+    var bits = [];
+    for (var i = 0; i < ex.length; i += 1) {
+      var e = ex[i] || {};
+      bits.push(String(e.cmd || '') + (e.doc ? ' \u2192 ' + e.doc
+        : (e.miss ? ' \u2192 ' + e.miss : '')));
+    }
+    if (bits.length) out += (out ? '  \u00b7  ' : '') + bits.join(', ');
+    return out;
+  }
+
   function moreFor(key, line, all) {
     var d = record(line, all);
     var f = [];
@@ -604,6 +1001,7 @@
       put(f, 'committed', clock(d.written.at));
       put(f, 'the brief it answered', d.sched.prompt);
       put(f, 'the kind of round', d.written.kind);
+      put(f, 'the instruction dialled', altSay(d.sched.alternative));   /* [#1195] */
       putFold(f, 'the prompt as sent', d.written.prompt);
       putFold(f, 'what came back', d.written.script);
       return f;
@@ -880,15 +1278,32 @@
     head.appendChild(make('i', 'ld-scene-state',
       i.on ? 'shaping this scene' : 'off'));
     card.appendChild(head);
+    /* [#1232] the weather card says whether its numbers were rolled
+     * for this round or are the fixed reading. */
+    if (i.key === 'mood' && i.roll && typeof i.roll === 'object') {
+      var rolled = i.roll.mode === 'random';
+      var badge = make('i', 'ld-scene-roll' + (rolled ? ' rolled' : ''));
+      if (rolled && typeof root.pineIcon === 'function') {
+        badge.innerHTML = root.pineIcon('c:shuffle');
+      }
+      badge.appendChild(document.createTextNode(rolled
+        ? ('rolled for this round'
+           + (i.roll.seed != null ? ' \u00b7 seed ' + String(i.roll.seed) : '')
+           + (i.roll.why ? ' \u00b7 ' + String(i.roll.why) : ''))
+        : ('fixed' + (i.roll.macro ? ' \u00b7 macro ' + String(i.roll.macro) : ''))));
+      card.appendChild(badge);
+    }
     if (i.value) {
-      card.appendChild(make('p', 'ld-scene-value', String(i.value)));
+      card.appendChild(editable(make('p', 'ld-scene-value', String(i.value)),
+        cardSpec(i, 'value')));                       // [#1231]
     } else if (!i.on) {
       card.appendChild(make('p', 'ld-scene-value ld-dim', 'nothing set'));
     }
     if (i.detail) {
       var d = make('details', 'ld-fold');
       d.appendChild(make('summary', '', 'the whole of it'));
-      d.appendChild(make('pre', 'ld-pre', String(i.detail)));
+      d.appendChild(editable(make('pre', 'ld-pre', String(i.detail)),
+        cardSpec(i, 'detail')));                      // [#1231]
       card.appendChild(d);
     }
     if (i.why) card.appendChild(make('p', 'ld-scene-why', String(i.why)));
@@ -1441,7 +1856,27 @@
       if (!pair[1]) return;
       var d = make('details', 'ld-fold');
       d.appendChild(make('summary', '', pair[0]));
-      d.appendChild(make('pre', 'ld-pre', String(pair[1])));
+      /* [#1231] Two of these three are the round itself. The tint pass
+       * writes its rewrite back over entry["script"] (app.py, the tint
+       * road), so the dressed clause IS what the round now holds and
+       * editing it is editing the round. The prompt as sent is a record
+       * of one visit to the writing room and says so. */
+      d.appendChild(editable(make('pre', 'ld-pre', String(pair[1])),
+        pair[0] === 'the prompt as sent'
+          ? {scope: '', why: 'the prompt as sent is the record of one '
+              + 'visit to the writing room and cannot be rewritten after '
+              + 'the fact. What shapes the NEXT one is on the scene sheet '
+              + 'at the top of this window: the road system prompt, the '
+              + 'seat character and the station disposition - all three '
+              + 'can be typed in.'}
+          : {scope: 'script', key: '',
+             label: pair[0] === 'after the tint'
+               ? 'the dressed clause' : 'the round as it was written',
+             how: 'change ONE line and Save - a round that has aired is '
+               + 'copied, the kept one is untouched, and only the line '
+               + 'you changed re-records',
+             applies: ['round'],
+             lineId: openFor ? String(openFor.id || '') : ''}));
       wrap.appendChild(d);
     });
     var bits = [];
@@ -1470,7 +1905,18 @@
       sum.appendChild(make('i', '', String(s.file || '')
         + (s.in_prompt ? '  ·  in the prompt' : '  ·  not used')));
       d.appendChild(sum);
-      d.appendChild(make('pre', 'ld-pre', String(s.text || '')));
+      /* [#1231] A shard is a swath of a document on the speakbox shelf,
+       * and the row names the file it was cut from - so a rewrite goes
+       * back into that file where those words were found. */
+      d.appendChild(editable(make('pre', 'ld-pre', String(s.text || '')),
+        s.file ? {scope: 'passage', key: String(s.file),
+                  label: 'a crystal shard', applies: ['future'],
+                  how: 'these words are written back into ' + String(s.file)
+                    + ' exactly where they were found; the next round that '
+                    + 'draws on that document reads yours'}
+               : {scope: '', why: 'the record does not name the document '
+                    + 'this shard was cut from, so there is nothing to '
+                    + 'write it back into'}));
       wrap.appendChild(d);
     });
     docs.slice(0, 6).forEach(function (doc) {
@@ -1479,7 +1925,15 @@
       sum.appendChild(make('b', '', String(doc.title || doc.file || 'a document')));
       sum.appendChild(make('i', '', doc.quoted ? 'quoted' : 'read, not quoted'));
       d.appendChild(sum);
-      d.appendChild(make('pre', 'ld-pre', String(doc.text || doc.snippet || '')));
+      /* [#1231] The swath the writer was handed, put back into its file. */
+      d.appendChild(editable(
+        make('pre', 'ld-pre', String(doc.text || doc.snippet || '')),
+        doc.file ? {scope: 'passage', key: String(doc.file),
+                    label: 'a speakbox passage', applies: ['future'],
+                    how: 'these words are written back into '
+                      + String(doc.file) + ' exactly where they were found'}
+                 : {scope: '', why: 'this row names no file on the '
+                      + 'speakbox shelf, so there is nothing to write into'}));
       wrap.appendChild(d);
     });
     if (vectors.length) {
@@ -1637,7 +2091,9 @@
     }, function () { return null; });
   }
 
-  root.PineLineDeep = {open: open, close: close};
+  /* [#1231] busy(): a field on this sheet is dirty or holds the caret.
+   * Anything that would repaint over the top asks first. */
+  root.PineLineDeep = {open: open, close: close, busy: editsBusy};
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = root.PineLineDeep;
   }

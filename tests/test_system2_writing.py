@@ -83,6 +83,7 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
         self.settings = copy.deepcopy(app.DEFAULT_DJ)
         self.settings.update(banter=True, reply_max_chars=6500, speakbox_rate=1,
             speakbox_prepend_rate=1, speakbox_append_rate=1, speakbox_full_swath_rate=1,
+            speakbox_quotes_system2=False,   # [#1233] this fixture proves the switch
             speakbox_full_swath_chars=2600, banter_max_lines=24, banter_min_lines=16,
             third_name="", drop_voice="", heat_rate=0, lyrics_talk=False)
         original = app.dj_banter
