@@ -7411,6 +7411,76 @@ def _pine_render(items: list[dict[str, Any]]) -> str:
     return header + "\n".join(blocks) + ("\n" if blocks else "")
 
 
+# --- #1255: THE INBOX CANNOT BE ERASED BY A READ THAT FAILED ---------------
+# `pine_read()` returns [] on any read exception, and `_pine_render([])` is
+# the header and nothing else — so one transient failure could rewrite this
+# file as 124 bytes with every open request gone, silently, and the file is
+# not in git. Every write of the request book goes through here now.
+_PINE_READ_FAILED: dict[str, Any] = {"at": 0.0, "why": ""}
+
+
+def pine_read_or_raise() -> list[dict[str, Any]]:
+    """The request book, or an exception. "No requests" and "I could not
+    read the book" are different answers and must not share a return."""
+    text = PINE_REQUESTS_PATH.read_text(encoding="utf-8")
+    out: list[dict[str, Any]] = []
+    for m in _PINE_BLOCK_RE.finditer(text):
+        out.append({"id": int(m.group(1)), "when": m.group(2).strip(),
+                    "status": m.group(3).strip(), "text": m.group(4).strip()})
+    return out
+
+
+def pine_write(items: list[dict[str, Any]], why: str = "",
+               dropping: Any = None) -> bool:
+    """Write the request book, refusing the write that can only be a bug.
+
+    `dropping` names the id(s) the caller means to remove. Losing any row it
+    did NOT name is refused: that is the shape a failed read takes on the way
+    to disk. Returns True when the bytes landed."""
+    try:
+        had = pine_read_or_raise()
+    except FileNotFoundError:
+        had = []
+    except Exception as exc:  # noqa: BLE001
+        _PINE_READ_FAILED.update({"at": time.time(), "why": str(exc)[:200]})
+        print("[pine] REFUSING to write the request book: it could not be "
+              "read first (%s). %d request(s) were about to be written over "
+              "an unknown file (#1255)." % (str(exc)[:120], len(items)),
+              flush=True)
+        return False
+
+    meant = set()
+    if dropping is not None:
+        meant = {int(d) for d in (dropping if isinstance(dropping, (list, tuple, set))
+                                  else [dropping])}
+    before = {int(it["id"]) for it in had}
+    after = {int(it["id"]) for it in items}
+    lost = before - after - meant
+    if lost and had:
+        print("[pine] REFUSING to write the request book: %d request(s) "
+              "would vanish unasked (%s) while %s. The book on disk is kept "
+              "(#1255)." % (len(lost), ", ".join("#%d" % i for i in sorted(lost)),
+                            why or "writing"), flush=True)
+        return False
+
+    body = _pine_render(items)
+    try:
+        PINE_REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if PINE_REQUESTS_PATH.exists():
+            # One generation back, so even a wrong-but-allowed write is
+            # recoverable. This file is not in git; nothing else keeps it.
+            try:
+                PINE_REQUESTS_PATH.with_suffix(".prev.md").write_bytes(
+                    PINE_REQUESTS_PATH.read_bytes())
+            except Exception:  # noqa: BLE001
+                pass
+        PINE_REQUESTS_PATH.write_text(body, encoding="utf-8")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print("[pine] could not write the request book: %s" % exc, flush=True)
+        return False
+
+
 # #1007: the body of a request WITHOUT its attachment blocks, which is
 # what makes two submissions "the same request" even when they carry
 # different screenshots.
@@ -7584,7 +7654,7 @@ async def pine_append(text: str) -> dict[str, Any]:
                 if add and add not in str(it.get("text") or ""):
                     it["text"] = (str(it.get("text") or "").rstrip()
                                   + add).strip()
-                    PINE_REQUESTS_PATH.write_text(_pine_render(items), encoding="utf-8")
+                    pine_write(items, "folding an attachment in")  # [#1255]
                 return it
     async with _pine_lock:
         items = pine_read()
@@ -7598,7 +7668,7 @@ async def pine_append(text: str) -> dict[str, Any]:
         }
         items.insert(0, item)          # newest first
         PINE_REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PINE_REQUESTS_PATH.write_text(_pine_render(items), encoding="utf-8")
+        pine_write(items, "filing a new request")  # [#1255]
         return item
 
 
@@ -7613,7 +7683,8 @@ async def pine_remove(req_id: int) -> dict[str, Any] | None:
             else:
                 rest.append(it)
         if found is not None:
-            PINE_REQUESTS_PATH.write_text(_pine_render(rest), encoding="utf-8")
+            pine_write(rest, "taking a request out",
+                       dropping=found.get("id"))  # [#1255]
         return found
 
 
@@ -124311,7 +124382,8 @@ async def _script_report_attach_inbox(report: dict[str, Any]) -> None:
             if missing:
                 item["text"] = text.rstrip() + "\n\nAttached images:\n" + "\n".join(
                     "![captured script](data/pine_uploads/%s) [img:%s]" % (n, n) for n in missing)
-                await asyncio.to_thread(PINE_REQUESTS_PATH.write_text, _pine_render(items), encoding="utf-8")
+                await asyncio.to_thread(  # [#1255]
+                    pine_write, items, "linking a report's pictures")
     await asyncio.to_thread(_SCRIPT_REPORT_STORE.mark_images_linked, Path(report["file"]).name)
     report["inbox_images_linked"] = True
 
@@ -172814,7 +172886,7 @@ async def pine_edit(
         if not text:
             raise HTTPException(status_code=400, detail="A request cannot be empty")
         it["text"] = text
-        PINE_REQUESTS_PATH.write_text(_pine_render(items), encoding="utf-8")
+        pine_write(items, "an edit from the panel")  # [#1255]
     note_action("you edited Pine request #%d" % int(req_id))
     return {"ok": True, "edited": it, "count": len(items),
             "image": str(it.get("image") or ""),
