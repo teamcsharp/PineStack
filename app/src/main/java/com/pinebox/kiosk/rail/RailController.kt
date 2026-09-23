@@ -966,10 +966,6 @@ class RailController(
                 val routed = JSONObject(client.post("/api/dj/output", DjOutput.preset(key)))
 
                 settings.put("broadcast_to", key)
-                val pinetab = settings.optJSONObject("pinetab") ?: JSONObject()
-                pinetab.put("audio", key == "pinetab")
-                pinetab.put("at", System.currentTimeMillis())
-                settings.put("pinetab", pinetab)
                 val terminals = settings.optJSONObject("terminals") ?: JSONObject()
                 val names = ArrayList<String>()
                 val keys = terminals.keys()

@@ -28,6 +28,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -432,6 +433,10 @@ class MainActivity : AppCompatActivity() {
     private var cornerLockWas = -1
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        /* Observe the native picture without giving it ownership of input.
+         * This keeps its tap-to-edit gesture while fullscreen video remains
+         * transparent to the panel and the four navigation corners. */
+        videoWall?.observeTouch(ev)
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             cornerLockWas = -1
             val prefs = HotCorners.live
@@ -1378,6 +1383,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private inner class PanelClient : WebViewClient() {
+
+        override fun onRenderProcessGone(
+            view: WebView,
+            detail: RenderProcessGoneDetail,
+        ): Boolean {
+            Log.e(TAG, "panel renderer gone; crashed=${detail.didCrash()}")
+            mainFrameFailed = true
+            showStatus("The panel stopped. Rebuilding it...", retry = false)
+            /* Recreating the activity also reconstructs every document-start
+             * bridge and native surface. Reusing a WebView whose renderer is
+             * gone is unsupported and tends to leave a half-alive kiosk. */
+            (view.parent as? android.view.ViewGroup)?.removeView(view)
+            view.destroy()
+            window.decorView.post {
+                if (!isFinishing && !isDestroyed) recreate()
+            }
+            return true
+        }
 
         /**
          * Two prefixes lifted off the WebView's six sockets. PineNet carries

@@ -230,13 +230,9 @@ function planFor(key, settings, roster) {
   for (const stream of STREAMS) output[stream] = chosen.to;
 
   /* Read-modify-write, because the PUT replaces the document. The
-   * destination is the durable statement - not the listener id, which is
-   * minted fresh on every page load. */
+  * destination is the durable statement - not the listener id, which is
+  * minted fresh on every page load. */
   const next = Object.assign({}, settings || {});
-  next.pinetab = Object.assign({}, next.pinetab || {}, {
-    audio: chosen.page === 'pinetab',
-    at: Date.now()
-  });
   next.broadcast_to = key;
 
   /* Every device's row follows the one destination, so nothing is left

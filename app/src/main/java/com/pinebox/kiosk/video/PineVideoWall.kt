@@ -161,12 +161,10 @@ class PineVideoWall(
 
     init {
         addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        /* [#1441] IT ANSWERS A TAP NOW. #1431 made this pass every touch
-         * through, because at the time it covered the whole screen and
-         * swallowed the panel. It sits in the operator's own box now, and
-         * a surface that IS the picture should answer a press on the
-         * picture - there is nothing behind it the press was meant for. */
-        isClickable = true
+        /* The activity observes taps before dispatch. The wall itself must
+         * never own input: a missing box can legitimately make it full-screen,
+         * and consuming that surface strands the operator outside the panel. */
+        isClickable = false
         isFocusable = false
         isFocusableInTouchMode = false
         visibility = View.GONE
@@ -178,6 +176,7 @@ class PineVideoWall(
     private var downX = 0f
     private var downY = 0f
     private var downAt = 0L
+    private var trackingTap = false
 
     /**
      * [#1441] A PRESS AND A RELEASE INSIDE THE SLOP IS A TAP; anything
@@ -185,31 +184,43 @@ class PineVideoWall(
      * Consumed either way: this surface is the picture, and a press on it
      * was never meant for whatever the box happens to be lying over.
      */
-    @Suppress("ClickableViewAccessibility")
-    override fun onTouchEvent(event: android.view.MotionEvent?): Boolean {
-        val press = event ?: return false
-        if (!running.get() || veiled || visibility != View.VISIBLE) return false
+    fun observeTouch(press: android.view.MotionEvent) {
+        if (!running.get() || veiled || visibility != View.VISIBLE) {
+            trackingTap = false
+            return
+        }
+        val here = IntArray(2)
+        getLocationOnScreen(here)
+        val inside = press.rawX >= here[0] && press.rawX < here[0] + width &&
+            press.rawY >= here[1] && press.rawY < here[1] + height
         when (press.actionMasked) {
             android.view.MotionEvent.ACTION_DOWN -> {
+                trackingTap = inside
+                if (!inside) return
                 downX = press.rawX
                 downY = press.rawY
                 downAt = android.os.SystemClock.uptimeMillis()
             }
             android.view.MotionEvent.ACTION_UP -> {
+                if (!trackingTap || !inside) { trackingTap = false; return }
                 val moved = Math.hypot(
                     (press.rawX - downX).toDouble(), (press.rawY - downY).toDouble())
                 val held = android.os.SystemClock.uptimeMillis() - downAt
+                trackingTap = false
                 if (moved <= TAP_SLOP_PX && held <= TAP_HOLD_MS) {
                     Log.i(TAG, "tap at ${press.rawX.toInt()},${press.rawY.toInt()}")
                     try { onTap?.invoke(press.rawX, press.rawY) }
                     catch (err: Throwable) { Log.w(TAG, "tap: ${err.message}") }
                 }
             }
+            android.view.MotionEvent.ACTION_CANCEL -> trackingTap = false
         }
-        return true
     }
 
-    override fun onInterceptTouchEvent(event: android.view.MotionEvent?): Boolean = true
+    @Suppress("ClickableViewAccessibility")
+    override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
+
+    override fun onInterceptTouchEvent(event: android.view.MotionEvent?): Boolean = false
 
     // ---------------------------------------------------------------- api
 

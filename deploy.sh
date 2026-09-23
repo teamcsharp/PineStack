@@ -27,6 +27,10 @@
 #
 #   ./deploy.sh            build, sign, install, verify
 #   ./deploy.sh --no-build just re-sign and install what is already built
+#
+# Before installation, tools/kiosk-preflight.sh reports the exact ADB target,
+# package versions, device-owner status, and lock-task state. It is read-only:
+# deployment never factory-resets, removes users/accounts, or changes owners.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -57,6 +61,7 @@ DEBUG="$HERE/app/build/outputs/apk/debug/app-debug.apk"
 SIGNED="$HERE/app/build/outputs/apk/debug/app-platform.apk"
 KEY="$HERE/keys/platform.pk8"
 CERT="$HERE/keys/platform.x509.pem"
+PREFLIGHT="$HERE/tools/kiosk-preflight.sh"
 
 say() { printf '\n== %s\n' "$1"; }
 
@@ -76,6 +81,10 @@ rm -f "$SIGNED"
 "$TOOLS/zipalign.exe" -p -f 4 "$DEBUG" "$SIGNED"
 "$TOOLS/apksigner.bat" sign --key "$KEY" --cert "$CERT" \
   --v1-signing-enabled true --v2-signing-enabled true "$SIGNED"
+
+say "kiosk deployment preflight"
+ADB="$ADB" AAPT="$TOOLS/aapt.exe" ANDROID_SDK="$SDK" PINE_TAB="$DEV" \
+  sh "$PREFLIGHT" --apk "$SIGNED"
 
 # IS THIS THE PLATFORM KEY? Asked twice, because neither question alone is
 # enough.

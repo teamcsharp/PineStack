@@ -18,9 +18,13 @@ tablet being a tablet.
 
 ```sh
 adb connect 10.89.1.154:5555
-adb -s 10.89.1.154:5555 install -r app/build/outputs/apk/debug/app-debug.apk
+./deploy.sh
 adb -s 10.89.1.154:5555 logcat -s PineKioskActivity PineBridge PinePanel PineKiosk PineAudio
 ```
+
+Use `deploy.sh`, not a direct install of `app-debug.apk`: the deployer applies
+and verifies the platform signature required by audio routing. Before it
+installs anything, it runs the read-only kiosk preflight described below.
 
 ## The station
 
@@ -71,12 +75,12 @@ git clone --depth 1 --branch 1.9.0 https://github.com/google/oboe \
 
 and it is picked up with no flags.
 
-**The JNI binding is still missing, and its package is not this one.**
-`cpp/android/jni_bridge.cpp` exports `Java_fm_pinebox_kiosk_audio_PineSampler_*`,
-so the class declaring those `external fun`s must be
-**`fm.pinebox.kiosk.audio.PineSampler`** - JNI resolves by *class* package,
-which need not match the application id, so such a class is perfectly legal
-inside this `com.pinebox.kiosk` app. It has not been written yet.
+**The JNI binding is live, and its package intentionally differs from the
+application id.** `cpp/android/jni_bridge.cpp` exports
+`Java_fm_pinebox_kiosk_audio_PineSampler_*`; the matching declarations live in
+`src/main/kotlin/fm/pinebox/kiosk/audio/PineSampler.kt`. JNI resolves by class
+package, so that class correctly lives inside the `com.pinebox.kiosk` app and
+is exposed to the panel through `PineSamplerBridge`.
 
 `audio/NativeAudio.kt` is only the loader: it names the library
 (`libpinebox_sampler.so`) in one place and reports `available = false`
@@ -107,6 +111,21 @@ adb -s 10.89.1.154:5555 shell dpm set-device-owner \
     com.pinebox.kiosk/.kiosk.PineDeviceAdminReceiver
 ```
 
+Run the deployment preflight before changing policy state:
+
+```sh
+sh tools/kiosk-preflight.sh
+sh tools/kiosk-preflight.sh --require-kiosk  # nonzero unless owner + lock task pass
+```
+
+It checks the selected ADB target, tablet identity, installed package/version,
+device/profile owners, lock-task state, users, accounts, and Android setup
+state. `deploy.sh` also supplies its signed candidate APK so the package and
+version about to be installed are shown. The preflight is strictly read-only:
+it never uninstalls an app, removes an account/user/admin, provisions an owner,
+or factory-resets the tablet. It also requires the tablet's known serial
+`HA1Y7RCV`; set `PINE_TAB_SERIAL` only when intentionally replacing the device.
+
 This **fails** unless:
 
 * the app is already installed,
@@ -121,6 +140,14 @@ already several users on the device", remove the extra users first:
 adb shell pm list users
 adb shell pm remove-user <id>
 ```
+
+Review those users and their data before removing any of them. If there is one
+owner user, no accounts, and no existing owner, the preflight prints the exact
+non-destructive `dpm set-device-owner` command to try. If Android rejects that
+command because setup has already provisioned the device, device ownership
+cannot be added in place: back up deliberately, factory-reset manually, and
+enroll the owner during initial setup. Neither preflight nor deployment will
+perform that reset.
 
 To undo it (the tablet becomes an ordinary tablet again):
 
