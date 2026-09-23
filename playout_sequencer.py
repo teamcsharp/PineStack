@@ -722,7 +722,41 @@ class LinearSequencer:
             # space it was waiting for. Stop reserving only once the air has
             # actually freed and it still was not taken - the same moment
             # evict_stale drops it, so the two tests agree.
-            if free <= now and ready_for > self.hold_reserve_s:
+            #
+            # [#1310] ...AND `free <= now` CANNOT HAPPEN WHILE THIS
+            # RESERVATION IS WHAT PUSHES `free`. `free` is _air_free_at:
+            # the end of the LAST pending row. Every filler this branch
+            # refuses is stamped at free + head.seconds and becomes a
+            # pending row, so the next ask sees a `free` further out than
+            # the one before. The bound therefore guards a condition the
+            # reservation itself guarantees will not arrive.
+            #
+            # Measured off data/playout/events.jsonl, 7.65 h: 243 holes in
+            # the stamped page schedule, 7,497 s, 27.2% of wall clock,
+            # median 23.0 s; 201 of the 202 holes >= 5 s were stamped with
+            # a round held as head and 153 of them match that head's own
+            # length within 3 s. 267 heads: 66 released, 158 dropped, 43
+            # still open at a median wait of 11,897 s - one of them head
+            # for 25,079 s, minting 23 separate 38.5 s holes. Nothing can
+            # ever fill a hole once stamped: the head lands after the
+            # fillers it pushed (its own _PAGE_AIR_UNTIL carries them) and
+            # page_feed_append clamps every clip to that same high-water
+            # mark. A reserved slot has never once been used.
+            #
+            # So ask the question the air can answer. Not "has the air
+            # freed" but "is anything sounding". A head ready longer than
+            # hold_reserve_s while the page is SILENT is not about to go -
+            # it has already failed to go, repeatedly - and the air it
+            # holds is dead air. While a clip is genuinely sounding the
+            # reservation stands exactly as #1290 left it, so the running
+            # order is still protected through every real round. The head
+            # keeps its place in `_held` and its rank either way. This is
+            # the test #1295's quiet-fill uses one function away, so the
+            # two now agree about what a hole is. Replayed against those
+            # 243 holes: 107 of them, 3,507 s, 47% of every hole second,
+            # are never minted.
+            if ready_for > self.hold_reserve_s and (
+                    free <= now or self._sounding(now, ROUTE_PAGE) is None):
                 return free
             return free + max(0.0, float(head.get("seconds") or 0.0))
 

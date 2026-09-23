@@ -25176,7 +25176,13 @@ def _admission_resolve(path: str) -> Path | None:
                 levelled = None
             if levelled is not None and levelled.is_file():
                 return levelled
-            return sample if sample.is_file() else None
+            # #1315: `sample.is_file()` was a SECOND round trip to
+            # the CIFS share on the event loop, immediately after
+            # the one inside sfx_levelled_name - and the answer to
+            # both is one stat. sfx_stamp has already asked, and
+            # remembered; a zero means exactly what is_file() False
+            # meant, because it checks S_ISREG off the same stat.
+            return sample if sfx_stamp(sample) else None  # [#1315]
         for prefix, room in (("/ads-audio/", PRODUCED_ADS_DIR),
                              ("/upstairs-audio/", UPSTAIRS_AUDIO_DIR)):
             if raw.startswith(prefix):
@@ -75333,29 +75339,99 @@ def _sfx_len_save() -> None:
         pass
 
 
+# --- #1315: THE STAT THAT WENT DEAF -----------------------------------
+# /samples is a CIFS mount of //exbox.local/quickswap, mounted `ro` and
+# `actimeo=1`: the kernel's attribute cache expires within a second, so
+# very nearly every stat() of a sample is a fresh round trip over the LAN.
+# Measured on the host on 2026-09-23 over 250 sample files: 664 ms median,
+# 1.08 s at p90, and one call in that 250 took 13.2 SECONDS. Learning that
+# a path is NOT there still costs ~380 ms. The host watchdog gives
+# /healthz eight seconds before it restarts the station, and a restart is
+# three to four minutes of dead air.
+#
+# The stamp is only ever used to INVALIDATE a derived file when the sample
+# underneath it changes, and the share is mounted READ-ONLY - nothing this
+# station does can change a sample while it is on the air. So remember it.
+SFX_STAT_TTL_S = float(os.getenv("SFX_STAT_TTL_S", "900"))
+SFX_STAT_MEMO_MOST = 40000
+_SFX_STAT_MEMO: dict[str, tuple[float, int]] = {}
+
+
+def sfx_stamp(path: Path) -> int:  # [#1315]
+    """`path`'s mtime in ns, off the share at most once per TTL. 0 = no file.
+
+    0 is the honest answer to "not a regular file on the share any more"
+    AND to "the share did not answer", which are the same thing to every
+    caller here: there is no derived file to name and nothing to hand the
+    box. The zero is remembered like any other answer, because an id the
+    pool no longer holds gets asked for over and over and every miss
+    costs its own round trip.
+
+    S_ISREG is checked so this keeps `is_file()`'s meaning exactly - it
+    is the same stat, so the check is free.
+    """
+    key = str(path)
+    now = time.time()
+    held = _SFX_STAT_MEMO.get(key)
+    if held is not None and (now - held[0]) < SFX_STAT_TTL_S:
+        return held[1]
+    try:
+        info = path.stat()
+        stamp = int(info.st_mtime_ns) if (info.st_mode & 0o170000) == 0o100000 else 0
+    except OSError:
+        stamp = 0
+    if len(_SFX_STAT_MEMO) >= SFX_STAT_MEMO_MOST:
+        _SFX_STAT_MEMO.clear()   # a pack repointed at a bigger library
+    _SFX_STAT_MEMO[key] = (now, stamp)
+    return stamp
+
+
+def sfx_stamp_forget(path: Path | None = None) -> None:  # [#1315]
+    """Drop a remembered stamp - or all of them - so the next ask pays.
+
+    The pool refresher calls this when it notices the pack has moved; it
+    is also the one-line cure if a sample really is replaced under a
+    running station and somebody wants the new one NOW."""
+    if path is None:
+        _SFX_STAT_MEMO.clear()
+    else:
+        _SFX_STAT_MEMO.pop(str(path), None)
+
+
 def sfx_seconds_held(path: Path) -> float | None:
     """#1321: the measurement we ALREADY HOLD, or None. Never probes.
 
     The video pool needs to know which clips are free to judge and which
     cost an ffprobe over CIFS, so that it can publish the free ones
     before it starts paying for the rest. sfx_seconds() cannot answer
-    that question because answering it is what costs the money."""
-    try:
-        key = f"{path}:{path.stat().st_mtime_ns}"
-    except OSError:
+    that question because answering it is what costs the money.
+
+    #1316: and for two days the first thing it did was spend it. The
+    key was built from `path.stat()`, which on the CIFS share is a
+    ~664 ms round trip (13.2 s at worst, measured 2026-09-23), so
+    "never probes" probed every time it was asked. `sfx_stamp` is
+    the same number, remembered - see #1315."""
+    stamp = sfx_stamp(path)  # [#1316]
+    if not stamp:
         return None
-    return _SFX_LEN_CACHE.get(key)
+    return _SFX_LEN_CACHE.get(f"{path}:{stamp}")
 
 
 def sfx_seconds(path: Path) -> float:
     """How long a sample actually runs. 0.0 means we could not tell.
 
     Cached on path+mtime: this is asked on every draw and the folder is
-    hundreds of files."""
-    try:
-        key = f"{path}:{path.stat().st_mtime_ns}"
-    except OSError:
+    hundreds of files.
+
+    #1316: the cache was right and the KEY was the cost. Reading the
+    mtime off the share is ~664 ms, paid on every lookup including
+    every hit, so a draw over hundreds of files spent minutes on the
+    event loop to avoid an ffprobe. The key is spelled exactly as
+    before, so every entry already in the ledger still matches."""
+    stamp = sfx_stamp(path)  # [#1316]
+    if not stamp:
         return 0.0
+    key = f"{path}:{stamp}"
     held = _SFX_LEN_CACHE.get(key)
     if held is not None:
         return held
@@ -76814,10 +76890,14 @@ def sfx_levelled_name(path: Path, vol: float | None = None) -> Path | None:
     the box is ABOUT TO BE HANDED, on the event loop, without doing the
     levelling itself. It is one function rather than two spellings of the
     same filename for the reason #1420 was written: the levels had lived
-    in two places and the two had drifted."""
-    try:
-        stamp = path.stat().st_mtime_ns
-    except OSError:
+    in two places and the two had drifted.
+
+    #1315: the stamp now comes from `sfx_stamp`, which is the same
+    number without the CIFS round trip. This function is called on
+    the event loop - its own note above says so - and that stat was
+    the top named blocker in the gap log over 48 hours."""
+    stamp = sfx_stamp(path)  # [#1315]
+    if not stamp:
         return None
     if vol is None:
         vol = box_gain()
@@ -98452,9 +98532,37 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # this is the first moment the audit's precondition can be
                 # met at all: "verify that its final audio is available and
                 # its ordered line/cue offsets are known" BEFORE committing.
-                _round_occurrence = await asyncio.to_thread(
-                    admission_admit_round, one, rows, length,
-                    producer="_speak_turns_floorless")
+                #
+                # [#1320] AND A THROW HERE IS A REASON TOO.
+                #
+                # This is the LAST step between the feed rows and any
+                # record of them. The rows are already in _RADIO["chat"]
+                # as `prepared`; the gate has not been told anything yet.
+                # A throw or a CancelledError on this await therefore
+                # leaves the round with no withdrawn_why, no ledger line
+                # and nothing in any file - the #1219 class, and the one
+                # shape the 2026-09-23 attribution could not place:
+                # sid 9322bf4f438f, welded whole, rows committed one
+                # second after this process wrote its last admission
+                # event and 112 s before it was killed. Every later step
+                # in this window runs AFTER an occurrence exists and is
+                # already covered by the resume sweep; this one is not.
+                # Same guard #1300 put on the weld, same order: record,
+                # then re-raise the exception on its way up untouched.
+                try:
+                    _round_occurrence = await asyncio.to_thread(
+                        admission_admit_round, one, rows, length,
+                        producer="_speak_turns_floorless")
+                except BaseException:
+                    try:
+                        _burst_withdraw(
+                            _round_entries,
+                            "the round was cut off on its way to the "
+                            "admission gate - its rows reached the feed "
+                            "and nothing was ever admitted for them")
+                    except Exception:  # noqa: BLE001
+                        pass            # a record never replaces the throw
+                    raise
                 # #1340: AND ON EVERY ROW OF THE ROUND, so a refusal one
                 # layer up can find what it has to take back - and so the
                 # feed row, the booth and the incident capture can all name
