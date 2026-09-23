@@ -119,13 +119,20 @@
         /* [#1189] the resolver's decision at this sample: how the mark was placed */
         mark: String(sample.mark || ''), road: String(sample.road || ''), sync: String(sample.sync || ''),
         expected_id: String(sample.expected_id || ''), carried_id: String(sample.carried_id || ''),
+        scroll_owner: String(sample.scroll_owner || ''),
+        scroll_owner_at_ms: number(sample.scroll_owner_at_ms),
+        live_segment: String(sample.live_segment || ''),
+        highlighted_segment: String(sample.highlighted_segment || ''),
+        nodes_transitioning: number(sample.nodes_transitioning),
         audio: {source: String(audio.source || 'unavailable'), file: String(audio.file || ''),
           position_start_s: number(audio.position_s), position_end_s: number(audio.position_s)}};
       var last = events[events.length - 1];
       var signature = JSON.stringify([event.highlight_id, event.active_id, event.document_revision,
         event.element_index, event.block, event.ord, event.scroll_top_px, event.lit_top_px,
         event.follow, event.paused, event.audio.source, event.audio.file,
-        event.mark, event.road, event.expected_id, event.carried_id]);   /* [#1189] */
+        event.mark, event.road, event.expected_id, event.carried_id,
+        event.scroll_owner, event.scroll_owner_at_ms, event.live_segment,
+        event.highlighted_segment, event.nodes_transitioning]);   /* [#1189/#1277] */
       var seek = false;
       if (last && last.audio.position_end_s !== null && event.audio.position_end_s !== null) {
         var delta = event.audio.position_end_s - last.audio.position_end_s;

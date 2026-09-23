@@ -24,13 +24,18 @@ NOW = time.time()
 SETTINGS = {"terminals": {}}
 ns = {"time": time, "Any": object,
       "AUDIO_OWNER_LIFE": 90.0,
+      "AUDIO_OWNER_QUICK": 12.0,
+      "OWNER_DEAF_SECONDS": 75.0, "OWNER_DEAF_REST": 300.0,
       "_AUDIO_OWNER": {}, "_LISTENER_SEEN": {},
+      "_OWNER_RUN": {"who": "", "since": 0.0},
+      "_OWNER_DEAF": {}, "_PAGE_ACK_EVENTS": [],
       "_TERMINALS_CACHE": {"at": 0.0, "rows": {}},
       "TERMINALS_TTL": 0.0,                       # no caching in the test
       "load_settings": lambda: SETTINGS,
       "pipeline_log": lambda *a, **k: None}
 for f in ("terminal_rows", "terminal_for_listener", "_listener_live",
-          "_listeners_live", "_listener_for_terminal", "audio_owner"):
+          "_listeners_live", "_listener_for_terminal", "_owner_deaf_key",
+          "_owner_resting", "_owner_takes_nothing", "audio_owner"):
     exec(fn(f), ns)
 audio_owner = ns["audio_owner"]
 

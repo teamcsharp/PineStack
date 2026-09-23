@@ -8,8 +8,8 @@
  * to pin the gap. The station routes each stream to box | here | both | off
  * | nabu (app.py:93361), and TWO of those five break the rule by
  * themselves: `both` is box AND a page by definition, and `here` means
- * every browser looking - the tablet, the Electron app and any web page on
- * the PC are all "here" clients.
+ * every browser looking. The picker deliberately exposes only the two
+ * application identities the operator runs: PineTab and PineApp.
  *
  * So a destination is two decisions - the route, and who holds the air
  * (#1008 /api/radio/solo) - and the tests below check that no combination
@@ -49,11 +49,12 @@ const ROSTER = (owner) => ({
 
 /* ---- what is on offer ----------------------------------------------- */
 
-test('every sink the operator named is offered, and Off', () => {
+test('the two page identities, physical sinks, and Off are offered', () => {
   const keys = destinations().map((entry) => entry.key);
-  for (const key of ['pinetab', 'app', 'web', 'box', 'nabu', 'off']) {
+  for (const key of ['pinetab', 'app', 'box', 'nabu', 'off']) {
     assert.ok(keys.includes(key), 'missing destination ' + key);
   }
+  assert.ok(!keys.includes('web'), 'an anonymous third page is not a destination');
 });
 
 test('NO destination routes to `both` - the one route that cannot be singular', () => {
@@ -89,11 +90,13 @@ test('this app takes the air by its own id prefix, wherever it is running', () =
   assert.ok(plan.solo.listener.startsWith(APP_PREFIX));
 });
 
-test('a web page is the one that is neither the app nor the tablet', () => {
-  /* All three share nothing but the roster: one id prefix and one address
-   * are what separate them. */
-  const plan = planFor('web', SETTINGS, ROSTER());
-  assert.deepEqual(plan.solo, {listener: 'pb546ttu7r'});
+test('collapsed station rows identify PineTab and PineApp directly', () => {
+  const collapsed = {audio_owner: '', listeners: [
+    {listener: 'desktop-one', device: 'desktop', seen: 0.2},
+    {listener: 'pb-one', device: 'pinetab', seen: 0.1}
+  ]};
+  assert.deepEqual(planFor('app', SETTINGS, collapsed).solo, {listener: 'desktop-one'});
+  assert.deepEqual(planFor('pinetab', SETTINGS, collapsed).solo, {listener: 'pb-one'});
 });
 
 test('the box and the Nabu RELEASE the air rather than leaving an owner behind', () => {

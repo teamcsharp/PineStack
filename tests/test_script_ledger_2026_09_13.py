@@ -190,6 +190,33 @@ class ScreenplayTakesTheLedgersWord(unittest.TestCase):
         self.assertEqual(self.ids(self.compose(rows, order)),
                          ["a0", "a1", "resc", "b0", "b1"])
 
+    def test_heard_scripted_sting_anchors_later_single_line_blocks(self):
+        """#1277: the last sting in a round must precede what aired after it.
+
+        Single-line catch-up blocks hang from heard spine rows. The action
+        adapter used to discard the sting's hearing receipt, so later blocks
+        hung from the dialogue before it and sorted ahead of the sting.
+        """
+        rows = [
+            {**air("a0", 10.0, "one"), "aired": "stream"},
+            {**air("a1", 11.0, "two"), "aired": "stream"},
+            {**air("sting", 12.0, "the cue", who="board", kind="sfx"),
+             "aired": "stream", "heard_ack_at": 12.0},
+            {**air("b0", 13.0, "three"), "aired": "stream"},
+            {**air("c0", 14.0, "four"), "aired": "stream"},
+        ]
+        order = {"a0": (1, 0, True), "a1": (1, 1, True),
+                 "sting": (1, 2, True),
+                 "b0": (2, 0, False), "c0": (3, 0, False)}
+        script = self.compose(rows, order)
+        sequence = [e.get("line") for e in script["elements"]
+                    if e.get("line") in order]
+        self.assertEqual(sequence, ["a0", "a1", "sting", "b0", "c0"])
+        sting = next(e for e in script["elements"]
+                     if e.get("line") == "sting")
+        self.assertEqual((sting.get("block"), sting.get("ord")), (1, 2))
+        self.assertEqual(sting.get("aired"), "stream")
+
 
 class TheRecordOnTheDeck(unittest.TestCase):
     """#1330: which record is turning, said on the entry itself."""

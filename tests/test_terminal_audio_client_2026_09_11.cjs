@@ -27,7 +27,7 @@ class FakeInput {
 }
 
 class FakeMedia {
-  constructor(where) { this.muted = false; this.where = where || ''; this._v = 1; }
+  constructor(where) { this.muted = false; this.where = where || ''; this._v = 1; this.dataset = {}; }
   closest(sel) { return this.where && sel.includes(this.where) ? {} : null; }
 }
 
@@ -176,12 +176,22 @@ test('a device switched off goes quiet but KEEPS its levels', () => {
 test('the desktop unmutes itself when it takes over from a dark tablet', () => {
   const {doc, client, state} = harness({id: 'desktop'});
   state.settings.terminals.pinetab.addr = '10.89.9.99';   /* gone */
-  doc.media.forEach((m) => { m.muted = true; });
+  mute(doc, true);
   return client.tick().then((decision) => {
     assert.equal(decision.takeover, 'desktop');
     assert.equal(doc.media[0].muted, false);
     assert.equal(doc.elements.djGainMusic.value, '60');
   });
+});
+
+test('a decorative video stays muted through a solo-gate handover', () => {
+  const {doc} = harness();
+  const decor = doc.media[1];
+  decor.dataset.pineDecor = '1';
+  decor.muted = true;
+  mute(doc, true);
+  mute(doc, false);
+  assert.equal(decor.muted, true, 'an intentional mute is not a gate mute');
 });
 
 test('a hand on the tablet\'s own slider wins and is written back', async () => {

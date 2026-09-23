@@ -19,6 +19,7 @@
 
 const api = window.pineDesktop || {};
 
+const glass = document.getElementById('glass');
 const film = document.getElementById('film');
 const waiting = document.getElementById('waiting');
 const track = document.getElementById('track');

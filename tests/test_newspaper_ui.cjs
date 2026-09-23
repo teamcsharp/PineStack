@@ -59,7 +59,7 @@ async function clipboardTest(nativeRefuses = false) {
     window: {pineDesktop: {copyImage: (data) => {copied.push(data); return !nativeRefuses;}}},
     navigator: {}, setTimeout() {},
     setStatus: (message) => messages.push(message),
-    paperEditionPng: async () => ({pages: 3, blob: 'all-three-pages'}),
+    paperEditionPlatePng: async () => ({pages: 3, blob: 'all-three-pages', png: 'all-three-pages'}),
     paperBlobUrl: async (blob) => 'data:image/png;base64,' + blob,
     paperCopyText: () => true,
     paperSaveBlob: (blob) => { saved.push(blob); return true; },

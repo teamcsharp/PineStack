@@ -176,3 +176,38 @@ test('the report posts its tap before requesting an image, then attaches only th
   assert.equal(finished[0].body.view.phase, 'post');
   assert.equal(captures[1].since, 1001);
 });
+
+test('script repaint settles folds before restoring and live follow has no smooth animation', () => {
+  const fs = require('node:fs'), path = require('node:path');
+  const source = fs.readFileSync(path.join(__dirname, '../desktop/renderer/script-page.js'), 'utf8');
+  const paint = source.slice(source.indexOf('  function paintScript('),
+    source.indexOf('  /* ONE SCROLL CONTROLLER.', source.indexOf('  function paintScript(')));
+  assert.ok(paint.indexOf('stitchScript(box, order);') < paint.indexOf('segApply(false);'));
+  assert.ok(paint.indexOf('segApply(false);') < paint.indexOf('scriptRestore(box, anchor);'));
+
+  const follow = source.slice(source.indexOf('  function keepLitInView('),
+    source.indexOf('  function seconds(', source.indexOf('  function keepLitInView(')));
+  assert.ok(follow.includes('seatLineNearest(pane, node)'));
+  assert.ok(!follow.includes("behavior: 'smooth'"));
+});
+
+test('script repaint anchors the visible on-air row before a generic visible row', () => {
+  const fs = require('node:fs'), path = require('node:path');
+  const source = fs.readFileSync(path.join(__dirname, '../desktop/renderer/script-page.js'), 'utf8');
+  const anchor = source.slice(source.indexOf('  function scriptAnchor('),
+    source.indexOf('  function scriptRestore(', source.indexOf('  function scriptAnchor(')));
+  assert.ok(anchor.includes("box.querySelector('.sp-el.sp-now')"));
+  assert.ok(anchor.indexOf("box.querySelector('.sp-el.sp-now')") < anchor.indexOf('for (var i = 0;'));
+});
+
+test('incident events retain the viewport movement owner and segment layout', () => {
+  const rec = diagnostics.createRecorder();
+  rec.observe(sample(1000, {scroll_owner: 'fold:live', scroll_owner_at_ms: 990,
+    live_segment: 'seg-a', highlighted_segment: 'seg-a', nodes_transitioning: 4}), []);
+  const got = rec.capture(1000, 'tap', 'incident');
+  assert.equal(got.events[0].scroll_owner, 'fold:live');
+  assert.equal(got.events[0].scroll_owner_at_ms, 990);
+  assert.equal(got.events[0].live_segment, 'seg-a');
+  assert.equal(got.events[0].highlighted_segment, 'seg-a');
+  assert.equal(got.events[0].nodes_transitioning, 4);
+});

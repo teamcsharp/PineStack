@@ -103,10 +103,11 @@
       </label>
       <label for="broadcastTarget">Broadcast</label>
       <select id="broadcastTarget">
-        <option value="nabu" selected>Nabu</option>
+        <option value="pinetab" selected>PineTab</option>
+        <option value="nabu">Nabu</option>
         <option value="box">Pine Box</option>
-        <option value="web">Web page</option>
-        <option value="app">Application</option>
+        <option value="app">PineApp</option>
+        <option value="off">Off</option>
         <option value="custom" disabled>Custom routes</option>
       </select>
       <p id="routeNote">routing unknown</p>
@@ -313,7 +314,7 @@
            controlFrame webview, and the endless set. Written through
            window.pineLevels (audio-law.js, #1192), which is the same number
            the Script view's Levels sheet and the Listen desk show, kept in
-           this machine's localStorage under `pineMixer`.
+           this machine's localStorage under `pineListenerLevels`.
            No route picker: the station has no road that sends a video
            somewhere else, and three dead options would be worse than none. -->
       <div id="mediaLevels" class="stream-routes">

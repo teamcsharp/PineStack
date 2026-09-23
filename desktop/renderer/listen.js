@@ -1544,15 +1544,13 @@
        * answer nine times out of ten, and three is the right answer when it
        * is not. */
       + '<div id="plDesk" class="pl-desk" hidden>'
-      /* 0-200%, not 0-100. These drive the panel's own gains, whose unity
-       * is 100 and whose voice bus sits at 160 by default - a 0-100 knob
-       * could not even represent where the desk already was, let alone
-       * reach it. */
+      /* The canonical listener bus carries the cut and boost stages together.
+       * 600% matches the panel gain controls and the Levels sheet. */
       + '<label class="pl-deskrow"><span>music</span>'
-      + '<input id="plDeskMusic" type="range" min="0" max="200" step="1">'
+      + '<input id="plDeskMusic" type="range" min="0" max="600" step="1">'
       + '<i id="plDeskMusicVal"></i></label>'
       + '<label class="pl-deskrow"><span>djs</span>'
-      + '<input id="plDeskVoice" type="range" min="0" max="200" step="1">'
+      + '<input id="plDeskVoice" type="range" min="0" max="600" step="1">'
       + '<i id="plDeskVoiceVal"></i></label>'
       /* #1194: THE DUCK ROW IS THE PANEL'S djDuck AND NOTHING ELSE.
        * It sets how far the music dips while a DJ is talking - the depth
@@ -1574,6 +1572,9 @@
       + 'the player itself."><span>here</span>'
       + '<input id="plDeskLocal" type="range" min="0" max="100" step="1">'
       + '<i id="plDeskLocalVal"></i></label>'
+      + '<label class="pl-deskrow" title="How loud clips and sound effects play on this terminal."><span>clips / sfx</span>'
+      + '<input id="plDeskSfx" type="range" min="0" max="100" step="1">'
+      + '<i id="plDeskSfxVal"></i></label>'
       /* [#1187]: "Offer a slider for setting the volume of videos that play
        * as well."  Everything with a picture and a soundtrack on this glass:
        * the SFX guy's set, the panel's little CRT tube, and - on the tablet -
@@ -1768,23 +1769,6 @@
       });
     }
 
-    /* Talk only: a STATION route, not a level. */
-    const talk = el("plTalkOnly");
-    if (talk) talk.addEventListener("click", async () => {
-      const was = talk.textContent;
-      talk.textContent = "...";
-      try {
-        const law = root.PineAudioLaw;
-        const state = root.PineStationFeed && root.PineStationFeed.state
-      ? (root.PineStationFeed.state() || {}) : {};
-        await law.talkOnly(!law.isTalkOnly(state), state);
-        paintDesk();
-      } catch (err) {
-        talk.textContent = String(err.message || err).slice(0, 26);
-        setTimeout(() => { talk.textContent = was; }, 2000);
-      }
-    });
-
     /* THE DRAWER IS THE LAW, and these are the same controls.
      *
      * They used to move the PANEL's djGainMusic / djGainVoice - this
@@ -1849,9 +1833,12 @@
       input.addEventListener("input", () => {
         const law = root.PineAudioLaw;
         deskTouched[stream] = Date.now();   /* a read-back must not fight the thumb */
-        const road = law && law.setMix
-          ? law.setMix(stream, Number(input.value))
-          : (law && law.setLocalMix && law.setLocalMix(stream, Number(input.value)) ? "local" : "");
+        const bus = videoBus();
+        const road = stream !== "duck" && bus
+          ? (bus.apply(stream, Number(input.value) / 100) || "bus")
+          : law && law.setMix
+            ? law.setMix(stream, Number(input.value))
+            : (law && law.setLocalMix && law.setLocalMix(stream, Number(input.value)) ? "local" : "");
         deskSay(stream, out, input.value, road);
       });
       /* THE STATION IS ONLY WRITTEN WHERE THERE IS NO LOCAL DESK AT ALL.
@@ -1866,6 +1853,7 @@
       input.addEventListener("change", async () => {
         const law = root.PineAudioLaw;
         if (!law) return;
+        if (stream !== "duck" && videoBus()) return;
         if (law.mixRoad && law.mixRoad(stream)) return;
         if (law.localMix && law.localMix(stream) !== null) return;
         if (stream === "duck") return;
@@ -1892,6 +1880,23 @@
           if (!input2) continue;
           deskSay(stream2, out2, input2.value,
             reach[stream2] ? (law0.mixRoad ? law0.mixRoad(stream2) : "panel") : "");
+        }
+      });
+    }
+    const shared = videoBus();
+    if (shared && typeof shared.onApply === "function" && !desk.dataset.levelWatch) {
+      desk.dataset.levelWatch = "1";
+      shared.onApply((levels) => {
+        for (const [kind, id, out] of [["music", "plDeskMusic", "plDeskMusicVal"],
+          ["voice", "plDeskVoice", "plDeskVoiceVal"],
+          ["sfx", "plDeskSfx", "plDeskSfxVal"],
+          ["video", "plDeskVideo", "plDeskVideoVal"]]) {
+          const input = el(id);
+          if (!input || document.activeElement === input) continue;
+          const pct = Math.round(Number(levels[kind] == null ? 1 : levels[kind]) * 100);
+          input.value = String(pct);
+          const label = el(out);
+          if (label) { label.textContent = pct + "%"; label.classList.remove("gone"); }
         }
       });
     }
@@ -1940,13 +1945,14 @@
         if (vol) vol.value = local.value;
       });
     }
-    wireVideoRow();                                              /* [#1187] */
+    wireLevelRow("sfx", "plDeskSfx", "plDeskSfxVal");
+    wireLevelRow("video", "plDeskVideo", "plDeskVideoVal");
   }
 
   /* [#1187]: THE VIDEOS ROW, ON ITS OWN ROAD.
    *
    * window.pineLevels (audio-law.js, #1192) is the one bus for the four
-   * listener levels.  It persists to this device's `pineMixer`, moves
+   * listener levels. It persists to `pineListenerLevels`, moves
    * everything this document owns synchronously, and coalesces the two
    * things that cost a crossing - the shell's injection into its webviews
    * and the tablet's native video wall - onto one animation frame.
@@ -1959,51 +1965,52 @@
       ? root.pineLevels : null;
   }
 
-  function videoLevelNow() {
+  function listenerLevelNow(kind) {
     const bus = videoBus();
     if (bus) {
-      const got = Number((bus.get() || {}).video);
-      if (Number.isFinite(got)) return Math.max(0, Math.min(1, got));
+      const got = Number((bus.get() || {})[kind]);
+      const top = Number((bus.CEIL || {})[kind]) || 1;
+      if (Number.isFinite(got)) return Math.max(0, Math.min(top, got));
     }
     try {
-      const m = JSON.parse(localStorage.getItem("pineMixer") || "{}") || {};
-      const v = Number(m.video);
+      const m = JSON.parse(localStorage.getItem("pineListenerLevels") || "{}") || {};
+      const v = Number(m[kind]);
       if (Number.isFinite(v)) return Math.max(0, Math.min(1, v));
     } catch (err) { /* first run */ }
     return 1;
   }
 
-  function wireVideoRow() {
-    const row = el("plDeskVideo");
+  function wireLevelRow(kind, id, out) {
+    const row = el(id);
     if (!row || row.dataset.wired) return;
     row.dataset.wired = "1";
-    const label = el("plDeskVideoVal");
+    const label = el(out);
     const paint = (pct, road) => {
       if (!label) return;
       label.textContent = pct + "%" + (road ? "" : " (no video here)");
       label.classList.toggle("gone", !road);
     };
-    row.value = String(Math.round(videoLevelNow() * 100));
+    row.value = String(Math.round(listenerLevelNow(kind) * 100));
     paint(row.value, videoBus() ? "bus" : "");
     row.addEventListener("input", () => {
-      deskTouched.video = Date.now();     /* a read-back must not fight the thumb */
+      deskTouched[kind] = Date.now();     /* a read-back must not fight the thumb */
       const want = Number(row.value) / 100;
       const bus = videoBus();
       let road = "";
       if (bus) {
-        road = bus.apply("video", want) || "bus";
+        road = bus.apply(kind, want) || "bus";
       } else {
         /* No bus in this host: keep the honest old road rather than a dead
          * knob - the store plus whatever mixer this document has. */
         try {
-          const m = JSON.parse(localStorage.getItem("pineMixer") || "{}") || {};
-          m.video = want;
-          localStorage.setItem("pineMixer", JSON.stringify(m));
+          const m = JSON.parse(localStorage.getItem("pineListenerLevels") || "{}") || {};
+          m[kind] = want;
+          localStorage.setItem("pineListenerLevels", JSON.stringify(m));
           road = "store";
         } catch (err) { /* private mode */ }
         try {
           if (root.pineMixer && root.pineMixer.set) {
-            root.pineMixer.set({video: want});
+            const patch = {}; patch[kind] = want; root.pineMixer.set(patch);
             road = "mixer";
           }
         } catch (err) { /* the store still moved */ }
@@ -2013,15 +2020,15 @@
   }
 
   /* Read back, but never over a thumb that is still on it. */
-  function paintVideoRow() {
-    const row = el("plDeskVideo");
+  function paintLevelRow(kind, id, out) {
+    const row = el(id);
     if (!row) return;
     if (document.activeElement === row) return;
-    if (Date.now() - (deskTouched.video || 0) < 1200) return;
-    const pct = String(Math.round(videoLevelNow() * 100));
+    if (Date.now() - (deskTouched[kind] || 0) < 1200) return;
+    const pct = String(Math.round(listenerLevelNow(kind) * 100));
     if (row.value === pct) return;
     row.value = pct;
-    const label = el("plDeskVideoVal");
+    const label = el(out);
     if (label) {
       label.textContent = pct + "%";
       label.classList.toggle("gone", !videoBus());
@@ -2229,6 +2236,17 @@
       const input = el(id);
       const label = el(out);
       if (!input) continue;
+      const bus = videoBus();
+      if (stream !== "duck" && bus) {
+        const levels = bus.get() || {};
+        const value = Number(levels[stream]);
+        const top = Number((bus.CEIL || {})[stream]) || 1;
+        input.min = "0";
+        input.max = String(Math.round(top * 100));
+        input.value = String(Math.round((Number.isFinite(value) ? value : 1) * 100));
+        if (label) { label.textContent = input.value + "%"; label.classList.remove("gone"); }
+        continue;
+      }
       /* THIS TERMINAL'S MIX FIRST, because that is what these knobs move.
        * Reading the station's level here is what put every knob at 50 with
        * "not set" beside it while the real mix was 100 / 160 / 70. */
@@ -2290,7 +2308,8 @@
       const label = el("plDeskLocalVal");
       if (label) { label.textContent = here + "%"; label.classList.remove("gone"); }
     }
-    paintVideoRow();                                               /* [#1187] */
+    paintLevelRow("sfx", "plDeskSfx", "plDeskSfxVal");
+    paintLevelRow("video", "plDeskVideo", "plDeskVideoVal");
     /* WHERE THESE KNOBS LAND, SAID ON THE FACE OF THE DRAWER.
      * The operator asked for the sliders to mix what he is hearing; when
      * the desk they reach is in another document he should be able to see
@@ -2307,19 +2326,12 @@
     }
     /* ...and then the crossing, which fills in what only the panel knows. */
     deskFromPanel();
-    /* And the talk-only switch reads the route, not a remembered flag. */
-    const talk = el("plTalkOnly");
-    if (talk) {
-      const off = law.isTalkOnly(state);
-      talk.textContent = off ? "Music back on" : "Talk only";
-      talk.classList.toggle("on", off);
-    }
   }
 
   /* #1194: ONE CROSSING, AND ONLY WHEN THE DRAWER IS OPEN.
    *
-   * paintDesk is called when the drawer opens and after the talk-only
-   * switch, not on a timer, so this is not a poller - it is the read half
+   * paintDesk is called when the drawer opens, not on a timer, so this is
+   * not a poller - it is the read half
    * of the same road setMix writes down. It refuses to move a row the
    * operator is holding: a value that landed 200 ms ago and a thumb that is
    * still dragging would fight each other, and the thumb must win. Rows the
@@ -2340,6 +2352,7 @@
         const input = el(id);
         const label = el(out);
         if (!input) continue;
+        if (stream !== "duck" && videoBus()) continue;
         if (Date.now() - (deskTouched[stream] || 0) < 1200) continue;   /* the thumb wins */
         const road = stream === "voice" ? (got.voiceRoad || "") : (got.road || "");
         const top = law.mixMax ? law.mixMax(stream) : (stream === "duck" ? 90 : 200);

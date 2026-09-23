@@ -2974,7 +2974,7 @@
     return null;
   }
 
-  document.addEventListener('click', function (ev) {
+  if (root.document) root.document.addEventListener('click', function (ev) {
     var node = ev.target;
     if (!node || !node.closest) return;
     /* Not while something is being edited or dragged over the script, and
@@ -6071,6 +6071,11 @@
         }
     });
     var top = lit ? Math.round(lit.getBoundingClientRect().top - rect.top) : null;
+    var hiddenCount = 0, transitionCount = 0;
+    for (var d = 0; d < diagnosticNodes.length; d += 1) {
+      if (diagnosticNodes[d].hidden) hiddenCount += 1;
+      if (diagnosticNodes[d].classList.contains('sp-fx')) transitionCount += 1;
+    }
     diagnosticSnapshot = {
       recorder_version: 2, capture_source: 'script-page',
       highlight_id: lit ? String(lit.dataset.line || '') : '', active_id: String(active.id || ''),
@@ -6083,6 +6088,13 @@
       stream: liveStream ? {at: liveStream.at, length: liveStream.length, row_count: (liveStream.rows || []).length,
         rows: (liveStream.rows || []).filter(function (r) { return String(r.id || '') === String(active.id || '') || String(r.id || '') === nowLineId; }).map(function (r) { return {id: r.id, from: r.from, until: r.until}; })} : null,
       viewport: {scroll_top_px: Math.round(pane.scrollTop), height_px: pane.clientHeight, width_px: pane.clientWidth, content_height_px: pane.scrollHeight, lit_top_px: top},
+      layout: {live_segment: String(liveSeg || ''),
+        highlighted_segment: lit ? String(lit.dataset.seg || '') : '',
+        nodes_total: diagnosticNodes.length, nodes_hidden: hiddenCount,
+        nodes_transitioning: transitionCount,
+        segments_folded: Object.keys(folded).filter(function (key) {
+          return folded[key] && key !== liveSeg;
+        }).length},
       paused: stationPaused, follow: follow, visibility: String(document.visibilityState || ''),
       /* THE INCIDENT REFERENCES section 5 of the recording note asks
          for: script revision, performer session, accepted cut, assembly
@@ -6114,7 +6126,13 @@
       audio: audio, follow: follow, paused: stationPaused, snapshot: diagnosticSnapshot,
       mark: String(decision.mark || ''), road: String(decision.road || ''),       /* [#1189] */
       sync: String(decision.sync || ''), expected_id: String(decision.expected_id || ''),
-      carried_id: String(decision.carried_id || '')}, records);
+      carried_id: String(decision.carried_id || ''),
+      /* #1277: enough layout provenance to distinguish a server reindex from
+         restore, fold and follow moving the viewport after that reindex. */
+      scroll_owner: String(scrollOwner || ''), scroll_owner_at_ms: Number(scrollAt || 0),
+      live_segment: String(liveSeg || ''),
+      highlighted_segment: lit ? String(lit.dataset.seg || '') : '',
+      nodes_transitioning: transitionCount}, records);
   }
   var reportKind = 'report';
   function ensureCaution() {
@@ -6336,7 +6354,7 @@
     var line = el('spSayingText');
     if (!line) return;
     sayUntil = Date.now() + 4000;
-    sayingSaid = ' said';        /* never equal to a real print */
+    sayingSaid = '__pine_never_said__'; /* never equal to a real print */
     line.textContent = String(text || '');
   }
 
@@ -7226,6 +7244,11 @@
       scriptNodes.delete(key);
     });
     stitchScript(box, order);
+    /* Settle the final layout before measuring the reader's anchor. New
+       rows in an already-finished segment arrive visible; restoring first
+       and hiding them afterward makes the pane compensate twice in opposite
+       directions. That was the remaining same-line jump in #1256-#1270. */
+    segApply(false);
     scriptRestore(box, anchor);
     diagnosticDocument(box);
     ensureCaution();
@@ -7249,9 +7272,6 @@
        line is kept where the eye is if the repaint moved it. */
     placeMarks(lastDecision);
     keepLitInView('paint');
-    /* #1285: re-assert the folds, so a line arriving into a folded
-       segment arrives folded rather than springing it open. */
-    segApply();
     tick();
   }
 
@@ -7293,18 +7313,29 @@
     scrollAt = now;
     scrollLog.push({at: now, why: reason, top: Math.round(box.scrollTop)});
     if (scrollLog.length > 40) scrollLog.shift();
-    selfScrollUntil = now + 2400;          /* backstop only */
-    /* #1330: on the box that actually scrolls - `scrollend` clears the
-       backstop early, and the backstop governs when it is unavailable. */
-    try {
-      if ('onscrollend' in box) {
-        box.addEventListener('scrollend', function done() {
-          box.removeEventListener('scrollend', done);
-          selfScrollUntil = 0;
-        }, {once: true});
-      }
-    } catch (err) { /* the backstop still covers it */ }
+    /* Every automatic move is now one exact scrollTop assignment. Keep the
+       event guard only long enough for that assignment's scroll event; a
+       multi-second guard belonged to smooth animations and made the pane
+       feel frozen after each line. */
+    selfScrollUntil = now + 180;
     try { apply(box); } catch (err) { caughtNote('scroll:' + reason, err); }
+    return true;
+  }
+
+  function seatLineNearest(pane, node) {
+    if (!pane || !node || node.hidden) return false;
+    var lip = pane.getBoundingClientRect();
+    var seat = node.getBoundingClientRect();
+    if (!(seat.height > 0 && lip.height > 0)) return false;
+    var margin = Math.min(96, Math.max(20, lip.height * 0.14));
+    var top = lip.top + margin;
+    var bottom = lip.bottom - margin;
+    var delta = 0;
+    if (seat.height >= bottom - top) delta = seat.top - top;
+    else if (seat.top < top) delta = seat.top - top;
+    else if (seat.bottom > bottom) delta = seat.bottom - bottom;
+    if (Math.abs(delta) <= 0.5) return false;
+    pane.scrollTop = Math.max(0, pane.scrollTop + delta);
     return true;
   }
 
@@ -7317,6 +7348,18 @@
   function scriptAnchor(box) {
     if (!box || box.scrollTop <= 4) return {pinned: true};
     var lip = box.getBoundingClientRect();
+    /* #1277: while following the show, preserve the row the operator is
+       actually reading. A repaint used the first visible row instead; when
+       the server reindexed the active row, that unrelated anchor held still
+       and the active row landed hundreds of pixels offscreen. */
+    var live = box.querySelector('.sp-el.sp-now');
+    if (live && !live.hidden) {
+      var liveSeat = live.getBoundingClientRect();
+      if (liveSeat.height > 0 && liveSeat.bottom > lip.top + 1
+          && liveSeat.top < lip.bottom - 1) {
+        return {node: live, was: liveSeat.top, active: true};
+      }
+    }
     for (var i = 0; i < box.children.length; i += 1) {
       if (!box.children[i].classList.contains('sp-el')) continue;
       var seat = box.children[i].getBoundingClientRect();
@@ -7334,45 +7377,16 @@
        the browser's own anchoring has already chosen a neighbour. */
     if (!node || node.parentNode !== box) return;
 
-    /* 2026-09-15 (#1183): THE PLACE-HOLDER MEASURED THE FOLLOW'S OWN
-       ANIMATION AND ADDED IT TO THE SCROLL.
-
-       The operator filed a capture asking "Why did this jump like this?"
-       and the 26 transitions in it show the same shape twice. The
-       highlight lands off screen, the smooth follow starts, and one
-       sample later the scroll takes a single 3,407 px step past the line
-       it was chasing - lit_top_px 278, then -422, then -3829 - before
-       walking all the way back to 715 three and a half seconds later.
-       The second time, after the document jumped 34 revisions under the
-       reader, it was 941 px and four seconds.
-
-       The guard in moveScript is one-directional: a follow is held off
-       while a restore is fresh, and a restore is never held off while a
-       follow is in flight. A follow is a SMOOTH scroll, and the note
-       above it already measured that 21.9% of them are still running two
-       samples later. So the anchor is taken part-way through the
-       animation and read again a moment later, and the difference it
-       calls `drift` is mostly the animation's own travel. Adding that to
-       scrollTop puts the pane where the animation was going to end up
-       ANYWAY, and the animation then goes there again from the new
-       place.
-
-       #1273 is right about reader-driven scroll and keeps every bit of
-       its reach here. It is wrong only while the pane is scrolling
-       itself, and in that case there is no reader's place to hold: the
-       follow exists to put the lit line on screen. So the drift is
-       dropped and the follow is re-issued instead, against the layout
-       that exists now rather than the one it started from. */
+    /* A same-turn follow already established the intended seat. Re-seat
+       once against the settled layout instead of treating that deliberate
+       movement as anchor drift. There is no animation left to race. */
     if (Date.now() < selfScrollUntil && scrollOwner === 'follow') {
       var lit = box.querySelector('.sp-el.sp-now');
       scrollLog.push({at: Date.now(), why: 'restore:skipped-mid-follow',
                       top: Math.round(box.scrollTop)});
       if (scrollLog.length > 40) scrollLog.shift();
       if (lit) {
-        moveScript('follow', function () {
-          try { lit.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
-          catch (err) { lit.scrollIntoView(false); }
-        });
+        moveScript('follow', function (pane) { seatLineNearest(pane, lit); });
       }
       return;
     }
@@ -8815,9 +8829,8 @@
     var out = seat.bottom <= pane.top || seat.top >= pane.bottom;
     if (!out) return false;
     keptAt = now;
-    return moveScript('follow:' + (reason || 'drift'), function () {
-      try { node.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
-      catch (err) { node.scrollIntoView(false); }
+    return moveScript('follow:' + (reason || 'drift'), function (pane) {
+      seatLineNearest(pane, node);
     });
   }
 
@@ -9228,36 +9241,11 @@
     node.classList.add('sp-now');
     segFollow(node.getAttribute('data-seg') || '');          /* #1285 */
     if (follow) {
-      /* Centred, not merely visible: the operator is reading the
-       * conversation, and the next line wants to be under it.
-       *
-       * THE GUARD IS THE WHOLE FIX. Measured: the highlight was on screen
-       * in 0 of 7 talking samples, because a smooth scroll fires scroll
-       * events all the way down, the handler below read "the line is not
-       * visible yet" from one of them and switched following OFF - the
-       * auto-scroll cancelled itself on its first frame, every time. */
-      /* #1282: MOVE ONLY IF IT HAS TO, AND DO NOT CANCEL YOURSELF.
-       *
-       * `block:'center'` re-centred on every line change - about ten
-       * full animations a minute at a 6.4s median dwell, each one a
-       * chance for the page to move under a finger. `nearest` moves
-       * only when the line is actually outside the pane, and
-       * `.sp-now`'s scroll-margin keeps it off the edge when it does.
-       *
-       * And the 900ms guard was a fixed window against a scroll whose
-       * duration grows with distance - 21.9% of movements were still
-       * running two samples later. When it expired mid-flight the
-       * animation's own scroll events reached the handler, which read
-       * geometry that had not settled and switched following off. The
-       * scroll cancelled itself, which is the very fault the guard
-       * exists to prevent. `scrollend` says when it is really over. */
-      /* #1330 lives in moveScript() now, with the other three movers of
-         this pane: the backstop, the `scrollend` early clear and the box
-         that actually scrolls are declared in ONE place. */
-      moveScript('follow', function () {
-        try { node.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
-        catch (err) { node.scrollIntoView(false); }
-      });
+      /* Move only when needed, by one measured delta. Smooth animations
+         overlapped the next poll and made anchor restoration count their
+         unfinished travel a second time; an exact nearest-edge seat has no
+         in-flight state for a repaint to race. */
+      moveScript('follow', function (pane) { seatLineNearest(pane, node); });
     }
   }
 

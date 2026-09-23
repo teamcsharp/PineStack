@@ -143,6 +143,9 @@ test('DJS on the desk rides the shell\'s own voice mix, because the panel slider
     mixer: {get: () => ({voice: 1, music: 1}), set: (v) => { set.push(v); return v; }}
   });
 
+  await wait(20);                /* the canonical bus applies its boot state */
+  set.length = 0;
+
   assert.equal(law.mixRoad('voice'), 'shell');
   assert.equal(law.setMix('voice', 60), 'shell');
   await wait(40);

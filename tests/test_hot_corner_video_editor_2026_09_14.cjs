@@ -16,6 +16,12 @@ class Element {
   removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; }
   replaceChildren() { this.children = []; }
   setAttribute(name, value) { this.attrs[name] = value; }
+  getContext() {
+    return {setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {},
+      lineTo() {}, stroke() {}};
+  }
+  setPointerCapture() {}
+  releasePointerCapture() {}
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   removeEventListener(type, fn) { this.listeners[type] = (this.listeners[type] || []).filter(x => x !== fn); }
   fire(type, event = {}) { for (const fn of this.listeners[type] || []) fn(event); }

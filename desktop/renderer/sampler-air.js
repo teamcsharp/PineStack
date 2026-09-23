@@ -846,7 +846,7 @@
      * how many buffers the ring has lost since it started. */
     drops: function () {
       return { gaps: gaps, seconds: gapSeconds,
-               how: (typeof AudioWorkletNode === 'function' ? 'worklet-capable' : 'no worklet'),
+               how: (typeof root.AudioWorkletNode === 'function' ? 'worklet-capable' : 'no worklet'),
                block: BLOCK };
     },
     sliceWav: sliceWav, measure: measure, quiet: quiet, spectrum: spectrum,

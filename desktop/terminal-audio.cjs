@@ -37,12 +37,11 @@
 
 const STREAMS = ['music', 'voice', 'reply'];
 
-/* Three missed polls. The panel polls every 4s, so a device that has not
- * been heard from in 15s has genuinely gone - a screen that blanked, a
- * tablet picked up and carried out of the room, a browser tab closed.
- * Shorter than this and a slow poll on a busy station hands the air back
- * and forth; much longer and a dark tablet holds a silent room. */
-const STALE_SECONDS = 15;
+/* A busy WebView can miss several polls while decoding or rebuilding. Give
+ * it enough room to recover without handing the broadcast to the desktop
+ * and then snapping it back. This still fails over well inside the server's
+ * 90-second listener lease. */
+const STALE_SECONDS = 45;
 
 /* An <audio> element THROWS above 1.0:
  *   IndexSizeError: The volume provided (1.6) is outside the range [0, 1]

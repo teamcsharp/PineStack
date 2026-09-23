@@ -26,6 +26,7 @@ These are the tests worth having because each one fails SILENTLY:
 """
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -192,6 +193,23 @@ class TheRoadsThatMustStayAudible(unittest.TestCase):
             for _ in range(8):
                 self.assertEqual(app._sfx_any(), self.audio)
 
+    def test_a_matched_dead_air_pick_uses_the_path_not_the_match_tuple(self):
+        """The matcher also returns its explanation and score. Those are
+        metadata, not characters in a filesystem path."""
+        match = (self.audio, "matched 'heard'", 3.2)
+        with (mock.patch.object(app, "sfx_match_on", return_value=True),
+              mock.patch.object(app, "sfx_match_ready", return_value=True),
+              mock.patch.object(app, "sfx_match_sting_pick", return_value=match),
+              mock.patch.object(app, "sting_recent", return_value=False)):
+            self.assertEqual(app._sfx_any(), self.audio)
+
+    def test_the_video_fallback_excludes_the_cooldown(self):
+        with (mock.patch.object(app, "_sfx_video_pool", return_value=[self.video]),
+              mock.patch.object(app, "sfx_video_on_cooldown", return_value=True),
+              mock.patch.object(app, "unrepeated",
+                                side_effect=AssertionError("recent clip reached draw"))):
+            self.assertIsNone(app._sfx_any_video())
+
     def test_the_cadence_never_welds_a_picture_into_a_round(self):
         """Cadence punctuation is concatenated INTO the round's own wav.
         There is no picture in a rendered round to see one in."""
@@ -208,6 +226,45 @@ class TheRoadsThatMustStayAudible(unittest.TestCase):
               mock.patch.object(app, "_SFX_CADENCE_STATUS", {})):
             for _ in range(8):
                 self.assertEqual(app._sfx_cadence_pick(), self.audio)
+
+
+class RotationSurvivesARebuild(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.video = Path(self.temp.name) / "recent.mp4"
+        self.audio = Path(self.temp.name) / "recent.mp3"
+
+    def test_the_sting_ring_is_seeded_from_the_durable_airing_ledger(self):
+        row = {"id": app.sfx_id(self.audio), "name": self.audio.name,
+               "ts": int(time.time())}
+        with (mock.patch.object(app, "_STING_RING", {"seen": [], "at": {}}),
+              mock.patch.object(app, "_STING_RING_READY", [False]),
+              mock.patch.object(app, "sfx_history_rows", return_value=[row])):
+            self.assertTrue(app.sting_recent(str(self.audio)))
+            app.sting_remember(str(self.audio))
+            self.assertEqual(app._STING_RING["seen"], [row["id"]])
+
+    def test_the_video_cooldown_recovers_the_unflushed_history_tail(self):
+        row = {"id": app.sfx_id(self.video), "name": self.video.name,
+               "ts": int(time.time())}
+        missing = Path(self.temp.name) / "no-cooldown-file.json"
+        with (mock.patch.object(app, "SFX_VIDEO_PLAYED_PATH", missing),
+              mock.patch.object(app, "_SFX_VIDEO_PLAYED", {}),
+              mock.patch.object(app, "_SFX_VIDEO_PLAYED_READY", [False]),
+              mock.patch.object(app, "sfx_history_rows", return_value=[row])):
+            self.assertTrue(app.sfx_video_on_cooldown(row["id"]))
+
+    def test_cycle_requests_reject_recent_and_duplicate_video_ids(self):
+        with (mock.patch.object(app, "_SFX_CYCLE", {"requests": [], "stale": 0}),
+              mock.patch.object(app, "sfx_video_on_cooldown", return_value=True)):
+            self.assertFalse(app.sfx_cycle_request(self.video, "dj"))
+            self.assertEqual(app._SFX_CYCLE["stale"], 1)
+        with (mock.patch.object(app, "_SFX_CYCLE", {"requests": [], "stale": 0}),
+              mock.patch.object(app, "sfx_video_on_cooldown", return_value=False)):
+            self.assertTrue(app.sfx_cycle_request(self.video, "dj"))
+            self.assertFalse(app.sfx_cycle_request(self.video, "cohost"))
+            self.assertEqual(len(app._SFX_CYCLE["requests"]), 1)
 
 
 class TheStingWithAPicture(unittest.IsolatedAsyncioTestCase):
@@ -234,7 +291,8 @@ class TheStingWithAPicture(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app, "_SAT_SAW_TURN_AT", [0.0]),
             mock.patch.object(app, "_BOX_DOWN", {}),
             mock.patch.object(app, "_BOX_HOLD", []),
-            mock.patch.object(app, "sfx_seconds", return_value=2.5),
+            mock.patch.object(app, "sfx_db_seconds_async",
+                              mock.AsyncMock(return_value=2.5)),
             mock.patch.object(app, "sfx_history_add"),
             mock.patch.object(app, "sfx_note_play"),
             mock.patch.object(app, "note_activity"),

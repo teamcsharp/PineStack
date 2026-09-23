@@ -86,6 +86,15 @@ class NabuMixSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings['nabu_voice_level'], 0)
         self.assertEqual(settings['nabu_reply_level'], 0)
 
+    def test_validation_preserves_only_canonical_broadcast_destinations(self):
+        for destination in ('pinetab', 'app', 'box', 'nabu', 'off'):
+            incoming = copy.deepcopy(app.DEFAULT_SETTINGS)
+            incoming['broadcast_to'] = destination
+            self.assertEqual(app.validate_settings(incoming)['broadcast_to'],
+                             destination)
+        incoming['broadcast_to'] = 'some anonymous web page'
+        self.assertEqual(app.validate_settings(incoming)['broadcast_to'], '')
+
 
 if __name__ == '__main__':
     unittest.main()

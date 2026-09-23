@@ -174,7 +174,7 @@
     return WEIGHT_FLOOR + (1 - WEIGHT_FLOOR) * Math.pow(2, -age / HALF_LIFE_MS);
   }
 
-  /* Newest first, one entry per file, videos only. `status: "lost"` rows
+  /* Newest first, one entry per file, clips and stills. `status: "lost"` rows
    * are dropped: three of the 267 measured rows carry it and it means
    * ComfyUI never handed the file over, so the name would 404 forever. */
   function catalogue(payload, at, names) {
@@ -439,16 +439,13 @@
        * "If I tap on the picture, allow me to cycle between it being a
        * slideshow of just videos or videos and images."
        *
-       * This module catalogues CLIPS only - the stills live in the gallery
-       * strip beneath it, and lcd-gallery's rule of holding at most one
-       * decoded clip is the reason this screen survives a long evening on a
-       * 4 GB tablet. So the modes it can honour are "run" and "stand down",
-       * and it says which it did rather than pretending to filter a shelf
-       * it never held.
+       * This module catalogues clips and stills. Only clips are fetched and
+       * held as blobs; stills use the station route directly, so switching
+       * pools does not add decoded video pressure on the tablet.
        *
-       *   clips / both  -> keep playing clips
-       *   stills        -> stop, release the current one, and let the
-       *                    gallery strip be the slideshow
+       *   clips          -> clips, falling back to stills when no clips exist
+       *   both           -> prefer clips, then stills
+       *   stills         -> stills only
        */
       setMode(next) {
         const want = String(next || "clips");

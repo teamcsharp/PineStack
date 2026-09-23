@@ -57,68 +57,32 @@
     return n;
   }
 
-  /* The panel owns both systems. On the desk the SHELL owns every element's
-     volume (#1147) and defines its own window.pineMixer, so this reads
-     whatever is actually there rather than assuming which document it is in. */
-  function mixer() {
-    try {
-      if (root.pineMixer && typeof root.pineMixer.get === 'function') {
-        return root.pineMixer.get();
-      }
-    } catch (err) { /* fall through */ }
-    return {voice: 1, music: 1, sfx: 1, video: 1};
+  function bus() {
+    return root.pineLevels && typeof root.pineLevels.apply === 'function'
+      ? root.pineLevels : null;
   }
 
-  function gainEl(which) {
-    return root.document.getElementById(
-      which === 'music' ? 'djGainMusic' : 'djGainVoice');
-  }
-
-  /* What the speakers are actually getting, as a percentage, whichever half
-     of the arrangement is carrying it. */
+  /* The public bus owns both the cut and boost stages. No view reads either
+     lower-level factor directly, so a value set elsewhere cannot be hidden
+     by a stale multiplier here. */
   function levelOf(which) {
-    var m = mixer();
-    var cut = which === 'music' ? m.music : m.voice;
-    var g = gainEl(which);
-    var boost = g ? Number(g.value) : 100;
-    if (cut < 0.999) return Math.round(cut * 100);
-    return Math.round(boost);
+    var lane = bus();
+    var value = lane ? Number((lane.get() || {})[which]) : 1;
+    return Math.round((isFinite(value) ? value : 1) * 100);
   }
 
   function setLevel(which, pct) {
-    var want = Math.max(0, Math.min(600, Number(pct) || 0));
-    var m = {};
-    if (want <= 100) {
-      m[which] = want / 100;
-      try { if (root.pineMixer) root.pineMixer.set(m); } catch (err) { /* private mode */ }
-      apply(which, 100);
-    } else {
-      m[which] = 1;
-      try { if (root.pineMixer) root.pineMixer.set(m); } catch (err) { /* private mode */ }
-      apply(which, want);
-    }
-  }
-
-  /* The gain slider is the panel's own control, so it is moved the way a
-     person would move it - value then 'input' - and the panel's existing
-     handler does the rest. Nothing here reaches into the audio graph itself. */
-  function apply(which, pct) {
-    var g = gainEl(which);
-    if (!g) return;
-    g.value = String(Math.max(0, Math.min(600, pct)));
-    try { g.dispatchEvent(new root.Event('input', {bubbles: true})); }
-    catch (err) {
-      try { g.dispatchEvent(new root.Event('input')); } catch (e2) { /* old host */ }
-    }
+    var lane = bus();
+    if (!lane) return '';
+    return lane.apply(which, Math.max(0, Number(pct) || 0) / 100);
   }
 
   function setVideo(pct) {
     var want = Math.max(0, Math.min(100, Number(pct) || 0));
-    try { if (root.pineMixer) root.pineMixer.set({video: want / 100}); }
-    catch (err) { /* private mode */ }
+    return setLevel('video', want);
   }
 
-  function videoLevel() { return Math.round((mixer().video) * 100); }
+  function videoLevel() { return levelOf('video'); }
 
   function row(host, key, label, most, read, write, hint) {
     var wrap = el('div', 'plv-row');
@@ -171,6 +135,9 @@
     refreshers.push(row(node, 'music', 'The music', 600,
       function () { return levelOf('music'); },
       function (v) { setLevel('music', v); }));
+    refreshers.push(row(node, 'sfx', 'Clips / SFX', 100,
+      function () { return levelOf('sfx'); },
+      function (v) { setLevel('sfx', v); }));
     refreshers.push(row(node, 'video', 'Videos', 100,
       videoLevel, setVideo,
       'A video cannot play louder than itself, so this one stops at 100%.'));
@@ -181,6 +148,13 @@
 
     root.document.body.appendChild(node);
     sheet = node;
+    var lane = bus();
+    if (lane && typeof lane.onApply === 'function') {
+      node.__pineUnwatch = lane.onApply(function () {
+        if (!sheet) return;
+        for (var j = 0; j < refreshers.length; j += 1) refreshers[j]();
+      });
+    }
     /* Follow the panel's own sliders if they are moved elsewhere, but never
        while he has hold of one of these. */
     beat = root.setInterval(function () {
@@ -194,6 +168,9 @@
 
   function close() {
     if (beat) { try { root.clearInterval(beat); } catch (err) { /* gone */ } beat = null; }
+    if (sheet && typeof sheet.__pineUnwatch === 'function') {
+      try { sheet.__pineUnwatch(); } catch (err2) { /* already gone */ }
+    }
     if (sheet && sheet.parentNode) sheet.parentNode.removeChild(sheet);
     sheet = null;
   }
@@ -231,7 +208,8 @@
 
   root.PineLevels = {
     open: open, close: close, toggle: toggle, button: button,
-    level: levelOf, set: setLevel, video: videoLevel, setVideo: setVideo
+    level: levelOf, set: setLevel, video: videoLevel, setVideo: setVideo,
+    bus: bus
   };
 
   try {

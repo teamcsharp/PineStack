@@ -268,7 +268,7 @@
            the solo gate has gagged surfaced a second copy of the
            broadcast in half-second bursts. The cure for a gag is the air
            rung; pineSoloGate lifts it on its own next clock poll. */
-        if (String(d.pineGag || '') === '1') continue;
+        if (String(d.pineGag || '') === '1' || String(d.pineDecor || '') === '1') continue;
         if (n.muted && String(d.pineShellMuted || '') === '1') {
           n.muted = false;
           d.pineShellMuted = '';

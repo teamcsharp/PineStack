@@ -487,6 +487,8 @@ function fakeDom() {
         contains: (n) => self.classes.has(n)
       },
       classes: new Set(),
+      attrs: {},
+      setAttribute: (name, value) => { self.attrs[name] = String(value); },
       addEventListener: (type, fn) => {
         (self.handlers[type] = self.handlers[type] || []).push(fn);
       },

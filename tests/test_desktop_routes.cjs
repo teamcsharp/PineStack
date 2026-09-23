@@ -7,7 +7,7 @@ const source = fs.readFileSync(path.join(__dirname, '../desktop/renderer/rendere
 const functions = source.slice(source.indexOf('function routeKeyFromState('), source.indexOf('function setDesiredBroadcast('));
 function desktop() {
   const select = {value: 'app'};
-  const context = {ROUTES: {app: {}, nabu: {}, box: {}, web: {}}, desiredBroadcast: 'app', broadcastChanging: false,
+  const context = {ROUTES: {pinetab: {}, app: {}, nabu: {}, box: {}, off: {}}, desiredBroadcast: 'app', broadcastChanging: false,
     document: {activeElement: null}, labels: {}, postCalls: 0,
     $: (id) => id === 'broadcastTarget' ? select : null};
   context.setText = (id, value) => { context.labels[id] = value; };
@@ -29,7 +29,7 @@ test('desktop displayed preset follows a backend route change without writing ro
 test('mixed routes do not claim the whole station uses the named device', () => {
   const {context, select} = desktop();
   context.syncBroadcastFromServer({routing: {...nabu, music_to: 'here'}});
-  assert.equal(select.value, 'custom'); assert.match(context.labels.routeSummary, /Music: App\nDJs: Nabu/);
+  assert.equal(select.value, 'custom'); assert.match(context.labels.routeSummary, /Music: PineApp\nDJs: Nabu/);
   assert.equal(context.postCalls, 0);
 });
 test('physical output pause and station off remain visible with Nabu selected', () => {
@@ -42,6 +42,12 @@ test('a pending operator preset choice is not replaced by an old poll', () => {
   const {context, select} = desktop(); context.broadcastChanging = true;
   context.syncBroadcastFromServer({routing: nabu});
   assert.equal(select.value, 'app'); assert.equal(context.desiredBroadcast, 'app'); assert.equal(context.postCalls, 0);
+});
+
+test('the six-second desktop refresh is single-flight', () => {
+  assert.match(source, /let refreshFlight = null/);
+  assert.match(source, /if \(refreshFlight\) return refreshFlight/);
+  assert.match(source, /refreshFlight = refreshOnce\(\)/);
 });
 
 test('legacy recovery preserves a custom route instead of selecting Nabu', async () => {

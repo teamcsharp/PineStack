@@ -343,11 +343,12 @@ test('LCD follows round timing and keeps prepared activity distinct from real au
     {id: 'info', text: 'An image arrived', aired: 'analysis'}], stream_now: {at: 100, length: 180, rows: [
       {id: 'a', text: 'First', from: 0, until: 90}, {id: 'b', text: 'Second', from: 90, until: 180}]}};
   const early = stationRows(station, 101000);
-  assert.equal(early.at(-1).id, 'a'); assert.equal(early.at(-1).lcdStatus, 'Playing');
+  assert.equal(early.find((r) => r.id === 'a').lcdStatus, 'Playing');
   assert.equal(early.find((r) => r.id === 'b').lcdAudio, false);
   assert.equal(early.find((r) => r.id === 'info').lcdStatus, 'Booth activity');
   const next = stationRows(station, 191000);
-  assert.equal(next.at(-1).id, 'b'); assert.equal(next.at(-1).air_at, 190);
+  assert.equal(next.find((r) => r.id === 'b').lcdStatus, 'Playing');
+  assert.equal(next.find((r) => r.id === 'b').air_at, 190);
   assert.equal(next.filter((r) => r.id === 'b').length, 1);
   assert.equal(stationRows(station, 290000).some((r) => r.lcdStatus === 'Playing'), false);
 });

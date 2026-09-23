@@ -89,7 +89,7 @@ function wallHarness(payload, overrides) {
 
 /* ---------------------------------------------------- what is on the shelf */
 
-test("the wall keeps only video, drops lost renders, duplicates and unsafe names", async () => {
+test("the wall keeps playable media, drops lost renders, duplicates and unsafe names", async () => {
   const shelf = wallApi.catalogue(log(
     { kind: "image", ts: 1, files: ["a-picture.png"] },
     { kind: "video", ts: 3, status: "lost", files: ["never-arrived.mp4"] },
@@ -100,9 +100,9 @@ test("the wall keeps only video, drops lost renders, duplicates and unsafe names
     { kind: "video", ts: 7, files: "not an array" }
   ), NOW, {});
   assert.deepEqual(shelf.map((row) => row.file),
-    ["PineBox_00047_.MP4", "ok name (2).webm", "PineBox_00043_.mp4"]);
+    ["PineBox_00047_.MP4", "ok name (2).webm", "PineBox_00043_.mp4", "a-picture.png"]);
   /* Newest first, so a recency draw with a low roll lands on new work. */
-  assert.deepEqual(shelf.map((row) => row.ts), [6, 5, 4]);
+  assert.deepEqual(shelf.map((row) => row.ts), [6, 5, 4, 1]);
 });
 
 /* The LCD gallery EXCLUDES Gazette plates because a newspaper snapshot is
@@ -305,14 +305,15 @@ test("ComfyUI being down does not take the wall with it: what is playing keeps p
   h.wall.destroy();
 });
 
-test("an empty gallery says so rather than looking like a failure", async () => {
+test("a still keeps the wall alive when the gallery has no clips", async () => {
   const h = wallHarness(log({ kind: "image", ts: 1, files: ["only-a-picture.png"] }));
   h.tick();
   await h.ready();
   const state = h.tick();
-  assert.equal(state.ready, false);
-  assert.equal(state.total, 0);
-  assert.equal(state.state, "empty");
+  assert.equal(state.ready, true);
+  assert.equal(state.total, 1);
+  assert.equal(state.state, "playing");
+  assert.equal(state.file, "only-a-picture.png");
   assert.equal(state.error, "");
   h.wall.destroy();
 });

@@ -726,11 +726,11 @@
   /* ================================================================== */
 
   var LEVEL_KINDS = ['voice', 'music', 'sfx', 'video'];
-  /* A video's volume is a real element volume and cannot exceed 1; saying
-     150% on a control that saturates at 100% is the lie #1222 exists to
-     remove.  The other three ride a gain stage or a multiplier. */
-  var LEVEL_CEIL = {voice: 1.5, music: 1.5, sfx: 1.5, video: 1};
-  var LEVEL_KEY = 'pineMixer';
+  /* Video and SFX land on real element volumes and stop at 1. Dialogue and
+     music have real gain stages and retain the panel's full 600% range. */
+  var LEVEL_CEIL = {voice: 6, music: 6, sfx: 1, video: 1};
+  var LEVEL_KEY = 'pineListenerLevels';
+  var LEGACY_LEVEL_KEY = 'pineMixer';
 
   var lvlPending = null;        /* kind -> value, the thumb's latest */
   var lvlBooked = false;        /* a flush is booked for the next frame */
@@ -761,8 +761,35 @@
 
   function lvlStored() {
     var m = {};
-    try { m = JSON.parse(root.localStorage.getItem(LEVEL_KEY) || '{}') || {}; }
+    var has = false;
+    try {
+      var raw = root.localStorage.getItem(LEVEL_KEY);
+      has = raw !== null && raw !== undefined && String(raw).trim() !== '';
+      m = JSON.parse(raw || '{}') || {};
+    }
     catch (err) { m = {}; }
+    /* Migrate the actual old two-stage result, not just one of its factors.
+       A 31% gain multiplied by a 21% mixer was the split state this bus was
+       created to eliminate. Once the canonical key exists, no legacy value
+       is allowed to overwrite it. */
+    if (!has) {
+      var legacy = {};
+      try { legacy = JSON.parse(root.localStorage.getItem(LEGACY_LEVEL_KEY) || '{}') || {}; }
+      catch (err2) { legacy = {}; }
+      for (var j = 0; j < LEVEL_KINDS.length; j += 1) {
+        var name = LEVEL_KINDS[j];
+        var cut = legacy[name] === undefined ? 1 : Number(legacy[name]);
+        if (!isFinite(cut)) cut = 1;
+        if (name === 'voice' || name === 'music') {
+          var gain = gainNode(name);
+          var boost = gain && isFinite(Number(gain.value))
+            ? Number(gain.value) / 100 : 1;
+          m[name] = cut * boost;
+        } else {
+          m[name] = cut;
+        }
+      }
+    }
     var out = {};
     for (var i = 0; i < LEVEL_KINDS.length; i += 1) {
       var k = LEVEL_KINDS[i];
@@ -798,12 +825,36 @@
      here would flutter against it twice a second. */
   function lvlLocalNow(m) {
     var touched = false;
+    var mixer = {};
+    var gains = {};
+    for (var key in m) {
+      if (!Object.prototype.hasOwnProperty.call(m, key)) continue;
+      if (key === 'voice' || key === 'music') {
+        mixer[key] = m[key] <= 1 ? m[key] : 1;
+        gains[key] = Math.round((m[key] <= 1 ? 1 : m[key]) * 100);
+      } else {
+        mixer[key] = m[key];
+      }
+    }
     try {
       if (root.pineMixer && typeof root.pineMixer.set === 'function') {
-        root.pineMixer.set(m);
+        root.pineMixer.set(mixer);
         touched = true;
       }
     } catch (err) { /* the element writes below still stand */ }
+    for (var stream in gains) {
+      if (!Object.prototype.hasOwnProperty.call(gains, stream)) continue;
+      var input = gainNode(stream);
+      if (!input) continue;
+      input.value = String(gains[stream]);
+      try { input.dispatchEvent(new Event('input', {bubbles: true})); }
+      catch (err2) { /* an older WebView still gets the explicit apply */ }
+      try { input.dispatchEvent(new Event('change', {bubbles: true})); }
+      catch (err3) { /* as above */ }
+      touched = true;
+    }
+    try { if (Object.keys(gains).length && typeof root.djApplyGain === 'function') root.djApplyGain(); }
+    catch (err4) { /* the event normally owns this */ }
     if (typeof m.video === 'number') {
       var v = lvlNum('video', m.video);
       /* The SFX guy's set, through ITS OWN door - the module level, so the
@@ -897,7 +948,7 @@
    *   pineLevels.apply('video', 0.3)
    *
    * `kind` is one of voice | music | sfx | video; `value` is a fraction
-   * where 1 is unity (videos stop at 1, the rest reach 1.5).  Returns the
+   * where 1 is unity (video/SFX stop at 1, voice/music reach 6). Returns the
    * roads taken, synchronously, so a label can be honest in the same frame:
    * 'local', 'shell', 'wall', or '' when there is nothing here to move.
    */
@@ -980,6 +1031,9 @@
       take: function (values) { return levelsApplyAll(values); }
     };
   }
+  /* Apply the migrated or persisted law once the panel has mounted. Every
+     later control reads and writes the same state through the public bus. */
+  soon(function () { try { levelsApplyAll(levelsGet()); } catch (err) { /* boot continues */ } });
 
   root.PineAudioLaw = {
     localMix: localMix,

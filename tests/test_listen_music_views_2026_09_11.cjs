@@ -517,14 +517,17 @@ test('every element Listen paints is an element Listen builds', () => {
    * seams this view drives rather than owns: the shell's master volume
    * slider, which renderer.js listens to, and the Sampler's own host,
    * which the one-tap grab mounts when it has to. */
-  const borrowed = new Set(['appVolume', 'sampler']);
+  const borrowedShell = new Set(['appVolume', 'sampler']);
+  const borrowedPanel = new Set(['musicPlayer', 'djGainMusic']);
   for (const id of idsUsed(source)) {
-    if (borrowed.has(id)) continue;
+    if (borrowedShell.has(id) || borrowedPanel.has(id)) continue;
     assert.ok(built.has(id), 'listen.js paints #' + id + ' but never builds it');
   }
-  /* And the borrowed ones really are somebody else's, in index.html. */
+  /* The shell-owned seams really are somebody else's, in index.html.
+   * The panel-owned ids belong to the station panel app.py serves into the
+   * shell; their presence is covered by the panel's own contract tests. */
   const page = read('index.html');
-  for (const id of borrowed) {
+  for (const id of borrowedShell) {
     assert.ok(page.includes('id="' + id + '"'),
       '#' + id + ' is borrowed from a page that no longer has it');
   }

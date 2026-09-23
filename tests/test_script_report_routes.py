@@ -37,7 +37,8 @@ class ScriptReportRoutes(unittest.IsolatedAsyncioTestCase):
         source = Path(__file__).parents[1].joinpath("app.py").read_text(encoding="utf-8")
         wanted = {"script_report_status_api", "script_report_file_api", "_script_report_payload",
                   "_script_report_observe", "_script_report_answer", "script_report_api",
-                  "script_report_finish_api", "script_diagnostic_context", "_script_report_attach_inbox"}
+                  "script_report_finish_api", "script_diagnostic_context", "_script_report_attach_inbox",
+                  "_script_report_summary", "_script_report_sync_inbox"}
         tree = ast.parse(source)
         selected = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                     and n.name in wanted]
@@ -69,6 +70,7 @@ class ScriptReportRoutes(unittest.IsolatedAsyncioTestCase):
                        _SPEAKING_NOW={}, _STREAM_NOW={}, _LISTENERS={}, _PAGE_ACK_EVENTS=[], _PAGE_DELIVERIES={},
                        _TALK_ACK={}, _PULSE={"stalls": []}, radio_paused=lambda: False)
         self.ns.update(_pine_lock=asyncio.Lock(), pine_read=lambda: self.items,
+                       pine_write=lambda items, why="": True,
                        _pine_render=json.dumps, PINE_REQUESTS_PATH=self.folder / "inbox.md")
         exec(self.code, self.ns)
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test",
@@ -121,6 +123,24 @@ class ScriptReportRoutes(unittest.IsolatedAsyncioTestCase):
         screenshot = self.ns["_SCRIPT_REPORT_STORE"].read(name)["screenshot"]
         self.assertEqual(screenshot, {"captured_at_ms": 1400, "requested_at_ms": 1100,
                                      "source": "shotView", "error": "image unavailable"})
+
+    async def test_post_window_verdict_updates_only_the_owned_inbox_summary(self):
+        got = (await self.client.post("/api/script/report", json={"view": view()})).json()
+        name = Path(got["file"]).name
+        initial_summary = self.inbox.await_args.args[0]
+        self.assertIn("script-report-summary:start", initial_summary)
+        self.items[0]["text"] = initial_summary + "\n\nOperator note: keep this sentence."
+
+        post = view("post", "first", 11000)
+        post["events"][0].update(element_index=1, document_revision="revision-2")
+        result = await self.client.post("/api/script/report/" + name + "/finish", json={
+            "incident_id": "capture-one", "view": post})
+        self.assertEqual(result.status_code, 200, result.text)
+        final = self.ns["_SCRIPT_REPORT_STORE"].read(name)
+        message = final["analysis"]["findings"][0]["message"]
+        self.assertIn(message, self.items[0]["text"])
+        self.assertIn("Operator note: keep this sentence.", self.items[0]["text"])
+        self.assertEqual(self.items[0]["text"].count("script-report-summary:start"), 1)
 
     async def test_rapid_taps_get_distinct_artifacts_and_complete_json(self):
         names = []

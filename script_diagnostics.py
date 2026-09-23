@@ -98,6 +98,10 @@ def _snapshot(raw, omissions):
     out['viewport'] = _fields(raw.get('viewport'), (),
                              ('scroll_top_px', 'height_px', 'width_px', 'lit_top_px',
                               'scroll_height_px', 'client_height_px', 'content_height_px'), ('in_view',))
+    out['layout'] = _fields(raw.get('layout'),
+                           ('live_segment', 'highlighted_segment'),
+                           ('nodes_total', 'nodes_hidden', 'nodes_transitioning',
+                            'segments_folded'), omissions=omissions)
     mapping_rows = raw.get('mapping_rows')
     if isinstance(mapping_rows, list):
         out['mapping_rows'] = [identity for identity in mapping_rows[:96]
@@ -177,9 +181,13 @@ def normalize_view(value):
             omissions['invalid_events'] += 1
             continue
         event = _fields(raw_event, ('highlight_id', 'active_id', 'document_revision',
-                                    'mark', 'road', 'sync', 'expected_id', 'carried_id'),   # [#1189]
+                                    'mark', 'road', 'sync', 'expected_id', 'carried_id',
+                                    'scroll_owner', 'live_segment',
+                                    'highlighted_segment'),   # [#1189/#1277]
                         ('first_ms', 'last_ms', 'samples', 'element_index', 'block', 'ord',
-                         'scroll_top_px', 'lit_top_px'), ('follow', 'paused', 'audio_discontinuity'), omissions)
+                         'scroll_top_px', 'lit_top_px', 'scroll_owner_at_ms',
+                         'nodes_transitioning'),
+                        ('follow', 'paused', 'audio_discontinuity'), omissions)
         event['audio'] = _audio(raw_event.get('audio'), omissions)
         out['events'].append(event)
     rows = _mapping(raw.get('rows'))

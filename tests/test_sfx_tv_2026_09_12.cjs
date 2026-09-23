@@ -322,7 +322,7 @@ test('the picture carries no chrome, and its place is kept when it ends',
   tv.stop();
 });
 
-test('the level the shell hands over reaches the picture', async () => {
+test('the level the shell hands over reaches the picture through its short ramp', async () => {
   const {body} = world();
   station([aClip()]);
   const tv = load();
@@ -330,8 +330,10 @@ test('the level the shell hands over reaches the picture', async () => {
   await wait(60);
   const video = findByClass(body, 'sfx-tv-tube')[0].children[0];
   tv.level(0.4);
+  await wait(180);
   assert.equal(video.volume, 0.4);
   tv.level(2);                       // clamped, like every other level here
+  await wait(180);
   assert.equal(video.volume, 1);
   tv.stop();
 });

@@ -79,11 +79,8 @@ async function pineCopy(text) {
 }
 
 const ROUTES = {
+  pinetab: { label: "PineTab", music: "here", voice: "here", reply: "here", box_talk: false },
   box: { label: "Pine Box", music: "box", voice: "box", reply: "box", voice_device: "pine", box_talk: true },
-  // #814: web/app route audio to the PAGE — they must not silently
-  // re-point the core DEVICE at the retired pine satellite. They
-  // leave voice_device alone; only box/nabu name a device.
-  web: { label: "Web page", music: "here", voice: "here", reply: "here", box_talk: false },
   // #979: APPLICATION MEANS ALL OF IT, HERE. music was "off" - the same
   // literal the note below records as the reason the Nabu speaker "sat
   // silent between rounds", left in place on this route. The app played
@@ -92,18 +89,20 @@ const ROUTES = {
   // this route at all, and the moment anything relied on the page feed
   // there was nothing in it. Application now asks for the whole
   // broadcast - the music, the DJs and the replies - out of one place.
-  app: { label: "Application", music: "here", voice: "here", reply: "here", box_talk: false },
+  app: { label: "PineApp", music: "here", voice: "here", reply: "here", box_talk: false },
   // #786: Nabu is the CORE broadcast device — broadcasting to it means the
   // WHOLE station: music and the DJ voice both. music "off" here was why
   // the speaker sat silent between rounds.
-  nabu: { label: "Nabu", music: "box", voice: "box", reply: "box", voice_device: "nabu", box_talk: true }
+  nabu: { label: "Nabu", music: "nabu", voice: "nabu", reply: "nabu", voice_device: "nabu", box_talk: true },
+  off: { label: "Off", music: "off", voice: "off", reply: "off", box_talk: false }
 };
 
 const EMBEDDED_ROUTES = {
+  pinetab: { djOutput: "here", djVoiceOut: "here", djReplyOut: "here" },
   box: { djOutput: "box", djVoiceOut: "box", djReplyOut: "box" },
-  web: { djOutput: "here", djVoiceOut: "here", djReplyOut: "here" },
   app: { djOutput: "here", djVoiceOut: "here", djReplyOut: "here" },  // #979
-  nabu: { djOutput: "nabu", djVoiceOut: "nabu", djReplyOut: "nabu" }
+  nabu: { djOutput: "nabu", djVoiceOut: "nabu", djReplyOut: "nabu" },
+  off: { djOutput: "off", djVoiceOut: "off", djReplyOut: "off" }
 };
 
 function setText(id, text) {
@@ -1796,18 +1795,31 @@ async function openDesktopRejectionReview(id) {
 function routeKeyFromState(status) {
   const routing = status && status.routing ? status.routing : {};
   const destinations = [routing.music_to, routing.voice_to, routing.reply_to || routing.voice_to];
+  const saved = String((status && status.broadcast_to) || "");
+  if (["pinetab", "app"].includes(saved)
+      && destinations.every((value) => value === "here")) return saved;
+  if (saved === "off" && destinations.every((value) => value === "off")) return "off";
+  if (saved === "box" && destinations.every((value) => value === "box")
+      && routing.voice_device !== "nabu") return "box";
+  if (saved === "nabu" && (destinations.every((value) => value === "nabu")
+      || (destinations.every((value) => value === "box")
+          && routing.voice_device === "nabu"))) return "nabu";
   if (destinations.every((value) => value === "here")) return "app";
+  if (destinations.every((value) => value === "off")) return "off";
+  if (destinations.every((value) => value === "nabu")) return "nabu";
   if (destinations.every((value) => value === "box")) return routing.voice_device === "nabu" ? "nabu" : "box";
   return "custom";
 }
 
-function routeSummaryFromState(routing) {
+function routeSummaryFromState(routing, key) {
   if (!routing) return "Waiting for the station's routes.";
   const device = routing.voice_device === "nabu" ? "Nabu" : "Pine Box";
-  const names = {here: "App", box: device, both: "App + " + device, off: "Off"};
+  const page = key === "pinetab" ? "PineTab" : "PineApp";
+  const names = {here: page, box: device, nabu: "Nabu",
+                 both: page + " + " + device, off: "Off"};
   const values = [routing.music_to, routing.voice_to, routing.reply_to];
   const lines = ["Music", "DJs", "Replies"].map((label, index) => label + ": " + (names[values[index]] || "Unknown"));
-  const physical = values.some((value) => value === "box" || value === "both");
+  const physical = values.some((value) => value === "box" || value === "nabu" || value === "both");
   lines.push(device + ": " + (!physical ? "not routed" : routing.box_talk === false ? "output paused" : "output enabled"));
   if (routing.on === false) lines.push("Station off");
   return lines.join("\n");
@@ -1817,7 +1829,7 @@ function syncBroadcastFromServer(status) {
   const key = routeKeyFromState(status);
   if (!broadcastChanging && ROUTES[key] && desiredBroadcast !== key) setDesiredBroadcast(key);
   setRouteUi(key, routeLabelFromState(status.routing));
-  setText("routeSummary", routeSummaryFromState(status.routing));
+  setText("routeSummary", routeSummaryFromState(status.routing, key));
 }
 
 function routeLabelFromState(routing) {
@@ -2119,53 +2131,6 @@ function playersKind(listener, device) {
   return "a web page";
 }
 
-/* Which devices the operator has chosen to play, from the table. */
-function playersChosen() {
-  return Object.entries(playersTerminals || {})
-    .filter(([, row]) => (row || {}).play)
-    .map(([key]) => key);
-}
-
-/* Write the table back. PUT /api/settings REPLACES the document, so this is
- * read-modify-write and the whole thing goes back every time. */
-async function playersWrite(mutate) {
-  const settings = await api.get("/api/settings");
-  const table = Object.assign({}, settings.terminals || {});
-  mutate(table);
-  settings.terminals = table;
-  await api.put("/api/settings", settings);
-  playersTerminals = table;
-  playersTerminalsAt = Date.now();
-}
-
-/* Plain click: this device alone. */
-async function playersSetOnly(row) {
-  if (!row.device) return;
-  await playersWrite((table) => {
-    for (const key of Object.keys(table)) {
-      table[key] = Object.assign({}, table[key], {play: key === row.device});
-    }
-  });
-}
-
-/* Shift-click: add this device to the set, or drop it if it is already in.
- *
- * The station's solo gate can only say "one" or "everybody", so as soon as
- * the set is bigger than one the gate is RELEASED and the per-device table
- * does the work - every terminal mutes itself unless its own row says play
- * (terminal-audio-client.js). Releasing is safe: a device with play:false
- * still silences itself. */
-async function playersAdd(row) {
-  if (!row.device) return;
-  await playersWrite((table) => {
-    const was = table[row.device] || {};
-    table[row.device] = Object.assign({}, was, {play: !was.play});
-  });
-  if (playersChosen().length > 1) {
-    playersRoster = await api.post("/api/radio/solo", {clear: true});
-  }
-}
-
 async function pollPlayers(force) {
   const box = $("playersList");
   if (!box) return;
@@ -2196,13 +2161,6 @@ const PLAYERS_DEVICES = [
    why: "The Pine Box application on this computer."},
   {id: "pinetab", row: "pinetab", label: "PineTab", page: true,
    why: "The tablet."},
-  /* [#1185] "there should be another listing, the web page". A browser tab
-   * on this machine is a THIRD surface, not a second copy of the app, and
-   * it was the one row this list never had - so a tab left open was either
-   * invisible or, on the tablet's copy of this list, drawn under the app's
-   * own name. */
-  {id: "web", row: "web", label: "Web page", page: true,
-   why: "A browser tab with the station open."},
   {id: "box", row: "", label: "Pine Box", page: false,
    why: "The box speaker."},
   {id: "nabu", row: "", label: "Nabu", page: false,
@@ -2215,7 +2173,7 @@ const PLAYERS_DEVICES = [
  * agent, and the x-pinebox-public header on a tune-in listener. None of
  * those reach this side, which is why this used to be guessed from an
  * address and why the guess was wrong whenever two surfaces shared one. */
-const PLAYERS_KIND = {app: "app", pinetab: "pinetab", web: "page"};
+const PLAYERS_KIND = {app: "app", pinetab: "pinetab"};
 
 /* Which listener id a page device is using right now, or "" if it is not
  * looking. The app names itself by its id prefix; the tablet is placed by
@@ -2242,7 +2200,6 @@ function playersListenerFor(device) {
       if (listener.startsWith("desktop-")) return {listener, addr, seen: row.seen};
       continue;
     }
-    if (device.id === "web") continue;       /* nothing honest to match on */
     const want = String((playersTerminals[device.row] || {}).addr || "");
     if (want && addr === want && !listener.startsWith("desktop-")) {
       return {listener, addr, seen: row.seen};
@@ -2306,53 +2263,27 @@ function paintPlayers() {
     if (!row.present) line.classList.add("away");
     line.title = row.present
       ? (row.owns ? row.why + " Click another device to move the show."
-                  : "Send the broadcast to " + row.label + ". "
-                    + "Shift-click to add it alongside the others.")
+                  : "Send the broadcast to " + row.label + ".")
       : row.label + " is not open, so the show cannot be sent there.";
     line.innerHTML = '<i></i><b></b><span></span>';
     line.querySelector("i").textContent = row.owns ? "◉" : "○";
     line.querySelector("b").textContent = row.label;
     line.querySelector("span").textContent = row.detail;
     line.onclick = async (event) => {
-      /* PLAIN CLICK PICKS ONE. SHIFT-CLICK ADDS ANOTHER.
-       *
-       * Two mechanisms, because the station has exactly one: #1008 hands ONE
-       * listener the air and gags every other page - which is perfect for
-       * the single case and cannot express a subset at all.
-       *
-       * So for one device the station's own gate is used, because it is the
-       * most robust thing available: it survives a client that is not
-       * running our code. For two or more the gate is RELEASED - it can only
-       * say "one" or "everybody" - and the per-device table takes over, each
-       * client muting itself unless its own row says play. That is what
-       * terminal-audio-client.js does on every terminal. */
+      /* A destination is singular. There is no modifier-key side path that
+       * can release the solo gate and leave multiple pages sounding. */
       try {
         if (!row.present) return;
-        if (!row.page) {
-          /* The box and the Nabu are station ROUTES. Sending the show there
-           * moves all three streams and releases the page-side gate, since
-           * no page is the destination any more. */
-          /* Post the canonical preset rather than a route guess - the two
-           * differ ONLY by voice_device, so sending {music:"nabu"} would
-           * leave the device pointed at the pine satellite and the Nabu
-           * silent. ROUTES is the same map the Broadcast picker uses. */
-          const preset = ROUTES[row.id === "box" ? "box" : "nabu"];
-          await api.post("/api/dj/output", {
-            music: preset.music, voice: preset.voice, reply: preset.reply,
-            voice_device: preset.voice_device, box_talk: preset.box_talk
-          });
-          playersRoster = await api.post("/api/radio/solo", {clear: true});
-        } else if (event.shiftKey) {
-          await playersAdd(row);
-        } else {
-          /* A page destination needs the route pointed at a page as well as
-           * the air claimed, or the station is still sending to the box and
-           * nothing the browser does matters. */
-          await api.post("/api/dj/output",
-            {music: "here", voice: "here", reply: "here"});
-          playersRoster = await api.post("/api/radio/solo", {listener: row.listener});
-          await playersSetOnly(row);
+        /* One transaction owns every destination change: air owner first,
+         * routes second, durable terminal table last. The top picker uses
+         * this same call, so the list can no longer undo it with a side path. */
+        const moved = await api.pinetabSend(row.id);
+        if (!moved || moved.ok === false) {
+          throw new Error((moved && moved.blockers || []).join(" ")
+            || "The destination could not be selected.");
         }
+        setDesiredBroadcast(row.id);
+        syncEmbeddedBroadcast(row.id);
         await pollPlayers(true);
       } catch (err) { /* the next poll will tell the truth */ }
     };
@@ -2440,8 +2371,19 @@ function renderPipeline(data) {
 
 let agentDownStreak = 0;       // #1147: consecutive failed healthz probes
 let lastFrameReload = 0;       // #1147: reload-once-per-outage cooldown
+let refreshFlight = null;      // one pass; the six-second clock may not pile them up
 
 async function refresh() {
+  if (refreshFlight) return refreshFlight;
+  refreshFlight = refreshOnce();
+  try {
+    return await refreshFlight;
+  } finally {
+    refreshFlight = null;
+  }
+}
+
+async function refreshOnce() {
   try {
     const health = await fetch(`${config.baseUrl}/healthz`);
     setText("agentState", health.ok ? "online" : "not ready");
@@ -2937,8 +2879,25 @@ async function setBroadcastTarget(key) {
   setDesiredBroadcast(key);
   setText("routeNote", `switching to ${route.label}...`);
   try {
-    const state = await api.post("/api/dj/output", route);
-    acceptRoutingResponse(state);
+    if (typeof api.pinetabSend === "function") {
+      const result = await api.pinetabSend(key);
+      if (!result || result.ok === false) {
+        const blockers = result && Array.isArray(result.blockers)
+          ? result.blockers.join(" ") : "The destination could not be selected.";
+        throw new Error(blockers);
+      }
+      acceptRoutingResponse({
+        music_to: route.music,
+        voice_to: route.voice,
+        reply_to: route.reply,
+        voice_device: route.voice_device
+          || (key === "box" ? "pine" : lastRouting && lastRouting.voice_device),
+        box_talk: route.box_talk
+      });
+    } else {
+      const state = await api.post("/api/dj/output", route);
+      acceptRoutingResponse(state);
+    }
     syncEmbeddedBroadcast(key);
     // #979: "immediately" - the frame's audio gate is derived from the
     // route, so re-apply it now rather than leaving it until the next

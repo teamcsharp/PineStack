@@ -38,10 +38,9 @@
  * addr and a listener id per player. Two discriminators, both measured
  * against the live station:
  *
- *   - the Electron app mints `desktop-<rand>` (renderer.js desktopListenerId),
- *     so its id is self-identifying wherever it runs
- *   - every other page mints `pb<rand>`, and is placed by ADDRESS against
- *     the `terminals` table - which is why the tablet's row carries an addr
+ *   - the station labels the collapsed physical endpoint as `desktop` or
+ *     `pinetab`
+ *   - old stations fall back to the Electron id prefix and terminal address
  *
  * A listener id is NOT an identity: it is minted fresh on every page load.
  * Measured across three relaunches of the tablet app: pbnvgdtefn, then
@@ -82,8 +81,6 @@ const DESTINATIONS = {
     why: 'The tablet plays it. Everything else is silent.'},
   app: {to: 'here', page: 'app', row: 'desktop', label: 'This app',
     why: 'The Pine Box app on this PC plays it. Everything else is silent.'},
-  web: {to: 'here', page: 'web', row: 'web', label: 'Web page',
-    why: 'A browser tab plays it. Everything else is silent.'},
   box: {to: 'box', page: '', row: '', label: 'Pine Box',
     why: 'The box speaker plays it. No page sounds.'},
   nabu: {to: 'nabu', page: '', row: '', label: 'Nabu',
@@ -116,6 +113,8 @@ function ownerOf(roster) {
  * on 10.89.1.13 when this was written - so an address alone cannot tell
  * them apart. */
 function deviceOf(terminals, row) {
+  const named = String((row || {}).device || '');
+  if (named) return named;
   const addr = String(row.addr || '');
   const listener = String(row.listener || '');
   let byAddr = '';
@@ -142,18 +141,13 @@ function playerFor(page, roster, settings) {
   const app = (row) => String(row.listener || '').startsWith(APP_PREFIX);
 
   if (page === 'app') {
-    const found = rows.filter((row) => app(row) && fresh(row));
+    const found = rows.filter((row) =>
+      (String(row.device || '') === 'desktop' || app(row)) && fresh(row));
     return found.length ? String(found[0].listener) : '';
   }
   if (page === 'pinetab') {
     const found = rows.filter((row) =>
       deviceOf(terminals, row) === 'pinetab' && fresh(row));
-    return found.length ? String(found[0].listener) : '';
-  }
-  if (page === 'web') {
-    /* A browser tab is what is left: not the app, and not the tablet. */
-    const found = rows.filter((row) => !app(row)
-      && deviceOf(terminals, row) !== 'pinetab' && fresh(row));
     return found.length ? String(found[0].listener) : '';
   }
   return '';
@@ -198,7 +192,7 @@ function currentDestination(state, settings, roster) {
         ? playing + ' pages are sounding at once. Pick one destination.'
         : 'One page is looking, so only one is sounding.'};
   }
-  for (const page of ['pinetab', 'app', 'web']) {
+  for (const page of ['pinetab', 'app']) {
     if (playerFor(page, roster, settings) === owner) {
       const value = DESTINATIONS[page];
       return {key: page, label: value.label, route: 'here', singular: true,

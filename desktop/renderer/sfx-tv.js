@@ -5292,6 +5292,10 @@
       wireWall();                                          /* #1184 */
       poll();
       timer = setInterval(poll, POLL_MS);
+      /* In browser runtimes this is a numeric handle. In Node-backed
+         diagnostics it is a Timer, and the television must not own the
+         process after every surface and assertion has finished. */
+      if (timer && typeof timer.unref === 'function') timer.unref();
       /* A window that shrank under a set left near the edge would strand
        * it off screen; the clamp is the same one the opener uses. */
       root.addEventListener('resize', function () {

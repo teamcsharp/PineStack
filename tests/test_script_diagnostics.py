@@ -133,20 +133,33 @@ class CaptureAnalysisTests(unittest.TestCase):
         capture = view()
         capture['snapshot'].update(
             mapping_rows=['a', 'b'], mapping_rows_total=9, visibility='visible',
+            layout={'live_segment': 'seg-live', 'highlighted_segment': 'seg-live',
+                    'nodes_total': 400, 'nodes_hidden': 310,
+                    'nodes_transitioning': 0, 'segments_folded': 18},
             errors=[{'at': 2000, 'kind': 'rejection', 'msg': 'capture failure'}],
             stream={'at': 1, 'length': 10, 'row_count': 3,
                     'rows': [{'id': 'a', 'from': 0, 'until': 2}]},
             viewport={'content_height_px': 1000})
         capture['events'][0]['audio_discontinuity'] = True
         capture['events'][0]['paused'] = True
+        capture['events'][0].update(
+            scroll_owner='restore', scroll_owner_at_ms=1999,
+            live_segment='seg-live', highlighted_segment='seg-live',
+            nodes_transitioning=3)
         capture['bounds'] = {'missing_rows': 1}
         result = normalize_view(capture)
         self.assertEqual(result['snapshot']['mapping_rows'], ['a', 'b'])
         self.assertEqual(result['snapshot']['errors'][0]['msg'], 'capture failure')
         self.assertEqual(result['snapshot']['stream']['rows'][0]['until'], 2)
         self.assertEqual(result['snapshot']['viewport']['content_height_px'], 1000)
+        self.assertEqual(result['snapshot']['layout']['nodes_hidden'], 310)
+        self.assertEqual(result['snapshot']['layout']['live_segment'], 'seg-live')
         self.assertTrue(result['events'][0]['audio_discontinuity'])
         self.assertTrue(result['events'][0]['paused'])
+        self.assertEqual(result['events'][0]['scroll_owner'], 'restore')
+        self.assertEqual(result['events'][0]['scroll_owner_at_ms'], 1999)
+        self.assertEqual(result['events'][0]['live_segment'], 'seg-live')
+        self.assertEqual(result['events'][0]['nodes_transitioning'], 3)
         self.assertEqual(result['bounds']['missing_rows'], 1)
 
     def test_context_elements_and_unavailable_player_telemetry_remain_explicit(self):

@@ -1894,6 +1894,9 @@ DEFAULT_TEST_SEQUENCE = (
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "active_prompt": 0,
+    # One operator choice shared by every control surface. The routing table
+    # says how streams travel; this says which named destination owns them.
+    "broadcast_to": "",
     "model": os.getenv("DEFAULT_MODEL", "qwen3:14b"),
     "temperature": 0.55,
     "top_p": 0.9,
@@ -2855,7 +2858,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "behavior": str(raw_pc.get("behavior") or "")[:4000],
     }
 
+    broadcast_to = str(data.get("broadcast_to") or "").strip().lower()
+    if broadcast_to not in ("", "pinetab", "app", "box", "nabu", "off"):
+        broadcast_to = ""
+
     return {
+        "broadcast_to": broadcast_to,
         "active_prompt": active_prompt,
         "model": model or "qwen3:14b",
         "temperature": max(0.0, min(2.0, temperature)),
@@ -10959,6 +10967,7 @@ _HOT_GATE = BoundedSemaphore(1)
 _LIBRARY: dict[str, Any] = {"at": 0.0, "kbps": 0.0, "probe_s": 0.0,
                             "slow": False, "reading": "not measured yet",
                             "path": ""}
+_LIBRARY_PROBE_TASK: list[asyncio.Task[Any] | None] = [None]
 
 
 def _music_hot_path(track: dict[str, Any]) -> Path:
@@ -10990,7 +10999,8 @@ def _library_note_speed(nbytes: int, seconds: float, src: str = "") -> None:
                     f"{nbytes >> 10} KB)")})
 
 
-def library_reading(max_age: float = 180.0) -> dict[str, Any]:
+def library_reading(max_age: float = 180.0,
+                    refresh: bool = True) -> dict[str, Any]:
     """The last reading, never a wait: stale readings kick a fresh probe
     off-loop and say so. The diagnose and the census both poll."""
     out = dict(_LIBRARY)
@@ -10998,10 +11008,11 @@ def library_reading(max_age: float = 180.0) -> dict[str, Any]:
     out["age_s"] = round(age) if out.get("at") else None
     if age > max_age:
         out["measuring"] = True
-        try:
-            fire_and_forget(library_speed())
-        except Exception:  # noqa: BLE001
-            pass
+        if refresh:
+            try:
+                fire_and_forget(library_speed())
+            except Exception:  # noqa: BLE001
+                pass
         if not out.get("at"):
             out["reading"] = "measuring the share now"
     return out
@@ -11141,20 +11152,42 @@ def library_probe() -> dict[str, Any]:
 
 
 async def library_speed(max_age: float = 90.0) -> dict[str, Any]:
-    """The share's speed, remembered for a minute and a half."""
+    """The share's speed, remembered for a minute and a half.
+
+    Every status surface asks for this reading. A slow share used to let all
+    of those callers start their own 512 KB probe, filling the default worker
+    pool with identical CIFS reads. They now share one in-flight reading.
+    """
     if time.time() - float(_LIBRARY.get("at") or 0) < max_age:
         return dict(_LIBRARY)
+    task = _LIBRARY_PROBE_TASK[0]
+    if task is None or task.done():
+        task = asyncio.create_task(asyncio.to_thread(library_probe))
+        _LIBRARY_PROBE_TASK[0] = task
+
+        def finished(done: asyncio.Task[Any]) -> None:
+            if _LIBRARY_PROBE_TASK[0] is done:
+                _LIBRARY_PROBE_TASK[0] = None
+            try:
+                done.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(finished)
     try:
-        return await asyncio.wait_for(asyncio.to_thread(library_probe), 25)
+        return await asyncio.wait_for(asyncio.shield(task), 25)
     except asyncio.TimeoutError:
-        _LIBRARY.update({"at": time.time(), "kbps": 0.0, "probe_s": 25.0,
-                         "slow": True,
-                         "reading": "crawling - a 512 KB read did not finish "
-                                    "in 25s; records play from the local "
-                                    "shelf"})
-        return dict(_LIBRARY)
-    except Exception:  # noqa: BLE001
-        return dict(_LIBRARY)
+        out = dict(_LIBRARY)
+        out.update({"probe_s": 25.0, "slow": True, "measuring": True,
+                    "reading": "crawling - the shared 512 KB reading has "
+                               "not finished in 25s; records play from the "
+                               "local shelf"})
+        return out
+    except Exception as exc:  # noqa: BLE001
+        out = dict(_LIBRARY)
+        out.update({"slow": True, "measuring": False,
+                    "reading": "the library probe failed: %s" % str(exc)[:120]})
+        return out
 
 
 async def records_warmer() -> None:
@@ -28162,7 +28195,8 @@ async def page_recovery_start() -> None:
                 _rec_len = max((float(r.get("until") or 0.0)
                                 for r in _rec_rows if isinstance(r, dict)),
                                default=0.0)
-            admission_admit_line(
+            await asyncio.to_thread(
+                admission_admit_line,
                 {"path": _rec_url.split("?")[0],
                  "sig": (_rec_url.split("?t=", 1)[1].split("&")[0]
                          if "?t=" in _rec_url else "")},
@@ -32303,7 +32337,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # gets a second occurrence, which is the audit's rule for the
             # same audio played twice.
             if voice_to == "both":
-                _line_occurrence = admission_admit_line(
+                _line_occurrence = await asyncio.to_thread(
+                    admission_admit_line,
                     clip, who=who, kind=kind, text=spoken, name=name,
                     line_id=line_id,
                     rows=((_sfx_stream.get("rows") or [])
@@ -32504,7 +32539,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # sheet; the marker in the booth is already driven off them.
     _line_occurrence = ""
     if clip:
-        _line_occurrence = admission_admit_line(
+        _line_occurrence = await asyncio.to_thread(
+            admission_admit_line,
             clip, who=who, kind=kind, text=spoken, name=name,
             line_id=line_id,
             rows=((_sfx_stream.get("rows") or []) if _sfx_stream else None),
@@ -33015,7 +33051,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     _DIALOGUE_AT[0] = time.time()                                # 2026-09-07
     # Capture the line into the rolling episode recording (#548).
     if clip and clip.get("path"):
-        _episode_stage(clip["path"], f"{entry.get('name') or who}: {spoken}")
+        await _episode_stage(clip["path"],
+                             f"{entry.get('name') or who}: {spoken}")
     # The pair remember their own reruns (#323): every aired line feeds
     # the do-not-reuse list the prompts carry. Callers are in it too now (#584)
     # — a regular's OWN lines were invisible to avoid_reruns(), so Martha B
@@ -33152,7 +33189,7 @@ def _listeners_live() -> list[str]:
         return []
 
 
-def _listener_for_terminal(row: dict[str, Any]) -> str:
+def _listener_for_terminal(row: dict[str, Any], device: str = "") -> str:
     """A live listener sitting at this device, if one is."""
     try:
         want_id = str((row or {}).get("listener") or "")
@@ -33161,14 +33198,21 @@ def _listener_for_terminal(row: dict[str, Any]) -> str:
         addr = str((row or {}).get("addr") or "")
         if not addr:
             return ""
-        best, best_at = "", 0.0
+        best, best_rank, best_at = "", -1, 0.0
         for who in _listeners_live():
             seen = _LISTENER_SEEN.get(who) or {}
             if str(seen.get("addr") or "") != addr:
                 continue
             at = float(seen.get("at") or 0)
-            if at >= best_at:
-                best, best_at = who, at
+            agent = str(seen.get("agent") or "").lower()
+            rank = 0
+            if device == "desktop":
+                rank = 2 if str(who).startswith("desktop-") else 0
+            elif device == "pinetab":
+                rank = (2 if "pineboxkiosk" in agent else
+                        1 if not str(who).startswith("desktop-") else 0)
+            if (rank, at) >= (best_rank, best_at):
+                best, best_rank, best_at = who, rank, at
         return best
     except Exception:  # noqa: BLE001
         return ""
@@ -33422,7 +33466,7 @@ def audio_owner() -> str:
                     continue
                 if bool((row or {}).get("fallback")) != want_fallback:
                     continue
-                got = _listener_for_terminal(row)
+                got = _listener_for_terminal(row, name)
                 # #1337: ...and not a device this road just
                 # dropped for taking nothing. Without this the
                 # #1332 cure is undone HERE, on the next clock
@@ -33471,7 +33515,9 @@ def listener_note(who: str, addr: str = "", agent: str = "",
         if addr:
             row["addr"] = str(addr)[:60]
         if agent:
-            row["agent"] = str(agent)[:120]
+            # The kiosk marker is appended to Chromium's long UA. Cutting at
+            # 120 removed it, so the real PineTab was relabelled a web page.
+            row["agent"] = str(agent)[:320]
         if public:                                            # [#1185]
             row["public"] = True
     except Exception:  # noqa: BLE001
@@ -33550,8 +33596,6 @@ def listener_device(kind: str, addr: str, table: dict[str, Any],
     if kind != "page" or not addr:
         return ""
     for key, row in rows.items():
-        if key in ("desktop", "pinetab"):
-            continue
         if str((row or {}).get("listener") or ""):
             continue
         if str((row or {}).get("addr") or "") == addr:
@@ -33602,6 +33646,13 @@ def listener_roster() -> list[dict[str, Any]]:
             addr = str(seen.get("addr") or "")
             kind = listener_kind(who, agent, bool(seen.get("public")))
             device = listener_device(kind, addr, table, who)
+            # A WebView is a rendering surface, not another room. Collapse
+            # the panel frames at a known terminal address into the physical
+            # PineApp/PineTab endpoint that can actually make the sound.
+            if device == "desktop":
+                kind = "app"
+            elif device == "pinetab":
+                kind = "pinetab"
             ago = round(now - float(when or now), 1)
             since = round(now - float(seen.get("first") or now), 1)
             key = "%s@%s" % (kind, addr or who)
@@ -35207,7 +35258,10 @@ async def _dj_loop() -> None:
             await _dj_hold()
             if not _RADIO["on"]:
                 break
-            track = dj_next_track()
+            # Record selection may refill the music shelf or inspect the MX
+            # tape share. Neither belongs on the event loop: one slow network
+            # stat used to freeze every API and every listener heartbeat.
+            track = await asyncio.to_thread(dj_next_track)
             if not track:
                 break
 
@@ -46198,7 +46252,7 @@ async def reel_open() -> None:
             _LARDER[:] = _keep
             _larder_save()
         try:
-            _episode_stage(path, "🎙 the resume reel")
+            await _episode_stage(path, "🎙 the resume reel")
         except Exception:  # noqa: BLE001
             pass
         pipeline_log(
@@ -66536,7 +66590,7 @@ async def dj_police_outside(text: str) -> None:
         page_feed_append({              # #1147: honest broadcast stamp
             "url": f"{play['path']}?t={play['sig']}",
             "text": label, "voice": voice})
-    _episode_stage(f"{play['path']}?t={play['sig']}", label)
+    await _episode_stage(f"{play['path']}?t={play['sig']}", label)
     pipeline_log("air", f"megaphone outside — {character} vocode, "
                         f"sirens behind (#636)")
     # And the pair have to deal with it.
@@ -67074,10 +67128,11 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     # the only way this one does not air is an exception, and an
     # exception leaves the occurrence admitted and visible, which is the
     # honest record of what happened.
-    admission_admit_line({"path": path, "sig": sig}, who="board",
-                         kind="upstairs", text=str(made.get("text") or ""),
-                         name="upstairs", line_id=str(made.get("id") or ""),
-                         producer="dj_upstairs_page")
+    await asyncio.to_thread(
+        admission_admit_line, {"path": path, "sig": sig}, who="board",
+        kind="upstairs", text=str(made.get("text") or ""),
+        name="upstairs", line_id=str(made.get("id") or ""),
+        producer="dj_upstairs_page")
     # (c) PLAY IT — the point of the whole request is that you hear him.
     to = _RADIO.get("voice_to") or "box"
     if to in ("box", "both"):
@@ -67086,7 +67141,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
         page_feed_append({              # #1147: honest broadcast stamp
             "url": f"{path}?t={sig}", "text": label,
             "voice": str(made.get("voice") or "")})
-    _episode_stage(f"{path}?t={sig}", label)
+    await _episode_stage(f"{path}?t={sig}", label)
     upstairs_update(str(made.get("id") or ""),
                     uses=int(made.get("uses") or 0) + 1,
                     last=int(time.time()))
@@ -67352,10 +67407,27 @@ def _cache_call_recording_parts(parts: list[str], transcript: list[Any],
 # cheap hardlink (survives the /media prune) into the current episode; a clock
 # finalizes a ~15-minute compressed mp3 + transcript for offline replay.
 _EPISODE_STAGE = RADIO_CACHE / "_staging"
+_EPISODE_STAGE_LOCK = asyncio.Lock()
 
 
-def _episode_stage(media_path: str, text: str,
-                   src_path: str | Path | None = None) -> None:
+def _episode_stage_file(src: Path, dst: Path) -> bool:
+    """Blocking filesystem half of episode staging."""
+    try:
+        if not src.is_file():
+            return False
+        _EPISODE_STAGE.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(str(src), str(dst))       # hardlink: no data copy
+        except OSError:
+            import shutil
+            shutil.copyfile(str(src), str(dst))
+        return True
+    except Exception:
+        return False
+
+
+async def _episode_stage(media_path: str, text: str,
+                         src_path: str | Path | None = None) -> None:
     """Stage one aired clip into the current episode (#548). Best effort — a
     failed stage never touches the show. `src_path` overrides where the audio
     lives for things served from outside /media — stings live in the SFX store,
@@ -67363,22 +67435,22 @@ def _episode_stage(media_path: str, text: str,
     try:
         key = media_path.rsplit("/", 1)[-1].split("?")[0]
         src = Path(src_path) if src_path else VOICE_MEDIA_DIR / key
-        if not src.is_file():
-            return
-        ep = _RADIO.setdefault("episode", {"started": time.time(), "items": []})
-        if not ep.get("started"):
-            ep["started"] = time.time()
-        _EPISODE_STAGE.mkdir(parents=True, exist_ok=True)
-        dst = _EPISODE_STAGE / f"{len(ep['items']):05d}_{key}"
-        try:
-            os.link(str(src), str(dst))       # hardlink: no data copy
-        except OSError:
-            import shutil
-            shutil.copyfile(str(src), str(dst))
-        # Aired-at, not written-at: a sting hardlinks a sample file whose
-        # mtime is the day it was made, and the tail cut wants air time (#630).
-        ep["items"].append({"file": str(dst), "text": text[:200],
-                            "t": time.time()})
+        # Serializing only this recorder keeps names and ledger order stable.
+        # The lock is asynchronous, and every filesystem operation is in a
+        # worker, so a slow SFX share cannot freeze the station's HTTP loop.
+        async with _EPISODE_STAGE_LOCK:
+            ep = _RADIO.setdefault(
+                "episode", {"started": time.time(), "items": []})
+            if not ep.get("started"):
+                ep["started"] = time.time()
+            dst = _EPISODE_STAGE / f"{len(ep['items']):05d}_{key}"
+            copied = await asyncio.to_thread(_episode_stage_file, src, dst)
+            if not copied:
+                return
+            # Aired-at, not written-at: a sting hardlinks a sample file whose
+            # mtime is the day it was made, and the tail cut wants air time.
+            ep["items"].append({"file": str(dst), "text": text[:200],
+                                "t": time.time()})
     except Exception:
         pass
 
@@ -67779,6 +67851,8 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
         # A sound effect punched into the opening swell (#618) — mixed IN, not
         # announced after. Best effort: no sample to hand → the ad airs without.
         sfx = await asyncio.to_thread(_sfx_any)
+        if sfx:
+            sting_remember(str(sfx))
         mixed = await asyncio.to_thread(
             _music_ad_mix_blocking, VOICE_MEDIA_DIR / voice_key,
             str(track["path"]), await _clip_seconds_async(clip["path"]) or 8.0, start,
@@ -68133,7 +68207,8 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
     # The spot is one finished audio object and it exists on disk - that
     # was checked at the top of this function - so the gate can name it
     # before either road is asked to carry it.
-    _ad_occurrence = admission_admit_line(
+    _ad_occurrence = await asyncio.to_thread(
+        admission_admit_line,
         {"path": path, "sig": sig}, who="dj", kind="ad",
         text=str(entry.get("text") or label), name=label,
         line_id=str(booth_row.get("id") or ""), producer="_air_produced_ad")
@@ -68171,7 +68246,7 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
         page_delivery_apply(booth_row, page_delivery)
     if not (box_played or page_delivery):
         return False
-    _episode_stage(f"{path}?t={sig}", label)
+    await _episode_stage(f"{path}?t={sig}", label)
     # #916b: EVERY road that airs a produced spot funnels through here, so
     # this is the one place worth remembering it from. A produced spot
     # never touched dj_speak, so its words were invisible to
@@ -68249,14 +68324,14 @@ async def ad_produce(product: str, script: str, voice: str,
     track: dict[str, Any] | None = None
     if track_id == "mx" or (not track_id and random.random() < 0.35):
         try:
-            tapes = mixtape_files()
+            tapes = await asyncio.to_thread(mixtape_files)
         except Exception:
             tapes = []
         if tapes:
             _tp = random.choice(tapes)
             track = {"path": str(_tp),
                      "title": f"the MX tape \"{mixtape_title(_tp)}\"",
-                     "seconds": tape_duration(_tp)}
+                     "seconds": await asyncio.to_thread(tape_duration, _tp)}
     if not track:
         track = ((music_track(track_id)
                   if track_id and track_id != "mx" else None)
@@ -68284,6 +68359,8 @@ async def ad_produce(product: str, script: str, voice: str,
                      if secs > 50 else 15.0)
         voice_key = clip["path"].rsplit("/", 1)[-1]
         sfx = await asyncio.to_thread(_sfx_any)
+        if sfx:
+            sting_remember(str(sfx))
         wav = await asyncio.to_thread(
             _music_ad_mix_blocking, VOICE_MEDIA_DIR / voice_key,
             str(track["path"]), await _clip_seconds_async(clip["path"]) or 8.0, start,
@@ -78124,9 +78201,22 @@ SFX_CYCLE_QUEUE = 36             # enough 0.8s clips to reach SFX_CYCLE_AHEAD
 def sfx_cycle_request(sample: Path, who: str = "",
                       why: str = "") -> bool:       # [#1251] why this clip
     """#1417: the SFX guy hands the cycle a clip to ring in turn."""
+    try:
+        key = sfx_id(sample)
+        if sfx_video_on_cooldown(key):
+            _SFX_CYCLE["stale"] = int(_SFX_CYCLE.get("stale") or 0) + 1
+            return False
+    except Exception:  # noqa: BLE001
+        return False
     asked = _SFX_CYCLE.setdefault("requests", [])
     if len(asked) >= 4:
         return False
+    for request in asked:
+        try:
+            if sfx_id(request[0]) == key:
+                return False
+        except Exception:  # noqa: BLE001
+            continue
     asked.append((sample, str(who or ""), str(why or "")))
     return True
 
@@ -78164,40 +78254,59 @@ SFX_VIDEO_PLAYED_KEEP = 20000
 _SFX_VIDEO_PLAYED: dict[str, float] = {}
 _SFX_VIDEO_PLAYED_READY = [False]
 _SFX_VIDEO_PLAYED_DIRTY = [0]
+_SFX_VIDEO_PLAYED_LOCK = RLock()
 
 
 def _sfx_video_played_load() -> None:
-    if _SFX_VIDEO_PLAYED_READY[0]:
-        return
-    _SFX_VIDEO_PLAYED_READY[0] = True
-    try:
-        got = json.loads(SFX_VIDEO_PLAYED_PATH.read_text())
-        if isinstance(got, dict):
-            for key, at in got.items():
-                try:
-                    _SFX_VIDEO_PLAYED[str(key)] = float(at)
-                except (TypeError, ValueError):
-                    continue
-    except Exception:  # noqa: BLE001
-        pass                      # a first run, or a file somebody broke
+    with _SFX_VIDEO_PLAYED_LOCK:
+        if _SFX_VIDEO_PLAYED_READY[0]:
+            return
+        _SFX_VIDEO_PLAYED_READY[0] = True
+        try:
+            got = json.loads(SFX_VIDEO_PLAYED_PATH.read_text())
+            if isinstance(got, dict):
+                for key, at in got.items():
+                    try:
+                        _SFX_VIDEO_PLAYED[str(key)] = float(at)
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:  # noqa: BLE001
+            pass                      # a first run, or a file somebody broke
+        # The compact cooldown file is flushed in batches so it can never
+        # hold up a cut. Recover the unflushed tail from the durable airing
+        # ledger after a restart, or the last nine pictures become eligible
+        # again precisely when the station is rebuilding itself.
+        old = time.time() - SFX_VIDEO_COOLDOWN
+        for row in sfx_history_rows():
+            try:
+                name = str(row.get("name") or "").lower()
+                at = float(row.get("ts") or 0)
+                key = str(row.get("id") or "")
+                if (key and at >= old
+                        and Path(name).suffix in SFX_VIDEO_TYPES):
+                    _SFX_VIDEO_PLAYED[key] = max(
+                        at, float(_SFX_VIDEO_PLAYED.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
 
 
 def _sfx_video_played_save() -> None:
     """Written on a count rather than on every clip - this is a ledger,
     and a ledger must never be what makes a picture late."""
     try:
-        old = time.time() - max(SFX_VIDEO_COOLDOWN * 4, 3600.0)
-        keep = {k: v for k, v in _SFX_VIDEO_PLAYED.items() if v >= old}
-        if len(keep) > SFX_VIDEO_PLAYED_KEEP:
-            newest = sorted(keep.items(), key=lambda kv: kv[1], reverse=True)
-            keep = dict(newest[:SFX_VIDEO_PLAYED_KEEP])
-        _SFX_VIDEO_PLAYED.clear()
-        _SFX_VIDEO_PLAYED.update(keep)
-        SFX_VIDEO_PLAYED_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = SFX_VIDEO_PLAYED_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(keep))
-        tmp.replace(SFX_VIDEO_PLAYED_PATH)
-        _SFX_VIDEO_PLAYED_DIRTY[0] = 0
+        with _SFX_VIDEO_PLAYED_LOCK:
+            old = time.time() - max(SFX_VIDEO_COOLDOWN * 4, 3600.0)
+            keep = {k: v for k, v in _SFX_VIDEO_PLAYED.items() if v >= old}
+            if len(keep) > SFX_VIDEO_PLAYED_KEEP:
+                newest = sorted(keep.items(), key=lambda kv: kv[1], reverse=True)
+                keep = dict(newest[:SFX_VIDEO_PLAYED_KEEP])
+            _SFX_VIDEO_PLAYED.clear()
+            _SFX_VIDEO_PLAYED.update(keep)
+            SFX_VIDEO_PLAYED_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SFX_VIDEO_PLAYED_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(keep))
+            tmp.replace(SFX_VIDEO_PLAYED_PATH)
+            _SFX_VIDEO_PLAYED_DIRTY[0] = 0
     except Exception:  # noqa: BLE001
         pass
 
@@ -78207,8 +78316,9 @@ def sfx_video_on_cooldown(key: str) -> bool:
     if not key or SFX_VIDEO_COOLDOWN <= 0:
         return False
     _sfx_video_played_load()
-    at = _SFX_VIDEO_PLAYED.get(str(key))
-    return at is not None and (time.time() - float(at)) < SFX_VIDEO_COOLDOWN
+    with _SFX_VIDEO_PLAYED_LOCK:
+        at = _SFX_VIDEO_PLAYED.get(str(key))
+        return at is not None and (time.time() - float(at)) < SFX_VIDEO_COOLDOWN
 
 
 def sfx_video_note_played(key: str) -> None:
@@ -78216,18 +78326,21 @@ def sfx_video_note_played(key: str) -> None:
     if not key:
         return
     _sfx_video_played_load()
-    _SFX_VIDEO_PLAYED[str(key)] = time.time()
-    _SFX_VIDEO_PLAYED_DIRTY[0] += 1
-    if _SFX_VIDEO_PLAYED_DIRTY[0] >= 10:
-        _sfx_video_played_save()
+    with _SFX_VIDEO_PLAYED_LOCK:
+        _SFX_VIDEO_PLAYED[str(key)] = time.time()
+        _SFX_VIDEO_PLAYED_DIRTY[0] += 1
+        if _SFX_VIDEO_PLAYED_DIRTY[0] >= 10:
+            _sfx_video_played_save()
 
 
 def sfx_video_cooldown_state() -> dict[str, Any]:
     _sfx_video_played_load()
     now = time.time()
-    warm = sum(1 for at in _SFX_VIDEO_PLAYED.values()
-               if now - at < SFX_VIDEO_COOLDOWN)
-    return {"cooldown_s": SFX_VIDEO_COOLDOWN, "held": len(_SFX_VIDEO_PLAYED),
+    with _SFX_VIDEO_PLAYED_LOCK:
+        warm = sum(1 for at in _SFX_VIDEO_PLAYED.values()
+                   if now - at < SFX_VIDEO_COOLDOWN)
+        held = len(_SFX_VIDEO_PLAYED)
+    return {"cooldown_s": SFX_VIDEO_COOLDOWN, "held": held,
             "on_cooldown": warm, "rejected": int(_SFX_CYCLE.get("stale") or 0)}
 
 
@@ -78240,25 +78353,20 @@ async def sfx_video_fresh_pick(tries: int = 40) -> Any:
     dial or the folder pin is set, because both are AND-ed into the same
     query. So the pick is drawn again when it lands on something recent.
 
-    It gives up rather than starving: if every draw is on cooldown - a
-    library smaller than the cooldown, or a pin onto a handful of clips -
-    the FIRST clip it saw is used. A repeat is better than a dark tube,
-    and that is the trade this makes on purpose.
+    It returns None rather than knowingly replaying a recent clip. The caller
+    may try the pre-warmed pool, but that road applies the same cooldown.
     """
-    first = None
     for _ in range(max(1, tries)):
         got = await sfx_db_pick_row_async(True)
         if got is None:
             continue
-        if first is None:
-            first = got
         try:
             if not sfx_video_on_cooldown(sfx_id(got[0])):
                 return got
         except Exception:  # noqa: BLE001
             return got
         _SFX_CYCLE["stale"] = int(_SFX_CYCLE.get("stale") or 0) + 1
-    return first
+    return None
 
 
 async def sfx_video_cycle() -> None:
@@ -78302,6 +78410,17 @@ async def sfx_video_cycle() -> None:
                 pick, asked_who = _req[0], _req[1]
                 _match_why = str(_req[2]) if len(_req) > 2 else ""
                 seconds = await asyncio.to_thread(sfx_seconds, pick)
+                # A request can wait behind a clip that was already rung.
+                # Re-check at dequeue time so two paths cannot reserve the
+                # same picture before either one reaches the screen.
+                if sfx_video_on_cooldown(sfx_id(pick)):
+                    _SFX_CYCLE["stale"] = int(
+                        _SFX_CYCLE.get("stale") or 0) + 1
+                    pick, asked_who, _match_why, _match_score = (
+                        None, "", "", 0.0)
+                    got = await sfx_video_fresh_pick()
+                    pick = got[0] if got else None
+                    seconds = float(got[1]) if got else 0.0
             else:
                 # The book first - instant, and full the moment the process
                 # is up - and #1433: not a clip that has been on this tube
@@ -78342,7 +78461,16 @@ async def sfx_video_cycle() -> None:
                     seconds = float(got[1]) if got else 0.0
             if pick is None:
                 # The old road, for the minutes after a fresh install only.
-                pick = sfx_deck_take()
+                pick = None
+                for _ in range(4):
+                    candidate = sfx_deck_take()
+                    if candidate is None:
+                        break
+                    if not sfx_video_on_cooldown(sfx_id(candidate)):
+                        pick = candidate
+                        break
+                    _SFX_CYCLE["stale"] = int(
+                        _SFX_CYCLE.get("stale") or 0) + 1
                 if pick is None:
                     pick = await asyncio.to_thread(_sfx_any_video)
                 if pick is None:
@@ -79047,21 +79175,64 @@ STING_SUBPOOL_MIN = int(os.getenv("PINE_STING_SUBPOOL_MIN", "6"))
 # heard. Bounded, and it costs one set lookup.
 STING_RING_KEEP = int(os.getenv("PINE_STING_RING", "900"))
 _STING_RING: dict[str, Any] = {"seen": [], "at": {}}
+_STING_RING_READY = [False]
+_STING_RING_LOCK = RLock()
+
+
+def _sting_key(sample: Any) -> str:
+    """The durable sample id used by both the history and the live ring."""
+    text = str(sample or "")
+    if not text:
+        return ""
+    try:
+        return sfx_id(Path(text))
+    except Exception:  # noqa: BLE001
+        return text
+
+
+def _sting_ring_load() -> None:
+    """Seed recency from what actually aired before this process started."""
+    with _STING_RING_LOCK:
+        if _STING_RING_READY[0]:
+            return
+        _STING_RING_READY[0] = True
+        rows = sfx_history_rows()[-max(0, STING_RING_KEEP):]
+        for row in rows:
+            key = str(row.get("id") or "") if isinstance(row, dict) else ""
+            if not key:
+                continue
+            if key in _STING_RING["at"]:
+                try:
+                    _STING_RING["seen"].remove(key)
+                except ValueError:
+                    pass
+            _STING_RING["seen"].append(key)
+            _STING_RING["at"][key] = float(row.get("ts") or 0)
 
 
 def sting_recent(name: str) -> bool:
-    return str(name or "") in _STING_RING["at"]
+    _sting_ring_load()
+    key = _sting_key(name)
+    with _STING_RING_LOCK:
+        return bool(key and key in _STING_RING["at"])
 
 
 def sting_remember(name: str) -> None:
-    name = str(name or "")
-    if not name:
+    _sting_ring_load()
+    key = _sting_key(name)
+    if not key:
         return
-    ring = _STING_RING["seen"]
-    ring.append(name)
-    _STING_RING["at"][name] = time.time()
-    while len(ring) > STING_RING_KEEP:
-        _STING_RING["at"].pop(ring.pop(0), None)
+    with _STING_RING_LOCK:
+        ring = _STING_RING["seen"]
+        if key in _STING_RING["at"]:
+            try:
+                ring.remove(key)
+            except ValueError:
+                pass
+        ring.append(key)
+        _STING_RING["at"][key] = time.time()
+        while len(ring) > STING_RING_KEEP:
+            _STING_RING["at"].pop(ring.pop(0), None)
 
 
 def sting_keep(count: int) -> int:
@@ -79140,9 +79311,10 @@ def _sfx_any() -> Path | None:
         if sfx_match_on(False) and sfx_match_ready():
             _hit = sfx_match_sting_pick("", want_video=False)
             if _hit is not None:
-                _p = _hit if isinstance(_hit, Path) else Path(str(_hit))
+                _p = (_hit if isinstance(_hit, Path)
+                      else _hit[0] if isinstance(_hit, tuple) and _hit
+                      else Path(str(_hit)))
                 if not sting_recent(str(_p)):
-                    sting_remember(str(_p))
                     return _p
     except Exception:  # noqa: BLE001
         pass
@@ -79170,7 +79342,6 @@ def _sfx_any() -> Path | None:
         if not _ok(got):
             continue
         if not sting_recent(str(got)):
-            sting_remember(str(got))
             return got
     # The book had nothing usable (or is not built): the walked pool.
     pool = [p for p in sfx_all()
@@ -79411,7 +79582,8 @@ def _sfx_any_video() -> Path | None:
 
     Unrepeated against the ordinary sting ring, so tapping the button
     twice does not play the same clip twice."""
-    pool = _sfx_video_pool()
+    pool = [path for path in _sfx_video_pool()
+            if not sfx_video_on_cooldown(sfx_id(path))]
     if not pool:
         return None
     got = unrepeated([str(p) for p in pool], "sting",
@@ -80348,19 +80520,30 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # So the ring is applied HERE, where both roads land, and a repeat
     # inside the window sends the pick back for another.
     try:
-        if sample is not None and sting_recent(str(sample)):
+        def _recent(candidate: Any) -> bool:
+            return bool(candidate and (
+                sting_recent(str(candidate))
+                or (sfx_is_video(candidate)
+                    and sfx_video_on_cooldown(sfx_id(candidate)))))
+
+        if _recent(sample):
             _again = None
-            if after:
+            if sfx_is_video(sample):
+                _fresh_video = await sfx_video_fresh_pick()
+                _again = _fresh_video[0] if _fresh_video else None
+            elif after:
                 try:
                     _again = await asyncio.to_thread(sting_due, after)
                 except Exception:  # noqa: BLE001
                     _again = None
-            if _again is None or sting_recent(str(_again)):
+            if _recent(_again):
+                _again = None
+            if _again is None:
                 _again = await asyncio.to_thread(_sfx_any)
-            if _again is not None and not sting_recent(str(_again)):
-                sample = _again
-        if sample is not None:
-            sting_remember(str(sample))
+            if _again is None or _recent(_again):
+                return ""
+            sample = _again
+        sting_remember(str(sample))
     except Exception:  # noqa: BLE001
         pass
     _STING_AT[0] = time.time()
@@ -80389,6 +80572,11 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
                 sample, who, _sting_why) else "")            # [#1251]
         if time.time() < float(_SFX_CYCLE.get("until") or 0):
             return ""
+    # The index already measured every playable clip. Read that local value
+    # on the SFX executor instead of stat/ffprobe on the network path from
+    # the event loop. The latter was an observed eight-second station stall.
+    _sample_seconds = await sfx_db_seconds_async(sample)
+    _sample_seconds = max(0.0, float(_sample_seconds or 0.0))
     # On the record like any spoken line (#269): which sample, from which
     # folder, with enough identity for the panel to vote it off the air.
     # #903 (#848): this row was written BEFORE any attempt to play, and
@@ -80403,7 +80591,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         "video": is_video,              # #1263: it has a picture
         # #704: how long it ran, on the entry — the point of seeing them
         # listed is being able to weed the ones that do not fit.
-        "seconds": round(sfx_seconds(sample), 2),
+        "seconds": round(_sample_seconds, 2),
         "url": f"/sfx/{key}?t={signature}",
         "aired": "airing",
         # [#1251] WHY THIS CLIP. Stamped on the booth row, which is what
@@ -80425,7 +80613,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # with no audio stream at all fails the whole build, and losing the
     # night's recording is a far worse trade than losing one sting off it.
     if not is_video:
-        _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}", src_path=sample)
+        await _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}",
+                             src_path=sample)
     # --- broadcast admission (#1339) ---
     # COMMITTED BEFORE EITHER TRANSPORT. Every veto - the cadence, the
     # rest between clips, the pick itself - is above this line, and the
@@ -80437,10 +80626,11 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # `seconds` is deliberately not measured here: the sample lives on
     # the share and the gate reads the length off the header of the file
     # it resolves, which is the levelled copy on local disk.
-    _sting_occurrence = admission_admit_line(
+    _sting_occurrence = await asyncio.to_thread(
+        admission_admit_line,
         {"path": f"/sfx/{key}", "sig": signature},
         who=who, kind="sfx", text=sample.stem, name=sample.stem,
-        line_id=key, producer="dj_sting")
+        line_id=key, length=_sample_seconds, producer="dj_sting")
     # --- broadcast admission (#1339) --- end
     _sting_started = time.monotonic()
     # Only where the line itself went. Queued for a browser in box-only mode
@@ -80459,7 +80649,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
             # so page_clip_seconds reserves the air the picture takes
             # instead of guessing from a text that is empty.
             "video": is_video,
-            "seconds": round(sfx_seconds(sample), 2),
+            "seconds": round(_sample_seconds, 2),
         })
     # A sting is MEANT to land over the DJ's own line it punctuates, so the
     # show's own just-finished announce tail must not block it (#559: "the
@@ -80497,6 +80687,10 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     if played_anywhere:
         sfx_note_play(key, sample.stem, who,
                       ms=int((time.monotonic() - _sting_started) * 1000))
+        if is_video:
+            # Ordinary stings and the endless set share one tube and one
+            # cooldown, so neither road can immediately replay the other.
+            sfx_video_note_played(key)
         # #905: THE SUCCESS BRANCH, which #903 left out — the row was
         # stamped "airing" before the attempt and nothing ever took it
         # down, so every sting that played kept shouting "going out right
@@ -88247,6 +88441,26 @@ def mixtape_files() -> list[Path]:
     return sorted(by_stem.values())
 
 
+def mixtape_catalog() -> list[dict[str, Any]]:
+    """Build the operator's tape list on a worker thread.
+
+    Every stat here may cross the media share. Keeping the complete walk in
+    one synchronous helper makes it difficult for an async route to move only
+    the directory listing off-loop and accidentally leave hundreds of
+    per-file probes behind.
+    """
+    out: list[dict[str, Any]] = []
+    for path in mixtape_files():
+        try:
+            when = int(path.stat().st_mtime)
+        except OSError:
+            when = 0
+        out.append({"id": sfx_id(path), "title": mixtape_title(path),
+                    "when": when, "ready": tape_ready(path)})
+    out.sort(key=lambda row: row["when"], reverse=True)
+    return out
+
+
 def mixtape_title(path: Path) -> str:
     """"2026-08-04_233946_000" is a filename, not a title. On air it is a
     numbered tape with the date it was cut."""
@@ -88463,6 +88677,7 @@ async def dj_mixtape_outro(tape: dict[str, Any] | None = None) -> list[str]:
         (" Somewhere in the praise, deliver these lines WORD FOR WORD as "
          f"your own: \"{seed['text']}\"")
         if seed else "")
+    crystal = await asyncio.to_thread(tape_crystal, tape)
     lines = await dj_banter(None, lines=4, angle=(
         "the MX tape has just finished. Come back on air glowing and talk "
         "about the MUSIC itself — the signatures and styles at work: the "
@@ -88471,7 +88686,7 @@ async def dj_mixtape_outro(tape: dict[str, Any] | None = None) -> list[str]:
         "Two people who really listen, being specific. Not one negative or "
         "ironic word about MX or the tape — he is the artist you both love "
         "without reservation. Wonder aloud when the next one is coming."
-        + tape_crystal(tape) + aside))
+        + crystal + aside))
     if lines and seed:
         speakbox_remember(seed)
     return lines
@@ -92238,8 +92453,9 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
             except Exception:  # noqa: BLE001
                 pass
             try:
-                _episode_stage(str(VOICE_MEDIA_DIR / key),
-                               f"☎ {name} — back on the line (re-air)")
+                await _episode_stage(
+                    str(VOICE_MEDIA_DIR / key),
+                    f"☎ {name} — back on the line (re-air)")
             except Exception:  # noqa: BLE001
                 pass
             pipeline_log("call", f"{name}'s call from "
@@ -97150,9 +97366,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             / one["path"].rsplit("/", 1)[-1]))
                 # The call belongs in the rolling episode too (its per-turn chat
                 # entries bypass dj_speak's capture) (#548).
-                _episode_stage(one["path"],
-                               ("☎ " + caller_name + " — the full call")
-                               if caller_name else "🎙 the booth — a full round")
+                await _episode_stage(
+                    one["path"],
+                    ("☎ " + caller_name + " — the full call")
+                    if caller_name else "🎙 the booth — a full round")
                 # The transcript still shows every turn in the booth/Mind, even
                 # though the audio is one clip.
                 # #748: THE fix for "the booth is not synced with the active
@@ -98261,6 +98478,159 @@ def _radio_entry_rejected(entry: dict[str, Any], stage: str) -> None:
                      "entry": copy.deepcopy(entry)}, technical=True)
 
 
+_BANTER_BEAT_ROW = re.compile(
+    r"(?m)^\s*(\d+)\s+([ABCD])\s+[-\u2013\u2014]\s*(.+?)\s*$")
+_BANTER_BEAT_STOCK = (
+    "the part i cannot shake", "you brought another thought",
+    "back to the music", "what you actually wanted us to",
+    "your point opens the call up",
+)
+_BANTER_BEAT_STOP = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by",
+    "do", "for", "from", "had", "has", "have", "he", "her", "here",
+    "him", "his", "i", "if", "in", "is", "it", "its", "me", "my",
+    "no", "not", "of", "on", "or", "our", "she", "so", "that", "the",
+    "their", "them", "then", "there", "they", "this", "to", "was", "we",
+    "were", "what", "when", "where", "who", "with", "you", "your",
+}
+
+
+def _beat_content_words(text: str) -> set[str]:
+    return {word for word in re.findall(r"[a-z0-9']+", str(text or "").lower())
+            if len(word) >= 4 and word not in _BANTER_BEAT_STOP}
+
+
+def _beat_answers(previous: str, fresh: str) -> bool:
+    """A free structural check before spending one optional retry."""
+    new = " ".join(str(fresh or "").lower().split())
+    if not new or any(frame in new for frame in _BANTER_BEAT_STOCK):
+        return False
+    before = _beat_content_words(previous)
+    return not before or bool(before & _beat_content_words(new))
+
+
+def _banter_beat_plan(sheet: str, lines: int,
+                      seats: list[str]) -> list[dict[str, Any]]:
+    """Turn the human-readable running order into bounded generation beats."""
+    found = {int(number): {"turn": int(number), "seat": seat, "work": work}
+             for number, seat, work in _BANTER_BEAT_ROW.findall(str(sheet or ""))}
+    available = [seat for seat in seats if seat in {"A", "B", "C", "D"}] or ["A", "B"]
+    out: list[dict[str, Any]] = []
+    last = ""
+    for turn in range(1, max(2, min(int(lines or 0), 24)) + 1):
+        row = found.get(turn)
+        if row is None:
+            choices = [seat for seat in available if seat != last] or available
+            seat = "A" if turn == 1 and "A" in choices else choices[(turn - 1) % len(choices)]
+            row = {"turn": turn, "seat": seat,
+                   "work": ("opens the subject" if turn == 1 else
+                            "answers the turn immediately before it, quoting one concrete word or claim")}
+        out.append(row)
+        last = str(row["seat"])
+    return out
+
+
+async def _banter_beats(context: str, sheet: str, lines: int,
+                        seats: list[str], seed_text: str = "",
+                        trace: list[dict[str, Any]] | None = None) -> str:
+    """Write a banked exchange as responsive 3-4-turn calls.
+
+    Each visit receives the final two completed turns verbatim. The generated
+    markers are re-seated onto the pre-rolled plan, so a marker embedded in
+    prose cannot create a phantom speaker or reorder the script.
+    """
+    trace = trace if trace is not None else []
+    plan = _banter_beat_plan(sheet, lines, seats)
+    made: list[tuple[str, str]] = []
+    first = ""
+    if seed_text and plan:
+        first = _verbatim_turn_text(seed_text).strip()
+        if first:
+            made.append((str(plan[0]["seat"]), first))
+    cursor = len(made)
+    compact = str(context or "").strip()
+    if len(compact) > 14000:
+        compact = compact[:9000].rstrip() + "\n\n[context middle elided]\n\n" + compact[-4500:].lstrip()
+
+    async def write(rows: list[dict[str, Any]], retry: bool = False) -> tuple[str, list[tuple[str, str]]]:
+        recent = "\n".join(
+            "%s has just said - %s" % (marker, text)
+            for marker, text in made[-2:]) or "Nothing has been said yet."
+        order = "\n".join(
+            "%d  %s  - %s" % (row["turn"], row["seat"], row["work"])
+            for row in rows)
+        correction = (
+            "\nThe prior attempt did not directly answer the last completed turn. "
+            "Use one of its concrete words in the first reply."
+            if retry else "")
+        prompt = (
+            compact + "\n\nCOMPLETED TRANSCRIPT - these lines are immutable:\n" + recent
+            + "\n\nWRITE ONLY THIS NEXT BEAT:\n" + order + correction
+            + "\nEvery turn reacts to the line immediately above it before adding "
+              "anything new. Output exactly one line per listed turn using only "
+              "the listed A:/B:/C:/D: marker. No preface, labels, markdown, stage "
+              "directions, or lines from earlier beats."
+        )
+        raw = await ask_model(
+            prompt, limit=min(2800, max(1200, 650 * len(rows))), spice=0.45,
+            num_ctx=16384,
+            mark={"kind": "banter beat", "from": rows[0]["turn"],
+                  "until": rows[-1]["turn"], "retry": retry})
+        parsed = banter_turns(raw or "")
+        clean: list[tuple[str, str]] = []
+        for row, candidate in zip(rows, parsed):
+            text = spoken_text(candidate[1]).strip()
+            if text:
+                clean.append((str(row["seat"]), text))
+        return raw, clean
+
+    while cursor < len(plan):
+        if made and prep_should_stop():
+            trace.append({"beat": len(trace) + 1, "from": cursor + 1,
+                          "until": len(plan), "stopped": prep_should_stop()})
+            break
+        rows = plan[cursor:cursor + 4]
+        started = time.monotonic()
+        attempts = 0
+        accepted: list[tuple[str, str]] = []
+        for retry in (False, True):
+            attempts += 1
+            _raw, candidate = await write(rows, retry=retry)
+            answers = bool(candidate) and _beat_answers(
+                made[-1][1] if made else "", candidate[0][1])
+            if len(candidate) >= len(rows) and answers:
+                accepted = candidate[:len(rows)]
+                break
+            if retry:
+                accepted = candidate[:len(rows)]
+        trace.append({"beat": len(trace) + 1, "from": rows[0]["turn"],
+                      "until": rows[-1]["turn"], "asked": len(rows),
+                      "made": len(accepted), "attempts": attempts,
+                      "ms": int((time.monotonic() - started) * 1000)})
+        if not accepted:
+            break
+        made.extend(accepted)
+        cursor += len(accepted)
+        if len(accepted) < len(rows):
+            break
+        await asyncio.sleep(0)
+
+    # One bounded glue visit gets the remainder. It is also the no-empty
+    # guarantee when the first beat failed transiently.
+    if cursor < len(plan) and not prep_should_stop():
+        rows = plan[cursor:]
+        started = time.monotonic()
+        _raw, accepted = await write(rows, retry=True)
+        accepted = accepted[:len(rows)]
+        trace.append({"beat": "glue", "from": rows[0]["turn"],
+                      "until": rows[-1]["turn"], "asked": len(rows),
+                      "made": len(accepted), "attempts": 1,
+                      "ms": int((time.monotonic() - started) * 1000)})
+        made.extend(accepted)
+
+    return "\n".join("%s: %s" % row for row in made).strip()
+
+
 async def dj_banter(track: dict[str, Any] | None = None,
                     angle: str = "", lines: int = 0,
                     also_name: str = "", force_seed: bool = False,
@@ -98378,6 +98748,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # on an unbound name.
     _desk_at = 0.0
     _paper_context: dict[str, Any] = {}
+    _engine_mode = banter_engine_mode(bank)
+    _beat_trace: list[dict[str, Any]] = []
     _system2_job = system2_current_work() if globals().get("system2_current_work") else None
     _system2_budget = dict(dj.get("system2_budget") or {}) if _system2_job else {}
     _system2_sources: list[dict[str, Any]] = []
@@ -99219,7 +99591,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             pipeline_log("drop", "the running order could not be rolled",
                          extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
             _beat_sheet, _dice_rolls = "", []
-        script = await ask_model(
+        _one_call_prompt = (
             f"{radio_persona('host', dj['persona'])}"
             f"{radio_prompt_instruction('host')}"
             f"{radio_prompt_instruction('cohost')}"
@@ -99403,13 +99775,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # The material says what to talk about; the running order is
             # the shape of the answer, and the shape must be the thing
             # the model is holding when it starts to write.
-            + ("\n\n" + _beat_sheet if _beat_sheet else ""),
-            spice=0.5,                  # wider intonation draw (#371)
-            # Room for the whole swath to come back out (#210): a long
-            # passage worked in needs more turns than a one-line remark, and
-            # running out of tokens is what a DJ stopping mid-word sounds
-            # like (#168).
-            limit=min(
+            + ("\n\n" + _beat_sheet if _beat_sheet else "")
+        )
+        # Room for the whole swath to come back out (#210): a long passage
+        # worked in needs more turns than a one-line remark. The same ceiling
+        # governs the one-call road; each beat has its own smaller bound.
+        _reply_limit = min(
                 int(_system2_budget.get("max_chars") or dj.get("reply_max_chars") or 6000),
                 int(dj.get("reply_max_chars") or 6000),
                 # #842: a banked round asks for a bigger script than a
@@ -99439,12 +99810,44 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     # still the hard ceiling above, so this can only ever
                     # give back room the operator already allows.
                     + len(_beat_sheet)),
-            ),
-            # #842: "we can increase the context length for the LLM to get
-            # more lines". The banked round is written in the wide window;
-            # a live one keeps the operator's own num_ctx untouched.
-            num_ctx=(32768 if _bank_rich else 0),
-        )
+            )
+        _engine_mode = banter_engine_mode(bank)
+        _beat_trace.clear()
+        if _bank_rich and _engine_mode == "beats" and not caller_name:
+            # A beat carries only stable authorship, subject and source
+            # context. The giant all-turn request above remains the complete
+            # one-call contract, while the bank road gets a short instruction
+            # followed by the two lines it has actually produced.
+            _beat_context = "\n\n".join(part for part in (
+                str(radio_persona("host", dj["persona"])),
+                str(radio_persona("cohost", dj["cohost_persona"])),
+                str(radio_prompt_instruction("interaction")),
+                str(radio_prompt_instruction("speakerbox")),
+                str(_paper_context.get("prompt") or ""),
+                "SUBJECT AND DIRECTION: " + str(angle or ""),
+                "OPENING SPEAKBOX PASSAGE: " + str((seed or {}).get("text") or ""),
+                ("MID-ROUND SUBJECT: " + str(_topic_new.get("text") or ""))
+                if _topic_new else "",
+                str(playing or ""),
+                tail_lists_clause(material, pictures, own_material),
+            ) if str(part or "").strip())
+            script = await _banter_beats(
+                _beat_context, _beat_sheet, int(lines or 0),
+                banter_floor_seats(dj, bool(third), caller_name),
+                seed_text=str((seed or {}).get("text") or ""),
+                trace=_beat_trace)
+            pipeline_log("model", "banked banter written as %d responsive "
+                         "beat(s), %d parsed turns" % (
+                             len(_beat_trace), len(banter_turns(script or ""))))
+        else:
+            script = await ask_model(
+                _one_call_prompt,
+                spice=0.5,              # wider intonation draw (#371)
+                limit=_reply_limit,
+                # #842: the banked one-call override keeps its wide context;
+                # live writing keeps the operator's num_ctx untouched.
+                num_ctx=(32768 if _bank_rich else 0),
+            )
     except Exception as exc:
         # #805: this `except` was SILENT, and the ledger showed what
         # silence costs — 52 of 99 calls in 12h aired zero turns, most
@@ -99758,19 +100161,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # Mined means SAID (#404): a swath the model paraphrased away is
         # put back as the round's opening line, verbatim.
         probe = " ".join(seed["text"].split()).lower()[:60]
-        if probe and probe not in " ".join(script.split()).lower():
-            # #862: and being put back word for word is what makes it a
-            # VERBATIM passage, with the same protection as the ones
-            # below. Registered where `_verbatim` is declared.
-            # 2026-09-08 (the scan): bounded when raw, like the other doors
-            # - this door put a thousand-character run-on in as one turn.
+        if probe:
+            # The beat road may already have dealt this exact opening. It is
+            # still a protected source passage, so registration is based on
+            # what the script contains, not only on whether this block had to
+            # put it back.
             _seed_forced = True
             _seed_put = _verbatim_turn_text(seed["text"])
-            # [#1386] THE PASSAGE OPENS THE EXCHANGE. It goes in at the
-            # HEAD as A's own first turn - which is what the operator
-            # drew: the first line of a banter is the one seeded by the
-            # speakbox, and everybody else is answering it.
-            script = f"A: {_seed_put}\n" + script
+            if probe not in " ".join(script.split()).lower():
+                # [#1386] THE PASSAGE OPENS THE EXCHANGE. It goes in at
+                # the head as A's first turn and everybody answers it.
+                script = f"A: {_seed_put}\n" + script
     _sb = dj_settings()
 
     async def _fresh_swath() -> dict[str, Any]:
@@ -100134,6 +100535,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             pass                        # the assembled round stands
     entry = {
         "script": script, "lines": lines, "vouched": vouched,
+        "writer_engine": _engine_mode,
+        **({"beat_chain": copy.deepcopy(_beat_trace)} if _beat_trace else {}),
         "newspaper": {k: v for k, v in (_paper_context or {}).items() if k != "prompt"},
         # The road identity has to exist BEFORE tint and brief audit.  The
         # outer prep_round used to stamp `caller` only after dj_banter
@@ -103601,6 +104004,77 @@ PEER_SERVICES = {
 }
 LIFEBOAT_URL = os.getenv("LIFEBOAT_URL", "http://127.0.0.1:8099")
 
+# The desktop asks /api/pinebox/status every six seconds. A live diagnosis
+# talks to Piper, the lifeboat, Home Assistant and sometimes the LAN; making
+# each status request wait for all of that piled several 25-second refreshes
+# on top of one another and, on 2026-09-22, starved /healthz until the host
+# watchdog restarted the broadcast. The diagnosis now has one worker thread
+# and one remembered answer. Slow or wedged peers can delay that worker, never
+# the station's asyncio loop.
+PINEBOX_DIAG_TTL = 60.0
+_PINEBOX_DIAG: dict[str, Any] = {
+    "at": 0.0, "value": {}, "running": False, "error": "",
+}
+_PINEBOX_DIAG_LOCK = RLock()
+
+
+def pinebox_diagnose_start(force: bool = False) -> dict[str, Any]:
+    """Start at most one off-loop diagnosis and return its current state."""
+    now = time.time()
+    with _PINEBOX_DIAG_LOCK:
+        age = now - float(_PINEBOX_DIAG.get("at") or 0)
+        if (_PINEBOX_DIAG.get("running")
+                or (not force and _PINEBOX_DIAG.get("value")
+                    and age < PINEBOX_DIAG_TTL)):
+            return copy.deepcopy(_PINEBOX_DIAG)
+        _PINEBOX_DIAG["running"] = True
+        _PINEBOX_DIAG["error"] = ""
+
+    def run() -> None:
+        value: dict[str, Any] = {}
+        error = ""
+        try:
+            value = asyncio.run(pinebox_diagnose())
+        except BaseException as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"[:140]
+        with _PINEBOX_DIAG_LOCK:
+            if value:
+                _PINEBOX_DIAG.update({"at": time.time(), "value": value})
+            _PINEBOX_DIAG.update({"running": False, "error": error})
+
+    Thread(target=run, name="pinebox-diagnose", daemon=True).start()
+    with _PINEBOX_DIAG_LOCK:
+        return copy.deepcopy(_PINEBOX_DIAG)
+
+
+async def pinebox_diagnose_cached(force: bool = False,
+                                  wait: bool = False,
+                                  timeout: float = 30.0) -> dict[str, Any]:
+    """Read the diagnosis cache, optionally waiting for its worker."""
+    state = pinebox_diagnose_start(force=force)
+    if wait and state.get("running"):
+        until = time.monotonic() + max(0.0, timeout)
+        while state.get("running") and time.monotonic() < until:
+            await asyncio.sleep(0.1)
+            with _PINEBOX_DIAG_LOCK:
+                state = copy.deepcopy(_PINEBOX_DIAG)
+    value = dict(state.get("value") or {})
+    if value:
+        value["diagnosis_at"] = state.get("at")
+        value["diagnosis_running"] = bool(state.get("running"))
+        if state.get("error"):
+            value["diagnosis_error"] = state.get("error")
+        return value
+    return {
+        "healthy": None, "checks": [], "steps": [], "failing": [],
+        "cause": (str(state.get("error") or "diagnosis is running")
+                  if state.get("running") or state.get("error") else
+                  "diagnosis has not run"),
+        "diagnosis_at": state.get("at"),
+        "diagnosis_running": bool(state.get("running")),
+        "diagnosis_error": str(state.get("error") or ""),
+    }
+
 
 async def peer_service_state() -> dict[str, Any]:
     """Which peer services are answering, and who can restart them."""
@@ -103676,7 +104150,10 @@ async def pinebox_diagnose() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         add("The station's own pulse", None, str(exc)[:120])
     try:
-        _ls = library_reading()
+        # This diagnosis may run in its own event loop on a worker thread.
+        # Report the last share reading without seeding a task tied to that
+        # short-lived loop; /api/library owns fresh probes.
+        _ls = library_reading(refresh=False)
         _coming_id = str((_RADIO.get("coming") or {}).get("id") or "")
         _covered = bool(music_hot_file(_RADIO.get("coming") or {})
                         or (_coming_id and _coming_id in _HOT_JOBS)
@@ -120207,25 +120684,29 @@ async def pinebox_status_api(
 ) -> dict[str, Any]:
     """Everything known about the Pine Box in one object (#762).
 
-    Aggregates rather than re-measures: every number here already exists
-    somewhere in the process. The one network round trip is the diagnosis,
-    and if it throws, that is REPORTED rather than smoothed over — a status
-    window that goes green when its own probe failed is the bug this whole
-    run has been about."""
+    Aggregates rather than re-measures. The multi-service diagnosis runs in
+    one worker and this six-second UI poll reads its last complete snapshot,
+    so a dead peer cannot hold the broadcast loop or freeze the controls."""
     require_read_auth(authorization)
-    diag: dict[str, Any] = {}
-    diag_error = ""
-    try:
-        diag = await asyncio.wait_for(pinebox_diagnose(), 25)
-    except Exception as exc:                # noqa: BLE001
-        diag_error = f"{type(exc).__name__}: {exc}"[:140]
+    _diag_state = pinebox_diagnose_start()
+    diag = dict(_diag_state.get("value") or {})
+    diag_error = str(_diag_state.get("error") or "")
+    if _diag_state.get("running") and not diag:
+        diag_error = "diagnosis is running off the broadcast loop"
     ok, spoken = station_health_words()
     now = _RADIO.get("now") or {}
+    try:
+        broadcast_to = str((load_settings() or {}).get("broadcast_to") or "")
+    except Exception:  # noqa: BLE001
+        broadcast_to = ""
     return {
         "healthy": bool(diag.get("healthy")) if diag else None,
         "spoken": spoken,
         "sounds_right": ok,
+        "broadcast_to": broadcast_to,
         "diag_error": diag_error,
+        "diagnosis_at": _diag_state.get("at"),
+        "diagnosis_running": bool(_diag_state.get("running")),
         "cause": diag.get("cause", ""),
         "steps": diag.get("steps", []),
         "checks": diag.get("checks", []),
@@ -120500,7 +120981,7 @@ async def pinebox_diagnose_api(
 ) -> dict[str, Any]:
     """Live diagnosis of why the Pine Box is not talking."""
     require_read_auth(authorization)
-    return await pinebox_diagnose()
+    return await pinebox_diagnose_cached(force=True, wait=True)
 
 
 @app.get("/api/pinebox/guide.pdf")
@@ -120527,7 +121008,7 @@ async def pinebox_guide() -> str:
     It is a page rather than only a PDF so the numbers in it are live; the
     print stylesheet makes Ctrl-P produce the same document."""
     try:
-        state = await pinebox_diagnose()
+        state = await pinebox_diagnose_cached(force=True, wait=True)
     except Exception:
         state = {"cause": "Could not run the diagnosis.", "checks": [],
                  "steps": [], "host": SATELLITE_HOST, "mac": SATELLITE_MAC,
@@ -126700,10 +127181,10 @@ async def script_line_replay(line_id: str, block: int = 0) -> dict[str, Any]:
                 "the station no longer knows which sample that sting was"))
         key = sfx_id(path)
         sig = media_sign(key)
-        admission_admit_line({"path": f"/sfx/{key}", "sig": sig},
-                             who="board", kind="sfx", text=path.stem,
-                             name=path.stem, line_id=new_id,
-                             producer="script_line_replay")
+        await asyncio.to_thread(
+            admission_admit_line, {"path": f"/sfx/{key}", "sig": sig},
+            who="board", kind="sfx", text=path.stem,
+            name=path.stem, line_id=new_id, producer="script_line_replay")
         delivery = page_feed_append({
             "url": f"/sfx/{key}?t={sig}", "text": "", "sting": path.stem,
             "replay": True, "replay_of": line_id})
@@ -126723,10 +127204,10 @@ async def script_line_replay(line_id: str, block: int = 0) -> dict[str, Any]:
             raise HTTPException(status_code=410, detail=(
                 "the audio behind that line has been pruned - the words "
                 "remain, the sound is gone"))
-        admission_admit_line({"path": f"/media/{media}", "sig": sig},
-                             who=who, kind=kind or "dialogue", text=text,
-                             name=name, line_id=new_id,
-                             producer="script_line_replay")
+        await asyncio.to_thread(
+            admission_admit_line, {"path": f"/media/{media}", "sig": sig},
+            who=who, kind=kind or "dialogue", text=text,
+            name=name, line_id=new_id, producer="script_line_replay")
         delivery = page_feed_append({
             "url": f"/media/{media}?t={sig}", "text": text, "who": who,
             "name": name, "kind": kind or "dialogue", "seconds": secs,
@@ -127391,9 +127872,17 @@ async def _script_report_payload(request: Request) -> dict[str, Any]:
     return payload
 
 
-def _script_report_observe(view: dict[str, Any], since_ms: float = 0) -> dict[str, Any]:
+async def _script_report_observe(view: dict[str, Any],
+                                 since_ms: float = 0) -> dict[str, Any]:
+    """Read incident context without making the report button block HTTP.
+
+    The context joins several disk-backed ledgers. On a busy or recovering
+    share those reads may be slow, but capturing a fault must not become a
+    second fault on the station's event loop.
+    """
     try:
-        return script_diagnostic_context(view, since_ms=since_ms)
+        return await asyncio.to_thread(
+            script_diagnostic_context, view, since_ms=since_ms)
     except Exception as exc:  # evidence failure must be visible, never a guessed diagnosis
         return {"observed_at_ms": int(time.time() * 1000),
                 "errors": [str(exc)[:240]]}
@@ -127406,6 +127895,47 @@ def _script_report_answer(report: dict[str, Any]) -> dict[str, Any]:
             "incident_id": report.get("incident_id"), "file": report.get("file"),
             "status": report.get("status"), "verdict": messages,
             "say": "filed as #%s - diagnostic capture saved" % report.get("inbox_id")}
+
+
+def _script_report_summary(report: dict[str, Any]) -> str:
+    """The replaceable, machine-owned part of a diagnostic inbox item."""
+    findings = (report.get("analysis") or {}).get("findings") or []
+    messages = [str(f.get("message") or "") for f in findings
+                if isinstance(f, dict) and f.get("message")]
+    body = "Script diagnostic capture"
+    if report.get("reason"):
+        body += ": " + str(report["reason"])
+    if messages:
+        body += "\n\n" + "\n".join("- " + message for message in messages[:3])
+    body += "\n\nFull evidence and available follow-up: " + str(report.get("file") or "")
+    return ("<!-- script-report-summary:start -->\n" + body
+            + "\n<!-- script-report-summary:end -->")
+
+
+async def _script_report_sync_inbox(report: dict[str, Any]) -> None:
+    """Publish the completed post-window verdict without touching operator edits."""
+    if not report.get("inbox_id"):
+        return
+    start = "<!-- script-report-summary:start -->"
+    end = "<!-- script-report-summary:end -->"
+    async with _pine_lock:
+        items = await asyncio.to_thread(pine_read)
+        item = next((row for row in items if row.get("id") == report["inbox_id"]), None)
+        if item is None:
+            return
+        text = str(item.get("text") or "")
+        left = text.find(start)
+        right = text.find(end, left + len(start)) if left >= 0 else -1
+        # Only replace a block this reporter explicitly owns. An old or
+        # operator-authored body is left exactly as it was.
+        if left < 0 or right < 0:
+            return
+        right += len(end)
+        fresh = text[:left] + _script_report_summary(report) + text[right:]
+        if fresh != text:
+            item["text"] = fresh
+            await asyncio.to_thread(pine_write, items,
+                                    "updating a completed script diagnostic")
 
 
 async def _script_report_attach_inbox(report: dict[str, Any]) -> None:
@@ -127441,20 +127971,14 @@ async def script_report_api(request: Request,
     view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
     # The timestamp belongs to receipt of the initial tap, before any image
     # upload, disk scans, or report writing. Each observation keeps its clock.
-    server = _script_report_observe(view)
+    server = await _script_report_observe(view)
     report = await asyncio.to_thread(_SCRIPT_REPORT_STORE.create, view, server,
                 incident_id=str(payload.get("incident_id") or view.get("incident_id") or ""),
                 reason=str(payload.get("reason") or ""),
                 image=str(payload.get("image") or ""), save_images=_save_pine_images)
-    messages = [str(f.get("message") or "") for f in
-                (report.get("analysis") or {}).get("findings", []) if isinstance(f, dict)]
-    summary = "Script diagnostic capture" + (": " + report["reason"] if report.get("reason") else "")
-    if messages:
-        summary += "\n\n" + "\n".join("- " + m for m in messages[:3])
-    summary += "\n\nFull evidence and available follow-up: " + report["file"]
     # Generic station context used to duplicate large, unrelated snapshots.
     # This incident already holds selected playback receipts and row states.
-    item = await pine_append(summary)
+    item = await pine_append(_script_report_summary(report))
     report["inbox_id"] = item.get("id")
     await asyncio.to_thread(_SCRIPT_REPORT_STORE.set_inbox, Path(report["file"]).name, item.get("id"))
     await _script_report_attach_inbox(report)
@@ -127477,7 +128001,8 @@ async def script_report_finish_api(name: str, request: Request,
     incident_id = str(payload.get("incident_id") or view.get("incident_id") or "")
     if incident_id != str(old.get("incident_id") or ""):
         raise HTTPException(status_code=409, detail="incident identity does not match")
-    server = _script_report_observe(view, since_ms=float(old.get("server_observed_at_ms") or 0))
+    server = await _script_report_observe(
+        view, since_ms=float(old.get("server_observed_at_ms") or 0))
     screenshot = payload.get("screenshot")
     if not isinstance(screenshot, dict):
         screenshot = {key: payload.get(source) for key, source in
@@ -127488,6 +128013,7 @@ async def script_report_finish_api(name: str, request: Request,
     report = await asyncio.to_thread(_SCRIPT_REPORT_STORE.finish, name, incident_id, view, server,
                 image=str(payload.get("image") or ""), screenshot=screenshot,
                 save_images=_save_pine_images)
+    await _script_report_sync_inbox(report)
     await _script_report_attach_inbox(report)
     return _script_report_answer(report)
 
@@ -143608,15 +144134,7 @@ async def dj_mixtapes_list(
     """Every mixtape in the folder, newest first, so the library window can
     list them and let one be requested by name (#532)."""
     require_read_auth(authorization)
-    out: list[dict[str, Any]] = []
-    for p in mixtape_files():
-        try:
-            when = int(p.stat().st_mtime)
-        except OSError:
-            when = 0
-        out.append({"id": sfx_id(p), "title": mixtape_title(p),
-                    "when": when, "ready": tape_ready(p)})
-    out.sort(key=lambda t: t["when"], reverse=True)
+    out = await asyncio.to_thread(mixtape_catalog)
     return {"tapes": out, "folder": str(mixtape_folder())}
 
 
@@ -143636,7 +144154,8 @@ async def dj_mixtape_api(
     except Exception:
         want = ""
     if want:
-        path = next((p for p in mixtape_files() if sfx_id(p) == want), None)
+        tapes = await asyncio.to_thread(mixtape_files)
+        path = next((p for p in tapes if sfx_id(p) == want), None)
         if not path:
             raise HTTPException(status_code=404,
                                 detail="That tape is not in the folder")
@@ -148411,9 +148930,10 @@ async def dj_sfx_play(
     key = sfx_id(path)
     signature = media_sign(key)
     # #1339: the button that proves the wiring proves this part of it too.
-    admission_admit_line({"path": f"/sfx/{key}", "sig": signature},
-                         who="board", kind="sfx", text=path.stem,
-                         name=path.stem, line_id=key, producer="dj_sfx_play")
+    await asyncio.to_thread(
+        admission_admit_line, {"path": f"/sfx/{key}", "sig": signature},
+        who="board", kind="sfx", text=path.stem,
+        name=path.stem, line_id=key, producer="dj_sfx_play")
     page_feed_append({                  # #1147: honest broadcast stamp
         "url": f"/sfx/{key}?t={signature}",
         "text": "", "sting": path.stem,
@@ -151099,7 +151619,7 @@ def air_handover(why: str = "") -> dict[str, Any]:              # [#1184]
                     continue
                 if bool((row or {}).get("fallback")) != want_fallback:
                     continue
-                got = _listener_for_terminal(row)
+                got = _listener_for_terminal(row, name)
                 if not got:
                     continue
                 key = _owner_deaf_key(got)
@@ -152613,7 +153133,8 @@ async def sfx_fill_now_api(
         # the sample as an argument (#1034), so this takes no new
         # powers and opens no second player - it picks, and hands the
         # pick to the door that already knows how to open the set.
-        pick = await asyncio.to_thread(_sfx_any_video)
+        fresh = await sfx_video_fresh_pick()
+        pick = fresh[0] if fresh else await asyncio.to_thread(_sfx_any_video)
         if pick is None:
             return {**sfx_gap_status(), "went": "", "road": road,
                     "say": "no video clip is free - the library has none "
@@ -153064,6 +153585,25 @@ async def sfx_db_pick_row_async(video: bool = True) -> tuple[Path, float] | None
     try:
         return await asyncio.get_running_loop().run_in_executor(
             _SFX_DB_EXEC, sfx_db_pick_row, video)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sfx_db_seconds(path: Path) -> float | None:
+    """A clip length from the local book, without touching its share path."""
+    try:
+        row = sfx_db_reader().execute(
+            "SELECT seconds FROM clips WHERE path = ? LIMIT 1", (str(path),)
+        ).fetchone()
+        return float(row["seconds"] or 0.0) if row is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def sfx_db_seconds_async(path: Path) -> float | None:
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            _SFX_DB_EXEC, sfx_db_seconds, path)
     except Exception:  # noqa: BLE001
         return None
 
@@ -154638,6 +155178,12 @@ def sfx_match_sting_pick(after: str = "", want_video: Any = None) -> Any:
             continue
         if float(weights.get(key, 1.0) or 0) <= 0.05:
             continue                          # marked all the way down (#645)
+        # A lone exact lexical hit must not defeat the station's rotation.
+        # If it was just heard, let the ordinary draw reach the deep book.
+        if sting_recent(str(path)):
+            continue
+        if sfx_is_video(path) and sfx_video_on_cooldown(key):
+            continue
         survivors.append(str(path))
         why_by_path[str(path)] = (_sfx_match.explain(cand), cand.score)
     if not survivors:
@@ -155006,7 +155552,7 @@ async def sfx_video_cue_api(
     # to_thread rather than inline because sqlite is blocking, and a
     # microsecond of blocking on this loop is still blocking on a loop
     # that was measured holding 42,991 seconds of dead air.
-    _got = await sfx_db_pick_row_async(True)              # #1362e/#1362f
+    _got = await sfx_video_fresh_pick()                   # #1362e/#1433
     _book = _got[0] if _got else None
     _book_secs = float(_got[1]) if _got else 0.0
     if _book is None and not sfx_video_warm():
@@ -155036,7 +155582,13 @@ async def sfx_video_cue_api(
     # one clip four times in ten taps - so it only stands in when the
     # book has nothing, never in front of it.
     if pick is None:
-        pick = sfx_deck_take()
+        for _ in range(4):
+            candidate = sfx_deck_take()
+            if candidate is None:
+                break
+            if not sfx_video_on_cooldown(sfx_id(candidate)):
+                pick = candidate
+                break
     if pick is None:
         pick = await asyncio.to_thread(_sfx_any_video)
     if pick is None:
@@ -155061,15 +155613,20 @@ async def sfx_video_cue_api(
     # #1339: a clip with a picture goes out on the set, and the set is
     # broadcast. `seconds` is already known here - the book pick carries
     # it - so the cue covers the real length rather than a guess.
-    admission_admit_line({"path": f"/sfx/{key}", "sig": signature},
-                         who="board", kind="sfx", text=pick.stem,
-                         name=pick.stem, line_id=key, length=float(seconds),
-                         producer="sfx_video_cue_api")
+    await asyncio.to_thread(
+        admission_admit_line, {"path": f"/sfx/{key}", "sig": signature},
+        who="board", kind="sfx", text=pick.stem,
+        name=pick.stem, line_id=key, length=float(seconds),
+        producer="sfx_video_cue_api")
     try:
         page_feed_append(dict(clip))
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "clip": None,
                 "say": "the set's own ring refused it: " + type(exc).__name__}
+    # Reserve it before this request answers. Two rapid taps otherwise both
+    # draw while the first one's slower history write is still in flight.
+    sfx_video_note_played(key)
+    sting_remember(str(pick))
 
     # Everything below is the record, not the broadcast, so it happens
     # behind the answer the thumb is waiting on.
@@ -155818,6 +156375,15 @@ async def sfx_video_cut_api(
         "from": body.get("from"),
         "to": body.get("to"),
     })
+    try:
+        key = str(body.get("id") or "")
+        if not key:
+            match = re.search(r"/sfx/([^/?#]+)", url)
+            key = match.group(1) if match else ""
+        if key:
+            sfx_video_note_played(key)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         note_activity("sting", str(clip.get("sting") or "clip"))
     except Exception:  # noqa: BLE001
@@ -160905,7 +161471,19 @@ def _screenplay_actions(d: dict[str, Any], since: float,
                 + (" - deleted from the library" if _gone else "") + ".",
                 "sting", line=str(row.get("id") or ""),
                 url=str(row.get("url") or ""),
-                sfx=str(row.get("sfx") or ""), deleted=_gone)
+                sfx=str(row.get("sfx") or ""), deleted=_gone,
+                # Keep the ear's receipt on the action adapter. The screenplay
+                # spine uses this to anchor the next event after a scripted
+                # sting. Dropping it put later single-line blocks before the
+                # final sting in a round (report #1277, block 12674).
+                aired=str(row.get("aired") or ""),
+                heard_ack_at=float(row.get("heard_ack_at") or 0),
+                heard_ack_by=str(row.get("heard_ack_by") or ""),
+                air_at=float(row.get("air_at") or 0),
+                ts=float(row.get("ts") or 0),
+                sid=str(row.get("sid") or ""),
+                seconds=float(row.get("seconds") or 0),
+                who=str(row.get("who") or "board"))
         elif kind == "marker":
             got = " ".join(str(row.get("text") or "").split())
             if got:
@@ -161680,6 +162258,8 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         _raw_at = ev.get("air_at")
         if ev["what"] == "action":
             row = ev["row"]
+            _line = str(row.get("line") or "")
+            _action_pos = _script_pos.get(_line)
             if elements and elements[-1]["type"] in ("dialogue",
                                                      "parenthetical"):
                 speaker = ""
@@ -161692,8 +162272,14 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                  # from was never there. Only when true: an action that is
                  # not a record has no business carrying it.
                  **({"playing": True} if row.get("playing") else {}),
-                 **({"line": row["line"], "clip": row.get("url") or ""}
-                    if row.get("line") else {}))
+                 **({"line": _line, "clip": row.get("url") or "",
+                     "who": str(row.get("who") or ""),
+                     "aired": str(row.get("aired") or ""),
+                     "seconds": round(float(row.get("seconds") or 0), 2),
+                     "sfx": str(row.get("sfx") or "")}
+                    if _line else {}),
+                 **({"block": _action_pos[0], "ord": _action_pos[1]}
+                    if _action_pos else {}))
             counts["actions"] += 1
             continue
         row = ev["row"]
@@ -184175,15 +184761,24 @@ const PineDecor = (function () {
   function show(vid, on) {
     if (!vid) return;
     try {
+      /* Decorative previews never own audio, even when a routing gate is
+         released. defaultMuted also keeps a later source assignment quiet. */
+      vid.muted = true;
+      vid.defaultMuted = true;
+      vid.setAttribute("muted", "");
       if (on) {
+        vid.autoplay = true;
         if (vid.paused && vid.dataset.pineDecorHeld === "1") {
           vid.dataset.pineDecorHeld = "";
           const go = vid.play();
           if (go && go.catch) go.catch(() => {});
         }
-      } else if (!vid.paused) {
+      } else {
+        /* Disarm even before a source exists. The previous `!paused` guard
+           let a later blob assignment autoplay behind the active view. */
         vid.dataset.pineDecorHeld = "1";
-        vid.pause();
+        vid.autoplay = false;
+        if (!vid.paused) vid.pause();
       }
     } catch (err) { /* torn down mid-scroll */ }
   }
@@ -184239,6 +184834,9 @@ function mediaElement(filename) {
   if (isVideoFile(filename)) {
     const vid = document.createElement("video");
     vid.muted = true;
+    vid.defaultMuted = true;
+    vid.setAttribute("muted", "");
+    vid.dataset.pineDecor = "1";
     vid.loop = true;
     vid.autoplay = true;
     vid.playsInline = true;
@@ -204769,11 +205367,18 @@ function pineSoloGate(clock) {
     const gagged = !!owner && !!me && owner !== me;
     window.__pineGagged = gagged;
     document.querySelectorAll("audio,video").forEach((el) => {
-      /* Only ever ADD the gag; releasing it restores whatever the page
-       * had, rather than unmuting something the operator muted. */
-      if (gagged) { el.muted = true; }
-      else if (el.dataset.pineGag === "1") { el.muted = false; }
-      el.dataset.pineGag = gagged ? "1" : "";
+      if (gagged) {
+        if (el.dataset.pineGag !== "1") {
+          el.dataset.pineGagWasMuted = el.muted ? "1" : "0";
+        }
+        el.muted = true;
+        el.dataset.pineGag = "1";
+      } else if (el.dataset.pineGag === "1") {
+        el.muted = (el.dataset.pineGagWasMuted === "1"
+                    || el.dataset.pineDecor === "1");
+        delete el.dataset.pineGag;
+        delete el.dataset.pineGagWasMuted;
+      }
     });
   } catch (e) { /* the show goes on */ }
 }
@@ -236450,11 +237055,18 @@ function pineSoloGate(clock) {
     const gagged = !!owner && !!me && owner !== me;
     window.__pineGagged = gagged;
     document.querySelectorAll("audio,video").forEach((el) => {
-      /* Only ever ADD the gag; releasing it restores whatever the page
-       * had, rather than unmuting something the operator muted. */
-      if (gagged) { el.muted = true; }
-      else if (el.dataset.pineGag === "1") { el.muted = false; }
-      el.dataset.pineGag = gagged ? "1" : "";
+      if (gagged) {
+        if (el.dataset.pineGag !== "1") {
+          el.dataset.pineGagWasMuted = el.muted ? "1" : "0";
+        }
+        el.muted = true;
+        el.dataset.pineGag = "1";
+      } else if (el.dataset.pineGag === "1") {
+        el.muted = (el.dataset.pineGagWasMuted === "1"
+                    || el.dataset.pineDecor === "1");
+        delete el.dataset.pineGag;
+        delete el.dataset.pineGagWasMuted;
+      }
     });
   } catch (e) { /* the show goes on */ }
 }
