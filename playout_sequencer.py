@@ -657,7 +657,21 @@ class LinearSequencer:
                 # round a round-length into the future, for ever.
                 return free
             ready_for = now - float(head.get("ready_at") or now)
-            if ready_for > self.hold_reserve_s:
+            # [#1290] A ROUND KEEPS ITS PLACE WHILE ITS TURN IS STILL COMING.
+            # This bound exists so "a maker that died must never push the air
+            # forward for ever" - but hold()'s audio gate already refuses a
+            # round whose audio is not finished, so a HELD round always has
+            # its work in hand and its maker cannot be dead; and since #1283
+            # the liveness question is asked properly one function away.
+            # Measured live, the bound was starving the script instead:
+            # nine held rounds, the head 1015s old, and all 92 items queued
+            # in front of them unscripted filler. Median wait is 182s and
+            # p90 793s against this 100s bound, so nearly every real round
+            # outlived its own reservation and had filler poured into the
+            # space it was waiting for. Stop reserving only once the air has
+            # actually freed and it still was not taken - the same moment
+            # evict_stale drops it, so the two tests agree.
+            if free <= now and ready_for > self.hold_reserve_s:
                 return free
             return free + max(0.0, float(head.get("seconds") or 0.0))
 
