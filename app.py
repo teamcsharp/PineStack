@@ -17513,6 +17513,16 @@ def unheard_state() -> dict[str, Any]:
     # two ever disagree again the fix is to make this read the one
     # function, not to nudge the number.
     AIR1186_NEXTIN_K = cupboard_unheard_every()
+    # Keep this display on the standing consumer's exact emergency cadence.
+    # A bare dialogue larder turns the cupboard into the temporary reserve;
+    # reporting the ordinary seven-minute dial here made a working 20-second
+    # consumer look stranded to both the operator and the orchestrator.
+    try:
+        if int(larder_stock_count() or 0) == 0:
+            AIR1186_NEXTIN_K = min(
+                AIR1186_NEXTIN_K, UNHEARD_EMPTY_LARDER_EVERY)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         if talk_quiet_for() >= UNHEARD_QUIET_AFTER:
             AIR1186_NEXTIN_K = min(AIR1186_NEXTIN_K, UNHEARD_QUIET_EVERY)

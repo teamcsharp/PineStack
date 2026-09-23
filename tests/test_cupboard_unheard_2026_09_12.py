@@ -475,5 +475,15 @@ class BothFitTestsAgree(unittest.TestCase):
             "both pre-floor and post-floor fit checks must use `free`")
 
 
+class ConsumerCadenceReport(unittest.TestCase):
+    """The panel and the consumer must publish the same emergency rest."""
+
+    def test_empty_larder_cadence_is_visible_in_unheard_state(self):
+        import inspect
+        source = inspect.getsource(app.unheard_state)
+        self.assertIn("larder_stock_count()", source)
+        self.assertIn("UNHEARD_EMPTY_LARDER_EVERY", source)
+
+
 if __name__ == "__main__":
     unittest.main()
