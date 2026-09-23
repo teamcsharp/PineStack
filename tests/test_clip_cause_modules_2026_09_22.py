@@ -1,6 +1,8 @@
 import json
 import socket
+from unittest import mock
 
+import app
 import clip_senses
 import clip_speech
 import sfx_match
@@ -64,3 +66,32 @@ def test_word_cause_edits_produces_honest_undo_calls():
     assert banned["undoable"] is False
     assert word_cause_edits.undo_call(banned) is None
     assert "cannot be put back" in banned["why_not"]
+
+
+def test_line_playout_band_requires_an_audible_listener_receipt():
+    row = {"id": "line-1", "aired": "published", "air_at": 10.0,
+           "seconds": 4.2, "delivery_id": "delivery-1"}
+    with mock.patch.object(app, "line_row_of", return_value=row):
+        band = app.line_playout_band("line-1")
+    assert band["grade"] == "written"
+    assert band["detail"]["heard"] is False
+    assert "no listener has acknowledged" in band["say"]
+
+    row[app.HEARD_STAMP] = 12.5
+    row[app.HEARD_STAMP_BY] = "pinetab"
+    with mock.patch.object(app, "line_row_of", return_value=row):
+        heard = app.line_playout_band("line-1")
+    assert heard["grade"] == "measured"
+    assert heard["detail"]["heard"] is True
+    assert heard["detail"]["heard_at"] == 12.5
+    assert "pinetab acknowledged" in heard["say"]
+
+
+def test_line_playout_band_names_a_withdrawal_instead_of_claiming_air():
+    row = {"id": "line-2", "aired": "withdrawn",
+           "withdrawn_why": "the linear hold refused an overtake"}
+    with mock.patch.object(app, "line_row_of", return_value=row):
+        band = app.line_playout_band("line-2")
+    assert band["grade"] == "absent"
+    assert band["detail"]["heard"] is False
+    assert "linear hold refused" in band["say"]

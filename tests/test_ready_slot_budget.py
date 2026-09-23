@@ -35,6 +35,9 @@ class ReadySlotBudgetTests(unittest.IsolatedAsyncioTestCase):
             "SHELF_REUSABLE": set(), "alt_took": self.took, "_pantry_save": self.save,
             "_INVENTORY_PLAN": {}, "_COMMITS": {}, "_PREPARED_KIND_MEMO": {},
             "VOICE_BROADCAST_LEAD_MS": 1000, "page_carries_live": mock.Mock(return_value=True),
+            # These tests pin the strict occurrence arithmetic. Overrun grace
+            # is covered separately and would deliberately change the answer.
+            "SEGMENT_OVERRUN_MOST": 0.0,
         }
         for name, value in replacements.items():
             self.stack.enter_context(mock.patch.object(app, name, value))

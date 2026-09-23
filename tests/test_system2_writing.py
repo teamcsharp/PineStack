@@ -89,8 +89,10 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
         original = app.dj_banter
         tree = ast.parse(inspect.getsource(original))
         names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        keep = {"dj_banter", "system2_current_work", "system2_source_thought",
-                "system2_turn_instruction", "system2_stamp_entry", "system2_scene_complete"}
+        keep = {"dj_banter", "banter_bank_plan", "plot_label_scrub",
+                "system2_current_work", "system2_source_thought",
+                "system2_turn_instruction", "system2_stamp_entry",
+                "system2_scene_complete"}
         for name in names - keep:
             value = getattr(app, name, None)
             if inspect.isfunction(value):

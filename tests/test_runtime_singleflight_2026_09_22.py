@@ -232,6 +232,62 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
         source = ast.get_source_segment(SOURCE, sting) or ""
         self.assertIn("length=_sample_seconds", source)
 
+        rounds = next(row for row in TREE.body
+                      if isinstance(row, ast.AsyncFunctionDef)
+                      and row.name == "_speak_turns_floorless")
+        source = ast.get_source_segment(SOURCE, rounds) or ""
+        self.assertIn("await asyncio.to_thread(\n"
+                      "                    admission_admit_round", source)
+
+    def test_continuous_polls_only_read_non_blocking_snapshots(self):
+        def body(name):
+            node = next(row for row in TREE.body
+                        if isinstance(row, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and row.name == name)
+            return ast.get_source_segment(SOURCE, node) or ""
+
+        self.assertIn('"admission": admission_state_cached(12)',
+                      body("dj_state"))
+        cached = body("admission_state_cached")
+        self.assertIn('name="admission-state"', cached)
+        self.assertIn("Thread(target=refresh", cached)
+        self.assertNotIn("controller.cue_map", cached)
+        clip_seconds = body("page_clip_seconds")
+        self.assertIn('clip.get("seconds")', clip_seconds)
+        self.assertLess(clip_seconds.index('clip.get("seconds")'),
+                        clip_seconds.index("measured = _clip_seconds"))
+        self.assertIn("await asyncio.to_thread(page_reservation_repair)",
+                      body("dj_voice_api"))
+        self.assertIn("await asyncio.to_thread(reflection_due)",
+                      body("reflection_clock"))
+        self.assertIn("return await asyncio.to_thread(work)",
+                      body("admission_api"))
+        perf = body("perf")
+        self.assertIn("await asyncio.to_thread(_perf_host_snapshot)", perf)
+        self.assertNotIn("read_text", perf)
+
+    def test_airlog_share_writes_do_not_hold_reader_locks(self):
+        writer = body = next(row for row in TREE.body
+                           if isinstance(row, ast.FunctionDef)
+                           and row.name == "airlog_write_rows")
+        source = ast.get_source_segment(SOURCE, writer) or ""
+        self.assertLess(source.index('AIR_LOG_PATH.open("a"'),
+                        source.index("with _AIRLOG_LOCK"))
+        compact = next(row for row in TREE.body
+                       if isinstance(row, ast.FunctionDef)
+                       and row.name == "airlog_compact")
+        source = ast.get_source_segment(SOURCE, compact) or ""
+        self.assertLess(source.index("tmp.write_text"),
+                        source.index("with _AIRLOG_LOCK"))
+        for name in ("airlog_heat_load", "airlog_heat_flush",
+                     "airlog_heat_sample", "heat_ring_rows"):
+            node = next(row for row in TREE.body
+                        if isinstance(row, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and row.name == name)
+            source = ast.get_source_segment(SOURCE, node) or ""
+            self.assertIn("_HEAT_LOCK", source, name)
+            self.assertNotIn("_AIRLOG_LOCK", source, name)
+
 
 if __name__ == "__main__":
     unittest.main()

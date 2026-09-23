@@ -20,6 +20,7 @@ correct on a panel:
     take. #1075 is the rule it would break: unheard radio is an argument
     for airing it, not for binning it.
 """
+import asyncio
 import time
 import unittest
 from unittest import mock
@@ -145,6 +146,237 @@ class UnheardPick(unittest.TestCase):
         self.assertIsNone(got)
 
 
+class ProducedAdDispatch(unittest.IsolatedAsyncioTestCase):
+    """A mixed spot is one file, not a dialogue round with takes."""
+
+    async def test_exact_row_commits_only_after_transport_accepts_it(self):
+        shelf = {"sid": "spot-shelf-1", "produced": "spot-1",
+                 "at": time.time() - 7200}
+        pile = [shelf]
+        entry = {"id": "spot-1", "audio": "spot-1.mp3",
+                 "text": "The finished commercial", "uses": 2}
+        took = []
+        handed = []
+
+        async def carried(got, on_handoff=None):
+            self.assertEqual(got["id"], "spot-1")
+            self.assertTrue(callable(on_handoff))
+            on_handoff()
+            return True
+
+        app._READY_SHELF_BUSY.clear()
+        with mock.patch.dict(app._SHELF, {"ad": pile}, clear=False), \
+                mock.patch.object(app, "_unheard_produced_ad_entry",
+                                  return_value=entry), \
+                mock.patch.object(app, "_floor_take",
+                                  new=mock.AsyncMock(return_value=True)), \
+                mock.patch.object(app, "_floor_drop") as floor_drop, \
+                mock.patch.object(app, "_air_produced_ad", side_effect=carried), \
+                mock.patch.object(app, "stock_used_by", return_value="hour-22"), \
+                mock.patch.object(app, "alt_took",
+                                  side_effect=lambda kind, row: took.append((kind, row))), \
+                mock.patch.object(app, "_pantry_save"), \
+                mock.patch.object(app, "ad_update") as update:
+            got = await app._unheard_produced_ad_air(
+                shelf, on_handoff=lambda: handed.append("accepted"))
+
+        self.assertEqual(got, ["The finished commercial"])
+        self.assertEqual(pile, [])
+        self.assertEqual(shelf["used_by"], "hour-22")
+        self.assertTrue(shelf.get("taken_at"))
+        self.assertEqual(took, [("ad", shelf)])
+        self.assertEqual(handed, ["accepted"])
+        update.assert_called_once_with("spot-1", uses=3)
+        floor_drop.assert_called_once_with(True)
+        self.assertNotIn(id(shelf), app._READY_SHELF_BUSY)
+
+    async def test_refused_transport_leaves_the_exact_row_on_the_shelf(self):
+        shelf = {"sid": "spot-shelf-2", "produced": "spot-2",
+                 "at": time.time() - 7200}
+        pile = [shelf]
+        entry = {"id": "spot-2", "audio": "spot-2.mp3",
+                 "text": "Do not lose me", "uses": 0}
+        app._READY_SHELF_BUSY.clear()
+        with mock.patch.dict(app._SHELF, {"ad": pile}, clear=False), \
+                mock.patch.object(app, "_unheard_produced_ad_entry",
+                                  return_value=entry), \
+                mock.patch.object(app, "_floor_take",
+                                  new=mock.AsyncMock(return_value=True)), \
+                mock.patch.object(app, "_floor_drop"), \
+                mock.patch.object(app, "_air_produced_ad",
+                                  new=mock.AsyncMock(return_value=False)), \
+                mock.patch.object(app, "_pantry_save") as save, \
+                mock.patch.object(app, "ad_update") as update:
+            got = await app._unheard_produced_ad_air(shelf)
+
+        self.assertEqual(got, [])
+        self.assertEqual(pile, [shelf])
+        save.assert_not_called()
+        update.assert_not_called()
+
+    async def test_standing_consumer_uses_the_produced_transport(self):
+        shelf = {"sid": "spot-shelf-3", "produced": "spot-3",
+                 "at": time.time() - 7200}
+        produced = mock.AsyncMock(return_value=["a commercial"])
+        dialogue = mock.AsyncMock(return_value=["wrong door"])
+        old_at, old_rescue = app._UNHEARD_AT[0], app._RESCUE_AT[0]
+        old_speaking = app._SPEAKING[0]
+        # Only 30 seconds have passed against the ordinary seven-minute dial.
+        # An empty banter larder is what makes this walk due.
+        app._UNHEARD_AT[0] = time.time() - 30.0
+        app._SPEAKING[0] = 0
+        try:
+            with mock.patch.dict(app._RADIO, {"on": True}, clear=False), \
+                    mock.patch.object(app, "cupboard_unheard_on", return_value=True), \
+                    mock.patch.object(app, "cupboard_unheard_every", return_value=420.0), \
+                    mock.patch.object(app, "larder_stock_count", return_value=0), \
+                    mock.patch.object(app, "talk_quiet_for", return_value=0.0), \
+                    mock.patch.object(app, "dialogue_quiet_for", return_value=-1.0), \
+                    mock.patch.object(app, "radio_paused", return_value=False), \
+                    mock.patch.object(app, "_floor_busy", return_value=False), \
+                    mock.patch.object(app, "unheard_replace_sweep"), \
+                    mock.patch.object(app, "unheard_pick",
+                                      return_value=("ad", shelf, 7200.0)), \
+                    mock.patch.object(app, "_unheard_produced_ad_air",
+                                      new=produced), \
+                    mock.patch.object(app, "_ready_shelf_air", new=dialogue), \
+                    mock.patch.object(app, "retire_id", return_value="spot-3"), \
+                    mock.patch.object(app, "pipeline_log"), \
+                    mock.patch.object(app, "_UNHEARD_LOG", []):
+                got = await app.unheard_stock_air()
+        finally:
+            app._UNHEARD_AT[0] = old_at
+            app._RESCUE_AT[0] = old_rescue
+            app._SPEAKING[0] = old_speaking
+
+        self.assertEqual(got, "ad")
+        produced.assert_awaited_once()
+        args, kwargs = produced.await_args
+        self.assertEqual(args, (shelf,))
+        self.assertFalse(kwargs["force"])
+        self.assertTrue(callable(kwargs["on_handoff"]))
+        dialogue.assert_not_awaited()
+
+    async def test_transport_handoff_finishes_watchdog_before_playout_settles(self):
+        """A long clip is accepted work at publication, while its tracked
+        task keeps the floor until the clip's real airtime finishes."""
+        shelf = row("manager", age_h=6.0)
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def long_playout(kind, track, *, rescue=False, pick=None,
+                               force=False, on_handoff=None):
+            self.assertIs(pick, shelf)
+            self.assertTrue(callable(on_handoff))
+            on_handoff()
+            try:
+                await release.wait()
+                return ["one", "two"]
+            finally:
+                finished.set()
+
+        old_at, old_rescue = app._UNHEARD_AT[0], app._RESCUE_AT[0]
+        old_speaking = app._SPEAKING[0]
+        old_sweep = dict(app._UNHEARD_SWEEP)
+        app._UNHEARD_AT[0] = 0.0
+        app._SPEAKING[0] = 0
+        try:
+            with mock.patch.dict(app._RADIO, {"on": True}, clear=False), \
+                    mock.patch.object(app, "cupboard_unheard_on", return_value=True), \
+                    mock.patch.object(app, "cupboard_unheard_every", return_value=420.0), \
+                    mock.patch.object(app, "larder_stock_count", return_value=0), \
+                    mock.patch.object(app, "talk_quiet_for", return_value=100.0), \
+                    mock.patch.object(app, "dialogue_quiet_for", return_value=100.0), \
+                    mock.patch.object(app, "radio_paused", return_value=False), \
+                    mock.patch.object(app, "_floor_busy", return_value=False), \
+                    mock.patch.object(app, "unheard_replace_sweep"), \
+                    mock.patch.object(app, "unheard_pick",
+                                      return_value=("manager", shelf, 21600.0)), \
+                    mock.patch.object(app, "_ready_shelf_air",
+                                      side_effect=long_playout), \
+                    mock.patch.object(app, "retire_id", return_value="manager-long"), \
+                    mock.patch.object(app, "pipeline_log"), \
+                    mock.patch.object(app, "_UNHEARD_LOG", []):
+                before = int(app._UNHEARD_SWEEP.get("aired") or 0)
+                got = await asyncio.wait_for(
+                    app.unheard_stock_air(force=True), timeout=15.0)
+                self.assertEqual(got, "manager")
+                self.assertFalse(finished.is_set())
+                self.assertEqual(app._UNHEARD_SWEEP["aired"], before + 1)
+                self.assertEqual(len(app._UNHEARD_LOG), 1)
+                self.assertEqual(app._UNHEARD_LOG[0]["lines"], 2)
+                release.set()
+                await asyncio.wait_for(finished.wait(), timeout=15.0)
+                await asyncio.sleep(0)
+                self.assertEqual(app._UNHEARD_SWEEP["aired"], before + 1)
+                self.assertEqual(len(app._UNHEARD_LOG), 1)
+        finally:
+            release.set()
+            app._UNHEARD_AT[0] = old_at
+            app._RESCUE_AT[0] = old_rescue
+            app._SPEAKING[0] = old_speaking
+            app._UNHEARD_SWEEP.clear()
+            app._UNHEARD_SWEEP.update(old_sweep)
+
+
+class BanterBootstrap(unittest.TestCase):
+    """The reserve gets a playable first round before it grows deep."""
+
+    def test_empty_larder_banks_a_short_complete_round_first(self):
+        with mock.patch.object(app, "larder_stock_count", return_value=0):
+            got = app.banter_bank_plan(30, bank=True)
+        self.assertTrue(got["bootstrap"])
+        self.assertFalse(got["rich"])
+        self.assertEqual(got["judge_lines"], app.BANTER_BOOTSTRAP_LINES)
+        self.assertEqual(got["lines"], app.BANTER_BOOTSTRAP_LINES)
+
+    def test_later_banked_rounds_keep_the_rich_expansion(self):
+        with mock.patch.object(app, "larder_stock_count", return_value=1):
+            got = app.banter_bank_plan(12, bank=True)
+        self.assertFalse(got["bootstrap"])
+        self.assertTrue(got["rich"])
+        self.assertEqual(got["judge_lines"], 12)
+        self.assertEqual(got["lines"], 16)
+
+    def test_assigned_calls_are_never_shortened_by_an_empty_larder(self):
+        with mock.patch.object(app, "larder_stock_count", return_value=0):
+            got = app.banter_bank_plan(11, bank=True, bootstrap_ok=False)
+        self.assertFalse(got["bootstrap"])
+        self.assertTrue(got["rich"])
+        self.assertEqual(got["judge_lines"], 11)
+        self.assertEqual(got["lines"], 15)
+
+
+class FlatSingleTake(unittest.TestCase):
+    """The original one-key shelf shape is a complete performance too."""
+
+    def test_ready_validator_adapts_a_flat_pantry_take_without_rerendering(self):
+        key = "flat-take-key"
+        text = "The finished dry ad already has a voice and a measured clip."
+        clip = {"path": "/voice-media/flat-take.wav", "seconds": 7.5}
+        saved = {"clip": clip, "text": text, "voice": "xtts:host",
+                 "who": "dj"}
+        shelf = {"sid": "ad-flat", "key": key, "text": text,
+                 "text_plain": text, "voice": "xtts:new-host",
+                 "seconds": 7.5, "tint_ok": True}
+        with mock.patch.dict(app._PANTRY, {key: saved}, clear=False), \
+                mock.patch.object(app, "dialogue_row_ready", return_value=True), \
+                mock.patch.object(app, "media_present", return_value=True):
+            takes = app._ready_round_takes("ad", shelf)
+            entry = app._ready_air_entry("ad", shelf)
+
+        self.assertEqual(len(takes), 1)
+        self.assertEqual(takes[0]["key"], key)
+        # The recording's actual voice wins over a later cast setting.
+        self.assertEqual(takes[0]["voice"], "xtts:host")
+        self.assertEqual(takes[0]["clip"], clip)
+        self.assertEqual(entry["script"], "A: " + text)
+        self.assertEqual(entry["lines"], 1)
+        self.assertTrue(entry["whole"])
+        self.assertTrue(entry["render_stream"])
+        self.assertEqual(entry["prep_kind"], "ad")
+
+
 class ReplaceSweep(unittest.TestCase):
     """"Replace what is not used" may never mean "bin unheard radio"."""
 
@@ -238,7 +470,9 @@ class BothFitTestsAgree(unittest.TestCase):
                          "the number of fit tests changed - check both "
                          "honour `free`")
         self.assertNotIn("not rescue\n", src.replace(" ", ""))
-        self.assertEqual(src.count("if not takes or (not free"), 2)
+        self.assertEqual(
+            src.count("if not free and not _ready_round_fits"), 2,
+            "both pre-floor and post-floor fit checks must use `free`")
 
 
 if __name__ == "__main__":

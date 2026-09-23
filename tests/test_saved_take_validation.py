@@ -20,6 +20,7 @@ class SavedTakeValidationTests(unittest.TestCase):
         self.forbidden = {}
         for name, value in {
             "_PANTRY": self.pantry, "VOICE_MEDIA_DIR": self.folder,
+            "_MEDIA_THERE": {},
             "dialogue_row_ready": mock.Mock(return_value=True),
             "_larder_current": mock.Mock(return_value=True),
             "voice_engine_for": mock.Mock(return_value="piper"),

@@ -17157,6 +17157,7 @@ def air_first() -> bool:
 UNHEARD_QUIET_AFTER = 20.0     # seconds of cast silence
 UNHEARD_QUIET_EVERY = 15.0     # the rest that replaces the interval
 UNHEARD_RETRY_EVERY = 20.0     # what a refused pick costs instead
+UNHEARD_EMPTY_LARDER_EVERY = 20.0  # cupboard bridges an empty dialogue reserve
 # 2026-09-15 (#1186): the rest that replaces the interval when it is the
 # HEARING clock that has gone quiet rather than the cast clock. Longer
 # than UNHEARD_QUIET_EVERY on purpose - see unheard_stock_air. A house
@@ -18011,6 +18012,156 @@ def cupboard_incomplete_rows(kind: str = "") -> list[tuple[str, dict[str, Any]]]
     return out
 
 
+def _unheard_produced_ad_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a produced shelf row to the immutable spot it names."""
+    want = str((row or {}).get("produced") or "")
+    if not want:
+        return {}
+    try:
+        return next((dict(entry) for entry in ad_list()
+                     if str(entry.get("id") or "") == want), {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _unheard_produced_ad_air(row: dict[str, Any],
+                                   force: bool = False,
+                                   on_handoff: Any = None) -> list[str]:
+    """Air one exact produced-ad shelf row through its native transport.
+
+    Produced ads are one finished mixed file, not a dialogue round with a
+    list of takes. The standing cupboard consumer used to hand them to
+    ``_ready_shelf_air`` anyway; its dialogue validator rejected the oldest
+    ad on every walk and starved every ready row behind it. Reserve the same
+    exact row, hold the floor, and consume it only after a page or box
+    transport accepts the spot.
+    """
+    if not isinstance(row, dict) or not str(row.get("produced") or ""):
+        return _shelf_no("ad", "the selected row does not name a produced spot")
+    if id(row) in _READY_SHELF_BUSY:
+        return _shelf_no("ad", "the produced spot is already in hand")
+    if not any(held is row for held in shelf_rows("ad")):
+        return _shelf_no("ad", "the produced spot left the shelf before handoff")
+    entry = await asyncio.to_thread(_unheard_produced_ad_entry, row)
+    if not entry or not str(entry.get("audio") or ""):
+        return _shelf_no("ad", "the produced spot or its finished audio is gone")
+
+    _READY_SHELF_BUSY.add(id(row))
+    owned = False
+    committed = False
+
+    def commit() -> None:
+        nonlocal committed
+        if committed:
+            return
+        rows = shelf_rows("ad")
+        if not any(held is row for held in rows):
+            return
+        committed = True
+        rows[:] = [held for held in rows if held is not row]
+        row["taken_at"] = time.time()
+        row.setdefault("used_by", stock_used_by())
+        alt_took("ad", row)
+        _INVENTORY_PLAN["at"] = _COMMITS["at"] = 0.0
+        _PREPARED_KIND_MEMO.update(at=0.0, value=None)
+        _pantry_save(True)
+        try:
+            ad_update(str(entry.get("id") or ""),
+                      uses=int(entry.get("uses") or 0) + 1)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if callable(on_handoff):
+                on_handoff()
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        if force:
+            try:
+                owned = await asyncio.wait_for(
+                    _floor_take("a ready produced ad"), 1.5)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                owned = False
+        else:
+            owned = await _floor_take("a ready produced ad")
+        if not any(held is row for held in shelf_rows("ad")):
+            return _shelf_no("ad", "the produced spot left the shelf while "
+                                   "it waited for the floor")
+        accepted = await _air_produced_ad(entry, on_handoff=commit)
+        if not accepted:
+            return _shelf_no("ad", "neither transport accepted the produced spot")
+        commit()
+        return [str(entry.get("text") or entry.get("product")
+                    or "a produced spot")]
+    finally:
+        _READY_SHELF_BUSY.discard(id(row))
+        _floor_drop(owned)
+
+
+def _unheard_row_lines(kind: str, row: dict[str, Any]) -> int:
+    """Count the accepted performance without waiting for its airtime."""
+    if kind == "ad" and str((row or {}).get("produced") or ""):
+        return 1
+    try:
+        entry = _ready_air_entry(kind, row)
+        stated = int(entry.get("lines") or 0)
+        if stated > 0:
+            return stated
+        return max(1, len(banter_turns(
+            str(entry.get("script") or ""),
+            str(entry.get("caller_name") or ""),
+            str(entry.get("caller2_name") or ""))))
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+def _unheard_playout_done(task: asyncio.Task[Any]) -> None:
+    """Retire a playout wait detached after its transport handoff."""
+    _BG_TASKS.discard(task)
+    _SPEECH_TASKS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("air", "an accepted cupboard playout failed while its "
+                     "receipt was still being followed: %s: %s"
+                     % (type(exc).__name__, str(exc)[:300]))
+
+
+async def _unheard_until_handoff(coro: Any,
+                                 handed: asyncio.Event) -> list[str]:
+    """Wait for refusal/completion or the earlier transport acceptance.
+
+    Page playout deliberately holds the floor until the queued burst's airtime
+    ends. The dead-air watchdog only needs to wait through acceptance; after
+    that this tracked task keeps owning the floor and following receipts while
+    the watchdog is free to complete its pass.
+    """
+    task = asyncio.create_task(coro)
+    waiter = asyncio.create_task(handed.wait())
+    _BG_TASKS.add(task)
+    _SPEECH_TASKS.add(task)
+    task.add_done_callback(_unheard_playout_done)
+    try:
+        done, _pending = await asyncio.wait(
+            {task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            return await task
+        return []
+    except asyncio.CancelledError:
+        # Before acceptance the old cancellation contract still applies: a
+        # timed-out attempt must release its row and floor. Once handed off,
+        # cancellation would tear down audio the page has already accepted.
+        if not handed.is_set() and not task.done():
+            task.cancel()
+        raise
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+
+
 async def unheard_stock_air(force: bool = False) -> str:
     """#1260: THE STANDING CONSUMER. Put the longest-unheard finished round
     on the air, out of turn, because nothing else ever will.
@@ -18043,6 +18194,16 @@ async def unheard_stock_air(force: bool = False) -> str:
     # the one condition this rung was built for and the last moment to
     # make it wait.
     rest = cupboard_unheard_every()
+    # A listener receipt on one produced spot resets both silence clocks. If
+    # the dialogue reserve is still empty, that must not restore the ordinary
+    # seven-minute cupboard interval and strand all the ready speech behind
+    # it. During this bounded emergency the cupboard becomes the reserve and
+    # stacks one accepted item per short pass into the linear page feed.
+    try:
+        if int(larder_stock_count() or 0) == 0:
+            rest = min(rest, UNHEARD_EMPTY_LARDER_EVERY)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         hush = talk_quiet_for()
     except Exception:  # noqa: BLE001
@@ -18116,8 +18277,47 @@ async def unheard_stock_air(force: bool = False) -> str:
     kind, row, age = unheard_pick()
     if row is None:
         return _unheard_no("nothing unheard is past the dial and airable")
-    said = await _ready_shelf_air(kind, _RADIO.get("now"), rescue=True,
-                                  pick=row, force=force)
+    handed = asyncio.Event()
+    accounted = False
+
+    def account_handoff() -> None:
+        """The exact instant this cupboard row becomes committed air."""
+        nonlocal accounted
+        if accounted:
+            return
+        accounted = True
+        _RESCUE_AT[0] = time.time()
+        _UNHEARD_SWEEP.update({
+            "at": time.time(), "why": "aired",
+            "aired": int(_UNHEARD_SWEEP.get("aired") or 0) + 1,
+        })
+        _UNHEARD_LOG.append({
+            "at": time.time(), "kind": kind, "waited": round(age),
+            "lines": _unheard_row_lines(kind, row),
+            "id": retire_id(kind, row),
+        })
+        del _UNHEARD_LOG[:-60]
+        _UNHEARD_MEMO.update(at=0.0, value=None)
+        pipeline_log(
+            "air", "%s had waited %s on the shelf without ever being heard - it "
+            "goes out of turn, because no slot was ever going to come for it "
+            "(#1260)" % (SHELF_LABEL.get(kind, kind), cupboard_ago(age)))
+        handed.set()
+
+    # A produced ad is a single mixed file. It has no dialogue takes and must
+    # use the produced transport; sending it to the generic shelf door is the
+    # starvation bug this consumer is meant to cure.
+    if kind == "ad" and str(row.get("produced") or ""):
+        said = await _unheard_until_handoff(
+            _unheard_produced_ad_air(
+                row, force=force, on_handoff=account_handoff), handed)
+    else:
+        said = await _unheard_until_handoff(
+            _ready_shelf_air(
+                kind, _RADIO.get("now"), rescue=True, pick=row, force=force,
+                on_handoff=account_handoff), handed)
+    if handed.is_set():
+        return kind
     if not said:
         # #1304: and it says WHICH refusal, because "the door refused"
         # was the sentence 120 unheard rounds hid behind.
@@ -18140,16 +18340,10 @@ async def unheard_stock_air(force: bool = False) -> str:
         return _unheard_no(
             ("%s refused: %s" % (SHELF_LABEL.get(kind, kind), door)) if door
             else "the air's own door refused the row it picked")
-    _RESCUE_AT[0] = time.time()
-    _UNHEARD_SWEEP.update({"at": time.time(), "why": "aired",
-                           "aired": int(_UNHEARD_SWEEP.get("aired") or 0) + 1})
-    _UNHEARD_LOG.append({"at": time.time(), "kind": kind, "waited": round(age),
-                         "lines": len(said), "id": retire_id(kind, row)})
-    del _UNHEARD_LOG[:-60]
-    pipeline_log(
-        "air", "%s had waited %s on the shelf without ever being heard - it "
-        "goes out of turn, because no slot was ever going to come for it "
-        "(#1260)" % (SHELF_LABEL.get(kind, kind), cupboard_ago(age)))
+    # Compatibility for a transport implementation that returns accepted
+    # work but does not invoke the callback. The production doors do invoke
+    # it at page publication or confirmed box acceptance.
+    account_handoff()
     return kind
 
 def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
@@ -25342,6 +25536,50 @@ def admission_state(limit: int = 40) -> dict[str, Any]:
                 "why": "%r" % (exc,)}
 
 
+_ADMISSION_STATE_CACHE: dict[str, Any] = {
+    "at": 0.0, "value": None, "busy": False,
+}
+_ADMISSION_STATE_CACHE_LOCK = RLock()
+
+
+def admission_state_cached(limit: int = 40) -> dict[str, Any]:
+    """A non-blocking admission snapshot for the continuously polled DJ state.
+
+    ``cue_map`` takes the controller lock. Admission may hold that lock while
+    identifying media on the share, so waiting for it in ``/api/dj`` froze all
+    listener heartbeats for ten seconds at a time. A worker refreshes a broad
+    snapshot; pollers always receive the last complete one.
+    """
+    now = time.time()
+    with _ADMISSION_STATE_CACHE_LOCK:
+        value = _ADMISSION_STATE_CACHE.get("value")
+        stale = now - float(_ADMISSION_STATE_CACHE.get("at") or 0) > 1.0
+        busy = bool(_ADMISSION_STATE_CACHE.get("busy"))
+        if stale and not busy:
+            _ADMISSION_STATE_CACHE["busy"] = True
+            busy = True
+
+            def refresh() -> None:
+                try:
+                    fresh = admission_state(64)
+                except Exception as exc:  # noqa: BLE001
+                    fresh = {"available": False, "occurrences": [],
+                             "mode": "error", "why": repr(exc)}
+                with _ADMISSION_STATE_CACHE_LOCK:
+                    _ADMISSION_STATE_CACHE.update(
+                        at=time.time(), value=fresh, busy=False)
+
+            Thread(target=refresh, name="admission-state", daemon=True).start()
+    if not isinstance(value, dict):
+        return {"available": False, "occurrences": [], "mode": "loading",
+                "why": "the admission snapshot is refreshing",
+                "refreshing": True}
+    out = copy.deepcopy(value)
+    out["occurrences"] = list(out.get("occurrences") or [])[-max(1, int(limit)):]
+    out["refreshing"] = busy
+    return out
+
+
 # --- broadcast admission (2026-09-15) --- end
 # --- the linear playout sequencer (#1218, #1246) ---   # [#1218]
 #
@@ -28079,13 +28317,22 @@ _PAGE_RESERVATION_UPDATES: dict[str, int] = {}
 
 
 def page_clip_seconds(clip: dict[str, Any]) -> float:
+    # This runs for every existing reservation on every listener poll and
+    # before every new page clip. The old first choice was a filesystem probe,
+    # often against the media share, even though producers already attach an
+    # exact duration. One slow stat stopped the whole station. Metadata is the
+    # playout contract here; a legacy row without it gets the same conservative
+    # speech estimate the append road has always used.
+    known = float(clip.get("seconds") or
+                  (clip.get("stream") or {}).get("length") or 0.0)
+    if known > 0:
+        return known
     url = str(clip.get("url") or "")
     path = url.split("?", 1)[0]
     if path.startswith("/upstairs-audio/"):
         path = str(data_path("upstairs_audio", path.rsplit("/", 1)[-1]))
     measured = _clip_seconds(path) if path else 0.0
-    return float(measured or clip.get("seconds") or
-                 (clip.get("stream") or {}).get("length") or
+    return float(measured or
                  max(2.5, len(str(clip.get("text") or "")) / 14.0))
 
 
@@ -34259,7 +34506,7 @@ def dj_state() -> dict[str, Any]:
         # instead of reconstructing a position out of estimates: it is what
         # the controller admitted, in the order it admitted it, with the
         # exact audio identity and cue sheet of each occurrence.
-        "admission": admission_state(12),
+        "admission": admission_state_cached(12),
         # # --- broadcast admission (2026-09-15) --- end
         # How the booth reached the vector DB, most recent first (#595).
         "vector_access": (_RADIO.get("vector_access") or [])[:12],
@@ -83646,7 +83893,32 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
             return _takes_no(kind, "the row itself is not ready")
         entry = dialogue_entry(row)
         if not entry:
-            return _takes_no(kind, "no dialogue entry on the row")
+            # The original prepared roads store a one-line performance flat:
+            # text, voice and one pantry key directly on the shelf row. The
+            # ready predicate has always accepted that shape, but this air
+            # validator only understood newer multi-take entries. Consequently
+            # every finished dry ad selected by the standing consumer was
+            # rejected after readiness had called it airable.
+            key = str((row or {}).get("key") or "")
+            saved = _PANTRY.get(key) or {}
+            clip = saved.get("clip") or {}
+            name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
+            text = str((row or {}).get("text_plain")
+                       or (row or {}).get("text") or saved.get("text") or "").strip()
+            voice = str(saved.get("voice") or (row or {}).get("voice") or "")
+            who = str(saved.get("who") or (row or {}).get("who") or "dj")
+            seconds = float((row or {}).get("seconds")
+                            or clip.get("seconds") or 0)
+            if not key or not text or not voice:
+                return _takes_no(kind, "the single take has no key, text or voice")
+            if who not in ("dj", "cohost", "third", "caller", "caller2"):
+                return _takes_no(kind, "the single take is on a seat that cannot air")
+            if not name or not media_present(name):
+                return _takes_no(kind, "the single take's clip is missing from disk")
+            if seconds <= 0:
+                return _takes_no(kind, "the single take has no measured duration")
+            return [{"i": 0, "key": key, "text": text, "voice": voice,
+                     "who": who, "seconds": seconds, "clip": dict(clip)}]
         if not _larder_current(entry):
             # The #1160 trap: the writing contract carries the crystal
             # and the plot's act, so an act rolling over orphans every
@@ -83756,6 +84028,29 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
         return ready
     except (KeyError, TypeError, ValueError, OSError) as exc:
         return _takes_no(kind, "raised " + type(exc).__name__)
+
+
+def _ready_air_entry(kind: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a stored performance for the common ready-air road."""
+    got = dialogue_entry(row)
+    if isinstance(got, dict):
+        entry = dict(got)
+    elif str((row or {}).get("key") or ""):
+        entry = dict(row)
+        key = str(row.get("key") or "")
+        saved = _PANTRY.get(key) or {}
+        who = str(saved.get("who") or row.get("who") or "dj")
+        marker = {"dj": "A", "cohost": "B", "caller": "C",
+                  "third": "D", "caller2": "E"}.get(who, "A")
+        text = str(row.get("text_plain") or row.get("text")
+                   or saved.get("text") or "").strip()
+        entry.update({"script": "%s: %s" % (marker, text),
+                      "script_plain": "%s: %s" % (marker, text),
+                      "lines": 1, "whole": True, "render_stream": True})
+    else:
+        entry = {}
+    entry["prep_kind"] = str(kind)
+    return entry
 
 
 def _ready_slot_window(kind: str) -> dict[str, Any] | None:
@@ -84018,7 +84313,8 @@ def _shelf_no(kind: str, why: str) -> list[str]:
 async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
                            rescue: bool = False,
                            pick: dict[str, Any] | None = None,
-                           force: bool = False) -> list[str]:
+                           force: bool = False,
+                           on_handoff: Any = None) -> list[str]:
     """Reserve one exact finished round; only its transport can commit it.
 
     2026-09-10: `rescue` is DEAD AIR, and it is the one caller allowed to
@@ -84061,8 +84357,7 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     _READY_SHELF_BUSY.add(id(row))
     owned = False
     committed = False
-    entry = dict(dialogue_entry(row) or {})
-    entry["prep_kind"] = kind
+    entry = _ready_air_entry(kind, row)
 
     def _takes_same() -> str:
         """2026-09-14: WHICH FIELD MOVED. The hand-off compares the takes it
@@ -84130,6 +84425,11 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
         _INVENTORY_PLAN["at"] = _COMMITS["at"] = 0.0
         _PREPARED_KIND_MEMO.update(at=0.0, value=None)
         _pantry_save(True)
+        try:
+            if callable(on_handoff):
+                on_handoff()
+        except Exception:  # noqa: BLE001
+            pass
 
     try:
         # #1313: WHEN THE AIR IS DEAD, THE FLOOR IS CEREMONY.
@@ -84160,8 +84460,7 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
         if not free and not _ready_round_fits(kind, takes, window):
             return _shelf_no(kind, "the slot moved on while we waited for "
                                    "the floor")
-        entry = dict(dialogue_entry(row) or {})
-        entry["prep_kind"] = kind
+        entry = _ready_air_entry(kind, row)
         entry["_ready_slot"] = window
         # 2026-09-14: THE RESCUE WAS REFUSED ONE DOOR LATER. `free` (dead air,
         # or a round overdue past the dial) lets this function ignore the
@@ -97779,8 +98078,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # this is the first moment the audit's precondition can be
                 # met at all: "verify that its final audio is available and
                 # its ordered line/cue offsets are known" BEFORE committing.
-                _round_occurrence = admission_admit_round(
-                    one, rows, length, producer="_speak_turns_floorless")
+                _round_occurrence = await asyncio.to_thread(
+                    admission_admit_round, one, rows, length,
+                    producer="_speak_turns_floorless")
                 # #1340: AND ON EVERY ROW OF THE ROUND, so a refusal one
                 # layer up can find what it has to take back - and so the
                 # feed row, the booth and the incident capture can all name
@@ -98631,6 +98931,33 @@ async def _banter_beats(context: str, sheet: str, lines: int,
     return "\n".join("%s: %s" % row for row in made).strip()
 
 
+BANTER_BOOTSTRAP_LINES = 8
+
+
+def banter_bank_plan(lines: int, bank: bool, system2_job: bool = False,
+                     bootstrap_ok: bool = True) -> dict[str, Any]:
+    """Choose the judged/generated size of one advance-written round.
+
+    A deep empty reserve used to begin with a 30-40-take round. Since takes
+    are recorded serially, the cupboard remained at zero until the entire
+    round finished. The first round is intentionally short enough to become
+    playable quickly; after that, advance-written rounds retain the richer
+    four-turn expansion.
+    """
+    requested = max(2, int(lines or 0))
+    bootstrap = False
+    if bank and not system2_job and bootstrap_ok:
+        try:
+            bootstrap = int(larder_stock_count() or 0) == 0
+        except Exception:  # noqa: BLE001
+            bootstrap = False
+    judged = min(requested, BANTER_BOOTSTRAP_LINES) if bootstrap else requested
+    rich = bool(bank) and not system2_job and not bootstrap
+    generated = max(2, min(24, judged + 4)) if rich else judged
+    return {"requested": requested, "judge_lines": judged,
+            "lines": generated, "rich": rich, "bootstrap": bootstrap}
+
+
 async def dj_banter(track: dict[str, Any] | None = None,
                     angle: str = "", lines: int = 0,
                     also_name: str = "", force_seed: bool = False,
@@ -98775,16 +99102,29 @@ async def dj_banter(track: dict[str, Any] | None = None,
     if _system2_job:
         lines = max(11 if caller_name else 4,
                     min(lines, int(_system2_job.get("generation_turns") or 6)))
-    _bank_rich = bool(bank) and not _system2_job
+    # Only the ordinary host/co-host reserve gets the quick first round.
+    # Calls and assigned briefs have their own minimum dramatic structure;
+    # an empty banter shelf must never shorten those promises.
+    _plain_reserve = not (angle or caller_name or caller2_name or own_material
+                          or force_seed or whole)
+    _bank_plan = banter_bank_plan(lines, bank, bool(_system2_job),
+                                  bootstrap_ok=_plain_reserve)
+    lines = int(_bank_plan["lines"])
+    _bank_rich = bool(_bank_plan["rich"])
+    _bank_bootstrap = bool(_bank_plan["bootstrap"])
     # #904: the count a round is JUDGED by stays the live one. The
     # extra four lines are a licence to write richer, not a harder
     # exam — but substantial_radio_script was handed the inflated
     # number, so a banked round faced a bar around half again as high
     # as the identical round faces on air, failed it, and was binned.
     # The model call was spent either way; the shelf just stayed empty.
-    _judge_lines = int(lines)
-    if _bank_rich:
-        lines = max(2, min(24, lines + 4))
+    _judge_lines = int(_bank_plan["judge_lines"])
+    if _bank_bootstrap:
+        pipeline_log(
+            "lookahead", "the dialogue reserve is empty, so its first "
+            "advance-written round is %d turns instead of %d; it becomes "
+            "playable before the longer rounds are recorded (#1392)"
+            % (_judge_lines, int(_bank_plan["requested"])))
     # A round off the larder shelf (#349, #351): written minutes ago while
     # the desk was quiet, on air the instant it is wanted. Only the plain
     # random rounds shop here — anything with its own subject (an angle, a
@@ -113030,7 +113370,7 @@ async def reflection_clock() -> None:
         try:
             if not _RADIO.get("on"):
                 continue
-            kind = reflection_due()
+            kind = await asyncio.to_thread(reflection_due)
             if kind:
                 await reflection_run(kind)
         except Exception as exc:  # noqa: BLE001
@@ -118022,7 +118362,7 @@ async def dj_voice_api(
                 "paused": True, "off_air": True,
                 "say": "the broadcast is paused - the booth is still "
                        "recording and this picks up when it returns"}
-    reservation_updates = page_reservation_repair()
+    reservation_updates = await asyncio.to_thread(page_reservation_repair)
     server_ms = int(time.time() * 1000)
     clips = []
     # #1146: everything appended before the last unpause is history, not
@@ -124241,6 +124581,55 @@ def line_clips(air_at: float, line_id: str,
     return out[:8]
 
 
+def line_playout_band(line_id: str) -> dict[str, Any]:
+    """The recorded transport and listener verdict for one script line.
+
+    Publication and hearing are deliberately separate facts. A page feed
+    append proves that the server offered audio; only ``heard_ack_at`` proves
+    that a listener reported audible, progressing playback.
+    """
+    row = line_row_of(str(line_id or ""))
+    if not row:
+        return {"band": "the playout", "grade": "absent",
+                "say": "the booth and air log hold no transport record for this line",
+                "detail": {"state": "unknown", "heard": False}}
+    state = str(row.get("aired") or "")
+    heard_at = line_heard_at(row)
+    air_at = float(row.get("air_at") or 0)
+    detail = {k: row.get(k) for k in (
+        "aired", "air_at", "seconds", "delivery_id", "page_delivery",
+        "box_delivery", "withdrawn_why", "clip_media", "clip_from",
+        "clip_until", "heard_ack_at", "heard_ack_by")
+        if row.get(k) not in (None, "")}
+    detail.update({"state": state or "unknown", "heard": heard_at > 0,
+                   "heard_at": heard_at, "published_at": air_at})
+    if heard_at > 0:
+        who = str(row.get(HEARD_STAMP_BY) or "a listener")
+        return {"band": "the playout", "grade": "measured",
+                "say": "%s acknowledged this line audible and progressing"
+                       % who,
+                "detail": detail}
+    if state in AIR_PUBLICATION_STATES:
+        return {"band": "the playout", "grade": "written",
+                "say": "%s; no listener has acknowledged hearing this line"
+                       % ({"published": "published to the page",
+                           "stream": "handed to the page",
+                           "box": "handed to the box",
+                           "both": "handed to the page and box",
+                           "page": "played by the page",
+                           "airing": "marked as going out"}.get(
+                               state, "published for playout")),
+                "detail": detail}
+    if str(row.get("withdrawn_why") or ""):
+        say = "withdrawn before playout: %s" % row.get("withdrawn_why")
+    elif state:
+        say = "%s; no audible listener receipt exists" % state
+    else:
+        say = "no transport accepted this line"
+    return {"band": "the playout", "grade": "absent", "say": say,
+            "detail": detail}
+
+
 def line_causes(line_id: str) -> dict[str, Any]:
     """Everything that made ONE line the line it is. THREAD ONLY.
 
@@ -124248,7 +124637,7 @@ def line_causes(line_id: str) -> dict[str, Any]:
     got through every piece of R N G in order to get to where it is and
     how it got seeded and how it became what it became."
 
-    Seven bands, in the order they actually happened, each one either a
+    Ordered bands, in the order they actually happened, each one either a
     fact off the record or an honest blank. Nothing here is inferred: if
     the round did not write a thing down, this says so rather than
     guessing, because a trace that invents a cause is worse than no trace
@@ -124454,6 +124843,11 @@ def line_causes(line_id: str) -> dict[str, Any]:
             "detail": {"clips": clips},
         })
 
+    # 10. The transport and the ear. This is intentionally present even when
+    # absent: a cause trace that stops at generation cannot explain whether
+    # the line actually made it out of a speaker.
+    bands.append(line_playout_band(want))
+
     # [#1386] THE SAME BANDS, AS A GRAPH.
     #
     # "I want the feed to become a visual node editor, allowing me to trace
@@ -124474,7 +124868,7 @@ def line_causes(line_id: str) -> dict[str, Any]:
                  "the quote doors": "swath", "the passage": "doc",
                  "the brief": "scenario", "the system prompts": "prompts",
                  "what was standing": "modifier", "the line": "block",
-                 "what was heard": "clip"}
+                 "what was heard": "clip", "the playout": "clip"}
     for at, b in enumerate(bands):
         name = str(b.get("band") or "")
         if name == "the line":
@@ -124595,6 +124989,23 @@ def line_causes(line_id: str) -> dict[str, Any]:
                             or "+%.1fs, nothing says it was chosen for this"
                             % float(clip.get("after") or 0)),
                 })
+        if name == "the playout":
+            kid = "%s:%s" % (nid, detail.get("delivery_id") or "verdict")
+            nodes.append({
+                "id": kid, "type": "clip", "n": 1,
+                "label": ("heard" if detail.get("heard") else
+                          str(detail.get("state") or "not delivered")),
+                "snippet": str(b.get("say") or "")[:300],
+                "store": "air log",
+                "key": str(detail.get("delivery_id") or want),
+                "detail": detail,
+            })
+            edges.append({
+                "from": nid, "to": kid,
+                "rel": "acknowledged" if detail.get("heard") else "published",
+                "n": 1, "grade": str(b.get("grade") or "absent"),
+                "say": str(b.get("say") or "")[:160],
+            })
         if name == "what was standing":
             for mod in (detail.get("modifiers") or [])[:6]:
                 if not isinstance(mod, dict):
@@ -127320,18 +127731,22 @@ async def admission_api(limit: int = Query(default=40, ge=1, le=200),
     turning a lane on would have silenced anything - and which producer
     would have been silenced, by name and line."""
     require_read_auth(authorization)
-    controller = admission_controller()
-    payload = admission_state(limit)
-    payload["mode_file"] = str(_ADMISSION_MODE_FILE)
-    payload["how_to_enforce"] = (
-        "write one line into the mode file: 'observe' (the default), "
-        "'enforce', 'enforce sfx' for a single lane, or "
-        "'enforce sfx,advert order' to add the ordering rule. It is re-read "
-        "within three seconds; no restart.")
-    if controller is not None:
-        payload["stats"] = controller.stats()
-        payload["refusals"] = controller.refusals(limit=limit)
-    return payload
+
+    def work() -> dict[str, Any]:
+        controller = admission_controller()
+        payload = admission_state(limit)
+        payload["mode_file"] = str(_ADMISSION_MODE_FILE)
+        payload["how_to_enforce"] = (
+            "write one line into the mode file: 'observe' (the default), "
+            "'enforce', 'enforce sfx' for a single lane, or "
+            "'enforce sfx,advert order' to add the ordering rule. It is "
+            "re-read within three seconds; no restart.")
+        if controller is not None:
+            payload["stats"] = controller.stats()
+            payload["refusals"] = controller.refusals(limit=limit)
+        return payload
+
+    return await asyncio.to_thread(work)
 
 
 # --- broadcast admission (2026-09-15) --- end
@@ -157169,13 +157584,25 @@ async def te_chat(
     return {"answer": answer, "links": links, "videos": videos}
 
 
+def _perf_host_snapshot() -> tuple[dict[str, int], float, int, dict[str, Any]]:
+    """Read the host files used by the HUD without occupying the event loop."""
+    mem = _read_meminfo()
+    load1 = 0.0
+    cores = os.cpu_count() or 1
+    try:
+        load1 = float(Path("/proc/loadavg").read_text().split()[0])
+    except Exception:
+        pass
+    return mem, load1, cores, _read_gpu_temp()
+
+
 @app.get("/api/perf")
 async def perf(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Light polling endpoint for the header performance HUD."""
     require_read_auth(authorization)
-    mem = _read_meminfo()
+    mem, load1, cores, therm = await asyncio.to_thread(_perf_host_snapshot)
     total = mem.get("MemTotal", 0)
     avail = mem.get("MemAvailable", 0)
     out: dict[str, Any] = {
@@ -157186,13 +157613,11 @@ async def perf(
         "ram_used_gb": round((total - avail) / 1048576, 1),
         "ram_total_gb": round(total / 1048576, 1),
     }
-    try:
-        load1 = float(Path("/proc/loadavg").read_text().split()[0])
-        cores = os.cpu_count() or 1
+    if load1:
         out["cpu_pct"] = round(min(100.0, 100.0 * load1 / cores), 1)
         out["load1"] = load1
         out["cores"] = cores
-    except Exception:
+    else:
         out["cpu_pct"] = 0
     gpu_line = await asyncio.to_thread(_gpu_stats)
     m = re.search(
@@ -157205,7 +157630,6 @@ async def perf(
         out["vram_used_gb"] = round(used / 1024, 1)
         out["vram_total_gb"] = round(total_v / 1024, 1)
         out["gpu_temp_c"] = temp
-    therm = _read_gpu_temp()
     temp_c = out.get("gpu_temp_c") or therm.get("temp_c")
     if temp_c:
         out["temp_c"] = round(float(temp_c), 1)
@@ -158949,6 +159373,7 @@ AIRLOG_TURN_ROUNDS = frozenset({
     "aside", "upstairs", "hawk", "banter", "caller", "prize", "played",
     "callin", "media", "intro", "outro", "open"})
 _AIRLOG_LOCK = RLock()
+_HEAT_LOCK = RLock()
 _AIRLOG_SEEN: dict[str, str] = {}       # id -> hash of the row last written
 _AIRLOG_INDEX: dict[str, dict[str, Any]] = {}   # id -> latest row (48 h)
 _AIRLOG_STATE: dict[str, Any] = {"compacted": 0.0, "loaded": False,
@@ -159350,35 +159775,45 @@ def airlog_write_rows(rows: list[dict[str, Any]]) -> int:
     wrote = 0
     try:
         AIR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        prepared: list[tuple[dict[str, Any], str, str]] = []
+        for source in rows:
+            row = dict(source)
+            digest = str(row.pop("_h", "") or airlog_row_hash(row))
+            prepared.append((row, digest,
+                             json.dumps(row, default=str) + "\n"))
+        # The keeper is the sole writer. The share write can take seconds and
+        # must not hold the in-memory reader lock while it does.
+        with AIR_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write("".join(encoded for _row, _digest, encoded in prepared))
+        battles: list[tuple[str, str, str]] = []
         with _AIRLOG_LOCK:
-            with AIR_LOG_PATH.open("a", encoding="utf-8") as handle:
-                for row in rows:
-                    digest = str(row.pop("_h", "") or airlog_row_hash(row))
-                    handle.write(json.dumps(row, default=str) + "\n")
-                    _AIRLOG_SEEN[row["id"]] = digest
-                    _AIRLOG_INDEX[row["id"]] = row
-                    wrote += 1
-                    if (row.get("who") in AIRLOG_CAST
-                            and row.get("aired") in AIRLOG_AIRED
-                            and row.get("kind") not in AIRLOG_QUIET_KINDS):
-                        _AIRLOG_SEAT_LAST[row["who"]] = max(
-                            float(_AIRLOG_SEAT_LAST.get(row["who"]) or 0),
-                            float(row.get("air_at") or 0)
-                            + float(row.get("seconds") or 0))
-                        # #1090: and it becomes the bar the next
-                        # combatant answers. Taken HERE because this
-                        # test - a cast seat, actually aired, not a
-                        # quiet kind - is already the station's own
-                        # definition of a line that went out, and
-                        # this runs off the event loop.
-                        rap_battle_note(str(row.get("who") or ""),
-                                        str(row.get("text") or ""),
-                                        str(row.get("kind") or ""))
+            for row, digest, _encoded in prepared:
+                _AIRLOG_SEEN[row["id"]] = digest
+                _AIRLOG_INDEX[row["id"]] = row
+                wrote += 1
+                if (row.get("who") in AIRLOG_CAST
+                        and row.get("aired") in AIRLOG_AIRED
+                        and row.get("kind") not in AIRLOG_QUIET_KINDS):
+                    _AIRLOG_SEAT_LAST[row["who"]] = max(
+                        float(_AIRLOG_SEAT_LAST.get(row["who"]) or 0),
+                        float(row.get("air_at") or 0)
+                        + float(row.get("seconds") or 0))
+                    # #1090: and it becomes the bar the next
+                    # combatant answers. Taken HERE because this
+                    # test - a cast seat, actually aired, not a
+                    # quiet kind - is already the station's own
+                    # definition of a line that went out, and
+                    # this runs off the event loop.
+                    battles.append((str(row.get("who") or ""),
+                                    str(row.get("text") or ""),
+                                    str(row.get("kind") or "")))
             _AIRLOG_STATE["written"] = int(_AIRLOG_STATE.get("written") or 0) + wrote
             _AIRLOG_STATE["last_write"] = time.time()
             if len(_AIRLOG_SEEN) > 40000:
                 for key in list(_AIRLOG_SEEN)[:20000]:
                     _AIRLOG_SEEN.pop(key, None)
+        for battle in battles:
+            rap_battle_note(*battle)
     except Exception:  # noqa: BLE001
         pass
     return wrote
@@ -159441,10 +159876,12 @@ def airlog_compact(path: Path | None = None) -> int:
         ordered = sorted(rows.values(),
                          key=lambda r: float(r.get("air_at") or r.get("ts") or 0))
         tmp = path.with_suffix(".jsonl.tmp")
+        # The hourly network rewrite is private to the keeper and happens
+        # before the short in-memory prune. Readers never wait on disk I/O.
+        tmp.write_text("".join(json.dumps(r, default=str) + "\n"
+                               for r in ordered), encoding="utf-8")
+        tmp.replace(path)
         with _AIRLOG_LOCK:
-            tmp.write_text("".join(json.dumps(r, default=str) + "\n"
-                                   for r in ordered), encoding="utf-8")
-            tmp.replace(path)
             cutoff = time.time() - AIRLOG_KEEP_S
             for key in [k for k, r in _AIRLOG_INDEX.items()
                         if float(r.get("air_at") or r.get("ts") or 0) < cutoff]:
@@ -160040,7 +160477,7 @@ def airlog_heat_load() -> int:
         rows = got.get("samples") if isinstance(got, dict) else got
         rows = [r for r in (rows or []) if isinstance(r, dict) and r.get("at")]
         cutoff = time.time() - AIRLOG_KEEP_S
-        with _AIRLOG_LOCK:
+        with _HEAT_LOCK:
             have = {float(r.get("at") or 0) for r in _HEAT_RING}
             merged = [r for r in rows if float(r["at"]) >= cutoff
                       and float(r["at"]) not in have] + list(_HEAT_RING)
@@ -160056,7 +160493,7 @@ def airlog_heat_load() -> int:
 def airlog_heat_flush() -> bool:
     """The ring onto disk, tmp + replace (thread). At most every 5 min."""
     try:
-        with _AIRLOG_LOCK:
+        with _HEAT_LOCK:
             rows = list(_HEAT_RING)
         HEAT_RING_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = HEAT_RING_PATH.with_suffix(".json.tmp")
@@ -160087,7 +160524,7 @@ async def airlog_heat_sample(got: dict[str, Any]) -> None:
                "gpu_util": round(float(got.get("util") or 0), 1)}
         if not (row["gpu_c"] or row["board_c"] or row["load1"] or row["mem_used_gb"]):
             return                          # a box with no sensors says nothing
-        with _AIRLOG_LOCK:
+        with _HEAT_LOCK:
             _HEAT_RING.append(row)
             del _HEAT_RING[:-HEAT_SAMPLE_KEEP]
             _HEAT_STATE["dirty"] = int(_HEAT_STATE.get("dirty") or 0) + 1
@@ -160104,7 +160541,7 @@ def heat_ring_rows(since: float, until: float) -> list[dict[str, Any]]:
     more than 90 s apart the later one carries `gap_s` (the seconds
     nothing was sampled) so a line chart can break rather than bridge.
     Sync; small (<=5,800 rows)."""
-    with _AIRLOG_LOCK:
+    with _HEAT_LOCK:
         rows = list(_HEAT_RING)
     if not _HEAT_STATE.get("loaded"):
         try:
