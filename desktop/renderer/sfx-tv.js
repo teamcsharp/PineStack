@@ -360,19 +360,22 @@
       try { el.volume = want; } catch (err) { /* gone */ }
       return;
     }
-    var step = 0;
+    var started = Date.now();
     var run = {el: el, timer: 0};
     run.timer = setInterval(function () {
-      step += 1;
       if (levelRun !== run || el !== video) {
         clearInterval(run.timer);
         if (levelRun === run) levelRun = null;
         return;
       }
-      var at = from + (want - from) * (step / LEVEL_RAMP_STEPS);
-      try { el.volume = Math.max(0, Math.min(1, step >= LEVEL_RAMP_STEPS ? want : at)); }
+      /* A busy renderer can delay interval callbacks while video or another
+       * view paints. Elapsed time keeps this a 120 ms ramp even when fewer
+       * than eight callbacks get CPU time. */
+      var share = Math.min(1, Math.max(0, (Date.now() - started) / LEVEL_RAMP_MS));
+      var at = from + (want - from) * share;
+      try { el.volume = Math.max(0, Math.min(1, share >= 1 ? want : at)); }
       catch (err) { /* the element went */ }
-      if (step >= LEVEL_RAMP_STEPS) {
+      if (share >= 1) {
         clearInterval(run.timer);
         if (levelRun === run) levelRun = null;
       }

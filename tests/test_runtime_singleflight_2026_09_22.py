@@ -21,7 +21,8 @@ def function_source(name):
 
 def banter_beat_source():
     names = {"_BANTER_BEAT_ROW", "_BANTER_BEAT_STOCK", "_BANTER_BEAT_STOP",
-             "_beat_content_words", "_beat_answers", "_banter_beat_plan",
+             "_beat_content_words", "_beat_answers", "_beat_sequence_answers",
+             "_banter_beat_plan",
              "_banter_beats"}
     nodes = []
     for node in TREE.body:

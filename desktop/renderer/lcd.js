@@ -5,6 +5,7 @@
   const entry = document.getElementById('lcdBtn');
   if (!entry || !bridge?.lcdState) return;
   let state = null, panel = null, timer = null, autoRetry = null, looping = false, running = false;
+  let stationLeave = null, cupboardPolling = false;
   let station = {}, editions = [], edition = null, latestPaper = '', manualEdition = false;
   let paperLines = [], paperHeight = 1, scroll = 0, lastFrame = 0, lastPoll = 0;
   let drawer = false, inputTimer = null, inputPolling = false;
@@ -227,19 +228,50 @@
     await showEdition(editions[index].id);
   }
 
-  async function pollStation() {
-    const [djResult, shelfResult, deviceResult] = await Promise.allSettled([
-      bridge.get('/api/dj'), bridge.get('/api/paper'), bridge.lcdState()]);
-    if (djResult.status === 'fulfilled') {
-      station = djResult.value || {};
-      stationSkew = Number(station.server_ms || Date.now()) - Date.now();
-      if ((station.paused || state?.config?.mode === 'cupboard') && Date.now() - lastCupboard > 2500) {
-        lastCupboard = Date.now();
-        bridge.get('/api/cupboard').then((got) => { cupboard = got || null; layoutCupboard(); }).catch(() => {});
-      }
+  function refreshCupboard() {
+    if (!(station.paused || state?.config?.mode === 'cupboard')) return;
+    if (cupboardPolling || Date.now() - lastCupboard <= 2500) return;
+    lastCupboard = Date.now();
+    cupboardPolling = true;
+    bridge.get('/api/cupboard')
+      .then((got) => { cupboard = got || null; layoutCupboard(); })
+      .catch(() => {})
+      .finally(() => { cupboardPolling = false; });
+  }
+
+  function stationBeat(payload) {
+    if (payload?.kind === 'error') {
+      note('Station connection unavailable'
+        + (payload.error ? ': ' + payload.error : '.'));
     }
+    if (payload?.station) {
+      station = payload.station;
+      stationSkew = Number(station.server_ms || Date.now()) - Date.now();
+      refreshCupboard();
+      syncOptions();
+      paintStatus();
+    }
+  }
+
+  /* The LCD keeps producing when its configuration panel closes, so it uses
+   * the ordinary shared subscription rather than subscribeView(). It joins
+   * only while a frame producer or panel actually needs station data. */
+  function syncStationFeed() {
+    const needed = !!(running || panel);
+    if (needed && !stationLeave && window.PineStationFeed?.subscribe) {
+      stationLeave = window.PineStationFeed.subscribe(stationBeat);
+    } else if (!needed && stationLeave) {
+      stationLeave();
+      stationLeave = null;
+    }
+  }
+
+  async function pollStation() {
+    const [shelfResult, deviceResult] = await Promise.allSettled([
+      bridge.get('/api/paper'), bridge.lcdState()]);
     if (deviceResult.status === 'fulfilled') {
       state = deviceResult.value; running = state.running;
+      syncStationFeed();
       if (state.device && (canvas.width !== state.device.width || canvas.height !== state.device.height)) {
         canvas.width = state.device.width; canvas.height = state.device.height; layoutPaper(); layoutCupboard();
       }
@@ -253,7 +285,6 @@
         if (!manualEdition || !edition) await showEdition(newId);
       }
     }
-    if (djResult.status === 'rejected') note('Station connection unavailable: ' + djResult.reason.message);
     syncOptions(); paintStatus();
   }
 
@@ -511,6 +542,7 @@
     if ('paperStyle' in change || 'mode' in change) layoutPaper();
     lastGalleryAckKey = ''; lastGalleryAckAt = 0;
     if (change.mode && state?.device?.displayMode === 'avatar' && state?.connected) state = await bridge.lcdDisplayMode('pine');
+    refreshCupboard();
     selected = null; syncOptions(); paintStatus();
   }
 
@@ -657,6 +689,7 @@
 
   async function tick() {
     if (looping || (!running && !panel)) return;
+    syncStationFeed();
     looping = true;
     const began = performance.now();
     let failed = false;
@@ -697,9 +730,10 @@
     clearTimeout(autoRetry);
     state = await bridge.lcdStart(automatic); running = !!state.running;
     if (state.device) { canvas.width = state.device.width; canvas.height = state.device.height; layoutPaper(); }
+    syncStationFeed();
     lastPoll = 0; note('Connected; waiting for the first drawn-frame acknowledgment.'); tick();
   }
-  async function stop() { clearTimeout(autoRetry); await bridge.lcdStop(); running = false; state = await bridge.lcdState(); note('LCD producer stopped.'); }
+  async function stop() { clearTimeout(autoRetry); await bridge.lcdStop(); running = false; state = await bridge.lcdState(); syncStationFeed(); note('LCD producer stopped.'); }
 
   async function resumeWhenAvailable() {
     const latest = await bridge.lcdState();
@@ -721,7 +755,7 @@
     card.style.cssText = 'background:#101e29;border:1px solid #3e687b;border-radius:12px;padding:18px;width:min(860px,96vw);max-height:94vh;overflow:auto;color:#e5eff5;font:13px/1.5 PineIcons, PineIcons, sans-serif, PineIcons';
     const heading = node('div'); heading.style.cssText = 'display:flex;justify-content:space-between;align-items:center';
     heading.appendChild(node('h2', 'Pine Box LCD'));
-    const close = node('button', 'Close'); close.onclick = () => { shade.remove(); panel = null; }; heading.appendChild(close); card.appendChild(heading);
+    const close = node('button', 'Close'); close.onclick = () => { shade.remove(); panel = null; syncStationFeed(); }; heading.appendChild(close); card.appendChild(heading);
     const form = node('div'); form.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px';
     const host = node('input'); host.placeholder = 'Display LAN IP, quanta-screen.local or COM8'; host.value = state.config.host;
     host.style.cssText = 'min-width:220px;flex:1'; host.setAttribute('aria-label', 'LCD host'); form.appendChild(host);
@@ -844,15 +878,20 @@
     }; card.appendChild(chooseSamples);
     shade.appendChild(card); shade.onclick = (event) => { if (event.target === shade) close.click(); };
     shade.onkeydown = (event) => { if (event.key === 'Escape') close.click(); };
-    document.body.appendChild(shade); panel = shade; card.focus(); layoutPaper(); syncOptions(); paintStatus(); lastPoll = 0; tick();
+    document.body.appendChild(shade); panel = shade; syncStationFeed(); card.focus(); layoutPaper(); syncOptions(); paintStatus(); lastPoll = 0; tick();
   }
   entry.onclick = () => open().catch((error) => { entry.title = 'LCD: ' + error.message; });
   bridge.lcdState().then(async (got) => {
     state = got;
     if (got.running) {
       running = true;
+      syncStationFeed();
       if (got.device) { canvas.width = got.device.width; canvas.height = got.device.height; }
       layoutPaper(); tick();
     } else if (got.config.autoStart) await resumeWhenAvailable();
   }).catch(() => {});
+  window.addEventListener('beforeunload', () => {
+    if (stationLeave) stationLeave();
+    stationLeave = null;
+  }, {once: true});
 })();

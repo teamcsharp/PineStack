@@ -2871,7 +2871,11 @@
     /* Subscribe first, paint second: a late subscriber is handed the
      * current picture immediately by PineStationFeed rather than staring
      * at an empty screen for up to four seconds. */
-    if (!unsubscribe) unsubscribe = root.PineStationFeed.subscribe(paint);
+    if (!unsubscribe) {
+      unsubscribe = root.PineStationFeed.subscribeView
+        ? root.PineStationFeed.subscribeView(host, paint)
+        : root.PineStationFeed.subscribe(paint);
+    }
     await loadGallery(false);
   }
 

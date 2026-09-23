@@ -1,0 +1,101 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from playout_sequencer import LinearSequencer, MODE_LINEAR, MODE_SHADOW
+
+
+class Clock:
+    def __init__(self, at=1000.0):
+        self.at = float(at)
+
+    def __call__(self):
+        return self.at
+
+    def move(self, seconds):
+        self.at += float(seconds)
+
+
+class LinearPlayoutContractTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.mode = MODE_LINEAR
+        self.seq = LinearSequencer(
+            clock=self.clock, mode_reader=lambda: self.mode,
+            held_stale_s=30, hold_reserve_s=20,
+            events_path=Path(tempfile.mkdtemp()) / "events.jsonl",
+        )
+
+    def test_competing_producers_release_in_script_block_order(self):
+        self.seq.hold("later", block=12, ord0=0, seconds=20, lines=3,
+                      road="banter", audio_ready=True)
+        self.seq.hold("first", block=11, ord0=0, seconds=15, lines=2,
+                      road="caller", audio_ready=True)
+        self.assertEqual(self.seq.head()["key"], "first")
+        self.assertFalse(self.seq.release_check("later")["head"])
+        self.assertTrue(self.seq.release_check("first")["head"])
+        self.seq.dispatched("occ-first", route="page", starts_at=self.clock(),
+                            seconds=15, key="first", delivery_id="d-first")
+        self.assertEqual(self.seq.head()["key"], "later")
+
+    def test_a_making_round_blocks_competing_dialogue_but_not_a_clip(self):
+        self.seq.making("writing", road="banter", lines=4, eta_s=20)
+        blocked = self.seq.ask_fill("continuity", dialogue=True)
+        clip = self.seq.ask_fill("sfx", dialogue=False)
+        self.assertFalse(blocked["allow"])
+        self.assertTrue(blocked["enforced"])
+        self.assertTrue(clip["allow"])
+
+    def test_delayed_ack_is_bound_to_its_delivery_and_route(self):
+        self.seq.dispatched("page-occ", route="page", starts_at=self.clock(),
+                            seconds=30, delivery_id="page-delivery")
+        self.seq.dispatched("box-occ", route="box", starts_at=self.clock(),
+                            seconds=40, delivery_id="box-delivery")
+        self.clock.move(8)
+        self.seq.heard(delivery_id="box-delivery", event="playing",
+                       position_s=8, listener="tablet")
+        self.clock.move(4)
+        self.seq.heard(delivery_id="page-delivery", event="ended",
+                       position_s=30, listener="old-page")
+        box = self.seq.heard(delivery_id="box-delivery", event="playing",
+                             position_s=12, listener="tablet")
+        self.assertEqual(box["oid"], "box-occ")
+        self.assertEqual(box["route"], "box")
+        self.assertFalse(box["ended_at"])
+
+    def test_dispatch_recovers_a_held_round_by_occurrence(self):
+        """A lost script key must not reserve the air until stale eviction."""
+        self.seq.hold("sid:round-7", block=7, seconds=30, lines=4,
+                      road="banter", occurrence="occ-round-7",
+                      audio_ready=True)
+
+        sent = self.seq.dispatched(
+            "occ-round-7", route="page", starts_at=self.clock(), seconds=30,
+            key="occ:", delivery_id="delivery-7")
+
+        self.assertIsNone(self.seq.head())
+        self.assertEqual(sent["oid"], "occ-round-7")
+        self.assertEqual(self.seq.state()["counts"]["released_by_occurrence"], 1)
+
+    def test_withdrawn_and_stale_holds_cannot_choke_the_line(self):
+        self.seq.hold("withdrawn", block=1, seconds=20, audio_ready=True)
+        self.seq.hold("next", block=2, seconds=20, audio_ready=True)
+        self.assertTrue(self.seq.forget("withdrawn", "operator withdrew it"))
+        self.assertEqual(self.seq.head()["key"], "next")
+        self.clock.move(31)
+        self.seq.evict_stale(self.clock())
+        self.assertIsNone(self.seq.head())
+        self.assertLessEqual(self.seq.page_floor(), self.clock())
+
+    def test_shadow_records_pressure_without_enforcing_it(self):
+        self.mode = MODE_SHADOW
+        self.seq.hold("ready", block=1, seconds=20, audio_ready=True)
+        verdict = self.seq.ask_fill("rescue", dialogue=True)
+        self.assertTrue(verdict["allow"])
+        self.assertFalse(verdict["enforced"])
+        self.assertGreater(verdict["would_be_after"], 0)
+        self.assertEqual(self.seq.page_floor(), 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

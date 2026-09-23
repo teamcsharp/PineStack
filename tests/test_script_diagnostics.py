@@ -192,6 +192,23 @@ class CaptureAnalysisTests(unittest.TestCase):
         self.assertFalse(any('Evidence is incomplete' in item
                              for item in analyze_capture(capture)['limitations']))
 
+    def test_stamp_lead_requires_a_measurable_directional_lead(self):
+        rows = [
+            {'id': 'a', 'air_at': 10.0, 'heard_ack_at': 9.99},
+            {'id': 'b', 'air_at': 20.0, 'heard_ack_at': 20.04},
+        ]
+        result = analyze_capture(view(), {'feed': {'rows': rows}})
+        self.assertNotIn('stamp_lead_s', self.codes(view()))
+        self.assertFalse(any(f['code'] == 'stamp_lead_s'
+                             for f in result['findings']))
+
+        rows.append({'id': 'c', 'air_at': 30.0, 'heard_ack_at': 30.2})
+        result = analyze_capture(view(), {'feed': {'rows': rows}})
+        lead = next(f for f in result['findings']
+                    if f['code'] == 'stamp_lead_s')
+        self.assertEqual(lead['count'], 1)
+        self.assertIn('median of 0.2s', lead['message'])
+
 
 class EvidenceBoundsTests(unittest.TestCase):
     def test_large_legacy_input_is_bounded_before_encoding_and_json_remains_valid(self):

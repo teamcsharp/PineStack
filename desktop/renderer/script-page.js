@@ -5946,7 +5946,9 @@
    * full line identities and audio coordinates. The tap submits immediately;
    * a screenshot and ten seconds of subsequent evidence finish the report.
    * Recording never scrolls the view or changes playback. */
-  var MOTION_MS = 250;
+  /* Two samples a second preserves a useful pre-incident history without
+     forcing layout on a thousand-row screenplay four times a second. */
+  var MOTION_MS = 500;
   var motionTimer = 0;
   var diagnosticRecorder = null;
   var diagnosticNodes = [];
@@ -5954,6 +5956,8 @@
   var diagnosticLines = Object.create(null);
   var diagnosticRevision = '';
   var diagnosticSnapshot = null;
+  var diagnosticHiddenCount = 0;
+  var diagnosticTransitionCount = 0;
   function recorder() {
     if (!diagnosticRecorder && root.PineScriptDiagnostics) diagnosticRecorder = root.PineScriptDiagnostics.createRecorder();
     return diagnosticRecorder;
@@ -5962,9 +5966,13 @@
     diagnosticNodes = Array.prototype.slice.call(box.querySelectorAll('.sp-el'));
     diagnosticIndices = new Map();
     diagnosticLines = Object.create(null);
+    diagnosticHiddenCount = 0;
+    diagnosticTransitionCount = 0;
     diagnosticNodes.forEach(function (n, i) {
       diagnosticIndices.set(n, i);
       if (n.pineItem && n.pineItem.line) diagnosticLines[String(n.pineItem.line)] = {item: n.pineItem, index: i};
+      if (n.hidden) diagnosticHiddenCount += 1;
+      if (n.classList.contains('sp-fx')) diagnosticTransitionCount += 1;
     });
     if (root.PineScriptDiagnostics) diagnosticRevision = root.PineScriptDiagnostics.revision(elements);
   }
@@ -6035,11 +6043,10 @@
     feed.forEach(function (r) { if (r.id) byId[String(r.id)] = r; });
     var rect = pane.getBoundingClientRect(), visible = -1;
     var knownActive = diagnosticLines[String(active.id || '')];
-    if (idx < 0 && !knownActive) {
-      for (var v = 0; v < diagnosticNodes.length; v += 1) {
-        var box = diagnosticNodes[v].getBoundingClientRect();
-        if (box.height > 0 && box.bottom > rect.top && box.top < rect.bottom) { visible = v; break; }
-      }
+    if (idx < 0 && !knownActive && document.elementFromPoint) {
+      var hit = document.elementFromPoint(rect.left + Math.min(24, rect.width / 2), rect.top + 2);
+      var visibleNode = hit && hit.closest ? hit.closest('.sp-el') : null;
+      visible = diagnosticIndices.has(visibleNode) ? diagnosticIndices.get(visibleNode) : -1;
     }
     var contextAt = root.PineScriptDiagnostics.contextIndex(idx, knownActive ? knownActive.index : -1, visible, diagnosticNodes.length);
     var from = contextAt < 0 ? 0 : Math.max(0, contextAt - 20);
@@ -6071,11 +6078,8 @@
         }
     });
     var top = lit ? Math.round(lit.getBoundingClientRect().top - rect.top) : null;
-    var hiddenCount = 0, transitionCount = 0;
-    for (var d = 0; d < diagnosticNodes.length; d += 1) {
-      if (diagnosticNodes[d].hidden) hiddenCount += 1;
-      if (diagnosticNodes[d].classList.contains('sp-fx')) transitionCount += 1;
-    }
+    var hiddenCount = diagnosticHiddenCount;
+    var transitionCount = diagnosticTransitionCount;
     diagnosticSnapshot = {
       recorder_version: 2, capture_source: 'script-page',
       highlight_id: lit ? String(lit.dataset.line || '') : '', active_id: String(active.id || ''),
@@ -7893,7 +7897,7 @@
       node.dataset.ord = String(item.ord);
     }
     if (type === 'dialogue' || type === 'action') {
-      node.addEventListener('click', function () { openLine(item, node); });
+      node.addEventListener('click', function () { openLine(node.pineItem || item, node); });
     }
     return node;
   }
@@ -9478,6 +9482,7 @@
   }
 
   function tick() {
+    if (document.hidden || !host || host.offsetParent === null) return;
     var row = activeRow();
     /* The bounded ring of what the mark did and why - the incident report
        carries it, so a backward movement can be told apart from a document

@@ -138,6 +138,34 @@ class ScriptLedgerOrder(unittest.TestCase):
         app._SCRIPT_LEDGER_MEMO["at"] = 0.0
         self.assertNotIn("", app.script_ledger_order())
 
+    def test_generation_and_playout_identity_survive_a_restart(self):
+        dice = {"roll": 0.82, "hard": 0.64, "lean": 1,
+                "band": [0.0, 1.0]}
+        model_call = {"provider": "local", "model": "writer",
+                      "request_id": "req-7"}
+        system2 = {"system2_job": "job-4", "system2_trace_id": "trace-9"}
+        scenario = {"id": "mind-change", "text": "Let somebody change their mind",
+                    "weight": 1.0}
+        app.script_ledger_commit("sid-trace", [{
+            "line_id": "trace-line", "who": "cohost", "text": "answer",
+            "turn": 1, "dice": dice, "model_call": model_call,
+            "system2": system2, "scenario": scenario,
+            "admission_occurrence": "occ-12",
+        }], "banter", source="speakerbox/memo.md")
+
+        # Clear the in-memory read cache to model a process restart.
+        app._SCRIPT_LEDGER_MEMO["at"] = 0.0
+        app._SCRIPT_LEDGER_MEMO["rows"] = []
+        row = app.script_ledger_rows()[0]
+        self.assertEqual(row["dice"], dice)
+        self.assertEqual(row["model_call"], model_call)
+        self.assertEqual(row["system2"], system2)
+        self.assertEqual(row["scenario"], scenario)
+        self.assertEqual(row["admission_occurrence"], "occ-12")
+        self.assertEqual(row["source"], "speakerbox/memo.md")
+        self.assertTrue(row["settings_revision"])
+        self.assertIn("host", row["system_prompts"])
+
 
 def air(rid, at, text, who="dj", kind="banter"):
     return {"id": rid, "who": who, "kind": kind, "round": "banter",

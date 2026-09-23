@@ -3275,7 +3275,10 @@
     document.querySelectorAll(".pb-trim").forEach((node) => node.remove());
     await preload(bank);
     if (!unsubscribe) {
-      unsubscribe = root.PineStationFeed.subscribe((payload) => paintFeed(payload.rows));
+      const receive = (payload) => paintFeed(payload.rows);
+      unsubscribe = root.PineStationFeed.subscribeView
+        ? root.PineStationFeed.subscribeView(host, receive)
+        : root.PineStationFeed.subscribe(receive);
     }
     mounted = true;
   }

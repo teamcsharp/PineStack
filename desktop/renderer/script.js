@@ -653,10 +653,13 @@
     try { stage().preload(config && config.baseUrl); } catch (err) { /* on demand */ }
 
     if (!unsubscribe) {
-      unsubscribe = root.PineStationFeed.subscribe((payload) => {
+      const receive = (payload) => {
         paintFeed(payload.rows);
         paintFeedSelection();
-      });
+      };
+      unsubscribe = root.PineStationFeed.subscribeView
+        ? root.PineStationFeed.subscribeView(host, receive)
+        : root.PineStationFeed.subscribe(receive);
     }
     mounted = true;
   }

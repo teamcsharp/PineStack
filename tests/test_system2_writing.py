@@ -85,7 +85,8 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
             speakbox_prepend_rate=1, speakbox_append_rate=1, speakbox_full_swath_rate=1,
             speakbox_quotes_system2=False,   # [#1233] this fixture proves the switch
             speakbox_full_swath_chars=2600, banter_max_lines=24, banter_min_lines=16,
-            third_name="", drop_voice="", heat_rate=0, lyrics_talk=False)
+            third_name="", drop_voice="", heat_rate=0, lyrics_talk=False,
+            banter_engine="one-call")
         original = app.dj_banter
         tree = ast.parse(inspect.getsource(original))
         names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}

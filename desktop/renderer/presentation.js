@@ -1100,7 +1100,11 @@
     source = root.PinePresentationSource.create({
       get: (route) => api().get(route),
       post: (route, body) => api().post(route, body),
-      subscribe: root.PineStationFeed ? root.PineStationFeed.subscribe : null
+      subscribe: root.PineStationFeed ? (fn) => {
+        return root.PineStationFeed.subscribeView
+          ? root.PineStationFeed.subscribeView(target, fn)
+          : root.PineStationFeed.subscribe(fn);
+      } : null
     });
     wall = root.PineVideoWall.create({
       /* Through the gate, not around it - so the wall and the gallery

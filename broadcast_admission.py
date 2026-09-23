@@ -39,8 +39,9 @@ import json
 import os
 import time
 import uuid
+import copy
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any, Callable, Iterable
 
 SCHEMA_VERSION = 1
@@ -418,6 +419,7 @@ class AdmissionStore:
         self.keep_events = max(200, int(keep_events))
         self.lock = RLock()
         self._since_checkpoint = 0
+        self._checkpoint_seq = 0
         self.seq = 0
 
     @property
@@ -446,23 +448,34 @@ class AdmissionStore:
             self._since_checkpoint += 1
             return self.seq
 
-    def write_state(self, state: dict[str, Any]) -> None:
-        with self.lock:
-            self.root.mkdir(parents=True, exist_ok=True)
-            payload = dict(state, seq=self.seq, schema_version=SCHEMA_VERSION)
-            temporary = self.state_path.with_name(
-                self.state_path.name + "." + uuid.uuid4().hex + ".tmp")
-            try:
-                temporary.write_text(
-                    json.dumps(payload, ensure_ascii=False, allow_nan=False,
-                               separators=(",", ":")), encoding="utf-8")
+    def write_state(self, state: dict[str, Any], *, seq: int | None = None) -> None:
+        target_seq = self.seq if seq is None else int(seq)
+        payload = dict(state, seq=target_seq,
+                       schema_version=SCHEMA_VERSION)
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False,
+                             separators=(",", ":"))
+        self.root.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_name(
+            self.state_path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            # Encoding and the full temporary-file write are intentionally
+            # outside the store lock. Ledger appends can continue while this
+            # bounded snapshot is materialized; its captured sequence tells
+            # recovery which later ledger rows still need replaying.
+            temporary.write_text(encoded, encoding="utf-8")
+            with self.lock:
+                # A slow older background snapshot must never replace a newer
+                # explicit checkpoint that reached disk first.
+                if target_seq < self._checkpoint_seq:
+                    return
                 temporary.replace(self.state_path)
-            finally:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            self._since_checkpoint = 0
+                self._checkpoint_seq = target_seq
+                self._since_checkpoint = max(0, self.seq - target_seq)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def due_for_checkpoint(self) -> bool:
         return self._since_checkpoint >= self.checkpoint_every
@@ -505,6 +518,8 @@ class AdmissionStore:
                 events.append(event)
         with self.lock:
             self.seq = highest
+            self._checkpoint_seq = floor
+            self._since_checkpoint = max(0, highest - floor)
         return state, events
 
     def compact(self, state: dict[str, Any]) -> None:
@@ -537,6 +552,7 @@ class PlayoutController:
                  resolve_audio: Callable[[str], Any] | None = None,
                  new_id: Callable[[], str] | None = None,
                  keep_occurrences: int = 400, keep_refusals: int = 400,
+                 admitted_stale_s: float = 300.0,
                  log: Callable[[str, dict[str, Any]], None] | None = None):
         self.store = store
         self.clock = clock
@@ -548,6 +564,7 @@ class PlayoutController:
         self.new_id = new_id or (lambda: uuid.uuid4().hex[:20])
         self.keep_occurrences = max(20, int(keep_occurrences))
         self.keep_refusals = max(20, int(keep_refusals))
+        self.admitted_stale_s = max(30.0, float(admitted_stale_s))
         self.log = log
         self.lock = RLock()
 
@@ -561,6 +578,8 @@ class PlayoutController:
         self._refusals: list[dict[str, Any]] = []
         self._counts: dict[str, int] = {}
         self._started = float(clock())
+        self._checkpoint_busy = False
+        self._checkpoint_error = ""
 
     # ------------------------------------------------------------ opening
 
@@ -982,7 +1001,8 @@ class PlayoutController:
              text: str = "", seconds: float = 0.0,
              generation: int | None = None,
              assembly: dict[str, Any] | None = None,
-             meta: dict[str, Any] | None = None) -> Verdict:
+             meta: dict[str, Any] | None = None,
+             ordered_transport: bool = False) -> Verdict:
         """THE question both transports must ask: was this committed first?
 
         In observe mode the answer is always yes and the truth is written
@@ -1005,6 +1025,9 @@ class PlayoutController:
                                      "saw": generation, "current": self._generation})
 
             found = self._claim(path, sig)
+            self._expire_stale_admitted(
+                except_occurrence=(str(found.get("occurrence_id") or "")
+                                   if found else ""))
             if found is None:
                 detail = {"producer": producer, "media": media_key(path),
                           "sig": str(sig or ""), "kind": kind,
@@ -1053,7 +1076,7 @@ class PlayoutController:
                     return verdict
                 soft.append(verdict)
             ahead = self._earlier_unfinished(int(row["position"]))
-            if ahead:
+            if ahead and not ordered_transport:
                 verdict = self._refuse(OUT_OF_ORDER, lane,
                                        enforcing and self.enforce_order,
                                        {"occurrence_id": oid,
@@ -1062,6 +1085,21 @@ class PlayoutController:
                 if not verdict.allow:
                     return verdict
                 soft.append(verdict)
+            elif ahead:
+                # An ordered, timestamped transport may accept more than one
+                # item before the head starts sounding. This is buffering,
+                # not out-of-order playout: the transport has already
+                # committed to preserve the admitted order. Refusing the
+                # second handoff leaves it ADMITTED with nobody able to retry
+                # it, and that orphan then blocks every later occurrence.
+                # Direct speaker transports never set this flag and retain
+                # the strict one-at-a-time check above.
+                self._count("ordered_transport_buffered")
+                self._record({"type": "ordered_transport_buffered",
+                              "at": self.clock(),
+                              "occurrence_id": oid,
+                              "position": row["position"],
+                              "waiting_on": ahead[:4]})
             self._begin(oid)
             self._count("dispatched")
             if soft:
@@ -1457,6 +1495,13 @@ class PlayoutController:
                     "next_position": self._next_position,
                     "occurrences": len(self._order), "states": states,
                     "counts": dict(self._counts),
+                    "checkpoint": {
+                        "busy": bool(self._checkpoint_busy),
+                        "error": self._checkpoint_error,
+                        "ledger_seq": int(self.store.seq),
+                        "snapshot_seq": int(self.store._checkpoint_seq),
+                        "pending_events": int(self.store._since_checkpoint),
+                    },
                     "open_reservations": sum(1 for r in self._reservations.values()
                                              if not r.get("filled")
                                              and not r.get("released")),
@@ -1527,6 +1572,37 @@ class PlayoutController:
                 out.append(oid)
         return out
 
+    def _expire_stale_admitted(self, except_occurrence: str = "") -> int:
+        """Withdraw commitments whose producer never reached a transport.
+
+        A page clip calls the gate when it is published, before any client
+        queue delay, so five minutes in ADMITTED is not listener latency. It
+        is an abandoned handoff. Leaving it live forever makes every later
+        occurrence out of order; withdrawing it preserves the position and
+        lets the reader proceed, exactly like restart recovery does.
+        """
+        now = float(self.clock())
+        expired = 0
+        for oid in list(self._order):
+            if oid == except_occurrence:
+                continue
+            row = self._occurrences.get(oid) or {}
+            if row.get("state") != ADMITTED:
+                continue
+            admitted = float(row.get("admitted_at") or 0.0)
+            if admitted <= 0 or now - admitted <= self.admitted_stale_s:
+                continue
+            row["state"] = WITHDRAWN
+            row["withdrawn_why"] = (
+                "the producer did not hand this occurrence to a transport "
+                "within %.0f seconds" % self.admitted_stale_s)
+            self._count("withdrawn:handoff_timeout")
+            self._record({"type": "withdrawn", "at": now,
+                          "occurrence_id": oid,
+                          "reason": row["withdrawn_why"]})
+            expired += 1
+        return expired
+
     def _blocking_reservation(self, position: int) -> dict[str, Any] | None:
         for row in self._reservations.values():
             if row.get("filled") or row.get("released"):
@@ -1558,12 +1634,38 @@ class PlayoutController:
             self._occurrences.pop(oid, None)
 
     def _checkpoint_if_due(self) -> None:
-        if self.store.due_for_checkpoint():
-            self.checkpoint()
+        if not self.store.due_for_checkpoint() or self._checkpoint_busy:
+            return
+        # A checkpoint is a recovery optimization, not an admission. The
+        # append-only admission record was already flushed before the caller
+        # was told it committed. Copy the bounded in-memory state under the
+        # controller lock, then serialize and replace the snapshot away from
+        # the broadcast loop. Capturing the matching ledger sequence matters:
+        # events appended while the snapshot is being written must still be
+        # replayed after it on restart.
+        state = copy.deepcopy(self._snapshot())
+        seq = int(self.store.seq)
+        self._checkpoint_busy = True
+        Thread(target=self._write_checkpoint,
+               args=(state, seq),
+               name="broadcast-admission-checkpoint", daemon=True).start()
+
+    def _write_checkpoint(self, state: dict[str, Any], seq: int) -> None:
+        error = ""
+        try:
+            self.store.write_state(state, seq=seq)
+        except Exception as exc:  # noqa: BLE001
+            error = "%s: %s" % (type(exc).__name__, exc)
+        finally:
+            with self.lock:
+                self._checkpoint_busy = False
+                self._checkpoint_error = error[:240]
 
     def checkpoint(self) -> None:
         with self.lock:
-            self.store.write_state(self._snapshot())
+            state = copy.deepcopy(self._snapshot())
+            seq = int(self.store.seq)
+        self.store.write_state(state, seq=seq)
 
     def _snapshot(self) -> dict[str, Any]:
         return {"generation": self._generation,

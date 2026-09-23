@@ -430,7 +430,13 @@ def window_facts(view, server_context=None):
                 aired_by_id[identity] = raw['aired']
             heard, stamped = _number(raw.get('heard_ack_at')), _number(raw.get('air_at'))
             if heard and stamped and heard > 0 and stamped > 0:
-                leads.append(heard - stamped)
+                lead = heard - stamped
+                # A lead is directional evidence: the page stamp happened
+                # before the ear acknowledged the line. Negative deltas are
+                # the opposite ordering, and sub-tenth jitter rounds to the
+                # misleading report "0.0s ahead".
+                if lead >= 0.05:
+                    leads.append(lead)
     seats = [_number(_mapping(e).get('element_index')) for e in events]
     seats = [s for s in seats if s is not None]
     ghosts, ghost_states = [], Counter()

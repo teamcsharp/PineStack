@@ -18,6 +18,7 @@ rather than trusting it.
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -193,6 +194,35 @@ class CommitmentTests(AdmissionBase):
                                   sig=second["audio"]["sig"], producer="dj_sting")
         self.assertFalse(verdict.allow)
         self.assertEqual(verdict.reason, ba.OUT_OF_ORDER)
+
+    def test_ordered_transport_buffers_behind_an_admitted_head(self):
+        """The page queue may accept future audio without airing it early.
+
+        A finished round can wait for its announced broadcast moment while a
+        later filler is already stamped behind it. Treating that handoff as a
+        direct-speaker dispatch strands the filler and deadlocks every later
+        occurrence. The ordered transport owns the wait; the direct route
+        above remains strictly refused.
+        """
+        controller = self.fix.reopen(mode=ba.MODE_ENFORCE,
+                                     enforce_lanes=("speech",),
+                                     enforce_order=True)
+        first = controller.admit(self.fix.round("r1.wav", ["a"]))
+        second = controller.admit(self.fix.round("r2.wav", ["b"]))
+
+        verdict = controller.gate(
+            lane="speech", path=second["audio"]["path"],
+            sig=second["audio"]["sig"], producer="page_feed_append",
+            ordered_transport=True)
+
+        self.assertTrue(verdict.allow)
+        self.assertEqual(verdict.reason, "admitted")
+        self.assertEqual(controller.occurrence(first["occurrence_id"])["state"],
+                         ba.ADMITTED)
+        self.assertEqual(controller.occurrence(second["occurrence_id"])["state"],
+                         ba.DISPATCHING)
+        self.assertEqual(
+            controller.stats()["counts"]["ordered_transport_buffered"], 1)
 
 
 # ------------------------------------------------------- positions never move
@@ -643,6 +673,27 @@ class RecoveryTests(AdmissionBase):
         self.assertTrue(verdict.allow)
         self.assertEqual(verdict.reason, "admitted")
 
+    def test_an_abandoned_handoff_expires_without_renumbering_the_script(self):
+        controller = self.fix.reopen(
+            mode=ba.MODE_ENFORCE, enforce_lanes=("speech",),
+            enforce_order=True, admitted_stale_s=60)
+        abandoned = controller.admit(self.fix.round("r1.wav", ["a"]))
+        self.fix.now += 61
+        next_round = controller.admit(self.fix.round("r2.wav", ["b"]))
+
+        verdict = controller.gate(
+            lane="speech", path=next_round["audio"]["path"],
+            sig=next_round["audio"]["sig"], producer="next")
+
+        self.assertTrue(verdict.allow)
+        self.assertEqual(verdict.reason, "admitted")
+        expired = controller.occurrence(abandoned["occurrence_id"])
+        self.assertEqual(expired["state"], ba.WITHDRAWN)
+        self.assertIn("did not hand", expired["withdrawn_why"])
+        self.assertEqual(expired["position"], abandoned["position"])
+        self.assertEqual(controller.stats()["counts"][
+            "withdrawn:handoff_timeout"], 1)
+
     def test_a_restart_says_how_many_it_took_back(self):
         """A withdrawal nobody can count is a withdrawal nobody can audit."""
         self.controller.admit(self.fix.round("r1.wav", ["a"]))
@@ -708,6 +759,38 @@ class RecoveryTests(AdmissionBase):
         after = controller.occurrence(first["occurrence_id"])
         self.assertEqual(after["outcome"], ba.ACCEPTED)
         self.assertEqual(after["position"], first["position"])
+
+    def test_periodic_checkpoint_does_not_hold_dispatch_or_lose_later_events(self):
+        controller = self.controller
+        controller.store.checkpoint_every = 1
+        entered = threading.Event()
+        release = threading.Event()
+        original = controller.store.write_state
+
+        def slow_checkpoint(state, *, seq=None):
+            entered.set()
+            release.wait(2.0)
+            return original(state, seq=seq)
+
+        controller.store.write_state = slow_checkpoint
+        first = controller.admit(self.fix.round("r1.wav", ["a"]))
+        self.assertTrue(entered.wait(1.0))
+
+        started = time.monotonic()
+        second = controller.admit(self.fix.round("r2.wav", ["b"]))
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(controller.stats()["checkpoint"]["busy"])
+
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while controller.stats()["checkpoint"]["busy"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        controller.store.write_state = original
+        self.assertFalse(controller.stats()["checkpoint"]["busy"])
+
+        reopened = self.fix.reopen()
+        self.assertIsNotNone(reopened.occurrence(first["occurrence_id"]))
+        self.assertIsNotNone(reopened.occurrence(second["occurrence_id"]))
 
 
 # ------------------------------------------ the assembler's actual cue map

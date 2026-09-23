@@ -9,11 +9,13 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import contextvars
 import copy
+import gzip
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import threading
 import time
 import uuid
 
@@ -100,6 +102,22 @@ def digest(value):
 
 
 class System2Runtime:
+    RETENTION_INTERVAL_SECONDS = 6 * 3600
+    RETENTION_MAX_AGE_SECONDS = 7 * 86400
+    RETENTION_REPEAT_SECONDS = 2 * 3600
+    RETENTION_BATCH_ROWS = 2000
+    RETENTION_LIMITS = {
+        "hours": 96,
+        "jobs": 4000,
+        "reservations": 2000,
+        "receipts": 8000,
+        "heard": 20000,
+        "events": 2000,
+        "absent_candidates": 500,
+    }
+    RETENTION_COMPACT_MIN_BYTES = 64 * 1024 * 1024
+    RETENTION_COMPACT_FREE_RATIO = .20
+
     def __init__(self, host):
         self.host = host
         self.store = System2Store(host.DATA_DIR / "system2.sqlite3")
@@ -141,6 +159,13 @@ class System2Runtime:
         self._record_slots = set()
         self._event_plans = []
         self._refused = {}
+        self._retention_guard = threading.Lock()
+        self._retention_last = {
+            "last_run_at": 0.0, "duration_seconds": 0.0,
+            "selected": {}, "deleted": {}, "skipped_changed": 0,
+            "archive": None, "compaction": None, "error": "",
+        }
+        self._retention_observed = {}
 
     @property
     def enabled(self):
@@ -498,6 +523,440 @@ class System2Runtime:
                 slot["drafts"] = [row for row in self.store.candidates_for_slot(slot["slot_id"]) if row["id"] not in staged]
         return result
 
+    @staticmethod
+    def _retention_json(raw):
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+
+    def _retention_select(self, db, *, now, max_age_seconds, limits, batch_rows):
+        """Select one dependency-safe retention batch from a single snapshot.
+
+        The archive write happens outside the database lock. The exact same
+        selection is therefore repeated in the deletion transaction and every
+        body is compared byte-for-byte before deletion.
+        """
+        cutoff = now - max_age_seconds
+        terminal_jobs = {"completed", "satisfied", "expired"}
+        terminal_reservations = {"completed", "released"}
+        terminal_events = {"completed", "expired"}
+
+        hours = [dict(row) for row in db.execute(
+            "SELECT id,start FROM s2_hours ORDER BY start DESC,id")]
+        slots = [dict(row) for row in db.execute(
+            "SELECT id,hour_id FROM s2_slots ORDER BY rowid DESC")]
+        jobs = [dict(row) for row in db.execute(
+            "SELECT id,slot_id,state,deadline,"
+            " COALESCE(json_extract(body,'$.finished_at'),deadline,0) AS stamp,body"
+            " FROM s2_jobs ORDER BY deadline DESC,id")]
+        reservations = [dict(row) for row in db.execute(
+            "SELECT id,slot_id,candidate_id,state,"
+            " COALESCE(json_extract(body,'$.completed_at'),"
+            " json_extract(body,'$.released_at'),json_extract(body,'$.reserved_at'),0) AS stamp"
+            " FROM s2_reservations ORDER BY stamp DESC,id")]
+        events = [dict(row) for row in db.execute(
+            "SELECT id,state,deadline,"
+            " COALESCE(json_extract(body,'$.completed_at'),"
+            " json_extract(body,'$.expired_at'),json_extract(body,'$.released_at'),deadline,0) AS stamp"
+            " FROM s2_events ORDER BY stamp DESC,id")]
+
+        slot_hour = {row["id"]: row["hour_id"] for row in slots}
+        protected_hours = {
+            row["id"] for row in hours
+            if row["start"] > now or row["start"] <= now < row["start"] + 3600
+        }
+        protected_hours.update(
+            str(hour.get("id") or "")
+            for hour in list(self._plans) + list(self._event_plans)
+            if hour.get("id"))
+        unfinished_jobs = {row["id"] for row in jobs if row["state"] not in terminal_jobs}
+        active_reservations = {
+            row["id"] for row in reservations
+            if row["state"] not in terminal_reservations
+        }
+        active_events = {row["id"] for row in events if row["state"] not in terminal_events}
+        protected_slots = {
+            row["slot_id"] for row in jobs if row["id"] in unfinished_jobs
+        } | {
+            row["slot_id"] for row in reservations if row["id"] in active_reservations
+        }
+        protected_hours.update(
+            slot_hour[slot_id] for slot_id in protected_slots if slot_id in slot_hour)
+        protected_hours.update("event-" + identity for identity in active_events)
+        protected_slots.update(
+            row["id"] for row in slots if row["hour_id"] in protected_hours)
+
+        selected = {table: set() for table in (
+            "s2_heard", "s2_receipts", "s2_reservations", "s2_jobs",
+            "s2_candidates", "s2_events", "s2_slots", "s2_hours")}
+
+        kept_hours = 0
+        for row in hours:
+            if row["id"] in protected_hours:
+                continue
+            old = row["start"] + 3600 < cutoff
+            if old or kept_hours >= limits["hours"]:
+                selected["s2_hours"].add(row["id"])
+            else:
+                kept_hours += 1
+        selected["s2_slots"].update(
+            row["id"] for row in slots
+            if row["hour_id"] in selected["s2_hours"] and row["id"] not in protected_slots)
+
+        protected_jobs = unfinished_jobs | {
+            row["id"] for row in jobs if row["slot_id"] in protected_slots
+        }
+        kept = 0
+        for row in sorted(jobs, key=lambda item: (float(item["stamp"] or 0), item["id"]), reverse=True):
+            if row["state"] not in terminal_jobs or row["id"] in protected_jobs:
+                continue
+            forced = row["slot_id"] in selected["s2_slots"]
+            if forced or float(row["stamp"] or 0) < cutoff or kept >= limits["jobs"]:
+                selected["s2_jobs"].add(row["id"])
+            else:
+                kept += 1
+
+        protected_reservations = active_reservations | {
+            row["id"] for row in reservations if row["slot_id"] in protected_slots
+        }
+        kept = 0
+        for row in sorted(reservations, key=lambda item: (float(item["stamp"] or 0), item["id"]), reverse=True):
+            if row["state"] not in terminal_reservations or row["id"] in protected_reservations:
+                continue
+            forced = row["slot_id"] in selected["s2_slots"]
+            if forced or float(row["stamp"] or 0) < cutoff or kept >= limits["reservations"]:
+                selected["s2_reservations"].add(row["id"])
+            else:
+                kept += 1
+
+        kept = 0
+        for row in sorted(events, key=lambda item: (float(item["stamp"] or 0), item["id"]), reverse=True):
+            if row["state"] not in terminal_events or row["id"] in active_events:
+                continue
+            if float(row["stamp"] or 0) < cutoff or kept >= limits["events"]:
+                selected["s2_events"].add(row["id"])
+            else:
+                kept += 1
+
+        reservation_ids = {row["id"] for row in reservations}
+        receipts = [dict(row) for row in db.execute(
+            "SELECT id,at,reservation_id FROM s2_receipts ORDER BY at DESC,id")]
+        kept = 0
+        for row in receipts:
+            reservation_id = str(row["reservation_id"] or "")
+            if reservation_id in protected_reservations:
+                continue
+            if reservation_id and reservation_id in reservation_ids:
+                if reservation_id in selected["s2_reservations"]:
+                    selected["s2_receipts"].add(row["id"])
+                continue
+            if float(row["at"] or 0) < cutoff or kept >= limits["receipts"]:
+                selected["s2_receipts"].add(row["id"])
+            else:
+                kept += 1
+
+        repeat_cutoff = now - self.RETENTION_REPEAT_SECONDS
+        heard = [dict(row) for row in db.execute(
+            "SELECT fingerprint,at,reservation_id,receipt_id FROM s2_heard"
+            " ORDER BY at DESC,fingerprint")]
+        kept = 0
+        for row in heard:
+            if (str(row["reservation_id"] or "") in protected_reservations
+                    or float(row["at"] or 0) >= repeat_cutoff):
+                continue
+            if float(row["at"] or 0) < repeat_cutoff or kept >= limits["heard"]:
+                selected["s2_heard"].add(row["fingerprint"])
+            else:
+                kept += 1
+
+        retained_candidate_ids = {
+            row["candidate_id"] for row in reservations
+            if row["id"] not in selected["s2_reservations"]
+        }
+        for row in db.execute(
+                "SELECT s.id AS slot_id,json_extract(a.value,'$.candidate.id') AS candidate_id"
+                " FROM s2_slots s,json_each(s.body,'$.allocations') a"):
+            if row["slot_id"] not in selected["s2_slots"] and row["candidate_id"]:
+                retained_candidate_ids.add(row["candidate_id"])
+        unfinished_references = set()
+        for row in jobs:
+            if row["id"] not in unfinished_jobs:
+                continue
+            stack = [self._retention_json(row["body"])]
+            while stack:
+                value = stack.pop()
+                if isinstance(value, dict):
+                    stack.extend(value.values())
+                elif isinstance(value, list):
+                    stack.extend(value)
+                elif isinstance(value, str):
+                    unfinished_references.add(value)
+        inventory_ids = {str(row.get("id") or "") for row in self._candidates}
+        candidates = [dict(row) for row in db.execute(
+            "SELECT id,json_extract(body,'$.slot_id') AS slot_id,"
+            " COALESCE(json_extract(body,'$.source.system2_job'),"
+            " json_extract(body,'$.system2_job'),'') AS job_id,"
+            " COALESCE(json_extract(body,'$.created_at'),0) AS stamp,"
+            " json_extract(body,'$.blocked_reasons[0]') AS first_block"
+            " FROM s2_candidates ORDER BY stamp DESC,id")]
+        kept = 0
+        for row in candidates:
+            if row["first_block"] != "absent_from_current_inventory":
+                continue
+            protected = (row["id"] in inventory_ids or row["id"] in retained_candidate_ids
+                         or row["id"] in unfinished_references
+                         or str(row["job_id"] or "") in unfinished_jobs
+                         or str(row["slot_id"] or "") in protected_slots)
+            if protected:
+                continue
+            if float(row["stamp"] or 0) < cutoff or kept >= limits["absent_candidates"]:
+                selected["s2_candidates"].add(row["id"])
+            else:
+                kept += 1
+
+        # Leaves precede their parents. If a large backlog hits the batch
+        # ceiling, no slot/hour can be removed before all selected children
+        # from this snapshot have already fit in the durable archive.
+        order = ("s2_heard", "s2_receipts", "s2_reservations", "s2_jobs",
+                 "s2_candidates", "s2_events", "s2_slots", "s2_hours")
+        entries = []
+        for table in order:
+            for identity in sorted(selected[table]):
+                if len(entries) >= batch_rows:
+                    return entries
+                if table == "s2_heard":
+                    row = db.execute(
+                        "SELECT fingerprint,at,reservation_id,receipt_id FROM s2_heard"
+                        " WHERE fingerprint=?", (identity,)).fetchone()
+                    if row:
+                        entries.append({"table": table, "key": identity,
+                                        "record": dict(row)})
+                    continue
+                row = db.execute("SELECT body FROM " + table + " WHERE id=?",
+                                 (identity,)).fetchone()
+                if row:
+                    entries.append({"table": table, "key": identity,
+                                    "raw_body": row[0]})
+        return entries
+
+    def _write_retention_archive(self, entries, *, now, policy):
+        directory = self.host.DATA_DIR / "system2-audit"
+        directory.mkdir(parents=True, exist_ok=True)
+        batch = "%d-%s" % (int(now * 1000), uuid.uuid4().hex)
+        path = directory / ("retention-" + batch + ".jsonl.gz")
+        temp = path.with_suffix(path.suffix + ".tmp")
+        header = {"type": "system2_retention", "version": 1, "batch": batch,
+                  "archived_at": now, "policy": policy, "rows": len(entries)}
+        with gzip.open(temp, "wt", encoding="utf-8", newline="\n") as output:
+            output.write(json.dumps(header, ensure_ascii=False, sort_keys=True) + "\n")
+            for entry in entries:
+                output.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        # Windows requires a writable descriptor for FlushFileBuffers, which
+        # is what os.fsync delegates to. The archive contents are already
+        # complete; r+b only supplies the descriptor mode needed to flush it.
+        with temp.open("r+b") as durable:
+            os.fsync(durable.fileno())
+        temp.replace(path)
+        checksum = hashlib.sha256()
+        with path.open("rb") as saved:
+            for chunk in iter(lambda: saved.read(1024 * 1024), b""):
+                checksum.update(chunk)
+        return {"path": str(path), "rows": len(entries), "bytes": path.stat().st_size,
+                "sha256": checksum.hexdigest(), "batch": batch}
+
+    def _retention_observe(self):
+        tables = ("s2_hours", "s2_slots", "s2_jobs", "s2_candidates",
+                  "s2_reservations", "s2_receipts", "s2_heard", "s2_events")
+        # WAL readers do not need the store-wide writer lock. Status polling
+        # must not queue behind a long planner transaction merely to count.
+        db = self.store._connect()
+        try:
+            db.execute("BEGIN")
+            rows = {table.removeprefix("s2_"): int(db.execute(
+                "SELECT count(*) FROM " + table).fetchone()[0]) for table in tables}
+            page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(db.execute("PRAGMA page_count").fetchone()[0])
+            free_pages = int(db.execute("PRAGMA freelist_count").fetchone()[0])
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        path = self.store.path
+        archive_dir = self.host.DATA_DIR / "system2-audit"
+        archives = list(archive_dir.glob("retention-*.jsonl.gz")) if archive_dir.is_dir() else []
+        return {"rows": rows, "database_bytes": path.stat().st_size if path.exists() else 0,
+                "wal_bytes": path.with_name(path.name + "-wal").stat().st_size
+                if path.with_name(path.name + "-wal").exists() else 0,
+                "page_size": page_size, "page_count": page_count,
+                "free_pages": free_pages,
+                "free_ratio": round(free_pages / max(1, page_count), 6),
+                "archive_files": len(archives),
+                "archive_bytes": sum(item.stat().st_size for item in archives)}
+
+    def _retention_compact(self, *, deleted, force=False):
+        result = {"attempted": False, "ran": False, "reason": "no rows deleted"}
+        if not deleted and not force:
+            return result
+        with self.store._lock:
+            db = self.store._connect()
+            try:
+                page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
+                before_pages = int(db.execute("PRAGMA page_count").fetchone()[0])
+                before_free = int(db.execute("PRAGMA freelist_count").fetchone()[0])
+                before_bytes = before_pages * page_size
+                free_ratio = before_free / max(1, before_pages)
+                result.update(attempted=True, before_pages=before_pages,
+                              before_free_pages=before_free,
+                              before_bytes=before_bytes,
+                              free_ratio=round(free_ratio, 6))
+                should_run = force or (before_bytes >= self.RETENTION_COMPACT_MIN_BYTES
+                                       and free_ratio >= self.RETENTION_COMPACT_FREE_RATIO)
+                station_active = (bool(self.host._RADIO.get("on"))
+                                  and not self.host.radio_paused())
+                if should_run and station_active and not force:
+                    result["reason"] = "station active; physical compaction deferred"
+                elif should_run:
+                    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    db.execute("VACUUM")
+                    result.update(ran=True, reason="fragmentation threshold reached")
+                else:
+                    result["reason"] = "below size or fragmentation threshold"
+                result.update(after_pages=int(db.execute("PRAGMA page_count").fetchone()[0]),
+                              after_free_pages=int(db.execute("PRAGMA freelist_count").fetchone()[0]))
+                result["after_bytes"] = result["after_pages"] * page_size
+            finally:
+                db.close()
+        return result
+
+    def run_retention(self, *, now=None, max_age_seconds=None, limits=None,
+                      batch_rows=None, compact=True, force_compact=False):
+        """Archive and prune one bounded System2 persistence batch."""
+        if not self._retention_guard.acquire(blocking=False):
+            return {**copy.deepcopy(self._retention_last), "busy": True}
+        started = time.monotonic()
+        when = time.time() if now is None else float(now)
+        age = self.RETENTION_MAX_AGE_SECONDS if max_age_seconds is None else float(max_age_seconds)
+        policy_limits = dict(self.RETENTION_LIMITS)
+        if limits:
+            unknown = set(limits) - set(policy_limits)
+            if unknown:
+                self._retention_guard.release()
+                raise ValueError("Unknown retention limits: " + ", ".join(sorted(unknown)))
+            policy_limits.update({key: int(value) for key, value in limits.items()})
+        if age < self.RETENTION_REPEAT_SECONDS or any(value < 0 for value in policy_limits.values()):
+            self._retention_guard.release()
+            raise ValueError("Retention age and row limits must preserve the repeat window and be nonnegative")
+        batch = self.RETENTION_BATCH_ROWS if batch_rows is None else int(batch_rows)
+        if batch < 1:
+            self._retention_guard.release()
+            raise ValueError("Retention batch_rows must be positive")
+        policy = {"max_age_seconds": age, "batch_rows": batch,
+                  "repeat_seconds": self.RETENTION_REPEAT_SECONDS,
+                  "limits": policy_limits}
+        try:
+            # A stable WAL snapshot is enough for archive selection and does
+            # not exclude writers. The later BEGIN IMMEDIATE transaction
+            # repeats this selection before deleting exact unchanged bodies.
+            db = self.store._connect()
+            try:
+                db.execute("BEGIN")
+                entries = self._retention_select(
+                    db, now=when, max_age_seconds=age,
+                    limits=policy_limits, batch_rows=batch)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+            archive = self._write_retention_archive(entries, now=when, policy=policy) if entries else None
+            deleted = {}
+            skipped = 0
+            if entries:
+                with self.store._tx() as db:
+                    eligible = {(entry["table"], entry["key"]): entry for entry in
+                                self._retention_select(
+                                    db, now=when, max_age_seconds=age,
+                                    limits=policy_limits, batch_rows=batch)}
+                    for entry in entries:
+                        table, identity = entry["table"], entry["key"]
+                        current = eligible.get((table, identity))
+                        if current != entry:
+                            skipped += 1
+                            continue
+                        if table == "s2_heard":
+                            record = entry["record"]
+                            changed = db.execute(
+                                "DELETE FROM s2_heard WHERE fingerprint=? AND at=?"
+                                " AND COALESCE(reservation_id,'')=COALESCE(?,'')"
+                                " AND COALESCE(receipt_id,'')=COALESCE(?,'')",
+                                (record["fingerprint"], record["at"],
+                                 record["reservation_id"], record["receipt_id"])).rowcount
+                        else:
+                            changed = db.execute(
+                                "DELETE FROM " + table + " WHERE id=? AND body=?",
+                                (identity, entry["raw_body"])).rowcount
+                        if changed:
+                            name = table.removeprefix("s2_")
+                            deleted[name] = deleted.get(name, 0) + changed
+                        else:
+                            skipped += 1
+            deleted_total = sum(deleted.values())
+            compaction = (self._retention_compact(deleted=deleted_total, force=force_compact)
+                          if compact else {"attempted": False, "ran": False,
+                                           "reason": "disabled for this run"})
+            self._retention_observed = self._retention_observe()
+            selected = {}
+            for entry in entries:
+                name = entry["table"].removeprefix("s2_")
+                selected[name] = selected.get(name, 0) + 1
+            self._retention_last = {
+                "last_run_at": when,
+                "duration_seconds": round(time.monotonic() - started, 6),
+                "selected": selected, "deleted": deleted,
+                "selected_total": len(entries), "batch_full": len(entries) >= batch,
+                "deleted_total": deleted_total, "skipped_changed": skipped,
+                "archive": archive, "compaction": compaction, "error": "",
+            }
+            return copy.deepcopy(self._retention_last)
+        except Exception as exc:
+            self._retention_last = {
+                **copy.deepcopy(self._retention_last), "last_run_at": when,
+                "duration_seconds": round(time.monotonic() - started, 6),
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
+            raise
+        finally:
+            self._retention_guard.release()
+
+    def retention_status(self):
+        """Return the last worker-produced census without touching SQLite.
+
+        ``status()`` is used by the live assembly view on the event loop. A
+        fresh count of the hundreds-of-megabytes store here would recreate the
+        exact synchronous status-poll stall retention is meant to remove.
+        ``run_retention`` refreshes this snapshot on its dedicated worker.
+        """
+        return {
+            "policy": {"interval_seconds": self.RETENTION_INTERVAL_SECONDS,
+                       "max_age_seconds": self.RETENTION_MAX_AGE_SECONDS,
+                       "batch_rows": self.RETENTION_BATCH_ROWS,
+                       "repeat_seconds": self.RETENTION_REPEAT_SECONDS,
+                       "limits": dict(self.RETENTION_LIMITS),
+                       "archive_directory": str(self.host.DATA_DIR / "system2-audit")},
+            "last": copy.deepcopy(self._retention_last),
+            "observed": (copy.deepcopy(self._retention_observed)
+                         if self._retention_observed else
+                         {"pending": True,
+                          "say": "the retention worker has not sampled the store yet"}),
+            "next_due_at": (float(self._retention_last.get("last_run_at") or 0)
+                            + self.RETENTION_INTERVAL_SECONDS),
+            "busy": self._retention_guard.locked(),
+        }
+
     def status(self, copy_plans=True):
         # #1070: copy_plans=False hands the live plan lists to a caller that
         # only serialises them at once (json.dumps holds the GIL for its whole
@@ -519,7 +978,8 @@ class System2Runtime:
                 "paused": self.host.radio_paused(), "on": bool(self.host._RADIO.get("on")),
                 "repeat_seconds": 3600, "events": self.store.events(limit=100),
                 "jobs": self.store.jobs(states=["pending", "working"], limit=100),
-                "event_plans": event_plans}
+                "event_plans": event_plans,
+                "retention": self.retention_status()}
 
     def trace(self, candidate_id, line_id=""):
         candidate = next((x for x in self._candidates if x["id"] == candidate_id), None)
@@ -574,13 +1034,12 @@ class System2Runtime:
             # #1084: a second sitting takes a road nobody is already on.
             busy = {str(w.get("kind") or "") for w in self._works.values()
                     if w.get("state") == "preparing"}
-            # #1171: recap and deep are in the host's CANNOT_PREPARE - a
-            # recap reads the hour that just happened - and no consumer
-            # exists for either shelf. Preparing them cost the deep tint
-            # lane one round an hour and produced nothing that could air.
+            # Recap is deliberately claimed here: its guard below refuses to
+            # snapshot until the final three minutes before the slot. Deep
+            # remains live-only because it has no scheduled shelf consumer.
             _cannot = set(getattr(self.host, "CANNOT_PREPARE", {}) or {})
             kinds = [k for k in ("ad", "manager", "caller", "gallery", "news",
-                                 "banter", "track_talk")
+                                 "banter", "track_talk", "recap")
                      if k not in busy and k not in _cannot]
             if not kinds:
                 return
@@ -791,7 +1250,7 @@ class System2Runtime:
         to the legacy keepers; now each sitting is its own task."""
         if not self.enabled or self._prepare_lock.locked():
             return None
-        return asyncio.create_task(self.prepare())
+        return asyncio.create_task(self.prepare(), name="system2:prepare")
 
     def _publish_clock(self, slot):
         """Publish one System2 occurrence without touching legacy persistence."""
@@ -1386,8 +1845,25 @@ def install(app, namespace):
                     runtime().error("events", exc)
                 await asyncio.sleep(1)
 
-        holder["tasks"] = [asyncio.create_task(plan_loop()), asyncio.create_task(prepare_loop()),
-                           asyncio.create_task(event_loop())]
+        async def retention_loop():
+            # Let the first inventory/plan refresh establish the protected
+            # horizon before considering any historical row for retention.
+            await asyncio.sleep(90)
+            while True:
+                try:
+                    await asyncio.to_thread(runtime().run_retention)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    runtime().error("retention", exc)
+                await asyncio.sleep(runtime().RETENTION_INTERVAL_SECONDS)
+
+        holder["tasks"] = [
+            asyncio.create_task(plan_loop(), name="system2:plan"),
+            asyncio.create_task(prepare_loop(), name="system2:prepare-loop"),
+            asyncio.create_task(event_loop(), name="system2:events"),
+            asyncio.create_task(retention_loop(), name="system2:retention"),
+        ]
 
     @app.on_event("shutdown")
     async def stop_system2():

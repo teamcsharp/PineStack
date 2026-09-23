@@ -334,11 +334,28 @@ class LinearSequencer:
             oid = str(oid or "")
             route = str(route or ROUTE_PAGE)
             held = self._held.pop(str(key or ""), None) if key else None
+            if held is None and oid:
+                # The occurrence is the second canonical join between an
+                # admitted round and its transport handoff. Recover by it if
+                # a caller lost the script-side key; otherwise one mismatched
+                # label leaves a ready round reserving the air until stale
+                # eviction while dialogue is pushed behind filler clips.
+                matches = [held_key for held_key, held_row in self._held.items()
+                           if str(held_row.get("occurrence") or "") == oid]
+                if len(matches) == 1:
+                    held = self._held.pop(matches[0], None)
+                    self._count("released_by_occurrence")
+                    self._event("key_reconciled", key=matches[0],
+                                reported_key=str(key or ""), oid=oid,
+                                route=route)
             if key:
                 self._making.pop(str(key), None)
             if held is not None:
+                self._making.pop(str(held.get("key") or ""), None)
+            if held is not None:
                 self._count("released")
-                self._event("released", key=key, oid=oid, route=route,
+                self._event("released", key=held.get("key") or key,
+                            oid=oid, route=route,
                             waited_s=round(now - float(held.get("ready_at") or now), 1))
             seconds = max(0.0, float(seconds or 0.0))
             if seconds <= 0 and held is not None:

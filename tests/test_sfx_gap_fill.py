@@ -21,6 +21,9 @@ class GapFillTests(unittest.IsolatedAsyncioTestCase):
             "dj_settings": lambda: self.settings, "box_talk_ok": lambda: True,
             "box_firmware_down_now": lambda: False, "pipeline_log": mock.Mock(),
             "_SFX_GAP": {"at": 0.0, "turn": 0, "count": 0, "why": "", "went": ""},
+            "_PAGE_ACK_EVENTS": [], "_PAGE_AIR_UNTIL": [0.0],
+            "talk_quiet_for": lambda: 0.0, "sfx_queue_deep": lambda: 0,
+            "sfx_gap_burst": lambda: 1,
             "SFX_GAP_REST": 9.0,
         }.items():
             self.stack.enter_context(mock.patch.object(app, name, value))
@@ -30,6 +33,10 @@ class GapFillTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app, "dj_speak", new=mock.AsyncMock(return_value="ok")))
         self.take = self.stack.enter_context(
             mock.patch.object(app, "shelf_take", mock.Mock(return_value=None)))
+        self.gold = self.stack.enter_context(
+            mock.patch.object(app, "gold_fill_gap", new=mock.AsyncMock(return_value="")))
+        self.gap_talk = self.stack.enter_context(
+            mock.patch.object(app, "sfxguy_gap_talk", new=mock.AsyncMock(return_value="")))
 
     async def test_silence_gets_a_sample_that_exists_and_then_rests(self):
         self.assertEqual(await app.sfx_fill_gap("the room is silent"), "sample")
@@ -76,6 +83,29 @@ class GapFillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await app.sfx_fill_gap(), "")
         app._SFX_GAP["at"] = time.time() - 31
         self.assertEqual(await app.sfx_fill_gap(), "sample")
+
+    async def test_a_held_floor_gets_one_tactical_fill_not_a_burst(self):
+        with (mock.patch.object(app, "_floor_busy", lambda: True),
+              mock.patch.object(app, "sfx_gap_burst", lambda: 3)):
+            self.assertEqual(
+                await app.sfx_fill_gap("a conversation is rendering", under_floor=True),
+                "sample")
+        self.sting.assert_awaited_once()
+        self.assertEqual(app._SFX_GAP["burst"], 1)
+
+    async def test_audible_page_audio_prevents_another_sold_air_burst(self):
+        now = time.time()
+        app._PAGE_AIR_UNTIL[0] = now + 30
+        app._PAGE_ACK_EVENTS.append({
+            "at": now, "event": "playing", "muted": False,
+            "audible_volume": 1.0,
+        })
+        with (mock.patch.object(app, "sfx_sold_tolerance", lambda: 10),
+              mock.patch.object(app, "sfx_gap_notice", lambda: 6),
+              mock.patch.object(app, "talk_quiet_for", lambda: 60.0)):
+            self.assertEqual(await app.sfx_fill_gap("the pair are quiet"), "")
+        self.sting.assert_not_awaited()
+        self.assertIn("air is already sold", app._SFX_GAP["gate"])
 
 
 if __name__ == "__main__":

@@ -183,16 +183,28 @@ def _cue_map_measured(app: Any, entry: Any) -> bool:
         return bool(got.get("cues")) and str(got.get("derivation") or "") == "measured"
 
 
+def _round_entry(app: Any, row: Any) -> dict[str, Any] | None:
+    """Return only a real conversation entry, never a stock-row fallback.
+
+    The commitment inventory deliberately exposes ``entry`` as
+    ``dialogue_entry(row) or row`` so every kind has one inspectable payload.
+    That is useful to the ledger, but it is not a type discriminator: a
+    produced advert is a ready single read, not a dialogue round that needs a
+    measured multi-line cue map.  Re-ask the station's canonical classifier
+    at the production boundary.
+    """
+    try:
+        got = app.dialogue_entry(row)
+    except Exception:  # noqa: BLE001
+        return None
+    return got if isinstance(got, dict) else None
+
+
 def item_view(app: Any, kind: str, item: dict[str, Any],
               public: dict[str, Any] | None = None) -> dict[str, Any]:
     """One bound stock item: its lines, its counts, its production state."""
     row = item.get("row")
-    entry = item.get("entry")
-    if entry is None and isinstance(row, dict):
-        try:
-            entry = app.dialogue_entry(row)
-        except Exception:  # noqa: BLE001
-            entry = None
+    entry = _round_entry(app, row)
     lines = line_states(app, kind, row if isinstance(row, dict) else (entry or {}))
     counts = {STATE_RENDERED: 0, STATE_WRITTEN: 0, STATE_LIVE: 0, STATE_MISSING: 0}
     rendered_seconds = 0.0
@@ -380,13 +392,8 @@ def production_queue(app: Any, minutes: int = 60,
                 continue
             seen.add(pid)
             row = item.get("row")
-            entry = item.get("entry")
-            if entry is None and isinstance(row, dict):
-                try:
-                    entry = app.dialogue_entry(row)
-                except Exception:  # noqa: BLE001
-                    entry = None
-            if not isinstance(entry, dict):
+            entry = _round_entry(app, row)
+            if entry is None:
                 continue                      # a single read has no round
             if not item.get("ready"):
                 continue                      # not finished: nothing to produce

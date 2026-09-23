@@ -25366,7 +25366,14 @@ def admission_ticket(path: str, sig: str = "", *, route: str = "box",
             return out
         verdict = controller.gate(lane=lane, path=path, sig=sig,
                                   producer=producer, reply=reply, kind=kind,
-                                  text=text, seconds=seconds)
+                                  text=text, seconds=seconds,
+                                  # The page feed is an ordered, timestamped
+                                  # queue when the linear sequencer is active.
+                                  # It may buffer the next admitted clip while
+                                  # the head waits for its broadcast moment.
+                                  ordered_transport=(
+                                      route == "page"
+                                      and playout_mode() == "linear"))
         if verdict.occurrence_id:
             _admission_remember_route(str(verdict.occurrence_id), {route})
         out.update(allow=bool(verdict.allow),
@@ -28284,6 +28291,86 @@ _RADIO: dict[str, Any] = {
 # provenance route now reads when the ring no longer holds a line.
 RADIO_CHAT_KEEP = int(os.getenv("RADIO_CHAT_KEEP", "600"))
 _RADIO_TASK: list[Any] = []
+_RADIO_RUN = [0]
+_RADIO_WORKERS: dict[str, dict[str, Any]] = {}
+RADIO_WORKER_BACKOFF_MAX = float(os.getenv("PINE_WORKER_BACKOFF_MAX", "30"))
+
+
+def radio_worker_state() -> dict[str, Any]:
+    """A cheap, serialisable census of every show-owned coroutine."""
+    now = time.time()
+    rows = []
+    for name, raw in sorted(_RADIO_WORKERS.items()):
+        row = {k: v for k, v in raw.items() if k != "task"}
+        row["name"] = name
+        row["age"] = round(max(0.0, now - float(row.get("started") or now)), 1)
+        rows.append(row)
+    live = [row for row in rows if row.get("generation") == _RADIO_RUN[0]]
+    return {
+        "generation": int(_RADIO_RUN[0]),
+        "expected": len(live),
+        "running": sum(row.get("state") == "running" for row in live),
+        "degraded": sum(row.get("state") in ("failed", "restarting") for row in live),
+        "workers": rows,
+    }
+
+
+async def _radio_worker(name: str, factory: Any, generation: int,
+                        persistent: bool = True) -> None:
+    """Run one named station worker and recover unexpected exits.
+
+    A show restart advances ``_RADIO_RUN`` before cancelling old tasks.  That
+    generation check is what prevents an old recovery loop from coming back
+    inside the new show.  Persistent clocks get bounded exponential backoff;
+    startup/regrade jobs are observed once and then stay complete.
+    """
+    row = _RADIO_WORKERS[name]
+    while generation == _RADIO_RUN[0] and _RADIO.get("on"):
+        row.update(state="running", started=time.time(), next_at=0.0,
+                   generation=generation)
+        try:
+            await factory()
+            why = "returned"
+            failed = False
+        except asyncio.CancelledError:
+            row.update(state="stopped", stopped=time.time(), next_at=0.0)
+            raise
+        except Exception as exc:  # noqa: BLE001 - a supervisor records all faults
+            why = f"{type(exc).__name__}: {exc}"[:300]
+            failed = True
+            row["traceback"] = traceback.format_exc()[-1200:]
+        row.update(last_exit=time.time(), last_error=why if failed else "")
+        if not persistent:
+            row["state"] = "failed" if failed else "complete"
+            return
+        if generation != _RADIO_RUN[0] or not _RADIO.get("on"):
+            row["state"] = "stopped"
+            return
+        row["restarts"] = int(row.get("restarts") or 0) + 1
+        delay = min(RADIO_WORKER_BACKOFF_MAX,
+                    max(1.0, float(2 ** min(5, row["restarts"] - 1))))
+        row.update(state="restarting", next_at=time.time() + delay,
+                   last_error=why)
+        pipeline_log("drop", f"station worker {name} {why}; restarting in "
+                     f"{delay:.0f}s", extra=str(row.get("traceback") or "")[-500:])
+        await asyncio.sleep(delay)
+
+
+def radio_worker_start(name: str, factory: Any, *,
+                       persistent: bool = True) -> Any:
+    """Launch and register one coroutine owned by the current show."""
+    generation = int(_RADIO_RUN[0])
+    _RADIO_WORKERS[name] = {
+        "generation": generation, "state": "starting", "started": time.time(),
+        "persistent": bool(persistent), "restarts": 0, "last_error": "",
+        "last_exit": 0.0, "next_at": 0.0,
+    }
+    task = asyncio.create_task(
+        _radio_worker(name, factory, generation, persistent),
+        name=f"radio:{name}")
+    _RADIO_WORKERS[name]["task"] = task
+    _RADIO_TASK.append(task)
+    return task
 VOICE_CLIP_FEED_KEEP = int(os.getenv("VOICE_CLIP_FEED_KEEP", "2000"))
 # A shared on-air instant gives each listener time to fetch a clip, then seek
 # into the exact same point if its network delivery was late.
@@ -28479,6 +28566,24 @@ _TALK_ACK: dict[str, Any] = {"at": 0.0, "listener": "",
 _TALK_ACK_BASE = [time.time()]
 
 
+def page_voice_audible_recent(within: float = 4.0) -> bool:
+    """Whether a page listener has reported audible playback very recently."""
+    floor = time.time() - max(0.5, float(within or 0.0))
+    for event in reversed(_PAGE_ACK_EVENTS[-80:]):
+        try:
+            if float(event.get("at") or 0) < floor:
+                break
+            if str(event.get("event") or "") != "playing":
+                continue
+            if event.get("muted"):
+                continue
+            if float(event.get("audible_volume") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def page_feed_append(clip: dict[str, Any]) -> str:
     """#1147: THE one door onto the page voice feed.
 
@@ -28625,7 +28730,13 @@ def page_feed_append(clip: dict[str, Any]) -> str:
                 starts_at=float((clip or {}).get("broadcast_ms") or 0) / 1000.0,
                 seconds=(float(_pl_stream.get("length") or 0.0)
                          or page_clip_seconds(clip)),
-                key=playout_round_key(_pl_rows),
+                # A held round is named from its script sid before this
+                # wrapper sees it. Keep that exact identity through the
+                # handoff; rebuilding from cue rows loses the sid and used
+                # to report every round as the empty key ``occ:``.
+                key=(str((clip or {}).get("playout_key") or "")
+                     or playout_round_key(
+                         _pl_rows, str(ticket.get("occurrence_id") or ""))),
                 producer=_admission_producer(2),
                 lane=str((clip or {}).get("kind") or ""),
                 label=str((clip or {}).get("text") or "")[:80],
@@ -31051,6 +31162,10 @@ def radio_stop() -> None:
     # it again a line later; every other caller means it.
     _RADIO.update({"station": "", "queue": [], "now": None, "started": 0.0,
                    "coming": None, "on": False})
+    _RADIO_RUN[0] += 1
+    _stopped = time.time()
+    for row in _RADIO_WORKERS.values():
+        row.update(state="stopped", stopped=_stopped, next_at=0.0)
     for task in _RADIO_TASK:
         if not task.done():
             task.cancel()
@@ -31067,7 +31182,10 @@ def radio_tune(station: str, dj: bool = True) -> dict[str, Any]:
     radio_stop()
     _RADIO.update({"station": station or "all", "dj": bool(dj)})
     _RADIO["queue"] = radio_fill(_RADIO["station"])
-    task = asyncio.create_task(_radio_loop())
+    # This legacy music-only tuner deliberately does not set _RADIO["on"];
+    # the supervised DJ-show workers use that flag as their lifetime. Keep its
+    # lone loop directly owned by _RADIO_TASK so radio_stop still cancels it.
+    task = asyncio.create_task(_radio_loop(), name="radio:music-only")
     _RADIO_TASK.append(task)
     return radio_state()
 
@@ -34475,6 +34593,10 @@ def dj_state() -> dict[str, Any]:
         # The continuity inspector: which part of the write → render →
         # delivery pipeline is protecting the next handoff, or holding it up.
         "dialogue_flow": dialogue_flow_state(),
+        # Named, supervised show workers. A dead clock is now an explicit
+        # degraded state with its exception and restart count, not a missing
+        # anonymous Task that the operator cannot inspect.
+        "workers": radio_worker_state(),
         # Which model is writing the lines, for the provenance card (#655).
         "model": str(load_settings().get("model") or ""),
         # The booth keeps its own running history now (#656), but it can
@@ -43438,8 +43560,6 @@ async def larder_keeper() -> None:
 # very different answers and the glass was giving the first for both.
 CANNOT_PREPARE = {
     "record": "a record is not a round — the needle just drops",
-    "recap": "a recap reads the hour that just happened, so it can only "
-             "be written at the end of it",
     "deep": "a deep conversation reads the last stretch of the show, so "
             "writing it early would be recapping something that has not "
             "happened",
@@ -56204,57 +56324,57 @@ def dj_start(station: str) -> dict[str, Any]:
     _track_talk_prune()
     _box_hold_load()                   # held dialogue outlives the deploy
     render_backlog_load()              # unrecorded accepted lines do too
-    _RADIO_TASK.append(asyncio.create_task(page_recovery_start()))
-    task = asyncio.create_task(dj_show())
-    _RADIO_TASK.append(task)
-    # The bulletin clock lives and dies with the show: radio_stop cancels
-    # everything in _RADIO_TASK (#229).
-    _RADIO_TASK.append(asyncio.create_task(news_clock()))
-    _RADIO_TASK.append(asyncio.create_task(caller_clock()))
-    _RADIO_TASK.append(asyncio.create_task(upstairs_clock()))   # #749
-    _RADIO_TASK.append(asyncio.create_task(ad_clock()))
+    radio_worker_start("page_recovery", page_recovery_start, persistent=False)
+    radio_worker_start("show", dj_show)
+    # Every clock lives and dies with the show.  The named supervisor keeps a
+    # fault in one clock from silently removing that station capability.
+    radio_worker_start("news", news_clock)
+    radio_worker_start("caller", caller_clock)
+    radio_worker_start("upstairs", upstairs_clock)              # #749
+    radio_worker_start("ad", ad_clock)
     _RADIO["episode"] = {"started": time.time(), "items": []}
-    _RADIO_TASK.append(asyncio.create_task(episode_clock()))
-    _RADIO_TASK.append(asyncio.create_task(speakbox_index_clock()))
-    _RADIO_TASK.append(asyncio.create_task(heat_clock()))
-    _RADIO_TASK.append(asyncio.create_task(mx_ad_clock()))
-    _RADIO_TASK.append(asyncio.create_task(ad_studio_clock()))      # #916
-    _RADIO_TASK.append(asyncio.create_task(dead_air_watch()))
+    radio_worker_start("episode", episode_clock)
+    radio_worker_start("speakerbox_index", speakbox_index_clock)
+    radio_worker_start("heat", heat_clock)
+    radio_worker_start("mx_ad", mx_ad_clock)
+    radio_worker_start("ad_studio", ad_studio_clock)             # #916
+    radio_worker_start("dead_air", dead_air_watch)
     # #1088: ...and the one that watches the TALK. dead_air_watch
     # resets its strikes on a spinning record, so it has never once
     # seen the pair go quiet. Measured: three-minute holes about
     # twice an hour, worst case seven minutes, every one of them
     # covered by music and none of them recorded.
-    _RADIO_TASK.append(asyncio.create_task(talk_watch()))
-    _RADIO_TASK.append(asyncio.create_task(continuity_clock()))
+    radio_worker_start("talk_watch", talk_watch)
+    radio_worker_start("continuity", continuity_clock)
     # 2026-09-08 (evening): the orchestrator's own reflection on each road's
     # accepted and refused bars, hourly per road.
-    _RADIO_TASK.append(asyncio.create_task(reflection_clock()))
-    # 2026-09-08 (evening): the review queue against today's grader, once.
-    _RADIO_TASK.append(asyncio.create_task(regrade_once()))
+    radio_worker_start("reflection", reflection_clock)
+    # 2026-09-08 (evening): periodically re-read the review queue against
+    # today's grader. It is a clock and must recover if it exits unexpectedly.
+    radio_worker_start("regrade", regrade_once)
     # #1023 (G1): the durable air log - upsert-by-id off the ring.
-    _RADIO_TASK.append(asyncio.create_task(airlog_keeper()))
+    radio_worker_start("airlog", airlog_keeper)
     # #1050 (P1): and beside it, how each of those lines was made - the
     # model call and the render, lifted off the ring row's own trace
     # before the ring turns over.
-    _RADIO_TASK.append(asyncio.create_task(screenplay_keeper()))
+    radio_worker_start("screenplay", screenplay_keeper)
     # #1022: ...and the ledger of the silences it watches for.
-    _RADIO_TASK.append(asyncio.create_task(gap_keeper()))
+    radio_worker_start("gap", gap_keeper)
     # #1112: and something that notices when the box has stopped playing
     # what it is sent. The station broadcast into a dead speaker for five
     # hours with the evidence on its own diagnostics page.
-    _RADIO_TASK.append(asyncio.create_task(box_delivery_watch()))
-    _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
-    _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
-    _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
-    _RADIO_TASK.append(asyncio.create_task(sfx_arrivals_keeper()))  # #1062
-    _RADIO_TASK.append(asyncio.create_task(sfx_levels_keeper()))    # #1199
-    _RADIO_TASK.append(asyncio.create_task(storage_keeper()))   # #836
-    _RADIO_TASK.append(asyncio.create_task(switchboard_keeper()))   # #884
-    _RADIO_TASK.append(asyncio.create_task(pantry_keeper()))        # #886
-    _RADIO_TASK.append(asyncio.create_task(tint_recovery_clock()))
-    _RADIO_TASK.append(asyncio.create_task(coordinator()))          # #942
-    _RADIO_TASK.append(asyncio.create_task(tape_watch()))
+    radio_worker_start("box_delivery", box_delivery_watch)
+    radio_worker_start("needle", needle_watch)                    # #689
+    radio_worker_start("torrent_talk", _torrent_talk)             # #700
+    radio_worker_start("larder", larder_keeper)
+    radio_worker_start("sfx_arrivals", sfx_arrivals_keeper)       # #1062
+    radio_worker_start("sfx_levels", sfx_levels_keeper)           # #1199
+    radio_worker_start("storage", storage_keeper)                 # #836
+    radio_worker_start("switchboard", switchboard_keeper)         # #884
+    radio_worker_start("pantry", pantry_keeper)                   # #886
+    radio_worker_start("tint_recovery", tint_recovery_clock)
+    radio_worker_start("coordinator", coordinator)                # #942
+    radio_worker_start("tape", tape_watch)
     tape_warmer()                      # the shelf normalizes itself (#242)
     remember_radio(True, _RADIO["station"])
     return dj_state()
@@ -60209,6 +60329,20 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
     Built out of the station's OWN log — the records that really played,
     what really went out — so the pair recap an hour that happened rather
     than inventing one."""
+    # System2 writes this only in the final three minutes before the slot,
+    # from acknowledged current-hour events. Consume that exact performance
+    # first; a failed handoff leaves it on the shelf for the next pass.
+    try:
+        _prepared_recap = shelf_take("recap", peek=True)
+        if _prepared_recap is not None:
+            _said_recap = await _ready_shelf_air(
+                "recap", track, pick=_prepared_recap)
+            if _said_recap:
+                return _said_recap
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "the prepared recap could not be handed off",
+                     extra=f"{type(exc).__name__}: {exc}"[:500])
+
     played: list[str] = []
     for row in reversed(list(_RADIO.get("history") or [])[-14:]):
         named = " - ".join(x for x in (str(row.get("artist") or ""),
@@ -62790,7 +62924,7 @@ def alt_prep_road(kind: str) -> Any:
 # rather than _SHELF, so hour_needs needs the same special case banter
 # already has, below.
 ALT_PREP_KINDS = ("ad", "station_id", "manager", "caller", "gallery",
-                  "news", "banter", "track_talk")
+                  "news", "banter", "track_talk", "recap")
 
 
 def alt_job_put(job: str, **more: Any) -> dict[str, Any]:
@@ -80499,8 +80633,9 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
             # been silent for 34. When the room says otherwise, the
             # cursor is describing audio that is not happening and it
             # does not get a vote.
-            if _ahead > sfx_sold_tolerance() \
-                    and talk_quiet_for() < sfx_gap_notice():
+            if _ahead > sfx_sold_tolerance() and (
+                    talk_quiet_for() < sfx_gap_notice()
+                    or page_voice_audible_recent()):
                 return _no("the air is already sold %.0fs ahead (allowing "
                            "%.0fs)" % (_ahead, sfx_sold_tolerance()))
             _deep = sfx_queue_deep()
@@ -80524,7 +80659,9 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
             # Same rule, same words: while the room has gone quiet past
             # the notice threshold, a queue on the page is describing
             # audio that is not happening, and it does not get a vote.
-            if _deep >= SFX_WAITING_CAP                     and talk_quiet_for() < sfx_gap_notice():
+            if _deep >= SFX_WAITING_CAP and (
+                    talk_quiet_for() < sfx_gap_notice()
+                    or page_voice_audible_recent()):
                 return _no("%d clip(s) already waiting on the page"
                            % _deep)
         except Exception:  # noqa: BLE001
@@ -80648,7 +80785,9 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
             # clips or him incessantly talking about topics from the
             # topics board" - so every other clip in the run is him
             # saying something off the board instead.
-            for _step in range(sfx_gap_burst() - 1):
+            # A held floor means the next conversation is already being made.
+            # One tactical fill covers it without pushing its air slot away.
+            for _step in range(0 if floor_held else sfx_gap_burst() - 1):
                 laid = ""
                 if _step % 2 == 1:
                     laid = await sfxguy_gap_talk(why, floorless=floor_held)
@@ -80861,17 +81000,6 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     _RADIO["chat"].append(_sting_row)
     del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     note_activity("sting", sample.stem)
-    # #862: write it down — the operator rules on the rotation from this.
-    sfx_history_add(sample, who)
-    # The stings are part of the broadcast, so the episode recording keeps them
-    # too (#560) — staged from the SFX store, which lives outside /media.
-    # #1263: a video is not staged into the episode. The episode is
-    # assembled by a concat graph that maps ONE audio output; an input
-    # with no audio stream at all fails the whole build, and losing the
-    # night's recording is a far worse trade than losing one sting off it.
-    if not is_video:
-        await _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}",
-                             src_path=sample)
     # --- broadcast admission (#1339) ---
     # COMMITTED BEFORE EITHER TRANSPORT. Every veto - the cadence, the
     # rest between clips, the pick itself - is above this line, and the
@@ -80888,7 +81016,30 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         {"path": f"/sfx/{key}", "sig": signature},
         who=who, kind="sfx", text=sample.stem, name=sample.stem,
         line_id=key, length=_sample_seconds, producer="dj_sting")
+    _admission = admission_controller()
+    _enforced_lanes = getattr(_admission, "enforce_lanes", set())
+    _sfx_enforced = bool(
+        _admission is not None
+        and str(getattr(_admission, "mode", "")) == "enforce"
+        and (not _enforced_lanes or "sfx" in _enforced_lanes))
+    if not _sting_occurrence and _sfx_enforced:
+        _sting_row["aired"] = "withdrawn"
+        _sting_row["withdrawn_why"] = (
+            "broadcast admission refused the final clip")
+        pipeline_log(
+            "drop",
+            "an SFX pick was not published because broadcast admission refused it",
+            extra=str(sample)[:300])
+        return ""
     # --- broadcast admission (#1339) --- end
+    # #862: write it down only after the clip has passed broadcast admission.
+    sfx_history_add(sample, who)
+    # The stings are part of the broadcast, so the episode recording keeps them
+    # too (#560) - staged from the SFX store, which lives outside /media.
+    # A video is not staged: the episode concat graph maps one audio output.
+    if not is_video:
+        await _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}",
+                             src_path=sample)
     _sting_started = time.monotonic()
     # Only where the line itself went. Queued for a browser in box-only mode
     # it would arrive as a scratch with no DJ in front of it, because the
@@ -85987,11 +86138,24 @@ DIALOGUE_APPROACHES = (
     "EXPLAIN IT TO A CHILD, badly, and get corrected by the other one.",
     "TREAT IT AS BENEATH YOU and be unable to stop talking about it.",
     "FIND IT UNBEARABLY MOVING for reasons neither of you can articulate.",
+    "PULL A STUDIO PRANK — one host quietly sets up a harmless practical "
+    "joke using something physically in the booth, the other discovers it "
+    "on mic, and the reveal changes the conversation. Keep it plausible and "
+    "let the person being pranked answer in character.",
+    "DROP THE PERFORMANCE AND TALK INTIMATELY — lower the temperature, let "
+    "one host admit something specific they normally protect, and let the "
+    "other listen before answering. Earn the moment from the source material; "
+    "do not turn it into therapy language or a generic confession.",
+    "LET SOMEBODY CHANGE THEIR MIND — begin with a real disagreement, make "
+    "the strongest concrete point on each side, and allow one speaker to say "
+    "exactly which fact moved them. The change must be earned rather than a "
+    "tidy sign-off.",
 )
 
 
 def _approach_seed() -> list[dict[str, Any]]:
-    return [{"id": uuid.uuid4().hex[:8], "text": t, "weight": 1.0,
+    return [{"id": hashlib.sha1(t.encode("utf-8")).hexdigest()[:8],
+             "text": t, "weight": 1.0, "builtin": True,
              "enabled": True, "uses": 0, "last": 0,
              "added": int(time.time())}
             for t in DIALOGUE_APPROACHES]
@@ -86016,6 +86180,20 @@ def approach_rules() -> list[dict[str, Any]]:
         if not isinstance(rows, list) or not rows:
             rows = _approach_seed()
             _approach_write(rows)
+        else:
+            # Built-in additions are migrations, not a reset. Operator edits,
+            # weights, disabled cards and custom rows remain byte-for-byte;
+            # only cards this version introduced and the file has never seen
+            # are appended. This is how new scenario types reach a station
+            # whose approach book was seeded months ago.
+            known = {" ".join(str(r.get("text") or "").split()).casefold()
+                     for r in rows if isinstance(r, dict)}
+            added = [r for r in _approach_seed()
+                     if " ".join(str(r.get("text") or "").split()).casefold()
+                     not in known]
+            if added:
+                rows.extend(added)
+                _approach_write(rows)
         return [r for r in rows if isinstance(r, dict)]
 
 
@@ -96199,9 +96377,13 @@ async def speak_turns(turns: list[tuple[str, str]],
                       # quote door dealt verbatim this round.
                       passage_source: list[dict[str, Any]] | None = None,
                       # [#1386] {turn -> the roll that shaped it}, so
-                      # the script editor can show the dice beside the
-                      # line they produced.
-                      turn_dice: dict[int, dict[str, Any]] | None = None) -> list[str]:
+                       # the script editor can show the dice beside the
+                       # line they produced.
+                       turn_dice: dict[int, dict[str, Any]] | None = None,
+                       # The immutable scene card and orchestrator ownership.
+                       # Prepared takes already carry this under `round`;
+                       # fresh rounds must hand it over explicitly too.
+                       round_meta: dict[str, Any] | None = None) -> list[str]:
     """#1146: the floor door. One round holds the air from its first line
     to its last; a second round queues behind it instead of interleaving
     with it. The body lives in _speak_turns_floorless, unchanged - this
@@ -96577,7 +96759,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     voices = ({str(t["who"]): str(t["voice"]) for t in ready_takes}
               if ready_takes is not None else await session_voices())
     spoken: list[str] = []
-    ready_meta = dict(ready_takes[0].get("round") or {}) if ready_takes else {}
+    ready_meta = (dict(ready_takes[0].get("round") or {}) if ready_takes
+                  else dict(round_meta or {}))
     if ready_takes is None and not await _system2_repeat_rows_async(
             [{"text": spoken_text(text)} for _, text in turns], ready_meta):
         return []
@@ -97793,11 +97976,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         if _said[:60] in _body or _body[:60] in _said:
                             return str(_d.get("file") or "")
                     return ""
-                try:
-                    script_ledger_commit(
-                        _round_sid,
-                        [{"line_id": (line_ids[_r] if _r < len(line_ids)
-                                      else ""),
+                _script_rows = [
+                         {"line_id": (line_ids[_r] if _r < len(line_ids)
+                                       else ""),
                           "who": _w, "text": _c, "seconds": _s,
                           "turn": (turn_ix[_r] if _r < len(turn_ix) else -1),
                           "kind": ("sfx" if _w == "board"
@@ -97814,30 +97995,22 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                           # changed subject.
                           **({"source": str(_ts_of(_r))}
                              if _ts_of(_r) else {}),
-                          # [#1386] THE ROLL THAT SHAPED THIS LINE.
+                           # [#1386] THE ROLL THAT SHAPED THIS LINE.
                           # "Next to each piece of dialogue in the script
                           # editor, I want to be able to see the dice roll
                           # and the result that it got and the intensity
                           # result of what each dice value equals."
-                          **({"dice": _td_of(_r)} if _td_of(_r) else {})}
-                         for _r, (_w, _c, _s) in enumerate(transcript)],
-                        # [#1245] THE ROAD, not the document.  `source` is the
-                        # speaker box file the round was seeded from, and
-                        # filing the round under it made every seeded booth
-                        # round a kind of its own ("fmn1.md") that no shelf,
-                        # no seed and no entry on the sheet could answer for.
-                        # The air log stamps the same rows with
-                        # airlog_round_now(); so does the script now.
-                        str(ready_meta.get("prep_kind")
-                            or airlog_round_now(
-                                "", "",
-                                caller_name if caller_seat == "caller" else "")
-                            or ""),
-                        source=str(source or ""))
-                except Exception:  # noqa: BLE001
-                    # A round must never fail to air because the document
-                    # could not be written.
-                    pass
+                            **({"dice": _td_of(_r)} if _td_of(_r) else {}),
+                           **({"scenario": copy.deepcopy(ready_meta["approach"])}
+                              if isinstance(ready_meta.get("approach"), dict)
+                              else {})}
+                         for _r, (_w, _c, _s) in enumerate(transcript)]
+                _script_round_kind = str(
+                    ready_meta.get("prep_kind")
+                    or airlog_round_now(
+                        "", "",
+                        caller_name if caller_seat == "caller" else "")
+                    or "")
                 _est0 = time.time()
                 _entries: list[dict[str, Any]] = []
                 for _row, (who, chunk, secs) in enumerate(transcript):
@@ -97910,7 +98083,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         # this since #226 and the coalesced road never did —
                         # which is most of the show, and all of every call. It
                         # is how you see the report a caller is citing.
-                        **({"source": source} if source else {}),
+                         **({"source": source} if source else {}),
+                         **({"scenario": copy.deepcopy(ready_meta["approach"])}
+                            if isinstance(ready_meta.get("approach"), dict)
+                            else {}),
                         "voice": (_turn_voice(aired_items[_ti]) if ready_takes is not None
                                   and 0 <= _ti < len(aired_items) else caller_voice if who == caller_seat
                                   else caller2_voice if who == "caller2"
@@ -98101,6 +98277,31 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         _e4["admission_occurrence"] = _round_occurrence
                     except Exception:  # noqa: BLE001
                         pass
+                # The immutable script is committed after admission so each
+                # line can name the exact occurrence that accepted it. It is
+                # still before either transport is touched. Generation calls
+                # and System2 ownership ride the same rows, surviving shelf
+                # retirement and a process restart.
+                try:
+                    _system2_record = {k: ready_meta.get(k) for k in (
+                        "system2_job", "system2_slot", "system2_trace_id",
+                        "system2_trace_ids") if ready_meta.get(k)}
+                    for _sr, _entry in zip(_script_rows, _entries):
+                        _sr["admission_occurrence"] = _round_occurrence
+                        _written = ((_entry.get("trace") or {}).get("written")
+                                    if isinstance(_entry.get("trace"), dict)
+                                    else None)
+                        if isinstance(_written, dict) and _written:
+                            _sr["model_call"] = _written
+                        if _system2_record:
+                            _sr["system2"] = _system2_record
+                    script_ledger_commit(
+                        _round_sid, _script_rows, _script_round_kind,
+                        source=str(source or ""))
+                except Exception:  # noqa: BLE001
+                    # A round must never fail to air because the document
+                    # could not be written.
+                    pass
                 # [#1218] HELD, AND THE AUDIO GATE.
                 #
                 # The file is welded, `rows` is its cue sheet after the
@@ -98235,6 +98436,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         "text": stream_label,
                         "voice": caller_voice or "",
                         "speech": True,
+                        # The same key used by playout_tell("hold") above.
+                        # The page wrapper must release that reservation,
+                        # rather than deriving a different key from cue rows
+                        # that intentionally do not repeat the round sid.
+                        "playout_key": _pl_key,
                         "stream": {"length": length, "rows": rows},
                         **({"ready_round": ready_meta}
                            if ready_takes is not None else {}),
@@ -98819,6 +99025,22 @@ def _beat_answers(previous: str, fresh: str) -> bool:
     return not before or bool(before & _beat_content_words(new))
 
 
+def _beat_sequence_answers(previous: str, rows: list[dict[str, Any]],
+                           parsed: list[tuple[str, str]]) -> bool:
+    """Every speaker and adjacency in a generated beat follows its sheet."""
+    if len(parsed) < len(rows):
+        return False
+    prior = str(previous or "")
+    for row, candidate in zip(rows, parsed):
+        marker, text = candidate
+        if str(marker) != str(row.get("seat") or ""):
+            return False
+        if not _beat_answers(prior, text):
+            return False
+        prior = str(text or "")
+    return True
+
+
 def _banter_beat_plan(sheet: str, lines: int,
                       seats: list[str]) -> list[dict[str, Any]]:
     """Turn the human-readable running order into bounded generation beats."""
@@ -98862,7 +99084,8 @@ async def _banter_beats(context: str, sheet: str, lines: int,
     if len(compact) > 14000:
         compact = compact[:9000].rstrip() + "\n\n[context middle elided]\n\n" + compact[-4500:].lstrip()
 
-    async def write(rows: list[dict[str, Any]], retry: bool = False) -> tuple[str, list[tuple[str, str]]]:
+    async def write(rows: list[dict[str, Any]], retry: bool = False
+                    ) -> tuple[str, list[tuple[str, str]], bool]:
         recent = "\n".join(
             "%s has just said - %s" % (marker, text)
             for marker, text in made[-2:]) or "Nothing has been said yet."
@@ -98892,7 +99115,8 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             text = spoken_text(candidate[1]).strip()
             if text:
                 clean.append((str(row["seat"]), text))
-        return raw, clean
+        return raw, clean, _beat_sequence_answers(
+            made[-1][1] if made else "", rows, parsed)
 
     while cursor < len(plan):
         if made and prep_should_stop():
@@ -98902,21 +99126,24 @@ async def _banter_beats(context: str, sheet: str, lines: int,
         rows = plan[cursor:cursor + 4]
         started = time.monotonic()
         attempts = 0
+        beat_error = ""
         accepted: list[tuple[str, str]] = []
         for retry in (False, True):
             attempts += 1
-            _raw, candidate = await write(rows, retry=retry)
-            answers = bool(candidate) and _beat_answers(
-                made[-1][1] if made else "", candidate[0][1])
+            try:
+                _raw, candidate, answers = await write(rows, retry=retry)
+            except Exception as exc:  # noqa: BLE001
+                beat_error = "%s: %s" % (
+                    type(exc).__name__, str(exc)[:160])
+                break
             if len(candidate) >= len(rows) and answers:
                 accepted = candidate[:len(rows)]
                 break
-            if retry:
-                accepted = candidate[:len(rows)]
         trace.append({"beat": len(trace) + 1, "from": rows[0]["turn"],
                       "until": rows[-1]["turn"], "asked": len(rows),
                       "made": len(accepted), "attempts": attempts,
-                      "ms": int((time.monotonic() - started) * 1000)})
+                      "ms": int((time.monotonic() - started) * 1000),
+                      **({"error": beat_error} if beat_error else {})})
         if not accepted:
             break
         made.extend(accepted)
@@ -98930,12 +99157,18 @@ async def _banter_beats(context: str, sheet: str, lines: int,
     if cursor < len(plan) and not prep_should_stop():
         rows = plan[cursor:]
         started = time.monotonic()
-        _raw, accepted = await write(rows, retry=True)
-        accepted = accepted[:len(rows)]
+        try:
+            _raw, candidate, answers = await write(rows, retry=True)
+            accepted = candidate[:len(rows)] if answers else []
+            error = ""
+        except Exception as exc:  # noqa: BLE001
+            accepted = []
+            error = "%s: %s" % (type(exc).__name__, str(exc)[:160])
         trace.append({"beat": "glue", "from": rows[0]["turn"],
                       "until": rows[-1]["turn"], "asked": len(rows),
                       "made": len(accepted), "attempts": 1,
-                      "ms": int((time.monotonic() - started) * 1000)})
+                      "ms": int((time.monotonic() - started) * 1000),
+                      **({"error": error} if error else {})})
         made.extend(accepted)
 
     return "\n".join("%s: %s" % row for row in made).strip()
@@ -98962,8 +99195,11 @@ def banter_bank_plan(lines: int, bank: bool, system2_job: bool = False,
         except Exception:  # noqa: BLE001
             bootstrap = False
     judged = min(requested, BANTER_BOOTSTRAP_LINES) if bootstrap else requested
-    rich = bool(bank) and not system2_job and not bootstrap
-    generated = max(2, min(24, judged + 4)) if rich else judged
+    rich = bool(bank) and not bootstrap
+    # System2 owns an exact per-slot turn budget. It gets responsive beats,
+    # but never the legacy four-turn expansion beyond that allocation.
+    generated = (judged if system2_job else
+                 max(2, min(24, judged + 4)) if rich else judged)
     return {"requested": requested, "judge_lines": judged,
             "lines": generated, "rich": rich, "bootstrap": bootstrap}
 
@@ -100886,6 +101122,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     entry = {
         "script": script, "lines": lines, "vouched": vouched,
         "writer_engine": _engine_mode,
+        "approach": copy.deepcopy(_approach),
         **({"beat_chain": copy.deepcopy(_beat_trace)} if _beat_trace else {}),
         "newspaper": {k: v for k, v in (_paper_context or {}).items() if k != "prompt"},
         # The road identity has to exist BEFORE tint and brief audit.  The
@@ -101896,8 +102133,9 @@ async def _banter_air(entry: dict[str, Any],
                                # #1063: a recorded round airs as recorded.
                                recorded=_recorded,
                                tint_report=dict(entry.get("tint") or {}),
-                               ready_takes=ready_takes, on_handoff=on_handoff,
-                               can_handoff=can_handoff)
+                                ready_takes=ready_takes, on_handoff=on_handoff,
+                                can_handoff=can_handoff,
+                                round_meta=entry)
     # #1050 (P1): the round's paperwork, written down before the entry is
     # dropped. The swaths, the tint with both scripts, the writing desk and
     # the line ids - everything the screenplay's provenance tree shows, and
@@ -124713,6 +124951,24 @@ def line_causes(line_id: str) -> dict[str, Any]:
                     "order"),
             "detail": {"banter_dice_rate": banter_dice_on()}})
 
+    # The weighted scenario/approach card is a separate cause from the
+    # per-turn dice: it defines the scene's dramatic frame, while the dice
+    # decide how each response and rebuttal moves inside it.
+    scenario = (dict(row.get("scenario") or {})
+                if isinstance(row.get("scenario"), dict) else {})
+    if scenario:
+        bands.append({
+            "band": "the frame", "grade": "measured",
+            "say": str(scenario.get("text") or "a weighted scene card was drawn")[:240],
+            "detail": scenario,
+        })
+    else:
+        bands.append({
+            "band": "the frame", "grade": "absent",
+            "say": "this historical line did not retain its approach card",
+            "detail": {},
+        })
+
     # 3. THE SEED - which document, and the passage
     src = str(row.get("source") or "")
     if src:
@@ -124806,23 +125062,32 @@ def line_causes(line_id: str) -> dict[str, Any]:
                              "the station used its own seed sentence",
                       "detail": {}})
 
-    # 7. the system prompts standing over it
-    try:
-        dj = dj_settings()
-        system = {
-            "station": str(station_disposition_text(600) or ""),
-            "host": str(dj.get("persona") or "")[:600],
-            "cohost": str(dj.get("cohost_persona") or "")[:600],
-            "followed": bool(dj.get("follow_prompt")),
-            "slots": {slot: bool(radio_prompt_enabled(slot))
-                      for slot in ("station_system", "host", "cohost",
-                                   "interaction", "speakerbox", "music")},
-        }
-    except Exception:  # noqa: BLE001
-        system = {}
-    bands.append({"band": "the system prompts", "grade": "written",
-                  "say": "what was standing over the booth when it was written",
-                  "detail": system})
+    # 7. the exact system prompts standing over it. Older rows explicitly
+    # identify their fallback to the current controls.
+    system = (dict(row.get("system_prompts") or {})
+              if isinstance(row.get("system_prompts"), dict) else {})
+    system_grade = "measured"
+    if not system:
+        system_grade = "written"
+        try:
+            dj = dj_settings()
+            system = {
+                "station": str(station_disposition_text(600) or ""),
+                "host": str(dj.get("persona") or "")[:600],
+                "cohost": str(dj.get("cohost_persona") or "")[:600],
+                "followed": bool(dj.get("follow_prompt")),
+                "historical_snapshot": False,
+            }
+        except Exception:  # noqa: BLE001
+            system = {}
+    system["settings_revision"] = str(row.get("settings_revision") or "")
+    bands.append({
+        "band": "the system prompts", "grade": system_grade,
+        "say": ("the exact prompt snapshot used to write this line"
+                if system_grade == "measured" else
+                "historical prompts were not stored; these are the current controls"),
+        "detail": system,
+    })
 
     # 8. the standing modifiers
     mods = list(row.get("mods") or [])
@@ -124835,7 +125100,38 @@ def line_causes(line_id: str) -> dict[str, Any]:
                       "say": "%d modifier(s) rode this round" % len(mods),
                       "detail": {"modifiers": named}})
 
-    # 9. [#1387] what was HEARD against it
+    # 9. generation and orchestration ownership, including the immutable
+    # admission record. This makes the line's trip through the server visible
+    # instead of ending the trace at the prompt.
+    model_call = row.get("model_call") if isinstance(row.get("model_call"), dict) else {}
+    system2 = row.get("system2") if isinstance(row.get("system2"), dict) else {}
+    occurrence_id = str(row.get("admission_occurrence") or "")
+    occurrence: dict[str, Any] = {}
+    if occurrence_id:
+        try:
+            occurrence = admission_controller().occurrence(occurrence_id) or {}
+        except Exception:  # noqa: BLE001
+            occurrence = {}
+    orchestrator = {
+        "model_call": model_call,
+        "system2": system2,
+        "admission_occurrence": occurrence_id,
+        "admission": occurrence,
+    }
+    if any((model_call, system2, occurrence_id)):
+        bands.append({
+            "band": "the orchestrator", "grade": "measured",
+            "say": "generation and ordered playout records are attached",
+            "detail": orchestrator,
+        })
+    else:
+        bands.append({
+            "band": "the orchestrator", "grade": "absent",
+            "say": "this older line has no persisted generation or admission identity",
+            "detail": orchestrator,
+        })
+
+    # 10. [#1387] what was HEARD against it
     # THE LEDGER ROW HAS NO `air_at`. Measured: a script_ledger row carries
     # `at` (committed), the air log carries `air_at` (heard). Reading only
     # the second gave every line a 0 and line_clips returned at once - the
@@ -124853,7 +125149,7 @@ def line_causes(line_id: str) -> dict[str, Any]:
             "detail": {"clips": clips},
         })
 
-    # 10. The transport and the ear. This is intentionally present even when
+    # 11. The transport and the ear. This is intentionally present even when
     # absent: a cause trace that stops at generation cannot explain whether
     # the line actually made it out of a speaker.
     bands.append(line_playout_band(want))
@@ -124874,11 +125170,13 @@ def line_causes(line_id: str) -> dict[str, Any]:
         "who": str(row.get("who") or ""), "round": str(row.get("round") or ""),
         "line_id": want}]
     edges: list[dict[str, Any]] = []
-    BAND_TYPE = {"the dice": "modifier", "the speakbox": "doc",
+    BAND_TYPE = {"the dice": "modifier", "the frame": "scenario",
+                 "the speakbox": "doc",
                  "the quote doors": "swath", "the passage": "doc",
                  "the brief": "scenario", "the system prompts": "prompts",
                  "what was standing": "modifier", "the line": "block",
-                 "what was heard": "clip", "the playout": "clip"}
+                 "what was heard": "clip", "the orchestrator": "scripts",
+                 "the playout": "clip"}
     for at, b in enumerate(bands):
         name = str(b.get("band") or "")
         if name == "the line":
@@ -125467,6 +125765,8 @@ async def dj_scenario_api(
                 "brief": brief[:900],
                 "since": float(row.get("ts") or 0) if row else 0.0,
                 "where": "the schedule desk"}
+    if isinstance(row.get("scenario"), dict):
+        scenario["frame"] = dict(row["scenario"])
     # [#1249] the provenance call above already carried it for a line
     # still in the booth; only fall back to the lookup.
     _topic: dict[str, Any] = dict((prov or {}).get("topic_contract") or {})
@@ -160783,6 +161083,23 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
         _pk = segment_prompts.for_sid(str(sid or ""))
     except Exception:  # noqa: BLE001
         _pk = None
+    try:
+        _dj_at_write = dj_settings()
+        _system_at_write = {
+            "station": str(station_disposition_text(2000) or ""),
+            "host": str(_dj_at_write.get("persona") or "")[:2000],
+            "cohost": str(_dj_at_write.get("cohost_persona") or "")[:2000],
+            "followed": bool(_dj_at_write.get("follow_prompt")),
+            "slots": {slot: bool(radio_prompt_enabled(slot))
+                      for slot in ("station_system", "host", "cohost",
+                                   "interaction", "speakerbox", "music")},
+        }
+        _settings_revision = hashlib.sha256(json.dumps(
+            _system_at_write, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+    except Exception:  # noqa: BLE001
+        _system_at_write = {}
+        _settings_revision = ""
     out: list[str] = []
     for ord_, row in enumerate(rows):
         out.append(json.dumps({
@@ -160794,6 +161111,24 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
             "text": str(row.get("text") or "")[:2000],
             "seconds": round(float(row.get("seconds") or 0), 2),
             "turn": row.get("turn"),
+            # The immutable line-level decisions. These arrive on the final
+            # rows but used to disappear here, leaving the provenance view to
+            # claim no dice or admission record ever existed.
+            **({"dice": dict(row["dice"])}
+               if isinstance(row.get("dice"), dict) else {}),
+            **({"admission_occurrence": str(row.get("admission_occurrence") or "")}
+               if row.get("admission_occurrence") else {}),
+            **({"model_call": dict(row["model_call"])}
+               if isinstance(row.get("model_call"), dict) else {}),
+            **({"system2": dict(row["system2"])}
+               if isinstance(row.get("system2"), dict) else {}),
+            **({"seed": row.get("seed")}
+               if row.get("seed") not in (None, "") else {}),
+            **({"scenario": dict(row["scenario"])}
+               if isinstance(row.get("scenario"), dict) else {}),
+            **({"system_prompts": _system_at_write,
+                "settings_revision": _settings_revision}
+               if _system_at_write else {}),
             # The SFX guy's own row: which cue, and whether he was rolled
             # into the script (scripted) or punched in later to cover a
             # hole (not). Both belong in the document; only one of them

@@ -346,6 +346,14 @@ class BanterBootstrap(unittest.TestCase):
         self.assertEqual(got["judge_lines"], 11)
         self.assertEqual(got["lines"], 15)
 
+    def test_system2_uses_beats_without_exceeding_its_slot_budget(self):
+        got = app.banter_bank_plan(6, bank=True, system2_job=True,
+                                   bootstrap_ok=False)
+        self.assertFalse(got["bootstrap"])
+        self.assertTrue(got["rich"])
+        self.assertEqual(got["judge_lines"], 6)
+        self.assertEqual(got["lines"], 6)
+
 
 class FlatSingleTake(unittest.TestCase):
     """The original one-key shelf shape is a complete performance too."""

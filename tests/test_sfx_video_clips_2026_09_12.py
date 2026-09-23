@@ -343,6 +343,19 @@ class TheStingWithAPicture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fed, [])
         self.assertFalse(self.radio["chat"][-1]["video"])
 
+    async def test_enforcement_rejects_an_unavailable_clip_before_transport(self):
+        controller = mock.Mock(mode="enforce", enforce_lanes={"sfx"})
+        with (mock.patch.object(app, "admission_controller", return_value=controller),
+              mock.patch.object(app, "admission_admit_line", return_value="")):
+            got = await app.dj_sting(True, sample=self.audio)
+        self.assertEqual(got, "")
+        self.assertEqual(self.boxed, [])
+        self.assertEqual(self.fed, [])
+        self.assertEqual(self.staged, [])
+        self.assertEqual(self.radio["chat"][-1]["aired"], "withdrawn")
+        self.assertIn("admission", self.radio["chat"][-1]["withdrawn_why"])
+        app.sfx_history_add.assert_not_called()
+
 
 class TheSetsOwnDoor(unittest.IsolatedAsyncioTestCase):
     """/api/dj/video. The panel does not poll the VOICE feed while the box
