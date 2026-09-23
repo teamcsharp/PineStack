@@ -67,6 +67,35 @@ object ViewAssets {
         "presentation-source.js", // its one-request-wide traffic gate
         "presentation.js",
         "busy.js",                // a working bar on whatever is working
+        // #1191/#1202: the orchestrator glass, BEFORE three-full.js because
+        // the 3JS chooser now offers it as its own strip above the scenes and
+        // asks window.PineOrchGlass for it. The ask is made when the sheet is
+        // painted rather than at load, so the order is not load-bearing - but
+        // a reader should not have to know that to see that it is satisfied.
+        //
+        // MEASURED, 2026-09-15: orchestrator-glass.js and its stylesheet were
+        // already sitting in assets/pine-views and were in NEITHER list here,
+        // so nothing on the tablet had ever evaluated them. The file existed,
+        // the copy was in step, and the tablet had no orchestrator page at
+        // all. Being present on disk is not being loaded, and this is the
+        // list that decides which.
+        //
+        // It costs nothing until it is asked for: the module builds no DOM,
+        // starts no timer and makes no request at load - the dot and the
+        // pop-up are both created on demand, and a shut pop-up asks for
+        // nothing at all.
+        // #1222: the levels sheet - DJs, music and videos on THIS
+        // terminal. He set the DJ gain to 200% and heard it quiet,
+        // because pineMixer.voice was holding the elements at 0.68 and
+        // nothing showed both numbers at once. One slider per stream
+        // now drives whichever half can carry it.
+        // #1226: the segments and their system prompts, the topic
+        // bank, and the window a dropped markdown becomes. Before
+        // orchestrator-glass.js, whose fold asks for it.
+        "pine-segments.js",
+        "pine-levels.js",
+        "orchestrator-glass.js",  // what the orchestrator is doing, and the
+                                  // rooms and the made-against-heard account
         "three-full.js",          // every 3JS scene, full screen on glass
         "line-deep.js",           // why a line was said, and how often
         "line-actions.js",        // hold a line: pad, keep, or examine
@@ -106,6 +135,13 @@ object ViewAssets {
         "sfx-tv.css",             // #1306b: the set, its glass and its sheet
         "clip-doctor.css",        // #1361b: the doctor's sheet
         "pine-cam.css",           // #1358: the box and the flag
+        // #1191/#1202: the glass, its triangles and its headline number. Same
+        // finding as the script above - the file was in assets and in no
+        // list, so on the tablet the pop-up would have opened unstyled if
+        // anything had been able to open it at all.
+        "pine-segments.css",      // #1226
+        "pine-levels.css",        // #1222
+        "orchestrator-glass.css",
         "three-full.css",         // the 3JS lift and the full-screen mode
         "busy.css",               // the working bar
         "slideshow.css",          // the slideshow and its twenty transitions

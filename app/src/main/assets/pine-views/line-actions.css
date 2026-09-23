@@ -90,6 +90,67 @@
 }
 .la-vote .la-ico { font-size: 18px; }
 
+/* [#1200] the trash can on the hold sheet, and the question it asks */
+.la-vote.la-bin:hover, .la-vote.la-bin:active {
+  color: var(--red, #e46b6b);
+  border-color: var(--red, #e46b6b);
+  background: rgba(228, 107, 107, .12);
+}
+.la-vote.la-bin.on { color: var(--red, #e46b6b); opacity: .45; }
+/* THE LIST FOLDS AWAY BEHIND THE QUESTION, AS A WHOLE.
+   The sheet's existing .la-gone rule collapses an individual .la-choice,
+   because perform() always keeps one row on screen as its stage. Here EVERY
+   row goes, and collapsing them one by one would leave the grid's own six
+   8px gaps standing - a 40px hole above the question. So the container
+   collapses instead. Two classes, so this beats `.la-list { gap: 8px }`
+   whichever order the file ends up in. */
+.la-list.la-gone {
+  max-height: 0;
+  margin: 0;
+  gap: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.la-confirm { padding: 2px 0 10px; }
+.la-confirm-say {
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--text, #edf3f5);
+  overflow-wrap: anywhere;
+}
+.la-confirm-row { display: flex; gap: 10px; }
+.la-confirm-yes, .la-confirm-no {
+  flex: 1;
+  min-height: 46px;
+  border-radius: 10px;
+  border: 1px solid var(--line, #35414c);
+  background: var(--panel-2, #222b35);
+  color: var(--text, #edf3f5);
+  font-size: 14px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.la-confirm-yes {
+  color: #fff;
+  background: var(--red, #e46b6b);
+  border-color: var(--red, #e46b6b);
+}
+.la-confirm-yes .la-ico { font-size: 18px; line-height: 1; }
+.la-confirm-yes b { font-weight: 600; }
+.la-confirm-yes:disabled, .la-confirm-no:disabled { opacity: .55; cursor: default; }
+.la-confirm-yes.la-busy { animation: la-bin-busy 1s ease-in-out infinite; }
+@keyframes la-bin-busy { 50% { opacity: .35; } }
+/* a row whose clip has been deleted, wherever it is drawn */
+[data-line].la-deleted,
+.sp-el.sp-deleted,
+.sp-msg.sp-deleted { text-decoration: line-through; opacity: .55; }
+.la-deleted-tag { text-decoration: none; font-style: italic; opacity: .9; }
+
 .la-said {
   margin: 6px 0 12px;
   font-size: 13px; line-height: 1.5;
@@ -235,6 +296,9 @@
   font-size: 13px; line-height: 1.5;
   border-bottom: 1px solid var(--line, #35414c);
   overflow-wrap: anywhere;
+  /* [#1231] the box holds the WHOLE line now, because it is an editor
+     and an editor showing a truncation would save one. */
+  max-height: 104px; overflow: auto;
 }
 
 /* THE SCENE ROW (#1113). "Offer a dropdown that shows what the scenario
@@ -315,6 +379,13 @@
 .ld-scene-value { margin: 3px 0 0; overflow-wrap: anywhere; }
 .ld-scene-card .ld-fold { margin: 4px 0 0; }
 .ld-scene-why { margin: 4px 0 0; font-size: 11px; color: var(--muted, #8fa0ad); }
+/* [#1232] the weather card: rolled for this round, or the fixed reading. */
+.ld-scene-roll {
+  display: inline-flex; align-items: center; gap: 4px; margin: 3px 0 0;
+  font-size: 11px; font-style: normal; color: var(--muted, #8fa0ad);
+}
+.ld-scene-roll.rolled { color: var(--cyan, #65c7da); }
+.ld-scene-roll svg { width: 12px; height: 12px; fill: currentColor; }
 .ld-scene-desk {
   display: block; margin-top: 3px; font-size: 10.5px;
   color: var(--cyan, #65c7da); opacity: .8;
@@ -332,10 +403,14 @@
 }
 .ld-flow canvas { display: block; width: 100%; height: 100%; }
 .ld-flow.flat canvas { display: none; }
+/* The caption was a sentence nothing could touch. Since #1149 it is eight
+   buttons - see the block at the foot of this file, which turns the
+   pointer-events back on rather than leaving a `none` here to contradict
+   it. */
 .ld-flowwhy {
   position: absolute; left: 10px; right: 10px; bottom: 5px;
   text-align: center; font-size: 10px; line-height: 1.5;
-  color: var(--muted, #8fa0ad); pointer-events: none;
+  color: var(--muted, #8fa0ad);
 }
 
 .ld-body {
@@ -783,3 +858,213 @@
 .ld-admin-row.on .ld-admin-dot { background: #54d18b; }
 .ld-admin-row.off .ld-admin-dot { background: #ff5d5d; }
 .ld-admin-row.na { opacity: .65; }
+
+/* ==========================================================================
+   EVERY ROAD ON THE STRIP OPENS (#1149)
+
+   "I want to tap on these and be able to expand each of them to see
+   additional details about what these roads entail and what contributed to
+   each of them."
+
+   The caption under the dots was one sentence with pointer-events: none. It
+   is now eight buttons, one per road, still separated by the same arrows so
+   it reads as the same sentence at a glance - and the dots themselves are
+   live too, cut into one column per road (see canvasTaps in line-deep.js).
+
+   The panel a road opens is the first child of .ld-body, which is the part
+   of the window that scrolls: it hangs off the strip, and however much the
+   record has to say the window stays the height it already was. On the
+   tablet's 1154x690 glass .ld-box is capped at calc(100vh - 48px) and this
+   sheet does not change that.
+
+   Every size, colour and background here is stated outright rather than
+   inherited, for the reason this file already gives at the top: the desk's
+   bare `button { height: 36px; padding: 0 12px; background: #25303a }`
+   lands on anything that does not say otherwise.
+   ========================================================================== */
+
+.ld-flowwhy {
+  pointer-events: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 1px 2px;
+}
+.ld-flowarrow { font-style: normal; opacity: .5; }
+.ld-stagebtn {
+  height: auto;
+  min-height: 20px;
+  padding: 2px 5px;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted, #8fa0ad);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.3;
+  letter-spacing: normal;
+  cursor: pointer;
+}
+/* Filled dot, lit word: the strip's two halves say the same thing, because
+   line-deep.js draws both from the one `got` flag. */
+.ld-stagebtn.got { color: var(--cyan, #65c7da); }
+.ld-stagebtn:hover { border-color: var(--line, #35414c); }
+.ld-stagebtn.open {
+  border-color: var(--cyan, #65c7da);
+  background: rgba(101, 199, 218, .14);
+  color: var(--text, #edf3f5);
+}
+
+.ld-stage-host:empty { display: none; }
+.ld-stage {
+  margin: 0 0 6px;
+  padding: 9px 11px;
+  border: 1px solid var(--cyan, #65c7da);
+  border-radius: 9px;
+  background: rgba(101, 199, 218, .06);
+}
+/* A road that left no mark is drawn as a quiet panel rather than a lit one:
+   it still opens, it still says what the road is, and it says plainly that
+   this line owes it nothing. */
+.ld-stage.none {
+  border-color: var(--line, #35414c);
+  background: rgba(255, 255, 255, .02);
+}
+.ld-stage-head {
+  display: flex; justify-content: space-between; gap: 10px; align-items: baseline;
+}
+.ld-stage-head b { font-size: 12.5px; color: var(--cyan, #65c7da); }
+.ld-stage.none .ld-stage-head b { color: var(--muted, #8fa0ad); }
+.ld-stage-mark {
+  flex: 0 0 auto;
+  font-style: normal; font-size: 10px;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--green, #54d18b);
+}
+.ld-stage.none .ld-stage-mark { color: var(--muted, #8fa0ad); }
+.ld-stage-what { margin: 5px 0 0; }
+.ld-stage-none { margin: 5px 0 0; }
+.ld-stage .ld-facts { margin-top: 7px; }
+.ld-stage .ld-fold { margin: 7px 0 0; }
+.ld-stage .ld-pre { max-height: 180px; }
+
+/* THE NUMBERED STEPS OPEN ON THE SAME RULE. The caret is the only thing
+   added to the row itself, so a shut stepper is the same height it was. */
+.ld-step { grid-template-columns: 26px minmax(0, 1fr) auto auto; }
+.ld-step.tap { cursor: pointer; }
+.ld-step.tap:hover .ld-step-body b { color: var(--cyan, #65c7da); }
+.ld-step.open .ld-step-n { background: rgba(101, 199, 218, .2); }
+.ld-step-caret {
+  padding-top: 7px;
+  width: 14px;
+  color: var(--muted, #8fa0ad);
+  line-height: 0;
+}
+.ld-step-caret svg {
+  width: 12px; height: 12px; fill: currentColor;
+  transition: transform .18s ease;
+}
+.ld-step.open .ld-step-caret { color: var(--cyan, #65c7da); }
+.ld-step.open .ld-step-caret svg { transform: rotate(90deg); }
+.ld-step-more {
+  grid-column: 1 / -1;
+  margin: 7px 0 0 36px;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  background: var(--bg, #101419);
+}
+.ld-step-more[hidden] { display: none; }
+.ld-step-more .ld-facts li { padding: 4px 0; }
+.ld-step-more .ld-fold { margin: 6px 0 0; }
+.ld-step-more .ld-pre { max-height: 160px; }
+
+
+/* ==========================================================================
+   [#1231] TAP A BOX AND TYPE IN IT
+
+   "in Any text field, allow me to tap on it and type inside of it and begin
+   making edits there."
+
+   A box that can be typed in wears a dotted underline and a text caret, so
+   the two kinds of box on this sheet - the stores and the records - can be
+   told apart at a glance rather than by tapping each one. The editor keeps
+   the box's own type: the monospace of a .ld-pre is what makes a list of
+   topics readable as a list, and losing it on the tap would be a different
+   box appearing in its place.
+   ========================================================================== */
+.ld-tap {
+  cursor: text;
+  border-bottom: 1px dotted rgba(101, 199, 218, .55);
+}
+.ld-pre.ld-tap {
+  border-color: rgba(101, 199, 218, .45);
+  border-bottom-style: dashed;
+}
+.ld-tap:hover { border-bottom-color: var(--cyan, #65c7da); }
+
+.ld-edit { margin: 5px 0 0; }
+.ld-edit-area {
+  display: block; width: 100%; box-sizing: border-box;
+  min-height: 64px; max-height: 320px; resize: vertical;
+  margin: 0; padding: 8px 10px;
+  border: 1px solid var(--cyan, #65c7da); border-radius: 6px;
+  background: var(--bg, #101419); color: var(--text, #edf3f5);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px; line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.ld-edit-area:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(101, 199, 218, .25);
+}
+
+/* The strip: what this edit does, where it lands, and the two buttons.
+   It is also where a box that CANNOT be written says so, which is why it
+   exists on its own and not only inside .ld-edit. */
+.ld-edit-strip {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin: 5px 0 0; padding: 5px 7px;
+  border: 1px solid var(--line, #35414c); border-radius: 6px;
+  background: var(--panel-2, #222b35);
+  font-size: 10.5px; line-height: 1.45; color: var(--muted, #8fa0ad);
+}
+.ld-edit-strip.bad {
+  border-color: var(--amber, #e3be63);
+  color: var(--amber, #e3be63);
+}
+.ld-edit-say { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+.ld-edit-only { font-style: normal; white-space: nowrap; }
+.ld-edit-applies {
+  padding: 3px 6px;
+  border: 1px solid var(--line, #35414c); border-radius: 6px;
+  background: var(--bg, #101419); color: var(--text, #edf3f5);
+  font: inherit;
+}
+.ld-edit-btn {
+  padding: 4px 11px;
+  border: 1px solid var(--line, #35414c); border-radius: 6px;
+  background: var(--panel, #161d24); color: var(--text, #edf3f5);
+  font: inherit; cursor: pointer;
+}
+.ld-edit-btn:hover { border-color: var(--cyan, #65c7da); }
+.ld-edit-btn.save {
+  border-color: var(--cyan, #65c7da); color: var(--cyan, #65c7da);
+}
+.ld-edit-btn:disabled { opacity: .5; cursor: default; }
+
+/* The line at the top of the window is a field too, and it lives directly in
+   the flex column of .ld-box rather than in the scrolling body - so it needs
+   the same "do not shrink me" .ld-said had, and the head's own padding. */
+.ld-box > .ld-edit { flex: 0 0 auto; margin: 0; padding: 8px 13px 10px; }
+.ld-box > .ld-edit-strip { flex: 0 0 auto; margin: 0 13px 9px; }
+
+/* The tablet. The soft keyboard halves the glass; line-deep re-centres the
+   window on the visual viewport, and these keep the field itself from
+   filling what is left of it. */
+@media (orientation: portrait), (max-height: 620px) {
+  .ld-edit-area { max-height: 170px; }
+  .ld-said { max-height: 72px; }
+}

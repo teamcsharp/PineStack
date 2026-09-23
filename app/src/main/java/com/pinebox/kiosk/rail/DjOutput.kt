@@ -27,23 +27,12 @@ object DjOutput {
     /** The three independently routable streams (#980). */
     val STREAMS: List<String> = listOf("music", "voice", "reply")
 
-    /**
-     * The Broadcast picker's four presets, field for field from the desktop's
-     * own `ROUTES` map (desktop/renderer/renderer.js:62).
-     *
-     * Note what `web` and `app` do NOT carry: a `voice_device`. #814 - "web/app
-     * route audio to the PAGE - they must not silently re-point the core DEVICE
-     * at the retired pine satellite. They leave voice_device alone; only
-     * box/nabu name a device." Adding one here would undo that.
-     */
+    /** The same destinations offered by the desktop's canonical picker. */
     val PRESETS: Map<String, Preset> = linkedMapOf(
-        "nabu" to Preset("Nabu", "box", "box", "box", voiceDevice = "nabu", boxTalk = true),
+        "nabu" to Preset("Nabu", "nabu", "nabu", "nabu", voiceDevice = "nabu", boxTalk = true),
         "box" to Preset("Pine Box", "box", "box", "box", voiceDevice = "pine", boxTalk = true),
-        "web" to Preset("Web page", "here", "here", "here", voiceDevice = null, boxTalk = false),
-        // #979: APPLICATION MEANS ALL OF IT, HERE - music included. It used to
-        // be "off", which is recorded there as the reason the speaker sat
-        // silent between rounds.
-        "app" to Preset("Application", "here", "here", "here", voiceDevice = null, boxTalk = false),
+        "pinetab" to Preset("PineTab", "here", "here", "here", voiceDevice = null, boxTalk = false),
+        "app" to Preset("PineApp", "here", "here", "here", voiceDevice = null, boxTalk = false),
     )
 
     data class Preset(
@@ -66,7 +55,7 @@ object DjOutput {
      * Move all three at once.
      *
      * `box_talk` and `voice_device` ride along exactly as the desktop sends
-     * them, and voice_device is OMITTED for web/app rather than sent empty -
+     * them, and voice_device is OMITTED for PineTab/PineApp rather than sent empty -
      * the handler validates it as `pine or nabu` when present (app.py:93395),
      * so an empty string would be a 400 on the two presets that need it least.
      */
@@ -122,6 +111,11 @@ object DjOutput {
         reply: String,
         voiceDevice: String,
     ): Set<String> {
+        /* Older station builds represented Nabu as the box route plus a
+         * voice-device discriminator. Keep that read compatibility while
+         * every new write uses the canonical `nabu` route. */
+        if (music == "box" && voice == "box" && reply == "box"
+            && voiceDevice == "nabu") return setOf("nabu")
         val hit = LinkedHashSet<String>()
         for ((key, preset) in PRESETS) {
             if (preset.music != music || preset.voice != voice || preset.reply != reply) continue

@@ -166,16 +166,45 @@
         text: String(speaking.text || "")
       };
     }
+    /* 2026-09-15 (#1206): THE RECORD KEEPS THE HEADLINE.
+     *
+     * The note above argues the other way and was written before anyone had
+     * watched it: a spoken line is the thing that just changed, and "record
+     * always wins" was tried ON PAPER and looked like it would freeze the
+     * screen through every round of banter.
+     *
+     * The screen disproved it. The operator sent a picture of a gallery
+     * round's analysis - four full-width lines at headline size - standing
+     * where the song should be, with the SAME TEXT scrolling in the marquee
+     * underneath it. "instead of taking over the header for the song, it
+     * should just be part of the scrolling marquee with the text below."
+     *
+     * Two things the original reasoning could not have known. The spoken line
+     * is already on screen in the marquee, so the headline was a second copy
+     * of it - which is the very fault the markup note at plNow says the first
+     * draft had. And a gallery line is not a line: it is a paragraph, and it
+     * pushes the record, the artist and the cover out of the way.
+     *
+     * Nothing freezes. The bar, the clock, the meters, the marquee, the
+     * spectrogram and what-is-next all keep moving. The only thing that stops
+     * changing is the line naming the record, which is the line that should
+     * be still while the record plays.
+     *
+     * `kind` stays "voice" so the speaker's name, the marquee and every other
+     * reader behave exactly as before. Only the headline moves. */
+    if (track) {
+      out.kind = out.voice && out.voice.text ? "voice" : "track";
+      out.headline = out.track.title || "an untitled track";
+      out.sub = [out.track.artist, out.track.album].filter(Boolean).join(" · ");
+      return out;
+    }
+    /* No record. The voice keeps the headline here, and must: a screen
+     * reading "quiet" while the pair are plainly talking is a worse lie than
+     * the one above, and the marquee alone is too small to carry the room. */
     if (out.voice && out.voice.text) {
       out.kind = "voice";
       out.headline = out.voice.text;
       out.sub = out.voice.who;
-      return out;
-    }
-    if (track) {
-      out.kind = "track";
-      out.headline = out.track.title || "an untitled track";
-      out.sub = [out.track.artist, out.track.album].filter(Boolean).join(" · ");
       return out;
     }
     /* Nothing is playing. WHICH kind of nothing is the useful part, and

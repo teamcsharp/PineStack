@@ -46,6 +46,15 @@ class ReplayRing(private val holdSeconds: Int = 60) {
     private companion object {
         /** The gap written where the screen was dark - see joinClock(). */
         const val FRAME_GAP_US = 100_000L
+
+        /**
+         * [#1225] How long audio waits for a picture before starting its
+         * own clock. Two seconds is long enough that a waking screen's
+         * video packet - which arrives within a frame or two - always
+         * wins the epoch, and short enough that a dark screen loses
+         * nothing worth having.
+         */
+        const val AUDIO_SOLO_WAIT_US = 2_000_000L
     }
 
     /** One encoded packet's place in the blob. */
@@ -71,6 +80,11 @@ class ReplayRing(private val holdSeconds: Int = 60) {
     private val audioGate = Any()
     private val audio = ReplayAudioWindow(24 * 1024 * 1024, holdSeconds * 60)
     private val pendingAudio = java.util.ArrayDeque<ReplayAudioPacket>()
+    /** [#1225] When the current wait for a video epoch began. */
+    @Volatile private var soloWaitFromUs = 0L
+    /** [#1225] Whether the epoch in force was set by sound rather than picture. */
+    @Volatile var audioLedEpoch = false
+        private set
     @Volatile private var audioFormat: MediaFormat? = null
     @Volatile var audioClockError: String? = null
         private set
@@ -143,8 +157,17 @@ class ReplayRing(private val holdSeconds: Int = 60) {
     private fun joinClock() {
         synchronized(audioGate) { pendingAudio.clear() }
         audioClockError = null
+        soloWaitFromUs = 0L                                    // [#1225]
+        audioLedEpoch = false                                  // [#1225]
         if (count == 0) { shift = 0L; based = true; return }
-        continueAfter = marks[(first + count - 1) % marks.size].timeUs
+        /* [#1225] CONTINUE AFTER THE NEWEST OF BOTH. Audio keeps rolling
+         * while the screen is dark, so the sound in the window can reach
+         * further than the last picture in it. Joining to the picture
+         * alone would place the waking run's first frame underneath audio
+         * that was recorded before it, and a save taken straight after a
+         * wake would carry the wrong minute's sound. */
+        continueAfter = maxOf(marks[(first + count - 1) % marks.size].timeUs,
+            audio.newestUs())
         based = false
     }
 
@@ -207,9 +230,37 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         val packet = ReplayAudioPacket(info.presentationTimeUs, bytes, info.flags, signal = signal)
         synchronized(audioGate) {
             if (!based) {
-                // Wait for the video epoch; never independently zero audio.
-                if (pendingAudio.size >= 128) pendingAudio.removeFirst()
-                pendingAudio.addLast(packet)
+                /* [#1225] AUDIO NO LONGER WAITS FOREVER FOR A PICTURE.
+                 *
+                 * This parked audio until a video packet set the epoch and
+                 * dropped the oldest past 128 packets - 21.33 ms each, so
+                 * two and three quarter seconds. That was right while
+                 * audio existed only to be muxed against video. It is
+                 * wrong now the tablet is meant to be capturing sound all
+                 * the time: with the screen dark there is no video encoder
+                 * at all, so everything past those 2.7 s was binned and
+                 * the desk was told there was no captured audio about a
+                 * capture that had been running for hours.
+                 *
+                 * Both encoders stamp from CLOCK_MONOTONIC, so sound can
+                 * set the epoch as well as picture can. Video still wins
+                 * whenever it is running, because it arrives within a
+                 * frame and this waits two seconds. */
+                if (pendingAudio.isEmpty()) soloWaitFromUs = info.presentationTimeUs
+                val waited = info.presentationTimeUs - soloWaitFromUs
+                if (pendingAudio.size >= 128 || waited >= AUDIO_SOLO_WAIT_US) {
+                    val firstUs = pendingAudio.peekFirst()?.timeUs ?: packet.timeUs
+                    shift = continueAfter + FRAME_GAP_US - firstUs
+                    based = true
+                    audioLedEpoch = true
+                    while (pendingAudio.isNotEmpty()) {
+                        val held = pendingAudio.removeFirst()
+                        audio.add(held.copy(timeUs = held.timeUs + shift))
+                    }
+                    audio.add(packet.copy(timeUs = packet.timeUs + shift))
+                } else {
+                    pendingAudio.addLast(packet)
+                }
             } else {
                 audio.add(packet.copy(timeUs = packet.timeUs + shift))
             }
@@ -456,7 +507,30 @@ class ReplayRing(private val holdSeconds: Int = 60) {
         val signalKnown = capturedAudio.count { it.signal != null }
         val signalNonzero = capturedAudio.count { it.signal == true }
         val silent = signalKnown == capturedAudio.size && signalKnown > 0 && signalNonzero == 0
-        val detail = if (!present) "This replay window has no captured tablet playback audio. Wait for audio capture or explicitly save video only."
+        /* [#1225] WHICH OF THE THREE IT IS. One sentence used to cover
+         * "the capture never started", "it is running and the window is
+         * older than it is" and "it ran and heard nothing", and the
+         * operator could not tell them apart - which is the whole of this
+         * request: the answer to "is the tablet capturing" was not on any
+         * surface. The window knows enough to separate them: whether a
+         * format has ever arrived, and how many seconds of sound are
+         * held against where this window sits. */
+        val heldAudioS = audio.seconds()
+        val detail = if (!present) (
+            if (audioClockError != null)
+                "Tablet playback audio is stopped: " + audioClockError +
+                " Nothing can be captured until the replay is restarted."
+            else if (audioFmt == null && heldAudioS <= 0.0)
+                "Tablet playback audio capture has NOT STARTED - nothing has been " +
+                "captured at all. Check the recorder service on the tablet, or save video only."
+            else if (capturedAudio.isEmpty())
+                "Tablet playback audio is STILL FILLING - " + Math.round(heldAudioS) +
+                " s captured so far, but none of it covers this replay window. " +
+                "Wait, choose a shorter window, or explicitly save video only."
+            else
+                "Tablet playback audio was CAPTURED BUT SILENT across this window - " +
+                Math.round(heldAudioS) + " s held. Real silence or capture-policy " +
+                "restrictions may be responsible.")
             else if (!complete) "Tablet playback audio does not cover this whole replay window. Narrow the window or explicitly save the incomplete recording."
             else if (silent) "Tablet playback samples were captured continuously but contain silence. Real silence or capture-policy restrictions may be responsible."
             else "Screen and device media playback share monotonic timestamps. No microphone or server soundtrack was substituted."
@@ -471,6 +545,16 @@ class ReplayRing(private val holdSeconds: Int = 60) {
             .put("signal_packets", signalNonzero).put("signal_known_packets", signalKnown)
             .put("signal_state", if (signalNonzero > 0) "nonzero_pcm" else if (silent) "zero_pcm" else "unknown")
             .put("video_only_explicit", allowVideoOnly)
+            /* [#1225] The three states, as a word a surface can switch on
+             * rather than a sentence it has to read. */
+            .put("capture_phase", if (audioClockError != null) "stopped"
+                else if (present && complete && silent) "silent"
+                else if (present) "filling"
+                else if (audioFmt == null && heldAudioS <= 0.0) "not_started"
+                else if (capturedAudio.isEmpty()) "filling"
+                else "silent")
+            .put("held_audio_seconds", heldAudioS)
+            .put("audio_led_epoch", audioLedEpoch)
         check(complete || allowVideoOnly) { detail }
 
         var muxer: MediaMuxer? = null

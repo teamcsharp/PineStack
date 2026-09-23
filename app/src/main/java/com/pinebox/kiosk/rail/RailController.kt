@@ -116,7 +116,7 @@ class RailController(
     private val presetChips: Map<String, Button> = mapOf(
         "nabu" to rail.findViewById(R.id.broadcast_nabu),
         "box" to rail.findViewById(R.id.broadcast_box),
-        "web" to rail.findViewById(R.id.broadcast_web),
+        "pinetab" to rail.findViewById(R.id.broadcast_web),
         "app" to rail.findViewById(R.id.broadcast_app),
     )
 
@@ -152,13 +152,15 @@ class RailController(
     private val volumes: Map<String, SeekBar> = mapOf(
         "music" to rail.findViewById(R.id.vol_music),
         "voice" to rail.findViewById(R.id.vol_voice),
-        "reply" to rail.findViewById(R.id.vol_reply),
+        "sfx" to rail.findViewById(R.id.vol_reply),
+        "video" to rail.findViewById(R.id.vol_video),
     )
 
     private val volumeLabels: Map<String, TextView> = mapOf(
         "music" to rail.findViewById(R.id.vol_music_value),
         "voice" to rail.findViewById(R.id.vol_voice_value),
-        "reply" to rail.findViewById(R.id.vol_reply_value),
+        "sfx" to rail.findViewById(R.id.vol_reply_value),
+        "video" to rail.findViewById(R.id.vol_video_value),
     )
 
     /** The last snapshot, painted or not. */
@@ -166,6 +168,9 @@ class RailController(
 
     /** Who is on the broadcast, from the last time the drawer was opened. */
     private var roster = AirOwners.Roster()
+
+    /** The durable destination, which distinguishes PineTab from PineApp. */
+    private var destination = ""
 
     /** True once the air has been put where the table asks, on this run. */
     private var airSettled = false
@@ -182,11 +187,13 @@ class RailController(
 
     /** Where the operator last dragged each slider, for the streams the
      *  station does not report a level for. See RailState.musicLevel. */
-    private val localLevel = mutableMapOf("music" to 100, "voice" to 100, "reply" to 100)
+    private val localLevel = mutableMapOf(
+        "music" to 100, "voice" to 100, "sfx" to 100, "video" to 100,
+    )
 
     fun bind() {
         for ((key, chip) in presetChips) {
-            chip.setOnClickListener { send("broadcast → " + DjOutput.PRESETS[key]?.label) { DjOutput.preset(key) } }
+            chip.setOnClickListener { selectDestination(key) }
         }
         for ((stream, chips) in streamChips) {
             for ((value, chip) in chips) {
@@ -219,7 +226,7 @@ class RailController(
                     val now = android.os.SystemClock.uptimeMillis()
                     if (now - lastVolumeSend >= THROTTLE_MS) {
                         lastVolumeSend = now
-                        sendLevelQuietly(stream, value)
+                        applyListenerLevel(stream, value)
                     }
                 }
 
@@ -235,9 +242,8 @@ class RailController(
                     if (syncing) return
                     localLevel[stream] = bar.progress
                     lastVolumeSend = android.os.SystemClock.uptimeMillis()
-                    send(label(stream) + " level → " + bar.progress + "%") {
-                        DjOutput.level(stream, bar.progress / 100.0)
-                    }
+                    applyListenerLevel(stream, bar.progress)
+                    noteOk(label(stream) + " level → " + bar.progress + "%")
                 }
             })
         }
@@ -308,6 +314,7 @@ class RailController(
                  * request, on the open, never on a clock. */
                 call(null) { JSONObject(client.get("/api/radio/pause")) }
                 readPlayers()
+                readListenerLevels()
                 startPower()
             }
 
@@ -375,6 +382,7 @@ class RailController(
                 } catch (err: Exception) {
                     null      /* names are a nicety; the list still works */
                 }
+                destination = settings?.optString("broadcast_to").orEmpty()
                 roster = AirOwners.read(listeners, settings)
                 paintPlayers()
                 reconcileAir(settings)
@@ -768,6 +776,52 @@ class RailController(
                     client.post("/api/broadcast/fix/release", "{}")
                 }
 
+                /* [#1388] THE FAULT WITH NO SOUND OF ITS OWN.
+                 *
+                 * "make sure this button is able to fix any and every
+                 *  issue that stops the dialogue and broadcast from
+                 *  happening. I need that dialogue always able to be
+                 *  repaired and restored."
+                 *
+                 * Measured on the station 2026-09-22: the pair went
+                 * unheard for 3h24m while every rung above would have
+                 * reported itself healthy. Nothing was gagged, nothing
+                 * was stuck, the page was fine, listeners were connected
+                 * and something was sounding every single second - the
+                 * board was filling the hole with 822 clips in thirty
+                 * minutes. The dialogue SHELF was empty, so every round
+                 * had to be written AND rendered live into its own
+                 * four-minute hole, and no rung on this ladder had ever
+                 * looked at the shelf.
+                 *
+                 * It goes HERE, before the rungs that cost a page reload
+                 * or a restart, because it is cheap and because a restart
+                 * does not fix it - a restarted station has an empty
+                 * shelf too. /api/broadcast/health now carries `bank` on
+                 * every branch, so this asks before it acts. */
+                val bank = health.optJSONObject("bank")
+                if (bank != null) {
+                    say("4b the dialogue bank")
+                    say("  " + bank.optString("say"))
+                    if (bank.optBoolean("bare", false)
+                        || bank.optInt("keeper_failures", 0) > 0) {
+                        val out = client.post("/api/broadcast/fix/bank", "{}")
+                        try {
+                            val lines = JSONObject(out).optJSONArray("lines")
+                            if (lines != null) {
+                                for (i in 0 until lines.length()) {
+                                    val line = lines.optString(i).trim()
+                                    if (line.isNotEmpty()) say("  " + line)
+                                }
+                            }
+                        } catch (err: Exception) {
+                            say("  asked for a round to be banked")
+                        }
+                    } else {
+                        say("  the shelf is stocked - not the cause here")
+                    }
+                }
+
                 say("listening for eight seconds…")
                 delay(8000)
                 health = JSONObject(client.get("/api/broadcast/health"))
@@ -882,26 +936,111 @@ class RailController(
     }
 
     /**
-     * A level, sent WITHOUT the note or the repaint.
-     *
-     * The ordinary [send] writes a line to the rail and repaints on every
-     * answer. That is right for a chip you press once and wrong for a knob
-     * under a moving finger: eight repaints a second, each one reconciling
-     * the very slider being dragged. This posts the level and does nothing
-     * else - the release still goes through [send] and puts the note up.
-     *
-     * A failure is NOT silent: it goes to the note line, because a level
-     * that did not take is the one thing the operator must not have to
-     * guess about.
+     * Select one complete destination with the same ordered transaction as
+     * the desktop: owner first, routes second, durable settings last.
      */
-    private fun sendLevelQuietly(stream: String, percent: Int) {
+    private fun selectDestination(key: String) {
+        val preset = DjOutput.PRESETS[key] ?: return
         scope.launch {
             try {
-                client.post("/api/dj/output", DjOutput.level(stream, percent / 100.0))
+                val settings = JSONObject(client.get("/api/settings"))
+                val listeners = JSONObject(client.get("/api/radio/listeners"))
+                val live = AirOwners.read(listeners, settings)
+                val pageDevice = when (key) {
+                    "pinetab" -> "pinetab"
+                    "app" -> "desktop"
+                    else -> ""
+                }
+                val solo = if (pageDevice.isNotBlank()) {
+                    val player = live.players.firstOrNull {
+                        it.device == pageDevice && it.seen <= 45.0
+                    } ?: throw IllegalStateException(
+                        preset.label + " is not looking at the station right now"
+                    )
+                    JSONObject().put("listener", player.listener)
+                } else {
+                    JSONObject().put("clear", true)
+                }
+
+                client.post("/api/radio/solo", solo.toString())
+                val routed = JSONObject(client.post("/api/dj/output", DjOutput.preset(key)))
+
+                settings.put("broadcast_to", key)
+                val pinetab = settings.optJSONObject("pinetab") ?: JSONObject()
+                pinetab.put("audio", key == "pinetab")
+                pinetab.put("at", System.currentTimeMillis())
+                settings.put("pinetab", pinetab)
+                val terminals = settings.optJSONObject("terminals") ?: JSONObject()
+                val names = ArrayList<String>()
+                val keys = terminals.keys()
+                while (keys.hasNext()) names.add(keys.next())
+                for (name in names) {
+                    terminals.optJSONObject(name)?.put("play", name == pageDevice)
+                }
+                settings.put("terminals", terminals)
+                client.put("/api/settings", settings.toString())
+
+                destination = key
+                state = state.patched(routed)
+                roster = AirOwners.read(
+                    JSONObject(client.get("/api/radio/listeners")), settings,
+                )
+                paint()
+                noteOk("broadcast -> " + preset.label)
             } catch (err: Exception) {
-                Log.w(TAG, "level write failed", err)
+                Log.w(TAG, "could not select broadcast destination", err)
                 noteError(err.message ?: err.javaClass.simpleName)
             }
+        }
+    }
+
+    /** The native drawer and every web view move the same page-side mixer. */
+    private fun applyListenerLevel(stream: String, percent: Int) {
+        val value = percent.coerceAtLeast(0) / 100.0
+        runScript(
+            "(function(){try{" +
+                "var b=window.pineLevels;if(!b||typeof b.apply!=='function')return 'absent';" +
+                "b.apply(" + JSONObject.quote(stream) + "," + value + ");return 'ok';" +
+            "}catch(e){return 'error:'+e.message;}})()",
+        ) { answer ->
+            if (answer.contains("error") || answer.contains("absent")) {
+                noteError("the shared audio mixer did not answer")
+            }
+        }
+    }
+
+    /** Read the shared values when the drawer opens. There is no audio poll. */
+    private fun readListenerLevels() {
+        runScript(
+            "(function(){try{" +
+                "var b=window.pineLevels,m=b&&b.get?b.get():{};" +
+                "return [m.music,m.voice,m.sfx,m.video];" +
+            "}catch(e){return [];}})()",
+        ) { answer ->
+            try {
+                val values = org.json.JSONArray(answer)
+                val names = listOf("music", "voice", "sfx", "video")
+                for (i in names.indices) {
+                    val n = values.optDouble(i, Double.NaN)
+                    if (!n.isNaN()) localLevel[names[i]] = Math.round(n * 100).toInt()
+                }
+                paintListenerLevels()
+            } catch (err: Exception) {
+                Log.w(TAG, "shared audio levels did not parse", err)
+            }
+        }
+    }
+
+    private fun paintListenerLevels() {
+        for ((stream, bar) in volumes) {
+            if (dragging == stream) continue
+            val want = (localLevel[stream] ?: 100).coerceIn(0, bar.max)
+            if (bar.progress != want) {
+                syncing = true
+                bar.progress = want
+                syncing = false
+            }
+            volumeLabels[stream]?.text = "$want%"
         }
     }
 
@@ -925,12 +1064,14 @@ class RailController(
                 musicWas = -1
                 bar.progress = back
                 localLevel["music"] = back
-                send("music back to $back%") { DjOutput.level("music", back / 100.0) }
+                applyListenerLevel("music", back)
+                noteOk("music back to $back%")
             } else {
                 musicWas = bar.progress
                 bar.progress = 0
                 localLevel["music"] = 0
-                send("music off - the DJs keep going") { DjOutput.level("music", 0.0) }
+                applyListenerLevel("music", 0)
+                noteOk("music off - the DJs keep going")
             }
             paintHush()
         }
@@ -1027,11 +1168,12 @@ class RailController(
         if (!state.connected && state.musicTo.isBlank()) {
             return rail.resources.getString(R.string.rail_route_unknown)
         }
-        /* web and app are the same routing (see DjOutput.presetsOf); on a
-         * terminal, "the application" is the truer of the two names. */
+        if (destination in presetChips && destination in state.presets) {
+            return "broadcast: " + (DjOutput.PRESETS[destination]?.label ?: destination)
+        }
         val preset = state.presets
         if (preset.isNotEmpty()) {
-            val key = if ("app" in preset) "app" else preset.first()
+            val key = preset.first()
             return "broadcast: " + (DjOutput.PRESETS[key]?.label ?: key)
         }
         // #980: three streams moved apart is a real state; name all three.
@@ -1061,7 +1203,13 @@ class RailController(
          * set lights NOTHING rather than a preset that is no longer true.
          * describeRouting() names the three separately in that case. */
         val presets = s.presets
-        for ((key, chip) in presetChips) chip.isActivated = key in presets
+        for ((key, chip) in presetChips) {
+            chip.isActivated = if (destination in presetChips) {
+                key == destination && key in presets
+            } else {
+                key in presets
+            }
+        }
         paintNote()
 
         for (stream in DjOutput.STREAMS) {
@@ -1078,17 +1226,8 @@ class RailController(
                 ),
             )
 
-            if (dragging == stream) continue   /* a finger beats a poll */
-            val reported = s.levelOf(stream)
-            val want = if (reported >= 0) reported else (localLevel[stream] ?: 100)
-            val bar = volumes[stream] ?: continue
-            if (bar.progress != want) {
-                syncing = true
-                bar.progress = want
-                syncing = false
-            }
-            volumeLabels[stream]?.text = "$want%"
         }
+        paintListenerLevels()
 
         if (s.log.isNotBlank() && !logsShowingPipeline) logs.text = s.log
     }
@@ -1207,6 +1346,8 @@ class RailController(
         "music" -> "Music"
         "voice" -> "DJs"
         "reply" -> "Replies"
+        "sfx" -> "Clips / SFX"
+        "video" -> "Videos"
         else -> value.ifBlank { "unknown" }
     }
 

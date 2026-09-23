@@ -35,6 +35,17 @@ internal class ReplayAudioWindow(private val maxBytes: Int, private val maxPacke
     @Synchronized fun seconds(): Double = if (packets.size < 2) 0.0 else
         (packets.last.timeUs - packets.first.timeUs) / 1_000_000.0
 
+    /**
+     * [#1225] How far the held sound reaches, or 0 when nothing is held.
+     *
+     * The ring joins a fresh video encoder's clock to the END of what it
+     * already holds. While audio only ran beside video, the end of the
+     * video was the end of everything. Audio now keeps rolling with the
+     * screen dark, so it can reach further - and a join that ignores that
+     * puts the new picture underneath sound recorded before it.
+     */
+    @Synchronized fun newestUs(): Long = if (packets.isEmpty()) 0L else packets.last.timeUs
+
     @Synchronized fun bytes(): Int = bytes
 }
 

@@ -95,7 +95,7 @@
        * nothing on it that let go. Any view that covers the lock must
        * carry its own exit, in plain sight, sized for a thumb. */
       + '<button id="lkOut" class="lk-out" type="button" '
-      + 'aria-label="put this away and unlock">✕</button>'
+      + 'aria-label="put this away and unlock" title="put this away and unlock">✕</button>'
       + '</header>'
 
       /* 2 - what is on, and the transport. */
@@ -108,8 +108,8 @@
       + '</div>'
       + '<div class="lk-transport">'
       + '<span id="lkVote"></span>'
-      + '<button id="lkPrev" class="lk-btn" type="button">‹‹</button>'
-      + '<button id="lkSkip" class="lk-btn" type="button">››</button>'
+      + '<button id="lkPrev" class="lk-btn" type="button" title="Previous" aria-label="Previous">‹‹</button>'
+      + '<button id="lkSkip" class="lk-btn" type="button" title="Skip" aria-label="Skip">››</button>'
       + '</div>'
       + '</section>'
 

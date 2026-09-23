@@ -266,7 +266,13 @@
   position: fixed;
   right: 46px;
   bottom: 34px;
-  z-index: 2147483004;
+  /* [#1193] ABOVE THE SHEETS. At 2147483004 the particle field the
+     operator dictates into was under every pop-up this shell can have
+     open - the Script view's windows, the hold sheet, the SFX menu. It
+     is now over all of them and still under the locked-screen dot
+     (2147483090), the boot splash and the rail. Same value on the desk
+     and on the tablet: this file is the one both of them load. */
+  z-index: 2147483080;
   width: 56px; height: 56px;
   padding: 0;
   border: 1px solid #35414c;
@@ -318,7 +324,7 @@
   position: fixed;
   right: 46px;
   bottom: 96px;
-  z-index: 2147483004;
+  z-index: 2147483080;   /* [#1193] with the dot */
   max-width: min(420px, 74vw);
   padding: 8px 12px;
   border: 1px solid #35414c;
@@ -340,7 +346,7 @@
   position: fixed;
   right: 46px;
   bottom: 96px;
-  z-index: 2147483005;
+  z-index: 2147483081;   /* [#1193] one over the dot */
   min-width: 220px;
   max-width: min(420px, 74vw);
   padding: 6px;

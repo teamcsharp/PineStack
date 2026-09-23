@@ -40,7 +40,8 @@
  *
  * THE BRIDGE. On the tablet the kiosk's Kotlin side exposes these on
  * pineDesktop: screenShot(), replayState(), replayExport({seconds,
- * upload}), hotCorners(), hotCornersSet({...}); and it calls
+ * upload}), replayFrames({seconds, count}), hotCorners(),
+ * hotCornersSet({...}); and it calls
  * window.PineHotCorners.configure(cfg) on page load and whenever the
  * drawer changes a preference. On the desk (Electron) the preload exposes
  * pineDesktop too, with shotView() for a picture of the window but no
@@ -64,8 +65,68 @@
   var COMMIT_DEG = 35;      /* within this many degrees of the diagonal */
   var JUDGE_PX = 40;        /* past this the direction is judged; short of it a
                                wobble is still a wobble */
+
+  /* #1166: "Make sure I can also activate hot corners by tapping on the
+   * corners. or clicking."
+   *
+   * A TAP IS A SWIPE THAT NEVER WENT ANYWHERE. Both begin with exactly the
+   * same pointerdown - same corner square, same gates, same glow - and the
+   * two are told apart only at the up. These are the numbers that do it.
+   *
+   * TAP_PX is deliberately UNDER JUDGE_PX. Short of JUDGE_PX the judge
+   * returns 'going' and never rules on direction, so a press that stayed
+   * inside TAP_PX cannot have been thrown out as "not toward the centre"
+   * along the way - a tap and a failed swipe can therefore never be
+   * confused for one another. Past it the press was travelling somewhere
+   * and belongs to the swipe, committed or abandoned; it is not a tap.
+   *
+   * TAP_MS leaves the long press alone. Half a second is far longer than a
+   * tap on glass and far shorter than a deliberate hold, so anything that
+   * wants press-and-hold in a corner later still has it to claim. */
+  var TAP_PX = 24;
+  var TAP_MS = 500;
+
   var STORE = 'pineHotCorners';
   var STEPS = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1200];
+
+  /* #1155 THE SCRUB STRIP'S REACH. "I would like to go back the whole
+   * recording range."
+   *
+   * SCRUB_WINDOW   how many seconds of ring one strip of thumbnails shows.
+   * SCRUB_COUNT    how many thumbnails that is.
+   * SCRUB_STEP     windows are snapped to this many seconds so that sliding
+   *                back and forth lands on the SAME window twice and the
+   *                cache can answer it. Without snapping every pixel of the
+   *                coarse slider would be a fresh mux of the ring.
+   * SCRUB_SETTLE   how long the coarse slider must be still before the ask
+   *                goes out. A drag across 20 minutes crosses hundreds of
+   *                windows and must not ask for any of them on the way.
+   * SCRUB_CACHE    the cap on remembered thumbnails, in BASE64 CHARACTERS.
+   *                5 MB of base64 is about 170 thumbnails at the ~30 kB
+   *                each one measures - 17 windows - and JavaScript holds
+   *                those characters as UTF-16, so the real cost is nearer
+   *                10 MB. That is the ceiling worth paying on this tablet;
+   *                past it the least recently used window is dropped. */
+  var SCRUB_WINDOW = 5;
+  var SCRUB_COUNT = 10;
+  var SCRUB_STEP = 5;
+  var SCRUB_SETTLE = 260;
+  var SCRUB_CACHE = 5 * 1024 * 1024;
+  /* [#1221] SLIDING THE CAPTURE WINDOW OUT OF THE WAY.
+   *
+   * "For the video editor frame window that pops up when we do a capture, I
+   *  want to be able to slide it out of the screen so that way I can draw on
+   *  the screen full screen."
+   *
+   * A drag on the grab handle counts once it has carried the window past
+   * SLIDE_TRIGGER of its own width; then it springs to the nearer edge with
+   * SLIDE_PEEK pixels still on screen so the edge is never a bare line, and a
+   * tab is put out to bring it back. The same fraction inward brings it home,
+   * which is why the number is a fraction of the width and not a pixel count:
+   * the desk window and the tablet's 1154 px glass are not the same size. */
+  var SLIDE_TRIGGER = 0.40;
+  var SLIDE_PEEK = 10;
+  var SLIDE_SPRING = 'transform .34s cubic-bezier(.22, 1.18, .36, 1)';
   var ACTIONS = ['off', 'shot', 'export', 'inspect', 'sfx', 'report'];
   var ACTION_WORDS = {
     off: 'Off',
@@ -197,6 +258,28 @@
     return (m === Math.floor(m) ? m : m.toFixed(1)) + ' min';
   }
 
+  /* #1155: HOW FAR BACK, IN REAL TIME. "I would like to go back the whole
+   * recording range" means the labels run to twenty minutes, and "-732.4s"
+   * is not a time anybody reads. Under a minute keeps the tenth of a
+   * second the operator was already picking frames by; past it the tenth
+   * is noise and the minute is the thing.
+   *
+   *   0      -> 'now'      12.4 -> '12.4s'
+   *   72     -> '1m 12s'   732  -> '12m 12s'
+   *
+   * Pure, and the one place this wording is decided: the thumbnail labels,
+   * the coarse slider's read-out and the line the report is filed with all
+   * come through here, so they can never disagree with each other. */
+  function fmtBack(sec) {
+    sec = Number(sec);
+    if (!isFinite(sec) || sec <= 0) return 'now';
+    if (sec < 60) return sec.toFixed(1) + 's';
+    var m = Math.floor(sec / 60);
+    var s = Math.round(sec - m * 60);
+    if (s === 60) { m += 1; s = 0; }
+    return m + 'm ' + s + 's';
+  }
+
   /* -------------------------------------------------------------- config */
 
   var cfg = merge({}, DEFAULTS);
@@ -279,12 +362,91 @@
     return {state: 'commit', progress: 1};
   }
 
+  /* #1166: IS THIS PRESS SOMEBODY ELSE'S?
+   *
+   * "Make sure I can also activate hot corners by tapping on the corners.
+   *  or clicking."
+   *
+   * A tap is a far more dangerous gesture than a swipe, because a tap is
+   * what everything else on the screen is listening for too. The corner
+   * squares are not empty: the TOP RIGHT sits under the view rail, whose
+   * tabs are the only way between views on the tablet, and the TOP LEFT
+   * sits under the panel's own controls on the desk. A corner that ate
+   * those would be far worse than no corner at all.
+   *
+   * So the tap is taken ONLY off the page's own background. Two families
+   * are refused, and a press that lands on either is left entirely alone -
+   * it is not swallowed, not acted on, and reaches whatever it was going
+   * to reach:
+   *
+   *   THINGS THAT ARE OPERATED. button, a, input, select, textarea,
+   *   label, summary, and anything wearing role=button/link/tab/checkbox/
+   *   slider/menuitem or contenteditable. That one list covers the rail's
+   *   tabs (they are <button class="pine-view-tab">), every sheet button,
+   *   the clock's GRAB button and the search box.
+   *
+   *   SURFACES THAT OWN THEIR OWN GESTURES. The SFX set (#sfxTv, which
+   *   takes a tap to open its menu and a double tap to replay), the talk
+   *   dot, the report pad, the camera, the rail's own body between its
+   *   tabs, and this file's own furniture. These are floating things that
+   *   can sit anywhere, including squarely in a corner.
+   *
+   * THE ANSWER IS DECIDED AT POINTERDOWN, not at the up, because that is
+   * where the operator's finger actually landed - by the up the element
+   * under it may have moved or gone. And it governs the TAP ONLY: the
+   * swipe is untouched, so a swipe that begins on a rail tab still works
+   * exactly as it did before this change.
+   *
+   * WHEN IN DOUBT, DO NOT TAKE IT. A throw anywhere in this walk answers
+   * "yes, somebody else's" - the corner losing a tap is a small thing
+   * beside the corner eating a press that was not its own. */
+  function overControl(node) {
+    var TAGS = {button: 1, a: 1, input: 1, select: 1, textarea: 1,
+                label: 1, summary: 1, option: 1};
+    var ROLES = {button: 1, link: 1, tab: 1, checkbox: 1, radio: 1,
+                 slider: 1, menuitem: 1, switch: 1, textbox: 1};
+    /* Floating surfaces with gestures of their own, by id or by class. */
+    var OWNED = /(^|\s)(pine-view-tab|pineViewRail|sfx-tv|pine-cam|hc-btn|hc-pick|hc-x|hc-glow|hc-strip|hc-toast)(\s|$)/;
+    var OWNED_ID = {sfxTv: 1, pineViewRail: 1, pineTalkDot: 1, pineTalkSay: 1,
+                    pineReportPad: 1, pineTip: 1};
+    try {
+      var el = node;
+      if (el && el.nodeType === 3) el = el.parentNode;   /* a text node */
+      var hops = 0;
+      while (el && el.nodeType === 1 && hops < 60) {
+        if (el === doc.body || el === doc.documentElement) return false;
+        var tag = String(el.tagName || '').toLowerCase();
+        if (TAGS[tag] === 1) return true;
+        if (el.getAttribute) {
+          var role = el.getAttribute('role');
+          if (role && ROLES[String(role).toLowerCase()] === 1) return true;
+          if (el.getAttribute('contenteditable') === 'true') return true;
+        }
+        if (el.id && OWNED_ID[el.id] === 1) return true;
+        /* className is an SVGAnimatedString on an SVG node, not a string. */
+        var cls = el.className;
+        if (typeof cls !== 'string') cls = (cls && cls.baseVal) || '';
+        if (cls && OWNED.test(cls)) return true;
+        el = el.parentNode;
+        hops += 1;
+      }
+    } catch (err) {
+      return true;                      /* unreadable: leave the press alone */
+    }
+    return false;
+  }
+
   /* --------------------------------------------------------- the glow */
 
   var glow = null;
 
+  var pulseTimer = 0;
+
   function glowShow(corner, progress) {
     if (!doc || !doc.body) return;
+    /* #1166: a swipe starting during a tap's pulse owns the glow from
+     * here; the pulse must not hide it out from under the drag. */
+    if (pulseTimer) { clearTimeout(pulseTimer); pulseTimer = 0; }
     if (!glow) {
       glow = make('div', 'hc-glow');
       doc.body.appendChild(glow);
@@ -296,9 +458,26 @@
   }
 
   function glowHide() {
+    if (pulseTimer) { clearTimeout(pulseTimer); pulseTimer = 0; }
     if (!glow) return;
     glow.className = 'hc-glow';
     glow.style.opacity = '0';
+  }
+
+  /* #1166: THE TAP'S OWN FLASH. A swipe grows the glow under the finger,
+   * so a tap - which has no travel to grow with - would otherwise fire
+   * with a glow that barely appeared. This puts it up at full and lets it
+   * go: dropping the `on` class hands it back to the stylesheet's
+   * .18s opacity fade, so the corner that fired is unmistakably the one
+   * that lights, and it is gone before the action's own sheet arrives. */
+  function glowPulse(corner) {
+    glowShow(corner, 1);
+    pulseTimer = setTimeout(function () {
+      pulseTimer = 0;
+      if (!glow) return;
+      glow.className = 'hc-glow';
+      glow.style.opacity = '0';
+    }, 150);
   }
 
   /* ---------------------------------------------------------- the gesture */
@@ -334,7 +513,11 @@
     var corner = cornerAt(ev.clientX, ev.clientY, w, h);
     if (!corner) return;
     if ((cfg[corner] || 'off') === 'off') return;
-    live = {id: ev.pointerId, corner: corner, x: ev.clientX, y: ev.clientY, t: now()};
+    /* #1166: `onControl` is decided HERE, where the finger actually
+     * landed, and is read only by the tap at the up - see onUp and
+     * overControl. The swipe does not consult it and is unchanged. */
+    live = {id: ev.pointerId, corner: corner, x: ev.clientX, y: ev.clientY,
+            t: now(), onControl: overControl(ev.target)};
     glowShow(corner, 0);
   }
 
@@ -354,8 +537,50 @@
     act(cfg[corner]);
   }
 
+  /* #1166: THE TAP, TAKEN HERE OR NOT AT ALL.
+   *
+   * "Make sure I can also activate hot corners by tapping on the corners.
+   *  or clicking."
+   *
+   * Everything that had to be true for a swipe to be possible was already
+   * checked at the down - the corners are on, this corner is not `off`, no
+   * sheet is up, it was the primary pointer, the left button, and the
+   * press landed inside the corner's square. If `live` is still here at
+   * the up, all of that held and the only questions left are whether the
+   * press stayed still, whether it was brief, and whose it was.
+   *
+   * The gates are re-checked rather than assumed: a sheet can have opened
+   * under the finger, and the preferences drawer can have turned the
+   * corner off, between the down and the up.
+   *
+   * ON FIRING, THE PRESS BECOMES OURS, exactly as a committed swipe does:
+   * the click the platform synthesises afterwards is swallowed by
+   * onClick. Without that a corner tap on the LISTEN view's backdrop
+   * would also be counted by that view's own double-tap-to-full-screen,
+   * and the operator would get two things for one finger. */
   function onUp(ev) {
-    if (live && ev.pointerId === live.id) { abandon(); return; }
+    if (live && ev.pointerId === live.id) {
+      var was = live;
+      live = null;
+      var dx = ev.clientX - was.x, dy = ev.clientY - was.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var ms = now() - was.t;
+      var what = cfg[was.corner] || 'off';
+      if (was.onControl                      /* somebody else's press */
+          || dist > TAP_PX                   /* it was going somewhere */
+          || ms > TAP_MS                     /* a press, not a tap */
+          || sheets.length                   /* a sheet owns the screen now */
+          || !cfg.enabled
+          || what === 'off') {
+        glowHide();
+        return;
+      }
+      swallowClickUntil = now() + 700;
+      glowPulse(was.corner);
+      eat(ev);
+      act(what);
+      return;
+    }
     if (swallowId !== null && ev.pointerId === swallowId) {
       swallowId = null;
       eat(ev);
@@ -500,6 +725,270 @@
     sheets.length = 0;
   }
 
+  /* ------------------------------------------- [#1221] the ink, on its own */
+
+  /* THE INK PAD, LIFTED OUT OF THE ANNOTATOR SO BOTH WINDOWS HAVE IT.
+   *
+   * It paints ONLY ink. Everywhere a stroke has not been laid the canvas is
+   * transparent, and that is the whole of why the capture window can leave:
+   * whatever is behind the pad shows through it - the frozen picture on the
+   * annotator's plate while the plate is home, and the LIVE panel once the
+   * plate has been pushed to the edge. The strokes are kept as a list rather
+   * than baked into pixels, so Undo takes one back, Clear takes them all, a
+   * resize repaints them at the new size, and the compose step can lay them
+   * over any background it likes.
+   *
+   * inkPad(canvas) answers {strokes, fit, redraw, undo, clear, metrics}. */
+  function inkPad(canvas) {
+    var ctx = canvas.getContext('2d');
+    var strokes = [];
+    var stroke = null;
+    var W = 0, H = 0, dpr = 1;
+    var inkId = null;
+
+    function inkStyle() {
+      ctx.strokeStyle = 'rgba(255,40,40,.95)';
+      ctx.lineWidth = 6;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+    }
+
+    function fit() {
+      W = root.innerWidth || 1280;
+      H = root.innerHeight || 800;
+      dpr = Math.min(2, root.devicePixelRatio || 1);
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+      canvas.style.width = W + 'px';
+      canvas.style.height = H + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      redraw();
+      return {w: W, h: H, dpr: dpr};
+    }
+
+    function path(points) {
+      if (!points.length) return;
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      if (points.length === 1) ctx.lineTo(points[0].x + 0.01, points[0].y);
+      for (var i = 1; i < points.length; i += 1) ctx.lineTo(points[i].x, points[i].y);
+      ctx.stroke();
+    }
+
+    function redraw() {
+      ctx.clearRect(0, 0, W, H);
+      inkStyle();
+      for (var i = 0; i < strokes.length; i += 1) path(strokes[i]);
+    }
+
+    canvas.addEventListener('pointerdown', function (ev) {
+      if (inkId !== null) return;
+      if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+      inkId = ev.pointerId;
+      try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+      stroke = [{x: ev.clientX, y: ev.clientY}];
+      /* #1154: the ink style is set ONCE per stroke, not once per move.
+       * Every redraw() ends by setting it too, and changing canvas.width
+       * (fit) resets the context and then redraws - so the context is
+       * always carrying the ink's stroke style when a move arrives. */
+      inkStyle();
+      path(stroke);
+      ev.preventDefault();
+    }, {passive: false});
+
+    /* #1154: "This is alright. It looks like it's better, but it is a
+     *  little laggy when I'm drawing the strokes."
+     *
+     * MEASURED FIRST, AND THE OBVIOUS SUSPECT WAS INNOCENT. This handler
+     * already drew only the NEW segment rather than repainting the world,
+     * and it costs 0.055 ms a move on the tablet (240 moves, p95 0.1 ms,
+     * worst 3.1 ms). The page around it is the cost - see hush() - and on
+     * top of that the panel paces requestAnimationFrame to one group every
+     * ~67 ms (app.py, PINE_PACE), so pointermove arrives in clumps rather
+     * than one delivery per digitiser sample.
+     *
+     * COALESCED EVENTS are the cure for what that clumping LOOKS like.
+     * The engine keeps every sample taken between two deliveries; without
+     * asking for them a fast stroke is one straight chord across the whole
+     * gap, which reads as angular AND late. With them the line follows the
+     * finger's real path, and the whole batch goes down as ONE path with
+     * one stroke() rather than a beginPath/stroke pair per point. */
+    canvas.addEventListener('pointermove', function (ev) {
+      if (inkId === null || ev.pointerId !== inkId || !stroke) return;
+      ev.preventDefault();
+      var pts = null;
+      if (typeof ev.getCoalescedEvents === 'function') {
+        try { pts = ev.getCoalescedEvents(); } catch (e) { pts = null; }
+      }
+      if (!pts || !pts.length) pts = [ev];
+      var last = stroke[stroke.length - 1];
+      ctx.beginPath();
+      ctx.moveTo(last.x, last.y);
+      for (var i = 0; i < pts.length; i += 1) {
+        var p = {x: pts[i].clientX, y: pts[i].clientY};
+        stroke.push(p);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }, {passive: false});
+
+    function inkUp(ev) {
+      if (inkId === null || ev.pointerId !== inkId) return;
+      try { canvas.releasePointerCapture(ev.pointerId); } catch (e) { /* not held */ }
+      inkId = null;
+      if (stroke && stroke.length) strokes.push(stroke);
+      stroke = null;
+    }
+    canvas.addEventListener('pointerup', inkUp);
+    canvas.addEventListener('pointercancel', inkUp);
+
+    return {
+      strokes: strokes,
+      fit: fit,
+      redraw: redraw,
+      undo: function () { strokes.pop(); redraw(); },
+      clear: function () { strokes.length = 0; redraw(); },
+      metrics: function () { return {w: W, h: H, dpr: dpr}; }
+    };
+  }
+
+  /* ----------------------------------------- [#1221] push the window aside */
+
+  /* THE GRAB HANDLE AND WHAT IT DOES.
+   *
+   * slideRig(opts) builds one handle - a grip, a word, and a Carbon button -
+   * and wires a sideways drag on it. It owns no geometry of its own: the
+   * caller's `apply(px, spring)` decides WHAT moves, because the annotator
+   * moves two elements (the picture plate and its furniture) around a canvas
+   * that must stay put, while the video editor is a single box.
+   *
+   * WHY THE JUDGEMENT IS A FRACTION OF THE WIDTH AND WHY IT IS TWO-SIDED.
+   * From home, the window goes once the drag has carried it SLIDE_TRIGGER of
+   * its width; from parked, it comes home once the drag has carried it the
+   * same fraction back. Judging a parked window by the same "past 40% of the
+   * width" test would re-park it on every attempt to pull it back, because a
+   * parked window is already 90-odd percent of a width away from home.
+   *
+   * opts: apply(px, spring), width(), z, tabWord, handleWord, onAway(side),
+   *       onHome(was). Answers {handle, away, home, toggle, isAway, destroy}. */
+  function slideRig(opts) {
+    opts = opts || {};
+    var move = typeof opts.apply === 'function' ? opts.apply : function () { /* nothing moves */ };
+    var widthOf = typeof opts.width === 'function' ? opts.width
+      : function () { return root.innerWidth || 1280; };
+    var side = 0;                 /* 0 home, -1 parked left, +1 parked right */
+    var at = 0;                   /* where it sits now, in px from home */
+    var drag = null;
+    var tab = null;
+    var dead = false;
+
+    function parkX(s) { return (s < 0 ? -1 : 1) * Math.max(40, widthOf() - SLIDE_PEEK); }
+    function place(px, spring) { at = px; move(px, !!spring); }
+
+    function dropTab() {
+      if (tab && tab.parentNode) tab.parentNode.removeChild(tab);
+      tab = null;
+    }
+
+    /* The tab is the ONLY thing left on screen, so it is built fresh on each
+     * park: the caret has to point the way the window will come back from. */
+    function showTab(s) {
+      dropTab();
+      tab = make('div', 'hc-slide-tab ' + (s < 0 ? 'left' : 'right'));
+      if (opts.z) tab.style.zIndex = String(opts.z);
+      var b = button('hc-btn hc-slide-tab-btn', String(opts.tabWord || 'bring it back'),
+        s < 0 ? 'c:caret--right' : 'c:caret--left');
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); home(); });
+      tab.appendChild(b);
+      doc.body.appendChild(tab);
+    }
+
+    function away(s) {
+      if (dead) return;
+      s = s < 0 ? -1 : 1;
+      side = s;
+      place(parkX(s), true);
+      showTab(s);
+      if (typeof opts.onAway === 'function') { try { opts.onAway(s); } catch (e) { /* theirs */ } }
+    }
+
+    function home() {
+      if (dead) return;
+      var was = side;
+      side = 0;
+      place(0, true);
+      dropTab();
+      if (typeof opts.onHome === 'function') { try { opts.onHome(was); } catch (e) { /* theirs */ } }
+    }
+
+    function toggle() { if (side) home(); else away(1); }
+
+    function settle() {
+      var w = Math.max(1, widthOf());
+      if (!side) {
+        if (Math.abs(at) >= w * SLIDE_TRIGGER) away(at < 0 ? -1 : 1); else home();
+      } else if (Math.abs(at) <= w * (1 - SLIDE_TRIGGER)) {
+        home();
+      } else {
+        away(side);
+      }
+    }
+
+    var handle = make('div', 'hc-grab');
+    handle.appendChild(make('span', 'hc-grab-grip'));
+    handle.appendChild(make('span', 'hc-grab-word',
+      String(opts.handleWord || 'drag this bar sideways to clear the screen')));
+    var go = button('hc-btn hc-grab-go', 'Slide away', 'c:caret--right');
+    go.addEventListener('click', function (ev) { ev.stopPropagation(); toggle(); });
+    handle.appendChild(go);
+
+    handle.addEventListener('pointerdown', function (ev) {
+      if (dead || drag) return;
+      if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+      /* The button on the handle is a button, not a grip. */
+      if (ev.target && ev.target !== handle && ev.target.closest && ev.target.closest('button')) return;
+      drag = {id: ev.pointerId, x: ev.clientX, from: at};
+      try { handle.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+      place(at, false);                       /* no spring under the finger */
+      ev.preventDefault();
+    }, {passive: false});
+
+    handle.addEventListener('pointermove', function (ev) {
+      if (!drag || ev.pointerId !== drag.id) return;
+      ev.preventDefault();
+      place(drag.from + (ev.clientX - drag.x), false);
+    }, {passive: false});
+
+    function letGo(ev) {
+      if (!drag || ev.pointerId !== drag.id) return;
+      try { handle.releasePointerCapture(ev.pointerId); } catch (e) { /* not held */ }
+      drag = null;
+      settle();
+    }
+    handle.addEventListener('pointerup', letGo);
+    handle.addEventListener('pointercancel', letGo);
+
+    /* A parked window is parked in PIXELS, so a rotation or a resized desk
+     * window would leave it half on screen. Re-park it against the new width. */
+    function onResize() { if (!dead && side) place(parkX(side), false); }
+    root.addEventListener('resize', onResize);
+
+    function destroy() {
+      dead = true;
+      root.removeEventListener('resize', onResize);
+      dropTab();
+    }
+
+    return {
+      handle: handle,
+      away: away,
+      home: home,
+      toggle: toggle,
+      isAway: function () { return side; },
+      destroy: destroy
+    };
+  }
+
   /* ------------------------------------------------- "shot": draw on it */
 
   /* The picture. Tablet first (the kiosk's PixelCopy of the whole screen),
@@ -541,10 +1030,18 @@
    *                     the station URL rule; fetched with the station key
    *                     and drawn from a blob URL where the page is file:,
    *                     so the export is never refused for taint)
-   *   opts.onDone(png)  the composed PNG data URL. May answer a promise:
-   *                     the sheet stays up, its button reads opts.busyLabel,
-   *                     until it settles; a rejection is toasted and the
-   *                     ink is kept for another go. Default: PineReport.
+   *   opts.onDone(png, note)
+   *                     the composed PNG data URL, and (#1148) the line
+   *                     saying which frame it is - '' when the picture is
+   *                     the live one, so a caller that does not care may
+   *                     ignore the second argument entirely. May answer a
+   *                     promise: the sheet stays up, its button reads
+   *                     opts.busyLabel, until it settles; a rejection is
+   *                     toasted and the ink is kept for another go.
+   *                     Default: PineReport.
+   *   opts.scrub        (#1148) offer the scrub strip under the toolbar.
+   *                     Only the corner's screenshot road sets it: an
+   *                     inbox picture has no last five seconds behind it.
    *   opts.onCancel()   the back button; nothing changes.
    *   opts.fileLabel    the primary button's words (default 'File the report')
    *   opts.fileIcon     its Carbon icon (default 'c:email')
@@ -555,8 +1052,18 @@
    * Answers {close}. */
   function annotate(src, opts) {
     opts = opts || {};
+    /* [#1221] THREE LAYERS WHERE THERE USED TO BE ONE CANVAS.
+     *
+     * `plate` carries the picture and `chrome` carries the toolbar and the
+     * scrub strip; both slide together. `canvas` is the ink and it NEVER
+     * slides, so with the plate parked at the edge the operator is drawing on
+     * the live screen at full size and the strokes still line up with the
+     * frozen picture when it comes back - both are the viewport, to the pixel. */
     var wrap = make('div', 'hc-ink');
+    var plate = make('div', 'hc-ink-plate');                          /* [#1221] */
+    var pic = make('canvas', 'hc-ink-pic');                           /* [#1221] */
     var canvas = make('canvas', 'hc-ink-canvas');
+    var chrome = make('div', 'hc-ink-chrome');                        /* [#1221] */
     var bar = make('div', 'hc-ink-bar');
     var note = make('span', 'hc-ink-note', String(opts.note || 'draw on the picture, then file the report'));
     var undo = button('hc-btn', 'Undo', 'c:skip--back--filled');
@@ -569,24 +1076,108 @@
     bar.appendChild(clear);
     bar.appendChild(cancel);
     bar.appendChild(file);
+    plate.appendChild(pic);                                           /* [#1221] */
+    wrap.appendChild(plate);
     wrap.appendChild(canvas);
-    wrap.appendChild(bar);
+    chrome.appendChild(bar);                                          /* [#1221] */
+    wrap.appendChild(chrome);
     doc.body.appendChild(wrap);
     if (root.PineDuck) root.PineDuck.hold('hc-ink', root.PineDuck.REPORT, wrap);   /* 2026-09-14 */
+    /* #1154: the sheet covers the screen, so nothing under it needs to be
+     * rendered while it is up. See hush() below for what this buys and
+     * what it deliberately leaves alone. */
+    hush();
 
-    var ctx = canvas.getContext('2d');
+    var pad = inkPad(canvas);                                         /* [#1221] */
+    var strokes = pad.strokes;
+    var picCtx = pic.getContext('2d');                                /* [#1221] */
     var img = new Image();
-    var strokes = [];
-    var stroke = null;
     var W = 0, H = 0;
     var revoke = null;
     var busy = false;
+    var slid = false;                                                 /* [#1221] */
+    var scrubClass = '';                                              /* [#1221] */
+    /* #1148, the scrub strip. `liveSrc` is the picture the annotator
+     * opened with - the live screenshot - which the strip calls "now";
+     * `bgSrc` is whatever the canvas is painted from at this moment;
+     * `scrubAt` is how many seconds before the capture that frame sits,
+     * and 0 means the live one. The INK IS NEVER BAKED IN: strokes stay a
+     * list and redraw() paints them over whatever background is current,
+     * which is the whole reason a frame can be swapped underneath them. */
+    var liveSrc = '';
+    var bgSrc = '';
+    var scrubAt = 0;
+
+    /* #1154 - WHY THE INK FELT LATE, AND WHAT ACTUALLY FIXED IT.
+     *
+     * "This is alright. It looks like it's better, but it is a little
+     *  laggy when I'm drawing the strokes."
+     *
+     * The stroke handler was never the cost: 0.055 ms a move. What is
+     * slow is the PAGE. Traced on the tablet with the sheet already up and
+     * nobody drawing, ProxyMain::BeginMainFrame took 2035 ms of 2500 ms
+     * wall across 34 frames - 60 ms of style, layout and paint for every
+     * frame the panel produces - and the ink can never appear sooner than
+     * the frame that carries it. Measured: 3.9 fps while the sheet was up.
+     *
+     * AND NONE OF THAT WORK WAS VISIBLE. This sheet is fixed, inset:0 and
+     * opaque; the feed, the meters, the clocks and the wallpaper under it
+     * are painting into a covered screen. So while it is up they are taken
+     * out of the rendering lifecycle with content-visibility:hidden - not
+     * display:none, which would throw away their layout and their scroll
+     * positions - and put back exactly as they were on close. Measured
+     * again straight afterwards: 11 fps, median frame gap 167 ms -> 86 ms.
+     *
+     * 11 fps is the pacer's own floor (PINE_PACE=4 in app.py is ~67 ms a
+     * group plus a vsync), so this reaches it and cannot pass it. Going
+     * further means changing the pace, and app.py is not ours.
+     *
+     * WHAT IS DELIBERATELY LEFT ALONE: the toast, because it speaks while
+     * the sheet is up; the report pad, because filing opens it; and the
+     * corner sheets. They are named in the rule in hot-corners.css.
+     *
+     * ONE CLASS ON <html>, NOT A LIST OF ELEMENTS, AND THAT IS THE WHOLE
+     * SAFETY ARGUMENT. The first cut walked document.body.children, hid
+     * each one and remembered what to put back. It shipped a terminal that
+     * went dark: the sheet left the DOM by a road that does not run
+     * close() - measured on the tablet, 36 children still hidden with no
+     * sheet up and nothing on screen - and a per-element list can only be
+     * undone by the code that made it. A class cannot leak that way: one
+     * removal restores everything, whatever happened in between, including
+     * elements that arrived while the sheet was up. And the WATCHDOG below
+     * removes it the moment there is no sheet left to justify it, so the
+     * worst case is one second of a covered screen instead of a dead one.
+     *
+     * Rendering only: timers, audio and the broadcast are untouched. */
+    var hushGuard = null;
+    function hush() {
+      if (!doc.documentElement || !doc.documentElement.classList) return;
+      doc.documentElement.classList.add('hc-hushed');
+      if (hushGuard) return;
+      /* THE DEAD MAN'S HANDLE. Nothing may keep the page hidden once the
+       * sheet that asked for it is gone, however it went. */
+      hushGuard = setInterval(function () {
+        if (!doc.querySelector('.hc-ink')) unhush();
+      }, 1000);
+    }
+    function unhush() {
+      if (hushGuard) { clearInterval(hushGuard); hushGuard = null; }
+      try {
+        if (doc.documentElement && doc.documentElement.classList) {
+          doc.documentElement.classList.remove('hc-hushed');
+        }
+      } catch (e) { /* nothing left to restore */ }
+    }
 
     var entry = {box: wrap, body: wrap, close: null};
     var unwatch = null;
     function close() {
       var at = sheets.indexOf(entry);
       if (at >= 0) sheets.splice(at, 1);
+      /* FIRST, and outside everything that can throw: a sheet that went
+       * away leaving the page hidden would be a black terminal. */
+      unhush();
+      try { rig.destroy(); } catch (e) { /* [#1221] the tab goes anyway */ }
       if (unwatch) { try { unwatch(); } catch (e) { /* gone */ } unwatch = null; }
       root.removeEventListener('resize', fit);
       if (revoke) { try { revoke(); } catch (e) { /* gone */ } revoke = null; }
@@ -600,91 +1191,137 @@
       unwatch = root.PineDismiss.watch(wrap, close, []);
     }
 
-    function inkStyle() {
-      ctx.strokeStyle = 'rgba(255,40,40,.95)';
-      ctx.lineWidth = 6;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
+    /* [#1221] The sheet's class is rebuilt from the two facts that can change
+     * it - which scrub state it is in, and whether it is parked - so that the
+     * strip arriving can never wipe the parked state off the sheet. */
+    function dressWrap() {
+      wrap.className = 'hc-ink' + (scrubClass ? ' ' + scrubClass : '') + (slid ? ' hc-slid' : '');
+    }
+
+    /* [#1221] The picture has its own canvas, the same size and the same dpr
+     * as the ink, sitting on the plate that slides. */
+    function paintPicture() {
+      picCtx.clearRect(0, 0, W, H);
+      picCtx.fillStyle = '#000';
+      picCtx.fillRect(0, 0, W, H);
+      if (img.complete && img.naturalWidth) picCtx.drawImage(img, 0, 0, W, H);
     }
 
     function fit() {
-      W = root.innerWidth || 1280;
-      H = root.innerHeight || 800;
-      var dpr = Math.min(2, root.devicePixelRatio || 1);
-      canvas.width = Math.round(W * dpr);
-      canvas.height = Math.round(H * dpr);
-      canvas.style.width = W + 'px';
-      canvas.style.height = H + 'px';
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      redraw();
+      var m = pad.fit();                                              /* [#1221] */
+      W = m.w;
+      H = m.h;
+      pic.width = Math.round(W * m.dpr);
+      pic.height = Math.round(H * m.dpr);
+      pic.style.width = W + 'px';
+      pic.style.height = H + 'px';
+      picCtx.setTransform(m.dpr, 0, 0, m.dpr, 0, 0);
+      paintPicture();
     }
 
-    function path(points) {
-      if (!points.length) return;
-      ctx.beginPath();
-      ctx.moveTo(points[0].x, points[0].y);
-      if (points.length === 1) ctx.lineTo(points[0].x + 0.01, points[0].y);
-      for (var i = 1; i < points.length; i += 1) ctx.lineTo(points[i].x, points[i].y);
-      ctx.stroke();
+    function redraw() { pad.redraw(); }                               /* [#1221] */
+
+    /* [#1221] Two canvases go out as one PNG, at exactly the size the single
+     * canvas used to be: the picture first, the ink over it. Ink laid while
+     * the plate was parked is in the same viewport coordinates as the frozen
+     * picture, so it lands where the operator drew it. */
+    function compose() {
+      var out = doc.createElement('canvas');
+      out.width = canvas.width;
+      out.height = canvas.height;
+      var o = out.getContext('2d');
+      o.drawImage(pic, 0, 0);
+      o.drawImage(canvas, 0, 0);
+      return out.toDataURL('image/png');
     }
 
-    function redraw() {
-      ctx.clearRect(0, 0, W, H);
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, W, H);
-      if (img.complete && img.naturalWidth) ctx.drawImage(img, 0, 0, W, H);
-      inkStyle();
-      for (var i = 0; i < strokes.length; i += 1) path(strokes[i]);
+    /* #1148: THE BACKGROUND IS SWAPPABLE, AND ONLY THE BACKGROUND.
+     *
+     * "Whenever I access the screen capture to follow report, I also want
+     *  to be able to scrub between the last five seconds of the broadcast
+     *  to find the right frame."
+     *
+     * The new picture is decoded into a SECOND Image and only becomes the
+     * background once it has loaded, so dragging the slider never flashes
+     * black between frames. A pick that lands while an earlier one is
+     * still decoding wins: the late arrival sees bgSrc has moved on and
+     * drops itself. redraw() then repaints the ink on top, untouched. */
+    function setBackground(url, live) {
+      url = String(url || '');
+      if (!url || url === bgSrc) return;
+      bgSrc = url;
+      var next = new Image();
+      next.onload = function () {
+        if (bgSrc !== url) return;          /* a later pick already won */
+        img = next;
+        paintPicture();                                               /* [#1221] */
+      };
+      next.onerror = function () {
+        if (bgSrc !== url) return;
+        toast(live
+          ? 'the picture could not be decoded; the ink still files'
+          : 'that frame could not be decoded; the picture is unchanged', true);
+      };
+      next.src = url;
     }
 
-    img.onload = fit;
-    img.onerror = function () { fit(); toast('the picture could not be decoded; the ink still files', true); };
     fit();                                  /* black until the picture lands */
     loadPicture(src).then(function (got) {
       if (!wrap.parentNode) { if (got.revoke) got.revoke(); return; }
       revoke = got.revoke;
-      img.src = got.src;
+      liveSrc = got.src;
+      /* Only if the operator has not already scrubbed away from it. */
+      if (!bgSrc) setBackground(got.src, true);
     }, function (err) {
       toast('the picture could not be fetched: ' + String((err && err.message) || err), true);
     });
 
-    /* Ink. The canvas owns its pointer (touch-action:none in the sheet, so
-     * the WebView never turns a stroke into a scroll). */
-    var inkId = null;
-    canvas.addEventListener('pointerdown', function (ev) {
-      if (inkId !== null) return;
-      if (ev.pointerType === 'mouse' && ev.button !== 0) return;
-      inkId = ev.pointerId;
-      try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
-      stroke = [{x: ev.clientX, y: ev.clientY}];
-      inkStyle();
-      path(stroke);
-      ev.preventDefault();
-    });
-    canvas.addEventListener('pointermove', function (ev) {
-      if (inkId === null || ev.pointerId !== inkId || !stroke) return;
-      var last = stroke[stroke.length - 1];
-      var p = {x: ev.clientX, y: ev.clientY};
-      stroke.push(p);
-      inkStyle();
-      ctx.beginPath();
-      ctx.moveTo(last.x, last.y);
-      ctx.lineTo(p.x, p.y);
-      ctx.stroke();
-      ev.preventDefault();
-    });
-    function inkUp(ev) {
-      if (inkId === null || ev.pointerId !== inkId) return;
-      try { canvas.releasePointerCapture(ev.pointerId); } catch (e) { /* not held */ }
-      inkId = null;
-      if (stroke && stroke.length) strokes.push(stroke);
-      stroke = null;
+    /* [#1221] The ink lives on inkPad now - the same coalesced-event stroke
+     * handling as before (#1154), on a canvas that stays where it is when the
+     * picture slides off the screen.
+     *
+     * AND THE WINDOW CAN LEAVE. The plate and the furniture move together; the
+     * ink canvas underneath them does not move at all. Parking also ENDS THE
+     * HUSH: the page below was taken out of the rendering lifecycle because an
+     * opaque sheet covered it (#1154), and the moment the sheet is not
+     * covering it there is nothing to hush - a parked plate over a hushed page
+     * would be a blank screen to draw on. */
+    function s2Note() {
+      return scrubAt > 0
+        ? 'the frame from ' + fmtBack(scrubAt) + ' before the capture - the ink stays'
+        : String(opts.note || 'draw on the picture, then file the report');
     }
-    canvas.addEventListener('pointerup', inkUp);
-    canvas.addEventListener('pointercancel', inkUp);
 
-    undo.addEventListener('click', function () { if (busy) return; strokes.pop(); redraw(); });
-    clear.addEventListener('click', function () { if (busy) return; strokes.length = 0; redraw(); });
+    var rig = slideRig({
+      z: 2147483036,
+      tabWord: 'the capture',
+      handleWord: 'drag sideways to draw on the whole screen',
+      apply: function (px, spring) {
+        var css = px ? 'translateX(' + Math.round(px) + 'px)' : '';
+        plate.style.transition = spring ? SLIDE_SPRING : 'none';
+        chrome.style.transition = spring ? SLIDE_SPRING : 'none';
+        plate.style.transform = css;
+        chrome.style.transform = css;
+      },
+      onAway: function () {
+        slid = true;
+        dressWrap();
+        unhush();
+        note.textContent = 'the whole screen takes ink - the capture is at the edge';
+        toast('the capture is parked; draw anywhere, then bring it back');
+      },
+      onHome: function (was) {
+        slid = false;
+        dressWrap();
+        hush();
+        note.textContent = s2Note();
+        if (was && strokes.length) toast('the ink came back with it');
+      }
+    });
+    chrome.appendChild(rig.handle);                                   /* [#1221] */
+
+    undo.addEventListener('click', function () { if (busy) return; pad.undo(); });
+    clear.addEventListener('click', function () { if (busy) return; pad.clear(); });
     cancel.addEventListener('click', function () {
       if (busy) return;
       close();
@@ -692,18 +1329,340 @@
       toast(String(opts.cancelSay || 'nothing filed'));
     });
 
+    /* ------------------------------------------- #1148: the scrub strip */
+
+    /* "Whenever I access the screen capture to follow report, I also want
+     *  to be able to scrub between the last five seconds of the broadcast
+     *  to find the right frame."
+     *
+     * The screenshot is of the screen AS IT IS WHEN THE SWIPE FINISHES,
+     * which is always a beat after the thing the operator meant to point
+     * at. The tablet has already been holding a rolling video of the
+     * screen (replay/ScreenReplay.kt); replayFrames pulls the last five
+     * seconds of it out as ten small JPEGs, and this is the row of them.
+     *
+     * WHAT IT MUST NOT DO. It must not delay the annotator: the sheet is
+     * already up and drawable with the live shot before this is asked for.
+     * It must not appear at all where there is no ring - the desk has no
+     * replayFrames, and an empty strip or an error there would be a worse
+     * annotator than the one that shipped. So: no bridge road, or ok:false,
+     * or no frames, and the whole thing is taken back off the sheet. */
+    /* #1155 - AND IT REACHES THE WHOLE RING.
+     *
+     * "Okay, that is actually much smoother. That is better. Also, I would
+     *  like to go back the whole recording range."
+     *
+     * TWO CONTROLS, because one cannot be both. The COARSE slider carries
+     * the whole of what the ring holds - twenty minutes - and says where
+     * the shown window sits; the FINE slider walks the ten thumbnails
+     * inside that window. On a 1154x690 glass a single slider over 1200
+     * seconds gives a thumb about half a second of ring per pixel, which
+     * is no way to find a frame.
+     *
+     * WINDOWS, NEVER THE WHOLE THING. Twenty minutes of thumbnails would
+     * be 2400 pictures and tens of megabytes; the strip only ever holds
+     * SCRUB_WINDOW seconds of them, and asks for another window when the
+     * coarse slider settles. Asks are snapped to SCRUB_STEP so that going
+     * back to somewhere already visited is answered from the cache rather
+     * than by re-muxing the ring.
+     *
+     * THE FIRST PAINT IS STILL INSTANT. The sheet opens on the live shot,
+     * the nearest window (back = 0) is asked for straight away, and
+     * nothing reaches further back until the operator asks it to. */
+    var strip = null;
+    var stripThumbs = null;
+    var stripSlider = null;
+    var stripCoarse = null;
+    var stripWhen = null;
+    var shots = [];
+    var held = 0;                /* what the ring holds, in seconds */
+    var backNow = 0;             /* where the shown window ends, before now */
+    var settleTimer = null;
+    var inFlight = 0;            /* the ask whose answer is still wanted */
+
+    /* The window cache. Keyed by the snapped `back`; value is the frame
+     * list exactly as the bridge gave it. `cacheChars` is the measured
+     * base64 it holds, and the least recently used window goes when that
+     * passes SCRUB_CACHE - see the constant for why 5 MB. */
+    var cache = {};
+    var cacheOrder = [];
+    var cacheChars = 0;
+
+    function cacheKey(back) { return String(Math.round(back / SCRUB_STEP) * SCRUB_STEP); }
+
+    function cacheGet(back) {
+      var k = cacheKey(back);
+      var hit = cache[k];
+      if (!hit) return null;
+      var at = cacheOrder.indexOf(k);            /* freshen it */
+      if (at >= 0) { cacheOrder.splice(at, 1); cacheOrder.push(k); }
+      return hit;
+    }
+
+    function cachePut(back, list) {
+      var k = cacheKey(back);
+      if (cache[k]) return;
+      var chars = 0, i;
+      for (i = 0; i < list.length; i += 1) chars += String(list[i].image || '').length;
+      cache[k] = {list: list, chars: chars};
+      cacheOrder.push(k);
+      cacheChars += chars;
+      while (cacheChars > SCRUB_CACHE && cacheOrder.length > 1) {
+        var old = cacheOrder.shift();
+        if (cache[old]) { cacheChars -= cache[old].chars; delete cache[old]; }
+      }
+    }
+
+    function dropStrip() {
+      if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+      if (strip && strip.parentNode) strip.parentNode.removeChild(strip);
+      strip = null;
+      stripThumbs = null;
+      stripSlider = null;
+      stripCoarse = null;
+      stripWhen = null;
+      shots = [];
+      cache = {};
+      cacheOrder = [];
+      cacheChars = 0;
+      scrubClass = '';                                                /* [#1221] */
+      dressWrap();
+    }
+
+    /* '-1m 12s' for the older frames, 'now' for the live shot. */
+    function stripLabel(at) {
+      return at > 0 ? '-' + fmtBack(at) : 'now';
+    }
+
+    function pick(i) {
+      if (busy || !shots.length) return;
+      if (!(i >= 0)) i = 0;
+      if (i >= shots.length) i = shots.length - 1;
+      var s = shots[i];
+      if (!s) return;
+      scrubAt = s.at;
+      setBackground(s.live ? (liveSrc || src) : s.full, !!s.live);
+      if (stripSlider && String(stripSlider.value) !== String(i)) stripSlider.value = String(i);
+      if (stripThumbs) {
+        var kids = stripThumbs.childNodes;
+        for (var k = 0; k < kids.length; k += 1) {
+          if (kids[k] && kids[k].className !== undefined) {
+            kids[k].className = 'hc-strip-thumb' + (k === i ? ' on' : '');
+          }
+        }
+      }
+      note.textContent = rig.isAway()                                 /* [#1221] */
+        ? 'the whole screen takes ink - the capture is at the edge'
+        : s2Note();
+    }
+
+    /* Paint the thumbnails for the window now in hand. `list` is the
+     * bridge's frames, oldest first; `atTail` says the window reaches now,
+     * in which case the newest tile is the LIVE SHOT rather than the ring's
+     * last frame - the operator is already drawing on the live shot, and
+     * coming back to "now" has to give back exactly the picture that was
+     * there, to the pixel, or the ink would no longer line up with what is
+     * under it. The ring's own last frame is still that tile's thumbnail:
+     * it is the cheap small one and it looks the same. */
+    function paintWindow(list, atTail) {
+      var i;
+      shots = [];
+      for (i = 0; i < list.length; i += 1) {
+        var f = list[i];
+        var at = Number(f && f.at);
+        if (!isFinite(at) || at < 0) at = 0;
+        var pic = String((f && f.image) || '');
+        if (pic) shots.push({at: at, thumb: pic, full: pic, live: false});
+      }
+      if (!shots.length) return false;
+      if (atTail) {
+        shots[shots.length - 1].at = 0;
+        shots[shots.length - 1].live = true;
+      }
+      if (!stripThumbs) return false;
+      stripThumbs.innerHTML = '';
+      for (i = 0; i < shots.length; i += 1) {
+        (function (idx) {
+          var b = make('button', 'hc-strip-thumb');
+          b.type = 'button';
+          var im = doc.createElement('img');
+          im.src = shots[idx].thumb;
+          im.alt = '';
+          b.appendChild(im);
+          b.appendChild(make('span', 'hc-strip-at', stripLabel(shots[idx].at)));
+          b.addEventListener('click', function (ev) { ev.stopPropagation(); pick(idx); });
+          stripThumbs.appendChild(b);
+        }(i));
+      }
+      stripSlider.max = String(shots.length - 1);
+      stripSlider.value = String(shots.length - 1);
+      pick(shots.length - 1);
+      return true;
+    }
+
+    function sayWhen(text) { if (stripWhen) stripWhen.textContent = text; }
+
+    /* Ask the bridge for the window ending `back` seconds before now, or
+     * answer it from the cache. Only the LAST ask counts: a drag across
+     * the ring can leave earlier answers in flight and they must not paint
+     * over the window the operator has since moved to. */
+    function loadWindow(back, onFirst) {
+      var snapped = Math.round(back / SCRUB_STEP) * SCRUB_STEP;
+      var hit = cacheGet(snapped);
+      if (hit) {
+        backNow = snapped;
+        paintWindow(hit.list, snapped <= 0);
+        sayWhen(snapped <= 0 ? 'the last ' + SCRUB_WINDOW + ' seconds'
+          : 'the ' + SCRUB_WINDOW + ' seconds ending ' + fmtBack(snapped) + ' ago');
+        return;
+      }
+      var mine = ++inFlight;
+      sayWhen(snapped <= 0 ? 'reading the last five seconds...'
+        : 'reading ' + fmtBack(snapped) + ' back...');
+      var asked;
+      try {
+        asked = bridge().replayFrames({seconds: SCRUB_WINDOW, count: SCRUB_COUNT, back: snapped});
+      } catch (err) { asked = Promise.reject(err); }
+      Promise.resolve(asked).then(function (got) {
+        if (!wrap.parentNode || mine !== inFlight) return;      /* stale */
+        var list = (got && got.ok && got.frames && got.frames.length) ? got.frames : null;
+        if (!list) {
+          if (onFirst) { dropStrip(); return; }
+          sayWhen('nothing readable that far back');
+          return;
+        }
+        /* What the ring holds can only be known once it has answered; the
+         * coarse slider's reach is set from it and grows as the ring does. */
+        var nowHeld = Number(got.held || got.seconds || 0);
+        if (isFinite(nowHeld) && nowHeld > held) {
+          held = nowHeld;
+          if (stripCoarse) stripCoarse.max = String(Math.max(SCRUB_STEP, Math.floor(held)));
+        }
+        cachePut(snapped, list);
+        backNow = snapped;
+        if (onFirst && !buildStrip()) { dropStrip(); return; }
+        if (!paintWindow(list, snapped <= 0)) { if (onFirst) dropStrip(); return; }
+        if (stripCoarse) stripCoarse.value = String(Math.round(snapped));
+        /* The bridge says where the window REALLY landed. Asking further
+         * back than the ring reaches is not an error - it is the oldest
+         * thing there is - but the operator is told rather than shown the
+         * wrong minute without a word. */
+        if (got.clamped) {
+          sayWhen('that is as far back as the ring goes - ' + fmtBack(Number(got.to) || 0) + ' ago');
+        } else {
+          sayWhen(snapped <= 0 ? 'the last ' + SCRUB_WINDOW + ' seconds'
+            : 'the ' + SCRUB_WINDOW + ' seconds ending ' + fmtBack(snapped) + ' ago');
+        }
+      }, function () {
+        if (!wrap.parentNode || mine !== inFlight) return;
+        /* Silence is the contract on the first ask: the annotator is
+         * exactly what it was where there is no ring to read. */
+        if (onFirst) dropStrip(); else sayWhen('that window could not be read');
+      });
+    }
+
+    /* The strip's furniture, built once the first window has answered. */
+    function buildStrip() {
+      if (!strip) return false;
+      strip.className = 'hc-strip';
+      strip.innerHTML = '';
+
+      stripThumbs = make('div', 'hc-strip-thumbs');
+
+      stripSlider = doc.createElement('input');
+      stripSlider.type = 'range';
+      stripSlider.className = 'hc-strip-slider';
+      stripSlider.min = '0';
+      stripSlider.max = String(SCRUB_COUNT - 1);
+      stripSlider.step = '1';
+      stripSlider.value = String(SCRUB_COUNT - 1);
+      stripSlider.addEventListener('input', function () { pick(Number(stripSlider.value)); });
+      stripSlider.addEventListener('change', function () { pick(Number(stripSlider.value)); });
+
+      /* THE COARSE SLIDER runs backwards on purpose: hard right is now,
+       * and dragging left walks into the past, which is the direction a
+       * timeline runs everywhere else on this station. It is `direction:
+       * rtl` in the stylesheet, so the VALUE is still plain seconds-back
+       * and no arithmetic has to be inverted here. */
+      var row = make('div', 'hc-strip-far');
+      stripCoarse = doc.createElement('input');
+      stripCoarse.type = 'range';
+      stripCoarse.className = 'hc-strip-coarse';
+      stripCoarse.min = '0';
+      stripCoarse.max = String(Math.max(SCRUB_STEP, Math.floor(held || SCRUB_STEP)));
+      stripCoarse.step = String(SCRUB_STEP);
+      stripCoarse.value = '0';
+      stripWhen = make('div', 'hc-strip-line', 'the last ' + SCRUB_WINDOW + ' seconds');
+
+      function coarseMoved() {
+        var back = Number(stripCoarse.value) || 0;
+        /* The read-out follows the thumb at once; the ASK waits until the
+         * thumb stops. A drag over twenty minutes crosses hundreds of
+         * windows and must not mux the ring for any of them on the way. */
+        sayWhen(back <= 0 ? 'the last ' + SCRUB_WINDOW + ' seconds'
+          : fmtBack(back) + ' ago');
+        if (settleTimer) clearTimeout(settleTimer);
+        settleTimer = setTimeout(function () {
+          settleTimer = null;
+          loadWindow(back, false);
+        }, SCRUB_SETTLE);
+      }
+      stripCoarse.addEventListener('input', coarseMoved);
+      stripCoarse.addEventListener('change', coarseMoved);
+
+      row.appendChild(stripCoarse);
+      strip.appendChild(stripThumbs);
+      strip.appendChild(stripSlider);
+      strip.appendChild(row);
+      strip.appendChild(stripWhen);
+      scrubClass = 'hc-scrub';                                        /* [#1221] */
+      dressWrap();
+      return true;
+    }
+
+    if (opts.scrub && has('replayFrames')) {
+      strip = make('div', 'hc-strip hc-strip-wait');
+      strip.appendChild(make('div', 'hc-strip-line', 'reading the last five seconds...'));
+      chrome.appendChild(strip);                                      /* [#1221] rides with the plate */
+      scrubClass = 'hc-scrub-wait';                                   /* [#1221] */
+      dressWrap();
+      /* What the ring holds, asked for beside the frames rather than
+       * before them - the first window must not wait on a second call.
+       * replayState is only a nicety here; replayFrames reports `held`
+       * itself and that is what actually sets the slider's reach. */
+      if (has('replayState')) {
+        Promise.resolve(bridge().replayState()).then(function (st) {
+          var s = Number(st && st.seconds);
+          if (isFinite(s) && s > held) {
+            held = s;
+            if (stripCoarse) stripCoarse.max = String(Math.max(SCRUB_STEP, Math.floor(held)));
+          }
+        }, function () { /* replayFrames will say */ });
+      }
+      loadWindow(0, true);
+    }
+
+    /* Which frame this picture is, in the operator's words, or '' for the
+     * live one. It becomes the first line of the Pine report so the inbox
+     * item says what the picture alone cannot. #1155: the same minutes-and
+     * -seconds wording the strip uses, through the one formatter. */
+    function frameNote() {
+      if (!(scrubAt > 0)) return '';
+      return '(the frame from ' + fmtBack(scrubAt) + ' before the capture)';
+    }
+
     /* The default onDone: the report road. */
     function fileReport(png) {
       if (!root.PineReport || typeof root.PineReport.fromKey !== 'function') {
         throw new Error('the report pad is not loaded on this surface');
       }
-      root.PineReport.fromKey(png);
+      root.PineReport.fromKey(png, frameNote());
     }
 
     file.addEventListener('click', function () {
       if (busy) return;
       var png = '';
-      try { png = canvas.toDataURL('image/png'); } catch (e) { png = ''; }
+      try { png = compose(); } catch (e) { png = ''; }                /* [#1221] */
       if (!png) {
         toast('the marked-up picture could not be composed (the picture is not ours to export)', true);
         return;
@@ -714,7 +1673,7 @@
       if (opts.busyLabel && file.lastChild) file.lastChild.textContent = String(opts.busyLabel);
       file.disabled = true;
       var out;
-      try { out = done(png); } catch (e) { out = Promise.reject(e); }
+      try { out = done(png, frameNote()); } catch (e) { out = Promise.reject(e); }
       Promise.resolve(out).then(function () {
         busy = false;
         close();
@@ -733,7 +1692,9 @@
     toast('taking the picture…');
     shoot().then(function (dataUrl) {
       toast('');
-      annotate(dataUrl, {});               /* the report road, as before */
+      /* #1148: the report road, as before - with the last five seconds
+       * offered underneath it where the tablet can serve them. */
+      annotate(dataUrl, {scrub: true});
     }, function (err) {
       toast(String((err && err.message) || err), true);
     });
@@ -770,6 +1731,36 @@
     return kind === 'pine-video-editor-close' || kind === 'pine-video-editor-export' ? kind : '';
   }
 
+  /* [#1242] THE EDITOR IS AN IFRAME AND CANNOT HOLD THE KEY.
+   *
+   * On the desk this page is a file:// document and the editor is loaded from
+   * the station, so the frame is cross-origin: Electron's preload never runs
+   * inside it, window.pineDesktop is not there, and the editor's last resort
+   * (window.__PINE_VIDEO_EDITOR_KEY) is assigned nowhere in this tree. Its
+   * save POST therefore went out bare and the station answered 401, which the
+   * editor's footer printed as the bare word "Unauthorized".
+   *
+   * This surface DOES hold the key. When the editor asks, mint a permit for
+   * that one source and post it back into the frame - never the key itself,
+   * and never to any window but the frame we opened. */
+  function editorPermitAsk(event, frameWindow, origin) {
+    if (!event || event.source !== frameWindow || event.origin !== origin) return;
+    var said = event.data;
+    if (!said || said.type !== 'pine-video-editor-need-save-token') return;
+    var id = String((said.detail && said.detail.source_id) || '');
+    if (!/^[0-9a-f]{32}$/.test(id)) return;
+    function hand(token) {
+      try { frameWindow.postMessage({type: 'pine-video-editor-save-token', detail: {save_token: token || ''}}, origin); }
+      catch (err) { /* the editor closed while we were minting */ }
+    }
+    Promise.resolve().then(function () {
+      if (!has('post')) throw new Error('no station bridge on this surface');
+      return bridge().post('/api/video-editor/sources/' + id + '/save-token', {});
+    }).then(function (answer) {
+      hand((answer && (answer.save_token || answer.token)) || '');
+    })['catch'](function () { hand(''); });
+  }
+
   /* Keep the station document and its player alive underneath the editor.
    * The source is an opaque station identity; returned URLs cannot navigate
    * the native bridge to another host. Export notifications never save files. */
@@ -788,14 +1779,110 @@
     frame.title = 'Edit screen recording';
     frame.setAttribute('allow', 'autoplay; fullscreen');
     frame.src = url;
+    /* [#1221] "I want to be able to slide it out of the screen so that way I
+     * can draw on the screen full screen."
+     *
+     * The editor is the window he named. It gets the same grab handle as the
+     * annotator, and BEHIND IT a full-screen ink pad that only takes pointers
+     * while the editor is parked. The recording under the editor is a
+     * recording OF THIS SCREEN, so a stroke's place on the glass is its place
+     * in the picture: x/innerWidth, y/innerHeight is the mark's normalised
+     * point, which is exactly the coordinate space video-editor.js keeps its
+     * marks in. When the editor comes back the strokes are handed to it as
+     * Draw-layer marks over the same-origin postMessage road it already
+     * speaks, and the pad is wiped so nothing is added twice. */
+    var free = make('canvas', 'hc-free-ink');
+    var freePad = inkPad(free);
+    var editorRig = slideRig({
+      z: 2147483037,
+      tabWord: 'the editor',
+      handleWord: 'drag sideways to draw on the whole screen',
+      apply: function (px, spring) {
+        box.style.transition = spring ? SLIDE_SPRING : 'none';
+        box.style.transform = px ? 'translateX(' + Math.round(px) + 'px)' : '';
+      },
+      onAway: function () {
+        free.classList.add('on');
+        freePad.fit();
+        toast('the editor is parked; draw anywhere and it goes into its drawings');
+      },
+      onHome: function (was) {
+        free.classList.remove('on');
+        if (was) handOff();
+      }
+    });
+    /* Marks are normalised to the viewport and the editor holds them
+     * normalised to the source frame. The recording IS the screen, so the two
+     * are the same numbers; a stroke of one point is still a dot. */
+    function handOff() {
+      var m = freePad.metrics();
+      var w = Math.max(1, m.w);
+      var h = Math.max(1, m.h);
+      var marks = [];
+      for (var i = 0; i < freePad.strokes.length; i += 1) {
+        var pts = [];
+        for (var k = 0; k < freePad.strokes[i].length; k += 1) {
+          pts.push({x: Math.min(1, Math.max(0, freePad.strokes[i][k].x / w)),
+            y: Math.min(1, Math.max(0, freePad.strokes[i][k].y / h))});
+        }
+        if (pts.length) marks.push({kind: 'pen', color: '#ff2828', weight: 6, points: pts});
+      }
+      freePad.clear();
+      if (!marks.length) return;
+      try {
+        frame.contentWindow.postMessage({type: 'pine-video-editor-marks', marks: marks}, origin);
+        toast(marks.length === 1 ? 'the stroke went into the editor drawings'
+          : marks.length + ' strokes went into the editor drawings');
+      } catch (err) {
+        toast('the strokes could not be handed to the editor: '
+          + String((err && err.message) || err), true);
+      }
+    }
+    box.appendChild(editorRig.handle);                                /* [#1221] */
     box.appendChild(bar);
     box.appendChild(frame);
+    doc.body.appendChild(free);                                       /* [#1221] */
     doc.body.appendChild(box);
+    freePad.fit();                                                    /* [#1221] */
+    /* 2026-09-15 (#1172): "Whenever I'm in the process of editing a screen
+     * recording or editing a screenshot or filing a report, stop playing
+     * video and audio until I close the window. Also stop playing videos
+     * and spawning videos whenever I have a pop-up up dealing with
+     * diagnostic screen capture or video editing."
+     *
+     * The report pad, the ink overlay and every corner sheet already tell
+     * PineDuck they are open, and the listen and SFX roads stand their
+     * clips down on that signal (#1167). This editor was the one surface
+     * that did not - so a clip could play, and start the next one, behind
+     * the very window he is editing a clip in. The hold is tied to the
+     * element, so a road that tears the editor out without calling close()
+     * still ends the quiet. */
+    /* 2026-09-15 (#1210): AND THE QUIET MAY NEVER COST HIM THE CLOSE BUTTON.
+     *
+     * This call was unguarded, and the iframe is appended ABOVE it. A throw
+     * out of hold() therefore left the editor on screen with every one of
+     * its exits still unbuilt - close(), the back-click that calls it, the
+     * listener that hears the editor's own close and export, and the entry
+     * in `sheets`. The window opened and no road could shut it.
+     *
+     * hold() walks the document's media nodes and fans out to every
+     * watcher, so it has real ways to fail. Ducking the room is a courtesy.
+     * Being able to close the window is not. */
+    try {
+      if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+        root.PineDuck.hold('hc-video-editor', root.PineDuck.REPORT, box);
+      }
+    } catch (err) { /* the show keeps playing; the editor still closes */ }
     var entry = {box: box, close: close};
     function close() {
       root.removeEventListener('message', receive);
       var at = sheets.indexOf(entry);
       if (at >= 0) sheets.splice(at, 1);
+      /* [#1221] Ink first: a parked editor that is closed still owes the
+       * editor its strokes, and the pad may never outlive the window. */
+      try { if (editorRig.isAway()) handOff(); } catch (e) { /* the window still shuts */ }
+      try { editorRig.destroy(); } catch (e) { /* the window still shuts */ }
+      if (free.parentNode) free.parentNode.removeChild(free);
       if (box.parentNode) box.parentNode.removeChild(box);
       if (videoEditor === entry) videoEditor = null;
     }
@@ -803,6 +1890,7 @@
       var kind = editorMessage(event, frame.contentWindow, origin);
       if (kind === 'pine-video-editor-close') close();
       else if (kind === 'pine-video-editor-export') toast('Edited video is ready');
+      else editorPermitAsk(event, frame.contentWindow, origin);        /* [#1242] */
     }
     back.addEventListener('click', close);
     root.addEventListener('message', receive);
@@ -811,6 +1899,19 @@
     return entry;
   }
 
+  /* [#1225] The phases ScreenReplay.audioStatus reports, in the words
+   * the operator used. `not started` is the one that means something is
+   * wrong; every other value means the background capture is alive. */
+  var PINE_AUDIO_PHASE = {
+    ready: 'running',
+    filling: 'running, still filling',
+    starting: 'starting',
+    silent: 'running, but hearing silence',
+    not_started: 'NOT STARTED',
+    stopped: 'stopped',
+    no_replay: 'no replay on this surface',
+    '': 'unknown'
+  };
   function exportSheet() {
     if (captureBusy) { toast('Preparing the captured video\u2026'); return; }
     var canEdit = has('replayEdit');
@@ -832,7 +1933,15 @@
     videoOnly.type = 'checkbox';
     var videoOnlyRow = make('label', 'hc-row hc-master');
     videoOnlyRow.appendChild(videoOnly);
-    videoOnlyRow.appendChild(make('span', '', 'Allow video without complete audio if unavailable'));
+    /* 2026-09-15 (#1205b): THE LABEL NOW HAS TO MEAN WHAT IT SENDS.
+     *
+     * It said "Allow video without complete audio if unavailable" and it
+     * sends `video_only`, which the cut reads as "do not carry the
+     * broadcast at all". Before tonight a desk recording was always silent,
+     * so the flag changed nothing and the wording cost nothing. Now that a
+     * cut carries the broadcast, ticking this is the difference between
+     * sound and none - so it says that. */
+    videoOnlyRow.appendChild(make('span', '', 'Record the picture only - no broadcast audio'));
     body.appendChild(big);
     body.appendChild(range);
     body.appendChild(ticks);
@@ -860,9 +1969,20 @@
     if (has('replayState')) {
       Promise.resolve(bridge().replayState()).then(function (got) {
         var audio = got && got.audio;
+        /* [#1225] IS THE TABLET CAPTURING, FIRST. This printed
+         * `audio.state`, which is the state of the last SAVE, not of the
+         * capture - so a tablet that had not captured a sample all day
+         * read "unavailable" exactly like one that had captured
+         * perfectly and simply had not been asked for a clip yet. The
+         * capture now runs as a background service whether or not the
+         * screen is lit, and its phase is one word. */
+        var phaseKey = String((got && got.capture_phase) || (audio && audio.capture_phase) || '');
         if (canEdit) audioNote.textContent = audio ?
-          'Audio: ' + String(audio.state || 'unknown').replace(/_/g, ' ') +
-          (audio.detail ? ' - ' + audio.detail : '') : 'Captured audio status is unavailable.';
+          'Audio capture: ' + (PINE_AUDIO_PHASE[phaseKey] || 'unknown')
+          + (Number(got && got.audio_seconds) > 0
+            ? ' (' + Math.round(Number(got.audio_seconds)) + ' s held)' : '')
+          + (audio.detail ? ' - ' + audio.detail : '')
+          : 'Captured audio status is unavailable.';
         var held = Number(got && got.seconds) || 0;
         table = stepTable(held);
         var last = -1;
@@ -1244,12 +2364,21 @@
     railTab: railTab,
     /* #1140: the red-ink annotator, for any picture - see annotate(). */
     annotate: annotate,
+    /* [#1221] the editor window, so the slide can be proved over CDP without
+     * cutting a fresh recording out of the ring first. */
+    videoEditor: openVideoEditor,
+    /* #1181: the rail keeps clear of the corner squares, and it can only
+     * do that if it knows how big they are. One number, one owner. */
+    CORNER_PX: CORNER_PX,
     ACTIONS: ACTIONS.slice(),
     ACTION_WORDS: merge({}, ACTION_WORDS),
     STEPS: STEPS.slice(),
     /* The pure parts, for a harness. */
     _cornerAt: cornerAt,
     _judge: judge,
+    /* #1166: whose press is this? Exported so the rail exemption can be
+     * checked against the real page rather than argued about. */
+    _overControl: overControl,
     _stepTable: stepTable,
     _heardRow: heardRow,
     _lastSfx: lastSfx,

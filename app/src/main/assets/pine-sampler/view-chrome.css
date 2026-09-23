@@ -1,3 +1,20 @@
+/* HIDDEN MEANS HIDDEN.
+ *
+ * "Collapse the volume panel into an icon - it's always open by default and
+ * I hate that", and before that, "I still can't close this volume overlay".
+ * Both were the same fault, and it was never in the JavaScript: the panel
+ * was BUILT with the `hidden` attribute and the close handler SET it, and
+ * neither did anything, because `.pl-desk { display: flex }` is a class
+ * selector and the browser's own `[hidden] { display: none }` is a
+ * type-level user-agent rule. The class wins. Every time.
+ *
+ * So the fix is not another per-panel guard - there were four elements one
+ * `display:` rule away from the same bug. It is this, once, first in the
+ * bundle: an element that says it is hidden IS hidden, whatever its class
+ * does about display. Anything that wants to show must clear the attribute.
+ */
+[hidden] { display: none !important; }
+
 /* The furniture every terminal view wears. See view-chrome.js for why it
  * exists at all - in short, all three of the operator's sketches draw the
  * same view bar, pine tree and transport in the same corner, and none of
@@ -193,4 +210,178 @@
 @media (max-width: 760px) {
   .vc-tree { width: 52px; height: 52px; }
   .vc-tree svg { width: 28px; height: 28px; }
+}
+
+/* THE CONSOLE LINE - one row along the bottom of every screen.
+ *
+ * "At the bottom of the tablet on all of these screens just have one line
+ * showing the output of what is happening with the console on the backhand."
+ * It reads the station's own activity_log, which is already in the poll
+ * every view makes - so it costs no request, no timer and no socket. */
+.pine-console {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 2147483002;
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 12px;
+  min-height: 22px;
+  background: rgba(10, 14, 18, .92);
+  border-top: 1px solid #35414c;
+  color: #8fa0ad;
+  font: 11px/1.4 Inter, Segoe UI, system-ui, sans-serif;
+  /* One line, always. A console strip that wraps is a console strip that
+     eats the view it is reporting on. */
+  white-space: nowrap; overflow: hidden;
+}
+.pine-console-dot {
+  flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%;
+  background: #54d18b; opacity: .55;
+}
+.pine-console.pulse .pine-console-dot { animation: pineConsolePulse 1.1s ease-out; }
+@keyframes pineConsolePulse {
+  0% { opacity: 1; transform: scale(1.6); }
+  100% { opacity: .55; transform: scale(1); }
+}
+.pine-console-stage {
+  flex: 0 0 auto; color: #edf3f5; font-weight: 600;
+  text-transform: lowercase;
+}
+.pine-console-detail {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+}
+/* Give every view room for it, so nothing is hidden under the strip. */
+.pine-view-host, #sampler { padding-bottom: 26px; }
+
+/* THE TALK DOT - bottom right, on every screen.
+ *
+ * "A dot that I'm able to tap on and use to begin talking to the tablet and
+ * make a request... that dot basically explodes into a 3JS simulation of
+ * undulating particles reacting to me talking."
+ *
+ * Above the console strip and clear of the view rail, so it never covers
+ * either. The particle canvas is the "explosion": collapsed to the dot's
+ * size at rest and expanded while listening. */
+.pine-talk-dot {
+  position: fixed;
+  right: 46px;
+  bottom: 34px;
+  /* [#1193] ABOVE THE SHEETS. At 2147483004 the particle field the
+     operator dictates into was under every pop-up this shell can have
+     open - the Script view's windows, the hold sheet, the SFX menu. It
+     is now over all of them and still under the locked-screen dot
+     (2147483090), the boot splash and the rail. Same value on the desk
+     and on the tablet: this file is the one both of them load. */
+  z-index: 2147483080;
+  width: 56px; height: 56px;
+  padding: 0;
+  border: 1px solid #35414c;
+  border-radius: 50%;
+  background: #1c242c;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: width .18s ease, height .18s ease, border-radius .18s ease,
+              right .18s ease, bottom .18s ease;
+}
+.pine-talk-core {
+  position: absolute; inset: 0; margin: auto;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #65c7da;
+  transition: opacity .18s ease;
+}
+.pine-talk-fx {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  display: none;
+  border-radius: inherit;
+}
+/* Listening: the dot becomes a field for the particles to move in.
+ *
+ * AND IT STAYS OPEN WHILE IT THINKS. It used to collapse back to 56px the
+ * moment listening stopped - which is exactly when the cloud assembles the
+ * words it heard, so they were being rastered into a 67x67 canvas and
+ * were never legible. The field is also wider than it was: a sentence
+ * needs width, and 320px spelled about three words.
+ *
+ * "I want to see the three JS simulation build my speech and assemble it
+ * as it is put together with particles and line work." */
+.pine-talk-dot.listening,
+.pine-talk-dot.thinking {
+  width: min(520px, 86vw);
+  height: min(230px, 38vh);
+  border-radius: 16px;
+  border-color: #65c7da;
+  right: 46px;
+}
+.pine-talk-dot.listening .pine-talk-core,
+.pine-talk-dot.thinking .pine-talk-core { opacity: 0; }
+.pine-talk-dot.listening .pine-talk-fx,
+.pine-talk-dot.thinking .pine-talk-fx { display: block; }
+.pine-talk-dot.thinking { border-color: #e3be63; }
+
+/* What it heard, and what the station did with it. */
+.pine-talk-say {
+  position: fixed;
+  right: 46px;
+  bottom: 96px;
+  z-index: 2147483080;   /* [#1193] with the dot */
+  max-width: min(420px, 74vw);
+  padding: 8px 12px;
+  border: 1px solid #35414c;
+  border-radius: 10px;
+  background: rgba(10, 14, 18, .95);
+  color: #edf3f5;
+  font: 12px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .5);
+}
+.pine-talk-say.bad { border-color: #e46b6b; color: #e46b6b; }
+
+/* #1355: which ear. Right-click the dot.
+
+   It sits where the transcript sits and looks like it, because it is
+   the same object answering a different question about itself - a
+   separate settings panel for one choice would be more chrome than
+   the choice is worth. */
+.pine-talk-mics {
+  position: fixed;
+  right: 46px;
+  bottom: 96px;
+  z-index: 2147483081;   /* [#1193] one over the dot */
+  min-width: 220px;
+  max-width: min(420px, 74vw);
+  padding: 6px;
+  border: 1px solid #35414c;
+  border-radius: 10px;
+  background: rgba(10, 14, 18, .97);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .5);
+  font: 12px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+}
+.pine-talk-mics-head {
+  padding: 3px 7px 6px;
+  color: #8ea0ad;
+  font-size: 10.5px;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.pine-talk-mic {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #edf3f5;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pine-talk-mic:hover { background: rgba(101, 199, 218, .14); }
+.pine-talk-mic.on { color: #65c7da; }
+.pine-talk-mic.on::after { content: ' \2713'; }
+.pine-talk-mics-none {
+  padding: 6px 8px;
+  color: #e46b6b;
 }

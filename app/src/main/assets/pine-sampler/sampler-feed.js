@@ -103,17 +103,71 @@
     emit("tick");
   }
 
+  /* [#1386] THE TABLET SUSPENDS TIMERS AND KEEPS rAF.
+   *
+   * "I dont know why videos pop up on the pine tab and sit there not
+   * playing frozen. why arent they closing and leaving the screen like
+   * normal?"
+   *
+   * Because the thing that would close them is a setInterval. The PineTab's
+   * WebView suspends JS timers while requestAnimationFrame keeps firing at
+   * vsync, so both timers below stop together - and with the 250ms tick go
+   * every consumer that hangs off it, including video-wall.js's MAX_CLIP_MS
+   * backstop, the one thing that takes a clip off the wall when its own
+   * `ended` never arrives. The wall is not stuck; it is never asked.
+   *
+   * So rAF paces them. It does NOT replace the intervals - on the desktop
+   * they fire perfectly well and this sees no gap and does nothing. It only
+   * notices that wall-clock time has passed without the beat arriving, and
+   * runs it. Every decision is made from a fresh Date.now(), never a frame
+   * count, because the frame rate on that glass is whatever it is (it tops
+   * out at 12fps) and counting frames would drift.
+   */
+  let rafId = null;
+  let lastTick = 0;
+  let lastPoll = 0;
+
+  function pace() {
+    rafId = null;
+    if (!pollTimer) return;            /* stopped */
+    const now = Date.now();
+    /* Generous margins: this is a backstop for a suspended timer, not a
+     * second scheduler. A beat that is merely late is left alone. */
+    if (now - lastTick >= TICK_MS * 4) {
+      lastTick = now;
+      try { tick(); } catch (err) { said(err); }
+    }
+    if (now - lastPoll >= POLL_MS * 2) {
+      lastPoll = now;
+      try { poll(); } catch (err) { said(err); }
+    }
+    arm();
+  }
+
+  function arm() {
+    if (rafId !== null || !pollTimer) return;
+    if (typeof root.requestAnimationFrame !== "function") return;
+    try { rafId = root.requestAnimationFrame(pace); }
+    catch (err) { rafId = null; }
+  }
+
   function start() {
     if (pollTimer) return;
+    lastTick = lastPoll = Date.now();
     poll();
-    pollTimer = setInterval(poll, POLL_MS);
-    tickTimer = setInterval(tick, TICK_MS);
+    pollTimer = setInterval(() => { lastPoll = Date.now(); poll(); }, POLL_MS);
+    tickTimer = setInterval(() => { lastTick = Date.now(); tick(); }, TICK_MS);
+    arm();
   }
 
   function stop() {
     if (pollTimer) clearInterval(pollTimer);
     if (tickTimer) clearInterval(tickTimer);
     pollTimer = tickTimer = null;
+    if (rafId !== null && typeof root.cancelAnimationFrame === "function") {
+      try { root.cancelAnimationFrame(rafId); } catch (err) { /* gone */ }
+    }
+    rafId = null;
   }
 
   root.PineStationFeed = {

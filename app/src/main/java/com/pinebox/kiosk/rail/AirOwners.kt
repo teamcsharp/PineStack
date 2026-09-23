@@ -82,15 +82,31 @@ object AirOwners {
             val listener = row.optString("listener")
             if (listener.isBlank()) continue
             val addr = row.optString("addr")
-            val device = deviceFor(table, addr, listener)
-            val name = table?.optJSONObject(device)?.optString("name").orEmpty()
+            /* [#1185] THE STATION DECIDES WHAT A PLAYER IS, NOT THIS SIDE.
+             *
+             * It can see the three things that settle it and this side
+             * cannot: the listener id prefix the Electron shell mints, the
+             * `PineBoxKiosk/<ver>` marker in the kiosk WebView's own user
+             * agent, and the x-pinebox-public header that says the poll
+             * came through the public listener door. Matching an ADDRESS
+             * against the terminals table - which is what this used to do -
+             * cannot tell two surfaces on one machine apart, and drew a
+             * browser window on the desk as "This app" beside the real one.
+             *
+             * `deviceFor` stays as the fallback so a tablet running ahead of
+             * a station restart still paints something sensible. */
+            val device = row.optString("device")
+                .ifBlank { deviceFor(table, addr, listener) }
+            val name = row.optString("name")
+                .ifBlank { table?.optJSONObject(device)?.optString("name").orEmpty() }
             val seen = row.optDouble("seen", -1.0)
+            val label = name.ifBlank { addr.ifBlank { listener } }
             out.add(
                 Player(
                     listener = listener,
                     device = device,
-                    label = name.ifBlank { addr.ifBlank { listener } },
-                    detail = detailOf(row, addr, name.isNotBlank(), seen, device),
+                    label = label,
+                    detail = detailOf(row, addr, name.isNotBlank(), seen, device, label),
                     addr = addr,
                     owns = listener == owner && owner.isNotBlank(),
                     seen = seen,
@@ -105,10 +121,19 @@ object AirOwners {
 
     private fun detailOf(
         row: JSONObject, addr: String, named: Boolean, seen: Double, device: String,
+        label: String = "",
     ): String {
-        val bits = ArrayList<String>(3)
+        val bits = ArrayList<String>(4)
         if (named && addr.isNotBlank()) bits.add(addr)
-        bits.add(kindOf(row.optString("listener"), device))
+        /* [#1185] the station's own word for this surface when it has one,
+         * and never repeated when it is already the row's name. */
+        val what = row.optString("what")
+            .ifBlank { kindOf(row.optString("listener"), device) }
+        if (what.isNotBlank() && !what.equals(label, ignoreCase = true)) bits.add(what)
+        /* [#1185] several listener ids collapsed into this one row: a page
+         * that reloaded, or two tabs of the same thing. One device. */
+        val surfaces = row.optInt("surfaces", 1)
+        if (surfaces > 1) bits.add(surfaces.toString() + " tabs")
         if (seen >= 0) bits.add(Math.round(seen).toString() + "s ago")
         return bits.joinToString(" · ")
     }

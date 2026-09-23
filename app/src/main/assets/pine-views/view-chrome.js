@@ -94,13 +94,32 @@
    * that has found the tree should not also have to know about the gesture,
    * so the tree opens it.
    *
-   * Three doors, tried in order of how much they can do:
-   *   the native rail            (tablet, via the bridge)
+   * Two doors, tried in order of how much they can do:
    *   the desktop station drawer (the same controls, in the shell)
-   *   this module's own sheet    (anything else - never nothing) */
+   *   this module's own sheet    (anything else - never nothing)
+   *
+   * #1183: THERE WAS A THIRD DOOR IN FRONT OF THESE AND IT WENT NOWHERE.
+   *
+   * It read `root.pineDesktop.openRail` and, being a typeof guard, fell
+   * quietly through to the drawer every single time - because openRail
+   * exists on NEITHER surface. It is not in the desk's preload.js and it is
+   * not in the tablet's allowed-name list in bridge/PineDesktopBridge.kt.
+   * Checked both while closing the desk's parity gaps; nothing answers it
+   * and nothing ever did.
+   *
+   * It is removed rather than implemented, and on the desk the reason is
+   * plain: the shell's drawer IS the native rail's controls - broadcast
+   * routing, the station settings, the view switcher - and the door below
+   * already opens it. A bridge name that ended in the same drawer would be
+   * a second road to one room, which is the dead wiring this is clearing
+   * out, not a cure for it.
+   *
+   * What the removal does NOT do is close the tablet's own gap: there, the
+   * native drawer is still only reachable by the left-edge swipe, so the
+   * tree falls to this module's sheet. Giving the tree the real rail is a
+   * change to the Kotlin bridge, not to this file, and it is not pretended
+   * here by a probe that always misses. */
   function openMenu() {
-    var native = root.pineDesktop && root.pineDesktop.openRail;
-    if (typeof native === 'function') { native(); return 'rail'; }
     var drawer = document.getElementById('stationDrawer');
     if (drawer) {
       var opener = document.getElementById('stationDrawerBtn');

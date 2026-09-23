@@ -341,13 +341,35 @@
     who.id = 'spSayingWho';
     var text = make('div', 'sp-saying-text', '');
     text.id = 'spSayingText';
-    body.appendChild(who);
+    /* [#1219] "Show a timeline at the bottom while the animation or the
+       sound clip is playing." The label row carries the clock (0:12 / 0:22)
+       and the strip rides the card's bottom edge: a fill driven by the
+       sounding element - or by the tablet's native video wall, which has
+       no element at all - a tick at every line boundary of a welded round
+       and an amber mark at each interjection. It collapses when nothing
+       sounds - see paintTimeline(). */
+    var head = make('div', 'sp-saying-head');
+    head.appendChild(who);
+    var clk = make('i', 'sp-tl-clock', '');
+    clk.id = 'spSayingClock';
+    head.appendChild(clk);
+    body.appendChild(head);
     body.appendChild(text);
     var scope = document.createElement('canvas');
     scope.className = 'sp-saying-scope';
     scope.id = 'spSayingScope';
     box.appendChild(body);
     box.appendChild(scope);
+    var strip = make('div', 'sp-tl');
+    strip.id = 'spSayingTl';
+    strip.appendChild(make('i', 'sp-tl-track', ''));
+    var fill = make('i', 'sp-tl-fill', '');
+    fill.id = 'spSayingTlFill';
+    strip.appendChild(fill);
+    var marks = make('span', 'sp-tl-marks', '');
+    marks.id = 'spSayingTlMarks';
+    strip.appendChild(marks);
+    box.appendChild(strip);
     /* #1303b: TAP JUMPS, HOLD OPENS.
      *
      * A tap takes the reader to the line the strip is quoting; a hold
@@ -474,6 +496,290 @@
   var scopeWide = 0;
   var scopeHigh = 0;
 
+  /* ------------------------------------------------ [#1219] THE TIMELINE
+   *
+   * "Show a timeline at the bottom while the animation or the sound clip
+   *  is playing."
+   *
+   * WHAT IT READS. The strip is driven by the thing that is actually
+   * sounding, never by the station clock. In order: the panel's voice
+   * element in this document, the CRT set's <video> when a clip with a
+   * picture is on, the PineTab's NATIVE video wall when the endless set
+   * has moved onto its own surface (#1426 - there is no <video> to read
+   * there at all), and - on the desktop, where the panel is a <webview>
+   * this document cannot reach - the playhead the shell posts out
+   * (#1330). rAF, not a timer: the tablet's WebView suspends JS timers
+   * and keeps firing rAF, and the scope already draws on that paced
+   * frame, so the strip rides it.
+   *
+   * WHAT IT DRAWS. Elapsed and total as m:ss beside the label; a fill
+   * whose width is currentTime / duration; for a welded round a tick at
+   * every line boundary and an amber mark at each interjection - the
+   * SFX guy's drops, and a hole between two lines wide enough to be a
+   * sting slot - read off the committed cue sheet (the admission map,
+   * #1336) when it names the file, else off the feed rows that carry
+   * clip_from / clip_until for it (#1294), else off stream_now. Nothing
+   * sounding: the strip collapses. The arithmetic is pure and exported
+   * (PineScriptPage.timeline) so a test holds the real code. */
+  var tlOn = false;
+  var tlKey = '';
+  var tlSecond = -1;
+  var tlHoldUntil = 0;
+  var tlLast = null;
+  var TL_HOLD_MS = 600;            /* the beat between two lines is not silence */
+  var TL_GAP_S = 0.35;             /* a hole this wide between lines is a sting slot */
+
+  /* [#1219] THE NATIVE WALL'S PLAYHEAD, and why it is not simply read.
+   *
+   * PineVideoWall.state() answers from volatile fields the #1440
+   * watchdog refreshes once a second, so position_ms can be a whole
+   * second old and a strip pinned straight to it would lurch once a
+   * second. Asked at 250 ms and stamped WHEN THE VALUE CHANGES, the
+   * sample time is known to within that window and the fill runs on the
+   * local clock between samples: it tracks, and it does not drift. A
+   * kiosk build that reports position_age_ms makes the stamp exact. */
+  var TL_WALL_ASK_MS = 250;
+  var TL_WALL_STALE_MS = 1600;     /* older than this is not evidence */
+  var tlWall = null;               /* {pos, span, file, moving, sampleAt, at} */
+  var tlWallAsking = false;
+  var tlWallAskedAt = 0;
+
+  function timelineInterjects(row) {
+    var kind = String((row && row.kind) || '').toLowerCase();
+    var who = String((row && row.who) || '').toLowerCase();
+    return kind === 'interject' || kind === 'sfxguy' || kind === 'sfx'
+      || who === 'drop' || who === 'board';
+  }
+
+  /* at / total in seconds, rows with from / until (and kind / who when
+     known) -> the fraction to fill, the ticks and the marks as fractions. */
+  function timelineModel(at, total, rows) {
+    var span = Number(total);
+    if (!isFinite(span) || span <= 0) span = 0;
+    var pos = Number(at);
+    if (!isFinite(pos) || pos < 0) pos = 0;
+    var out = {at: pos, total: span, fraction: 0, ticks: [], marks: []};
+    if (!span) return out;
+    out.fraction = Math.max(0, Math.min(1, pos / span));
+    var list = [];
+    var i;
+    for (i = 0; i < (rows || []).length; i += 1) {
+      var row = rows[i] || {};
+      var from = Number(row.from), until = Number(row.until);
+      if (!isFinite(from) || !isFinite(until) || until <= from || from >= span) continue;
+      list.push({from: from, until: until, id: String(row.id || row.line_id || ''),
+        interject: timelineInterjects(row)});
+    }
+    list.sort(function (a, b) { return a.from - b.from; });
+    var seen = Object.create(null);
+    var put = function (kind, t, id) {
+      var f = Math.max(0, Math.min(1, t / span));
+      var k = kind + ':' + f.toFixed(4);
+      if (seen[k]) return;
+      seen[k] = true;
+      out[kind].push({at: f, id: id || ''});
+    };
+    for (i = 0; i < list.length; i += 1) {
+      var one = list[i];
+      if (one.interject) put('marks', one.from, one.id);
+      else if (one.from > 0.05) put('ticks', one.from, one.id);
+      var next = list[i + 1];
+      if (next && next.from - one.until >= TL_GAP_S) put('marks', one.until, '');
+    }
+    return out;
+  }
+
+  /* The rows that describe the sounding file, and the road they came by:
+     the admitted cue sheet, the feed's rows for that file, stream_now.
+     The feed's windows are read through rowFrom / rowUntil because 168 of
+     171 feed rows carry only clip_from / clip_until (#1294). */
+  function timelineRows(file, total, admit, feed, stream) {
+    var name = String(file || '');
+    var span = Number(total) || 0;
+    if (name && admit && admit.ok && admit.count && admit.byMedia && admit.byMedia[name]) {
+      var occ = PineScriptCues.choose(admit.byMedia[name], admit.current);
+      if (occ && occ.cues && occ.cues.length) {
+        return {rows: occ.cues, total: span || Number(occ.seconds) || 0, road: 'admitted'};
+      }
+    }
+    if (name && feed && feed.length) {
+      var mine = [];
+      for (var i = 0; i < feed.length; i += 1) {
+        var row = feed[i] || {};
+        if (String(row.clip_media || row.media || '') !== name) continue;
+        var from = rowFrom(row), until = rowUntil(row);
+        if (!isFinite(from) || !isFinite(until)) continue;
+        mine.push({id: row.id, from: from, until: until, kind: row.kind, who: row.who});
+      }
+      if (mine.length) return {rows: mine, total: span, road: 'feed'};
+    }
+    if (stream && stream.rows && stream.rows.length) {
+      var len = Number(stream.length) || 0;
+      if (!span || !len || Math.abs(len - span) < 1.5) {
+        return {rows: stream.rows, total: span || len, road: 'stream'};
+      }
+    }
+    return {rows: [], total: span, road: 'none'};
+  }
+
+  function timelineFileOf(media) {
+    var src = String((media && (media.currentSrc || media.src)) || '').split('?')[0];
+    return src.split('/').pop() || '';
+  }
+
+  /* [#1219] Ask the tablet's native wall where it has got to. Paced, one
+     ask in flight at a time, and never called while something nearer is
+     sounding - see timelineSource(). The answer lands for a later frame;
+     nothing here waits. */
+  function timelineWallAsk() {
+    var bridge = root.pineDesktop;
+    if (!bridge || typeof bridge.videoWall !== 'function') return;
+    var nowMs = Date.now();
+    if (tlWallAsking || nowMs - tlWallAskedAt < TL_WALL_ASK_MS) return;
+    tlWallAsking = true;
+    tlWallAskedAt = nowMs;
+    var landed = function (got) {
+      tlWallAsking = false;
+      var st = got;
+      if (typeof st === 'string') {
+        try { st = JSON.parse(st); } catch (err) { st = null; }
+      }
+      var at = Date.now();
+      if (!st || !st.on || st.veiled) { tlWall = null; return; }
+      var pos = Number(st.position_ms);
+      var span = Number(st.duration_ms);
+      if (!isFinite(pos) || pos < 0 || !isFinite(span) || span <= 0) { tlWall = null; return; }
+      var age = Number(st.position_age_ms);   /* a later kiosk build may say */
+      var was = tlWall;
+      var sampleAt;
+      if (isFinite(age) && age >= 0) sampleAt = at - age;
+      else if (was && was.pos === pos && was.file === String(st.playing || '')) sampleAt = was.sampleAt;
+      else sampleAt = at;                     /* the value moved: sampled just now */
+      tlWall = {pos: pos, span: span, file: String(st.playing || ''),
+        moving: String(st.playback || '') === 'ready' && st.play_when_ready !== false,
+        sampleAt: sampleAt, at: at};
+    };
+    try {
+      var answer = bridge.videoWall('state');
+      if (answer && typeof answer.then === 'function') {
+        answer.then(landed, function () { tlWallAsking = false; tlWall = null; });
+      } else { landed(answer); }
+    } catch (err) { tlWallAsking = false; tlWall = null; }
+  }
+
+  function timelineWall() {
+    timelineWallAsk();
+    var got = tlWall;
+    if (!got) return null;
+    var nowMs = Date.now();
+    if (nowMs - got.at > TL_WALL_STALE_MS) return null;
+    var on = got.pos + (got.moving ? Math.max(0, nowMs - got.sampleAt) : 0);
+    if (on > got.span) on = got.span;
+    return {at: on / 1000, total: got.span / 1000, file: got.file, road: 'wall'};
+  }
+
+  /* What is sounding, for the strip - see the note above. */
+  function timelineSource() {
+    var a = soundingPlayer();
+    if (a) {
+      return {at: Number(a.currentTime) || 0, total: Number(a.duration) || 0,
+        file: timelineFileOf(a), road: 'voice'};
+    }
+    var v = null;
+    try { v = document.querySelector('#sfxTv video, #pineWin-sfxTv video'); }
+    catch (err) { v = null; }
+    if (v && !v.paused && !v.ended && Number(v.currentTime) > 0) {
+      return {at: Number(v.currentTime) || 0, total: Number(v.duration) || 0,
+        file: timelineFileOf(v), road: 'video'};
+    }
+    var wall = timelineWall();
+    if (wall) return wall;
+    var head = bridgeHead();
+    if (head && Number(head.t) > 0) {
+      return {at: Number(head.t) || 0, total: Number(head.duration) || 0,
+        file: String(head.file || ''), road: 'bridge'};
+    }
+    return null;
+  }
+
+  function paintTimelineMarks(model) {
+    var box = el('spSayingTlMarks');
+    if (!box) return;
+    box.replaceChildren();
+    var i, one;
+    for (i = 0; i < model.ticks.length; i += 1) {
+      one = make('i', 'sp-tl-seg', '');
+      one.style.left = (model.ticks[i].at * 100).toFixed(2) + '%';
+      box.appendChild(one);
+    }
+    for (i = 0; i < model.marks.length; i += 1) {
+      one = make('i', 'sp-tl-mark', '');
+      one.style.left = (model.marks[i].at * 100).toFixed(2) + '%';
+      one.title = 'an interjection';
+      box.appendChild(one);
+    }
+  }
+
+  function paintTimeline() {
+    var fill = el('spSayingTlFill');
+    if (!fill) return;
+    var src = timelineSource();
+    var nowMs = Date.now();
+    if (src) { tlHoldUntil = nowMs + TL_HOLD_MS; tlLast = src; }
+    else if (tlLast && nowMs < tlHoldUntil) { src = tlLast; }
+    var on = !!src;
+    if (on !== tlOn) {
+      tlOn = on;
+      if (host) host.classList.toggle('sp-tl-on', on);
+      if (!on) {
+        tlKey = ''; tlSecond = -1; tlLast = null;
+        var c0 = el('spSayingClock');
+        if (c0) c0.textContent = '';
+        fill.style.width = '0%';
+        var m0 = el('spSayingTlMarks');
+        if (m0) m0.replaceChildren();
+      }
+    }
+    if (!on) return;
+    var feed = [];
+    try { feed = (root.PineStationFeed && root.PineStationFeed.rows()) || []; }
+    catch (err) { feed = []; }
+    var got = timelineRows(src.file, src.total, admitMap, feed, liveStream);
+    var model = timelineModel(src.at, got.total, got.rows);
+    fill.style.width = (model.fraction * 100).toFixed(2) + '%';
+    var key = src.road + '|' + got.road + '|' + src.file + '|' + model.total.toFixed(1)
+      + '|' + model.ticks.length + '|' + model.marks.length;
+    if (key !== tlKey) { tlKey = key; paintTimelineMarks(model); }
+    var sec = Math.floor(model.at);
+    if (sec !== tlSecond) {
+      tlSecond = sec;
+      var c1 = el('spSayingClock');
+      if (c1) {
+        c1.textContent = clock(sec) + (model.total ? ' / ' + clock(model.total) : '');
+      }
+    }
+  }
+
+  /* [#1219] What the strip is reading right now, for the CDP probe in the
+     D4-timeline verification sheet and for anything that has to prove the
+     fill and the sound agree. Reads, never paints. */
+  function timelineRead() {
+    var src = timelineSource();
+    var fill = el('spSayingTlFill');
+    var track = el('spSayingTl');
+    var said = el('spSayingClock');
+    var wide = 0, of = 0;
+    try {
+      of = (track && track.clientWidth) || 0;
+      wide = (fill && fill.getBoundingClientRect().width) || 0;
+    } catch (err) { wide = 0; of = 0; }
+    return {on: tlOn, road: src ? src.road : '', file: src ? src.file : '',
+      at: src ? src.at : 0, total: src ? src.total : 0,
+      width: wide, of: of, fraction: of ? (wide / of) : 0,
+      clock: (said && said.textContent) || ''};
+  }
+  /* ------------------------------------------------ [#1219] end */
+
   /* #1413: THE SCOPE AT A TABLET'S PACE. Profiled on the PineTab
      2026-09-14 over the WebView's devtools socket: this loop and the
      panel's drawScope were a quarter of the page's main thread, at
@@ -515,6 +821,7 @@
       }
     }
     if (!scopeSeen) return;
+    try { paintTimeline(); } catch (err) { /* [#1219] the strip is decoration */ }
     var player = soundingPlayer();
     var ctx2d = null;
     try { ctx2d = canvas.getContext('2d'); } catch (err) { return; }
@@ -792,6 +1099,51 @@
       filterTimer = setTimeout(function () { filterTimer = 0; folderPaint(); }, 150);
     });
     top.appendChild(filter);
+
+    /* [#1251] MATCH HIS CLIPS TO WHAT IS BEING SAID.
+     *
+     * "I want this to be something I can toggle off and on where
+     *  basically the DJ is matching the videos that are being played to
+     *  the things that are being said loosely matching them either via
+     *  the noun, verb, or context."
+     *
+     * This sheet is already the one place that answers "where does a
+     * clip come from", so the switch that changes HOW one is chosen
+     * belongs beside the pin that changes WHICH FOLDER it comes from.
+     * This half is the SFX guy's stings; the endless set has its own
+     * switch in its own sheet (sfx-tv.js), because they are two dials
+     * on two different roads and the operator asked for both.
+     *
+     * The station holds it, not this browser: /api/sfx/match is a held
+     * setting like the folder pin above it, so the desk, the panel and
+     * the tablet cannot disagree about it and a restart finds it where
+     * it was left. */
+    var matchRow = make('div', 'sp-folder-match-row');
+    matchRow.id = 'spSfxMatchRow';
+    matchRow.setAttribute('style',
+      'display:flex;gap:8px;align-items:center;flex-wrap:wrap;'
+      + 'padding:6px 0;border-top:1px solid #23313c');
+    var matchBtn = make('button', 'sp-folder-match-btn');
+    matchBtn.type = 'button';
+    matchBtn.id = 'spSfxMatchBtn';
+    matchBtn.setAttribute('style',
+      'min-height:36px;padding:0 10px;border-radius:8px;'
+      + 'border:1px solid #2c7a8c;background:#1d4d5a;color:#dfe7ee;'
+      + 'font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px');
+    var matchDial = make('input', 'sp-folder-match-dial');
+    matchDial.type = 'range';
+    matchDial.id = 'spSfxMatchDial';
+    matchDial.min = '0'; matchDial.max = '100'; matchDial.step = '5';
+    matchDial.value = '35';
+    matchDial.style.flex = '1 1 120px';
+    matchDial.setAttribute('aria-label', 'How close a match has to be');
+    var matchSay = make('div', 'sp-folder-match-say', '');
+    matchSay.id = 'spSfxMatchSay';
+    matchSay.setAttribute('style', 'flex:1 1 100%;font-size:11px;color:#93a4b3');
+    matchRow.appendChild(matchBtn);
+    matchRow.appendChild(matchDial);
+    matchRow.appendChild(matchSay);
+    top.appendChild(matchRow);
     box.appendChild(top);
 
     var list = make('div', 'sp-folder-list');
@@ -801,6 +1153,7 @@
     back.appendChild(box);
     back.addEventListener('click', function (ev) { if (ev.target === back) folderClose(); });
     document.body.appendChild(back);
+    matchWire();                                          /* [#1251] */
 
     Promise.resolve(api().get('/api/sfx/folders')).then(function (d) {
       if (!el('spFolderSheet')) return;       /* closed before the answer */
@@ -994,6 +1347,94 @@
     media.src = stationUrl(s.url);
     item.appendChild(media);
     return item;
+  }
+
+
+  /* [#1251] ---- the dialogue-matching switch ------------------------ */
+
+  var matchState = null;
+
+  function matchWord(n) {
+    n = Number(n) || 0;
+    if (n <= 10) return 'any loose connection';
+    if (n <= 40) return 'one uncommon word out of the line';
+    if (n <= 70) return 'two words, or one rare one';
+    return 'only a strong match';
+  }
+
+  /* Painted from what the station holds, never from this browser's
+     guess - a switch whose state only the page believes in is the fault
+     #1184 wrote a paragraph about in the endless sheet. */
+  function matchPaint(st) {
+    if (st) matchState = st;
+    var btn = el('spSfxMatchBtn'), dial = el('spSfxMatchDial'),
+        say = el('spSfxMatchSay');
+    if (!btn) return;
+    var s = matchState || {};
+    var on = !!s.stings;
+    var icon = '';
+    try {
+      if (typeof root.pineIcon === 'function') {
+        icon = root.pineIcon(on ? 'c:magic-wand--filled' : 'c:search',
+                             on ? 'Matching' : 'Not matching') || '';
+      }
+    } catch (err) { icon = ''; }
+    btn.innerHTML = icon + '<span>' + (on ? 'MATCHING the line' : 'Match the line')
+      + '</span>';
+    btn.style.background = on ? '#1d5a3a' : '#1d4d5a';
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.title = 'His stings are chosen to fit the words just spoken - '
+      + 'loosely, by a noun, a verb or the folder\'s subject. Below the '
+      + 'strength below, the ordinary random draw runs instead, so he '
+      + 'never goes quiet waiting for a match.';
+    if (dial) {
+      dial.value = String(Number(s.strength == null ? 35 : s.strength));
+      dial.disabled = false;
+    }
+    if (say) {
+      say.textContent = 'strength ' + (dial ? dial.value : '35') + ' - '
+        + matchWord(dial ? dial.value : 35) + '. '
+        + String(s.say || '');
+    }
+  }
+
+  function matchPost(body) {
+    if (!api() || !api().post) { folderSay('no bridge to the station'); return; }
+    Promise.resolve(api().post('/api/sfx/match', body)).then(function (got) {
+      if (!el('spSfxMatchRow')) return;
+      matchPaint(got || null);
+      folderSay(String((got && got.say) || 'saved'));
+    }, function (err) {
+      /* The station holds this, so a refusal means it did NOT change. */
+      folderSay('the station would not take it: '
+        + String((err && err.message) || err).slice(0, 70));
+    });
+  }
+
+  function matchWire() {
+    var btn = el('spSfxMatchBtn'), dial = el('spSfxMatchDial');
+    if (btn) {
+      btn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        matchPost({stings: !(matchState && matchState.stings)});
+      });
+    }
+    if (dial) {
+      dial.addEventListener('input', function () {
+        var say = el('spSfxMatchSay');
+        if (say) say.textContent = 'strength ' + dial.value + ' - '
+          + matchWord(dial.value) + '.';
+      });
+      dial.addEventListener('change', function () {
+        matchPost({strength: Number(dial.value)});
+      });
+    }
+    if (!api() || !api().get) return;
+    Promise.resolve(api().get('/api/sfx/match')).then(function (st) {
+      if (!el('spSfxMatchRow')) return;      /* closed before the answer */
+      matchPaint(st || null);
+    }, function () { /* the row paints its default and says nothing */ });
+    matchPaint(null);
   }
 
   function folderPost(body) {
@@ -2054,11 +2495,1060 @@
    * hand-over, with the check that refused it beside it), and a written
    * line that was never heard is common enough tonight that hiding it
    * would make this pop-up lie. */
+  /* ---- #1238 / #1193 / #1194 / #1235: these surfaces answer a tap --- */
+
+  /* WHAT THESE WINDOWS WOULD NOT DO.
+   *
+   *  #1238  "If I tap on either of these [the Co-host, The board and the
+   *          Drop nodes of the chain], I want to see additional details
+   *          about them."
+   *  #1193  "I want to be able to tap elements in the sidebar and be able
+   *          to see them on screen."
+   *  #1194  "Allow me to tap each one in order to play its sound on the
+   *          broadcast and allow me to tap and hold it to bring up the
+   *          right click menu for various options pertaining to each sound
+   *          effect."
+   *  #1235  "[the script heading] When I tap on that I want to see the
+   *          full itinerary."
+   *
+   * Everything in the Segment window was drawn and then left alone. The
+   * chain down the right named a seat and a hand-off and gave no way to
+   * reach the line it stands for; the line list printed every line of the
+   * block and gave no way to HEAR one. Three gestures now, each the
+   * gesture that surface already teaches elsewhere in this shell:
+   *
+   *   tap a chain node / an arrow   the list scrolls to that line, flashes
+   *                                 it and unfolds its detail card
+   *   tap a line row                the line goes back on the BROADCAST -
+   *                                 POST /api/script/line/replay - not out
+   *                                 of the speaker of whoever tapped
+   *   hold a row 600 ms, or         the station's one hold sheet, placed
+   *   right-click it                where the finger is
+   *
+   * THE HOLD SHEET IS NOT BUILT HERE. line-actions.js owns it and #1200
+   * teaches it the sound-effect items; this file hands it the line and a
+   * node carrying `pineItem` so a sting is recognised as a sting, then
+   * moves it to the finger - there is no hover on a tablet and no mouse to
+   * follow, and a sheet pinned to the foot of the glass is a sheet a thumb
+   * on the top row has to travel the whole screen to reach.
+   *
+   * AND IT DRIVES THAT SHEET RATHER THAN LETTING THE DOCUMENT HANDLER DO
+   * IT. line-actions.js binds one long-press on the document for anything
+   * carrying `data-line`; marking these rows with that attribute would get
+   * the sheet for free - and would get it TWICE, once from that handler
+   * and once from the press this file has to time anyway to keep a tap
+   * from being read as a hold. One timer, one sheet, one place it lands.
+   *
+   * THE STATION IS ASKED NOTHING EXTRA. The answer already on screen is
+   * kept in `segShown` and every tap is served out of it. This file's
+   * traffic rule is not decorative: 38 concurrent requests were measured
+   * starving this tablet's audio for 46 seconds.
+   */
+  var segShown = null;            /* the open window's /api/segment/inspect */
+  var segShownAt = null;          /* and the heading it was opened from */
+  var segSaying = null;           /* that window's own say() line */
+  var segReplaying = '';          /* a replay in flight, by line id */
+  var SEG_HOLD_MS = 600;          /* the same hold line-actions.js uses */
+  var SEG_HOLD_SLOP = 12;         /* a scroll is not a hold */
+
+  /* Called from segInspectOpen, so a window opened twice never shows the
+     last one's answer while the fresh one is still being asked for. */
+  function segWindowOpen(sheet, ident) {
+    segShown = null;
+    segShownAt = ident || null;
+    segSaying = (sheet && sheet.say) || null;
+    segReplaying = '';
+  }
+
+  function segSay(text, hold) {
+    if (typeof segSaying === 'function') {
+      try { segSaying(String(text || ''), !!hold); return; } catch (err) { /* fall through */ }
+    }
+    caughtNote('segment', String(text || ''));
+  }
+
+  function segWhy(err) {
+    var msg = String((err && (err.detail || err.message)) || err || '');
+    if (/\b404\b/.test(msg)) {
+      return 'This station has no replay road yet - it may still be deploying.';
+    }
+    return msg.slice(0, 160) || 'the station did not say why';
+  }
+
+  /* An id is only ever used inside a CSS selector after this. */
+  function segTame(id) {
+    return String(id || '').replace(/[^A-Za-z0-9_:.-]/g, '');
+  }
+
+  function segLineOf(lineId) {
+    var lines = (segShown && segShown.lines) || [];
+    var want = String(lineId || '');
+    if (!want) return null;
+    for (var i = 0; i < lines.length; i += 1) {
+      if (String((lines[i] || {}).line_id || '') === want) return lines[i];
+    }
+    return null;
+  }
+
+  /* A sting is a line of the script like any other; what makes it one is
+     that the station named a sample behind it (#1194 carries `sfx` and the
+     signed /sfx/ road on every line of the inspect answer). `kind` alone is
+     not enough - a welded sting can come through as `dialogue`. */
+  function segIsSting(l) {
+    if (!l) return false;
+    if (String(l.kind || '') === 'sfx') return true;
+    if (String(l.who || '') === 'board' || String(l.who || '') === 'drop') return true;
+    return !!l.sfx;
+  }
+
+  /* ------------------------------------------------ #1193/#1238: reveal */
+
+  function segWindowBody() {
+    var win = el('spSegInspect');
+    return win ? win.querySelector('.sp-segins-body') : null;
+  }
+
+  function segCardFor(lineId) {
+    var win = el('spSegInspect');
+    var id = segTame(lineId);
+    if (!win || !id) return null;
+    return win.querySelector('.sp-segline[data-line-id="' + id + '"]');
+  }
+
+  function segCardForSeat(seat) {
+    var win = el('spSegInspect');
+    var want = segTame(seat);
+    if (!win || !want) return null;
+    return win.querySelector('.sp-segline[data-seat="' + want + '"]');
+  }
+
+  /* "tap elements in the sidebar and be able to see them on screen."
+   *
+   * The chain is a column of seats and arrows; the answer to a tap on one
+   * is the LINE it stands for, over on the left, where every fact about it
+   * already is. So: scroll it into the middle of the window's own scroller,
+   * flash it the way jumpToLine flashes a line of the script (the same
+   * gesture, so it reads as the same answer), and unfold its card.
+   *
+   * A chip that is only a seat - the first node of the chain, and every
+   * node of a segment that had no hand-offs at all - has no one line, so it
+   * reveals that seat's FIRST line and the card says which seat it is. That
+   * is honest: the station recorded the seat, not a line, for that node. */
+  /* ---------------------------------------------- [#1386] TECHNICAL VIEW */
+  var techView = null;          /* the mounted graph, when there is one */
+  var techHost = null;          /* the div it lives in, beside the feed */
+  var techOn = false;
+  var techOpening = false;
+  var techWide = false;         /* [#1387] across the whole bottom */
+  try { techWide = localStorage.getItem('sp.tech.wide') === '1'; }
+  catch (e) { techWide = false; }
+
+  /* [#1386] ABSOLUTE, ALWAYS.
+   *
+   * import() resolves a RELATIVE specifier against the importing script's
+   * base URL - and this file is INJECTED into the kiosk's WebView rather
+   * than loaded from a URL, so its base is `about:blank` and every
+   * relative path fails with "Failed to resolve module specifier". The
+   * error names the cause exactly and is easy to misread as a missing
+   * file, which is what it looked like.
+   *
+   * `pineThreeUrl` is no help either: it lives in the Electron shell's
+   * renderer.js and does not exist in the panel page at all.
+   *
+   * So the origin is taken from the page itself when there is one - on
+   * the tablet the panel is served from http://127.0.0.1:8096 - and only
+   * a file:// shell falls back to naming the station outright. */
+  function techUrl(name) {
+    try {
+      if (/^https?:$/.test(location.protocol) && location.origin
+          && location.origin !== 'null') {
+        return location.origin + name;
+      }
+    } catch (err) { /* no location worth having */ }
+    try {
+      if (root.pineThreeUrl) {
+        return String(root.pineThreeUrl())
+          .replace(/\/vendor\/three\.min\.js.*$/, '') + name;
+      }
+    } catch (err) { /* older shell */ }
+    return 'http://127.0.0.1:8096' + name;
+  }
+
+  function techBox() {
+    if (techHost) return techHost;
+    var feed = document.getElementById('spFeed');
+    if (!feed || !feed.parentNode) return null;
+    techHost = make('div', 'sp-tech');
+    techHost.style.display = 'none';
+    feed.parentNode.insertBefore(techHost, feed.nextSibling);
+    return techHost;
+  }
+
+  async function techMount() {
+    if (techView || techOpening) return techView;
+    var box = techBox();
+    if (!box) return null;
+    techOpening = true;
+    try {
+      if (!document.getElementById('spTechStyle')) {
+        var style = document.createElement('link');
+        style.id = 'spTechStyle';
+        style.rel = 'stylesheet';
+        style.href = techUrl('/word-cause/word-cause.css?v=3');
+        document.head.appendChild(style);
+      }
+      var mod = await import(techUrl('/word-cause/word-cause.js?v=3'));
+      techView = mod.openWordCause({
+        embed: true,
+        host: box,
+        threeUrl: techUrl('/vendor/three.min.js'),
+        base: location.origin,
+        /* [#1387] The full-screen host is the panel's own PINE_3JS frame.
+           On the tablet this code IS the panel's document, so the function
+           is right there; in the desktop shell it is not, and a new window
+           on the same road is the honest fallback rather than a button
+           that silently does nothing. */
+        onFull: function (want) {
+          try {
+            if (typeof root.pineShow3JS === 'function') {
+              root.__wcWant = want;
+              root.pineShow3JS('wordcause');
+              return;
+            }
+          } catch (err) { /* fall through to the window */ }
+          var q = '/?view=wordcause'
+            + (want && want.line ? '&wc=' + encodeURIComponent(want.line) : '')
+            + (want && !want.line && want.word
+               ? '&wcq=' + encodeURIComponent(want.word) : '');
+          try { root.open(techUrl('') + q, '_blank'); }
+          catch (err) { /* a shell with no window opener */ }
+        },
+        request: function (path, options) { return api()[
+          (options && options.method === 'PUT') ? 'put'
+            : (options && options.method === 'POST') ? 'post' : 'get'](
+          path, options && options.body ? JSON.parse(options.body) : undefined); },
+        onClose: function () { techView = null; },
+      });
+    } catch (err) {
+      box.textContent = '';
+      box.appendChild(make('div', 'sp-techbad',
+        'the technical view could not open: ' + String((err && err.message) || err)));
+    } finally { techOpening = false; }
+    return techView;
+  }
+
+  /* [#1387] ACROSS THE WHOLE BOTTOM.
+   *
+   * "I might also need to be able to expand the technical view in the
+   *  script sub page to be able to go all the way across to the right side.
+   *  So it's basically splitting into the script section and taking up that
+   *  whole bottom section of the window, allowing me to have more room to
+   *  work horizontally."
+   *
+   * The feed column is about a third of the glass, and a flowchart that
+   * fans out five columns deep cannot be read in a third of the glass - his
+   * screenshot is the proof. So the pane can leave its column: pinned to
+   * the page, left to right, taking the bottom band under BOTH the column
+   * and the script, with a handle on its top edge to say how much of the
+   * height it gets. The script keeps running above it.
+   *
+   * It is the same mounted graph either way - moved, not rebuilt - so
+   * nothing is re-fetched and nothing loses its place; only `resize` is
+   * told, because the canvas has to be re-measured after any move. */
+  function techPage() {
+    var at = document.querySelector('.' + HOST_CLASS);
+    return at || document.body;
+  }
+
+  function techPlace() {
+    if (!techHost) return;
+    var page = techPage();
+    if (techWide) {
+      techHost.classList.add('sp-tech-wide');
+      var tall = 0;
+      try { tall = parseInt(localStorage.getItem('sp.tech.tall') || '0', 10); }
+      catch (e) { tall = 0; }
+      techHost.style.height = (tall >= 160 ? tall : Math.round(
+        (page.clientHeight || 700) * 0.55)) + 'px';
+      if (techHost.parentNode !== page) page.appendChild(techHost);
+    } else {
+      techHost.classList.remove('sp-tech-wide');
+      techHost.style.height = '';
+      var feed = document.getElementById('spFeed');
+      if (feed && feed.parentNode && techHost.parentNode !== feed.parentNode) {
+        feed.parentNode.insertBefore(techHost, feed.nextSibling);
+      }
+    }
+    var flip = document.querySelector('.sp-techwide');
+    if (flip) {
+      flip.textContent = techWide ? 'in column' : 'full width';
+      flip.title = techWide
+        ? 'Put the technical view back in the feed column'
+        : 'Take the technical view across the whole bottom of the window';
+    }
+    if (techView && techView.resize) {
+      setTimeout(function () { try { techView.resize(); } catch (e) { /* gone */ } }, 40);
+    }
+  }
+
+  function techWideSet(on) {
+    techWide = !!on;
+    try { localStorage.setItem('sp.tech.wide', techWide ? '1' : '0'); }
+    catch (e) { /* a private window; the choice lasts this session */ }
+    /* [#1389] THE TABS GET OUT OF THE WAY.
+     *
+     * "whenever this is brought into full mode ... these tabs need to
+     *  slide out of the way so that the buttons aren't being overlapped
+     *  with by tabs because I can never tap them."
+     *
+     * The vertical view rail (#pineViewRail: TECH, SAMPLER, SCRIPT ...)
+     * is `position: fixed; right: 0` and sits at z-index 2147483001 - so
+     * it floats over ANY pane, and in full width the technical view's own
+     * bar runs right underneath it. Fit, full and the layout picker were
+     * all behind a tab.
+     *
+     * A class on <html>, exactly as listen.js's bare mode does it, because
+     * rail.js injects its own stylesheet AFTER every other one: a bare
+     * `#pineViewRail` rule here would lose every tie, and `html.<class>
+     * #pineViewRail` is an id plus a class, which wins whatever the source
+     * order. rail.js itself is untouched.
+     *
+     * It slides OUT, not away: a strip stays on the edge and a finger on
+     * it brings the whole rail back. A control whose only way back is a
+     * control you just hid is the fault in [[a-modal-needs-its-own-way-out]],
+     * and this does not repeat it. */
+    try {
+      document.documentElement.classList.toggle('pine-tech-wide', techWide);
+    } catch (e) { /* no document element is not a thing, but never throw here */ }
+    techPlace();
+    /* The feed only hides when the pane is IN its column. Wide, the pane is
+       somewhere else entirely and the feed can carry on being the feed. */
+    var feed = document.getElementById('spFeed');
+    if (feed) feed.style.display = (techOn && !techWide) ? 'none' : '';
+  }
+
+  /* The handle on its top edge. Drag to say how much of the bottom band the
+     drawing gets; double tap to put it back to the middle. */
+  function techGrip() {
+    if (!techHost || techHost.querySelector('.sp-tech-grip')) return;
+    var grip = make('div', 'sp-tech-grip');
+    grip.title = 'Drag to resize; double tap to put it back';
+    var from = 0;
+    var was = 0;
+    var move = function (ev) {
+      var page = techPage();
+      var want = Math.max(160, Math.min(
+        Math.max(240, (page.clientHeight || 700) - 140),
+        was + (from - ev.clientY)));
+      techHost.style.height = want + 'px';
+      if (techView && techView.resize) {
+        try { techView.resize(); } catch (e) { /* gone */ }
+      }
+    };
+    var stop = function (ev) {
+      try { grip.releasePointerCapture(ev.pointerId); } catch (e) { /* gone */ }
+      grip.removeEventListener('pointermove', move);
+      grip.removeEventListener('pointerup', stop);
+      grip.removeEventListener('pointercancel', stop);
+      try {
+        localStorage.setItem('sp.tech.tall',
+          String(parseInt(techHost.style.height, 10) || 0));
+      } catch (e) { /* nothing is lost but the memory */ }
+    };
+    grip.addEventListener('pointerdown', function (ev) {
+      if (!techWide) return;
+      ev.preventDefault();
+      from = ev.clientY;
+      was = techHost.clientHeight;
+      try { grip.setPointerCapture(ev.pointerId); } catch (e) { /* older */ }
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', stop);
+      grip.addEventListener('pointercancel', stop);
+    });
+    grip.addEventListener('dblclick', function () {
+      techHost.style.height = Math.round(
+        (techPage().clientHeight || 700) * 0.55) + 'px';
+      try { localStorage.removeItem('sp.tech.tall'); } catch (e) { /* fine */ }
+      if (techView && techView.resize) {
+        try { techView.resize(); } catch (e) { /* gone */ }
+      }
+    });
+    techHost.appendChild(grip);
+  }
+
+  function techShowFace(on) {
+    var feed = document.getElementById('spFeed');
+    techOn = !!on;
+    /* Wide, the pane is not in the feed's place, so the feed stays. */
+    if (feed) feed.style.display = (techOn && !techWide) ? 'none' : '';
+    if (techHost) techHost.style.display = techOn ? '' : 'none';
+    if (techOn) { techGrip(); techPlace(); }
+    var flip = document.querySelector('.sp-feedflip');
+    if (flip) flip.textContent = techOn ? 'feed' : 'technical';
+    var name = document.querySelector('.sp-feedhead b');
+    if (name) name.textContent = techOn ? 'Technical' : 'Feed';
+    var why = document.querySelector('.sp-feedwhy');
+    if (why) {
+      why.textContent = techOn
+        ? 'where it came from - pinch to zoom, tap a node, double tap to bring it in'
+        : 'everything the station is doing';
+    }
+    if (techOn && techView && techView.resize) {
+      setTimeout(function () { try { techView.resize(); } catch (e) { /* gone */ } }, 30);
+    }
+  }
+
+  function technicalToggle() {
+    if (!techOn) {
+      techMount().then(function () {
+        techShowFace(true);
+        /* Re-stamp on the way in: the pane can be reopened already wide
+           from a remembered choice, and the rail would not know. */
+        techWideSet(techWide);
+      });
+    } else {
+      techShowFace(false);
+      /* [#1389] The pane is gone, so the tabs are nobody's problem any
+         more - they come back whatever `wide` is remembered as. */
+      try {
+        document.documentElement.classList.remove('pine-tech-wide');
+      } catch (e) { /* never throw on the way out */ }
+    }
+  }
+
+  /* Tapping a name in the script traces THAT line, here, without taking
+     the show off the glass. */
+  function technicalTrace(lineId, said) {
+    if (!lineId) return;
+    techMount().then(function (view) {
+      techShowFace(true);
+      if (view && view.showLine) view.showLine(lineId, said);
+    });
+  }
+  root.PineTechnical = {trace: technicalTrace, toggle: technicalToggle};
+
+  /* [#1386] ANY NAME, ANY TITLE, ANY SECTION.
+   *
+   * "whenever I tap on a title or any name or a section inside of the
+   *  script view, I want the feed to become a visual node editor."
+   *
+   * ONE delegated listener rather than a handle sewn onto each renderer.
+   * The screenplay is built out of `.sp-el` elements - scene, character,
+   * dialogue, parenthetical, action - and a dialogue element carries its
+   * `data-line`. A character heading has none of its own, because a name
+   * is not a line; the line it names is the next element down, which is
+   * exactly what sayingWho() walks backwards to find. So: take the id off
+   * whichever element was tapped, or off the first one below it that has
+   * one.
+   *
+   * Delegated also means it keeps working for every element the script
+   * grows later without anybody remembering to wire it up. */
+  function techIdNear(node) {
+    var at = node;
+    for (var up = 0; at && up < 4; up += 1) {
+      if (at.classList && at.classList.contains('sp-el')) break;
+      at = at.parentNode;
+    }
+    if (!at || !at.classList || !at.classList.contains('sp-el')) return null;
+    /* A REAL line id, not a plan key. The screenplay carries two kinds of
+       `data-line`: an aired line's own 32-character id, and the planner's
+       composite key for an entry that has not happened yet (`seg:c3`).
+       The ledger only knows the first, and answering "that line is not in
+       the ledger" for a row that was never a line is a true sentence that
+       helps nobody. So a short or punctuated key is skipped and the walk
+       carries on to the next element that has a real one. */
+    var REAL = /^[0-9a-f]{24,}$/i;
+    var own = at.getAttribute && at.getAttribute('data-line');
+    if (own && REAL.test(own)) {
+      return {id: own, said: String(at.textContent || '')};
+    }
+    /* A heading, a scene or a cue: the line it introduces is below it. */
+    var walk = at.nextElementSibling;
+    for (var down = 0; walk && down < 6; down += 1) {
+      var got = walk.getAttribute && walk.getAttribute('data-line');
+      if (got && REAL.test(got)) {
+        return {id: got, said: String(walk.textContent || '')};
+      }
+      walk = walk.nextElementSibling;
+    }
+    return null;
+  }
+
+  if (root.document) root.document.addEventListener('click', function (ev) {
+    var node = ev.target;
+    if (!node || !node.closest) return;
+    /* Not while something is being edited or dragged over the script, and
+       never over the technical pane itself - a tap on a node there is the
+       graph's own. */
+    if (node.closest('.wc-dialog') || node.closest('input')
+        || node.closest('textarea') || node.closest('button')) return;
+    var el2 = node.closest('.sp-el');
+    if (!el2) return;
+    var got = techIdNear(el2);
+    if (!got) return;
+    technicalTrace(got.id, got.said);
+  }, true);
+
+  function segReveal(lineId, seat) {
+    var card = segCardFor(lineId) || (seat ? segCardForSeat(seat) : null);
+    if (!card) {
+      segSay(lineId
+        ? 'That line is not in the list under this window.'
+        : 'The station recorded no line for ' + segSeatLook(seat).label
+          + ' inside this block.');
+      return false;
+    }
+    try { card.scrollIntoView({block: 'center'}); } catch (err) { /* no scroller */ }
+    card.classList.remove('sp-segflash');
+    /* Read a layout property so the animation restarts when the same card
+       is tapped twice; without it the second tap does nothing visible. */
+    try { void card.offsetWidth; } catch (err) { /* headless */ }
+    card.classList.add('sp-segflash');
+    setTimeout(function () { card.classList.remove('sp-segflash'); }, 1300);
+    segDetailOpen(card, true);
+    return true;
+  }
+
+  /* Wire one chain element - a seat chip or an arrow - to the line it
+     stands for. `tie` is the hand-off row; a chip that follows an arrow is
+     the seat that ANSWERED, so the arrow's line_id is that chip's line. */
+  function segFlowTap(node, seat, tie) {
+    if (!node || !node.addEventListener) return;
+    var lid = String((tie && tie.line_id) || '');
+    node.classList.add('sp-segflow-tap');
+    node.setAttribute('role', 'button');
+    node.setAttribute('tabindex', '0');
+    node.title = lid
+      ? 'Show this line in the list'
+      : 'Show ' + segSeatLook(seat).label + '’s first line in the list';
+    var go = function (ev) {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+      segReveal(lid, seat);
+    };
+    node.addEventListener('click', go);
+    node.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+      go(ev);
+    });
+  }
+
+  /* ------------------------------------------- #1238: the detail card */
+
+  /* EVERYTHING THE STATION HOLDS ABOUT ONE LINE, under the line.
+   *
+   * Not a second pop-up: a window on top of a window is a window the
+   * operator has to close twice, and the thing he is comparing it against
+   * is the thing it would be covering. It unfolds in place, and folds away
+   * when the row is tapped again on its own head.
+   *
+   * Half of these fields exist because #1194 taught segment_inspect to
+   * carry them: the sample behind a sting and its signed road, the take
+   * (the pantry key the render cache knows the audio by), the media file,
+   * the delivery it rode, and whether this line is ITSELF a replay. On a
+   * station without that patch they are simply absent, and absent prints
+   * as absent - this window has never been allowed to invent a field. */
+  function segDetailOpen(card, force) {
+    if (!card) return;
+    var had = card.querySelector('.sp-segdeep');
+    if (had) {
+      if (force) return;                 /* already unfolded: leave it */
+      had.remove();
+      card.classList.remove('sp-segopen');
+      return;
+    }
+    var l = segLineOf(card.getAttribute('data-line-id')) || card.pineLine || {};
+    var look = segSeatLook(l.who);
+    var deep = make('div', 'sp-segdeep');
+    deep.appendChild(make('div', 'sp-segdeep-h', 'What the station holds about this line'));
+
+    segRow(deep, 'seat', look.label + (segHas(l.who) ? '  ·  ' + l.who : ''),
+      segHas(l.name) ? 'named ' + l.name : '');
+    segRow(deep, 'voice', l.voice, segHas(l.voice) ? '' : 'no voice id was recorded');
+    segRow(deep, 'engine', l.engine, segHas(l.engine) ? '' : 'the ledger did not record which engine spoke it');
+    segRow(deep, 'model', l.model);
+    segRow(deep, 'length', segSecs(l.seconds), segHas(l.seconds) ? '' : 'never measured');
+    segRow(deep, 'air time', segHas(l.at) ? l.at : null,
+      segHas(l.air_at) ? 'air_at ' + l.air_at : 'the station gave it no air time');
+
+    /* HEARD IS THE TRUTHFUL ONE. published is a hand-over; heard is an
+       acknowledgement, and the two are different answers. */
+    var heard = l.heard === true ? 'heard'
+      : (l.heard === false ? 'never heard' : 'the station did not say');
+    var why = '';
+    if (l.heard === true && segHas(l.heard_at)) why = 'at ' + l.heard_at;
+    else if (l.heard === false) {
+      why = segHas(l.withdrawn_why)
+        ? 'refused at hand-over: ' + l.withdrawn_why
+        : (l.published
+          ? 'handed over and never acknowledged'
+          : 'it was written and never handed over');
+      if (segHas(segShown && segShown.heard_basis)) {
+        why += '  ·  basis: ' + segShown.heard_basis;
+      }
+    }
+    var hr = segRow(deep, 'heard', heard, why);
+    if (l.heard === false) hr.classList.add('sp-seghole');
+    segRow(deep, 'aired', l.aired, segHas(l.aired) ? '' : 'nothing was recorded');
+    segRow(deep, 'scripted', l.scripted === false ? 'no' : (l.scripted === true ? 'yes' : null),
+      l.scripted === false ? 'welded on afterwards, not written into the running order' : '');
+
+    segRow(deep, 'source document', l.source,
+      segHas(l.source) ? '' : 'no document was recorded behind these words');
+    segRow(deep, 'block / ord',
+      (segHas(segShown && segShown.block) ? segShown.block : '?')
+        + ' / ' + (segHas(l.ord) ? l.ord : '?'),
+      'the pair the ledger orders the script by (#1330)');
+    segRow(deep, 'line id', l.line_id);
+
+    /* #1194's handles. The sample for a sting, the file for a spoken line,
+       and the take - three different ways to find the same audio. */
+    if (segIsSting(l)) {
+      segRow(deep, 'the sample', l.sfx,
+        segHas(l.sfx) ? 'the id the /sfx/ road serves'
+          : 'the station could not name the sample behind this sting');
+    }
+    segRow(deep, 'audio file', l.media || l.clip_media,
+      (segHas(l.clip_from) || segHas(l.clip_until))
+        ? ('cut from ' + segWord(l.clip_from, '?') + ' to ' + segWord(l.clip_until, '?'))
+        : (segHas(l.media) || segHas(l.clip_media) ? '' : 'nothing on disk is named for it'));
+    segRow(deep, 'the take', l.take,
+      segHas(l.take) ? 'the pantry key - engine, voice and words, hashed'
+        : 'this line was not rendered from a take');
+    segRow(deep, 'delivery', l.delivery_id);
+    if (l.replay) {
+      segRow(deep, 'this is a replay', 'yes',
+        segHas(l.replay_of) ? 'of line ' + l.replay_of : '');
+    }
+    if (l.video) segRow(deep, 'it had a picture', 'yes');
+
+    deep.appendChild(segReplayButton(card, l));
+    card.appendChild(deep);
+    card.classList.add('sp-segopen');
+  }
+
+  /* ------------------------------------------- #1194: say it again, live */
+
+  function segReplayButton(card, l) {
+    var row = make('div', 'sp-segdeep-do');
+    var b = make('button', 'sp-segdeep-play', '');
+    b.type = 'button';
+    var ico = folderIcon('c:volume--up--filled', 'Say it again');
+    b.innerHTML = (ico ? ico + ' ' : '') + 'Say it again, on the broadcast';
+    b.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      segLineReplay(card, l);
+    });
+    row.appendChild(b);
+    row.appendChild(make('span', 'sp-segdeep-note',
+      'every page and the box, not this speaker'));
+    return row;
+  }
+
+  /* "tap each one in order to play its sound ON THE BROADCAST."
+   *
+   * The hold sheet's own "Play it" is deliberately left alone: that one
+   * says "hear this line, here", for one pair of ears. This is the other
+   * thing, and it is the whole point of the request - the page feed every
+   * listener drains and the box. The road is POST /api/script/line/replay
+   * (app.py, #1194), which re-admits the line, appends it to the page feed
+   * and hands it to the box, and writes a fresh ring row marked
+   * `replay`/`replay_of` so the ledger can tell a line said twice from a
+   * line said once. */
+  function segLineReplay(card, l) {
+    var lid = String((l && l.line_id) || '');
+    if (!lid) {
+      segSay('The station gave this line no id, so it cannot be played again.');
+      return;
+    }
+    if (segReplaying) {
+      segSay(segReplaying === lid
+        ? 'that one is already going out'
+        : 'one line is already on its way to the air');
+      return;
+    }
+    if (!api() || !api().post) {
+      segSay('There is no bridge to the station from this surface.');
+      return;
+    }
+    segReplaying = lid;
+    card.classList.add('sp-segsending');
+    segSay('putting it back on the air…', true);
+    Promise.resolve(api().post('/api/script/line/replay',
+      {line_id: lid, block: (segShown && segShown.block) || 0})).then(function (got) {
+        segReplaying = '';
+        card.classList.remove('sp-segsending');
+        card.classList.add('sp-segsaid');
+        setTimeout(function () { card.classList.remove('sp-segsaid'); }, 2600);
+        segSay(String((got && got.say) || 'said again on every page'));
+      }, function (err) {
+        segReplaying = '';
+        card.classList.remove('sp-segsending');
+        segSay('it did not go out: ' + segWhy(err), true);
+      });
+  }
+
+  /* --------------------------------- #1194: the hold sheet, at the finger */
+
+  function segRowSheet(card, l, x, y) {
+    var la = root.PineLineActions;
+    var words = card.querySelector('.sp-segline-text');
+    if (!la || typeof la.open !== 'function') {
+      segSay('This surface has no hold sheet loaded, so there is nothing to open.');
+      return;
+    }
+    var said = String((l && l.text) || (words ? words.textContent : '') || '').trim();
+    try {
+      la.open({id: String((l && l.line_id) || ''), said: said, node: words || card});
+    } catch (err) {
+      segSay('the hold sheet would not open: ' + segWhy(err));
+      return;
+    }
+    segSheetAtFinger(x, y);
+  }
+
+  /* There is no hover on the tablet and no mouse for the sheet to follow,
+     so it is put where the finger is - and clamped inside the glass,
+     because a menu half off the screen is a menu with items nobody can
+     reach. Measured twice: the sheet grows as its rows land, so the second
+     measurement on the next frame is the one that matters. */
+  function segSheetAtFinger(x, y) {
+    var sheet = document.querySelector('.la-sheet');
+    if (!sheet) return;
+    var place = function () {
+      var w = sheet.offsetWidth || 0;
+      var h = sheet.offsetHeight || 0;
+      var vw = root.innerWidth || 0;
+      var vh = root.innerHeight || 0;
+      if (!w || !h || !vw || !vh) return;
+      var left = Math.round((Number(x) || (vw / 2)) - (w / 2));
+      var top = Math.round((Number(y) || (vh / 2)) + 16);
+      left = Math.max(8, Math.min(vw - w - 8, left));
+      top = Math.max(8, Math.min(vh - h - 8, top));
+      sheet.classList.add('sp-at-finger');
+      sheet.style.left = left + 'px';
+      sheet.style.top = top + 'px';
+      sheet.style.right = 'auto';
+      sheet.style.bottom = 'auto';
+      sheet.style.transform = 'none';
+    };
+    place();
+    try {
+      if (root.requestAnimationFrame) root.requestAnimationFrame(place);
+    } catch (err) { /* one measurement is better than none */ }
+  }
+
+  /* ------------------------------------- #1194: the gestures on one row */
+
+  function segRowForget(card) {
+    if (card.pineHoldTimer) clearTimeout(card.pineHoldTimer);
+    card.pineHoldTimer = 0;
+  }
+
+  /* A TAP, A HOLD AND A SCROLL ARE THREE DIFFERENT THINGS, and getting
+     that wrong makes a list impossible to read: the timer dies on any
+     movement past a few pixels, the hold marks the press so the release
+     is not also read as a tap, and a press that starts inside the unfolded
+     detail card belongs to that card's own buttons. */
+  function segLineWire(card, l) {
+    var lid = String((l && l.line_id) || '');
+    card.pineLine = l || {};
+    card.setAttribute('data-line-id', lid);
+    card.setAttribute('data-seat', String((l && l.who) || ''));
+    var words = card.querySelector('.sp-segline-text');
+    if (words && segIsSting(l)) {
+      /* #1200 reads this to know a sound-effect row when it sees one, and
+         to offer the trash can that belongs only to those. */
+      words.pineItem = {tag: 'sting', sfx: String((l && l.sfx) || ''),
+        line: lid, deleted: false, text: String((l && l.text) || '')};
+    }
+    if (!lid) {
+      card.classList.add('sp-segline-mute');
+      card.title = 'The station gave this line no id, so it cannot be'
+        + ' played again or looked up.';
+      return;
+    }
+    card.classList.add('sp-segtap');
+    card.setAttribute('role', 'button');
+    card.setAttribute('tabindex', '0');
+    card.title = 'Tap: say it again on the broadcast. Hold or right-click:'
+      + ' what can be done with it.';
+    var press = null;
+    card.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== undefined && ev.button > 0) return;   /* the right button */
+      if (ev.target && ev.target.closest && ev.target.closest('.sp-segdeep')) return;
+      segRowForget(card);
+      press = {x: ev.clientX || 0, y: ev.clientY || 0, held: false};
+      card.pineHoldTimer = setTimeout(function () {
+        card.pineHoldTimer = 0;
+        if (!press) return;
+        press.held = true;
+        segRowSheet(card, card.pineLine, press.x, press.y);
+      }, SEG_HOLD_MS);
+    });
+    card.addEventListener('pointermove', function (ev) {
+      if (!press) return;
+      if (Math.abs((ev.clientX || 0) - press.x) > SEG_HOLD_SLOP
+          || Math.abs((ev.clientY || 0) - press.y) > SEG_HOLD_SLOP) {
+        segRowForget(card);
+        press = null;                                   /* a scroll, not a hold */
+      }
+    });
+    card.addEventListener('pointerup', function (ev) {
+      segRowForget(card);
+      var was = press;
+      press = null;
+      if (!was || was.held) return;
+      if (ev.target && ev.target.closest && ev.target.closest('.sp-segdeep')) return;
+      segLineReplay(card, card.pineLine);
+    });
+    card.addEventListener('pointercancel', function () {
+      segRowForget(card);
+      press = null;
+    });
+    /* The desk has a second button and that is what it is for. */
+    card.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      segRowForget(card);
+      press = null;
+      segRowSheet(card, card.pineLine, ev.clientX, ev.clientY);
+    });
+    /* At the desk there is a keyboard, and a role="button" that cannot be
+       worked from it is a button in name only. Enter says it again; the
+       space bar unfolds what the station holds about it. */
+    card.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); segLineReplay(card, card.pineLine); }
+      else if (ev.key === ' ' || ev.key === 'Spacebar') {
+        ev.preventDefault();
+        segDetailOpen(card, false);
+      }
+    });
+  }
+
+  /* ------------------------------------------------ #1235: the itinerary */
+
+  /* "[the script heading] When I tap on that I want to see the full
+   * itinerary."
+   *
+   * The heading already had a HOLD on it (#1164: complain, mark an issue,
+   * report a missing segment) and a tap did nothing at all except shut that
+   * menu again. A tap now opens the hour's running order - the sheet the
+   * script is being performed FROM - with the next hour under it.
+   *
+   * /api/director?hour=N is that running order and nothing here re-derives
+   * it: the times, the kinds, the durations, what is banked behind each
+   * entry, what aired out of it and what is still to come are all the
+   * station's own fields. The pane at the bottom of the script shows the
+   * same source but only what is STILL TO COME; this shows the whole hour,
+   * which is what "full itinerary" asks for.
+   *
+   * The hold is untouched. A tap is a tap and a hold is a hold, and #1164's
+   * menu is still the thing a hold raises. */
+  var ITIN_ID = 'spItinerary';
+
+  function itineraryClose() { var n = el(ITIN_ID); if (n) n.remove(); }
+
+  function itineraryOpen() {
+    var sheet = sheetShell(ITIN_ID, 'sp-itin', 'The itinerary');
+    /* A diagnostic surface: the broadcast ducks while it is open and lets
+       go by itself when the sheet leaves the page. */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-' + ITIN_ID, root.PineDuck.REPORT, sheet.back);
+    }
+    var name = el('spScriptHead');
+    sheet.box.appendChild(make('div', 'sp-itin-what',
+      name ? headerText(name) : 'the broadcast'));
+    var list = make('div', 'sp-itin-list');
+    sheet.box.appendChild(list);
+    list.appendChild(make('div', 'sp-itin-wait',
+      'asking the station for the running order…'));
+    if (!api() || !api().get) {
+      list.textContent = '';
+      list.appendChild(make('div', 'sp-segrow-why',
+        'There is no bridge to the station from this surface.'));
+      return sheet;
+    }
+    var want = [
+      Promise.resolve(api().get('/api/director?hour=0')).then(null, function () { return null; }),
+      Promise.resolve(api().get('/api/director?hour=1')).then(null, function () { return null; })
+    ];
+    Promise.all(want).then(function (got) {
+      if (!el(ITIN_ID)) return;                       /* closed while asking */
+      var fresh = got.filter(Boolean);
+      /* #1289b's rule, for the same reason: a blip must not WIPE the
+         running order this terminal already holds. */
+      if (fresh.length) { planHours = fresh; planAt = Date.now(); }
+      var hours = fresh.length ? fresh : planHours;
+      list.textContent = '';
+      if (!hours.length) {
+        list.appendChild(make('div', 'sp-segrow-why', 'The station did not'
+          + ' answer for the running order, and this terminal holds none.'));
+        return;
+      }
+      itineraryPaint(list, hours, sheet);
+      if (!fresh.length) {
+        sheet.say('The station did not answer just now - this is the running'
+          + ' order as it last stood here.', true);
+      }
+    });
+    return sheet;
+  }
+
+  function itinClock(ts) {
+    var n = Number(ts) || 0;
+    if (!n) return '';
+    try { return new Date(n * 1000).toTimeString().slice(0, 5); } catch (err) { return ''; }
+  }
+
+  /* WHICH LINE OF THE SCRIPT AN ENTRY ON THE SHEET IS.
+   *
+   * The ledger does not record the slot a round was written for - the
+   * Segment window says so in the station's own words under "Which entry on
+   * the sheet". So the honest link is the CLOCK: the first element on the
+   * page whose air time falls inside this entry's window. Where the entry
+   * names a road, one written for that road is preferred over one that
+   * merely overlaps it, and where nothing falls inside, nothing is claimed:
+   * the row says the script holds no line for it yet, which for an entry
+   * that has not happened is the truth rather than a gap. */
+  function itinFirstLine(entry, until) {
+    var from = Number(entry && entry.start) || 0;
+    if (!from) return null;
+    var to = Number(until) || Number(entry && entry.deadline) || 0;
+    if (!to || to <= from) {
+      to = from + Math.max(60, (Number(entry && entry.minutes) || 1) * 60);
+    }
+    var kind = String((entry && entry.kind) || '');
+    var loose = null;
+    for (var i = 0; i < elements.length; i += 1) {
+      var e = elements[i] || {};
+      var at = Number(e.at) || 0;
+      if (!e.line || at < from || at >= to) continue;
+      if (kind && (String(e.kind || '') === kind || String(e.round || '') === kind)) {
+        return e;
+      }
+      if (!loose) loose = e;
+    }
+    return loose;
+  }
+
+  /* What is behind an entry, in one phrase. `turns` is material BOUND to
+     it and ready to say; `drafts` is material written and not bound, which
+     is not the same promise and must not read like it. */
+  function itinBanked(entry) {
+    var sc = (entry && entry.script) || {};
+    var turns = sc.turns || [];
+    if (turns.length) {
+      return turns.length + (turns.length === 1 ? ' line banked' : ' lines banked')
+        + (segHas(sc.seconds) ? '  ·  ' + segSecs(sc.seconds) : '');
+    }
+    var drafts = Number(sc.drafts) || 0;
+    if (drafts) {
+      return drafts + (drafts === 1 ? ' draft waiting' : ' drafts waiting')
+        + ', none bound';
+    }
+    return 'nothing behind it';
+  }
+
+  function itinAired(entry) {
+    var rows = (entry && entry.aired) || [];
+    var n = rows.length || 0;
+    var secs = Number(entry && entry.aired_seconds) || 0;
+    if (!n && !secs) return '';
+    return (n ? n + (n === 1 ? ' line aired' : ' lines aired') : 'aired')
+      + (secs ? '  ·  ' + segSecs(secs) : '');
+  }
+
+  function itineraryPaint(list, hours, sheet) {
+    for (var h = 0; h < hours.length; h += 1) {
+      var page = hours[h] || {};
+      var rows = page.entries || [];
+      var band = make('div', 'sp-itin-hour');
+      var banked = 0, aired = 0, k;
+      for (k = 0; k < rows.length; k += 1) {
+        if (((rows[k].script || {}).turns || []).length) banked += 1;
+        if (String(rows[k].state || '') === 'aired'
+            || ((rows[k].aired || []).length)) aired += 1;
+      }
+      band.appendChild(make('b', 'sp-itin-hour-h',
+        h === 0 ? 'THIS HOUR' : 'THE HOUR AFTER'));
+      band.appendChild(make('span', 'sp-itin-hour-n',
+        rows.length + (rows.length === 1 ? ' entry' : ' entries')
+        + '  ·  ' + banked + ' with material banked'
+        + '  ·  ' + aired + ' that have aired'
+        + (segHas(page.sheet && page.sheet.preset)
+          ? '  ·  ' + page.sheet.preset : '')));
+      list.appendChild(band);
+      if (!rows.length) {
+        list.appendChild(make('div', 'sp-segrow-why',
+          'The station has no running order for this hour.'));
+        continue;
+      }
+      for (k = 0; k < rows.length; k += 1) {
+        var next = rows[k + 1] ? Number(rows[k + 1].start) || 0 : 0;
+        list.appendChild(itinRow(rows[k] || {}, next, sheet));
+      }
+    }
+  }
+
+  function itinRow(entry, until, sheet) {
+    var state = String(entry.state || '');
+    var row = make('div', 'sp-itin-row');
+    row.setAttribute('data-state', state);
+    if (state === 'on air') row.classList.add('sp-itin-live');
+    else if (state === 'aired' || state.indexOf('went by') === 0) row.classList.add('sp-itin-past');
+    row.appendChild(make('span', 'sp-itin-when', itinClock(entry.start) || '--:--'));
+    var mid = make('div', 'sp-itin-mid');
+    mid.appendChild(make('b', 'sp-itin-name',
+      String(entry.label || entry.kind || 'segment')));
+    var bits = [];
+    if (segHas(entry.kind)) bits.push(String(entry.kind));
+    if (segHas(entry.minutes)) bits.push(entry.minutes + ' min');
+    if (segHas(entry.slot_id)) bits.push(String(entry.slot_id));
+    mid.appendChild(make('span', 'sp-itin-tag', bits.join('  ·  ')));
+    var said = itinAired(entry);
+    mid.appendChild(make('span', 'sp-itin-hold',
+      itinBanked(entry) + (said ? '  ·  ' + said : '')));
+    row.appendChild(mid);
+    row.appendChild(make('span', 'sp-itin-state', state || 'not said yet'));
+
+    var found = itinFirstLine(entry, until);
+    var lid = found ? String(found.line || '') : '';
+    if (!lid) {
+      row.classList.add('sp-itin-nogo');
+      row.title = 'The script on this page holds no line inside this'
+        + ' entry’s window, so there is nothing to jump to yet.';
+      return row;
+    }
+    row.classList.add('sp-itin-go');
+    row.setAttribute('role', 'button');
+    row.setAttribute('tabindex', '0');
+    row.title = 'Jump the script to the first line of this entry';
+    var go = function (ev) {
+      if (ev) ev.preventDefault();
+      var node = document.querySelector('.sp-el[data-line="' + segTame(lid) + '"]');
+      if (!node) {
+        if (sheet && sheet.say) sheet.say('That line has left the page.', true);
+        return;
+      }
+      itineraryClose();
+      jumpToLine(lid);
+    };
+    row.addEventListener('click', go);
+    row.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+      go(ev);
+    });
+    return row;
+  }
+
   function segInspectClose() { var n = el('spSegInspect'); if (n) n.remove(); }
 
   function segInspectOpen(ident) {
     var sheet = sheetShell('spSegInspect', 'sp-segins',
       'Segment ' + (ident.block ? ident.block : '(unnumbered)'));
+    segWindowOpen(sheet, ident);   /* [#1238] a tap in this window is served out of
+                                      one answer, not a fresh request each time */
+    segExportButtons(sheet, ident);                         /* [#1220] */
     /* A diagnostic surface: the broadcast ducks while it is open and
        lets go by itself when the sheet leaves the page. */
     if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
@@ -2099,6 +3589,7 @@
      one. */
   function segFactsPaint(body, d, ident) {
     d = d || {};
+    segShown = d;                  /* [#1238] what every tap in here reads */
     if (d.available === false) {
       var gone = segSection(body, 'The station has no record');
       gone.appendChild(make('div', 'sp-segrow-why', String(d.why
@@ -2289,7 +3780,21 @@
     if (String(l.aired || '') === 'withdrawn') card.classList.add('sp-withdrawn');
     card.style.borderLeftColor = look.colour;
     var top = make('div', 'sp-segline-top');
-    top.appendChild(make('b', 'sp-segline-who', segWord(l.name, look.label)));
+    /* [#1386] THE NAME IS THE HANDLE. "whenever I tap on a title or any
+       name or a section inside of the script view, I want the feed to
+       become a visual node editor." The line's own body still unfolds the
+       record underneath it; the NAME is what traces it. */
+    var whoTag = make('b', 'sp-segline-who sp-tracable',
+      segWord(l.name, look.label));
+    whoTag.title = 'Trace this line - where it came from, and what made it';
+    whoTag.addEventListener('click', function (ev) {
+      /* The inspector's own cards are not `.sp-el`, so the delegated
+         listener above never sees them - this stays, and stops the tap
+         before it also unfolds the record underneath. */
+      ev.stopPropagation();
+      technicalTrace(l.line_id, l.text);
+    });
+    top.appendChild(whoTag);
     var tags = [];
     if (segHas(l.ord)) tags.push('#' + l.ord);
     if (segHas(l.kind)) tags.push(String(l.kind));
@@ -2302,6 +3807,42 @@
     top.appendChild(make('span', 'sp-segline-tag', tags.join('  ·  ')));
     card.appendChild(top);
     card.appendChild(make('div', 'sp-segline-text', segWord(l.text, '(no text)')));
+    /* [#1386] THE DICE, BESIDE THE LINE THEY MADE.
+     *
+     * "Next to each piece of dialogue in the script editor, I want to be
+     *  able to see the dice roll and the result that it got and the
+     *  intensity result of what each dice value equals."
+     *
+     * The raw roll is shown, not a bucket name, because the bucket is
+     * derived and the roll is the fact. The band is shown beside it so a
+     * locked range is visible as a range: a 0.12 inside [0, 0.35] is the
+     * dice doing what it was told, and a 0.12 inside [0, 1] is chance. */
+    if (l.dice && l.dice.roll != null) {
+      var d = l.dice;
+      var band = Array.isArray(d.band) ? d.band : [0, 1];
+      var locked = !(Number(band[0]) === 0 && Number(band[1]) === 1);
+      var hard = Number(d.hard || 0);
+      var means = hard >= 0.72 ? 'hard' : hard >= 0.36 ? 'plainly' : 'mildly';
+      var dice = make('div', 'sp-segline-dice');
+      if (locked) dice.classList.add('sp-dice-locked');
+      var pip = make('span', 'sp-dice-pip', String(d.roll));
+      pip.style.background = Number(d.lean) > 0 ? '#54d18b' : '#e06c9f';
+      dice.appendChild(pip);
+      dice.appendChild(make('span', 'sp-dice-axis', String(d.axis || 'stance')));
+      dice.appendChild(make('span', 'sp-dice-means',
+        (Number(d.lean) > 0 ? 'with them' : 'against them') + ' \u00b7 ' + means));
+      if (locked) {
+        dice.appendChild(make('span', 'sp-dice-band',
+          'locked ' + band[0] + '-' + band[1]));
+      }
+      if (d.answers) {
+        dice.appendChild(make('span', 'sp-dice-ans', 'answering #' + d.answers));
+      }
+      if (d.text) dice.appendChild(make('span', 'sp-dice-text', String(d.text)));
+      dice.title = 'rolled ' + d.roll + ' in [' + band[0] + ', ' + band[1] + ']'
+        + '  ->  ' + means + (d.text ? ('  ->  ' + d.text) : '');
+      card.appendChild(dice);
+    }
     var made = [];
     if (segHas(l.voice)) made.push('voice ' + l.voice);
     if (segHas(l.engine)) made.push('engine ' + l.engine);
@@ -2309,6 +3850,8 @@
     if (segHas(l.source)) made.push('source ' + l.source);
     if (segHas(l.air_at)) made.push('air_at ' + l.air_at);
     if (segHas(l.line_id)) made.push('line ' + l.line_id);
+    if (segHas(l.bound_to)) made.push('bound to ' + l.bound_to);   /* [#1237] */
+    if (segHas(l.cut_why)) made.push(String(l.cut_why));
     card.appendChild(make('div', 'sp-segline-made',
       made.length ? made.join('  ·  ')
         : 'the station recorded nothing about how this line was made'));
@@ -2316,6 +3859,16 @@
       card.appendChild(make('div', 'sp-segline-why',
         'refused at hand-over: ' + String(l.withdrawn_why)));
     }
+    /* [#1251] and why the SFX guy chose the clip he chose. The
+       station writes this onto the booth row at the moment of the
+       draw and airlog_row_from carries it into the durable ledger,
+       so it is here for a segment inspected hours later. */
+    if (segHas(l.match_why)) {
+      var mw = make('div', 'sp-segline-match', String(l.match_why));
+      mw.setAttribute('style', 'font-size:11px;color:#7fd6a8');
+      card.appendChild(mw);
+    }
+    segLineWire(card, l);          /* [#1194] tap: on the air. Hold: the sheet. */
     return card;
   }
 
@@ -2351,13 +3904,16 @@
       if (last === '') steps.push({node: from});
       else if (last !== from) { steps.push({gap: true}); steps.push({node: from}); }
       steps.push({arrow: rows[i] || {}});
-      steps.push({node: to});
+      /* [#1238] the seat that ANSWERED, and the hand-off it
+         answered with - so a tap on the chip can reach the
+         line rather than only naming a seat. */
+      steps.push({node: to, tie: rows[i] || null});
       last = to;
     }
     return steps;
   }
 
-  function segFlowChip(seat) {
+  function segFlowChip(seat, tie) {          /* [#1238] tie: the hand-off */
     var look = segSeatLook(seat);
     var chip = make('div', 'sp-segflow-node', '');
     var dot = make('span', 'sp-segflow-dot', '');
@@ -2365,6 +3921,7 @@
     chip.appendChild(dot);
     chip.appendChild(make('span', 'sp-segflow-name', look.label));
     chip.style.borderColor = look.colour;
+    segFlowTap(chip, seat, tie);   /* [#1238] the node reaches its line */
     return chip;
   }
 
@@ -2386,6 +3943,7 @@
       || 'the station said nothing about what passed');
     if (segHas(t && t.text)) label.title = String(t.text).slice(0, 300);
     wrap.appendChild(label);
+    segFlowTap(wrap, (t && t.to) || '', t || null);  /* [#1193] so does the arrow */
     return wrap;
   }
 
@@ -2443,7 +4001,9 @@
     var drawn = rows.length > SEG_FLOW_MOST ? rows.slice(0, SEG_FLOW_MOST) : rows;
     var steps = segFlowSteps(drawn);
     for (var i = 0; i < steps.length; i += 1) {
-      if (steps[i].node !== undefined) side.appendChild(segFlowChip(steps[i].node));
+      if (steps[i].node !== undefined) {
+        side.appendChild(segFlowChip(steps[i].node, steps[i].tie));  /* [#1238] */
+      }
       else if (steps[i].arrow) side.appendChild(segFlowArrow(steps[i].arrow));
       else if (steps[i].gap) {
         side.appendChild(make('div', 'sp-segflow-gap',
@@ -2722,6 +4282,50 @@
     'next_hour': 'the next hour - both thirty-minute halves'
   };
 
+  /* [#1195] THE COMMAND GRAMMAR, as the writing room expands it. The
+   * station sends its own list on every answer (`grammar`); this is what
+   * the sheet prints before the first answer lands, and if the station is
+   * older than the book. Keep the two in step: segment_prompts.GRAMMAR. */
+  var SEG_PROMPT_GRAMMAR = [
+    {cmd: '- speaker box -', says: 'one random passage out of the speaker box'},
+    {cmd: '{{speakbox}}', says: 'the same thing'},
+    {cmd: '{{speakbox:doc.md}}', says: 'a passage from that one document'},
+    {cmd: '{{speakbox:random:3}}', says: 'three passages, three documents'},
+    {cmd: '{{topic}}', says: 'the topic on the table'},
+    {cmd: '{{caller}}', says: 'the next caller on the shelf'},
+    {cmd: '{{plot}}', says: 'the storyline act that is due'}
+  ];
+
+  /* [#1195] One line naming what each command in a call became - the doc
+     a speaker box passage came out of, or why nothing came. */
+  function segCmdSay(expanded) {
+    var bits = [], i;
+    for (i = 0; i < ((expanded && expanded.length) || 0) && i < 8; i += 1) {
+      var e = expanded[i] || {};
+      bits.push(String(e.cmd || '')
+        + (e.doc ? ' → ' + String(e.doc)
+                 : (e.miss ? ' → ' + String(e.miss) : '')));
+    }
+    return bits.join(', ');
+  }
+
+  function segErrSay(err) {
+    return String((err && err.message) || err || 'no reason given').slice(0, 110);
+  }
+
+  /* [#1245] An act button: the Carbon mark when the sheet has icons, the
+     words always. Never an emoji, and never only an icon. */
+  function segAct(cls, icon, text) {
+    var b = make('button', cls, '');
+    b.type = 'button';
+    var mark = make('span', '', '');
+    mark.innerHTML = folderIcon(icon, '');
+    if (mark.innerHTML) b.appendChild(mark);
+    b.appendChild(make('span', '', String(text)));
+    return b;
+  }
+
+
   function segPromptClose() { var n = el('spSegPrompt'); if (n) n.remove(); }
 
   function segPromptOpen(ident) {
@@ -2743,6 +4347,367 @@
     ta.placeholder = 'the system prompt this kind of segment writes with';
     ta.setAttribute('aria-label', 'The system prompt for this segment');
     sheet.box.appendChild(ta);
+
+    /* ---------------- [#1245] THE BOX MUST STAY ----------------------
+     * "the segment system prompt shows and then it disappears. I need it
+     * to stay so I can edit it".  It disappeared because this sheet reads
+     * the prompt twice - once for the round the screenplay carries, again
+     * for the road segInspect names - and the second answer was painted
+     * into the box even when it was EMPTY.  For a round filed under the
+     * speaker box document it was seeded from (fmn1.md; 19.6% of the
+     * ledger) the second answer is always empty, so the instruction
+     * showed and then vanished in front of him.
+     *
+     * Two rules, and every write to the box goes through taSet so both
+     * hold everywhere:
+     *   HELD - while the box has focus, or carries an edit that has not
+     *     been saved, an arriving answer is PARKED, not painted. The
+     *     station can never type over the operator.
+     *   NEVER BLANK - an answer with no instruction in it cannot empty a
+     *     box that has one. A read that knows nothing leaves what is
+     *     there rather than replacing it with a placeholder. */
+    var taWas = '';           /* the last words the station or the shelf put in */
+    var taDirty = false;      /* he has typed since then */
+    var taParked = null;      /* an answer that arrived while he was typing */
+
+    function taMark(on) {
+      on = !!on;
+      var was = taDirty;
+      taDirty = on;
+      ta.classList.toggle('sp-segpr-dirty', on);
+      if (on && !was) {
+        sheet.say('your words are in the box - nothing the station says will'
+          + ' overwrite them. Save them, or re-read to throw them away.', true);
+      }
+    }
+    function taHeld() {
+      if (taDirty) return true;
+      try { return document.activeElement === ta; } catch (err) { return false; }
+    }
+    function taSet(text, force) {
+      text = String(text === undefined || text === null ? '' : text);
+      if (!force && taHeld()) { taParked = text; return false; }
+      if (!force && !text.trim() && String(ta.value || '').trim()) return false;
+      taParked = null;
+      ta.value = text;
+      taWas = text;
+      taMark(false);
+      return true;
+    }
+    ta.addEventListener('input', function () { taMark(ta.value !== taWas); });
+    ta.addEventListener('blur', function () { taMark(ta.value !== taWas); });
+
+    /* [#1195] THE COMMANDS, on the sheet. A command nobody is told about
+       is a command nobody types. */
+    var help = make('div', 'sp-segpr-help', '');
+    sheet.box.appendChild(help);
+    function helpPaint(rows) {
+      help.textContent = '';
+      help.appendChild(make('span', '', 'Type a command into the instruction'
+        + ' and the writing room fills it in as the segment is written:  '));
+      var list = (rows && rows.length) ? rows : SEG_PROMPT_GRAMMAR, i;
+      for (i = 0; i < list.length; i += 1) {
+        var g = list[i] || {};
+        if (i) help.appendChild(make('span', '', '   ·   '));
+        help.appendChild(make('code', '', String(g.cmd || '')));
+        help.appendChild(make('span', '', ' ' + String(g.says || '')));
+      }
+    }
+    helpPaint(null);
+
+    /* [#1195] WHAT THEY BECOME, before anything is saved or aired. The
+       preview draws a passage to show him, and spends nothing: no chunk
+       is stamped as served and no pick is recorded. */
+    var seeRow = make('div', 'sp-segpr-row');
+    var see = segAct('sp-segpr-act', 'c:view', 'See what the commands become');
+    see.title = 'Expands the commands in the box without saving or airing'
+      + ' anything';
+    var reread = segAct('sp-segpr-act', 'c:renew', 'Re-read the instruction');
+    reread.title = 'Throw away what is in the box and read the station again';
+    seeRow.appendChild(see);
+    seeRow.appendChild(reread);
+    sheet.box.appendChild(seeRow);
+    var seen = make('details', 'sp-segpr-clause');
+    seen.hidden = true;
+    seen.appendChild(make('summary', '', 'the instruction with its commands filled in'));
+    var seenPre = make('pre', 'sp-segpr-pre', '');
+    seen.appendChild(seenPre);
+    sheet.box.appendChild(seen);
+
+    see.addEventListener('click', function () {
+      if (!api() || !api().post) { sheet.say('no bridge to the station'); return; }
+      var text = String(ta.value || '');
+      if (!text.trim()) { sheet.say('there is nothing in the box to expand'); return; }
+      sheet.say('asking the station what these commands become…', true);
+      Promise.resolve(api().post('/api/segment/prompts/preview',
+          {kind: kind, text: text})).then(function (d) {
+        if (!el('spSegPrompt')) return;
+        d = d || {};
+        seenPre.textContent = String(d.text || '');
+        seen.hidden = false;
+        seen.open = true;
+        var ex = d.expanded || [];
+        sheet.say(ex.length
+          ? (ex.length + (ex.length === 1 ? ' command' : ' commands')
+             + ' filled in: ' + segCmdSay(ex))
+          : 'no commands in these words - the writing room gets them as typed',
+          true);
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        sheet.say('the station could not expand them: ' + segErrSay(err));
+      });
+    });
+    reread.addEventListener('click', function () {
+      taWas = ta.value;
+      taMark(false);
+      try { ta.blur(); } catch (err) { /* no focus to drop */ }
+      if (taParked !== null) { var p = taParked; taParked = null; taSet(p, true); }
+      promptLoad();
+      sheet.say('reading the station again…', true);
+    });
+
+    /* -------------- [#1245] THE ALTERNATIVES AND THE DIAL -------------
+     * "I want to be able to make and store alternative system prompts
+     * that are able to be dialed back and forth and randomised between
+     * the segments."  The shelf is per KIND and lives in the station's
+     * own book (data/segment_prompts.json), not in this window: what is
+     * saved here is what the writing room reads for the NEXT segment of
+     * this kind.  The segment on air keeps the instruction it was
+     * written with - a round already written cannot be rewritten by
+     * changing the shelf, and pretending otherwise would be a lie the
+     * operator only finds out about when he listens. */
+    var alts = make('div', 'sp-segpr-alts');
+    sheet.box.appendChild(alts);
+    var usesLine = make('div', 'sp-segpr-uses', '');
+    usesLine.hidden = true;
+    sheet.box.appendChild(usesLine);
+    var altView = null;      /* the station's last shelf answer for this kind */
+    var altOpen = '';        /* whose words are in the box */
+    var altArmed = '';       /* a bin that has been pressed once */
+
+    function altRoute(tail) {
+      return '/api/segment/prompts/' + encodeURIComponent(kind || 'banter') + tail;
+    }
+    function altAfter(got, said) {
+      if (!el('spSegPrompt')) return;
+      if (got && got.book) altsPaint(got.book);
+      if (said) sheet.say(String(said).slice(0, 240), true);
+      promptLoad();          /* which one is dialled now, in the station's words */
+    }
+    function altPut(body) {
+      if (!api() || !api().post) { sheet.say('no bridge to the station'); return; }
+      var text = String(ta.value || '');
+      if (!text.trim()) { sheet.say('there is nothing in the box to save'); return; }
+      body = body || {};
+      body.text = text;
+      body.name = String(nameIn.value || '').slice(0, 80)
+        || (String(kind || 'segment') + ' alternative');
+      sheet.say('saving it to the shelf…', true);
+      Promise.resolve(api().post(altRoute('/alternative'), body)).then(function (got) {
+        if (!el('spSegPrompt')) return;
+        var row = (got && got.alternative) || {};
+        if (row.id) altOpen = String(row.id);
+        taWas = text;
+        taMark(false);
+        altAfter(got, '“' + String(row.name || 'it') + '” is on the '
+          + String((got && got.kind) || kind) + ' shelf - '
+          + String(((got && got.book) || {}).says || '')
+          + '. The next segment of this kind reads it.');
+      }, function (err) {
+        if (!el('spSegPrompt')) return;
+        sheet.say('the station refused the save: ' + segErrSay(err));
+      });
+    }
+    function altPatch(id, fields) {
+      if (!id) return;
+      if (!api() || !api().post) { sheet.say('no bridge to the station'); return; }
+      Promise.resolve(api().post(altRoute('/alternative/' + encodeURIComponent(id)),
+          fields || {})).then(function (got) {
+        altAfter(got, String(((got && got.book) || {}).says || 'saved'));
+      }, function (err) {
+        if (el('spSegPrompt')) sheet.say('the station refused it: ' + segErrSay(err));
+      });
+    }
+    function altDrop(id) {
+      if (!id) return;
+      if (!api() || !api().del) {
+        sheet.say('this surface cannot delete - switch it off instead');
+        return;
+      }
+      Promise.resolve(api().del(altRoute('/alternative/' + encodeURIComponent(id))))
+        .then(function (got) {
+          if (altOpen === String(id)) altOpen = '';
+          altAfter(got, 'taken off the shelf. '
+            + String(((got && got.book) || {}).says || ''));
+        }, function (err) {
+          if (el('spSegPrompt')) sheet.say('the station refused it: ' + segErrSay(err));
+        });
+    }
+    function altMode(mode) {
+      if (!api() || !api().post) { sheet.say('no bridge to the station'); return; }
+      Promise.resolve(api().post(altRoute('/mode'), {mode: String(mode || '')}))
+        .then(function (got) {
+          altAfter(got, 'between the segments: '
+            + String((got && got.says) || mode));
+        }, function (err) {
+          if (el('spSegPrompt')) sheet.say('the station refused it: ' + segErrSay(err));
+        });
+    }
+
+    function altRow(row) {
+      var line = make('div', 'sp-segpr-alt');
+      if (!row.on) line.classList.add('off');
+      if (row.id && String(row.id) === altOpen) line.classList.add('open');
+      var open = make('button', 'sp-segpr-altname', '');
+      open.type = 'button';
+      open.appendChild(make('b', '', String(row.name || row.id || 'Untitled')));
+      open.appendChild(make('span', '', 'weight ' + String(row.weight || 1)
+        + '  ·  written with ' + String(row.used || 0)
+        + (Number(row.used) === 1 ? ' time' : ' times') + '  ·  '
+        + String(row.text || '').replace(/\s+/g, ' ').slice(0, 80)));
+      open.title = 'Put these words in the box';
+      open.addEventListener('click', function () {
+        altOpen = String(row.id || '');
+        taSet(String(row.text || ''), true);
+        nameIn.value = String(row.name || '');
+        altsPaint(altView);
+        sheet.say('“' + String(row.name || row.id) + '” is in the box'
+          + ' - edit it and press Rewrite to change it, or Save as an'
+          + ' alternative to make another one', true);
+      });
+      line.appendChild(open);
+
+      var weight = make('input', 'sp-segpr-weight', '');
+      weight.type = 'number';
+      weight.min = '1';
+      weight.max = '9';
+      weight.step = '1';
+      weight.value = String(row.weight || 1);
+      weight.title = 'How heavily the random draw leans on this one (1-9)';
+      weight.setAttribute('aria-label',
+        'Weight for ' + String(row.name || 'this alternative'));
+      weight.addEventListener('change', function () {
+        altPatch(row.id, {weight: Math.max(1, Math.min(9, Number(weight.value) || 1))});
+      });
+      line.appendChild(weight);
+
+      var sw = make('button', 'sp-segpr-iconbtn', '');
+      sw.type = 'button';
+      sw.title = row.on ? 'On the dial - switch it off'
+                        : 'Switched off - put it back on the dial';
+      sw.setAttribute('aria-pressed', row.on ? 'true' : 'false');
+      sw.setAttribute('aria-label', sw.title);
+      sw.innerHTML = folderIcon(row.on ? 'c:checkbox--checked' : 'c:checkbox', '');
+      if (!sw.innerHTML) sw.textContent = row.on ? '[x]' : '[ ]';
+      if (row.on) sw.classList.add('on');
+      sw.addEventListener('click', function () { altPatch(row.id, {on: !row.on}); });
+      line.appendChild(sw);
+
+      /* Two presses to take one off the shelf: the first arms the bin and
+         says what it will do, the second does it. Nothing here is
+         recoverable, and the shelf is small enough to misclick. */
+      var armed = altArmed === String(row.id || '');
+      var kill = make('button', 'sp-segpr-iconbtn danger', '');
+      kill.type = 'button';
+      kill.title = armed ? 'Press again to take it off the shelf'
+                         : 'Take it off the shelf';
+      kill.setAttribute('aria-label', kill.title);
+      kill.innerHTML = folderIcon('c:trash-can', '');
+      if (!kill.innerHTML) kill.textContent = armed ? 'sure?' : 'x';
+      if (armed) kill.classList.add('on');
+      kill.addEventListener('click', function () {
+        if (altArmed !== String(row.id || '')) {
+          altArmed = String(row.id || '');
+          altsPaint(altView);
+          sheet.say('press the bin again to take “'
+            + String(row.name || row.id) + '” off the shelf', true);
+          return;
+        }
+        altArmed = '';
+        altDrop(row.id);
+      });
+      line.appendChild(kill);
+      alts.appendChild(line);
+    }
+
+    function altsPaint(view) {
+      altView = view || null;
+      alts.textContent = '';
+      var rows = (view && view.alternatives) || [], i;
+      alts.appendChild(make('div', 'sp-segsec-h', 'Alternative instructions'
+        + (kind ? ' for ' + kind : '') + ' — ' + rows.length
+        + (rows.length === 1 ? ' on the shelf' : ' on the shelf')));
+      alts.appendChild(make('div', 'sp-segrow-why', String((view && view.says)
+        || 'nothing saved for this kind yet - the words in the box are what'
+           + ' it writes with')));
+      for (i = 0; i < rows.length; i += 1) altRow(rows[i] || {});
+
+      var dialRow = make('div', 'sp-segpr-row');
+      dialRow.appendChild(make('span', 'sp-segrow-k', 'between the segments'));
+      var dial = make('select', 'sp-segpr-mode');
+      dial.setAttribute('aria-label',
+        'How this kind picks between its alternative instructions');
+      var opts = [], o;
+      for (i = 0; i < rows.length; i += 1) {
+        opts.push({v: 'fixed:' + String(rows[i].id || ''),
+                   t: 'always “' + String(rows[i].name || '') + '”'});
+      }
+      opts.push({v: 'cycle', t: 'take the next one in turn, segment by segment'});
+      opts.push({v: 'random',
+                 t: 'a weighted draw, never the same one twice running'});
+      for (i = 0; i < opts.length; i += 1) {
+        o = make('option', '', opts[i].t);
+        o.value = opts[i].v;
+        dial.appendChild(o);
+      }
+      if (!rows.length) {
+        dial.disabled = true;
+        dial.title = 'Save an alternative first';
+      } else {
+        dial.value = String((view && view.mode) || '');
+        dial.addEventListener('change', function () { altMode(dial.value); });
+      }
+      dialRow.appendChild(dial);
+      alts.appendChild(dialRow);
+
+      var actRow = make('div', 'sp-segpr-row');
+      var keep = segAct('sp-segpr-act lit', 'c:add', 'Save as an alternative');
+      keep.title = 'Puts the words in the box on this kind’s shelf as a'
+        + ' new alternative. Nothing already written changes.';
+      keep.addEventListener('click', function () { altPut({}); });
+      actRow.appendChild(keep);
+      if (altOpen) {
+        var over2 = segAct('sp-segpr-act', 'c:save', 'Rewrite the one I opened');
+        over2.title = 'Replaces the words of the alternative loaded into the box';
+        over2.addEventListener('click', function () { altPut({id: altOpen}); });
+        actRow.appendChild(over2);
+      }
+      alts.appendChild(actRow);
+    }
+    altsPaint(null);
+
+    /* [#1195] WHAT THE LAST ROUNDS OF THIS KIND WERE ACTUALLY WRITTEN
+       WITH - the paperwork, read back. Two consecutive rounds naming two
+       different alternatives is what "randomised between the segments"
+       looks like from the outside. */
+    function usesPaint(rows) {
+      rows = rows || [];
+      var bits = [], i;
+      for (i = 0; i < rows.length && i < 6; i += 1) {
+        var u = rows[i] || {};
+        var one = (u.name ? '“' + String(u.name) + '”'
+                          : 'the shelf text as it stands')
+          + (u.mode ? ' (' + String(u.mode)
+                      + (u.of ? ' of ' + String(u.of) : '') + ')' : '');
+        if (segCmdSay(u.expanded)) one += ' · ' + segCmdSay(u.expanded);
+        bits.push(one);
+      }
+      usesLine.textContent = bits.length
+        ? ('the last segments of this kind were written with:  ' + bits.join('   |   '))
+        : '';
+      usesLine.hidden = !bits.length;
+    }
+
 
     var namely = make('div', 'sp-segpr-row');
     var nameIn = make('input', 'sp-segpr-in', '');
@@ -2865,7 +4830,7 @@
             (row.kind ? String(row.kind) : 'suits anything')
             + (row.scenario ? '  ·  ' + String(row.scenario) : '')));
           b.addEventListener('click', function () {
-            ta.value = String(row.text || '');
+            taSet(String(row.text || ''), true);   /* [#1245] one road in */
             nameIn.value = String(row.name || '');
             scenIn.value = String(row.scenario || '');
             picked = row;
@@ -2911,6 +4876,19 @@
         segRow(facts, 'kind', segWord(d.kind, kind));
         segRow(facts, 'hour', segWord(d.hour, hour || 'the hour on air'));
         segRow(facts, 'these words came from', d.source);
+        /* [#1245] The two facts that made this box look empty: a round
+           filed under the speaker box DOCUMENT it was seeded from
+           (fmn1.md) is keyed on a ROAD, and the road is what has a shelf.
+           And which alternative the dial has landed on for the next one. */
+        if (d.road && String(d.road) !== String(d.kind || '')) {
+          segRow(facts, 'the road it is keyed on', d.road);
+        }
+        if (d.seed_doc) segRow(facts, 'seeded from the speaker box', d.seed_doc);
+        if (d.dialled) {
+          segRow(facts, 'the alternative dialled for the next one',
+            String(d.dialled.name || d.dialled.id || ''))
+            .classList.add('sp-segpr-pick');
+        }
         if (d.variant) segRow(facts, 'variant', d.variant.name || d.variant.id);
         if (d.window) {
           var w = segRow(facts, 'a timed prompt owns this kind',
@@ -2919,12 +4897,30 @@
         }
         if (d.why) facts.appendChild(make('div', 'sp-segrow-why', String(d.why)));
         if (d.blurb) facts.appendChild(make('div', 'sp-segrow-why', String(d.blurb)));
-        ta.value = String(d.text || '');
-        if (!String(d.text || '').trim() && d.seed) {
-          ta.value = String(d.seed);
+        /* [#1245] THE BOX IS FILLED WITH WHAT THE WRITING ROOM WOULD
+           ACTUALLY BE HANDED for the next segment of this kind - the
+           alternative the dial lands on, else the shelf text, else the
+           station's own seed - and it is filled through taSet, so an
+           answer that arrives while he is typing is parked instead of
+           painted over him, and an answer with nothing in it can no
+           longer empty a box that has something. This is the line that
+           made the prompt "show and then disappear". */
+        var want = String(d.text || '');
+        if (!want.trim()) want = String(d.seed || '');
+        var landed = taSet(want);
+        if (!landed && taHeld()) {
+          sheet.say('the station answered while you were typing - your words'
+            + ' are still in the box. Re-read to take the station’s.', true);
+        } else if (!landed) {
+          sheet.say('the station has no instruction for this kind just now -'
+            + ' what is in the box is left as it is', true);
+        } else if (!String(d.text || '').trim() && d.seed) {
           sheet.say('there is nothing on the shelf for this kind; the'
             + ' station’s own seed is in the box', true);
         }
+        helpPaint(d.grammar);                                    /* [#1195] */
+        altsPaint(d.alternatives || null);                       /* [#1245] */
+        usesPaint(d.uses || []);                                 /* [#1195] */
         if (!nameIn.value) {
           nameIn.value = String(d.label || d.kind || kind || 'segment')
             + (ident.block ? ' · block ' + ident.block : '');
@@ -3059,6 +5055,203 @@
     return sheet;
   }
 
+  /* ---- #1220: download the whole segment ------------------------- */
+
+  /* "I want to be able to download an entire segment, offer an option to
+   * download the whole segment and export it to Pinebox for recordings
+   * as a segment."
+   *
+   * The station builds the file (POST /api/export/segment: every heard
+   * line of the block in ledger order, cut from the round's own welded
+   * audio with the stings where they fell, records as short beds) and
+   * hands it to the courier, which is what carries anything to the
+   * PineBoxRecordings folder (#1114). This only asks, then watches the
+   * job (GET /api/export/segment/<job>) in a toast at the corner of the
+   * glass that says which step it is on and, at the end, where the file
+   * landed. "As it aired" asks for the same stretch off the broadcast
+   * shelf's full mix; a stretch the shelf has not sealed yet comes back
+   * refused with `can_seal`, and the toast offers to seal it first. */
+  var SEG_EXPORT_POLL_MS = 1500;
+  var SEG_EXPORT_MAX_MS = 15 * 60 * 1000;
+  var SEG_EXPORT_RAIL_ID = 'spSegExportRail';
+
+  function segExportToast(title) {
+    var rail = el(SEG_EXPORT_RAIL_ID);
+    if (!rail) {
+      rail = make('div', 'sp-segexp-rail');
+      rail.id = SEG_EXPORT_RAIL_ID;
+      document.body.appendChild(rail);
+    }
+    var box = make('div', 'sp-segexp');
+    var head = make('div', 'sp-segexp-head');
+    head.appendChild(make('b', null, title));
+    var x = make('button', 'sp-segexp-x', '\u00d7');
+    x.type = 'button';
+    x.setAttribute('aria-label', 'Close');
+    head.appendChild(x);
+    box.appendChild(head);
+    var bar = make('div', 'sp-segexp-bar');
+    var fill = make('div', 'sp-segexp-fill');
+    bar.appendChild(fill);
+    box.appendChild(bar);
+    var step = make('div', 'sp-segexp-step', 'asking the station\u2026');
+    box.appendChild(step);
+    var where = make('div', 'sp-segexp-where', '');
+    where.hidden = true;
+    box.appendChild(where);
+    var acts = make('div', 'sp-segexp-acts');
+    acts.hidden = true;
+    box.appendChild(acts);
+    rail.appendChild(box);
+    while (rail.children.length > 3) rail.removeChild(rail.children[0]);
+    var gone = 0;
+    function close() {
+      clearTimeout(gone);
+      if (box.parentNode) box.parentNode.removeChild(box);
+      var r = el(SEG_EXPORT_RAIL_ID);
+      if (r && !r.children.length && r.parentNode) r.parentNode.removeChild(r);
+    }
+    x.addEventListener('click', close);
+    return {
+      box: box, close: close,
+      open: function () { return !!box.parentNode; },
+      pct: function (p) {
+        var n = Number(p);
+        if (!isFinite(n)) n = 0;
+        fill.style.width = Math.max(0, Math.min(100, n)) + '%';
+      },
+      say: function (text, bad) {
+        step.textContent = String(text || '');
+        step.classList.toggle('bad', !!bad);
+      },
+      where: function (text) {
+        where.textContent = String(text || '');
+        where.hidden = !where.textContent;
+      },
+      done: function (ms) {
+        clearTimeout(gone);
+        gone = setTimeout(close, ms || 15000);
+      },
+      button: function (label, act) {
+        var b = make('button', 'sp-segexp-btn', label);
+        b.type = 'button';
+        b.addEventListener('click', function () { acts.hidden = true; act(); });
+        acts.appendChild(b);
+        acts.hidden = false;
+        return b;
+      }
+    };
+  }
+
+  function segExportRun(ident, source, extra) {
+    ident = ident || {};
+    source = source === 'aired' ? 'aired' : 'welded';
+    var block = String(ident.block || '').trim();
+    var toast = segExportToast('Segment ' + (block || '(unnumbered)') + ' \u00b7 '
+      + (source === 'aired' ? 'as it aired' : 'the whole segment'));
+    if (!block) {
+      toast.say('No line under this heading carries a block number, so there is'
+        + ' nothing to download - a segment is named by its block (#1330).', true);
+      toast.done(9000);
+      return Promise.resolve(null);
+    }
+    if (!api() || !api().post || !api().get) {
+      toast.say('There is no bridge to the station from this surface.', true);
+      toast.done(9000);
+      return Promise.resolve(null);
+    }
+    var body = {block: Number(block), source: source, records: 'short'};
+    if (extra && typeof extra === 'object') {
+      Object.keys(extra).forEach(function (k) { body[k] = extra[k]; });
+    }
+    toast.pct(3);
+    var startedAt = Date.now();
+    function paint(d) {
+      d = d || {};
+      toast.pct(d.pct);
+      var st = String(d.state || '');
+      if (st === 'ready') {
+        toast.pct(100);
+        toast.say(String(d.say || 'landed'));
+        toast.where(String(d.landed || d.share_path || d.path || ''));
+        toast.done(20000);
+        return true;
+      }
+      if (st === 'failed' || st === 'empty') {
+        toast.say(String(d.say || d.error || 'the station could not build it'), true);
+        if (d.can_seal) {
+          toast.button('Seal the shelf now and build it', function () {
+            toast.close();
+            segExportRun(ident, source, {seal: true});
+          });
+        }
+        if (source === 'aired') {
+          toast.button('Build the welded segment instead', function () {
+            toast.close();
+            segExportRun(ident, 'welded');
+          });
+        } else if (!d.can_seal) {
+          toast.done(14000);
+        }
+        return true;
+      }
+      toast.say(String(d.step || d.say || 'building\u2026'));
+      return false;
+    }
+    function poll(job) {
+      if (!toast.open()) return;                 /* closed by hand: stop asking */
+      if (Date.now() - startedAt > SEG_EXPORT_MAX_MS) {
+        toast.say('the station is still building it; the file lands in the'
+          + ' recording folder when it is done', true);
+        return;
+      }
+      Promise.resolve(api().get('/api/export/segment/' + encodeURIComponent(job)))
+        .then(function (d) {
+          if (!paint(d)) setTimeout(function () { poll(job); }, SEG_EXPORT_POLL_MS);
+        }, function (err) {
+          toast.say('the station did not answer: '
+            + String((err && err.message) || err).slice(0, 120), true);
+          setTimeout(function () { poll(job); }, SEG_EXPORT_POLL_MS * 3);
+        });
+    }
+    return Promise.resolve(api().post('/api/export/segment', body)).then(function (got) {
+      got = got || {};
+      if (!got.job) {
+        toast.say(String(got.say || got.detail || 'the station refused it'), true);
+        toast.done(12000);
+        return got;
+      }
+      if (!paint(got)) poll(got.job);
+      return got;
+    }, function (err) {
+      toast.say('the station refused it: '
+        + String((err && err.message) || err).slice(0, 160), true);
+      toast.done(12000);
+      return null;
+    });
+  }
+
+  /* The Segment window's own header carries the same two roads, so a
+     segment being inspected can be taken away without going back to the
+     menu. Inserted before the close button, which sheetShell owns. */
+  function segExportButtons(sheet, ident) {
+    if (!sheet || !sheet.head || !sheet.x) return;
+    function one(icon, label, short, source) {
+      var b = make('button', 'sp-segins-dl', '');
+      b.type = 'button';
+      b.title = label;
+      b.setAttribute('aria-label', label);
+      b.innerHTML = folderIcon(icon, '') || '';
+      b.appendChild(make('span', 'sp-segins-dl-text', short));
+      b.addEventListener('click', function () { segExportRun(ident, source); });
+      sheet.head.insertBefore(b, sheet.x);
+    }
+    one('c:download', 'Download the whole segment to the recording folder',
+      'download', 'welded');
+    one('c:recording--filled', 'Download the segment as it aired, off the broadcast shelf',
+      'as aired', 'aired');
+  }
+
   /* ---- #1168: the menu itself ------------------------------------- */
 
   var SEG_CHOICES = [
@@ -3070,7 +5263,17 @@
         + ' records ride along'},
     {id: 'prompt', label: 'Examine system prompt', icon: 'c:book',
      why: 'The system prompt this kind of segment writes with: read it,'
-        + ' edit it, save it, or put it to work'}
+        + ' edit it, save it, or put it to work'},
+    /* [#1220] the two downloads: the station builds one file for the
+       block and the courier carries it to the recording folder. */
+    {id: 'export', label: 'Download the whole segment', icon: 'c:download',
+     why: 'One file in the recording folder: every heard line of this'
+        + ' segment in script order, cut from the round\'s own audio with'
+        + ' the stings where they fell, records as short beds'},
+    {id: 'export-air', label: 'Download the segment as it aired',
+     icon: 'c:recording--filled',
+     why: 'The same stretch off the broadcast shelf\'s full mix - records'
+        + ' underneath, gaps as they were - once the shelf has sealed it'}
   ];
 
   function segMenuClose() {
@@ -3115,6 +5318,8 @@
         try {
           if (choice.id === 'inspect') segInspectOpen(ident);
           else if (choice.id === 'report') segReportOpen(ident);
+          else if (choice.id === 'export') segExportRun(ident, 'welded');     /* [#1220] */
+          else if (choice.id === 'export-air') segExportRun(ident, 'aired');  /* [#1220] */
           else segPromptOpen(ident);
         } catch (err) {
           caughtNote('seg:' + choice.id, err);
@@ -3191,6 +5396,17 @@
     var box = make('div', 'sp-find-box');
     var head = make('div', 'sp-find-head');
     head.appendChild(make('b', null, '\u201c' + q + '\u201d on the air'));
+    /* [#1241] "an icon here for tracing a typed phrase through the prompts,
+       the data crystal, the topics, the scripts, and find the source of
+       where a scripted phrase is coming from", and [#1239] "a trash can so
+       that whenever I search for [it] I'm able to delete [it] ... and have
+       it not said by the host anymore". Both live in the head of the sheet
+       the operator is already looking at. */
+    var traceBtn = findHeadBtn('c:chart--network', 'Where it comes from');
+    var banBtn = findHeadBtn('c:trash-can', 'Never say this again');
+    banBtn.classList.add('sp-find-bin');
+    head.appendChild(traceBtn);
+    head.appendChild(banBtn);
     var x = make('button', 'sp-find-x', '\u00d7');
     x.type = 'button';
     x.addEventListener('click', findClose);
@@ -3200,6 +5416,16 @@
     box.appendChild(why);
     var facts = make('div', 'sp-find-facts');
     box.appendChild(facts);
+    var trace = make('div', 'sp-find-trace');                    /* [#1241] */
+    trace.id = 'spFindTrace';
+    trace.hidden = true;
+    box.appendChild(trace);
+    traceBtn.addEventListener('click', function () {
+      if (!trace.hidden) { trace.hidden = true; traceBtn.setAttribute('aria-expanded', 'false'); return; }
+      traceBtn.setAttribute('aria-expanded', 'true');
+      findTraceOpen(trace, q, '');
+    });
+    banBtn.addEventListener('click', function () { findBanAsk(back, trace, q); });
     var list = make('div', 'sp-find-list');
     box.appendChild(list);
     back.appendChild(box);
@@ -3208,6 +5434,17 @@
     Promise.resolve(api().get('/api/said/search?q=' + encodeURIComponent(q) + '&hours=48&limit=120')).then(function (d) {
       if (!d) { why.textContent = 'the station did not answer'; return; }
       why.textContent = d.why || d.say || '';
+      /* [#1230] "They are saying that somewhere a system prompt is making it
+         say that." Sometimes it is, and this names the line. Sometimes it is
+         NOT - on "wanted us to explore" the verdict says "a persona or a
+         prompt for that seat" and the tracer finds no persona and no prompt
+         at all, only a line of code the tint rhymes. Either way the operator
+         gets the answer instead of the guess, so a ONE VOICE or ONE ROAD
+         verdict opens the pane by itself. */
+      if (/^ONE (VOICE|ROAD)/.test(String(d.why || ''))) {
+        traceBtn.setAttribute('aria-expanded', 'true');
+        findTraceOpen(trace, q, String(d.why || ''), why);
+      }
       var bits = [String(d.total || 0) + ' airing(s) in ' + (d.hours || 48) + 'h, ' + String(d.distinct || 0) + ' distinct line(s)'];
       (d.by_round || []).slice(0, 4).forEach(function (r) { bits.push(r.name + ' \u00d7' + r.n); });
       (d.by_who || []).slice(0, 3).forEach(function (r) { bits.push(r.name + ' \u00d7' + r.n); });
@@ -3259,6 +5496,265 @@
       if (!(d.rows || []).length) list.appendChild(make('div', 'sp-find-row', 'not said on the air in the last two days'));
     }, function (err) {
       why.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 80);
+    });
+  }
+
+  /* ---- #1241 / #1239 / #1230: where a phrase comes from, and the bin ---- */
+
+  /* "I want an icon here for tracing a typed phrase through the prompts,
+   *  the data crystal, the topics, the scripts, and find the source of where
+   *  a scripted phrase is coming from. I need to be able to completely
+   *  remove and delete and trace a phrase or saying from the dialogue and
+   *  future scripting."  (#1241)
+   * "I want the ability to have a trash can so that whenever I search for
+   *  [a phrase] I'm able to delete [it] from the database and have it not
+   *  said by the host anymore."  (#1239)
+   * "They are saying that somewhere a system prompt is making it say that.
+   *  I want the ability to make it stop doing that."  (#1230)
+   *
+   * The station does every bit of the work (GET /api/phrase/trace, POST and
+   * DELETE /api/phrase/ban); this draws four layers in a fixed order, a tick
+   * beside every source that can actually be removed, and a confirm sheet
+   * that names the consequence in the station's own words before anything
+   * is deleted. */
+
+  var FIND_LAYER_ICON = {prompts: 'c:notebook', crystal: 'c:gem',
+                         topics: 'c:chat', scripts: 'c:script'};
+
+  function findHeadBtn(icon, title) {
+    var b = make('button', 'sp-find-act', '');
+    b.type = 'button';
+    b.title = title;
+    b.setAttribute('aria-label', title);
+    b.setAttribute('aria-expanded', 'false');
+    try {
+      if (typeof root.pineIcon === 'function') b.innerHTML = root.pineIcon(icon, title);
+    } catch (err) { /* the text below stands in */ }
+    if (!b.innerHTML) b.textContent = title.slice(0, 1);
+    return b;
+  }
+
+  function findTraceOpen(pane, q, verdict, whyNode) {
+    pane.hidden = false;
+    if (pane.pineTrace) { findTracePaint(pane, pane.pineTrace, verdict, whyNode); return; }
+    if (pane.pineAsking) return;
+    if (!api() || !api().get) { pane.textContent = 'no bridge to ask through'; return; }
+    pane.textContent = 'asking the station where it is written<u2026>';
+    pane.pineAsking = true;
+    Promise.resolve(api().get('/api/phrase/trace?q=' + encodeURIComponent(q))).then(function (d) {
+      pane.pineAsking = false;
+      if (!d || d.ok === false) { pane.textContent = 'the station did not answer'; return; }
+      pane.pineTrace = d;
+      findTracePaint(pane, d, verdict, whyNode);
+    }, function (err) {
+      pane.pineAsking = false;
+      pane.textContent = 'the station did not answer: '
+        + String((err && err.message) || err).slice(0, 80);
+    });
+  }
+
+  function findSourceLine(s) {
+    var bits = [];
+    if (s.what) bits.push(s.what);
+    if (s.file) bits.push(s.file);
+    if (s.line) bits.push('line ' + s.line);
+    if (s.round) bits.push(s.round);
+    if (s.count > 1) bits.push('<u00d7>' + s.count);
+    return bits.join('  <u00b7>  ');
+  }
+
+  function findTracePaint(pane, d, verdict, whyNode) {
+    pane.textContent = '';
+    pane.appendChild(make('div', 'sp-find-trace-head',
+      'Where it comes from  <u00b7>  ' + String(d.say || '')));
+
+    /* THE CORRECTION. A phrase the tint RHYMED into being is written in no
+       prompt and no persona, and every search of the prompts will keep
+       finding nothing. Say so, and name the line the rhyme came off. */
+    if (d.kin) {
+      var kin = make('div', 'sp-find-kin', '');
+      kin.appendChild(make('b', null, 'Not written anywhere. '));
+      kin.appendChild(make('span', null,
+        'No persona, prompt, crystal or topic contains this phrase. The rhyme '
+        + 'pass made it out of <u201c>' + d.kin + '<u201d>, below <u2014> so the '
+        + 'verdict above is pointing at a seat that never wrote it.'));
+      pane.appendChild(kin);
+    }
+
+    var picked = pane.pinePicked || (pane.pinePicked = {});
+    (d.layers || []).forEach(function (layer) {
+      var box = make('div', 'sp-find-layer', '');
+      var h = make('div', 'sp-find-layer-head', '');
+      var mark = make('span', 'sp-find-layer-mark', '');
+      try {
+        if (typeof root.pineIcon === 'function') {
+          mark.innerHTML = root.pineIcon(FIND_LAYER_ICON[layer.layer] || 'c:document', '');
+        }
+      } catch (err) { /* the label stands alone */ }
+      h.appendChild(mark);
+      h.appendChild(make('b', null, layer.label));
+      h.appendChild(make('span', 'sp-find-layer-n',
+        layer.count ? String(layer.count) + ' source(s)' : 'nothing'));
+      h.appendChild(make('span', 'sp-find-layer-why', layer.blurb || ''));
+      box.appendChild(h);
+      (layer.sources || []).forEach(function (s) {
+        var row = make('div', 'sp-find-src', '');
+        row.dataset.src = s.id;
+        var can = (s.kill === 'strip' || s.kill === 'drop' || s.kill === 'deactivate');
+        var tick = make('button', 'sp-find-tick', '');
+        tick.type = 'button';
+        tick.setAttribute('role', 'checkbox');
+        tick.setAttribute('aria-checked', 'false');
+        tick.title = can ? ('Remove this too: ' + (s.kill_label || ''))
+                         : (s.kill_label || 'nothing here can be removed');
+        tick.disabled = !can;
+        function drawTick() {
+          var on = !!picked[s.id];
+          tick.setAttribute('aria-checked', on ? 'true' : 'false');
+          try {
+            if (typeof root.pineIcon === 'function') {
+              tick.innerHTML = root.pineIcon(on ? 'c:checkbox--checked' : 'c:checkbox', '');
+            }
+          } catch (err) { /* fall through */ }
+          if (!tick.innerHTML) tick.textContent = on ? '[x]' : '[ ]';
+        }
+        drawTick();
+        tick.addEventListener('click', function () {
+          if (!can) return;
+          if (picked[s.id]) delete picked[s.id]; else picked[s.id] = true;
+          drawTick();
+        });
+        row.appendChild(tick);
+        var body = make('div', 'sp-find-src-body', '');
+        body.appendChild(make('div', 'sp-find-src-name', s.label || s.store));
+        body.appendChild(make('div', 'sp-find-src-where', findSourceLine(s)));
+        body.appendChild(make('div', 'sp-find-src-snip', s.snippet || ''));
+        if (s.why) body.appendChild(make('div', 'sp-find-src-why', s.why));
+        if (!can && s.kill_label) body.appendChild(make('div', 'sp-find-src-why', s.kill_label));
+        row.appendChild(body);
+        box.appendChild(row);
+      });
+      if (!(layer.sources || []).length) {
+        box.appendChild(make('div', 'sp-find-src sp-find-src-none',
+          'nothing in this layer says it'));
+      }
+      pane.appendChild(box);
+    });
+
+    /* #1230: turn the verdict itself into the link the operator asked for. */
+    if (whyNode && /^ONE (VOICE|ROAD)/.test(String(verdict || ''))) {
+      var src = d.verdict_source;
+      whyNode.textContent = String(verdict || '');
+      var jump = make('button', 'sp-find-link', '');
+      if (src) {
+        jump.textContent = '<u2192> ' + (src.label || src.store)
+          + (src.file ? ' (' + src.file + (src.line ? ':' + src.line : '') + ')' : '');
+        jump.title = 'Show the exact line the tracer found';
+        jump.addEventListener('click', function () {
+          pane.hidden = false;
+          var node = pane.querySelector('[data-src="' + src.id + '"]');
+          if (node) {
+            node.classList.add('lit');
+            try { node.scrollIntoView({block: 'center'}); } catch (err) { /* no view */ }
+          }
+        });
+      } else {
+        jump.textContent = d.kin
+          ? '<u2192> no prompt says it: the tint rhymes it out of <u201c>' + d.kin + '<u201d>'
+          : '<u2192> no prompt, persona, crystal or topic says it';
+        jump.title = 'What the tracer actually found';
+        jump.addEventListener('click', function () { pane.hidden = false; });
+      }
+      whyNode.appendChild(jump);
+    }
+  }
+
+  /* ---- #1239: the trash can, and the sheet that names the cost ---- */
+
+  function findBanAsk(back, pane, q) {
+    if (el('spFindBan')) return;
+    var wrap = make('div', 'sp-find-confirm-back');
+    wrap.id = 'spFindBan';
+    var sheet = make('div', 'sp-find-confirm');
+    var picked = Object.keys((pane && pane.pinePicked) || {});
+    var d = (pane && pane.pineTrace) || null;
+    sheet.appendChild(make('div', 'sp-find-confirm-head',
+      'Never say <u201c>' + q + '<u201d> again'));
+    var body = make('div', 'sp-find-confirm-body', '');
+    if (d) {
+      body.appendChild(make('div', null, d.confirm || ''));
+    } else {
+      body.appendChild(make('div', null,
+        'The station has not been asked where it comes from yet <u2014> the ban '
+        + 'still holds, and the trace will show what it took.'));
+    }
+    var says = make('ul', 'sp-find-confirm-list', '');
+    [['it is blocked in the writing prompt, stripped out at the mouth, and '
+      + 'refused on the rhyme pass’s way out'],
+     ['every prepared round that says it is retired to the retirement desk, '
+      + 'reason <u201c>phrase banned<u201d>, and can never go on air'
+      + (d ? ' <u2014> ' + String(d.rounds || 0) + ' round(s) right now' : '')],
+     ['every gold bar that says it is burnt'
+      + (d ? ' <u2014> ' + String(d.bars || 0) + ' bar(s) right now' : '')],
+     [picked.length
+       ? String(picked.length) + ' ticked source(s) are removed from their desk'
+       : 'nothing written in a persona, prompt, crystal or topic is deleted '
+         + 'unless you tick it in the pane'],
+     ['it is written in the judgment book, and the trash can lifts it again']
+    ].forEach(function (t) { says.appendChild(make('li', null, t[0])); });
+    body.appendChild(says);
+    sheet.appendChild(body);
+    var row = make('div', 'sp-find-confirm-row', '');
+    var no = make('button', 'sp-find-confirm-no', 'Cancel');
+    no.type = 'button';
+    no.addEventListener('click', function () { wrap.remove(); });
+    var yes = make('button', 'sp-find-confirm-yes',
+      (d && d.banned) ? 'Let it be said again' : 'Never say it again');
+    yes.type = 'button';
+    yes.addEventListener('click', function () {
+      yes.disabled = true;
+      findBanDo(wrap, back, q, picked, !!(d && d.banned));
+    });
+    row.appendChild(no);
+    row.appendChild(yes);
+    sheet.appendChild(row);
+    wrap.appendChild(sheet);
+    wrap.addEventListener('click', function (ev) { if (ev.target === wrap) wrap.remove(); });
+    document.body.appendChild(wrap);
+    /* A confirm sheet is a report surface: the radio ducks while it is up,
+       and the hold dies with the node (standing rule, PineDuck). */
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-find-ban', root.PineDuck.REPORT, wrap);
+    }
+  }
+
+  function findBanDo(wrap, back, q, picked, lift) {
+    var note = make('div', 'sp-find-confirm-note', 'telling the station<u2026>');
+    wrap.firstChild.appendChild(note);
+    var call;
+    if (lift && api() && api().del) {
+      call = api().del('/api/phrase/ban?q=' + encodeURIComponent(q));
+    } else if (!api() || !api().post) {
+      note.textContent = 'no bridge to the station';
+      return;
+    } else {
+      call = api().post('/api/phrase/ban',
+        lift ? {phrase: q, lift: true}
+             : {phrase: q, scope: 'everywhere', sources: picked,
+                reason: 'banned from the word search on the script view'});
+    }
+    Promise.resolve(call).then(function (got) {
+      note.textContent = (got && got.say) || 'done';
+      try { say((got && got.say) || 'done'); } catch (err) { /* no voice line */ }
+      var trace = el('spFindTrace');
+      if (trace) { trace.pineTrace = null; trace.pinePicked = {}; }
+      root.setTimeout(function () {
+        wrap.remove();
+        if (trace && !trace.hidden) findTraceOpen(trace, q, '');
+      }, 1400);
+    }, function (err) {
+      note.textContent = 'the station refused: '
+        + String((err && err.message) || err).slice(0, 120);
     });
   }
 
@@ -3528,7 +6024,11 @@
     var lit = pane.querySelector('.sp-el.sp-now');
     var idx = diagnosticIndices.has(lit) ? diagnosticIndices.get(lit) : -1;
     var audio = root.PineScriptDiagnostics.readAudio(bridgeHead(), soundingPlayer(), streamAt());
-    var active = attempt(activeRow) || {};
+    /* [#1189] THE RESOLVER'S OWN ANSWER, not a second computation. The
+       recorder used to call activeRow() itself; the highlight was placed
+       by another timer from another call. */
+    var decision = lastDecision || {};
+    var active = decision.mark === 'air' ? {id: String(decision.line_id || '')} : {};
     var feed = [];
     try { feed = root.PineStationFeed.rows() || []; } catch (e) { /* no feed */ }
     var records = [], nearby = [], mapping = [], byId = Object.create(null);
@@ -3552,7 +6052,9 @@
         var source = byId[id] || {};
         records.push({id: id, element_id: item.id, block: item.block, ord: item.ord,
           kind: item.type, who: source.who || source.name || '', text: item.text,
-          media: rowFile(source), from_s: rowFrom(source), until_s: rowUntil(source), document_index: i});
+          media: rowFile(source), from_s: rowFrom(source), until_s: rowUntil(source), document_index: i,
+          sfx: String(source.sfx || ''), url: String(source.url || item.clip || item.url || ''),   /* [#1189] */
+          aired: String(source.aired || item.aired || '')});
       }
     }
     // Keep a small cue neighborhood and both claimed identities. Copying the
@@ -3564,10 +6066,16 @@
           var known = diagnosticLines[String(r.id || '')] || {}, item = known.item || {};
           records.push({id: r.id, kind: r.kind, who: r.who || r.name, text: r.text,
             media: rowFile(r), from_s: rowFrom(r), until_s: rowUntil(r),
+            sfx: String(r.sfx || ''), url: String(r.url || ''), aired: String(r.aired || ''),   /* [#1189] */
             element_id: item.id, block: item.block, ord: item.ord, document_index: known.index});
         }
     });
     var top = lit ? Math.round(lit.getBoundingClientRect().top - rect.top) : null;
+    var hiddenCount = 0, transitionCount = 0;
+    for (var d = 0; d < diagnosticNodes.length; d += 1) {
+      if (diagnosticNodes[d].hidden) hiddenCount += 1;
+      if (diagnosticNodes[d].classList.contains('sp-fx')) transitionCount += 1;
+    }
     diagnosticSnapshot = {
       recorder_version: 2, capture_source: 'script-page',
       highlight_id: lit ? String(lit.dataset.line || '') : '', active_id: String(active.id || ''),
@@ -3580,6 +6088,13 @@
       stream: liveStream ? {at: liveStream.at, length: liveStream.length, row_count: (liveStream.rows || []).length,
         rows: (liveStream.rows || []).filter(function (r) { return String(r.id || '') === String(active.id || '') || String(r.id || '') === nowLineId; }).map(function (r) { return {id: r.id, from: r.from, until: r.until}; })} : null,
       viewport: {scroll_top_px: Math.round(pane.scrollTop), height_px: pane.clientHeight, width_px: pane.clientWidth, content_height_px: pane.scrollHeight, lit_top_px: top},
+      layout: {live_segment: String(liveSeg || ''),
+        highlighted_segment: lit ? String(lit.dataset.seg || '') : '',
+        nodes_total: diagnosticNodes.length, nodes_hidden: hiddenCount,
+        nodes_transitioning: transitionCount,
+        segments_folded: Object.keys(folded).filter(function (key) {
+          return folded[key] && key !== liveSeg;
+        }).length},
       paused: stationPaused, follow: follow, visibility: String(document.visibilityState || ''),
       /* THE INCIDENT REFERENCES section 5 of the recording note asks
          for: script revision, performer session, accepted cut, assembly
@@ -3593,12 +6108,31 @@
           occurrence_id: lastGood.occurrence_id, position: lastGood.position,
           media: lastGood.media, at_ms: lastGood.at} : null},
       scroll: {owner: scrollOwner, at_ms: scrollAt, moves: scrollLog.slice(-12)},
+      /* [#1189] HOW THE MARK WAS PLACED, so the next capture explains
+         itself: the decision that stands, the ring of decisions before it,
+         what was expected and what was carried, and the station's verdict. */
+      resolver: resolverSnapshot(),
+      expected_id: String(decision.expected_id || ''),
+      carried_id: String(decision.carried_id || ''),
+      playout: playoutNow ? {verdict: playoutNow.verdict, occurrence_id: playoutNow.occurrence_id,
+        line_id: playoutNow.line_id, block: playoutNow.block, ord: playoutNow.ord,
+        file: playoutNow.file, offset_s: playoutNow.offset_s, at_ms: playoutNow.at_ms,
+        agrees: playoutAgrees()} : null,
       errors: caught.slice(-6)
     };
     rec.observe({at_ms: Date.now(), highlight_id: diagnosticSnapshot.highlight_id, active_id: diagnosticSnapshot.active_id,
       document_revision: diagnosticRevision, element_index: idx, block: lit && lit.dataset.block,
       ord: lit && lit.dataset.ord, scroll_top_px: Math.round(pane.scrollTop), lit_top_px: top,
-      audio: audio, follow: follow, paused: stationPaused, snapshot: diagnosticSnapshot}, records);
+      audio: audio, follow: follow, paused: stationPaused, snapshot: diagnosticSnapshot,
+      mark: String(decision.mark || ''), road: String(decision.road || ''),       /* [#1189] */
+      sync: String(decision.sync || ''), expected_id: String(decision.expected_id || ''),
+      carried_id: String(decision.carried_id || ''),
+      /* #1277: enough layout provenance to distinguish a server reindex from
+         restore, fold and follow moving the viewport after that reindex. */
+      scroll_owner: String(scrollOwner || ''), scroll_owner_at_ms: Number(scrollAt || 0),
+      live_segment: String(liveSeg || ''),
+      highlighted_segment: lit ? String(lit.dataset.seg || '') : '',
+      nodes_transitioning: transitionCount}, records);
   }
   var reportKind = 'report';
   function ensureCaution() {
@@ -3820,7 +6354,7 @@
     var line = el('spSayingText');
     if (!line) return;
     sayUntil = Date.now() + 4000;
-    sayingSaid = ' said';        /* never equal to a real print */
+    sayingSaid = '__pine_never_said__'; /* never equal to a real print */
     line.textContent = String(text || '');
   }
 
@@ -3898,6 +6432,8 @@
       + '<div id="spWho" class="sp-who"></div>'
       + '<canvas id="spSpectrum" class="sp-spectrum"></canvas>'
       + '<canvas id="spVoice" class="sp-voicemeter"></canvas>'
+      /* [#1198] the readout that only exists while a level is moving */
+      + '<div id="spLevelPill" class="sp-levelpill" aria-live="polite"></div>'
       + '<div class="sp-seekrow">'
       + '<i id="spAt" class="sp-time"></i>'
       + '<input id="spSeek" class="sp-seek" type="range" min="0" max="1000" value="0">'
@@ -3910,6 +6446,218 @@
       + '<button id="spNext" class="sp-tbtn" title="Skip to the next track" aria-label="Skip to the next track">⏭</button>'
       + '</div>';
     return box;
+  }
+
+  /* ---- #1198: THE METERS ARE THE LEVEL CONTROLS -------------------
+   *
+   * "I want to swipe my fingers on these spectra grams in order to set the
+   *  volume. So if I swipe to the left it goes down and if I swipe to the
+   *  right it goes up."
+   *
+   * The green bar is the music player, the amber one is the louder DJ voice,
+   * and those are two of the four kinds on the level bus (audio-law.js,
+   * #1192): 'music' and 'voice'. So the bar the operator is already looking
+   * at to read a level becomes the thing that sets it.
+   *
+   * RELATIVE, NOT ABSOLUTE, and the reason is the page it lives on. An
+   * absolute control means "the value is wherever your finger is", so the
+   * first frame of any contact snaps the level to that x - and this card sits
+   * in a column the operator scrolls with his thumb, an inch below a mixer
+   * dot he taps. A finger that grazes the bar on the way past would slam the
+   * music to 12% before the direction lock had anything to look at. Relative
+   * costs nothing: the level starts where it was, moves by how far the finger
+   * travelled, and a gesture that turns out not to be a level drag leaves the
+   * level exactly as it found it. It also keeps the ceiling honest - these
+   * two kinds reach 1.5, so an absolute map would put unity at two thirds of
+   * the way along a bar with no marks on it.
+   *
+   * THE SCALE: one full width of the bar = the full range (0 to the kind's
+   * ceiling). On the tablet's card that is about 340 px, so ~0.4% of level
+   * per pixel - fine enough to land on a number, coarse enough to cross the
+   * whole range in one swipe.
+   *
+   * INERTIA-FREE: the value is a pure function of the pointer's total dx from
+   * where it went down. Nothing continues after release, nothing smooths.
+   *
+   * IT MUST NOT FIRE WHILE THE PAGE IS BEING SCROLLED, and the lock is cut in
+   * two places on purpose:
+   *   - `touch-action: pan-y` on both canvases (script-page.css) lets the
+   *     compositor keep vertical panning. Once it claims the gesture we get a
+   *     pointercancel and stand down; we never see the moves at all.
+   *   - the script locks direction itself, because touch-action does nothing
+   *     for a mouse: no move counts until the pointer has travelled 8 px, and
+   *     at that moment |dx| <= |dy| means a scroll and this pointer is
+   *     abandoned for good.
+   *
+   * IT MUST NOT FIGHT A TAP: under 8 px of travel nothing is armed, nothing
+   * is captured, nothing is preventDefault'ed and no click is swallowed. A
+   * tap on these bars still means whatever a tap on them meant.
+   *
+   * Arrow keys move it by 2% of the range, because a desk with a keyboard
+   * should not need a mouse, and the canvases carry role="slider" with a live
+   * aria-valuenow so a reader can say what the level is.
+   */
+  var LEVEL_DRAG_SLOP = 8;           /* px before a gesture has a direction */
+  var LEVEL_NAMES = {music: 'MUSIC', voice: 'DJ VOICES'};
+  var levelPillTimer = 0;
+
+  function levelBus() {
+    return (root.pineLevels && typeof root.pineLevels.apply === 'function')
+      ? root.pineLevels : null;
+  }
+
+  function levelCeil(kind) {
+    var bus = levelBus();
+    var c = bus && bus.CEIL ? bus.CEIL[kind] : null;
+    return typeof c === 'number' && c > 0 ? c : 1.5;
+  }
+
+  function levelNow(kind) {
+    var bus = levelBus();
+    if (!bus) return null;
+    var m = null;
+    try { m = bus.get() || {}; } catch (err) { return null; }
+    return typeof m[kind] === 'number' ? m[kind] : 1;
+  }
+
+  function levelSay(kind, value) {
+    return (LEVEL_NAMES[kind] || kind).toUpperCase() + ' '
+      + Math.round(value * 100) + '%';
+  }
+
+  function levelPill(text, hold) {
+    var pill = el('spLevelPill');
+    if (!pill) return;
+    pill.textContent = text;
+    pill.classList.add('on');
+    if (levelPillTimer) { clearTimeout(levelPillTimer); levelPillTimer = 0; }
+    if (hold) return;
+    levelPillTimer = setTimeout(function () {
+      levelPillTimer = 0;
+      var p = el('spLevelPill');
+      if (p) p.classList.remove('on');
+    }, 900);
+  }
+
+  /* The hairline that says WHERE on the bar the level currently sits - drawn
+   * after PineMeters.draw, in the dpr transform it leaves behind. Without it
+   * the control is invisible and the operator is dragging in the dark. */
+  function levelMark(canvas, kind) {
+    if (!canvas) return;
+    var v = levelNow(kind);
+    if (v === null) return;
+    var w = canvas.clientWidth || 0;
+    var h = canvas.clientHeight || 0;
+    if (!w || !h) return;
+    var g = canvas.getContext('2d');
+    if (!g) return;
+    var dpr = Math.min(2, root.devicePixelRatio || 1);
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var x = Math.max(0.5, Math.min(w - 0.5, (v / levelCeil(kind)) * w));
+    g.globalAlpha = canvas.dataset.levelDragging ? 0.95 : 0.4;
+    g.fillStyle = '#e8f0ff';
+    g.fillRect(x - 0.5, 0, 1, h);
+    g.globalAlpha = 1;
+  }
+
+  function levelDrag(canvas, kind) {
+    if (!canvas || canvas.dataset.levelWired) return;
+    canvas.dataset.levelWired = '1';
+    canvas.setAttribute('role', 'slider');
+    canvas.setAttribute('tabindex', '0');
+    canvas.setAttribute('aria-label',
+      (kind === 'music' ? 'Music level' : 'DJ voices level')
+      + ' — swipe right to raise, left to lower');
+    canvas.setAttribute('aria-valuemin', '0');
+    canvas.setAttribute('aria-valuemax',
+      String(Math.round(levelCeil(kind) * 100)));
+
+    var aria = function () {
+      var v = levelNow(kind);
+      if (v === null) return;
+      canvas.setAttribute('aria-valuenow', String(Math.round(v * 100)));
+      canvas.setAttribute('aria-valuetext', Math.round(v * 100) + '%');
+    };
+    aria();
+
+    var id = -1;
+    var x0 = 0;
+    var y0 = 0;
+    var from = 1;
+    var armed = false;
+    var decided = false;
+
+    var stand = function () {
+      id = -1; armed = false; decided = false;
+      if (canvas.dataset.levelDragging) delete canvas.dataset.levelDragging;
+    };
+
+    canvas.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== undefined && ev.button !== 0) return;
+      var v = levelNow(kind);
+      if (v === null) return;              /* no bus here: stay inert */
+      id = ev.pointerId; x0 = ev.clientX; y0 = ev.clientY;
+      from = v; armed = false; decided = false;
+    });
+
+    canvas.addEventListener('pointermove', function (ev) {
+      if (ev.pointerId !== id) return;
+      var dx = ev.clientX - x0;
+      var dy = ev.clientY - y0;
+      if (!decided) {
+        if (Math.abs(dx) < LEVEL_DRAG_SLOP && Math.abs(dy) < LEVEL_DRAG_SLOP) return;
+        decided = true;
+        if (Math.abs(dx) <= Math.abs(dy)) { stand(); return; }   /* a scroll */
+        armed = true;
+        canvas.dataset.levelDragging = '1';
+        try { canvas.setPointerCapture(ev.pointerId); } catch (err) { /* mouse */ }
+      }
+      if (!armed) return;
+      if (ev.cancelable) ev.preventDefault();
+      var bus = levelBus();
+      if (!bus) return;
+      var span = canvas.clientWidth || 1;
+      var ceil = levelCeil(kind);
+      var want = Math.max(0, Math.min(ceil, from + (dx / span) * ceil));
+      bus.apply(kind, want);
+      levelPill(levelSay(kind, want), true);
+      aria();
+    });
+
+    var done = function (ev) {
+      if (id !== -1 && ev.pointerId !== id) return;
+      if (armed) {
+        try { canvas.releasePointerCapture(ev.pointerId); } catch (err) { /* gone */ }
+        var v = levelNow(kind);
+        levelPill(levelSay(kind, v === null ? 0 : v), false);
+      }
+      stand();
+      aria();
+    };
+    ['pointerup', 'pointercancel'].forEach(function (name) {
+      canvas.addEventListener(name, done);
+    });
+
+    canvas.addEventListener('keydown', function (ev) {
+      var step = ev.key === 'ArrowLeft' ? -0.02
+        : ev.key === 'ArrowRight' ? 0.02 : 0;
+      if (!step) return;
+      var bus = levelBus();
+      var v = levelNow(kind);
+      if (!bus || v === null) return;
+      ev.preventDefault();
+      var ceil = levelCeil(kind);
+      var want = Math.max(0, Math.min(ceil, v + step * ceil));
+      bus.apply(kind, want);
+      levelPill(levelSay(kind, want), false);
+      aria();
+    });
+
+    /* The mixer popup and the drawer move the same numbers; the bar's
+       hairline and its aria value follow them without a poll. */
+    if (root.pineLevels && typeof root.pineLevels.onApply === 'function') {
+      try { root.pineLevels.onApply(aria); } catch (err) { /* no watcher */ }
+    }
   }
 
   /* THE PLAYHEAD IS A REAL SCRUB, and it moves THIS terminal's player.
@@ -3938,6 +6686,9 @@
       });
     }
     seek && (seek.dataset.dragging = '');
+    /* [#1198] the two bars in this card are the two level controls */
+    levelDrag(el('spSpectrum'), 'music');
+    levelDrag(el('spVoice'), 'voice');
     var dot = el('spMixDot');                                    /* #1419 */
     if (dot) dot.addEventListener('click', function (ev) { ev.stopPropagation(); mixerOpen(); });
     var prev = el('spPrev');
@@ -3970,6 +6721,8 @@
         meters.draw(spectrum, meters.read('musicPlayer', 'music'), '#54d18b');
         meters.draw(el('spVoice'),
           meters.readLoudest(['djVoiceAudio0', 'djVoiceAudio1'], 'voice'), '#e3be63');
+        levelMark(spectrum, 'music');                             /* [#1198] */
+        levelMark(el('spVoice'), 'voice');                        /* [#1198] */
       }
       var p = player();
       if (p && isFinite(p.duration) && p.duration) {
@@ -4015,6 +6768,22 @@
     return out;
   }
   function mixerWrite(values) {
+    /* [#1192]: ONE ROAD, AND IT ANSWERS UNDER THE THUMB.
+     *
+     * window.pineLevels (audio-law.js) persists, moves everything this
+     * document owns synchronously, coalesces the webview crossing and the
+     * native video wall onto one animation frame, and knows which document
+     * each element lives in.  Called straight off `input`, so the level is
+     * true for what is sounding NOW and for every clip made after it.
+     *
+     * The old two lines stay as the fallback: in a host where the bus was
+     * never loaded this file must still do what it used to. */
+    try {
+      if (root.pineLevels && typeof root.pineLevels.applyAll === 'function') {
+        root.pineLevels.applyAll(values);
+        return;
+      }
+    } catch (err) { /* the old road below */ }
     try { root.localStorage.setItem('pineMixer', JSON.stringify(values)); } catch (err) { /* private mode */ }
     try { if (root.pineMixer && root.pineMixer.set) root.pineMixer.set(values); } catch (err) { /* applied next time */ }
   }
@@ -4054,7 +6823,9 @@
       box.appendChild(line);
     });
     box.appendChild(make('div', 'sp-mix-note',
-      'Remembered on this device. On top of the station\u2019s own levels.'));
+      'Remembered on this device. On top of the station\u2019s own levels, '
+      + 'and they take effect as you drag \u2014 on what is playing now and '
+      + 'on everything after it.'));                               /* [#1192] */
     reset.addEventListener('click', function () {
       MIXER_ROWS.forEach(function (row) {
         levels[row[0]] = 1;
@@ -4256,6 +7027,11 @@
     var text = String(row.text || '').trim();
     if (head && head.textContent !== name) head.textContent = name;
     if (body && body.textContent !== text) body.textContent = text;
+    /* [#1200] a clip deleted from the library reads as gone in the feed. */
+    if (line.pineDeleted !== !!row.deleted) {
+      line.pineDeleted = !!row.deleted;
+      line.classList.toggle('sp-deleted', !!row.deleted);
+    }
     var state = String(row.aired || '');
     if (line.pineState !== state) {
       line.pineState = state;
@@ -4430,7 +7206,8 @@
       /* Everything the node's APPEARANCE depends on, so a line revised
          in place is re-dressed rather than rebuilt. */
       var print = String(item.text || '') + SEP + String(item.type || '')
-        + SEP + String(item.aired || '') + SEP + (item.tinted ? '1' : '0');
+        + SEP + String(item.aired || '') + SEP + (item.tinted ? '1' : '0')
+        + SEP + (item.deleted ? 'D' : '');                        /* [#1200] */
       var node = scriptNodes.get(key);
       if (node && node.pinePrint !== print) {
         var lit = node.classList.contains('sp-now');
@@ -4440,6 +7217,7 @@
           + ((item.aired === 'prepared' || item.aired === 'withdrawn')   /* 2026-09-14: refused at hand-over - never aired */ ? ' pending' : '')
           + (item.tinted ? ' tinted' : '')
           + (lit ? ' sp-now' : '') + (picked ? ' picked' : '');
+        if (item.deleted) node.classList.add('sp-deleted');        /* [#1200] */
         node.pinePrint = print;
       }
       if (!node) {
@@ -4466,6 +7244,11 @@
       scriptNodes.delete(key);
     });
     stitchScript(box, order);
+    /* Settle the final layout before measuring the reader's anchor. New
+       rows in an already-finished segment arrive visible; restoring first
+       and hiding them afterward makes the pane compensate twice in opposite
+       directions. That was the remaining same-line jump in #1256-#1270. */
+    segApply(false);
     scriptRestore(box, anchor);
     diagnosticDocument(box);
     ensureCaution();
@@ -4485,14 +7268,10 @@
        That is the operator's "highlighting incorrect segments". Keyed
        nodes make it rare; asking the right question makes it
        impossible. */
-    if (nowLineId) {
-      var held = box.querySelector('.sp-el[data-line="' + nowLineId + '"]');
-      if (!held) nowLineId = '';
-      else if (!held.classList.contains('sp-now')) held.classList.add('sp-now');
-    }
-    /* #1285: re-assert the folds, so a line arriving into a folded
-       segment arrives folded rather than springing it open. */
-    segApply();
+    /* [#1189] the marks are re-asserted on the keyed nodes, and the lit
+       line is kept where the eye is if the repaint moved it. */
+    placeMarks(lastDecision);
+    keepLitInView('paint');
     tick();
   }
 
@@ -4534,18 +7313,29 @@
     scrollAt = now;
     scrollLog.push({at: now, why: reason, top: Math.round(box.scrollTop)});
     if (scrollLog.length > 40) scrollLog.shift();
-    selfScrollUntil = now + 2400;          /* backstop only */
-    /* #1330: on the box that actually scrolls - `scrollend` clears the
-       backstop early, and the backstop governs when it is unavailable. */
-    try {
-      if ('onscrollend' in box) {
-        box.addEventListener('scrollend', function done() {
-          box.removeEventListener('scrollend', done);
-          selfScrollUntil = 0;
-        }, {once: true});
-      }
-    } catch (err) { /* the backstop still covers it */ }
+    /* Every automatic move is now one exact scrollTop assignment. Keep the
+       event guard only long enough for that assignment's scroll event; a
+       multi-second guard belonged to smooth animations and made the pane
+       feel frozen after each line. */
+    selfScrollUntil = now + 180;
     try { apply(box); } catch (err) { caughtNote('scroll:' + reason, err); }
+    return true;
+  }
+
+  function seatLineNearest(pane, node) {
+    if (!pane || !node || node.hidden) return false;
+    var lip = pane.getBoundingClientRect();
+    var seat = node.getBoundingClientRect();
+    if (!(seat.height > 0 && lip.height > 0)) return false;
+    var margin = Math.min(96, Math.max(20, lip.height * 0.14));
+    var top = lip.top + margin;
+    var bottom = lip.bottom - margin;
+    var delta = 0;
+    if (seat.height >= bottom - top) delta = seat.top - top;
+    else if (seat.top < top) delta = seat.top - top;
+    else if (seat.bottom > bottom) delta = seat.bottom - bottom;
+    if (Math.abs(delta) <= 0.5) return false;
+    pane.scrollTop = Math.max(0, pane.scrollTop + delta);
     return true;
   }
 
@@ -4558,6 +7348,18 @@
   function scriptAnchor(box) {
     if (!box || box.scrollTop <= 4) return {pinned: true};
     var lip = box.getBoundingClientRect();
+    /* #1277: while following the show, preserve the row the operator is
+       actually reading. A repaint used the first visible row instead; when
+       the server reindexed the active row, that unrelated anchor held still
+       and the active row landed hundreds of pixels offscreen. */
+    var live = box.querySelector('.sp-el.sp-now');
+    if (live && !live.hidden) {
+      var liveSeat = live.getBoundingClientRect();
+      if (liveSeat.height > 0 && liveSeat.bottom > lip.top + 1
+          && liveSeat.top < lip.bottom - 1) {
+        return {node: live, was: liveSeat.top, active: true};
+      }
+    }
     for (var i = 0; i < box.children.length; i += 1) {
       if (!box.children[i].classList.contains('sp-el')) continue;
       var seat = box.children[i].getBoundingClientRect();
@@ -4575,45 +7377,16 @@
        the browser's own anchoring has already chosen a neighbour. */
     if (!node || node.parentNode !== box) return;
 
-    /* 2026-09-15 (#1183): THE PLACE-HOLDER MEASURED THE FOLLOW'S OWN
-       ANIMATION AND ADDED IT TO THE SCROLL.
-
-       The operator filed a capture asking "Why did this jump like this?"
-       and the 26 transitions in it show the same shape twice. The
-       highlight lands off screen, the smooth follow starts, and one
-       sample later the scroll takes a single 3,407 px step past the line
-       it was chasing - lit_top_px 278, then -422, then -3829 - before
-       walking all the way back to 715 three and a half seconds later.
-       The second time, after the document jumped 34 revisions under the
-       reader, it was 941 px and four seconds.
-
-       The guard in moveScript is one-directional: a follow is held off
-       while a restore is fresh, and a restore is never held off while a
-       follow is in flight. A follow is a SMOOTH scroll, and the note
-       above it already measured that 21.9% of them are still running two
-       samples later. So the anchor is taken part-way through the
-       animation and read again a moment later, and the difference it
-       calls `drift` is mostly the animation's own travel. Adding that to
-       scrollTop puts the pane where the animation was going to end up
-       ANYWAY, and the animation then goes there again from the new
-       place.
-
-       #1273 is right about reader-driven scroll and keeps every bit of
-       its reach here. It is wrong only while the pane is scrolling
-       itself, and in that case there is no reader's place to hold: the
-       follow exists to put the lit line on screen. So the drift is
-       dropped and the follow is re-issued instead, against the layout
-       that exists now rather than the one it started from. */
+    /* A same-turn follow already established the intended seat. Re-seat
+       once against the settled layout instead of treating that deliberate
+       movement as anchor drift. There is no animation left to race. */
     if (Date.now() < selfScrollUntil && scrollOwner === 'follow') {
       var lit = box.querySelector('.sp-el.sp-now');
       scrollLog.push({at: Date.now(), why: 'restore:skipped-mid-follow',
                       top: Math.round(box.scrollTop)});
       if (scrollLog.length > 40) scrollLog.shift();
       if (lit) {
-        moveScript('follow', function () {
-          try { lit.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
-          catch (err) { lit.scrollIntoView(false); }
-        });
+        moveScript('follow', function (pane) { seatLineNearest(pane, lit); });
       }
       return;
     }
@@ -4891,8 +7664,16 @@
     folded[seg] = false;
     /* #1300: the hand-off the operator asked to SEE - the finished
        script shutting and the next one opening out. */
+    foldGuardStart();                                        /* [#1189] */
     segApply(true);
     foldSave();                                              /* #1294 */
+    /* [#1189] the fold commits `hidden` at the end of its animation
+       (segSettle); the reader's place is restored there, and the lit
+       line is brought back if the reflow moved it out of view. */
+    root.setTimeout(function () {
+      foldGuardEnd('follow');
+      keepLitInView('fold');
+    }, FOLD_FX_MS + 60);
   }
 
   /* #1289: THE HOUR AHEAD. /api/director?hour=N is already the hour
@@ -5054,6 +7835,7 @@
     var type = String(item.type || 'action');
     var node = make('div', 'sp-el sp-' + type);
     node.textContent = String(item.text || '');
+    if (item.deleted) node.classList.add('sp-deleted');          /* [#1200] */
     if (item.id) node.dataset.el = String(item.id);
     if (item.line) node.dataset.line = String(item.line);
     if (item.seg) node.dataset.seg = String(item.seg);        /* #1285 */
@@ -5095,6 +7877,14 @@
      * over changing the track" is what a forty second lag looks like
      * from the outside. The server says which; this shows it. */
     if (item.playing) node.classList.add('sp-spinning');
+    /* [#1237] the record this line is bound to rides on the node as an
+       attribute: the re-dress pass resets textContent and keeps attributes,
+       and the stylesheet draws it after the speech. */
+    if (item.bound_to) {
+      node.dataset.bound = String(item.bound_to);
+      node.title = 'Bound to ' + String(item.bound_to)
+        + ' - this line airs only while that record is on the deck (#1237)';
+    }
     /* #1330: where the SCRIPT put this line. Carried so a reader can
      * follow the running order without re-deriving it, and so the mark
      * can tell a scripted line from one nothing wrote. */
@@ -5164,6 +7954,27 @@
       return parts[parts.length - 1] || '';
     }
 
+    /* [#1189] THE IDENTITY BEHIND A NAME.
+       One clip is named four ways on this station and the view compared
+       the spelling. A welded round is `/media/<32hex>.wav` (and the same
+       key with `?br=` serves mp3 bytes); a sting is `/sfx/<16hex>?t=` -
+       the URL keeps the id while the bytes come from the levelled cache,
+       whose files are `<16hex>-v2-v<vol>-<mtime>.wav`,
+       `<16hex>-<mtime>-src.wav` or `<16hex>-<mark>-<mtime>.<ext>`
+       (sfx_levelled_name, _as_wav and sfx_video_levelled in app.py); and a
+       feed row carries the same thing under `sfx`, `url`, `media` or
+       `clip_media`. This folds every spelling to the one identity the
+       station keys on: the 32-hex media key or the 16-hex sample id.
+       Anything else answers to its basename. */
+    function ident(name) {
+      var base = key(name).toLowerCase();
+      if (!base) return '';
+      var got = /^([0-9a-f]{32})(?:\.[a-z0-9]{1,4})?$/.exec(base);
+      if (got) return got[1];
+      got = /^([0-9a-f]{16})(?:-[^/]*)?(?:\.[a-z0-9]{1,4})?$/.exec(base);
+      if (got) return got[1];
+      return base;
+    }
     /* NULL IS NOT ZERO, and this is where that matters most.
      *
      * `Number(null)` is 0 and `isFinite(0)` is true, so an absent playhead
@@ -5185,7 +7996,7 @@
        by arrival, by air time or by anything that can be rewritten. */
     function read(payload) {
       var out = {ok: false, generation: null, mode: '', enforceOrder: false,
-        reader: null, current: null, order: [], byMedia: {}, count: 0,
+        reader: null, current: null, order: [], byMedia: {}, byIdent: {}, count: 0,   /* [#1189] */
         why: 'the station is not sending an admitted cue map'};
       if (!payload || typeof payload !== 'object') return out;
       out.ok = true;
@@ -5252,6 +8063,11 @@
         if (!name) continue;
         if (!out.byMedia[name]) out.byMedia[name] = [];
         out.byMedia[name].push(kept[k]);
+        var same = ident(name);                                  /* [#1189] */
+        if (same && same !== name) {
+          if (!out.byIdent[same]) out.byIdent[same] = [];
+          out.byIdent[same].push(kept[k]);
+        }
       }
       var now = payload.current;
       if (now && now.occurrence_id) {
@@ -5294,12 +8110,32 @@
       return list[0];
     }
 
+    /* [#1189] A CARRIED MARK HAS AN END. #1210's capture read "AIR PAUSED
+       - HELD - holding the last read line for 22189s": six hours of a
+       stopped station with a line dressed as though it were sounding,
+       because `blank()` carried the last trustworthy answer for ever.
+       Past ten minutes the carry is dropped - nothing is lit - and the
+       answer says when it was last heard instead. */
+    var CARRY_MAX_S = 600;
+    var carryNow = 0;              /* the reading clock, set by locate() */
+
     function blank(sync, why, last) {
       var out = {sync: sync, why: why, trustworthy: !!TRUSTED[sync],
         line_id: '', occurrence_id: '', position: null, from: null,
         until: null, speechEnd: null, index: -1, of: 0, media: '',
         origin: '', carried: false};
       if (last && last.line_id) {
+        var carriedAt = num(last.at_ms);
+        if (carriedAt === null) carriedAt = num(last.at);
+        var carriedAge = carriedAt === null ? -1
+          : (((carryNow || Date.now()) - carriedAt) / 1000);
+        out.carried_age_s = carriedAge >= 0 ? Math.round(carriedAge) : null;
+        if (carriedAge > CARRY_MAX_S) {          /* [#1189] history, not a mark */
+          out.held_since_ms = carriedAt;
+          out.why = why + ' - the last line read was '
+            + Math.round(carriedAge / 60) + ' minutes ago; nothing is lit';
+          return out;
+        }
         /* PRESERVE THE LAST TRUSTWORTHY POSITION - and say it is being
            preserved. A mark with no evidence behind it that looks exactly
            like a mark with evidence behind it is the fault, not the cure. */
@@ -5324,6 +8160,7 @@
     function locate(map, look) {
       look = look || {};
       var last = look.last || null;
+      carryNow = num(look.now_ms) || Date.now();          /* [#1189] */
       if (look.paused) return blank(SYNC.PAUSED, 'the air is paused', last);
       var source = String(look.source || 'unavailable');
       var at = num(look.position_s);
@@ -5342,7 +8179,7 @@
         return blank(SYNC.UNMAPPED,
           'no admitted cue map to read ' + file + ' against', last);
       }
-      var list = map.byMedia[file];
+      var list = map.byMedia[file] || (map.byIdent && map.byIdent[ident(file)]);   /* [#1189] */
       if (!list || !list.length) {
         return blank(SYNC.UNMAPPED,
           'nothing admitted names ' + file, last);
@@ -5399,7 +8236,316 @@
     }
 
     return {SYNC: SYNC, read: read, locate: locate, choose: choose,
-            key: key, say: say};
+            key: key, ident: ident, say: say};   /* [#1189] */
+  }());
+
+  /* ======================================== THE RESOLVER, PURELY  [#1189]
+   *
+   * "Why did this jump like this?" (#1229, #1228, #1227). Sixteen captures,
+   * five findings, one experience: the ON AIR mark leaping to an earlier
+   * line, sitting on a line that is not what is sounding, or the page
+   * reflowing under the reading eye. Read back from the captures' own
+   * event rings, every one of those marks was placed by something that
+   * is not evidence of sound:
+   *
+   *   - the station CLOCK bracketing a window in a different file, with
+   *     no file to hold it to (#1248 event 3: 63.4s into an old burst lit
+   *     a row 350 elements up, in file 5d109e66 - the estimate road
+   *     searched every feed row because nothing was sounding);
+   *   - `speaking_now`, the server's four-second notion, which lags a
+   *     line behind and never leads (#1205/#1204/#1203: at 14.06s of
+   *     6a3fa9b9, past the last window, it named the burst's FIRST line);
+   *   - a CARRIED last-known line held for minutes while a different file
+   *     sounded (#1197 events 11-16, #1228 event 0, #1234 event 1);
+   *   - an `observed:<file>` pseudo-id from the admitted map, which no
+   *     node carries, so the mark went dark and markNow chased a fresh
+   *     screenplay every three seconds for the whole clip - the document
+   *     revisions that churned under the reader (1665, 1680, 1705 inside
+   *     one minute of #1205).
+   *
+   * One law now: ON AIR is placed ONLY by evidence of what is sounding -
+   * a read playhead (file + offset) mapped through the cue map, or
+   * through a row that names that file - never by the clock, never by
+   * speaking_now, never by a carried mark. The clock's guess is still
+   * computed and still shown, as a separate dim EXPECTED mark that says
+   * what it is.
+   *
+   * No DOM, no clock, no fetch. Handed the evidence, the tables and the
+   * last decision it returns the next decision and the trail that led
+   * to it - so the cases above are held to it in node, and the next
+   * incident report explains itself. */
+  var PineScriptResolver = (function () {
+    var LINE_ID = /^[0-9a-f]{32}(?:-punct-\d+)?$/i;
+    var NEVER_AIRED = {prepared: 1, withdrawn: 1};
+    /* #1210: "AIR PAUSED - HELD - holding the last read line for 22189s".
+       Six hours of a stopped station with a line still dressed as though
+       it were sounding, because the carry had no end. Ten minutes is the
+       end of it: past that the last known line is history, nothing is
+       dressed, and the strip says how long ago it was heard. Ten minutes
+       is also the same cap `PineScriptCues.locate` applies to its own
+       carried answer, so the two roads cannot disagree. */
+    var CARRY_MAX_S = 600;         /* a last-known mark older than this is history */
+    var BACK_S = 0.3;              /* a playhead step back smaller than this is jitter */
+    var ROADS = {
+      CUE: 'cue-map',                /* the admitted cue sheet named the line */
+      OBSERVED: 'observed-to-page',  /* an observed dispatch, matched to a page row by identity */
+      WINDOW: 'feed-window',         /* a row of this file whose window brackets the offset */
+      CLIP: 'feed-clip',             /* a row that IS this file - a clip of one line */
+      TAIL: 'file-tail',             /* past the last window of the same file: still that clip */
+      HELD: 'held-monotone',         /* a backward candidate refused; the last line stands */
+      NONE: 'none'
+    };
+
+    function num(value) {
+      if (value === null || value === undefined || value === '') return null;
+      var got = Number(value);
+      return isFinite(got) ? got : null;
+    }
+    function isLineId(id) { return LINE_ID.test(String(id || '')); }
+
+    /* Every name a row answers to, folded to identities. */
+    var NAMED = ['clip_media', 'media', 'sfx', 'url', 'clip', 'audio_url', 'clip_url'];
+    function identities(row) {
+      var out = [];
+      if (!row || typeof row !== 'object') return out;
+      for (var i = 0; i < NAMED.length; i += 1) {
+        var v = row[NAMED[i]];
+        if (!v) continue;
+        var k = PineScriptCues.ident(v);
+        if (k && out.indexOf(k) < 0) out.push(k);
+      }
+      return out;
+    }
+
+    function windowOf(row) {
+      var from = num(row.from), until = num(row.until);
+      if (from === null) from = num(row.clip_from);
+      if (until === null) until = num(row.clip_until);
+      return {from: from, until: until};
+    }
+
+    /* THE TABLE. Feed rows (the booth ring: clip_media + clip_from, or
+       media, sfx, url) and page elements (the screenplay's `line` with
+       its clip or url), joined by line id. The feed is fresher for
+       `aired` and for windows; the page adds identities the feed has
+       rolled out of, and block/ord. */
+    function index(feedRows, elements) {
+      var byIdent = Object.create(null), byId = Object.create(null), n = 0;
+      function entry(id) {
+        var got = byId[id];
+        if (!got) {
+          got = {id: id, from: null, until: null, aired: '', kind: '', who: '',
+                 block: null, ord: null, idents: [], windowed: false, source: ''};
+          byId[id] = got;
+          n += 1;
+        }
+        return got;
+      }
+      function name(got, row, source) {
+        var ids = identities(row);
+        for (var i = 0; i < ids.length; i += 1) {
+          if (got.idents.indexOf(ids[i]) < 0) {
+            got.idents.push(ids[i]);
+            if (!byIdent[ids[i]]) byIdent[ids[i]] = [];
+            if (byIdent[ids[i]].indexOf(got) < 0) byIdent[ids[i]].push(got);
+          }
+        }
+        if (!got.source) got.source = source;
+      }
+      var i, row, got, w;
+      for (i = 0; i < (feedRows || []).length; i += 1) {
+        row = feedRows[i];
+        if (!row || !row.id) continue;
+        got = entry(String(row.id));
+        w = windowOf(row);
+        if (w.from !== null && w.until !== null) { got.from = w.from; got.until = w.until; got.windowed = true; }
+        if (row.aired) got.aired = String(row.aired);
+        if (row.kind) got.kind = String(row.kind);
+        if (row.who) got.who = String(row.who);
+        if (num(row.block) !== null) got.block = num(row.block);
+        if (num(row.ord) !== null) got.ord = num(row.ord);
+        name(got, row, 'feed');
+      }
+      for (i = 0; i < (elements || []).length; i += 1) {
+        row = elements[i];
+        if (!row || !row.line) continue;
+        got = entry(String(row.line));
+        if (!got.aired && row.aired) got.aired = String(row.aired);
+        if (got.block === null && num(row.block) !== null) got.block = num(row.block);
+        if (got.ord === null && num(row.ord) !== null) got.ord = num(row.ord);
+        if (!got.kind && row.type) got.kind = String(row.type);
+        name(got, row, 'page');
+      }
+      return {byIdent: byIdent, byId: byId, count: n};
+    }
+
+    /* Of the rows that name this file: the windowed one bracketing `at`,
+       else the last windowless one (a clip of one line). Two windowed rows
+       bracketing the same offset is the feed's own re-air twin; the later
+       `from` is the freshest. */
+    function pick(list, at) {
+      var hit = null, lone = null;
+      for (var i = 0; i < (list || []).length; i += 1) {
+        var e = list[i];
+        if (e.windowed) {
+          if (at !== null && at >= e.from && at < e.until && (!hit || e.from >= hit.from)) hit = e;
+        } else {
+          lone = e;
+        }
+      }
+      return hit || lone;
+    }
+
+    function carry(d, state, now, otherFile) {
+      var lg = state.lastGood;
+      if (!lg || !lg.line_id) return;
+      var age = (now - (num(lg.at_ms) === null ? (num(lg.at) || 0) : num(lg.at_ms))) / 1000;
+      if (!(age >= 0 && age <= CARRY_MAX_S)) return;
+      /* A different file is sounding and nothing names it: the last line
+         is not "what is sounding", so it is not shown as though it were. */
+      if (otherFile && lg.key && lg.key !== d.key) return;
+      d.carried_id = String(lg.line_id);
+      d.carried_age_s = Math.round(age);
+    }
+
+    function refuse(d, road, id, why) {
+      if (d.refused.length < 6) d.refused.push({road: road, id: String(id || ''), why: why});
+    }
+
+    /* look:   {source, file, position_s, paused, stalledMs, stallLimitMs,
+                now_ms, expected: {id, via} | null}
+       tables: {map: PineScriptCues.read(...), index: index(...)}
+       state:  {airLast, lastGood}                                          */
+    function resolve(look, tables, state) {
+      look = look || {}; tables = tables || {}; state = state || {};
+      var S = PineScriptCues.SYNC;
+      var now = num(look.now_ms);
+      if (now === null) now = Date.now();
+      var d = {at_ms: now, source: String(look.source || 'unavailable'),
+        file: PineScriptCues.key(look.file), key: PineScriptCues.ident(look.file),
+        t: num(look.position_s), mark: 'none', line_id: '', road: ROADS.NONE,
+        why: '', sync: S.HELD, trustworthy: false, occurrence_id: '', position: null,
+        from: null, until: null, index: -1, of: 0, block: null, ord: null,
+        observed: '', expected_id: String((look.expected && look.expected.id) || ''),
+        expected_via: String((look.expected && look.expected.via) || ''),
+        carried_id: '', carried_age_s: null, refused: []};
+      var last = state.airLast || null;
+      var read = (d.source === 'bridge' || d.source === 'local')
+        && d.t !== null && d.t >= 0 && !!d.key;
+      if (look.paused) {
+        d.sync = S.PAUSED; d.why = 'the air is paused';
+        carry(d, state, now, false);
+        return d;
+      }
+      if (!read) {
+        d.sync = d.source === 'estimated' ? S.ESTIMATED : S.HELD;
+        d.why = d.source === 'estimated'
+          ? 'no playhead - the station clock only guesses, so nothing is marked on air'
+          : 'no playback evidence is available';
+        carry(d, state, now, false);
+        return d;
+      }
+      /* Road 1: the admitted cue sheet, when the station committed one
+         for this file. */
+      var map = tables.map, got = null, candidate = null;
+      var idx = tables.index || {byIdent: {}, byId: {}};
+      if (map && map.ok && map.count) {
+        got = PineScriptCues.locate(map, {file: d.file, position_s: d.t, source: d.source,
+          stalledMs: look.stalledMs, stallLimitMs: look.stallLimitMs});
+        d.sync = got.sync; d.why = got.why; d.occurrence_id = got.occurrence_id;
+        d.position = got.position; d.of = got.of; d.index = got.index;
+        if (got.line_id && isLineId(got.line_id)) {
+          candidate = {id: got.line_id, from: got.from, until: got.until, road: ROADS.CUE};
+        } else if (got.line_id) {
+          d.observed = String(got.line_id);        /* observed:<file> - a clip, not a line */
+        }
+      }
+      /* Roads 2 and 3: a row that names this file - the cue map's observed
+         clip resolved to the page, or straight from the feed and the page. */
+      if (!candidate) {
+        var hit = pick(idx.byIdent ? idx.byIdent[d.key] : null, d.t);
+        if (hit) {
+          candidate = {id: hit.id, from: hit.from, until: hit.until,
+            road: d.observed ? ROADS.OBSERVED : (hit.windowed ? ROADS.WINDOW : ROADS.CLIP)};
+        }
+      }
+      var entry = candidate && idx.byId ? idx.byId[candidate.id] : null;
+      /* (b) A line the station never put out cannot be sounding. */
+      if (candidate && entry && NEVER_AIRED[entry.aired]) {
+        refuse(d, candidate.road, candidate.id, 'aired=' + entry.aired + ' - never put out');
+        candidate = null;
+      }
+      /* (d) While the same file plays forward, the line cannot move to an
+         earlier window of it. A step back in the playhead itself - a seek,
+         the same sting played twice - resets the guard. */
+      var sameFile = !!(last && last.key === d.key && last.t !== null && d.t >= last.t - BACK_S);
+      var held = false;
+      if (candidate && sameFile && candidate.id !== last.line_id) {
+        var earlier = (candidate.from !== null && last.from !== null && candidate.from < last.from - 0.05)
+          || (entry && last.block !== null && entry.block === last.block
+              && entry.ord !== null && last.ord !== null && entry.ord < last.ord);
+        if (earlier) {
+          refuse(d, candidate.road, candidate.id, 'earlier in the same file than '
+            + String(last.line_id).slice(0, 8) + ' (from ' + candidate.from + ' < ' + last.from + ')');
+          candidate = null; held = true;
+        }
+      }
+      /* Road 4: past every window of the file that is still sounding - the
+         tail of the clip (a hang-up, room tone, an inserted pause). The
+         audit's stationary cursor across a declared gap. */
+      if (!candidate && sameFile) {
+        candidate = {id: last.line_id, from: last.from, until: last.until,
+          road: held ? ROADS.HELD : ROADS.TAIL};
+        entry = (idx.byId && idx.byId[candidate.id]) || entry;
+      }
+      if (candidate) {
+        d.mark = 'air'; d.line_id = String(candidate.id); d.road = candidate.road;
+        d.from = candidate.from; d.until = candidate.until;
+        if (entry) { d.block = entry.block; d.ord = entry.ord; }
+        if (candidate.road !== ROADS.CUE) {
+          if (got && got.sync === S.STALL) d.sync = S.STALL;
+          else if (candidate.road === ROADS.TAIL || candidate.road === ROADS.HELD) d.sync = S.GAP;
+          else d.sync = S.READ;
+          d.why = candidate.road === ROADS.OBSERVED
+              ? 'read off the sound; the station observed this clip and the page names it'
+            : candidate.road === ROADS.WINDOW
+              ? 'read off the sound; a feed row of ' + d.file + ' brackets ' + d.t.toFixed(1) + 's'
+            : candidate.road === ROADS.CLIP
+              ? 'read off the sound; this row is the whole of ' + d.file
+            : candidate.road === ROADS.TAIL
+              ? 'the tail of ' + d.file + ' - past its last line, still sounding'
+            : 'a backward candidate was refused; the last line of ' + d.file + ' stands';
+        }
+        d.trustworthy = d.sync === S.READ || d.sync === S.GAP;
+        return d;
+      }
+      /* Evidence, and nothing on the page answers to it. Said plainly. */
+      if (d.sync === S.READ || d.sync === S.HELD || d.sync === S.ESTIMATED) d.sync = S.UNMAPPED;
+      d.why = d.observed
+        ? 'sounding ' + d.file + ' - an observed dispatch nothing on the page names'
+        : (got && got.why && d.sync !== S.UNMAPPED)
+          ? got.why
+          : 'sounding ' + d.file + ' - nothing on the page names it';
+      carry(d, state, now, true);
+      return d;
+    }
+
+    /* A short sentence for the operator, per decision. */
+    function say(d) {
+      if (!d) return '';
+      var S = PineScriptCues.SYNC;
+      if (d.mark === 'air') {
+        if (d.sync === S.STALL) return 'the sound stopped moving';
+        return d.road === ROADS.CUE ? 'in step with the sound' : 'read off the sound';
+      }
+      if (d.sync === S.PAUSED) return 'air paused';
+      if (d.source === 'estimated') return 'expected - no playhead';
+      if (d.sync === S.UNMAPPED) return 'sounding something the page does not name';
+      return 'nothing sounding';
+    }
+
+    return {resolve: resolve, index: index, identities: identities, pick: pick,
+            isLineId: isLineId, ROADS: ROADS, CARRY_MAX_S: CARRY_MAX_S, say: say};
   }());
 
   function bridgeHead() {
@@ -5474,8 +8620,25 @@
     return src.split('/').pop() || '';
   }
 
+  /* [#1189] EVERY NAME A ROW ANSWERS TO.
+     A board sting's ring row has no `media` and no `clip_media` at all -
+     it is `sfx: <16hex>` and `url: /sfx/<16hex>?t=<sig>` (app.py
+     76557-76575) - so this returned '' and the row could never be held
+     to the file that was sounding. That is #1188 (two stings played
+     while the mark sat 9 elements above them for 20s), #1197, #1228,
+     #1234 and the opening of #1203/#1204: "the script jumped" with the
+     script standing perfectly still. An ad is the same shape under
+     `/ads-audio/<name>.mp3`. The basename of `url` with its query
+     stripped, and the raw `sfx` key, are the same clip under two more
+     spellings; `soundingFile()` already reduces the player's own source
+     to exactly that basename, so the two sides now meet. */
   function rowFile(row) {
-    return String(row.clip_media || row.media || '');
+    var named = String(row.clip_media || row.media || '');
+    if (named) return named;
+    var url = String(row.url || row.clip || '').split('?')[0].replace(/\\/g, '/');
+    var base = url.split('/').pop();
+    if (base) return base;
+    return String(row.sfx || '');
   }
 
   /* #1294: a row's window under EITHER name.
@@ -5495,37 +8658,32 @@
     return isFinite(v) ? v : Number(row.clip_until);
   }
 
-  /* THE ADMITTED OCCURRENCE, from the player's own file and offset.
-   *
-   * This runs BEFORE every reconstruction below it. Where the station has
-   * committed a cue sheet for the file that is actually sounding, there is
-   * nothing left to infer: the answer is read, not searched for.
-   *
-   * Where it cannot, it returns null and the older roads have their go -
-   * and `syncState` already says which of the eight answers this was, so
-   * a fallback is visible rather than silent. */
-  function admittedRow() {
-    /* NO MAP AT ALL IS NOT A FAULT IN THE SOUND.
-     *
-     * A station that has not been patched to carry `admission` sends
-     * nothing, and treating that as "the player is sounding something
-     * unadmitted" would dash an outline round every line of the script,
-     * all day, for ever. The file already knows what that costs: "A
-     * readout that says the same worried thing all day teaches the
-     * operator to ignore it."
-     *
-     * So this is reported as ESTIMATED - which is exactly what the older
-     * roads below are doing - with the reason said once, and the per-line
-     * mark is left alone. */
-    if (!admitMap || !admitMap.ok || !admitMap.count) {
-      if (syncState !== 'estimated') {
-        syncState = 'estimated';
-        syncSince = Date.now();
-      }
-      syncWhy = (admitMap && admitMap.why)
-        || 'the station is not sending an admitted cue map';
-      return null;
-    }
+  /* [#1189] THE ONE ROAD TO THE MARK. Evidence in, decision out. The
+     roads that used to place the mark - the clock inside stream_now, the
+     feed searched without a file, speaking_now - live on as estimateRow()
+     below, and feed the EXPECTED mark and nothing else. */
+  var lastDecision = null;
+  var airLast = null;                 /* the last ON AIR decision, for the monotone guard */
+  var resolverRing = [];              /* bounded: what the resolver decided, and why */
+  var RESOLVER_RING_MAX = 120;
+  var feedIndexHeld = null, feedIndexAt = 0, feedIndexRows = -1, feedIndexEls = -1;
+
+  function feedIndex() {
+    var now = Date.now();
+    var fed = [];
+    try { fed = root.PineStationFeed.rows() || []; } catch (e) { fed = []; }
+    /* rows() is rebuilt every tick; the table is rebuilt once a second, or
+       sooner when either source changes size. */
+    if (feedIndexHeld && now - feedIndexAt < 1000
+        && fed.length === feedIndexRows && elements.length === feedIndexEls) return feedIndexHeld;
+    feedIndexHeld = PineScriptResolver.index(fed, elements);
+    feedIndexAt = now; feedIndexRows = fed.length; feedIndexEls = elements.length;
+    return feedIndexHeld;
+  }
+
+  /* What the player says, and only what the player says. The clock is
+     reported as `estimated` so the resolver can refuse it by name. */
+  function evidence() {
     var head = bridgeHead();
     var player = head ? null : soundingPlayer();
     var source = head ? 'bridge' : (player ? 'local' : 'unavailable');
@@ -5546,33 +8704,280 @@
       }
       moved = headMovedAt ? now - headMovedAt : 0;
     } else { headWas = -1; headMovedAt = 0; }
-    var got = PineScriptCues.locate(admitMap, {
-      file: file, position_s: at, source: source, paused: stationPaused,
-      stalledMs: moved, stallLimitMs: STALL_MS, last: lastGood});
-    if (syncState !== got.sync) { syncState = got.sync; syncSince = Date.now(); }
-    syncWhy = got.why || PineScriptCues.say(got);
-    if (got.trustworthy && got.line_id) {
-      lastGood = {line_id: got.line_id, occurrence_id: got.occurrence_id,
-        position: got.position, media: got.media, origin: got.origin,
-        at: Date.now()};
-    }
-    if (!got.line_id) return null;
-    return {id: got.line_id,
-      from: got.carried ? 0 : Number(got.from || 0),
-      until: got.carried ? 0 : Number(got.until || 0),
-      at: got.carried ? 0 : Number(got.at || 0),
-      index: got.index, of: got.of,
-      occurrence_id: got.occurrence_id, position: got.position,
-      sync: got.sync, carried: !!got.carried, admitted: true};
+    return {source: source, file: file, position_s: at, stalledMs: moved};
   }
 
   function activeRow() {
+    var look = evidence();
+    var expected = null;
+    try { expected = estimateRow(); } catch (e) { expected = null; }
+    look.paused = stationPaused;
+    look.stallLimitMs = STALL_MS;
+    look.now_ms = Date.now();
+    look.expected = (expected && expected.id)
+      ? {id: String(expected.id), via: headIsRead() ? 'feed-tables' : 'station-clock'}
+      : null;
+    var d = PineScriptResolver.resolve(look, {map: admitMap, index: feedIndex()},
+                                       {airLast: airLast, lastGood: lastGood});
+    if (d.mark === 'air') {
+      airLast = {line_id: d.line_id, key: d.key, t: d.t, from: d.from, until: d.until,
+                 block: d.block, ord: d.ord, at_ms: d.at_ms};
+    }
+    if (d.trustworthy && d.line_id) {
+      lastGood = {line_id: d.line_id, occurrence_id: d.occurrence_id, position: d.position,
+                  media: d.file, key: d.key, origin: '', at: d.at_ms, at_ms: d.at_ms};
+    }
+    if (syncState !== d.sync) { syncState = d.sync; syncSince = d.at_ms; }
+    syncWhy = d.why || PineScriptCues.say({sync: d.sync});
+    var seen = resolverRing[resolverRing.length - 1];
+    if (!seen || seen.mark !== d.mark || seen.line_id !== d.line_id || seen.road !== d.road
+        || seen.sync !== d.sync || seen.key !== d.key || seen.refused !== d.refused.length
+        || seen.expected_id !== d.expected_id || seen.carried_id !== d.carried_id) {
+      resolverRing.push({at_ms: d.at_ms, mark: d.mark, line_id: d.line_id, road: d.road,
+        sync: d.sync, source: d.source, key: d.key,
+        t: d.t === null ? null : Math.round(d.t * 1000) / 1000,
+        why: String(d.why || '').slice(0, 160), refused: d.refused.length,
+        refused_why: d.refused.length ? String(d.refused[0].why || '').slice(0, 120) : '',
+        expected_id: d.expected_id, carried_id: d.carried_id,
+        occurrence_id: d.occurrence_id});
+      if (resolverRing.length > RESOLVER_RING_MAX) resolverRing.shift();
+    }
+    lastDecision = d;
+    if (d.mark !== 'air') return null;
+    return {id: d.line_id, from: Number(d.from || 0), until: Number(d.until || 0),
+      at: Number(d.t || 0), index: d.index, of: d.of, occurrence_id: d.occurrence_id,
+      position: d.position, sync: d.sync, carried: false,
+      admitted: d.road === PineScriptResolver.ROADS.CUE, road: d.road};
+  }
+
+  /* The decision, compact, for the incident capture. */
+  function resolverSnapshot() {
+    var d = lastDecision;
+    var decision = null;
+    if (d) {
+      decision = {at_ms: d.at_ms, source: d.source, file: d.file, key: d.key, t: d.t,
+        mark: d.mark, line_id: d.line_id, road: d.road, sync: d.sync, why: String(d.why || '').slice(0, 200),
+        occurrence_id: d.occurrence_id, position: d.position, from: d.from, until: d.until,
+        block: d.block, ord: d.ord, observed: d.observed, expected_id: d.expected_id,
+        expected_via: d.expected_via, carried_id: d.carried_id, carried_age_s: d.carried_age_s,
+        refused: d.refused.slice(0, 6)};
+    }
+    return {decision: decision, ring: resolverRing.slice(-40)};
+  }
+
+  /* ---------------------------------------------- THE MARKS  [#1189]
+     Three marks, one node each, placed idempotently and re-asserted on the
+     keyed node after every repaint: .sp-now is ON AIR (evidence only),
+     .sp-expect is the clock's guess when there is no evidence, .sp-last
+     is the last line heard while nothing sounds. */
+  var dressed = Object.create(null);
+
+  function lineNode(id) {
+    return id ? document.querySelector('.sp-el[data-line="' + id + '"]') : null;
+  }
+
+  /* The CHARACTER cue above a line, for the status sentence. */
+  function lineWho(id) {
+    var node = lineNode(id);
+    if (!node) return '';
+    var prev = node.previousElementSibling;
+    if (prev && prev.classList && prev.classList.contains('sp-character')) {
+      return String(prev.textContent || '') + ' ';
+    }
+    return '';
+  }
+
+  function dress(cls, id) {
+    id = String(id || '');
+    if (dressed[cls] === id) {
+      var same = id ? lineNode(id) : null;
+      if (same && !same.classList.contains(cls)) same.classList.add(cls);
+      return;
+    }
+    var lit = document.querySelectorAll('.sp-el.' + cls);
+    for (var i = 0; i < lit.length; i += 1) lit[i].classList.remove(cls);
+    dressed[cls] = id;
+    var node = id ? lineNode(id) : null;
+    if (node) node.classList.add(cls);
+  }
+
+  function placeMarks(d) {
+    d = d || lastDecision || {};
+    var air = d.mark === 'air' ? String(d.line_id || '') : '';
+    markNow(air);
+    dress('sp-expect', (!air && d.expected_id && d.expected_id !== d.carried_id) ? d.expected_id : '');
+    dress('sp-last', (!air && d.carried_id) ? d.carried_id : '');
+  }
+
+  /* (c) THE LIT LINE STAYS WHERE THE EYE IS. A fold, a repaint or an
+     insert above can move the lit node out of the pane with no line
+     change to re-follow on (#1248: scroll ran 1,772px past the line while
+     follow was on). Rate-limited; never while a move of ours is in flight;
+     never against a hand scroll, which stands follow down first. */
+  var keptAt = 0;
+  function keepLitInView(reason) {
+    if (!follow) return false;
+    var box = el('spScript');
+    if (!box) return false;
+    var now = Date.now();
+    if (now < selfScrollUntil) return false;
+    if (now - keptAt < 900) return false;
+    var node = lineNode(nowLineId);
+    if (!node || node.hidden) return false;
+    var pane = box.getBoundingClientRect(), seat = node.getBoundingClientRect();
+    if (!(seat.height > 0)) return false;
+    var out = seat.bottom <= pane.top || seat.top >= pane.bottom;
+    if (!out) return false;
+    keptAt = now;
+    return moveScript('follow:' + (reason || 'drift'), function (pane) {
+      seatLineNearest(pane, node);
+    });
+  }
+
+  /* The reader's place across a fold: measured on the lit node when it is
+     on screen (that is what they are reading), else on the first visible
+     element, and restored by the drift once the fold has committed. */
+  var foldHold = null;
+  function foldGuardStart() {
+    var box = el('spScript');
+    if (!box) { foldHold = null; return; }
+    var node = lineNode(nowLineId);
+    var pane = box.getBoundingClientRect();
+    if (node && !node.hidden) {
+      var seat = node.getBoundingClientRect();
+      if (!(seat.height > 0 && seat.bottom > pane.top && seat.top < pane.bottom)) node = null;
+    } else node = null;
+    if (!node) {
+      var anchor = scriptAnchor(box);
+      foldHold = anchor && anchor.node ? {node: anchor.node, was: anchor.was} : null;
+      return;
+    }
+    foldHold = {node: node, was: node.getBoundingClientRect().top};
+  }
+  function foldGuardEnd(reason) {
+    var hold = foldHold;
+    foldHold = null;
+    var box = el('spScript');
+    if (!hold || !box || !hold.node || hold.node.parentNode !== box || hold.node.hidden) return;
+    var drift = hold.node.getBoundingClientRect().top - hold.was;
+    if (Math.abs(drift) > 0.5) {
+      moveScript('fold:' + (reason || 'settle'), function (pane) {
+        pane.scrollTop = Math.max(0, pane.scrollTop + drift);
+      });
+    }
+  }
+
+  /* ---------------------------------------- THE STATION'S VERDICT  [#1189]
+     GET /api/playout (the linear playout controller) says which occurrence
+     is sounding, by its own reading. Feature-tested: a station without it
+     answers 404 through the bridge as a rejection, and the strip simply
+     does not show a verdict. Asked every four seconds when present, once
+     every ten minutes when absent. */
+  var playoutNow = null;
+  var playoutState = 'unknown';
+  var playoutAt = 0;
+  var playoutBusy = false;
+  var PLAYOUT_MS = 4000;
+  var PLAYOUT_RETRY_MS = 600000;
+
+  function playoutRead(got) {
+    if (!got || typeof got !== 'object') return null;
+    var s = got.sounding || got.current || got.now || {};
+    var verdict = String(got.verdict || got.state || '');
+    if (!verdict && !s.occurrence_id) return null;
+    var off = s.offset_s;
+    if (off === undefined) off = s.offset;
+    if (off === undefined) off = s.position_s;
+    return {verdict: verdict.slice(0, 80),
+      occurrence_id: String(s.occurrence_id || s.occurrence || s.id || ''),
+      line_id: String(s.line_id || s.line || ''),
+      block: (s.block === undefined || s.block === null) ? null : Number(s.block),
+      ord: (s.ord === undefined || s.ord === null) ? null : Number(s.ord),
+      file: PineScriptCues.key(s.file || s.media || ''),
+      offset_s: (off === undefined || off === null || !isFinite(Number(off))) ? null : Number(off),
+      next: got.next && typeof got.next === 'object'
+        ? {occurrence_id: String(got.next.occurrence_id || ''), line_id: String(got.next.line_id || ''),
+           block: got.next.block === undefined ? null : got.next.block,
+           ord: got.next.ord === undefined ? null : got.next.ord}
+        : null,
+      at_ms: Date.now()};
+  }
+
+  function playoutPoll() {
+    var now = Date.now();
+    if (playoutBusy) return;
+    if (playoutState === 'absent' && now - playoutAt < PLAYOUT_RETRY_MS) return;
+    if (playoutState === 'present' && now - playoutAt < PLAYOUT_MS) return;
+    if (playoutState === 'unknown' && now - playoutAt < PLAYOUT_MS) return;
+    var bridge = api();
+    if (!bridge || typeof bridge.get !== 'function') return;
+    playoutBusy = true;
+    playoutAt = now;
+    var ask;
+    try { ask = Promise.resolve(bridge.get('/api/playout')); }
+    catch (err) { playoutBusy = false; playoutState = 'absent'; playoutNow = null; return; }
+    ask.then(function (got) {
+      playoutBusy = false;
+      var read = playoutRead(got);
+      if (!read) { playoutState = 'absent'; playoutNow = null; return; }
+      playoutState = 'present';
+      playoutNow = read;
+    }, function () {
+      playoutBusy = false;
+      playoutState = 'absent';
+      playoutNow = null;
+    });
+  }
+
+  /* Does the station's verdict name what this view marked? null = cannot
+     tell (no verdict, or the verdict carries no identity). */
+  function playoutAgrees() {
+    var p = playoutNow, d = lastDecision;
+    if (!p || !d) return null;
+    if (Date.now() - p.at_ms > PLAYOUT_MS * 3) return null;
+    if (d.mark !== 'air') return null;
+    if (p.line_id) return p.line_id === d.line_id;
+    if (p.occurrence_id && d.occurrence_id) return p.occurrence_id === d.occurrence_id;
+    if (p.block !== null && d.block !== null) return p.block === d.block && (p.ord === null || d.ord === null || p.ord === d.ord);
+    return null;
+  }
+
+  function playoutWord() {
+    var p = playoutNow;
+    if (!p || Date.now() - p.at_ms > PLAYOUT_MS * 3) return '';
+    var words = p.verdict ? 'station: ' + p.verdict : 'station: sounding';
+    if (p.block !== null) words += ' ' + p.block + (p.ord !== null ? '.' + p.ord : '');
+    var agrees = playoutAgrees();
+    if (agrees === false) words += ' (the view disagrees)';
+    return words;
+  }
+
+  function paintPlayout(strip) {
+    if (!strip) return;
+    var node = strip.querySelector('.sp-sync-playout');
+    var words = playoutWord();
+    if (!node) {
+      if (!words) return;
+      node = make('u', 'sp-sync-playout', '');
+      strip.insertBefore(node, strip.lastChild);
+    }
+    var agrees = playoutAgrees();
+    node.classList.toggle('sp-disagree', agrees === false);
+    if (node.__text !== words) { node.__text = words; node.textContent = words; }
+  }
+
+  /* [#1189] THE EXPECTED LINE - the roads that used to place the mark.
+     The clock inside stream_now, the feed searched with no file to hold a
+     row to, and speaking_now: each was measured placing the mark wrongly
+     (see PineScriptResolver above), so none of them touches ON AIR now.
+     They still answer "where does the station think it is", and that is
+     drawn as EXPECTED, dim and labelled, when there is no evidence. */
+  function estimateRow() {                                   /* [#1189] */
     /* #1336 / the sequential-playout audit: the ADMITTED map first. Every
        road below this line reconstructs a position from something that can
        be rewritten - estimates, feed rows, a four-second poll. The cue
        sheet the controller committed cannot be. */
-    var admitted = admittedRow();
-    if (admitted) return admitted;
+    /* [#1189] the admitted map is read by the resolver; this road only estimates. */
     var t = streamAt();    var rows = (liveStream && liveStream.rows) || [];
     var file = soundingFile();
     /* #1330: A BURST THAT HAS RUN OUT IS NOT A TABLE TO SEARCH.
@@ -5665,11 +9070,19 @@
        * the page, so it was never the screenplay being stale.
        *
        * The feed's full row list is where those clips live. */
-      var all = fed;
-      if (!file && all.length && all !== rows) {
-        var loose = within(all, all.length);
-        if (loose) return loose;
-      }
+      /* [#1189] THE FILE-LESS SEARCH IS GONE.
+       *
+       * It used to be: with nothing sounding and no file to hold a row
+       * to, search EVERY feed row for one whose window brackets the
+       * estimate. #1247 is what that does. The station clock said 63.4s;
+       * the desktop had already finished that burst and had no player at
+       * all; `within(all)` found a row of block 6205 whose 63.4s window
+       * matched - in a different file, 354 elements up the page - and lit
+       * it for 1.7 seconds. An offset without a filename is not evidence
+       * of anything, and two files agreeing about a number is a
+       * coincidence, not a reading. Nothing replaces it: with no file
+       * this road returns whatever speaking_now says, and that only ever
+       * dresses the EXPECTED mark now. */
     }
     if (speakingNow && speakingNow.id) {
       return {id: String(speakingNow.id), from: 0, until: 0, at: t,
@@ -5743,8 +9156,17 @@
   /* ONE line carries the mark. The class is removed from whatever had it
    * before rather than from everything, so a 283-element script does not
    * get walked four times a second. */
+  var chasedFor = Object.create(null);           /* [#1189] id -> last chase */
+
   function markNow(id) {
-    if (id === nowLineId) return;
+    if (id === nowLineId) {
+      /* [#1189] RE-ASSERTED ON THE KEYED NODE. A repaint may have rebuilt
+         the node without its mark; the id being unchanged is not the mark
+         being present. */
+      var same = id ? lineNode(id) : null;
+      if (same && !same.classList.contains('sp-now')) same.classList.add('sp-now');
+      return;
+    }
     /* #1263: CLEAR EVERY MARK, not the one we remember.
      *
      * "it's highlighting multiple lines at the same time when it's
@@ -5800,8 +9222,18 @@
        * stale, so it asks for a fresh one there and then, at most once
        * every three seconds. Nothing else in the view has to know. */
       nowLineId = '';
+      /* [#1189] A CHASE IS FOR A LINE THE PAGE SHOULD HAVE. An `observed:`
+         pseudo-id, a short board id or a row the feed does not know can
+         never arrive in a fresh screenplay, and chasing them forced a full
+         re-read every three seconds for the length of every unadmitted
+         clip - the document revisions that churned under the reader. A
+         real line id is chased once per twenty seconds. */
       var t = Date.now();
-      if (t - chasedAt > 3000) { chasedAt = t; loadScreenplay(true); }
+      if (PineScriptResolver.isLineId(id) && t - chasedAt > 3000
+          && t - Number(chasedFor[id] || 0) > 20000) {
+        chasedAt = t; chasedFor[id] = t;
+        loadScreenplay(true);
+      }
       return;
     }
     nowLineId = id || '';
@@ -5809,36 +9241,11 @@
     node.classList.add('sp-now');
     segFollow(node.getAttribute('data-seg') || '');          /* #1285 */
     if (follow) {
-      /* Centred, not merely visible: the operator is reading the
-       * conversation, and the next line wants to be under it.
-       *
-       * THE GUARD IS THE WHOLE FIX. Measured: the highlight was on screen
-       * in 0 of 7 talking samples, because a smooth scroll fires scroll
-       * events all the way down, the handler below read "the line is not
-       * visible yet" from one of them and switched following OFF - the
-       * auto-scroll cancelled itself on its first frame, every time. */
-      /* #1282: MOVE ONLY IF IT HAS TO, AND DO NOT CANCEL YOURSELF.
-       *
-       * `block:'center'` re-centred on every line change - about ten
-       * full animations a minute at a 6.4s median dwell, each one a
-       * chance for the page to move under a finger. `nearest` moves
-       * only when the line is actually outside the pane, and
-       * `.sp-now`'s scroll-margin keeps it off the edge when it does.
-       *
-       * And the 900ms guard was a fixed window against a scroll whose
-       * duration grows with distance - 21.9% of movements were still
-       * running two samples later. When it expired mid-flight the
-       * animation's own scroll events reached the handler, which read
-       * geometry that had not settled and switched following off. The
-       * scroll cancelled itself, which is the very fault the guard
-       * exists to prevent. `scrollend` says when it is really over. */
-      /* #1330 lives in moveScript() now, with the other three movers of
-         this pane: the backstop, the `scrollend` early clear and the box
-         that actually scrolls are declared in ONE place. */
-      moveScript('follow', function () {
-        try { node.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
-        catch (err) { node.scrollIntoView(false); }
-      });
+      /* Move only when needed, by one measured delta. Smooth animations
+         overlapped the next poll and made anchor restoration count their
+         unfinished travel a second time; an exact nearest-edge seat has no
+         in-flight state for a repaint to race. */
+      moveScript('follow', function (pane) { seatLineNearest(pane, node); });
     }
   }
 
@@ -5858,13 +9265,61 @@
    * a count. */
   function status() {
     var row = activeRow();
-    if (stationPaused) return {state: 'paused', text: 'air paused — nothing is going out'};
+    /* [#1189] HOW LONG A HELD MARK HAS BEEN HELD, said the way a person
+       says it. #1210's strip read "AIR PAUSED - HELD - holding the last
+       read line for 22189s", which is a number nobody reads as six
+       hours. Seconds while it is fresh; the clock time and the minutes
+       once it is not. Declared here so both roads out of status() -
+       paused, and nothing sounding - tell the age the same way. */
+    function heldWords(ageS, atMs) {
+      var age = Number(ageS);
+      if (!isFinite(age) || age < 0) return 'a moment ago';
+      if (age < 90) return Math.round(age) + 's ago';
+      var when = Number(atMs) - age * 1000;
+      var stamp = '';
+      if (isFinite(when) && when > 0) {
+        try { stamp = new Date(when).toTimeString().slice(0, 8); } catch (e) { stamp = ''; }
+      }
+      var mins = Math.round(age / 60);
+      var words = mins + (mins === 1 ? ' minute' : ' minutes') + ' ago';
+      return stamp ? stamp + ' (' + words + ')' : words;
+    }
+    /* [#1189] #1210: the paused strip said "HELD" over a line lit six
+       hours earlier and never said how old it was. It says so now, and
+       the mark itself is let go after ten minutes
+       (PineScriptResolver.CARRY_MAX_S). */
+    if (stationPaused) {
+      var dPause = lastDecision;
+      return {state: 'paused', text: 'air paused \u2014 nothing is going out'
+        + ((dPause && dPause.carried_id)
+            ? ' \u2014 held since ' + heldWords(dPause.carried_age_s, dPause.at_ms)
+            : '')};
+    }
 
     /* A CARRIED MARK IS NOT "ON AIR". It is the last line this view could
        prove, held up while the evidence is missing, and saying "4.2s left"
        over it would be inventing a countdown for audio nobody can see. */
+    /* [#1189] NOTHING IS ON AIR. Say what the page can honestly say: what
+       is sounding that it cannot name, what it last heard, or what the
+       station clock expects - each labelled as that, never as air. */
+    if (!row && lastDecision) {
+      var d0 = lastDecision, chip = playoutWord();
+      if (chip) chip = ' \u2014 ' + chip;
+      if (d0.sync === 'read-unmapped') {
+        return {state: 'wait', text: (d0.why || 'sounding something the page does not name') + chip};
+      }
+      if (d0.carried_id) {
+        return {state: 'wait', text: 'last heard ' + lineWho(d0.carried_id) + '\u2014 '
+          + heldWords(d0.carried_age_s, d0.at_ms) + '; ' + (d0.why || 'nothing sounding') + chip};
+      }
+      if (d0.expected_id) {
+        return {state: 'wait', text: 'expected ' + lineWho(d0.expected_id) + '\u2014 '
+          + (d0.source === 'estimated' ? 'estimated from the station clock, no playhead'
+             : (d0.why || 'no playhead')) + chip};
+      }
+    }
     if (row && row.carried) {
-      return {state: 'wait', text: 'holding the last read line — ' + syncWhy};
+      return {state: 'wait', text: 'holding the last read line \u2014 ' + syncWhy};
     }
 
     if (row && row.until > row.from) {
@@ -5881,10 +9336,11 @@
         tail = rest > 0 ? ' · ' + rest + ' more in this burst' : ' · last of the burst';
       }
       return {state: 'air', text: who + 'on air · ' + seconds(Math.max(0, left))
-        + ' left of ' + seconds(row.until - row.from) + tail};
+        + ' left of ' + seconds(row.until - row.from) + tail
+        + (playoutWord() ? ' — ' + playoutWord() : '')};                     /* [#1189] */
     }
 
-    if (row && row.id) return {state: 'air', text: 'on air'};
+    if (row && row.id) return {state: 'air', text: 'on air' + (playoutWord() ? ' — ' + playoutWord() : '')};
 
     /* Nothing in the room. Say what the booth is doing about it. */
     var f = flow || {};
@@ -5958,6 +9414,7 @@
           mapped && !(state === 'read' || state === 'read-gap'));
       }
     } catch (err) { /* the strip still says it */ }
+    paintPlayout(node);                                       /* [#1189] */
     var b = node.firstChild, i = node.lastChild;
     if (b && b.__text !== name) { b.__text = name; b.textContent = name; }
     if (i && i.__text !== why) { i.__text = why; i.textContent = why; }
@@ -6036,7 +9493,7 @@
       syncRing.push(mine);
       if (syncRing.length > SYNC_RING_MAX) syncRing.shift();
     }
-    markNow(row ? row.id : '');
+    placeMarks(lastDecision);                                /* [#1189] */
     markRun(row);                                            /* #1295 */
     paintSaying(row);                                        /* #1298 */
     markFeedLive(row ? row.id : '');            /* #1279 */
@@ -6053,7 +9510,21 @@
     } catch (err) { /* the mark still stands on its own */ }
     paintStatus();
     paintSync(row);
+    /* [#1189] ONE TIMER. The recorder used to sample on its own 250ms
+       interval, a quarter-phase away from this one, so every line change
+       was recorded once with the old highlight and the new active - the
+       "highlighted identity differs from the client active-line identity"
+       finding in all sixteen captures was that phase, not a fault. It
+       samples here, after placement, and the lit line is kept in view. */
+    var nowMs = Date.now();
+    if (nowMs - sampledAt >= MOTION_MS - 20) {
+      sampledAt = nowMs;
+      try { sampleMotion(); } catch (e) { /* the ring is a courtesy */ }
+    }
+    keepLitInView('tick');
+    playoutPoll();
   }
+  var sampledAt = 0;                              /* [#1189] */
 
   /* #1303b: the row the sampler's own sourceFor() expects. A clip line
      carries its url and is taken exactly; a spoken line carries its id
@@ -6239,9 +9710,38 @@
     left.appendChild(treeRow);
     left.appendChild(buildPanel());
     left.appendChild(buildPlayer());         /* 5 */
+    /* [#1386] THE FEED HAS TWO FACES.
+     *
+     * "I want to be able to toggle feed view between being feed view and
+     *  technical view which is what it jumps into when i select any
+     *  element in the script view."
+     *
+     * Feed is what the station is DOING. Technical is where any of it
+     * CAME FROM - the same pane, the same place on the glass, so tracing
+     * a line does not take the show off the screen. Tapping a name in the
+     * script flips it here and traces that line; the toggle flips it back
+     * and the feed carries on where it was. */
     var feedHead = make('div', 'sp-feedhead');
-    feedHead.appendChild(make('b', '', 'Feed'));
-    feedHead.appendChild(make('i', 'sp-feedwhy', 'everything the station is doing'));
+    var feedName = make('b', '', 'Feed');
+    feedHead.appendChild(feedName);
+    var feedWhy = make('i', 'sp-feedwhy', 'everything the station is doing');
+    feedHead.appendChild(feedWhy);
+    var feedFlip = make('button', 'sp-feedflip', 'technical');
+    feedFlip.title = 'Trace where any of this came from. Tap a name in the '
+      + 'script to trace that line.';
+    feedFlip.addEventListener('click', function () {
+      technicalToggle();
+    });
+    feedHead.appendChild(feedFlip);
+    var wideFlip = make('button', 'sp-feedflip sp-techwide',
+      techWide ? 'in column' : 'full width');
+    wideFlip.addEventListener('click', function () {
+      /* Pressing this is also asking to SEE it - going wide with the pane
+         still shut would look like a button that does nothing. */
+      if (!techOn) { technicalToggle(); }
+      techWideSet(!techWide);
+    });
+    feedHead.appendChild(wideFlip);
     left.appendChild(feedHead);
     var feed = make('div', 'sp-feed');       /* 6 */
     feed.id = 'spFeed';
@@ -6267,11 +9767,16 @@
     head.setAttribute('tabindex', '0');
     head.setAttribute('aria-haspopup', 'menu');
     head.setAttribute('aria-expanded', 'false');
-    head.title = 'Hold this name (or right-click it): complain, mark an issue, report a missing segment';
+    head.title = 'Tap: the full itinerary for this hour. Hold (or right-click):'
+      + ' complain, mark an issue, report a missing segment';
     holdOpen(head, function () { headerOpen(head); });
     head.addEventListener('click', function () {
       if (head.pineHeld) return;              /* the hold has just answered */
-      if (el(HEADER_MENU_ID)) headerClose();
+      /* [#1235] A tap used to do nothing here but shut #1164's
+         menu again. It opens the hour's running order now; the
+         hold still raises the report menu, untouched. */
+      if (el(HEADER_MENU_ID)) { headerClose(); return; }
+      itineraryOpen();
     });
     /* At the desk there is a keyboard, and a role="button" that cannot
        be worked from it is a button in name only. */
@@ -6515,7 +10020,8 @@
   }
 
   function mount(node) {
-    if (!motionTimer) motionTimer = setInterval(function () { try { sampleMotion(); } catch (e) { /* the ring is a courtesy */ } }, MOTION_MS);   /* 2026-09-14 */
+    /* [#1189] the recorder samples from tick(), after the marks are placed,
+       so highlight and active are read in the same breath. */
     if (mounted) return Promise.resolve(true);
     build(node);
     retryReports();
@@ -6571,6 +10077,9 @@
 
   root.PineScriptPage = {
     mount: mount,
+    /* [#1219] the timeline arithmetic, pure, plus what the strip reads now. */
+    timeline: {model: timelineModel, rowsOf: timelineRows,
+      interjects: timelineInterjects, source: timelineSource, read: timelineRead},
     /* The cue-map arithmetic, exported for
        tests/test_script_admission_view_2026_09_15.cjs. It is pure, so the
        test holds the real code rather than a copy of it. */
@@ -6590,8 +10099,29 @@
       steps: segFlowSteps,
       flow: segFlowPaint,
       seat: segSeatLook,
-      block: scriptBlock
+      /* [#1238] the taps, and the itinerary a tap on the
+         script's name opens. */
+      line: segLineCard,
+      wire: segLineWire,
+      tap: segFlowTap,
+      reveal: segReveal,
+      detail: segDetailOpen,
+      replay: segLineReplay,
+      itinerary: itineraryOpen,
+      itinRow: itinRow,
+      block: scriptBlock,
+      download: segExportRun                          /* [#1220] */
     },
+    /* [#1189] the resolver and the mark placement, exported for
+       tests/test_script_view_evidence_2026_09_21.cjs - the real code,
+       not a copy. */
+    resolver: PineScriptResolver,
+    marks: {place: placeMarks, keepLitInView: keepLitInView, stitch: stitchScript,
+            anchor: scriptAnchor, restore: scriptRestore, nodes: scriptNodes,
+            decision: function () { return lastDecision; },
+            reset: function () { lastDecision = null; airLast = null; lastGood = null;
+                                 resolverRing.length = 0; nowLineId = ''; dressed = Object.create(null); },
+            active: activeRow, playoutRead: playoutRead},
     isMounted: function () { return mounted; },
     close: function () {
       folderClose();                                  /* 2026-09-14 */
@@ -6602,6 +10132,7 @@
       segInspectClose();
       segReportClose();
       segPromptClose();
+      itineraryClose();                               /* [#1235] */
       if (stop) stop();
       stop = null;
       if (beat) clearInterval(beat);

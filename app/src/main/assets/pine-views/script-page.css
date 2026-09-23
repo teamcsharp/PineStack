@@ -204,6 +204,52 @@
   height: 46px;
   display: block;
 }
+
+/* [#1219] THE TIMELINE ALONG THE CARD'S BOTTOM EDGE. The clock rides the
+   label row (CLIP  0:12 / 0:22); the strip is a 4px band pinned to the
+   bottom edge that collapses (scaleY to 0) when nothing sounds, so the
+   card never changes height. Ticks are the line boundaries of a welded
+   round, the amber marks its interjections. Painted on the scope's own
+   requestAnimationFrame - see paintTimeline() in script-page.js. */
+.sp-saying { position: relative; }
+.sp-saying-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+/* min-width:0 as well as on the row: without it the label's ellipsis
+   cannot engage and a long name pushes the clock off the card. */
+.sp-saying-head .sp-saying-who { flex: 0 1 auto; min-width: 0; }
+.sp-tl-clock {
+  flex: 0 0 auto; margin-left: auto; margin-bottom: 2px;
+  font-style: normal; font-size: 9px; line-height: 1.2; letter-spacing: .06em;
+  color: var(--sp-muted, #8fa0ad); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.sp-tl-clock:empty { display: none; }
+.sp-tl {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 4px;
+  border-radius: 0 0 7px 7px; pointer-events: none;
+  /* NOT overflow:hidden - .sp-tl-mark is 8px tall in a 4px band on
+     purpose, so an interjection stands proud of the strip. */
+  transform: scaleY(0); transform-origin: 50% 100%; opacity: 0;
+  transition: transform .18s ease, opacity .18s ease;
+}
+.sp-page.sp-tl-on .sp-tl { transform: none; opacity: 1; }
+.sp-tl-track {
+  position: absolute; inset: 0; border-radius: inherit;
+  background: rgba(143, 160, 173, .22);
+}
+.sp-tl-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+  border-radius: inherit; background: var(--sp-on, #65c7da);
+}
+.sp-tl-marks { position: absolute; inset: 0; }
+.sp-tl-seg {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  background: var(--sp-bg, #101419);
+}
+.sp-tl-mark {
+  position: absolute; bottom: 0; width: 3px; height: 8px; margin-left: -1px;
+  background: var(--sp-amber, #e3be63); border-radius: 1px 1px 0 0;
+}
+@media (prefers-reduced-motion: reduce) { .sp-tl { transition: none; } }
 .sp-tree {
   display: grid; place-items: center;
   width: 54px; height: 54px; padding: 0;
@@ -276,6 +322,40 @@
 }
 .sp-spectrum { height: 22px; }
 .sp-voicemeter { height: 12px; }
+
+/* [#1198] THE BARS ARE CONTROLS. Swipe right raises, left lowers; the page
+   still scrolls vertically through them because pan-y leaves that gesture
+   with the compositor, which is also what stops a scroll from nudging a
+   level. The taller music bar is a comfortable thumb target already; the
+   12px voice bar gets a transparent border so the finger has 20px to land
+   on without the drawn bar changing size. */
+.sp-spectrum, .sp-voicemeter {
+  touch-action: pan-y;
+  cursor: ew-resize;
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.sp-voicemeter { border-top: 4px solid transparent; border-bottom: 4px solid transparent; background-clip: padding-box; }
+.sp-spectrum:focus-visible, .sp-voicemeter:focus-visible {
+  outline: 1px solid var(--sp-accent, #65c7da); outline-offset: 1px;
+}
+.sp-spectrum[data-level-dragging], .sp-voicemeter[data-level-dragging] {
+  background: rgba(255, 255, 255, .10);
+}
+/* The live readout. It exists only while a level is moving, sits above the
+   title between the art and the mixer dot, and never takes a pointer. */
+.sp-levelpill {
+  position: absolute; left: 50%; top: 3px; z-index: 4;
+  transform: translateX(-50%) translateY(-3px);
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 10px; letter-spacing: .05em;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  color: #eaf3ff; background: rgba(4, 9, 17, .94);
+  border: 1px solid var(--sp-line);
+  opacity: 0; pointer-events: none;
+  transition: opacity .12s ease, transform .12s ease;
+}
+.sp-levelpill.on { opacity: 1; transform: translateX(-50%) translateY(0); }
 
 .sp-seekrow { display: flex; align-items: center; gap: 7px; }
 .sp-seek { flex: 1 1 auto; min-width: 0; }
@@ -474,6 +554,17 @@
 .sp-page.sp-look-paper .sp-el.sp-spinning { color: #1d1913; }
 .sp-page.sp-look-paper .sp-el.sp-spinning::after { color: #6b4f2a; }
 
+/* [#1237] a line bound to a record says which, quietly, after the speech -
+   the same voice as the deck mark above, because it is the same fact. */
+.sp-el.sp-dialogue[data-bound]::after {
+  content: ' \00b7 bound to: ' attr(data-bound);
+  color: var(--sp-on, #65c7da);
+  font-size: 11px;
+  letter-spacing: .04em;
+  opacity: .8;
+}
+.sp-page.sp-look-paper .sp-el.sp-dialogue[data-bound]::after { color: #6b4f2a; }
+
 /* THE LINE BEING SAID, RIGHT NOW.
    One at a time, and unmistakable: the eye should find it without reading.
    The bar on the left pulses at roughly the pace of speech so a still
@@ -564,6 +655,126 @@
 /* Scrolled away from the live line: say so, and offer the way back. */
 .sp-now-line.adrift::before { content: '↩ '; color: var(--sp-on, #65c7da); }
 .sp-now-line.adrift::after { content: '  · tap to follow'; opacity: .7; }
+
+/* THE SYNCHRONIZATION STATE.
+ *
+ * "Preserve the last trustworthy position when playback evidence is
+ *  unavailable and expose the synchronization state. Merely preventing a
+ *  backward visual movement would hide an audio fault."
+ *
+ * So this strip is never absent and never neutral: it says, in two words
+ * and a reason, what the mark above it is standing on. The three states
+ * that are read off the sound are the only ones drawn in the live colour;
+ * everything else is drawn as the fault or the doubt it is. */
+.sp-sync {
+  flex: 0 0 auto;
+  display: flex; align-items: baseline; gap: 8px;
+  margin: -2px 0 6px;
+  padding: 3px 9px;
+  border-left: 3px solid var(--sp-line, #35414c);
+  border-radius: 0 4px 4px 0;
+  background: rgba(0, 0, 0, .18);
+  font-size: 10px; line-height: 1.4;
+  letter-spacing: .02em;
+  color: var(--sp-muted, #8fa0ad);
+  white-space: nowrap; overflow: hidden;
+}
+.sp-sync .sp-sync-name {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  flex: 0 0 auto;
+}
+.sp-sync .sp-sync-why {
+  font-style: normal;
+  opacity: .78;
+  overflow: hidden; text-overflow: ellipsis;
+}
+/* Read off the sound, mapped through the committed cue sheet. */
+.sp-sync[data-sync="read"] { border-left-color: var(--sp-on, #65c7da); color: var(--sp-text, #edf3f5); }
+.sp-sync[data-sync="read-gap"] { border-left-color: var(--sp-on, #65c7da); }
+/* Not read, or read and disagreeing with what was committed. */
+.sp-sync[data-sync="estimated"] { border-left-color: var(--sp-amber, #d8a657); }
+.sp-sync[data-sync="held"] { border-left-color: var(--sp-amber, #d8a657); }
+.sp-sync[data-sync="read-unmapped"] { border-left-color: #b078d8; color: #d9c2ec; }
+.sp-sync[data-sync="read-outside"] { border-left-color: #d86b57; color: #e9b5aa; }
+.sp-sync[data-sync="stalled"] { border-left-color: #d86b57; color: #e9b5aa; }
+.sp-sync[data-sync="paused"] { border-left-color: #6d7c88; opacity: .8; }
+/* A mark with no evidence under it must not look like one that has some. */
+.sp-sync.sp-sync-carried .sp-sync-name::after { content: ' · held'; opacity: .7; }
+
+/* [#1189] A GUESS DRAWN AS A GUESS. When no playhead can be read the
+   station clock still says where it thinks the reading is; that used to
+   be painted as ON AIR and it was wrong in 81% of samples. It is its own
+   mark now: dotted, amber, and labelled. Never the live colour. */
+.sp-el.sp-expect {
+  position: relative;
+  border-left: 3px dotted var(--sp-amber, #d8a657);
+  border-radius: 4px;
+  color: var(--sp-text, #edf3f5);
+  scroll-margin: 96px 0;
+}
+.sp-el.sp-expect::before {
+  content: "EXPECTED\A no playhead";
+  white-space: pre;
+  text-align: right;
+  line-height: 1.35;
+  position: absolute;
+  left: -66px;
+  top: 1px;
+  width: 58px;
+  font-size: 9px;
+  letter-spacing: .16em;
+  font-weight: 700;
+  color: var(--sp-amber, #d8a657);
+  opacity: .8;
+}
+/* The last line heard, while nothing is sounding. Faint, and said. */
+.sp-el.sp-last {
+  position: relative;
+  border-left: 3px solid rgba(101, 199, 218, .38);
+  border-radius: 4px;
+}
+.sp-el.sp-last::before {
+  content: "LAST\A HEARD";
+  white-space: pre;
+  text-align: right;
+  line-height: 1.35;
+  position: absolute;
+  left: -66px;
+  top: 1px;
+  width: 58px;
+  font-size: 9px;
+  letter-spacing: .16em;
+  font-weight: 700;
+  color: rgba(101, 199, 218, .55);
+}
+/* The one mark that means sounding wins the edge if it is ever doubled. */
+.sp-el.sp-now.sp-expect::before, .sp-el.sp-now.sp-last::before {
+  content: "ON AIR\A" attr(data-left);
+  color: var(--sp-on, #65c7da);
+  opacity: .95;
+}
+.sp-page.sp-look-paper .sp-el.sp-expect { color: #1d1913; border-left-color: #8a6a2c; }
+.sp-page.sp-look-paper .sp-el.sp-expect::before { color: #8a6a2c; }
+.sp-page.sp-look-paper .sp-el.sp-last::before { color: #6b7c88; }
+/* The station's own verdict (GET /api/playout), beside the view's. */
+.sp-sync .sp-sync-playout {
+  text-decoration: none;
+  font-style: normal;
+  margin-left: auto;
+  padding-left: 8px;
+  flex: 0 1 auto;
+  opacity: .85;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.sp-sync .sp-sync-playout.sp-disagree { color: #e9b5aa; opacity: 1; }
+/* The mark itself, while nothing is standing behind it. */
+.sp-page.sp-unsynced .sp-el.sp-now {
+  outline: 1px dashed var(--sp-amber, #d8a657);
+  outline-offset: 2px;
+}
+.sp-page.sp-unsynced .sp-el.sp-now::after { content: ''; }
 /* #1286: the crystal's rhyme mark rides on 433 of 693 dialogue
    elements - 63%, nearly every line - so as a highlight it carried no
    information and only crowded the one that did. Silent in the reading
@@ -896,6 +1107,115 @@
 .sp-find-row { display: flex; flex-direction: column; padding: 6px 14px; border-bottom: 1px solid #101823; }
 .sp-find-when { font-size: 11px; color: #8ea0ad; }
 .sp-find-text { color: #cfe0e6; }
+/* [#1241] / [#1239] WHERE A PHRASE COMES FROM, AND THE TRASH CAN.
+   Two icons in the head of the word search, and a pane under the facts that
+   lays the sources out in four fixed layers - prompts, the crystal, topics,
+   scripts. A tick sits beside every source that can actually be removed and
+   is disabled beside the ones that cannot (a line of code, a document), so
+   the sheet never offers an action the station cannot perform. Thumb sizes
+   throughout: this is opened on the tablet. */
+.sp-find-act {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 40px; min-height: 40px; padding: 0;
+  border: 1px solid #35414c; border-radius: 9px;
+  background: rgba(255, 255, 255, .03); color: #8ea0ad;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-find-act .pi-icon { width: 17px; height: 17px; }
+.sp-find-act:hover { color: #edf3f5; border-color: #4a5a68; }
+.sp-find-act[aria-expanded="true"] { color: #65c7da; border-color: #65c7da; }
+.sp-find-bin:hover { color: #ff9a8a; border-color: #ff9a8a; }
+.sp-find-head .sp-find-act:first-of-type { margin-left: auto; }
+.sp-find-head .sp-find-act + .sp-find-x { margin-left: 0; }
+
+.sp-find-link {
+  display: inline; margin-left: 6px; padding: 0; border: 0; background: none;
+  color: #ffd479; font: inherit; text-align: left; cursor: pointer;
+  text-decoration: underline dotted;
+}
+.sp-find-link:hover { color: #ffe9b4; }
+
+.sp-find-trace {
+  padding: 4px 0 8px; border-bottom: 1px solid #24323a;
+  background: rgba(255, 255, 255, .02);
+}
+.sp-find-trace-head {
+  padding: 8px 14px 4px; font-weight: 600; font-size: 12px; color: #8ea0ad;
+  text-transform: uppercase; letter-spacing: .04em;
+}
+/* The correction, when the phrase is written nowhere at all and the rhyme
+   pass made it: this is the answer to #1230's "somewhere a system prompt is
+   making it say that", and it is the one the operator cannot get by
+   searching the prompts. */
+.sp-find-kin {
+  margin: 4px 12px 8px; padding: 8px 10px;
+  border-left: 3px solid #ffd479; border-radius: 0 8px 8px 0;
+  background: rgba(255, 212, 121, .07); color: #ffe9b4; font-size: 12px;
+}
+.sp-find-layer { border-top: 1px solid #101823; }
+.sp-find-layer-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  padding: 8px 14px 4px;
+}
+.sp-find-layer-mark { display: inline-flex; align-self: center; color: #65c7da; }
+.sp-find-layer-mark .pi-icon { width: 15px; height: 15px; }
+.sp-find-layer-n { font-size: 11px; color: #ffd479; }
+.sp-find-layer-why { flex: 1 1 100%; font-size: 11px; color: #6f8291; }
+.sp-find-src {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 6px 14px 6px 12px; border-top: 1px solid rgba(16, 24, 35, .8);
+}
+.sp-find-src.lit { background: rgba(101, 199, 218, .12); }
+.sp-find-src-none { color: #6f8291; font-style: italic; padding-left: 40px; }
+.sp-find-tick {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 34px; min-height: 34px; padding: 0;
+  border: 0; border-radius: 6px; background: none; color: #8ea0ad;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-find-tick .pi-icon { width: 17px; height: 17px; }
+.sp-find-tick[aria-checked="true"] { color: #ff9a8a; }
+.sp-find-tick:disabled { opacity: .25; cursor: default; }
+.sp-find-src-body { flex: 1 1 auto; min-width: 0; }
+.sp-find-src-name { color: #edf3f5; font-weight: 600; }
+.sp-find-src-where { font-size: 11px; color: #8ea0ad; }
+.sp-find-src-snip {
+  color: #cfe0e6; font-size: 12px;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.sp-find-src-why { font-size: 11px; color: #6f8291; font-style: italic; }
+
+/* The confirm sheet. It never says "are you sure": it names, in the
+   station's own sentence, exactly what stops being said and what is
+   deleted, because a trash can that does five things at once has to. */
+.sp-find-confirm-back {
+  position: fixed; inset: 0; z-index: 2147483007; display: flex;
+  align-items: center; justify-content: center; background: rgba(4, 6, 11, .72);
+}
+.sp-find-confirm {
+  width: min(520px, 92vw); max-height: 86vh; overflow-y: auto;
+  border: 1px solid #ff9a8a; border-radius: 12px; background: rgba(12, 10, 12, .98);
+  color: #edf3f5; font: 13px/1.55 Inter, Segoe UI, system-ui, sans-serif;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .7);
+}
+.sp-find-confirm-head {
+  padding: 12px 14px; font-size: 15px; font-weight: 600; color: #ff9a8a;
+  border-bottom: 1px solid #35414c;
+}
+.sp-find-confirm-body { padding: 10px 14px; }
+.sp-find-confirm-list { margin: 8px 0 0; padding-left: 18px; color: #cfe0e6; font-size: 12px; }
+.sp-find-confirm-list li { margin-bottom: 4px; }
+.sp-find-confirm-row {
+  display: flex; gap: 8px; justify-content: flex-end;
+  padding: 10px 14px 14px; border-top: 1px solid #24323a;
+}
+.sp-find-confirm-no, .sp-find-confirm-yes {
+  min-height: 40px; padding: 0 16px; border-radius: 9px; font: inherit; cursor: pointer;
+}
+.sp-find-confirm-no { border: 1px solid #35414c; background: none; color: #cfe0e6; }
+.sp-find-confirm-yes { border: 1px solid #ff9a8a; background: rgba(255, 154, 138, .16); color: #ffd6cd; }
+.sp-find-confirm-yes:disabled { opacity: .5; cursor: default; }
+.sp-find-confirm-note { padding: 0 14px 12px; font-size: 12px; color: #ffd479; }
 
 /* #1117: the triangle at the front of every row of the word search.
    A thumb-sized caret (the operator opens this on the tablet) that turns
@@ -1124,3 +1444,722 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
 .sp-inbox-details { margin: 6px 0; padding-left: 8px; border-left: 2px solid #35414c; }
 .sp-inbox-details summary { cursor: pointer; min-height: 32px; line-height: 32px; color: #65c7da; }
 .sp-inbox-img { display: block; max-width: 100%; max-height: 260px; margin: 6px 0; border-radius: 6px; background: #000000; }
+
+/* --- #1164: THE DROP-DOWN UNDER THE SCRIPT'S NAME ----------------------
+ *
+ * "I want to be able to tap and hold on the name of the script as being
+ *  run for that particular session and I want a drop-down menu that comes
+ *  down that lets me pick options like complain, mark issue and report
+ *  missing segment."
+ *
+ * It COMES DOWN. The reason sheet and the inbox are modals in the middle
+ * of the glass, which is right for what they are and wrong for this: this
+ * hangs off the heading inside .sp-right, which is already position:
+ * relative, and script-page.js sets its top from the heading's own
+ * offsets - the rule here is only the fallback for a surface with no
+ * geometry yet. Colours are the reason sheet's, because it is the same
+ * road with a different door.
+ *
+ * Every row is 44 px. The operator works this view with a thumb while the
+ * station is playing, and a press-and-hold that lands on a 20 px row is a
+ * press-and-hold that files the wrong report.
+ */
+.sp-scripthead {
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  touch-action: manipulation; cursor: context-menu;
+}
+/* The same two marks the caution button and the report icon wear while a
+   report is in flight, so the name answers the hold the way they do. */
+.sp-scripthead.sp-firing { opacity: .55; }
+.sp-scripthead.sp-fired-bad { color: #ff5d5d; }
+
+.sp-headmenu {
+  position: absolute; z-index: 9; top: 24px; left: 6px;
+  width: min(320px, 88vw); max-height: 72%;
+  display: flex; flex-direction: column; overflow-y: auto;
+  border: 1px solid #35414c; border-radius: 10px;
+  background: #0b1116; color: #dfe7ee;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .55);
+}
+.sp-headmenu-say {
+  padding: 8px 14px; background: #10202a; color: #65c7da;
+  font-weight: 600; border-bottom: 1px solid #24323a;
+}
+.sp-headmenu-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 0 14px;
+  border: 0; border-bottom: 1px solid #101823; background: none; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-headmenu-item.on { color: #65c7da; background: #0e1a21; }
+.sp-headmenu-mark { display: inline-flex; flex: 0 0 auto; color: #8ea0ad; }
+.sp-headmenu-item.on .sp-headmenu-mark { color: #65c7da; }
+.sp-headmenu-mark .pi-icon { width: 20px; height: 20px; }
+.sp-headmenu-text { flex: 1 1 auto; min-width: 0; }
+/* Cancel is the way out, not a choice among the three: quieter, and last. */
+.sp-headmenu-cancel { color: #8ea0ad; border-bottom: 0; }
+
+/* "let him say WHAT is missing" - revealed under its own row, never open
+   by default, and prefilled with nothing. */
+.sp-headmenu-ask { padding: 8px 14px; background: #080d11; border-bottom: 1px solid #101823; }
+.sp-headmenu-ta {
+  width: 100%; box-sizing: border-box; min-height: 68px; padding: 8px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee;
+  font: inherit; resize: vertical;
+}
+.sp-headmenu-ta::placeholder { color: #6f8291; }
+.sp-headmenu-row { display: flex; gap: 8px; margin-top: 8px; }
+.sp-headmenu-dictate {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 0 12px;
+  border: 1px solid #35414c; border-radius: 9px; background: #0b1116; color: #dfe7ee;
+  font: inherit; cursor: pointer;
+}
+.sp-headmenu-dictate .pi-icon { width: 16px; height: 16px; }
+.sp-headmenu-file {
+  flex: 1 1 auto; min-height: 44px; border: 1px solid #65c7da; border-radius: 9px;
+  background: #10202a; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}
+
+/* ---- #1168: the menu on a segment's header -------------------------
+ *
+ * "whenever i tap and hold on a segment's header, I want a right click
+ *  menu ... I also want a sidebar showing a vertical infographic
+ *  showing guided arrows going from path to path, from person to
+ *  person ... going down the screen in a sidebar to the right of the
+ *  pop-up."
+ *
+ * THE GLASS IS 1154x690 CSS px on the tablet, so nothing here may be
+ * taller than that: every box is a flex column with ONE scrolling child,
+ * capped at min(86vh, 640px), which leaves the header and the buttons
+ * pinned where a thumb expects them however long the segment ran. The
+ * sheets are the ones sheetShell() builds, so PineDrag already moves
+ * them by their header (.sp-find-box / .sp-find-head).
+ */
+
+/* The heading is now a held control as well as the fold's handle, so
+   the WebView's own selection callout must not race the hold - the same
+   rule the script's name (#1164) and the caution button already wear. */
+.sp-scene {
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  touch-action: manipulation;
+}
+/* The two marks reportFire paints on whatever it was given, so a report
+   filed from a heading answers the way the caution button does. */
+.sp-scene.sp-firing { opacity: .55; }
+.sp-scene.sp-fired-bad { color: #ff5d5d; }
+
+.sp-segmenu {
+  position: fixed; z-index: 2147483007;
+  width: min(320px, 88vw); max-height: min(72vh, 480px);
+  display: flex; flex-direction: column; overflow-y: auto;
+  border: 1px solid #35414c; border-radius: 10px;
+  background: #0b1116; color: #dfe7ee;
+  font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .55);
+}
+.sp-segmenu-where {
+  padding: 8px 14px; font-size: 11px; color: #8ea0ad;
+  border-bottom: 1px solid #24323a;
+}
+.sp-segmenu-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 0 14px;
+  border: 0; border-bottom: 1px solid #101823; background: none; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-segmenu-mark { display: inline-flex; flex: 0 0 auto; color: #8ea0ad; }
+.sp-segmenu-mark .pi-icon { width: 20px; height: 20px; }
+.sp-segmenu-text { flex: 1 1 auto; min-width: 0; }
+/* Cancel is the way out, not a fourth choice: quieter, and last. */
+.sp-segmenu-cancel { color: #8ea0ad; border-bottom: 0; }
+
+/* ---- [#1220] the segment download: a toast at the corner of the glass
+   while the station builds the file, and two buttons in the Segment
+   window's header. Same palette as the menu above; the rail is
+   pointer-transparent so a toast never blocks the page under it. */
+.sp-segexp-rail {
+  position: fixed; right: 12px; bottom: 12px; z-index: 2147483008;
+  display: flex; flex-direction: column; gap: 8px;
+  width: min(380px, 92vw); pointer-events: none;
+}
+.sp-segexp {
+  pointer-events: auto; overflow: hidden;
+  border: 1px solid #35414c; border-radius: 10px;
+  background: #0b1116; color: #dfe7ee;
+  font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .55);
+}
+.sp-segexp-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #24323a; }
+.sp-segexp-head b { flex: 1 1 auto; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-segexp-x { background: none; border: 0; color: #8ea0ad; font: 20px/1 inherit; cursor: pointer; min-width: 36px; min-height: 36px; }
+.sp-segexp-bar { height: 4px; background: #16232b; }
+.sp-segexp-fill { height: 100%; width: 0; background: #65c7da; transition: width .4s ease; }
+.sp-segexp-step { padding: 8px 12px 4px; color: #cfe0e6; }
+.sp-segexp-step.bad { color: #ffb4a6; }
+.sp-segexp-where { padding: 0 12px 8px; font-size: 11px; color: #8ea0ad; word-break: break-all; }
+.sp-segexp-acts { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 12px 10px; }
+.sp-segexp-btn {
+  min-height: 40px; padding: 0 12px; border: 1px solid #35414c; border-radius: 8px;
+  background: #10202a; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-segins-dl {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0 10px;
+  margin-left: 6px; border: 1px solid #35414c; border-radius: 8px;
+  background: #10202a; color: #65c7da; cursor: pointer;
+  font: 12px/1 Inter, Segoe UI, system-ui, sans-serif; font-weight: 600;
+}
+.sp-segins-dl .pi-icon { width: 18px; height: 18px; }
+.sp-find-head .sp-segins-dl:first-of-type { margin-left: auto; }
+.sp-find-head .sp-segins-dl + .sp-find-x { margin-left: 0; }
+@media (max-width: 560px) { .sp-segins-dl-text { display: none; } }
+
+/* ---- the facts, shared by all three windows ---------------------- */
+.sp-segsec { padding: 8px 14px; border-bottom: 1px solid #101823; }
+.sp-segsec-h {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 6px; font-size: 11px; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; color: #65c7da;
+}
+.sp-segrow { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 2px 0; }
+.sp-segrow-k { flex: 0 0 auto; min-width: 116px; font-size: 11px; color: #8ea0ad; }
+.sp-segrow-v { flex: 1 1 160px; min-width: 0; color: #dfe7ee; word-break: break-word; }
+/* A field the station does not have must not read like one it does. */
+.sp-segrow-none { color: #6f8291; font-style: italic; }
+.sp-segrow-why { flex: 1 1 100%; font-size: 10.5px; line-height: 1.5; color: #7f8f9c; }
+.sp-seghole .sp-segrow-v, .sp-seghole .sp-segrow-k { color: #e3be63; }
+
+.sp-segseat { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; padding: 3px 0; }
+.sp-segseat-name { color: #dfe7ee; }
+.sp-segseat-seat { font-size: 10.5px; color: #8ea0ad; }
+.sp-segseat-n { margin-left: auto; font-size: 11px; color: #8ea0ad; font-variant-numeric: tabular-nums; }
+
+.sp-segline {
+  margin: 6px 0; padding: 5px 0 5px 9px;
+  border-left: 3px solid #35414c; background: #080d11; border-radius: 0 6px 6px 0;
+}
+.sp-segline-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.sp-segline-who { color: #dfe7ee; }
+.sp-segline-tag { font-size: 10.5px; color: #8ea0ad; font-variant-numeric: tabular-nums; }
+.sp-segline-text { color: #cfe0e6; word-break: break-word; }
+.sp-segline-made { font-size: 10.5px; color: #7f8f9c; word-break: break-word; }
+.sp-segline-why { font-size: 11px; color: #ff9d6b; }
+/* Written and never heard: the one thing this pop-up is opened to see,
+   so it is dimmed and marked rather than hidden. */
+.sp-segline.sp-unheard { opacity: .72; }
+.sp-segline.sp-unheard .sp-segline-text { text-decoration: line-through; text-decoration-color: #6f8291; }
+.sp-segline.sp-withdrawn { background: #140d0d; }
+
+/* ---- inspect: the body and the sidebar beside it ----------------- */
+.sp-segins-box {
+  width: min(980px, 96vw); max-height: min(86vh, 640px);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: #0b1116; color: #dfe7ee;
+}
+.sp-segins-split { flex: 1 1 auto; min-height: 0; display: flex; }
+.sp-segins-body { flex: 1 1 auto; min-width: 0; overflow-y: auto; }
+/* "a sidebar to the right of the pop-up" - inside its own scroller, so
+   it scrolls with the window and never lengthens it. */
+.sp-segins-side {
+  flex: 0 0 236px; min-width: 0; overflow-y: auto;
+  padding: 8px 12px; border-left: 1px solid #24323a; background: #080d11;
+}
+.sp-segins-wait { padding: 10px 14px; color: #65c7da; font-weight: 600; }
+/* A narrow surface puts the flow under the facts rather than squeezing
+   both: the operator still gets the whole drawing, in one column. */
+@media (max-width: 720px) {
+  .sp-segins-split { flex-direction: column; }
+  .sp-segins-side { flex: 0 0 auto; border-left: 0; border-top: 1px solid #24323a; }
+}
+
+/* ---- the vertical infographic ------------------------------------ */
+.sp-segflow-h {
+  margin-bottom: 6px; font-size: 11px; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; color: #65c7da;
+}
+.sp-segflow-note { font-size: 10.5px; line-height: 1.5; color: #7f8f9c; padding: 4px 0; }
+.sp-segflow-legend {
+  display: flex; flex-wrap: wrap; gap: 4px 10px;
+  padding: 4px 0 8px; margin-bottom: 6px; border-bottom: 1px solid #101823;
+}
+.sp-segflow-key { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: #8ea0ad; }
+.sp-segflow-dot { display: inline-block; flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: #6f8291; }
+.sp-segflow-name { min-width: 0; }
+.sp-segflow-n { color: #6f8291; font-variant-numeric: tabular-nums; }
+.sp-segflow-node {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 9px; border: 1px solid #35414c; border-radius: 8px;
+  background: #0b1116; font-size: 11.5px; color: #dfe7ee;
+}
+/* The arrow: a stem in the speaker's colour, a head in the answerer's,
+   and what passed between them written beside it. Two elements and a
+   border triangle - no canvas, no animation, nothing per frame. */
+.sp-segflow-arrow { position: relative; display: flex; align-items: center; gap: 8px; padding: 2px 0 2px 11px; }
+.sp-segflow-stem { flex: 0 0 auto; width: 2px; height: 30px; background: #6f8291; border-radius: 1px; }
+.sp-segflow-head {
+  position: absolute; left: 7px; bottom: 0;
+  width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent;
+  border-top: 7px solid #6f8291;
+}
+.sp-segflow-label { flex: 1 1 auto; min-width: 0; font-size: 10.5px; line-height: 1.4; color: #8ea0ad; word-break: break-word; }
+.sp-segflow-unheard .sp-segflow-stem { opacity: .45; }
+.sp-segflow-unheard .sp-segflow-label { color: #ff9d6b; }
+.sp-segflow-gap { padding: 4px 0 4px 11px; font-size: 10.5px; color: #e3be63; }
+
+/* ---- [#1238] [#1193] [#1194] [#1235]: the surfaces that answer a tap --- */
+
+/* A ROW THAT CAN BE TAPPED SAYS SO, AND A LONG PRESS DOES NOT SELECT IT.
+ *
+ * There is no hover on the tablet, so a row cannot announce itself by
+ * lighting up under a pointer that is not there: it carries a quiet
+ * affordance all the time instead. And a 600 ms press on text is a text
+ * selection on every touch surface this shell runs on - the blue drag
+ * handles come up, the browser's own "copy" bar appears over the sheet and
+ * the hold never reads as a hold. user-select and the iOS callout are
+ * switched off on the row for exactly that, and only on the row. */
+.sp-segline.sp-segtap {
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  transition: background .16s ease, border-left-color .16s ease;
+}
+.sp-segline.sp-segtap::after {
+  content: 'tap to say it again  \00b7  hold for what else it can do';
+  display: block; margin-top: 3px;
+  font-size: 10px; letter-spacing: .04em; color: #56656f;
+}
+.sp-segline.sp-segtap:hover { background: #0c151b; }
+.sp-segline.sp-segtap:focus-visible { outline: 2px solid #65c7da; outline-offset: 1px; }
+/* A line the station gave no id is not a button; it says why in its title. */
+.sp-segline.sp-segline-mute { opacity: .6; }
+
+/* The flash a revealed line gets. Deliberately the SAME gesture the
+   script's own jumpToLine uses, so a tap in the sidebar and a jump in the
+   script read as one answer rather than two. */
+@keyframes spSegFlash {
+  from { background: #1d3038; border-left-color: #65c7da; }
+  to   { background: #080d11; }
+}
+.sp-segline.sp-segflash { animation: spSegFlash 1.3s ease-out; }
+.sp-segline.sp-segopen { background: #0c151b; }
+/* On its way to the air, and just gone out. */
+.sp-segline.sp-segsending { border-left-color: #e3be63; }
+.sp-segline.sp-segsaid { border-left-color: #54d18b; background: #0d1a14; }
+
+/* The card that unfolds under a line. */
+.sp-segdeep {
+  margin: 6px 9px 2px 0; padding: 7px 9px;
+  border: 1px solid #24323a; border-radius: 8px; background: #05090c;
+  -webkit-user-select: text; user-select: text;   /* it is meant to be copied */
+}
+.sp-segdeep-h {
+  margin-bottom: 4px; font-size: 10px; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; color: #4fb0a6;
+}
+.sp-segdeep-do { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 7px; }
+.sp-segdeep-play {
+  display: inline-flex; align-items: center; gap: 7px;
+  min-height: 38px; padding: 0 12px;
+  border: 1px solid #4fb0a6; border-radius: 8px;
+  background: #0a1a18; color: #7fe0d2;
+  font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.sp-segdeep-play .pi-icon { width: 18px; height: 18px; fill: currentColor; }
+.sp-segdeep-play:active { background: #10302c; }
+.sp-segdeep-note { font-size: 10.5px; color: #7f8f9c; }
+
+/* The chain on the right is now a column of buttons. Same shapes, one
+   more affordance: a left edge that lights, and a real focus ring for the
+   keyboard at the desk. */
+.sp-segflow-node.sp-segflow-tap,
+.sp-segflow-arrow.sp-segflow-tap {
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.sp-segflow-node.sp-segflow-tap:hover,
+.sp-segflow-arrow.sp-segflow-tap:hover { background: rgba(101, 199, 218, .09); }
+.sp-segflow-node.sp-segflow-tap:focus-visible,
+.sp-segflow-arrow.sp-segflow-tap:focus-visible {
+  outline: 2px solid #65c7da; outline-offset: 2px;
+}
+.sp-segflow-arrow.sp-segflow-tap { border-radius: 6px; }
+
+/* [#1194] THE HOLD SHEET, WHERE THE FINGER IS. line-actions.css pins it to
+   the foot of the glass, which is right when it is raised from the feed and
+   wrong when it is raised from a row halfway up a window: the placement is
+   written inline by script-page.js, and this only stops the sheet from
+   growing past the height it now has room for. */
+.la-sheet.sp-at-finger { max-height: min(60vh, 520px); }
+
+/* ---- [#1235] the itinerary -------------------------------------- */
+.sp-itin-box { width: min(760px, 96vw); max-height: min(88vh, 720px); }
+.sp-itin-what {
+  padding: 8px 14px; border-bottom: 1px solid #24323a;
+  font-size: 11.5px; color: #8ea0ad;
+}
+.sp-itin-list { padding: 4px 0 10px; }
+.sp-itin-wait { padding: 10px 14px; color: #65c7da; font-weight: 600; }
+.sp-itin-hour {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px;
+  padding: 10px 14px 4px;
+}
+.sp-itin-hour-h {
+  font-size: 11px; font-weight: 700; letter-spacing: .08em;
+  text-transform: uppercase; color: #65c7da;
+}
+.sp-itin-hour-n { font-size: 10.5px; color: #7f8f9c; font-variant-numeric: tabular-nums; }
+.sp-itin-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  min-height: 44px;                          /* a thumb, on the tablet */
+  padding: 7px 14px; border-bottom: 1px solid #101823;
+  -webkit-tap-highlight-color: transparent;
+}
+.sp-itin-when {
+  flex: 0 0 auto; min-width: 42px;
+  color: #8ea0ad; font-variant-numeric: tabular-nums;
+}
+.sp-itin-mid { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.sp-itin-name { color: #dfe7ee; }
+.sp-itin-tag { font-size: 10.5px; color: #8ea0ad; }
+/* What is behind it, and what came out of it - the two facts an operator
+   reads an itinerary for. */
+.sp-itin-hold { font-size: 10.5px; color: #7f8f9c; }
+.sp-itin-state {
+  flex: 0 0 auto; max-width: 34%;
+  font-size: 10.5px; color: #8ea0ad; text-align: right; word-break: break-word;
+}
+.sp-itin-row.sp-itin-live { background: #0a1a1e; }
+.sp-itin-row.sp-itin-live .sp-itin-state { color: #65c7da; }
+.sp-itin-row.sp-itin-past { opacity: .72; }
+/* An entry the script holds a line for can be jumped to; one it does not
+   is not a button, and says why in its title rather than looking broken. */
+.sp-itin-row.sp-itin-go { cursor: pointer; }
+.sp-itin-row.sp-itin-go:hover { background: #0c151b; }
+.sp-itin-row.sp-itin-go:focus-visible { outline: 2px solid #65c7da; outline-offset: -2px; }
+.sp-itin-row.sp-itin-nogo .sp-itin-name { color: #a8b6bf; }
+@media (max-width: 560px) {
+  .sp-itin-row { flex-wrap: wrap; }
+  .sp-itin-state { max-width: none; text-align: left; }
+}
+
+/* ---- report segment ---------------------------------------------- */
+.sp-segrep-box {
+  width: min(620px, 96vw); max-height: min(86vh, 640px);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: #0b1116; color: #dfe7ee;
+}
+.sp-segrep-who { flex: 0 0 auto; padding: 8px 14px; border-bottom: 1px solid #101823; }
+.sp-segrep-extract { flex: 1 1 auto; min-height: 60px; overflow-y: auto; padding: 8px 14px; background: #080d11; }
+.sp-segrep-ta {
+  flex: 0 0 auto; margin: 8px 14px 0; box-sizing: border-box; min-height: 72px; padding: 8px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee;
+  font: inherit; resize: vertical;
+}
+.sp-segrep-ta::placeholder { color: #6f8291; }
+.sp-segrep-row { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 14px 0; }
+.sp-segrep-dictate {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 0 12px;
+  border: 1px solid #35414c; border-radius: 9px; background: #0b1116; color: #dfe7ee;
+  font: inherit; cursor: pointer;
+}
+.sp-segrep-dictate .pi-icon { width: 16px; height: 16px; }
+.sp-segrep-file {
+  flex: 1 1 auto; min-height: 44px; border: 1px solid #65c7da; border-radius: 9px;
+  background: #10202a; color: #65c7da; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-segrep-box > .sp-segrow-why { flex: 0 0 auto; padding: 6px 14px 12px; }
+
+/* ---- examine system prompt --------------------------------------- */
+.sp-segpr-box {
+  width: min(720px, 96vw); max-height: min(86vh, 640px);
+  display: flex; flex-direction: column; overflow-y: auto;
+  background: #0b1116; color: #dfe7ee;
+}
+.sp-segpr-facts { flex: 0 0 auto; padding: 8px 14px; border-bottom: 1px solid #101823; }
+.sp-segpr-ta {
+  flex: 0 0 auto; margin: 8px 14px 0; box-sizing: border-box; min-height: 150px; padding: 8px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; resize: vertical;
+}
+.sp-segpr-ta::placeholder { color: #6f8291; }
+.sp-segpr-row { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px 0; }
+.sp-segpr-in {
+  flex: 1 1 180px; min-width: 0; min-height: 40px; box-sizing: border-box; padding: 6px 9px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee; font: inherit;
+}
+.sp-segpr-in::placeholder { color: #6f8291; }
+.sp-segpr-tick {
+  display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 4px;
+  border: 0; background: none; color: #8ea0ad; font: inherit; font-size: 11.5px;
+  text-align: left; cursor: pointer;
+}
+.sp-segpr-tick.on { color: #e3be63; }
+.sp-segpr-tickmark { display: inline-flex; flex: 0 0 auto; }
+.sp-segpr-tickmark .pi-icon { width: 18px; height: 18px; }
+.sp-segpr-scope {
+  flex: 1 1 200px; min-width: 0; min-height: 40px; padding: 6px 9px;
+  border: 1px solid #35414c; border-radius: 8px; background: #0b1116; color: #dfe7ee; font: inherit;
+}
+/* Two acts, two buttons, and they must not look like one another: the
+   book is quiet, the air is lit. The station keeps them apart and so
+   does this - "Never apply silently on a save." */
+.sp-segpr-save {
+  flex: 1 1 200px; min-height: 44px; border: 1px solid #35414c; border-radius: 9px;
+  background: #0b1116; color: #dfe7ee; font: inherit; cursor: pointer;
+}
+.sp-segpr-apply {
+  flex: 1 1 200px; min-height: 44px; border: 1px solid #e3be63; border-radius: 9px;
+  background: #211a0c; color: #e3be63; font: inherit; font-weight: 600; cursor: pointer;
+}
+.sp-segpr-book { flex: 0 0 auto; padding: 10px 14px 14px; }
+.sp-segpr-again {
+  margin-left: auto; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 34px; min-height: 34px; border: 0; border-radius: 8px;
+  background: none; color: #8ea0ad; font: inherit; cursor: pointer;
+}
+.sp-segpr-again .pi-icon { width: 16px; height: 16px; }
+.sp-segpr-preset {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  width: 100%; min-height: 44px; padding: 6px 10px; margin-bottom: 6px;
+  border: 1px solid #24323a; border-radius: 8px; background: #080d11; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer;
+}
+.sp-segpr-presetwhy { font-size: 10.5px; color: #8ea0ad; }
+.sp-segpr-clause { margin-top: 8px; font-size: 11px; color: #8ea0ad; }
+.sp-segpr-pre {
+  margin: 6px 0 0; padding: 8px; max-height: 180px; overflow: auto;
+  border: 1px solid #24323a; border-radius: 8px; background: #06090c;
+  color: #cfe0e6; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-word;
+}
+
+/* #1168b: which entry on the sheet, and the admitted occurrence.
+ *
+ * The entry the clock is standing on is the one worth finding in a list
+ * of candidates, so it is lit; the rest are plain. And `slot.say` above
+ * the two prompt buttons is the one sentence an operator could act
+ * wrongly on - "a prompt saved for this segment reaches the road rather
+ * than one entry" - so when it is a ROAD it is amber and boxed, and
+ * when it really is one entry it is quiet. */
+.sp-segcand-now .sp-segrow-k, .sp-segcand-now .sp-segrow-v { color: #65c7da; }
+.sp-segocc {
+  margin: 6px 0; padding: 5px 0 5px 9px;
+  border-left: 3px solid #4fb0a6; background: #080d11; border-radius: 0 6px 6px 0;
+}
+.sp-segpr-reach {
+  flex: 0 0 auto; margin: 8px 14px 0; padding: 7px 9px;
+  border: 1px solid #24323a; border-radius: 8px; background: #080d11;
+  font-size: 11px; line-height: 1.5; color: #8ea0ad;
+}
+.sp-segpr-reach.sp-segpr-wide { border-color: #e3be63; color: #e3be63; background: #1a150a; }
+
+/* [#1245] THE SEGMENT PROMPT BOOK in the prompt sheet: the alternatives
+ * shelf, the dial (fixed / cycle / random), the command grammar, and the
+ * three acts - Save, Save as alternative, Use now - kept apart the way
+ * the book and the air are. Rows are 44 px for a thumb. */
+.sp-segpr-help { flex: 0 0 auto; margin: 6px 14px 0; font-size: 10.5px; line-height: 1.55; color: #7f8f9c; }
+.sp-segpr-help code {
+  color: #cfe0e6; background: #101823; padding: 0 4px; border-radius: 4px;
+  font: 10.5px ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.sp-segpr-alts { flex: 0 0 auto; padding: 8px 14px 0; }
+.sp-segpr-alt {
+  display: flex; align-items: center; gap: 6px; min-height: 44px; padding: 3px 6px; margin-top: 4px;
+  border: 1px solid #24323a; border-radius: 8px; background: #080d11;
+}
+.sp-segpr-alt.open { border-color: #65c7da; }
+.sp-segpr-alt.off { opacity: .55; }
+.sp-segpr-altname {
+  flex: 1 1 120px; min-width: 0; min-height: 40px; border: 0; background: none; color: #dfe7ee;
+  font: inherit; text-align: left; cursor: pointer; overflow: hidden;
+}
+.sp-segpr-altname b { display: block; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-segpr-altname span { display: block; font-size: 10.5px; color: #8ea0ad; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-segpr-weight {
+  flex: 0 0 52px; min-height: 40px; box-sizing: border-box; padding: 4px 4px;
+  border: 1px solid #35414c; border-radius: 8px; background: #06090c; color: #dfe7ee; font: inherit; text-align: center;
+}
+.sp-segpr-iconbtn {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 40px; min-height: 40px; border: 0; border-radius: 8px; background: none;
+  color: #8ea0ad; font: inherit; cursor: pointer;
+}
+.sp-segpr-iconbtn .pi-icon { width: 18px; height: 18px; }
+.sp-segpr-iconbtn.on { color: #e3be63; }
+.sp-segpr-iconbtn.danger:hover { color: #e37363; }
+.sp-segpr-mode {
+  flex: 1 1 200px; min-width: 0; min-height: 40px; padding: 6px 9px;
+  border: 1px solid #35414c; border-radius: 8px; background: #0b1116; color: #dfe7ee; font: inherit;
+}
+.sp-segpr-act {
+  flex: 1 1 150px; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 44px; border: 1px solid #35414c; border-radius: 9px; background: #0b1116;
+  color: #dfe7ee; font: inherit; cursor: pointer;
+}
+.sp-segpr-act .pi-icon { width: 18px; height: 18px; }
+.sp-segpr-act.lit { border-color: #e3be63; background: #211a0c; color: #e3be63; font-weight: 600; }
+.sp-segpr-act:disabled { opacity: .45; cursor: default; }
+.sp-segpr-uses { flex: 0 0 auto; margin: 6px 14px 0; font-size: 10.5px; line-height: 1.5; color: #7f8f9c; }
+.sp-segpr-ta.sp-segpr-dirty { border-color: #e3be63; }
+.sp-segpr-pick .sp-segrow-v { color: #65c7da; }
+
+
+/* [#1386] THE DICE BESIDE THE LINE. A locked band reads differently from
+   a free roll on purpose - the whole point of locking one is to be able
+   to see, at a glance, that it is locked. */
+.sp-segline-dice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: #9fb0bd;
+}
+.sp-dice-pip {
+  color: #06121a;
+  font-weight: 700;
+  border-radius: 9px;
+  padding: 1px 7px;
+  min-width: 36px;
+  text-align: center;
+}
+.sp-dice-axis {
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: #6f8190;
+}
+.sp-dice-means { color: #b9cbd8; }
+.sp-dice-band {
+  color: #e3be63;
+  border: 1px solid rgba(227, 190, 99, .4);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.sp-dice-ans { color: #6f8190; }
+.sp-dice-text {
+  flex: 1 0 100%;
+  color: #7f95a5;
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+.sp-segline-dice.sp-dice-locked { background: rgba(227, 190, 99, .06); }
+
+
+/* [#1386] The feed's other face. */
+.sp-feedflip {
+  margin-left: auto;
+  background: #12202c;
+  border: 1px solid rgba(159, 216, 255, .34);
+  border-radius: 6px;
+  color: #dcecf6;
+  padding: 2px 9px;
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.sp-feedflip:hover { background: #1b3040; }
+.sp-tech {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+  background: #05080c;
+}
+.sp-techbad { padding: 14px; color: #e06c9f; font-size: 12px; }
+/* A name you can tap reads as one. */
+.sp-segline-who.sp-tracable {
+  cursor: pointer;
+  border-bottom: 1px dotted rgba(159, 216, 255, .45);
+}
+.sp-segline-who.sp-tracable:hover { color: #9fd8ff; }
+
+
+/* [#1386] The script is tappable all the way down. Understated on purpose:
+   a screenplay that underlines every line is not a screenplay. */
+.sp-el.sp-character { cursor: pointer; }
+.sp-el.sp-character:hover { color: #9fd8ff; }
+
+
+/* [#1387] THE TECHNICAL VIEW ACROSS THE WHOLE BOTTOM.
+   Pinned to the page rather than living in the feed column, so it gets the
+   full width under both the column and the script. The script carries on
+   above it; this takes a band off the bottom, it does not cover the page. */
+.sp-page { position: relative; }
+.sp-tech.sp-tech-wide {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 55%;
+  z-index: 40;
+  border-top: 1px solid rgba(255, 95, 31, .5);
+  box-shadow: 0 -14px 40px rgba(0, 0, 0, .6);
+  padding-top: 7px;
+  background: #0e0e0d;
+}
+/* The handle on its top edge: 7px of grab, because a 1px target on glass
+   cannot be hit. It only grabs in wide mode - in the column the pane has
+   no top edge of its own to pull. */
+.sp-tech-grip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 7px;
+  cursor: row-resize;
+  touch-action: none;
+  display: none;
+}
+.sp-tech.sp-tech-wide .sp-tech-grip { display: block; }
+.sp-tech.sp-tech-wide .sp-tech-grip::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 2px;
+  width: 42px;
+  height: 3px;
+  margin-left: -21px;
+  border-top: 1px solid rgba(255, 95, 31, .55);
+  border-bottom: 1px solid rgba(255, 95, 31, .55);
+}
+
+
+/* [#1389] THE VIEW RAIL SLIDES OUT OF THE TECHNICAL VIEW'S WAY.
+
+   rail.js injects `#pineViewRail{position:fixed;right:0;top:50%;
+   transform:translateY(-50%)}` from its own stylesheet, which lands after
+   this one - so these rules are written as `html.pine-tech-wide
+   #pineViewRail`, an id PLUS a class, which beats a bare id whatever the
+   source order. Same trick, same reason, as listen-music.css's bare mode.
+
+   IT SLIDES, IT DOES NOT VANISH. A 16px strip stays on the edge, keeps
+   its pointer events, and :hover / :active / :focus-within bring the whole
+   rail back - three pseudo-classes and no JavaScript, no listener, no
+   timer, no frame, which is the only kind of "while the finger is near it"
+   this tablet should be asked to pay for. On glass Chromium applies :hover
+   on touch and holds it until the next tap elsewhere, so the tabs come up
+   under the thumb and settle back once the drawing is touched again. */
+html.pine-tech-wide #pineViewRail {
+  transform: translateY(-50%) translateX(calc(100% - 16px));
+  opacity: .38;
+  transition: transform 260ms ease, opacity 260ms ease;
+}
+html.pine-tech-wide #pineViewRail:hover,
+html.pine-tech-wide #pineViewRail:active,
+html.pine-tech-wide #pineViewRail:focus-within {
+  transform: translateY(-50%) translateX(0);
+  opacity: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  html.pine-tech-wide #pineViewRail { transition: none; }
+}
+
+/* And the bar keeps its hands clear of that 16px strip, so the edge a
+   finger reaches for is never also a button. */
+html.pine-tech-wide .sp-tech.sp-tech-wide .wc-bar,
+html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
+  padding-right: 26px;
+}

@@ -125,6 +125,7 @@
    * appeared since. */
   function sweep() {
     var now = Date.now();
+    var wasReporting = reporting();
     var changed = false;
     for (var k in holds) {
       var h = holds[k];
@@ -138,14 +139,57 @@
     }
     if (changed) settle();
     else if (current < 1) apply(current);
+    if (changed && wasReporting !== reporting()) tell();   /* 2026-09-15 (#1167) */
+  }
+
+  /* 2026-09-15 (#1167): WHO ELSE NEEDS TO KNOW THE OPERATOR IS FILING.
+   *
+   * "If I'm in endless video mode and I bring up the file report screen or
+   *  any report screen, remove the video from displaying and mute the audio
+   *  for a moment while I narrate to the dictation system. Don't have the
+   *  audio playing and don't have videos popping up during the process of
+   *  filing tickets. Resume everything after the ticket following screen
+   *  has been closed or sent."
+   *
+   * Ducking the volume was only half of it: a clip still playing behind a
+   * report pad is still moving, still starting the next one, and still
+   * asking for his eye while he is dictating. Every surface that raises a
+   * report already tells this module so; it now tells anyone who asks
+   * back, so the video roads can stand down and come back on the same
+   * signal rather than each inventing its own idea of "a report is open". */
+  var watchers = [];
+
+  function reporting() {
+    for (var k in holds) if (holds[k]) return true;
+    return false;
+  }
+
+  function tell() {
+    var on = reporting();
+    for (var i = 0; i < watchers.length; i += 1) {
+      try { watchers[i](on, current); } catch (err) { /* a watcher must not stop the duck */ }
+    }
+  }
+
+  function watch(fn) {
+    if (typeof fn !== 'function') return function () { /* nothing to undo */ };
+    watchers.push(fn);
+    try { fn(reporting(), current); } catch (err) { /* fine */ }
+    return function () {
+      for (var i = 0; i < watchers.length; i += 1) {
+        if (watchers[i] === fn) { watchers.splice(i, 1); return; }
+      }
+    };
   }
 
   function hold(name, lvl, el) {
     var key = String(name || 'hold');
     var value = Number(lvl);
     if (!(value >= 0 && value <= 1)) value = 0.1;
+    var was = reporting();
     holds[key] = {level: value, el: el || null, until: el ? 0 : Date.now() + CEILING_MS};
     settle();
+    if (!was) tell();
     return current;
   }
 
@@ -154,12 +198,15 @@
     if (!holds[key]) return current;
     delete holds[key];
     settle();
+    if (!reporting()) tell();
     return current;
   }
 
   function releaseAll() {
+    var was = reporting();
     holds = Object.create(null);
     settle();
+    if (was) tell();
   }
 
   /* Anything a previous life of this page left lowered, put back. A
@@ -182,6 +229,12 @@
     releaseAll: releaseAll,
     level: function () { return current; },
     holds: function () { var out = []; for (var k in holds) if (holds[k]) out.push({name: k, level: holds[k].level}); return out; },
+    /* 2026-09-15 (#1167): is a report surface open right now, and tell me
+       when that changes. The sweep that drops a hold whose element has left
+       the page calls settle(), which calls this, so a sheet torn out
+       without closing still ends the quiet. */
+    reporting: reporting,
+    watch: watch,
     REPORT: 0.10,       /* a report, an inbox, a diagnostic: the broadcast at 10% */
     DICTATION: 0.02     /* the dot listening: 2% */
   };

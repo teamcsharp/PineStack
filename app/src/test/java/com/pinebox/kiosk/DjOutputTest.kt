@@ -45,9 +45,9 @@ class DjOutputTest {
     fun `the presets are the desktop's, field for field`() {
         // desktop/renderer/renderer.js:62
         val nabu = JSONObject(DjOutput.preset("nabu"))
-        assertEquals("box", nabu.getString("music"))
-        assertEquals("box", nabu.getString("voice"))
-        assertEquals("box", nabu.getString("reply"))
+        assertEquals("nabu", nabu.getString("music"))
+        assertEquals("nabu", nabu.getString("voice"))
+        assertEquals("nabu", nabu.getString("reply"))
         assertEquals("nabu", nabu.getString("voice_device"))
         assertTrue(nabu.getBoolean("box_talk"))
 
@@ -65,12 +65,12 @@ class DjOutputTest {
     }
 
     @Test
-    fun `web and app never name a device`() {
-        /* #814: "web/app route audio to the PAGE - they must not silently
+    fun `PineTab and PineApp never name a device`() {
+        /* Page routes must not silently
          * re-point the core DEVICE at the retired pine satellite." And an
          * EMPTY voice_device would be worse than none: the handler validates
          * it as "pine or nabu" when the key is present (app.py:93395). */
-        for (key in listOf("web", "app")) {
+        for (key in listOf("pinetab", "app")) {
             assertFalse(key, JSONObject(DjOutput.preset(key)).has("voice_device"))
         }
     }
@@ -97,10 +97,10 @@ class DjOutputTest {
     }
 
     @Test
-    fun `web and app are the same routing, so both light`() {
-        // They are identical rows, here and in the desktop's EMBEDDED_ROUTES
-        // (renderer.js:83). Picking one would be a claim the station never made.
-        assertEquals(setOf("web", "app"), DjOutput.presetsOf("here", "here", "here", "pine"))
+    fun `PineTab and PineApp share a route but retain distinct identities`() {
+        // Routing alone cannot distinguish the two. RailController uses the
+        // persisted broadcast_to key to light exactly one.
+        assertEquals(setOf("pinetab", "app"), DjOutput.presetsOf("here", "here", "here", "pine"))
     }
 
     @Test

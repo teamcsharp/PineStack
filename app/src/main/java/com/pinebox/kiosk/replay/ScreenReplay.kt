@@ -96,6 +96,22 @@ class ScreenReplay(private val context: Context) {
     fun audioStatus(): JSONObject = audioCapture.status().apply {
         put("held_seconds", ring.audioSeconds())
         ring.audioClockError?.let { put("available", false); put("state", "unavailable"); put("error", it); put("detail", it) }
+        /* [#1225] ONE WORD FOR "IS THE TABLET CAPTURING". The operator
+         * asked for audio capture to be a background service that is
+         * always running, and the honest answer to "is it" was spread
+         * across `running`, `available`, `state`, `last_packet_age_ms`
+         * and a sentence. It is spread across them still - this is the
+         * summary, and it is what the desk's window and the tablet's own
+         * readout now print. */
+        put("always_on", true)
+        put("capture_phase", when {
+            ring.audioClockError != null -> "stopped"
+            !optBoolean("running", false) -> "not_started"
+            optLong("captured_frames", 0L) <= 0L -> "starting"
+            optLong("signal_frames", 0L) <= 0L -> "silent"
+            ring.audioSeconds() < 5.0 -> "filling"
+            else -> "ready"
+        })
     }
 
     @Synchronized
@@ -240,6 +256,12 @@ class ScreenReplay(private val context: Context) {
         if (running.get()) return
         ring.size(BITRATE)
         if (ring.seconds() <= 0.0) restore()
+        /* [#1225] AND THE SOUND STARTS HERE, not when the screen lights
+         * up. prime() is what PineAppRecorder calls in onCreate - at
+         * BOOT_COMPLETED, and again on every MainActivity.onResume - so
+         * this is the earliest honest moment in the process's life. It
+         * is idempotent; start() calls it again and gets nothing. */
+        audioCapture.start()
     }
 
     /** Where the history lives between runs. One file, replaced whole. */
@@ -295,11 +317,23 @@ class ScreenReplay(private val context: Context) {
         }
     }
 
+    /**
+     * [#1225] STOP THE PICTURE, LEAVE THE SOUND.
+     *
+     * The screen going off is not a reason to stop capturing audio - it
+     * is the reason the operator asked for this, because a tablet face
+     * down on the desk is still playing the station. This is the road
+     * the recorder service and standby take; the full stop() is kept for
+     * a service being destroyed, which really must release the loopback
+     * policy and its retry thread.
+     */
+    fun stopVideo() = stop(keepAudio = true)
+
     @Synchronized
-    fun stop() {
+    fun stop(keepAudio: Boolean = false) {
         val was = running.get()
         running.set(false)
-        audioCapture.stop()
+        if (!keepAudio) audioCapture.stop()                    // [#1225]
         try { display?.release() } catch (err: Exception) { /* gone */ }
         try { worker?.join(1500) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
         worker = null
@@ -348,7 +382,12 @@ class ScreenReplay(private val context: Context) {
      */
     @Synchronized
     fun release() {
-        stop()
+        /* [#1225] The ninety megabytes of VIDEO blob is what #1182T came
+         * to give back; the audio window is a separate fixed 24 MB and
+         * the capture thread costs nothing to leave running. Standby
+         * used to take the sound down with the picture, so the tablet
+         * stopped capturing every time another app came forward. */
+        stop(keepAudio = true)
         ring.letGo()
         Log.i(TAG, "#1182T standing down: the ring is on disk and its memory is "
             + "back with the heap")

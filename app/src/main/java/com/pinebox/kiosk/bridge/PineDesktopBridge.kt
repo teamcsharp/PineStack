@@ -955,6 +955,17 @@ class PineDesktopBridge(
                 .put("atLeast", com.pinebox.kiosk.replay.ScreenReplay.HOLD_SECONDS)
                 .put("bytes", replay?.bytes() ?: 0)
                 .put("audio", replay?.audioStatus() ?: JSONObject.NULL)
+                /* [#1225] THE AUDIO ANSWER AT THE TOP, not twenty keys
+                 * down. `running` above is the VIDEO encoder, and it is
+                 * false whenever the screen is dark - which is most of
+                 * the day and exactly when the audio capture is now
+                 * still going. A surface that reads `running` to mean
+                 * "is the tablet capturing" gets the wrong answer, and
+                 * every surface did. */
+                .put("capturing", replay?.audioStatus()?.optBoolean("running", false) ?: false)
+                .put("capture_phase", replay?.audioStatus()?.optString("capture_phase", "")
+                    ?: "no_replay")
+                .put("audio_seconds", replay?.audioStatus()?.optDouble("held_seconds", 0.0) ?: 0.0)
                 .put("detail", replay?.lastError ?: JSONObject.NULL).toString())
         }
 
@@ -1286,10 +1297,18 @@ class PineDesktopBridge(
                     .put("why", "no wall on this build").toString())
             } else {
                 /* #1426b: the rect the page reports, in device pixels.
-                 * Sent on every ask, so dragging the set moves the wall. */
+                 * Sent on every ask, so dragging the set moves the wall.
+                 *
+                 * [#1192]: ...but ONLY when the object in that slot really is
+                 * a rect.  The `level` op carries {level: ...} there, and
+                 * optInt("w") on that is 0, which setBox reads as "no size"
+                 * and answers with MATCH_PARENT - every notch of the videos
+                 * slider would have thrown the wall full screen. */
                 args.optJSONObject(1)?.let { box ->
-                    wall.setBox(box.optInt("x"), box.optInt("y"),
-                        box.optInt("w"), box.optInt("h"))
+                    if (box.has("w") || box.has("h")) {
+                        wall.setBox(box.optInt("x"), box.optInt("y"),
+                            box.optInt("w"), box.optInt("h"))
+                    }
                 }
                 when (want) {
                     "on" -> { wall.veil(false); wall.start() }
@@ -1298,6 +1317,30 @@ class PineDesktopBridge(
                      * running and only the surface leaves the screen. */
                     "hide" -> wall.veil(true)
                     "show" -> wall.veil(false)
+                    /* [#1386] HOLD is not HIDE. The operator has a menu
+                     * open over this clip and is deciding what to do with
+                     * it: the picture must stay exactly where it is and
+                     * the playlist must not move on underneath him. */
+                    "hold" -> wall.hold(true)
+                    "free" -> wall.hold(false)
+                    /* [#1386] "I need to be able to have the video show up
+                     * as full screen if I choose it in the option."
+                     * setBox reads a zero size as MATCH_PARENT, which is
+                     * the whole glass; `window` hands it back the rect the
+                     * page last reported. */
+                    "full" -> wall.setBox(0, 0, 0, 0)
+                    /* [#1192]: "Offer a slider for setting the volume of
+                     * videos that play as well."  The set is an ExoPlayer on
+                     * a SurfaceView, so it is not in the page and no walk of
+                     * "audio,video" could ever have found it; this is the
+                     * only road to its volume.  Accepts {level: v} or a bare
+                     * number, and the wall remembers it across the #1440
+                     * watchdog's rebuilds.  state() reports it back. */
+                    "level" -> {
+                        val lv = args.optJSONObject(1)?.optDouble("level", -1.0)
+                            ?: args.optDouble(1, -1.0)
+                        if (lv >= 0.0) wall.setLevel(lv)
+                    }
                     else -> Unit
                 }
                 BridgeEnvelope.ok(id, wall.state().toString())

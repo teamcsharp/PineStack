@@ -33,12 +33,23 @@
 
   var IDLE = 'idle', LISTENING = 'listening', THINKING = 'thinking';
   var MAX_MS = 12000;          /* a command is a sentence, not a monologue */
-  var SILENCE_MS = 1400;       /* quiet this long and we assume you are done */
+  /* 2026-09-15 (#1174): "dictation is finishing too fast. Like the moment
+   * I take a pause it stops. I actually need double the threshold or
+   * triple the threshold before it." Was 1400 ms, which is inside the
+   * pause a person takes mid-sentence while they think - so a report cut
+   * itself off at the comma. Tripled. The ceiling that ends a runaway
+   * recording is elsewhere and unchanged, so this cannot strand him. */
+  var SILENCE_MS = 4200;       /* quiet this long and we assume you are done */
 
   var state = IDLE;
   var stream = null;
   var recorder = null;
   var chunks = [];
+  /* [#1224] `chunks` now holds Float32Array blocks off the tap below
+     rather than MediaRecorder Blobs - the station only decodes WAV. */
+  var pcmTap = null;
+  var pcmGate = null;
+  var pcmRate = 48000;
   var ctx = null;
   var analyser = null;
   var data = null;
@@ -242,12 +253,141 @@
     return dot;
   }
 
+
+  /* [#1224] THE DICTATION SURFACE, ABOVE EVERY WINDOW.
+   *
+   * "The text overlay isn't on top of all the windows. So the graphic of
+   *  it responding to my speech needs to be on top of every window."
+   *
+   * In the page, view-chrome.css already puts the dot and its note at
+   * 2147483080 (#1193), which settles it against every sheet this shell
+   * can open and is the whole answer on the tablet.  It cannot be the
+   * answer on the desk: Pine Box opens a dozen separate windows - the
+   * shot editor, the inspector, the SC popup, the LCD, the video editor -
+   * and #pineTalkDot lives in the main window's document only, so
+   * whichever of those is in front is in front of it.  No value in a
+   * stylesheet reaches outside its own page.
+   *
+   * So the shell owns a frameless, transparent, click-through,
+   * always-on-top window and this tells it what to show.  Where the door
+   * is not there - the tablet, or a desk that has not been relaunched
+   * yet - every call is a no-op and nothing changes. */
+  var overlayAt = 0;
+  var overlayText = '';
+  var overlayBad = false;
+
+  function overlayMode() {
+    if (state === LISTENING) return 'listening';
+    if (state === THINKING) return 'thinking';
+    return overlayText ? 'idle' : 'off';
+  }
+
+  function overlay(mode, level, force) {
+    var bridge = root.pineDesktop;
+    if (!bridge || typeof bridge.talkOverlay !== 'function') return;
+    /* The level road calls this every animation frame. ~9 a second is
+     * enough to look alive and is not an IPC message per vsync. */
+    var now = (root.performance && root.performance.now)
+      ? root.performance.now() : Date.now();
+    if (!force && now - overlayAt < 110) return;
+    overlayAt = now;
+    try {
+      bridge.talkOverlay({mode: String(mode || 'off'),
+                          level: Number(level) || 0,
+                          text: overlayText, bad: overlayBad});
+    } catch (err) { /* an overlay is never worth an exception */ }
+  }
+
+  /* [#1224] THE TAKE, CACHED AS PCM AND TURNED INTO A REAL WAV.
+   *
+   * "there's just not the ability for it to cache my audio and then turn
+   *  it into text"
+   *
+   * MediaRecorder gave webm/opus and the station's whisper door only
+   * decodes WAV - measured: the same speech transcribes as WAV and comes
+   * back with no words in it as webm.  The blocks are kept at the audio
+   * context's own rate and the station resamples (audioop.ratecv in
+   * whisper_transcribe); a 48 kHz WAV was proven through the live route. */
+  function pcmWav(pieces, rate) {
+    var total = 0;
+    var i;
+    var j;
+    for (i = 0; i < pieces.length; i += 1) {
+      total += (pieces[i] && pieces[i].length) || 0;
+    }
+    if (!total) return null;
+    var hz = Math.max(8000, Math.round(Number(rate) || 48000));
+    var buf = new ArrayBuffer(44 + total * 2);
+    var view = new DataView(buf);
+    var put = function (at, word) {
+      for (var k = 0; k < word.length; k += 1) {
+        view.setUint8(at + k, word.charCodeAt(k));
+      }
+    };
+    put(0, 'RIFF');
+    view.setUint32(4, 36 + total * 2, true);
+    put(8, 'WAVE');
+    put(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);            /* PCM */
+    view.setUint16(22, 1, true);            /* mono */
+    view.setUint32(24, hz, true);
+    view.setUint32(28, hz * 2, true);       /* bytes a second */
+    view.setUint16(32, 2, true);            /* block align */
+    view.setUint16(34, 16, true);           /* bits a sample */
+    put(36, 'data');
+    view.setUint32(40, total * 2, true);
+    var at = 44;
+    for (i = 0; i < pieces.length; i += 1) {
+      var piece = pieces[i];
+      for (j = 0; j < piece.length; j += 1) {
+        var v = piece[j];
+        if (v > 1) v = 1; else if (v < -1) v = -1;
+        view.setInt16(at, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+        at += 2;
+      }
+    }
+    return buf;
+  }
+
+  function pcmStop() {
+    try {
+      if (pcmTap) { pcmTap.onaudioprocess = null; pcmTap.disconnect(); }
+    } catch (err) { /* already gone */ }
+    pcmTap = null;
+  }
+
+  /* [#1224] The spoken reply, once the bytes are in hand, whichever road
+   * brought them. */
+  function playReply(blob) {
+    var src = URL.createObjectURL(blob);
+    var player = new Audio(src);
+    player.volume = 1;
+    /* The show is still ducked from the capture; hold it down until the
+     * answer has finished, or the reply lands under the broadcast. */
+    player.onended = function () {
+      URL.revokeObjectURL(src);
+      duck(false);
+      release(600);
+    };
+    player.onerror = function () { URL.revokeObjectURL(src); duck(false); };
+    duck(true);
+    var go = player.play();
+    if (go && go.catch) {
+      go.catch(function () { duck(false); });
+    }
+  }
+
   function announce(text, bad) {
     var box = el('pineTalkSay') || mount() && el('pineTalkSay');
     if (!box) return;
     box.textContent = text || '';
     box.hidden = !text;
     box.classList.toggle('bad', !!bad);
+    /* [#1224] and on top of every WINDOW, not only on top of this page. */
+    overlayText = String(text || '');
+    overlayBad = !!bad;
+    overlay(overlayMode(), 0, true);
     if (text && !bad) {
       clearTimeout(box.__timer);
       /* AN ANSWER STAYS UP LONGER THAN A STATUS.
@@ -260,12 +400,18 @@
       var dwell = 6000;
       var size = String(text || '').length;
       if (size > 40) dwell = Math.min(26000, 6000 + size * 55);
-      box.__timer = setTimeout(function () { box.hidden = true; }, dwell);
+      box.__timer = setTimeout(function () {
+        box.hidden = true;
+        overlayText = '';                                 /* [#1224] */
+        overlayBad = false;
+        overlay(overlayMode(), 0, true);
+      }, dwell);
     }
   }
 
   function setState(next) {
     state = next;
+    overlay(overlayMode(), 0, true);                      /* [#1224] */
     var dot = el('pineTalkDot');
     if (!dot) return;
     dot.classList.toggle('listening', next === LISTENING);
@@ -487,12 +633,34 @@
     source.connect(analyser);
 
     chunks = [];
-    recorder = new MediaRecorder(stream);
-    recorder.ondataavailable = function (event) {
-      if (event.data && event.data.size) chunks.push(event.data);
+    /* [#1224] CACHE THE AUDIO, AS SOMETHING THE STATION CAN READ.
+     *
+     * This was `new MediaRecorder(stream)`, which on this shell produces
+     * audio/webm;codecs=opus - and whisper_transcribe() only decodes WAV,
+     * so every take the operator made on the desk arrived as bytes the
+     * station could not hear.  Measured with one piece of real speech:
+     * as WAV it transcribes, as webm it comes back "found no words in it".
+     *
+     * The tap hangs off the SAME MediaStreamSource the level meter uses,
+     * so what is sent and what he watched react are one signal.  It is
+     * connected through a gain of 0 because a ScriptProcessor only runs
+     * when it reaches the destination - and routing the microphone to the
+     * speakers of a machine playing the broadcast is a feedback loop. */
+    pcmRate = ctx.sampleRate || 48000;
+    pcmStop();
+    pcmTap = ctx.createScriptProcessor(4096, 1, 1);
+    pcmTap.onaudioprocess = function (event) {
+      if (state !== LISTENING) return;
+      var raw = event.inputBuffer.getChannelData(0);
+      var copy = new Float32Array(raw.length);
+      copy.set(raw);
+      chunks.push(copy);
     };
-    recorder.onstop = send;
-    recorder.start();
+    pcmGate = pcmGate || ctx.createGain();
+    pcmGate.gain.value = 0;
+    source.connect(pcmTap);
+    pcmTap.connect(pcmGate);
+    pcmGate.connect(ctx.destination);
 
     startedAt = performance.now();
     quietSince = 0;
@@ -542,6 +710,7 @@
        * immediately it was the only moment that mattered. Measuring the
        * room and showing the room are not in conflict; both happen now. */
       if (scene && scene.level) scene.level(loud);
+      overlay('listening', loud);                         /* [#1224] */
 
       if (since < 400) {
         floor += loud; floorFrames += 1;
@@ -581,6 +750,7 @@
     duck(false);
     try { if (native && root.pineDesktop && root.pineDesktop.micStop) root.pineDesktop.micStop(); } catch (e) { /* the ear closes by itself */ }
     try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch (e) { /* already stopped */ }
+    pcmStop();                                            /* [#1224] */
     if (stream) {
       stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* gone */ } });
       stream = null;
@@ -598,7 +768,8 @@
     announce('Sending it through...');
     cancelAnimationFrame(frame);
     if (native) { sendNative(); return; }
-    try { recorder.stop(); } catch (err) { send(); }
+    pcmStop();                                            /* [#1224] */
+    send();
   }
 
   /* The native road: stop, and the words come back. The clip never enters
@@ -654,19 +825,25 @@
       stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* gone */ } });
       stream = null;
     }
-    var blob = new Blob(chunks, {type: (recorder && recorder.mimeType) || 'audio/webm'});
+    pcmStop();                                            /* [#1224] */
+    var wav = pcmWav(chunks, pcmRate);                    /* [#1224] */
     chunks = [];
-    if (blob.size < 2000) {
+    if (!wav || wav.byteLength < 2000) {
       setState(IDLE);
       announce('That was too short to hear.', true);
       return;
     }
     try {
-      var heard = await postAudio(blob);
+      var heard = await postAudio(wav);
       var text = String((heard && heard.text) || '').trim();
       if (!text) {
         setState(IDLE);
-        announce('Nothing was made out of that.', true);
+        /* [#1224] An empty transcript carries its own reason now - the
+           station puts one in `detail` and sendNative() has repeated it
+           since the day "Nothing was made out of that" cost three takes
+           to a bug nowhere near the operator's voice. */
+        announce(String((heard && heard.detail)
+          || 'Nothing was made out of that.'), true);
         return;
       }
       await act(text);
@@ -730,9 +907,23 @@
   }
 
   var padImage = '';
-  function reportOpen(heard, image, dictateNow) {
+  /* 2026-09-15, #1148: `note` is the OPTIONAL fourth argument and it is a
+     line the pad opens with, above whatever was dictated. It exists so the
+     scrub strip can say which frame the operator actually chose:
+
+       "Whenever I access the screen capture to follow report, I also want
+        to be able to scrub between the last five seconds of the broadcast
+        to find the right frame."
+
+     A picture from 2.4 s before the capture is not the picture the report
+     would otherwise claim to be, so the inbox item must say so in words -
+     the image alone cannot. Blank means nothing is added and the pad opens
+     exactly as it did before. */
+  function reportOpen(heard, image, dictateNow, firstLine) {
     padClose();
     padImage = String(image || '');
+    /* Not called `note`: the pad already has a `note` element below. */
+    var padNote = String(firstLine || '').trim();
     pad = document.createElement('div');
     pad.id = 'pineReportPad';
     pad.setAttribute('style', 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);'
@@ -757,7 +948,24 @@
     debugRow.setAttribute('style', 'display:flex;align-items:center;gap:8px;font-size:12px;color:#9fb3c0');
     var debug = document.createElement('input');
     debug.type = 'checkbox';
+    /* 2026-09-15 (#1171): "Remember if I have this toggled off and retain
+       that setting so that way it's not enabled accidentally for things
+       that it's not needed for." It was rebuilt ticked every time the pad
+       opened, so a deliberate no lasted exactly one report. Remembered per
+       glass in localStorage - the same key the panel's Pine Chat uses, so
+       one answer covers both places he files from on this screen - and on
+       by default only until he says otherwise. Every access is wrapped:
+       the accessor itself throws in some contexts on this stack, and a
+       preference is never worth an exception. */
     debug.checked = true;
+    try {
+      var savedDebug = localStorage.getItem('pineDebugAttach');
+      if (savedDebug !== null) debug.checked = savedDebug === '1';
+    } catch (err) { /* the default stands */ }
+    debug.addEventListener('change', function () {
+      try { localStorage.setItem('pineDebugAttach', debug.checked ? '1' : '0'); }
+      catch (err) { /* a glass that cannot remember still works */ }
+    });
     debugRow.appendChild(debug);
     debugRow.appendChild(document.createTextNode("Attach the station's debug information to this report"));
     var row = document.createElement('div');
@@ -775,8 +983,14 @@
     var dictate = btn('Dictate', '', function () {
       note.textContent = 'listening - speak, then wait a moment';
       capture = function (words) {
-        var had = area.value.trim();
-        area.value = (had ? had + ' ' : '') + String(words || '').trim();
+        /* #1148: a pad opened with a frame note ends in a NEWLINE, and the
+           dictation must land under that line, not beside it - the note is
+           the first line of the report or it is nothing. Anywhere else this
+           behaves exactly as it always did: one space between sentences. */
+        var raw = area.value;
+        var had = raw.replace(/\s+$/, '');
+        var join = had ? (/\n\s*$/.test(raw) ? '\n' : ' ') : '';
+        area.value = had + join + String(words || '').trim();
         note.textContent = 'heard - fix anything on the keyboard, or Dictate more';
         try { area.focus(); } catch (e) {}
       };
@@ -823,7 +1037,13 @@
        "make a pine report: the sampler is silent". Keep what follows. */
     var body = String(heard || '').replace(/^.*?\breport\b[\s:,.-]*/i, '').trim();
     if (body.split(/\s+/).length >= 3) area.value = body;
+    /* #1148: the chosen frame goes in as the FIRST LINE, and the dictated
+       words (if any) keep the rest. It is plain text in the report body on
+       purpose: the inbox item then says which frame this is without anyone
+       having to open the picture and guess. */
+    if (padNote) area.value = padNote + (area.value ? '\n' + area.value : '\n');
     note.textContent = body ? 'that is what was heard after "report" - edit it, or Dictate more' : 'press Dictate and say the report';
+    if (padNote && !body) note.textContent = 'the frame is noted above - press Dictate and say the report';
     try { (body ? area : dictate).focus(); } catch (e) {}
     if (dictateNow) {
       /* the chord: the dot comes up listening at once */
@@ -838,7 +1058,20 @@
    * Android never hands an app the power key, so the kiosk listens for
    * volume-up pressed TWICE within a moment (MainActivity.onKeyDown),
    * takes the picture with PixelCopy, and calls this with it. */
-  function fromKey(dataUrl) {
+  /* 2026-09-15, #1148: THE SECOND ARGUMENT IS OPTIONAL AND THE OLD CALL
+   * MUST KEEP WORKING. MainActivity.reportShot evaluates
+   * `PineReport.fromKey("data:...")` with one argument and that road does
+   * not change: no note, the pad opens as it always has.
+   *
+   * "Whenever I access the screen capture to follow report, I also want to
+   *  be able to scrub between the last five seconds of the broadcast to
+   *  find the right frame."
+   *
+   * When the annotator's scrub strip has been used, hot-corners.js passes
+   * `note` as the second argument - "(the frame from 2.4s before the
+   * capture)" - and it becomes the first line of the report body, so the
+   * inbox item says which frame the picture actually is. */
+  function fromKey(dataUrl, note) {
     try {
       var flash = document.createElement('div');
       flash.setAttribute('style', 'position:fixed;inset:0;background:#fff;opacity:.92;z-index:2147483045;pointer-events:none;transition:opacity .45s ease-out');
@@ -846,9 +1079,12 @@
       setTimeout(function () { flash.style.opacity = '0'; }, 30);
       setTimeout(function () { if (flash.parentNode) flash.parentNode.removeChild(flash); }, 520);
     } catch (e) { /* the pad still opens */ }
-    reportOpen('', String(dataUrl || ''), true);
+    reportOpen('', String(dataUrl || ''), true, String(note || ''));
   }
-  root.PineReport = {fromKey: fromKey, open: function (image) { reportOpen('', image || '', false); }};
+  root.PineReport = {
+    fromKey: fromKey,
+    open: function (image, note) { reportOpen('', image || '', false, String(note || '')); }
+  };
 
   async function act(text) {
     /* 2026-09-14: the pad first. A capture takes the sentence as text;
@@ -1010,6 +1246,7 @@
    * that makes this work on the tablet. Cached, because a reply should not
    * cost a config read every time. */
   var cachedKey = '';
+  var cachedBase = '';                                    /* [#1224] */
   /* #1360: WHERE THE STATION IS, FOR THE TWO ROADS THAT BYPASS THE
    * BRIDGE.
    *
@@ -1038,8 +1275,14 @@
         return '';
       }
       if (root.pineStationBase) return root.pineStationBase();
+      /* [#1224] `pineStationBase` IS DEFINED NOWHERE - grep the shell:
+         only the two calls exist - so #1360's road always fell through to
+         the loopback below, and on this desk nothing listens there.  The
+         config knows (baseUrl http://10.89.1.246:8096); serverKey()'s
+         readConfig() caches it here. */
+      if (cachedBase) return cachedBase;
     } catch (err) { /* fall through to the last resort */ }
-    return 'http://127.0.0.1:8096';
+    return cachedBase || 'http://127.0.0.1:8096';
   }
 
   function serverKey() {
@@ -1054,6 +1297,9 @@
     }
     return bridge.readConfig().then(function (cfg) {
       cachedKey = String((cfg && (cfg.apiKey || cfg.api_key)) || '');
+      /* [#1224] and where the station actually is - see where(). */
+      cachedBase = String((cfg && (cfg.baseUrl || cfg.base_url)) || '')
+        .replace(/\/+$/, '');
       return cachedKey;
     }, function () { return ''; });
   }
@@ -1120,6 +1366,27 @@
   }
 
   function sayIt(words, key, voice) {
+    /* [#1224] Same two faults as the clip: file:// has no road to the
+       station that CORS will allow, and where() named a loopback with
+       nothing on it.  Out through the shell where there is one. */
+    var bridge = root.pineDesktop;
+    if (bridge && typeof bridge.speechSay === 'function') {
+      Promise.resolve(bridge.speechSay({
+        input: String(words).slice(0, 600),
+        voice: String(voice || REPLY_VOICE),
+        format: 'mp3'
+      })).then(function (got) {
+        if (!got || !got.ok || !got.bytes) {
+          throw new Error(String((got && got.why) || 'no audio came back'));
+        }
+        playReply(new Blob([got.bytes],
+                           {type: String(got.type || 'audio/mpeg')}));
+      }, function () {
+        /* Said nothing, showed everything. The words are already up. */
+        duck(false);
+      });
+      return;
+    }
     var headers = {'Content-Type': 'application/json'};
     headers.Authorization = 'Bearer ' + key;
     fetch(where() + '/v1/audio/speech', {   /* #1360 */
@@ -1133,22 +1400,7 @@
       if (!res.ok) throw new Error('the voice bench said ' + res.status);
       return res.blob();
     }).then(function (blob) {
-      var src = URL.createObjectURL(blob);
-      var player = new Audio(src);
-      player.volume = 1;
-      /* The show is still ducked from the capture; hold it down until the
-       * answer has finished, or the reply lands under the broadcast. */
-      player.onended = function () {
-        URL.revokeObjectURL(src);
-        duck(false);
-        release(600);
-      };
-      player.onerror = function () { URL.revokeObjectURL(src); duck(false); };
-      duck(true);
-      var go = player.play();
-      if (go && go.catch) {
-        go.catch(function () { duck(false); });
-      }
+      playReply(blob);                                    /* [#1224] */
     }, function () {
       /* Said nothing, showed everything. The words are already on screen. */
       duck(false);
@@ -1162,8 +1414,29 @@
    * own SERVER_KEY is in scope; /api/listen/transcribe is require_auth, so
    * the bearer is not optional. Where the key is not in scope (the desktop
    * shell loads from file://) the bridge is asked for one. */
-  function postAudio(blob) {
+  function postAudio(wav) {
     var url = '/api/listen/transcribe';
+    var bytes = (wav instanceof ArrayBuffer) ? new Uint8Array(wav) : wav;
+    /* [#1224] THE SHELL CARRIES IT, WHERE THERE IS A SHELL.
+     *
+     * The desk renderer is file://.  A POST from it with Authorization
+     * and Content-Type is preflighted, and the station answers OPTIONS
+     * with 405 and sends no Access-Control-Allow-Origin on anything, so
+     * this fetch could never have completed however right the address
+     * was.  In the main process there is no origin and no preflight, and
+     * the key is already there.  The fetch below stays for the tablet,
+     * where the page IS the station's own panel and is same-origin. */
+    var bridge = root.pineDesktop;
+    if (bridge && typeof bridge.listenTranscribe === 'function') {
+      return Promise.resolve(bridge.listenTranscribe(bytes))
+        .then(function (got) {
+          if (!got || !got.ok) {
+            throw new Error(String((got && got.why)
+              || 'the desk could not reach the station'));
+          }
+          return got;
+        });
+    }
     return serverKey().then(function (key) {
       if (!key) {
         throw new Error('no station key on this terminal to authorise the clip');
@@ -1174,7 +1447,7 @@
           'Authorization': 'Bearer ' + key,
           'Content-Type': 'application/octet-stream'
         },
-        body: blob
+        body: new Blob([bytes], {type: 'audio/wav'})      /* [#1224] */
       });
     }).then(function (res) {
       return res.json().then(function (body) {

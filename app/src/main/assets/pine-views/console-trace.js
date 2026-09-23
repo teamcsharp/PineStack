@@ -142,7 +142,7 @@
       '<div class="ct-head">'
       + '<b class="ct-stage"></b>'
       + '<span class="ct-detail"></span>'
-      + '<button class="ct-close" type="button" aria-label="close">×</button>'
+      + '<button class="ct-close" type="button" aria-label="close" title="close">×</button>'
       + '</div>'
       + '<div class="ct-road"><canvas class="ct-canvas"></canvas>'
       + '<div class="ct-roadwhy"></div></div>'

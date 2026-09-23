@@ -35,19 +35,39 @@
             android:layout_width="match_parent"
             android:layout_height="match_parent" />
 
-        <!-- The affordance. A 14dp ribbon down the left bezel, mostly
-             transparent, so "there is something over here" is visible without
-             a chrome bar eating 48dp of a 640dp-tall screen.
+        <!-- The affordance. A 14dp ribbon down the left bezel.
              DrawerLayout::onInterceptTouchEvent runs BEFORE this view sees
              anything, so a DRAG from the edge still opens the drawer; only a
              plain TAP falls through to this view's click listener. That is the
-             whole reason it can be both a hint and a button. -->
+             whole reason it can be both a hint and a button.
+
+             #1153 - "This yellow bar on the left side of the screen is no
+             longer needed. Get rid of that superimposed yellow line on the
+             left side of the screen."
+
+             THE HINT IS OFF; THE BUTTON STAYS. What the operator was looking
+             at was @drawable/edge_handle on this view - a horizontal gradient
+             from #66E3B341 (pine_amber at 40%) through #22E3B341 to nothing,
+             14dp wide and the full height of the glass. Measured from a
+             screencap: rgb(92,76,35) at x=0 fading out by x=15, which is
+             0.4*#E3B341 over the #0A0C10 ground to within four counts. It is
+             NOT in the panel: a CDP walk of every element in the WebView
+             found no yellow on the left edge, and Page.captureScreenshot came
+             back without the bar, because this is a native View sitting on
+             top of the WebView and the page cannot see it.
+
+             It was only ever a hint, and by now the rail has better ones -
+             the drag edge is widened to 40dp in MainActivity.widenDragEdge
+             and every view has the rail down its right-hand side. So the
+             background goes and the view stays: it is still the tap target
+             MainActivity:876 hangs openDrawer on, and deleting it outright
+             would be an NPE on start. -->
         <View
             android:id="@+id/edgeHandle"
             android:layout_width="14dp"
             android:layout_height="match_parent"
             android:layout_gravity="start"
-            android:background="@drawable/edge_handle"
+            android:background="@null"
             android:contentDescription="@string/rail_open" />
 
         <LinearLayout

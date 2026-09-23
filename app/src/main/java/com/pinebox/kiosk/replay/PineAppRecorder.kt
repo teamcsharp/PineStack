@@ -179,7 +179,22 @@ class PineAppRecorder : Service() {
      * wakes, and now also on disk if the process does not survive.
      */
     private fun rest() {
-        replay?.stop()
+        /* [#1225] THE SOUND DOES NOT GO OFF WITH THE SCREEN.
+         *
+         * This called stop(), which stopped the audio capture as well as
+         * the encoder - so the tablet captured playback only while its
+         * glass was lit, and the desk's replay window was right to say
+         * there was no audio: for most of the day there was none. A
+         * tablet face down on the desk is still playing the station, and
+         * that is exactly the audio somebody wants afterwards.
+         *
+         * stopVideo() writes the history to disk and gives up the
+         * encoder and the VirtualDisplay just as before; only the
+         * loopback capture is left running. It is one thread and a 24 MB
+         * window, and it is the whole of this request. */
+        replay?.stopVideo()
+        Log.i(TAG, "#1225 screen off: the encoder is down, the audio capture "
+            + "stays up")
     }
 
     override fun onDestroy() {

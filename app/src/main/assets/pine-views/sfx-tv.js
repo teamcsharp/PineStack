@@ -168,6 +168,10 @@
    * play()'s closure, and every road that closes the sheet goes through
    * sheetClose() so the owed finish cannot be missed. */
   var sheetWrap = null;
+  /* [#1450] The wall sheet's shade: full-screen, transparent, and the
+     thing a tap lands on when the operator means "away". Held here
+     rather than looked up, so sheetClose() cannot miss it. */
+  var sheetShade = null;
   var curtain = null;
   var owed = false;
   /* #1121-#1124: THE COUNTERS LIVE HERE, NOT IN play()'s CLOSURE.
@@ -422,7 +426,93 @@
    * here, because a road that removed the sheet by hand would leave an
    * owed finish owed for ever: a set on its last frame that nothing
    * ever takes down. */
+  /* [#1386c] THE PICTURE STAYS UP AND STOPS MOVING.
+   *
+   * "if i bring up the menu. Keep the video up so i can decide what to do
+   *  with it. Dont cycle to the next video while the popup is active. I
+   *  need to make decisions on that element"
+   *
+   * The first cut of this HID the picture, which was wrong for the obvious
+   * reason: the operator is deciding what to do with the clip he is
+   * looking at, and taking it off the glass takes away the thing the
+   * decision is about.
+   *
+   * So: hold, never hide. The clip freezes where it is, the playlist keeps
+   * its place, and the menu is moved clear of the picture rather than laid
+   * over it - because on this glass it CANNOT be laid over it. Measured on
+   * the tablet: `document.querySelectorAll('.sfx-tv')` is EMPTY while a
+   * picture-in-picture clip is up, so there is no web frame at all; the
+   * picture is PineVideoWall's own SurfaceView, composited by
+   * SurfaceFlinger above an opaque WebView (setZOrderMediaOverlay(true),
+   * PineVideoWall.kt:93). No z-index, no promoted layer and no amount of
+   * CSS reaches across that, and the first two attempts here were both
+   * arguing in the wrong layer.
+   */
+  var wallBox = null;
+
+  function wallAsk(cmd, arg) {
+    try {
+      var bridge = root.pineDesktop;
+      if (!bridge || typeof bridge.videoWall !== 'function') return null;
+      return bridge.videoWall(cmd, arg);        /* a Promise on this build */
+    } catch (err) { return null; }
+  }
+
+  /* Where the picture actually is, so the sheet can stand beside it. */
+  function wallWhere() {
+    var got = wallAsk('state');
+    if (!got || typeof got.then !== 'function') return Promise.resolve(null);
+    return got.then(function (raw) {
+      try { return typeof raw === 'string' ? JSON.parse(raw) : raw; }
+      catch (err) { return null; }
+    }).catch(function () { return null; });
+  }
+
+  function surfaceDown(on) {
+    /* The web frame, when there is one (the desktop shell has one; the
+       tablet, as measured, usually does not). Held rather than hidden. */
+    try {
+      var frames = document.querySelectorAll('.sfx-tv');
+      for (var i = 0; i < frames.length; i += 1) {
+        if (frames[i].classList.contains('sfx-tv-sheet')) continue;
+        var v = frames[i].querySelector('video');
+        if (v) { if (on) { try { v.pause(); } catch (e) { /* gone */ } }
+                 else { try { v.play(); } catch (e) { /* gone */ } } }
+      }
+    } catch (err) { /* no frame on screen */ }
+    /* The native wall: freeze it, do not veil it. */
+    wallAsk(on ? 'hold' : 'free');
+    if (!on) wallBox = null;
+  }
+
+  /* [#1386c] Stand the sheet CLEAR of the picture. The wall reports its own
+     rectangle in device pixels; anything that overlaps it is unreachable,
+     so the sheet goes under it when there is room and over the top strip
+     when there is not. */
+  function sheetClear(wrap) {
+    if (!wrap) return;
+    wallWhere().then(function (st) {
+      if (!st || !wrap.parentNode) return;
+      var w = Number(st.w || st.width || 0);
+      var h = Number(st.h || st.height || 0);
+      var y = Number(st.y || st.top || 0);
+      if (!(w > 0 && h > 0)) return;              /* full screen: leave it */
+      wallBox = {x: Number(st.x || 0), y: y, w: w, h: h};
+      var below = y + h + 10;
+      var room = (root.innerHeight || 800) - below;
+      wrap.style.position = 'fixed';
+      wrap.style.left = '10px';
+      wrap.style.right = '10px';
+      wrap.style.bottom = 'auto';
+      if (room > 170) { wrap.style.top = below + 'px'; }
+      else if (y > 180) { wrap.style.top = '10px';
+                          wrap.style.maxHeight = (y - 20) + 'px'; }
+      else { wrap.style.top = below + 'px'; }     /* nothing fits: below */
+    });
+  }
+
   function sheetClose() {
+    surfaceDown(false);                                  /* [#1386b] */
     var wrap = sheetWrap;
     sheetWrap = null;
     sheetOnWall = false;                                 /* #1184 */
@@ -430,6 +520,14 @@
     stripEl = null;                                      /* #1200 */
     histNoteEl = null;                                   /* #1200 */
     try { if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap); }
+    catch (err) { /* already gone */ }
+    /* [#1450] and the shade with it. Every road that closes the sheet
+       comes through here - a delete, a ban, a glue landing on its new
+       clip, the editor coming back - so none of them can leave an
+       invisible full-screen div behind swallowing taps. */
+    var shade = sheetShade;
+    sheetShade = null;
+    try { if (shade && shade.parentNode) shade.parentNode.removeChild(shade); }
     catch (err) { /* already gone */ }
     var due = owed;
     owed = false;
@@ -3196,6 +3294,7 @@
        that ended under the sheet is finished now, not left standing. */
     if (sheetHeld()) { sheetClose(); return; }
     sheetAt = at || null;                                  /* #1184 */
+    surfaceDown(true);                                   /* [#1386b] */
     var onWall = !!at;
     /* #1184: is this sheet about the clip that is actually on the tube?
        A tile in the strip opens this same sheet for a NEIGHBOUR, and the
@@ -3220,6 +3319,48 @@
     var say = function (text) { note.textContent = String(text || ''); };
     var rowA = document.createElement('div');
     rowA.className = 'sfx-tv-sheetrow';
+    /* [#1386b] FULL SCREEN. "I need to be able to have the video show up
+       as full screen if I choose it in the option." It belongs on the
+       first row because it is the option people reach for first, and it
+       toggles rather than latching, so the same tap gets the frame back
+       to the size the operator dragged it to. */
+    var fullBtn = document.createElement('button');
+    var fullFrame = (function () {
+      try {
+        var all = document.querySelectorAll('.sfx-tv');
+        for (var i = 0; i < all.length; i += 1) {
+          if (!all[i].classList.contains('sfx-tv-sheet')) return all[i];
+        }
+      } catch (err) { /* not on screen */ }
+      return null;
+    }());
+    function fullLabel() { fullBtn.textContent = 'full screen'; }
+    /* [#1386c] The picture on this glass is usually the NATIVE wall, not a
+       frame in the page - so full screen is a bridge command, not a class.
+       The first cut toggled a CSS class on a `.sfx-tv` element that is not
+       there, which is why the button did nothing at all. */
+    var wentFull = false;
+    fullBtn.onclick = function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      wentFull = !wentFull;
+      if (fullFrame) fullFrame.classList.toggle('sfx-tv-full', wentFull);
+      if (wentFull) {
+        wallAsk('full');
+        say('full screen - tap again for the window back');
+      } else {
+        var b = wallBox;
+        if (b) wallAsk('state', {x: b.x, y: b.y, w: b.w, h: b.h});
+        else if (fullFrame) {
+          var r = fullFrame.getBoundingClientRect();
+          wallAsk('state', {x: Math.round(r.left), y: Math.round(r.top),
+                            w: Math.round(r.width), h: Math.round(r.height)});
+        }
+        say('back to the size you dragged it to');
+      }
+      fullBtn.textContent = wentFull ? 'windowed' : 'full screen';
+    };
+    fullLabel();
+    rowA.appendChild(fullBtn);
     var rowB = document.createElement('div');
     rowB.className = 'sfx-tv-sheetrow';
     /* #1112: a third row for the two that take the picture away, so
@@ -3525,6 +3666,7 @@
       host.appendChild(wrap);
       sheetOnWall = false;                                 /* #1184 */
       sheetWrap = wrap;                                    /* #1112 */
+      sheetClear(wrap);                                    /* [#1386c] */
       return;
     }
     /* #1184: OVER THE WALL, AND OVER A FULL-BLEED PICTURE.
@@ -3561,14 +3703,83 @@
     var home = document.body;
     try { home = document.fullscreenElement || document.body; }
     catch (err) { home = document.body; }
+    /* [#1450] THE WAY OUT GOES DOWN FIRST.
+     *
+     * The wall sheet used to be dismissed by a second tap on the
+     * picture, and #1442 takes the picture away for exactly as long as
+     * the sheet is up - so that tap could never arrive and the operator
+     * was shut in. This shade is the page, not the surface, so it is
+     * there whether or not the wall is. One z below the sheet, so the
+     * sheet's own rows and rails still take their taps first. */
+    var shade = document.createElement('div');
+    shade.className = 'sfx-tv-shade sfx-tv';
+    var ss = shade.style;
+    ss.position = 'fixed';
+    ss.left = '0px'; ss.top = '0px';
+    ss.right = '0px'; ss.bottom = '0px';
+    ss.background = 'transparent';
+    ss.zIndex = '2147483045';
+    shade.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      sheetClose();
+    });
+    home.appendChild(shade);
+    sheetShade = shade;
+
     home.appendChild(wrap);
     sheetOnWall = true;                                    /* #1184 */
     sheetWrap = wrap;                                      /* #1112 */
+    sheetClear(wrap);                                      /* [#1386c] */
+
+    /* [#1450] and a visible way out, because "tap somewhere else" is a
+       convention and this is a tablet. Carbon only (c:close--filled);
+       see the icon rule. */
+    var quit = document.createElement('button');
+    quit.type = 'button';
+    quit.className = 'sfx-tv-quit';
+    quit.title = 'Close this menu';
+    quit.setAttribute('aria-label', 'Close this menu');
+    quit.innerHTML = (typeof root.pineIcon === 'function'
+      ? (root.pineIcon('c:close--filled', 'Close') || '') : '') || 'x';
+    var qs = quit.style;
+    qs.position = 'absolute';
+    qs.top = '4px'; qs.right = '4px';
+    qs.minWidth = '34px'; qs.minHeight = '34px';
+    qs.display = 'flex'; qs.alignItems = 'center';
+    qs.justifyContent = 'center';
+    qs.background = 'transparent'; qs.border = '0';
+    qs.color = '#dfe7ee'; qs.cursor = 'pointer';
+    qs.zIndex = '3';
+    quit.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      sheetClose();
+    });
+    wrap.appendChild(quit);
     /* Placed only once it has a height: above the finger where there is
        room for it, below it where there is not, and never off either
        edge. Measured after the append because a sheet whose rows depend
        on `mine` is not always the same height. */
     var tall = wrap.offsetHeight || 260;
+    /* [#1444] A PRESS THAT IS THE PICTURE OPENS ON THE PICTURE.
+     *
+     * Above-the-finger is the right manner for a fingertip on a small
+     * tube - the hand must not cover what it just opened. It is the
+     * wrong manner when the press came from the native wall, where
+     * there is no finger on the glass over that box: measured, a press
+     * in the middle of a box at y 286..624 put a 353-tall sheet at y 87,
+     * the top of the screen and clear of the window it describes.
+     *
+     * It may cover the picture because #1442 takes the picture away
+     * whenever anything is laid across it, which is the whole reason
+     * centring is available here and was not before. */
+    var box = at.box;
+    if (box && Number(box.width) > 0 && Number(box.height) > 0) {
+      s.left = Math.max(8, Math.min(W - wide - 8, Math.round(
+        Number(box.left) + Number(box.width) / 2 - wide / 2))) + 'px';
+      s.top = Math.max(8, Math.min(H - tall - 8, Math.round(
+        Number(box.top) + (Number(box.height) - tall) / 2))) + 'px';
+      return;
+    }
     var top = Math.round(Number(at.y) - tall - 14);
     if (top < 8) top = Math.round(Number(at.y) + 14);
     s.top = Math.max(8, Math.min(H - tall - 8, top)) + 'px';
@@ -4088,6 +4299,16 @@
    *
    * Walks document.body.children only - a handful of nodes - and runs on
    * the poll this module already makes. */
+  /* [#1448b] the one line of dress the hand-back needs */
+  try {
+    if (!document.getElementById('plNativeVeilCss')) {
+      var st1 = document.createElement('style');
+      st1.id = 'plNativeVeilCss';
+      st1.textContent = '.pl-natively-veiled{display:none !important}';
+      document.head.appendChild(st1);
+    }
+  } catch (err) { /* no head yet: the class simply does nothing */ }
+
   var UI_Z_FLOOR = 2147483000;
   var UI_AREA_MIN = 20000;          /* a panel, not a button */
 
@@ -4130,15 +4351,128 @@
      was no longer true, and it never spoke again. `st` is the wall's own
      state, which wallFollow() already fetches every poll; when it is not
      to hand the change is simply sent. */
+  /* [#1445] THE LISTEN VIEW IS THE PICTURE, so there is no window on it.
+   *
+   * "The popup shouldnt be there since its the bg." On that view the
+   * endless clip is the WALLPAPER (#1184 paintEndless, in #plBackVid) and
+   * a floating box of the same clip over the top of it is the same
+   * picture twice - which is what #1434 set out to stop and only half
+   * did, because it depended on listen.js getting round to calling
+   * veil(). This asks the view itself, on the same test listen.js uses
+   * for the question (`#plNow` connected and laid out), so the answer
+   * does not wait on anybody's clock.
+   *
+   * It is deliberately not "is the endless set on": the view owns the
+   * picture whenever it is up - EXCEPT bare, see below. */
+  function listenUp() {
+    try {
+      var face = document.getElementById('plNow');
+      return !!(face && face.isConnected && face.clientWidth > 0);
+    } catch (err) { return false; }
+  }
+
+  /* [#1448] BARE is the listen view's own full-screen wallpaper mode -
+     it hides the panel over the picture. With nothing above the video
+     there is nothing for the surface to get in the way of, so the
+     surface takes the whole view and is as smooth there as anywhere.
+     Measured on the page's own backdrop before this: 13.6% of frames
+     dropped, 26.3 fps of a 30 fps clip. */
+  function listenBare() {
+    try {
+      var host = document.getElementById('listen');
+      return !!(host && /(^|\s)pl-bare(\s|$)/.test(String(host.className || '')));
+    } catch (err) { return false; }
+  }
+
+  /* The page owns the picture on the listen view only while the panel is
+     over it. Bare, the surface owns it. */
+  function listenOwnsPicture() { return listenUp() && !listenBare(); }
+
+  var wallWide = null;                 /* [#1448] what shape it was left in */
+
+  /* [#1448b] THE PAGE'S OWN BACKDROP STANDS DOWN UNDER A FULL-BLEED
+   * SURFACE, and is handed straight back when it stops.
+   *
+   * Measured after #1448: #plBackVid was laid out at 0x0 and still
+   * `paused:false` - decoding a second copy of the same clip underneath
+   * an opaque surface. That decode is the workload that made the page
+   * road judder in the first place (13.6% of frames dropped, 26.3 fps of
+   * a 30 fps clip), and invisible is the worst way to spend it.
+   *
+   * HANDED BACK, NOT TAKEN. Only a class and a pause, both undone the
+   * moment bare ends, so listen.js's paintEndless (#1184) arms it again
+   * on its next slot exactly as before. And it cannot fire off the
+   * tablet: `on` is false unless there is a bridge with a wall behind
+   * it, so the listen page in a plain browser is untouched. */
+  var backdropDown = null;
+
+  function pageBackdrop(on) {
+    on = !!on;
+    /* [#1448c] THE HOLD IS RE-ASSERTED, NOT REMEMBERED. listen.js's
+       paintEndless (#1184) arms this element on its own poll and knows
+       nothing about the surface, so an edge-triggered pause is undone
+       within the second - measured, `handedBack:true` with
+       `paused:false`. Remembering a state owned by another module is the
+       fault #1442b and #1434b both removed; so while the surface has the
+       screen the requirement is simply stated again every pass. One
+       `.paused` read, and a pause() only when listen.js has restarted it. */
+    if (!on) {
+      var live;
+      try { live = document.getElementById('plBackVid'); } catch (err) { return; }
+      if (!live) return;
+      try {
+        if (!live.classList.contains('pl-natively-veiled')) {
+          live.classList.add('pl-natively-veiled');
+        }
+        if (!live.paused) live.pause();
+      } catch (err) { /* the next poll says it again */ }
+      backdropDown = true;
+      return;
+    }
+    if (!backdropDown) return;             /* never taken: nothing to give back */
+    var el;
+    try { el = document.getElementById('plBackVid'); } catch (err) { return; }
+    if (!el) return;
+    backdropDown = false;
+    try {
+      el.classList.remove('pl-natively-veiled');
+      if (el.paused && el.getAttribute('src')) {
+        var q = el.play();
+        if (q && q['catch']) q['catch'](function () {});
+      }
+    } catch (err) { backdropDown = null; }   /* ask again next poll */
+  }
+
   function wallReconcile(st) {
     var bridge = api();
     if (!bridge || typeof bridge.videoWall !== 'function') return;
-    var want;
-    try { want = !!veiled || uiOverPicture(); }
-    catch (err) { return; }
-    if (st && typeof st.veiled === 'boolean' && !!st.veiled === want) return;
-    bridge.videoWall(want ? 'hide' : 'show')['catch'](function () {
-      /* the next poll asks again; nothing here is remembered */
+    var want, wide;
+    try {
+      /* [#1448] full-bleed while the listen view is bare - there is no
+         panel over the picture there, so the surface may have all of it. */
+      wide = listenUp() && listenBare();
+      /* [#1448b] AND BARE OUTRANKS THE VEIL. listen.js veils this module
+         so the endless clip is not on screen twice (#1184/#1434), which
+         is right while the PAGE draws the wallpaper. Bare, the page is
+         not meant to draw it at all, so the veil is answering a question
+         nobody is asking - measured, the surface stayed
+         `{"on":true,"veiled":true}` on a bare view. The "twice" it guards
+         against is honoured by pageBackdrop(false) below instead. */
+      want = (!!veiled && !wide) || listenOwnsPicture() || uiOverPicture();
+    } catch (err) { return; }
+    pageBackdrop(!wide);
+    var shapeChanged = (wallWide !== wide);
+    if (!shapeChanged && st && typeof st.veiled === 'boolean'
+        && !!st.veiled === want) return;
+    wallWide = wide;
+    /* Full-bleed is {w:0,h:0}, NOT null. Checked in the two places that
+       decide it rather than assumed: the bridge only forwards a box that
+       `has("w")||has("h")`, so a null box leaves the old one standing,
+       and setBox reads width<=0 as MATCH_PARENT. The bridge reads the box
+       out of argument two whatever the verb, so this rides the same call. */
+    bridge.videoWall(want ? 'hide' : 'show',
+                     wide ? {x: 0, y: 0, w: 0, h: 0} : nativeWallRect())['catch'](function () {
+      wallWide = null;                 /* ask again next poll */
     });
   }
 
@@ -4156,7 +4490,17 @@
       /* [#1442b] BEFORE the veiled early-return below: a wall that is
          hidden must still be told when it may come back. */
       wallReconcile(st);
-      if (!id || (st && st.veiled)) return;
+      /* [#1446] VEILED IS NOT STOPPED, and this line used to treat it as
+         though it were. A veiled wall is still playing - that is the
+         whole meaning of veil (#1434) - and the LISTEN view is precisely
+         the place that needs to know what it is playing, because the
+         clip is that view's WALLPAPER and the wall is veiled there by
+         definition (#1445). Returning here froze `playing`, so
+         paintEndless kept re-arming on a clip that had long finished and
+         the backdrop sat on one frame: measured, the element was armed
+         for ...ece41c45f7 while the wall was on 1cd53fb0. Only a wall
+         with nothing to say is skipped now. */
+      if (!id) return;
       var row = ringSeen[id];
       if (!row) return;                      /* a larder clip we never saw */
       if (playing && playing.id === id) return;
@@ -4948,6 +5292,10 @@
       wireWall();                                          /* #1184 */
       poll();
       timer = setInterval(poll, POLL_MS);
+      /* In browser runtimes this is a numeric handle. In Node-backed
+         diagnostics it is a Timer, and the television must not own the
+         process after every surface and assertion has finished. */
+      if (timer && typeof timer.unref === 'function') timer.unref();
       /* A window that shrank under a set left near the edge would strand
        * it off screen; the clamp is the same one the opener uses. */
       root.addEventListener('resize', function () {
@@ -5114,7 +5462,13 @@
       var px = Number(x) / d;
       var py = Number(y) / d;
       if (!isFinite(px) || !isFinite(py)) return false;
-      try { sheet(playing, {x: px, y: py}); } catch (err) { return false; }
+      /* [#1444] and WHICH WINDOW it came from. A sheet that knows its box
+         is centred on it rather than opened above the finger - there is
+         no finger here, and the operator means "on the video". */
+      var over = null;
+      try { over = readBox(); } catch (err) { over = null; }
+      try { sheet(playing, {x: px, y: py, box: over}); }
+      catch (err) { return false; }
       return true;
     },
     /* #1200: NUMBERS RATHER THAN A CLAIM IN A COMMENT. The one thing that

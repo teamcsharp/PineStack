@@ -95,6 +95,19 @@ class PineVideoWall(
     private var player: ExoPlayer? = null
     private val running = AtomicBoolean(false)
     @Volatile private var veiled = false
+    /* [#1386] HELD, because the operator is deciding what to do with THIS
+     * clip. "if i bring up the menu, keep the video up so i can decide
+     * what to do with it. Dont cycle to the next video while the popup is
+     * active."
+     *
+     * A hold is not a stop and not a veil: the picture stays on the glass
+     * exactly as it is, the playlist keeps its place, and only the moving
+     * stops. It has to be a flag rather than just playWhenReady=false,
+     * because watch() below sees a READY player with the play flag down
+     * for 1.5s and kicks it straight back on ("play flag dropped") - which
+     * is the watchdog doing its job, and would have made the menu look
+     * broken for no reason anybody could see. */
+    @Volatile private var held = false
     private var pump: Job? = null
 
     /** What is in the playlist, in the player's own index order. */
@@ -294,6 +307,16 @@ class PineVideoWall(
 
     fun state(): JSONObject = JSONObject()
         .put("on", running.get())
+        .put("held", held)                          // [#1386]
+        /* [#1386] WHERE THE PICTURE ACTUALLY IS, in device pixels.
+         * The page cannot lay a menu over this surface - it is
+         * composited above an opaque WebView - so the only way to
+         * make the options reachable is to stand them CLEAR of the
+         * rectangle, and the page has no other way to learn it. */
+        .put("x", (layoutParams as? LayoutParams)?.leftMargin ?: 0)
+        .put("y", (layoutParams as? LayoutParams)?.topMargin ?: 0)
+        .put("w", width)
+        .put("h", height)
         .put("veiled", veiled)
         .put("queued", aheadCount())
         .put("queued_s", aheadMs() / 1000.0)                // [#1212]
@@ -339,9 +362,30 @@ class PineVideoWall(
     }
 
     /** Main thread, once a second: is the picture moving, and if not, why not. */
+    /**
+     * [#1386] Freeze on this clip while a menu is open over it, or let it
+     * run again. The picture is untouched either way.
+     */
+    fun hold(on: Boolean) {
+        held = on
+        onMain {
+            val p = player ?: return@onMain
+            p.playWhenReady = !on
+            /* So the watchdog's "still" clock starts from now rather than
+             * counting the held time as a stall the moment we let go. */
+            stillSince = 0L
+        }
+    }
+
+    fun isHeld(): Boolean = held
+
     private fun watch() {
         val p = player ?: return
         if (!running.get()) return
+        /* A held wall is standing still ON PURPOSE. Every rung below reads
+         * "not moving" as a fault, and every one of them would be wrong
+         * here. */
+        if (held) { stillSince = 0L; return }
         val now = android.os.SystemClock.elapsedRealtime()
         val idx = p.currentMediaItemIndex
         val pos = p.currentPosition

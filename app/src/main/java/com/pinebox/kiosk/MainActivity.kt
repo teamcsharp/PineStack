@@ -1113,6 +1113,25 @@ class MainActivity : AppCompatActivity() {
             scope = lifecycleScope,
             openExternal = ::openExternal,
         )
+        /* [#1448] The WebView is left OPAQUE, and the note is here so the
+         * next person does not repeat the reasoning that led away from it.
+         *
+         * A media-overlay SurfaceView is composited ABOVE this WebView, so
+         * the picture can only sit IN FRONT of the panel. To put the
+         * endless clip BEHIND the listen panel the order has to be
+         * inverted: surface under the WebView, WebView transparent. That
+         * was built and measured, and it changed nothing on screen,
+         * because every view paints its own opaque ground anyway
+         * (rgb(10,12,16), read off the device) - so it would also have
+         * needed the panel's ground rebuilt view by view.
+         *
+         * It is not needed. `pl-bare` is the listen view's own full-screen
+         * wallpaper mode and it hides the panel, so in the one place the
+         * picture is meant to be the wallpaper there is nothing above it
+         * to preserve, and the surface can stay where it is and take the
+         * whole screen (#1448 in sfx-tv.js). A transparent WebView gives
+         * up an opaque-surface compositing path for no gain, and "seamless"
+         * is the whole point here, so it goes. */
         webView.addJavascriptInterface(bridge, PineDesktopBridge.NAME)
         installVideoWall()                                    // #1426
         /* THE FIRST RESUME HAS ALREADY HAPPENED. This runs from

@@ -1182,6 +1182,66 @@
 }
 .pb-pad.filled .pb-pad-label { position: relative; }
 
+/* #1198: A VIDEO PAD WEARS ITS OWN FRAME, AND RUNS IT WHILE HE HOLDS IT.
+ *
+ * "If I put the video on a sampler pad, I want the video on the sampler pad
+ *  so I see the thumbnail of it and then whenever I tap and hold it I want
+ *  the video to play until I let go of it on the sampler pad. Have the video
+ *  on the sampler pad faded to 30% or whatever I said it to in the
+ *  preferences."
+ *
+ * The still and the film share one box and one look, because they are two
+ * states of the same thing: the pad's picture, not moving, and the pad's
+ * picture, moving. Both fill the WHOLE tile rather than the waveform's
+ * 44-pixel band - a frame letterboxed into a strip is a frame nobody can
+ * recognise, and recognition is the entire job at this size.
+ *
+ * THE OPACITY IS NOT SET HERE. It is written onto the element by
+ * sampler-face.js from the operator's own preference, defaulting to the 30%
+ * he asked for, so that a number in a stylesheet can never quietly disagree
+ * with the dial under the pads.
+ *
+ * object-fit: cover, not contain: the pad is square and a clip is not, and
+ * black bars top and bottom on a 110-pixel tile spend a third of the picture
+ * on nothing. The middle of the frame is where the subject is. */
+.pb-pad-shot,
+.pb-pad-film {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 10px;         /* the pad's own radius, or it corners out */
+  /* Every gesture on a pad is a strike; the picture must never take one,
+     never be dragged as an image, and never show a media control. */
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+  background: transparent;
+}
+.pb-pad-film::-webkit-media-controls { display: none !important; }
+
+/* THE WORDS STAY ON TOP, AND SAYING SO IS NOT OPTIONAL.
+ *
+ * An absolutely positioned child paints above in-flow content whatever the
+ * source order, so a picture that fills the tile would sit over the pad's
+ * own number, label and length - which is the one thing the fade exists to
+ * prevent. `.pb-pad-label` was already made `position: relative` for the
+ * waveform; the sub-line never was, because a 44-pixel band down the middle
+ * happened to miss it. A full-tile frame does not miss it. */
+.pb-pad-shot { z-index: 0; }
+/* THE FILM ABOVE THE STILL, SAID HERE RATHER THAN LEFT TO DOM ORDER.
+ * Both are absolutely positioned, so among equal z-indexes the LATER child
+ * wins - and both are inserted at `firstChild`, so whichever went in last is
+ * underneath. That is the opposite of what is wanted and it flips depending
+ * on whether the frame arrived before or after the first hold. (The still is
+ * also hidden outright while its own pad is running, by sampler-face.js: at
+ * 30% you would otherwise see a frozen frame through a moving one.) */
+.pb-pad-film { z-index: 1; }
+.pb-pad-num { z-index: 2; }
+.pb-pad .pb-pad-label,
+.pb-pad .pb-pad-sub { position: relative; z-index: 2; }
+
 /* --- the knob row --------------------------------------------------------
  *
  * Above the grid and below the banks, which is where the reference puts it:

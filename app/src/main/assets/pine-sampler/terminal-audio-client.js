@@ -32,7 +32,7 @@
   'use strict';
 
   const STREAMS = ['music', 'voice', 'reply'];
-  const POLL_MS = 8000;      /* presence goes stale at 15s; two looks inside it */
+  const POLL_MS = 8000;      /* several looks inside the shared presence lease */
 
   function clamp(value, fallback) {
     const level = Number(value);
@@ -104,7 +104,20 @@
       /* The sampler is the operator's own hands on a pad, not the
        * broadcast, and it is never silenced by the routing table. */
       if (element.closest && element.closest('#sampler, .pb-sampler')) continue;
-      if (element.muted !== quiet) { element.muted = quiet; touched += 1; }
+      element.dataset = element.dataset || {};
+      if (quiet) {
+        if (element.dataset.pineTerminalGag !== '1') {
+          element.dataset.pineTerminalWasMuted = element.muted ? '1' : '0';
+        }
+        if (!element.muted) { element.muted = true; touched += 1; }
+        element.dataset.pineTerminalGag = '1';
+      } else if (element.dataset.pineTerminalGag === '1') {
+        const muted = element.dataset.pineTerminalWasMuted === '1'
+          || element.dataset.pineDecor === '1';
+        if (element.muted !== muted) { element.muted = muted; touched += 1; }
+        delete element.dataset.pineTerminalGag;
+        delete element.dataset.pineTerminalWasMuted;
+      }
     }
     return touched;
   }

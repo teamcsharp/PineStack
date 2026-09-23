@@ -262,23 +262,499 @@
     }
   }
 
+  /* ============================== #1198: a video pad wears its own frame == */
+
+  /* "If I put the video on a sampler pad, I want the video on the sampler
+   *  pad so I see the thumbnail of it ... Have the video on the sampler pad
+   *  faded to 30% or whatever I said it to in the preferences."
+   *
+   * THE SAME IDEA AS THE WAVEFORM ABOVE, CARRIED ONE STEP FURTHER. Sixteen
+   * tiles of text look the same at arm's length; sixteen waveforms do not;
+   * and a clip that HAS a picture is better recognised by its picture than
+   * by a drawing of its soundtrack. So a video pad shows a still of itself
+   * and an audio pad keeps its waveform, exactly as today.
+   *
+   * WHAT A PAD ALREADY KNEW, AND WHAT IT DID NOT. #1310 set two fields on
+   * the pad's metadata at import time, off the RESPONSE'S OWN Content-Type
+   * rather than a flag a caller has to remember to pass:
+   *
+   *     meta.video = true          it decoded from a video/* body
+   *     meta.url   = <signed url>  the clip's own signed media url
+   *
+   * plus `meta.srcId`, the clip's id, which every import already carried.
+   * That is the whole of what a still and a film need, so nothing had to be
+   * added to the metadata and no pad had to be re-imported - a pad the
+   * operator filled last week lights up with this the moment it repaints.
+   *
+   * THE STILL IS THE STATION'S, NOT OURS. GET /api/sfx/poster/{sid} renders
+   * one frame per clip in a worker thread behind a semaphore of two, seeks
+   * before the input for a keyframe, caches under data/sfx_posters/ and
+   * prunes to six hundred. There is exactly one poster road on this station
+   * and this is it; drawing a second thumbnail here - grabbing a frame off
+   * the decoded pad into a canvas, say - would be a second answer to the
+   * same question, and the two would disagree the first time the seek
+   * changed.
+   */
+
+  /* WHERE THE STATION IS, FOR ANYTHING THAT PUTS A PATH IN AN <img src>.
+   *
+   * #1348: the desktop chrome is a file:// document, so a root-relative url
+   * resolves to file:///api/... and loads nothing at all. The tablet's panel
+   * IS served by the station, so there the relative url is the right one and
+   * pineStationBase does not exist. Both, in four lines. */
+  function mediaBase() {
+    try {
+      if (/^https?:$/.test(String(root.location.protocol))) return '';
+      if (typeof root.pineStationBase === 'function') {
+        return String(root.pineStationBase() || '').replace(/\/+$/, '');
+      }
+    } catch (err) { /* not a browser, or no shell */ }
+    return '';
+  }
+
+  /* THE POSTER CALL, IN THE STATION'S ONE SPELLING.
+   *
+   * Copied from sfx-tv.js posterOf(): the same route, the same id, and the
+   * signature LIFTED OFF THE CLIP'S OWN URL rather than asked for a second
+   * time - it is the same media sign both routes check.
+   *
+   * ONE DELIBERATE DIFFERENCE, AND IT IS A CORRECTION. posterOf decides
+   * video-or-not by looking for a file extension on the url. Measured
+   * against this station: an sfx clip's url is `/sfx/<16 hex>?t=<sig>` and
+   * has NO extension - app.py builds it that way in eight places - so that
+   * test answers false for every clip in the cycle. A pad does not have to
+   * guess: meta.video came from the Content-Type of the bytes it decoded,
+   * which is the authoritative answer, so it is used here. An audio pad
+   * asks for nothing at all and keeps its waveform.
+   * (Reported rather than fixed at the source: sfx-tv.js belongs to another
+   * hand tonight.) */
+  function posterUrlFor(meta) {
+    if (!meta || !meta.video) return '';
+    var url = String(meta.url || '');
+    var id = String(meta.srcId || '');
+    /* The same fallback sfx-tv's clipId uses: older rows carry only the url. */
+    if (!id) {
+      var got = /\/sfx\/([^?#/]+)/.exec(url);
+      id = got ? got[1] : '';
+    }
+    if (!id) return '';
+    var m = /[?&]t=([^&#]+)/.exec(url);
+    var sign = m ? m[1] : '';
+    return mediaBase() + '/api/sfx/poster/' + encodeURIComponent(id)
+      + (sign ? '?t=' + sign : '');
+  }
+
+  /* SIXTEEN PADS MUST NOT ALL ASK AT ONCE.
+   *
+   * The poster road renders behind a semaphore of two, so sixteen tiles
+   * asking together is not sixteen requests, it is a queue fourteen deep
+   * with an ffmpeg at the front of it - and a bank change while that queue
+   * drains is another sixteen behind those. So this keeps at most two in
+   * flight, the same two the station will serve, and everything else waits
+   * its turn here where it can be thrown away.
+   *
+   * WHAT THE CACHE IS. One record per PAD KEY ("bank:pad"), holding the url
+   * it was built for and the <img> element itself. The element is reused,
+   * never rebuilt - an <img> that has loaded and is moved between parents
+   * does not fetch again - so a pad is asked for exactly ONCE per session
+   * however many times its bank is repainted. The url is kept beside it so
+   * that a pad the operator refills with a different clip is spotted and
+   * asked again rather than showing the old clip's frame.
+   *
+   * WHAT A BANK CHANGE DOES. Loaded posters are KEPT: coming back to bank 1
+   * must not re-ask the station for pictures it has already handed over.
+   * What is dropped is the QUEUE - any pad still waiting whose bank is no
+   * longer the one on screen is taken out of the line, because the operator
+   * has stopped looking at it, and its record is cleared so that it is
+   * asked again cleanly if he comes back. Requests already in flight are
+   * left to land; cancelling them would waste the ffmpeg the station has
+   * already started. */
+  var POSTER_AT_ONCE = 2;          /* the station's own semaphore is two */
+  var posters = Object.create(null);   /* "bank:pad" -> record */
+  var posterQueue = [];
+  var posterLive = 0;
+
+  function forgetPoster(key) {
+    var rec = posters[key];
+    if (rec) rec.dropped = true;
+    delete posters[key];
+  }
+
+  /* Both pictures a pad can carry, forgotten together - used when a pad is
+   * deleted or overwritten. */
+  function forgetPad(key) {
+    forgetPeaks(key);
+    forgetPoster(key);
+  }
+
+  function posterPump() {
+    while (posterLive < POSTER_AT_ONCE && posterQueue.length) {
+      var rec = posterQueue.shift();
+      if (!rec || rec.dropped || posters[rec.key] !== rec) continue;
+      posterLive += 1;
+      rec.state = 'flight';
+      rec.img = make('img', 'pb-pad-shot');
+      rec.img.alt = '';
+      rec.img.addEventListener('load', posterLanded(rec, 'ok'));
+      /* A 404 is the station's honest answer for a clip it cannot draw -
+       * an older mp4 ffmpeg will not seek, or a pad whose video came from
+       * some road the sfx shelf has never heard of. The pad falls back to
+       * its waveform and nothing is said about it. */
+      rec.img.addEventListener('error', posterLanded(rec, 'bad'));
+      rec.img.src = rec.url;
+    }
+  }
+
+  function posterLanded(rec, how) {
+    return function () {
+      if (rec.state !== 'flight') return;    /* load and error both fired */
+      rec.state = how;
+      posterLive = Math.max(0, posterLive - 1);
+      posterPump();
+      if (how === 'ok' && !rec.dropped) paintPadFaces();
+    };
+  }
+
+  /* The record for this pad, asking the station for it if this is the first
+   * time. Answers null for a pad that has no poster to have. */
+  function posterFor(bank, pad, meta) {
+    var url = posterUrlFor(meta);
+    if (!url) return null;
+    var key = bank + ':' + pad;
+    var rec = posters[key];
+    if (rec && rec.url === url) return rec;
+    if (rec) rec.dropped = true;             /* the pad was refilled */
+    rec = {key: key, bank: bank, pad: pad, url: url,
+           state: 'queued', img: null, dropped: false};
+    posters[key] = rec;
+    posterQueue.push(rec);
+    posterPump();
+    return rec;
+  }
+
+  /* Everything still standing in line for a bank nobody is looking at. */
+  function dropQueuedElsewhere(bank) {
+    if (!posterQueue.length) return;
+    var kept = [];
+    for (var i = 0; i < posterQueue.length; i += 1) {
+      var rec = posterQueue[i];
+      if (rec.bank === bank) { kept.push(rec); continue; }
+      rec.dropped = true;
+      if (posters[rec.key] === rec) delete posters[rec.key];
+    }
+    posterQueue = kept;
+  }
+
+  /* HOW STRONGLY THE PICTURE SHOWS, 0..1 - his number, from his
+   * preferences. The 0.3 here is the fallback for a face running in front
+   * of an older sampler.js with no such seam, and it is the same 30 he
+   * asked for, so a missing seam cannot make the pads go blank. */
+  function padVideoFade() {
+    var api_ = sampler();
+    if (api_ && typeof api_.padVideoFade === 'function') {
+      try {
+        var got = Number(api_.padVideoFade());
+        if (isFinite(got)) return Math.max(0, Math.min(1, got));
+      } catch (err) { /* fall through to his default */ }
+    }
+    return 0.3;
+  }
+
+  function dropClass(cell, cls) {
+    var node = cell.querySelector('.' + cls);
+    if (node && node.parentNode) node.parentNode.removeChild(node);
+  }
+
+  /* TWO PICTURES ON ONE PAD IS ONE TOO MANY. While a pad is running its
+   * film, its own still is taken out of sight rather than left underneath
+   * it: at 30% you see THROUGH the moving frame to the frozen one, and a
+   * clip playing over a stopped copy of itself is the ugliest thing this
+   * pad could do. Hidden rather than removed, so letting go puts it back
+   * with no round trip and no repaint of the rest of the bank. */
+  function veilPoster(bank, pad, on) {
+    var rec = posters[bank + ':' + pad];
+    if (rec && rec.img) rec.img.style.visibility = on ? 'hidden' : '';
+  }
+
+  function filmIsOn(bank, pad) {
+    return !!(film && film.bank === bank && film.pad === pad);
+  }
+
+  /* The still, under the label, at the fade he set. */
+  function drawPadPoster(cell, rec, fade) {
+    if (!rec || rec.state !== 'ok' || !rec.img) return false;
+    if (rec.img.parentNode !== cell) cell.insertBefore(rec.img, cell.firstChild);
+    rec.img.style.opacity = String(fade);
+    /* Said on every repaint as well as at the two moments below, because a
+     * frame that lands DURING a hold would otherwise arrive unveiled. */
+    rec.img.style.visibility = filmIsOn(rec.bank, rec.pad) ? 'hidden' : '';
+    return true;
+  }
+
   function paintPadFaces() {
     var api_ = sampler();
     if (!api_) return;
     var bank = api_.bankIndex();
     var layout = api_.layout();
+    dropQueuedElsewhere(bank);
+    var fade = padVideoFade();
     for (var p = 0; p < api_.padCount; p += 1) {
       var cell = document.getElementById('pad-' + p);
       if (!cell) continue;
       var meta = layout[bank][p];
       if (!meta) {
-        var old = cell.querySelector('.pb-pad-wave');
-        if (old) old.remove();
+        dropClass(cell, 'pb-pad-wave');
+        dropClass(cell, 'pb-pad-shot');
         continue;
       }
-      drawPadWave(cell, api_.padKey(bank, p));
+      /* A VIDEO PAD SHOWS ITS FRAME, AN AUDIO PAD SHOWS ITS SOUND, AND A
+       * VIDEO PAD WHOSE FRAME HAS NOT ARRIVED YET SHOWS ITS SOUND TOO.
+       *
+       * The poster is a round trip and an ffmpeg at the far end of it; a
+       * tile that went blank while it waited would be a pad that looks
+       * broken for as long as the queue is deep. The waveform is already
+       * there and costs nothing, so it holds the tile until the frame
+       * lands and is taken off the moment it does. */
+      var rec = posterFor(bank, p, meta);
+      if (drawPadPoster(cell, rec, fade)) {
+        dropClass(cell, 'pb-pad-wave');
+      } else {
+        dropClass(cell, 'pb-pad-shot');
+        drawPadWave(cell, api_.padKey(bank, p));
+      }
     }
+    /* A film already running follows the dial without waiting for the next
+     * hold - see the note on the dial in sampler.js. */
+    if (film && film.el) film.el.style.opacity = String(fade);
   }
+
+  /* ========================== #1198: hold the pad and the video runs ===== */
+
+  /* "whenever I tap and hold it I want the video to play until I let go of
+   *  it on the sampler pad."
+   *
+   * ONE ELEMENT FOR THE WHOLE GRID, AND THAT IS THE CHOKE RULE.
+   *
+   * The sampler already has a name for "these two cannot both have the
+   * floor": a choke group. sampler-engine.js cutSiblings() fades any voice
+   * sharing the pressed pad's `choke`, and a choked voice does not come
+   * back when the one that took the floor is released.
+   *
+   * EVERY VIDEO PAD IS IN ONE CHOKE GROUP, because there is one screen and
+   * one pair of eyes. Hold pad 8 and it runs; put a second finger on pad 12
+   * and 12 takes the picture - 8 keeps SOUNDING, its voice was never choked
+   * and POLY still governs that, but it drops back to its poster. Lift 12
+   * and the picture stops; it does not hand back to 8, exactly as a choked
+   * voice does not come back. Lifting 8 after that does nothing at all,
+   * because 8 is not the pad showing.
+   *
+   * The cost of the alternative is the argument for it: two 110-pixel films
+   * at 30% behind two labels is not two things being watched, it is neither
+   * being watched, on a tablet paying for two decoders to do it.
+   */
+  var film = null;     /* {key, bank, pad, el, src, from, to, loop, ceiling} */
+
+  /* THE CEILING, AND WHY IT IS FLAT.
+   *
+   * sampler-air.js keeps one on the duck for the same reason and says it
+   * best: a holder that forgets to let go leaves the station in a state
+   * nobody can see the cause of. Every release path is wired below, but the
+   * one that is missed is by definition the one nobody thought of, so the
+   * film also dies of old age.
+   *
+   * IT IS NOT THE LENGTH OF THE CLIP. That was the first shape of this and
+   * it is wrong twice over: a finger routinely outlasts a two-second sting,
+   * so the ceiling would fire on a perfectly normal hold - snatching the
+   * picture out from under a thumb that is still down - and it would log
+   * "never released" about a release that was about to arrive, which is a
+   * meter that cries wolf. A film paused on its last frame costs nothing;
+   * the only thing this guards against is a release that never comes, and
+   * two minutes is the right order of magnitude for that. It is also longer
+   * than any clip on this shelf, so a pad set to LOOP can be held for as
+   * long as anyone would want to hold one. */
+  var FILM_CEILING_MS = 120000;
+
+  /* ONE ELEMENT, KEPT FOR THE LIFE OF THE PAGE. It is the choke rule made
+   * physical - there is only ever one film, so there is only ever one
+   * decoder - and it is also why the listeners below are wired HERE and not
+   * at each start: a fresh pair on every hold, on a reused element, is a
+   * listener leak that grows for as long as the operator plays. */
+  var filmEl = null;
+  /* WHAT IS ALREADY LOADED INTO IT, as it was HANDED OVER. Reading it back
+   * off the element is no good: assign a relative url and `.src` answers
+   * with an absolute one, so a comparison against what we meant is always
+   * unequal - and assigning a src a media element already holds starts the
+   * fetch again from the top. The whole point of keeping the element is
+   * that holding the same pad twice is instant. */
+  var filmSrc = '';
+
+  function filmElement() {
+    if (filmEl) return filmEl;
+    var node = make('video', 'pb-pad-film');
+    /* MUTED, AND SAID THREE WAYS. The property is what the autoplay policy
+     * reads, the attribute is what a reload reads, and defaultMuted is what
+     * survives a src change - a film that asks for sound is refused
+     * permission to start at all, and it would be the clip twice over
+     * anyway: the engine is already playing its audio track in the mix. */
+    node.muted = true;
+    node.defaultMuted = true;
+    node.setAttribute('muted', '');
+    node.playsInline = true;
+    node.setAttribute('playsinline', '');
+    node.setAttribute('webkit-playsinline', '');
+    node.preload = 'auto';
+    node.controls = false;
+    /* sampler-air.js taps every element that ever plays, so it can keep the
+     * last two minutes of the broadcast - and it skips anything the sampler
+     * previews, by this mark, so a grab never samples the thing you just
+     * grabbed. A muted film makes no sound, but being inside the sampler is
+     * the reason, not the silence. */
+    try { node.dataset.pineSelf = '1'; } catch (err) { /* no dataset */ }
+    node.addEventListener('loadedmetadata', function () {
+      if (film && film.el === node) filmSeekStart(film);
+    });
+    /* The out point, honoured by hand because a media element has no such
+     * thing. Cheap: timeupdate fires about four times a second. */
+    node.addEventListener('timeupdate', function () {
+      if (!film || film.el !== node || !(film.to > film.from)) return;
+      if (node.currentTime < film.to) return;
+      if (film.loop) filmSeekStart(film);
+      else { try { node.pause(); } catch (err) { /* already stopped */ } }
+    });
+    filmEl = node;
+    return node;
+  }
+
+  function filmSeekStart(state) {
+    try { state.el.currentTime = state.from; } catch (err) { /* not ready */ }
+  }
+
+  function filmPlay(state) {
+    try {
+      var got = state.el.play();
+      if (got && typeof got.catch === 'function') {
+        got.catch(function () { /* a frame the browser would not start */ });
+      }
+    } catch (err) { /* the pad still sounds */ }
+  }
+
+  function filmArmCeiling(state) {
+    if (state.ceiling) root.clearTimeout(state.ceiling);
+    state.ceiling = root.setTimeout(function () {
+      state.ceiling = 0;
+      if (film !== state) return;
+      if (root.console) {
+        root.console.warn('sampler: pad ' + (state.pad + 1)
+          + ' held its picture for ' + Math.round(FILM_CEILING_MS / 1000)
+          + 's and was never released - stopping it');
+      }
+      filmStopAll();
+    }, FILM_CEILING_MS);
+  }
+
+  /* THE PAD'S OWN IN AND OUT, so the picture agrees with the sound.
+   *
+   * The trim is the engine's - the one the edit sheet writes and the one
+   * fire() plays - so a pad trimmed to its second half shows its second
+   * half. #1310 hands the same trim to the set for the same reason: one
+   * editor, both halves of the clip. */
+  function filmWindow(meta) {
+    var from = 0;
+    var to = 0;
+    if (meta && meta.trim) {
+      from = Math.max(0, Number(meta.trim.start) || 0);
+      var end = Number(meta.trim.end) || 0;
+      if (end > from) to = end;
+    }
+    return {from: from, to: to};
+  }
+
+  function filmStart(bank, pad, meta) {
+    if (!meta || !meta.video || !meta.url) return false;
+    var cell = document.getElementById('pad-' + pad);
+    if (!cell) return false;
+    var key = bank + ':' + pad;
+    var win = filmWindow(meta);
+    var src = mediaBase() + String(meta.url);
+
+    /* The same pad hit again - a retrigger, or NOTE RPT - rewinds rather
+     * than rebuilding, which is what the engine does with the same voice
+     * and is the difference between a film and a stutter. */
+    if (film && film.key === key && film.src === src && film.el) {
+      film.from = win.from;
+      film.to = win.to;
+      filmSeekStart(film);
+      filmPlay(film);
+      filmArmCeiling(film);
+      return true;
+    }
+
+    var node = filmElement();
+    filmStopAll();                                        /* the choke */
+    film = {key: key, bank: bank, pad: pad, el: node, src: src,
+            from: win.from, to: win.to, loop: !!meta.loop, ceiling: 0};
+    /* LOOP FOLLOWS THE PAD'S OWN PLAY MODE rather than being invented here.
+     * A pad set to LOOP sounds until it is let go, so its picture should
+     * too; a ONE SHOT's picture ending with its sound is the truth, and a
+     * looping picture over a finished sound would be the pad claiming to
+     * still be playing. */
+    node.loop = film.loop;
+    node.style.opacity = String(padVideoFade());
+    if (filmSrc !== src) { filmSrc = src; node.src = src; }
+    veilPoster(bank, pad, true);
+    cell.insertBefore(node, cell.firstChild);
+    filmSeekStart(film);
+    filmPlay(film);
+    filmArmCeiling(film);
+    return true;
+  }
+
+  /* STOP THIS PAD'S FILM - and only if it is the one showing. A release for
+   * a pad that was choked by a later hold must not take the later hold's
+   * picture down with it, which is the whole of the two-fingers rule. */
+  function filmStop(bank, pad) {
+    if (!film) return false;
+    if (film.bank !== bank || film.pad !== pad) return false;
+    filmStopAll();
+    return true;
+  }
+
+  function filmStopAll() {
+    var state = film;
+    film = null;
+    if (!state) return;
+    veilPoster(state.bank, state.pad, false);    /* the still comes back */
+    if (state.ceiling) root.clearTimeout(state.ceiling);
+    var node = state.el;
+    if (!node) return;
+    /* PAUSED, NOT STRIPPED. The src is left on the element so that holding
+     * the same pad again is instant rather than a second fetch; the element
+     * itself is taken out of the cell so the pad's still shows through
+     * again underneath, which is what "let go of it" should look like. */
+    try { node.pause(); } catch (err) { /* never started */ }
+    if (node.parentNode) node.parentNode.removeChild(node);
+  }
+
+  /* Which pad is showing a film, for a caller that wants to know - and for
+   * the test, which otherwise has to read a private. */
+  function filmAt() {
+    return film ? {bank: film.bank, pad: film.pad} : null;
+  }
+
+  /* ---- what the poster queue is doing, as numbers -----------------------
+   *
+   * Three plain reads, published rather than left private, because the
+   * thing that has to be PROVED about this queue is a negative - that
+   * sixteen pads do NOT go at the station together - and a negative proved
+   * by reading a module's insides is a test that passes when the insides
+   * are renamed. They are also the honest answer to "is it still asking",
+   * which is a question the operator's console can put. */
+  function posterNode(bank, pad) {
+    var rec = posters[bank + ':' + pad];
+    return rec ? rec.img : null;
+  }
+  function postersInFlight() { return posterLive; }
+  function postersWaiting() { return posterQueue.length; }
 
   /* ====================================================== the knob row ==== */
 
@@ -479,7 +955,11 @@
      * sound with nothing left to stop it. */
     try { engine().stopAll(); } catch (err) { /* nothing playing */ }
     if (root.PineAir) root.PineAir.release('pad');
-    forgetPeaks(at.key);
+    /* #1198: and the picture with it. `at.key` is "bank:pad", which is the
+     * poster cache's key too, so a pad deleted and refilled with a
+     * different clip cannot come back wearing the old one's frame. */
+    filmStop(at.bank, at.pad);
+    forgetPad(at.key);
     await api_.forget(at.bank, at.pad);
     closeEdit();
     paintFace();
@@ -712,6 +1192,16 @@
     start: start, openEdit: openEdit, closeEdit: closeEdit,
     openPicker: openPicker, paintFace: paintFace, paintPadFaces: paintPadFaces,
     forgetPeaks: forgetPeaks,
+    /* #1198: both of a pad's pictures forgotten together, and the three
+     * doors the instrument presses to start and stop a film. sampler.js
+     * owns WHEN - press, lift, the bank, the window losing focus - and this
+     * file owns the element, because the pad's face is what it is for. */
+    forgetPad: forgetPad,
+    filmStart: filmStart, filmStop: filmStop, filmStopAll: filmStopAll,
+    filmAt: filmAt,
+    padVideoFade: padVideoFade,
+    posterUrlFor: posterUrlFor, posterNode: posterNode,
+    postersInFlight: postersInFlight, postersWaiting: postersWaiting,
     skin: function () { return skin; }
   };
   root.PineSamplerFace = out;

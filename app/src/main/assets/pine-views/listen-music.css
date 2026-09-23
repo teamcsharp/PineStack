@@ -82,6 +82,19 @@
   position: relative;
   height: 100%;
   display: grid;
+  /* #1151 - "This bar at the bottom isn't working."
+     ONE COLUMN, AND minmax(0,1fr) RATHER THAN THE IMPLICIT auto. An
+     implicit grid column is `auto`, which sizes to the MAX-CONTENT of its
+     items, and one of the items down there is a canvas - an element with a
+     real intrinsic width that listen.js rewrites from its own clientWidth
+     every frame. That is a loop: the canvas grew by devicePixelRatio a
+     frame, the column grew with it, and on the tablet the whole face was
+     32896px wide inside a 1120px view within about fifteen frames. The
+     spectrogram was the visible casualty, but the progress bar, the NEXT
+     row and the search box were running off the same cliff. minmax(0,1fr)
+     is a column exactly as wide as this grid and no wider, so nothing
+     inside can decide how wide the outside is. */
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto 1fr auto auto auto auto;
   gap: clamp(8px, 1.6vh, 20px);
   padding: clamp(14px, 3vh, 40px) clamp(16px, 4vw, 56px);
@@ -140,6 +153,11 @@
 /* A voice reads as the station speaking; a record reads as the station
    playing. Colour is the only difference, and it is enough. */
 .pl-now.voice .pl-head { color: var(--green); }
+/* 2026-09-15 (#1206): a record holds the headline while somebody speaks.
+   The title stays a title - the marquee below is where the speech is - and
+   the only tell is a quiet mark on the subtitle, so the screen still says
+   the booth is live without shouting a paragraph at him. */
+.pl-now.speaking .pl-sub { color: var(--green); }
 .pl-now.quiet .pl-head { color: var(--muted); font-weight: 400; }
 
 /* THE RECORD UNDERNEATH. When a voice has the headline this is the only
@@ -227,6 +245,11 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 10px 16px;
+  /* #1151: a grid item's automatic minimum size is its MIN-CONTENT, and
+     min-content here includes the spectrogram canvas's intrinsic width -
+     which is the other half of the loop the column fixes above. Zero, and
+     the row can be as narrow as the face is. */
+  min-width: 0;
 }
 .pl-vol { display: flex; align-items: center; gap: 8px; }
 .pl-vol span, .pl-sleep span {
@@ -732,7 +755,18 @@
   font-size: 11px; color: var(--muted, #8fa0ad);
   font-variant-numeric: tabular-nums;
 }
+/* #1194: THE HONEST FAILURE NEEDS ROOM TO BE READ.
+   The value cell is 42px of tabular numbers, which is right for "120%" and
+   clips "(no desk here)" down to a shrug. When a row genuinely has no desk
+   to turn it stops being a number cell: it takes the width it needs and it
+   goes red, because a slider that cannot move the sound must look different
+   from one that can. */
+.pl-deskrow i.gone {
+  flex: 0 1 auto; font-size: 10px; letter-spacing: .01em;
+  color: var(--red, #e46b6b); text-align: right;
+}
 .pl-deskwhy { font-style: normal; font-size: 10px; line-height: 1.5; color: var(--muted, #8fa0ad); }
+#plDeskWhere { display: block; margin-top: 3px; opacity: .85; }
 
 /* The video backdrop sits exactly where the still does. object-fit: cover,
    because a backdrop that letterboxes shows the room its own black bars. */
@@ -824,8 +858,26 @@
 .pl-hit.asking { opacity: .5; }
 .pl-hit-none { cursor: default; color: var(--muted, #8fa0ad); font-size: 12px; }
 
-/* The plexus behind the show, while a clip is still arriving. */
+/* The plexus behind the show, while a clip is still arriving.
+
+   #1147 - "I don't want this logo to show every time the video changes.
+   Like this play button doesn't look good. I instead want plexus graphics
+   in the background undulating."
+
+   AND IT COULD NOT BE SEEN. This canvas carries `.pl-back` as well, for
+   the position and the object-fit, and `.pl-back` says `opacity:.34` -
+   while `.pl-back:not([src]){opacity:0}` says nothing at all for an
+   element that has no src attribute and never could, which a <canvas> is.
+   So the stand-in that listen.js has been raising over every loading clip
+   since it was written has been drawing at zero opacity the whole time,
+   and what the operator saw instead was the WebView's own play badge
+   underneath it. It is a full-strength picture now, and unsaturated: it is
+   the SUBJECT between clips, not wallpaper behind one.
+
+   Both selectors are two classes, so this one wins on coming later in the
+   file - which is also why it has to stay below .pl-back. */
 .pl-back-fx { display: none; z-index: 0; }
+.pl-back.pl-back-fx { opacity: 1; filter: none; }
 
 /* THE BACKDROP MOVES, AND CHANGES WITHOUT A CUT.
    Two layers cross-fading (see swapStill) and a slow alternating drift, so
@@ -993,6 +1045,11 @@
 .pl-said-spec {
   display: block;
   width: 100%;
+  /* #1151: and the canvas itself never asks for more room than it was
+     given. Its width and height ATTRIBUTES are an intrinsic size that
+     layout is entitled to use; these two lines say it may not. */
+  min-width: 0;
+  max-width: 100%;
   height: 48px;
   border-radius: 6px;
   background: #05080a;
@@ -1005,4 +1062,181 @@
 .pl-said-note:empty { display: none; }
 @media (prefers-reduced-motion: reduce) {
   .pl-marquee-track { animation: none; }
+}
+
+/* =============================================  THE SCREEN ALONE  ======
+
+   #1152 - "When under the Listen tab, in endless video mode, allow me to
+   double tap the background in order to go full screen and hide all of the
+   UI except for the dot."
+
+   #1150 - "Whenever this screen is idle after 10 seconds, fade the UI to
+   20% until I tap the screen to show it again. In endless video mode."
+
+   ONE ELEMENT CARRIES BOTH. Every piece of chrome this view has is inside
+   .pl-face; the gallery layers, the clip, the plexus and the shade are its
+   siblings, and the talk dot is not in this view at all. So a deliberate
+   hide and an idle fade are the same property on the same box, which is
+   the only shape of this that a tablet can afford: one opacity the
+   compositor animates, rather than nine style writes a frame.
+
+   TWO HOSTS, AS EVERYWHERE ELSE IN THIS FILE. `.view.pb-listen.active` is
+   Electron's element and `.pine-view-host.open.pb-listen` is the one
+   rail.js builds on the tablet; neither carries the other's classes. Both
+   are reached here by keying on .pb-listen and the state class together,
+   which is two classes - enough to beat the one-class rules above without
+   needing to be written out twice.
+
+   listen.js is the only thing that writes .pl-bare and .pl-idle, and it
+   takes them both off again whenever this view stops being the open one.
+   Nothing here is remembered between sessions. */
+
+.pb-listen .pl-face,
+.pb-listen .pl-shade {
+  /* #1150 asks for about six hundred milliseconds, and the same curve
+     serves the deliberate hide: a cut to black on a double tap reads as a
+     screen that broke rather than a screen that obeyed. */
+  transition: opacity 600ms ease;
+}
+
+/* #1150: a fifth of itself, and still perfectly tappable - this is a fade,
+   not a hide, and the operator's own number. */
+.pb-listen.pl-idle .pl-face { opacity: .2; }
+
+/* #1152: gone, and nothing under the finger. pointer-events matters as
+   much as the opacity does: an invisible search box that still takes a tap
+   is how a bare screen turns into a keyboard nobody asked for, and it is
+   also what lets the SECOND double tap land on the backdrop and bring
+   everything back. */
+.pb-listen.pl-bare .pl-face {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* "...go full screen." The shade is a gradient that exists to keep the
+   headline readable over a photograph. With no headline on the glass it is
+   just a dark sheet over the operator's video, so it goes too - and the
+   clip comes up off its wallpaper opacity to its own full strength. That
+   is the difference between hiding the UI and being full screen. */
+.pb-listen.pl-bare .pl-shade { opacity: 0; }
+.pb-listen.pl-bare .pl-back-vid.pl-endless { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pb-listen .pl-face,
+  .pb-listen .pl-shade { transition: none; }
+}
+
+/* ===============================================  THE TABS  ============
+
+   #1156 - "When I am in full screen, fade the tabs down to 5%."
+
+   Full screen is the bare mode #1152 asked for: a double tap on the clip
+   takes .pl-face away and drops the shade. What was left on the glass
+   afterwards was the picture, the talk dot - which the operator asked for
+   by name - and the view rail down the right-hand edge at full strength.
+
+   THE RAIL IS NOT THIS VIEW'S TO REACH DOWN INTO. rail.js builds
+   #pineViewRail on the BODY and gives it z-index 2147483001, one above the
+   view host it floats over, so there is no selector starting at #listen
+   that can find it. listen.js therefore stamps `pine-listen-bare` on
+   <html> whenever bare mode is on and takes it off on every road out -
+   the second double tap, Escape, the tab going hidden, the view being
+   closed - and the rule below is the only thing that reads it. rail.js
+   itself is untouched.
+
+   SPECIFICITY, SINCE TWO STYLESHEETS ARE INVOLVED. RAIL_CSS is injected by
+   rail.js and lands AFTER this file, so a plain `#pineViewRail` here would
+   lose every tie. `html.pine-listen-bare #pineViewRail` is an id and a
+   class, which beats a bare id whatever the source order - and rail.js
+   sets no opacity of its own, so nothing is being fought over.
+
+   FIVE PERCENT, AND STILL A BUTTON. Opacity has never affected hit
+   testing: the tabs take a tap at .05 exactly as they do at 1, and the
+   rail keeps its own scrolling. That is the whole reason the operator's
+   number is safe to obey - he asked for the tabs faded, not disabled, and
+   he must be able to leave the view without guessing where the edge is.
+   Nothing here touches pointer-events, and nothing may.
+
+   A FINGER ON THE RAIL BRINGS IT BACK, AND COSTS NOTHING. :hover, :active
+   and :focus-within are three pseudo-classes and no JavaScript at all - no
+   listener, no timer, no frame, which is the only kind of "while the
+   finger is near it" this tablet should be asked to pay for. On glass
+   Chromium applies :hover on touch and holds it until the next tap
+   somewhere else, so the rail comes up under the thumb, stays up while it
+   is being used, and settles back to five percent once the operator
+   touches the picture again. */
+
+#pineViewRail {
+  /* The same 600ms ease the chrome fades on, so the two halves of one
+     gesture move together rather than one snapping and one gliding. */
+  transition: opacity 600ms ease;
+}
+html.pine-listen-bare #pineViewRail { opacity: .05; }
+html.pine-listen-bare #pineViewRail:hover,
+html.pine-listen-bare #pineViewRail:active,
+html.pine-listen-bare #pineViewRail:focus-within { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  #pineViewRail { transition: none; }
+}
+
+/* ==========================================  THE LINE ON A RESTORED
+                                                FULL SCREEN  ============
+
+   #1163 - "If I set the video to full screen, then reload it in full
+   screen as well on the next video open. Retain the scale settings on
+   reload in the web client."
+
+   #1152 refused to remember the bare screen, and said why: "a remembered
+   bare screen is a tablet that looks dead on the shelf the next morning".
+   The operator has overruled that, and he is right to - this kiosk
+   relaunches every few minutes on its own, so a session-only full screen
+   is one he keeps losing to something he did not do. But the objection was
+   never wrong about the failure mode, only about the price. A tablet that
+   looks dead is a tablet that was told nothing. This is the telling.
+
+   It is a SIBLING of .pl-face, not a child, because .pl-face is the
+   element bare mode takes to zero - a note inside it would be a note
+   nobody can read. And it is pointer-events:none, so the double tap it
+   describes goes through it to the backdrop, where onBackdrop() is
+   waiting.
+
+   Bottom centre, above the console strip's 26px and well clear of the
+   talk dot in the corner. Six seconds on listen.js's clock, then the same
+   600ms ease everything else in this view fades on. */
+
+.pl-barenote {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  z-index: 3;
+  margin: 0;
+  padding: 7px 15px;
+  border: 1px solid rgba(101, 199, 218, .3);
+  border-radius: 999px;
+  background: rgba(8, 11, 15, .72);
+  color: var(--text, #dfe7ee);
+  font-size: 12.5px;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  max-width: calc(100% - 32px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 600ms ease;
+}
+.pl-barenote.on { opacity: 1; }
+
+/* #1163: and while that line is up the rail is at full strength, not at
+   #1156's five percent. Five percent is right for a full screen the
+   operator just chose; it is wrong for the first six seconds after a
+   relaunch he did not choose, when the way OUT of the view is the one
+   thing he must be able to find. Two classes and an id, so it beats the
+   #1156 rule above it without needing !important. */
+html.pine-listen-bare.pine-listen-bare-said #pineViewRail { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pl-barenote { transition: none; }
 }

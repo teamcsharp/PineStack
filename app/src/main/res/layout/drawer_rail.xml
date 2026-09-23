@@ -236,7 +236,7 @@
         <Button
             android:id="@+id/broadcast_web"
             style="@style/PineChip"
-            android:text="@string/rail_web" />
+            android:text="PineTab" />
         <Button
             android:id="@+id/broadcast_app"
             style="@style/PineChip"
@@ -366,7 +366,7 @@
                 android:layout_width="0dp"
                 android:layout_height="@dimen/tap"
                 android:layout_weight="1"
-                android:max="100"
+                android:max="600"
                 android:progress="100" />
 
             <TextView
@@ -440,7 +440,7 @@
                 android:layout_width="0dp"
                 android:layout_height="@dimen/tap"
                 android:layout_weight="1"
-                android:max="100"
+                android:max="600"
                 android:progress="100" />
 
             <TextView
@@ -509,6 +509,13 @@
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
+            <TextView
+                android:layout_width="44dp"
+                android:layout_height="wrap_content"
+                android:text="SFX"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp" />
+
             <SeekBar
                 android:id="@+id/vol_reply"
                 android:layout_width="0dp"
@@ -519,6 +526,40 @@
 
             <TextView
                 android:id="@+id/vol_reply_value"
+                android:layout_width="44dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="100%" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout style="@style/PineCard">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Videos"
+            android:textColor="@color/pine_ink"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <SeekBar
+                android:id="@+id/vol_video"
+                android:layout_width="0dp"
+                android:layout_height="@dimen/tap"
+                android:layout_weight="1"
+                android:max="100"
+                android:progress="100" />
+
+            <TextView
+                android:id="@+id/vol_video_value"
                 android:layout_width="44dp"
                 android:layout_height="wrap_content"
                 android:gravity="end"

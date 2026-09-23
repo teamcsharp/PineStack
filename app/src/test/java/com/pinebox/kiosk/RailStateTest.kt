@@ -26,9 +26,9 @@ class RailStateTest {
     private fun dj(
         on: Boolean = true,
         paused: Boolean = false,
-        music: String = "box",
-        voice: String = "box",
-        reply: String = "box",
+        music: String = "nabu",
+        voice: String = "nabu",
+        reply: String = "nabu",
         device: String = "nabu",
     ): JSONObject = JSONObject()
         .put("on", on)
@@ -51,12 +51,12 @@ class RailStateTest {
     @Test
     fun `the routing is read from the fields the station actually publishes`() {
         // Read off the live station on 2026-09-10: on=false, paused=false,
-        // music_to/voice_to/reply_to=box, voice_device=nabu.
+        // music_to/voice_to/reply_to=nabu, voice_device=nabu.
         val state = RailState.of(FeedState(station = dj(on = false)))
         assertTrue(state.connected)
         assertFalse(state.fm)
         assertFalse(state.paused)
-        assertEquals("box", state.musicTo)
+        assertEquals("nabu", state.musicTo)
         assertEquals("nabu", state.voiceDevice)
         assertEquals(setOf("nabu"), state.presets)
     }
@@ -95,7 +95,7 @@ class RailStateTest {
         val before = RailState.of(FeedState(station = dj()))
         val after = before.patched(dj(music = "here", voice = "here", reply = "here", device = "pine"))
         assertEquals("here", after.musicTo)
-        assertEquals(setOf("web", "app"), after.presets)
+        assertEquals(setOf("pinetab", "app"), after.presets)
         // ...and it must not blank what the response does not carry.
         assertEquals(before.log, after.log)
     }
@@ -105,7 +105,7 @@ class RailStateTest {
         val before = RailState.of(FeedState(station = dj()))
         val after = before.patched(JSONObject().put("music_to", "off"))
         assertEquals("off", after.musicTo)
-        assertEquals("box", after.voiceTo)
+        assertEquals("nabu", after.voiceTo)
         assertEquals("nabu", after.voiceDevice)
     }
 
