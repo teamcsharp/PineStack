@@ -91,6 +91,10 @@ END_GRACE_S = 4.0          # a beat past a planned end before the air is free
 STALL_S = 45.0             # no listener progress for this long = stalled (reported)
 MAKING_SOON_S = 90.0       # a round this close to ready keeps dialogue fillers out
 HELD_STALE_S = 240.0       # a held round nobody released for this long is dropped
+QUIET_FILL_S = 20.0        # [#1295] nothing sounding and the head this far
+# off = a real hole a filler may have. PAGE_LEAD_S (7s, the page's announce
+# window) + a typical filler (~8s) + a beat; under it a filler cannot be got
+# onto the page before the head's own slot opens, so the answer stays no.
 # How long a RESERVATION for a rendered round that has not been dispatched
 # holds the page floor. Deliberately short: a wedged maker must never push
 # the air forward for minutes. Past it the round keeps its place in the
@@ -503,7 +507,8 @@ class LinearSequencer:
     # ------------------------------------------------------- the answers
 
     def ask_fill(self, road: str, *, dialogue: bool | None = None,
-                 priority: bool = False) -> dict[str, Any]:
+                 priority: bool = False,
+                 seconds: float = 0.0) -> dict[str, Any]:   # [#1295] seconds
         """May a filler road put something on the air NOW?
 
         NO while a committed round is ready and waiting (it goes next).
@@ -534,6 +539,52 @@ class LinearSequencer:
                        % (head.get("road") or head.get("kind") or "?", int(head.get("lines") or 0),
                           int(head.get("seconds") or 0),
                           (" - the air frees in %ds" % int(wait)) if wait > 0 else ""))
+                # [#1295] SILENCE OUTRANKS THE QUEUE (#840, #1260, #1313).
+                # `wait` above is the end of the LAST pending row, not the
+                # end of the air, so a 6s line twelve minutes out makes the
+                # whole twelve minutes read "busy". Measured on this line:
+                # 1,384.8s of "air frees in" holding 360.6s of audio, with
+                # nothing sounding and the first row 60.8s away - and 77%
+                # of every dead second on the station had a road being
+                # refused inside it. If nothing is sounding and the head
+                # cannot start for QUIET_FILL_S, the hole is real and a
+                # filler may have it: there is nothing there to collide
+                # with. The head keeps its place in `_held` and its rank -
+                # this takes nothing from it but the silence in front.
+                #
+                # AND IT MUST FIT. `seconds` is the filler's own measured
+                # length. Verified against the live post-#1290 sequencer:
+                # a 6s or a 14s filler stamped into a 25.9s hole moved the
+                # page floor by +0.0s, while a 120s one moved it +40.5s.
+                # So an oversized filler cannot OVERRUN the head - #1290's
+                # reservation re-floors behind it - but it does DELAY it by
+                # its overhang, and enough of those would re-grow `pushed_s`
+                # by the back door that #1290 just shut. A filler that
+                # cannot fit in front of the head does not belong in front
+                # of it. `seconds` of 0 means the caller did not say, and
+                # then the QUIET_FILL_S floor alone applies, as before.
+                # [#1295b] ...and only while it is ENFORCING. In shadow
+                # nothing is held back, so there is no silence to rescue and
+                # clearing `why` would only erase `would_be_after` - the
+                # census that is the whole purpose of the mode.
+                if linear and self._sounding(now, ROUTE_PAGE) is None:
+                    starts_at = self._next_start_at(now, ROUTE_PAGE)
+                    room = None if starts_at is None else (starts_at - now)
+                    need = max(QUIET_FILL_S,
+                               max(0.0, float(seconds or 0.0)) + self.page_lead_s)
+                    if room is None or room >= need:
+                        why = ""
+                        self._count("quiet_fill")
+                        self._count("quiet_fill:" + road)
+                        self._event("quiet_fill", road=road,
+                                    room_s=(None if room is None
+                                            else round(room, 1)),
+                                    filler_s=round(max(0.0, float(seconds or 0.0)), 1),
+                                    need_s=round(need, 1),
+                                    said_air_free_in_s=round(wait, 1),
+                                    head=head.get("road") or head.get("kind"))
+                    elif room is not None:
+                        self._count("quiet_fill_too_big")
             elif dialogue and not priority:
                 soon = self._making_soon(now)
                 if soon is not None:
@@ -918,6 +969,23 @@ class LinearSequencer:
             if float(row.get("eff_start") or 0) <= now < float(row.get("eff_end") or 0):
                 return row
         return None
+
+    def _next_start_at(self, now: float, route: str = "") -> float | None:
+        """[#1295] When the next pending row STARTS, or None when nothing
+        is waiting. `_air_free_at` gives the end of the last pending row,
+        which is a different number and not the size of the hole in front
+        of you: on the live line that this was written against the last
+        row ended 1,384.8s out while the FIRST one started 60.8s out."""
+        soonest = None
+        for row in self._walk(now, route):
+            if row.get("ended_at"):
+                continue
+            start = float(row.get("eff_start") or 0)
+            if start <= now:
+                continue
+            if soonest is None or start < soonest:
+                soonest = start
+        return soonest
 
     def _air_free_at(self, now: float, route: str = "") -> float:
         free = now

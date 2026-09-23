@@ -16182,6 +16182,20 @@ def larder_stock_count() -> int:
         return len(_LARDER)
 
 
+def larder_ready_count() -> int:
+    """Banter rounds that can go to air now with no writing or recording.
+
+    This is deliberately separate from larder_stock_count(): viable drafts
+    belong against the writing cap, but they cannot cover the next gap in the
+    broadcast until every take exists and the round passes its air gates.
+    """
+    try:
+        return sum(1 for entry in _LARDER
+                   if dialogue_row_ready("banter", entry))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def larder_trim() -> None:
     """2026-09-08: the larder holds larder_cap() rounds of stock PLUS the
     repertoire - rhymed rounds inside their keep - bounded at
@@ -17518,7 +17532,7 @@ def unheard_state() -> dict[str, Any]:
     # reporting the ordinary seven-minute dial here made a working 20-second
     # consumer look stranded to both the operator and the orchestrator.
     try:
-        if int(larder_stock_count() or 0) == 0:
+        if int(larder_ready_count() or 0) == 0:
             AIR1186_NEXTIN_K = min(
                 AIR1186_NEXTIN_K, UNHEARD_EMPTY_LARDER_EVERY)
     except Exception:  # noqa: BLE001
@@ -18210,7 +18224,7 @@ async def unheard_stock_air(force: bool = False) -> str:
     # it. During this bounded emergency the cupboard becomes the reserve and
     # stacks one accepted item per short pass into the linear page feed.
     try:
-        if int(larder_stock_count() or 0) == 0:
+        if int(larder_ready_count() or 0) == 0:
             rest = min(rest, UNHEARD_EMPTY_LARDER_EVERY)
     except Exception:  # noqa: BLE001
         pass
@@ -25711,17 +25725,32 @@ def playout_round_key(entries: Any, occurrence: str = "") -> str:
 
 
 def playout_ask(road: str, kind: str = "", dialogue: Any = None,
-                priority: bool = False) -> dict[str, Any]:
-    """May this road put something on the air now? Always answers."""
+                priority: bool = False,
+                seconds: float = 0.0) -> dict[str, Any]:      # [#1295]
+    """May this road put something on the air now? Always answers.
+
+    [#1295] `seconds` is the filler's own measured length, and it is what
+    lets the door tell a filler that FITS in the hole in front of the held
+    head from one that would overhang it. Optional: a caller that does not
+    know stays exactly as it was."""
     seq = playout()
     if seq is None:
         return {"allow": True, "why": "", "enforced": False, "after": 0.0,
                 "queued": False, "mode": "off", "road": road}
     try:
-        return dict(seq.ask_fill(road, dialogue=dialogue, priority=priority))
+        return dict(seq.ask_fill(road, dialogue=dialogue, priority=priority,
+                                 seconds=float(seconds or 0.0)))
+    except TypeError:
+        # An older sequencer without the parameter. Ask the way it knows.
+        try:
+            return dict(seq.ask_fill(road, dialogue=dialogue,
+                                     priority=priority))
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001
-        return {"allow": True, "why": "", "enforced": False, "after": 0.0,
-                "queued": False, "mode": "off", "road": road}
+        pass
+    return {"allow": True, "why": "", "enforced": False, "after": 0.0,
+            "queued": False, "mode": "off", "road": road}
 
 
 def playout_state(limit: int = 12) -> dict[str, Any]:
@@ -28699,7 +28728,13 @@ def page_feed_append(clip: dict[str, Any]) -> str:
     # moves.
     if not reply and not playout_is_committed_round(clip):
         _pl_road, _pl_priority = playout_clip_road(clip)
-        _pl = playout_ask(_pl_road, kind=kind, priority=_pl_priority)
+        # [#1295] ...AND HOW LONG IT IS. The same figure handed to
+        # admission_ticket below. The sequencer may admit a filler into a
+        # measured hole in front of the held head, and it can only judge
+        # whether it fits if it is told the length. 0.0 reads as "did not
+        # say" and leaves the plain QUIET_FILL_S floor to decide.
+        _pl = playout_ask(_pl_road, kind=kind, priority=_pl_priority,
+                          seconds=float((clip or {}).get("seconds") or 0.0))
         if _pl.get("queued") and float(_pl.get("after") or 0) > 0:
             try:
                 _pl_at = int(float(_pl["after"]) * 1000)
@@ -49207,7 +49242,7 @@ def hour_shortfall() -> dict[str, Any]:
         if not store.get("enabled", True):
             return out
         name, slots = schedule_slots_now(store)        # #963
-        board = {str(r.get("kind")): r for r in (prep_board() or [])}
+        prepared = prepared_by_kind()
         seen: set[str] = set()
         for slot in slots:
             out["entries"] += 1
@@ -49220,8 +49255,7 @@ def hour_shortfall() -> dict[str, Any]:
                                           "why": CANNOT_PREPARE[kind]})
                 continue
             prep = str(SCHED_PREP_KIND.get(kind) or kind)
-            row = board.get(prep) or {}
-            held = int(prepared_by_kind().get(prep) or 0)
+            held = int(prepared.get(prep) or 0)
             tag = {"kind": kind, "label": label, "held": held}
             (out["ready"] if held > 0 else out["short"]).append(tag)
     except Exception:  # noqa: BLE001
@@ -71641,6 +71675,22 @@ def switchboard_take() -> dict[str, Any]:
         interject_mark("starting", id=str(got.get("id") or ""))
     except Exception:  # noqa: BLE001
         pass
+    # A hand-seeded topic is counted only when the booth actually takes it.
+    # Queueing is not airing: another operator choice may displace one of the
+    # three waiting entries before it ever reaches this door.
+    if got.get("topic_id"):
+        try:
+            topic_id = str(got.get("topic_id") or "")
+            topic_shape = str(got.get("topic_shape") or "")
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                use_bombshell(topic_id, topic_shape)
+            else:
+                fire_and_forget(asyncio.to_thread(
+                    use_bombshell, topic_id, topic_shape))
+        except Exception:  # noqa: BLE001
+            pass
     return got
 
 
@@ -86983,13 +87033,17 @@ def read_bombshells() -> list[dict[str, Any]]:
         return []
 
 
-def write_bombshells(rows: list[dict[str, Any]]) -> None:
+def write_bombshells(rows: list[dict[str, Any]]) -> bool:
     with _BOMBSHELL_LOCK:
         try:
             BOMBSHELL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            BOMBSHELL_PATH.write_text(json.dumps(rows[:BOMBSHELL_MAX], indent=2))
+            tmp = BOMBSHELL_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows[:BOMBSHELL_MAX], indent=2)
+                           + chr(10), encoding="utf-8")
+            tmp.replace(BOMBSHELL_PATH)
+            return True
         except Exception:
-            pass
+            return False
 
 
 # --- [#1386] THE HOLDING PEN, THE TRASH CAN AND THE SETS ------------------
@@ -87219,8 +87273,7 @@ def add_bombshell(text: str, kind: str = "topic", by: str = "operator",
             **({"source": str(source)[:120]} if source else {}),
         }
         rows.insert(0, row)
-        write_bombshells(rows)
-        return row
+        return row if write_bombshells(rows) else {}
 
 
 # #1161: THE DECK. Twelve ways a topic can go, one of which is the
@@ -87398,6 +87451,35 @@ def use_bombshell(topic_id: str, shape: str = "") -> None:
                     row["shapes"] = (had + [shape])[-len(BANTER_SHAPES):]
                     row["shape"] = shape
         write_bombshells(rows)
+
+
+def queue_bombshell(row: dict[str, Any]) -> dict[str, Any]:
+    """Put this exact saved topic at the front of the next-round queue."""
+    topic_id = str((row or {}).get("id") or "")
+    text = " ".join(str((row or {}).get("text") or "").split())
+    if not topic_id or not text:
+        return {}
+    shape = bombshell_shape_for(row)
+    entry = {
+        "id": uuid.uuid4().hex[:10],
+        "kind": "rant",
+        "round": "bombshell",
+        "face": "the operator's scenario",
+        "premise": bombshell_angle(text, shape),
+        "topic_id": topic_id,
+        "topic_shape": shape,
+        "at": time.time(),
+    }
+    with _SWITCH_LOCK:
+        _SWITCH_QUEUE.insert(0, entry)
+        del _SWITCH_QUEUE[3:]
+        position = next((i + 1 for i, queued in enumerate(_SWITCH_QUEUE)
+                         if queued.get("id") == entry["id"]), 0)
+    note_action("you queued the next banter scenario: " + text[:160])
+    pipeline_log("switchboard", "operator topic %s is next: %s"
+                 % (topic_id, text[:180]))
+    return {"queued": bool(position), "queue_position": position,
+            "queue_id": entry["id"], "entry": entry}
 
 
 # #1226: THE COOKER. The bank was 87 topics, every one sprung 13 or 14
@@ -96642,7 +96724,13 @@ def _burst_withdraw(entries: list[dict[str, Any]], why: str) -> None:
                      why=str(why)[:160])
     except Exception:  # noqa: BLE001
         pass
-    if n:
+    # [#1300] A REFUSAL WITH NO ROWS LEFT TO TAKE BACK IS STILL A
+    # ROUND THAT DID NOT AIR. The guard was `if n:` - the book only
+    # heard about a refusal that moved a feed row, so the three
+    # exits that drop a round before its rows exist wrote nothing
+    # anywhere. `sid` names the round even when every row of it has
+    # already gone somewhere else, and `rows` stays honest at 0.
+    if n or sid:
         _WITHDRAWN_LAST.update({"at": time.time(), "why": str(why), "sid": sid,
                                 "rows": n, "kind": kind})
         # [#1191] AND WHERE THE WORK WENT, written down. `shelf` is how
@@ -96831,6 +96919,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     voices = ({str(t["who"]): str(t["voice"]) for t in ready_takes}
               if ready_takes is not None else await session_voices())
     spoken: list[str] = []
+    # [#1300] EVERY ROW THIS ROUND PUT IN THE FEED, ACROSS BURSTS.
+    # `_entries` is rebuilt per burst and is out of scope at the
+    # round-level exits below, so those refusals had nothing to
+    # withdraw and nothing to name themselves with.
+    _round_entries: list[dict[str, Any]] = []
     ready_meta = (dict(ready_takes[0].get("round") or {}) if ready_takes
                   else dict(round_meta or {}))
     if ready_takes is None and not await _system2_repeat_rows_async(
@@ -97596,6 +97689,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     zip(playlist[_lo:_hi], batch), start=_lo):
                 if not clip and ready_takes is not None:
                     _sfx_cadence_release(_sfx_meta.values())
+                    _burst_withdraw(                      # [#1300]
+                        _round_entries,
+                        "a turn of this round had no audio at hand-over and a "
+                        "prepared round is never re-rendered live - it goes "
+                        "back to the shelf whole")
                     return []
                 if not clip:                        # premake missed — render now
                     v = _turn_voice(item) or ""
@@ -97846,6 +97944,19 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                          if len(seg) >= 2 else None)
             except BaseException:
                 _sfx_cadence_release(_sfx_meta.values())
+                # [#1300] AND A THROW IS A REASON TOO. This is the
+                # #1219 class - the round leaves by an exception (or
+                # a CancelledError) with its rows standing in the
+                # feed as `prepared` and nothing written anywhere.
+                # Guarded so a failing record can never replace the
+                # exception that is on its way up.
+                try:
+                    _burst_withdraw(
+                        _round_entries,
+                        "the weld threw or was cancelled - the round "
+                        "never reached a transport")
+                except Exception:  # noqa: BLE001
+                    pass
                 raise
             if not mixed:
                 _sfx_cadence_release(_sfx_meta.values())
@@ -97902,6 +98013,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                 bool(dj_settings().get("stream_texture")), beats)
                              if len(seg) >= 2 else Path(seg[0]).read_bytes())
                     if not mixed:
+                        _burst_withdraw(                  # [#1300]
+                            _round_entries,
+                            "the round's lines could not be welded into "
+                            "one clip - nothing of it reached a transport")
                         return []
                     one = _store_media(mixed, "wav")
                     length = await _clip_seconds_async(one["path"]) or 0.0
@@ -98184,6 +98299,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                   "turns": len(transcript)})
                     _RADIO["chat"].append(entry)
                     _entries.append(entry)
+                    _round_entries.append(entry)          # [#1300]
                     # #778: the length this turn actually runs for INSIDE the
                     # coalesced clip.
                     _sx = (seg_ix[_row] if _row < len(seg_ix)
@@ -98354,6 +98470,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # still before either transport is touched. Generation calls
                 # and System2 ownership ride the same rows, surviving shelf
                 # retirement and a process restart.
+                _pl_block = 0
                 try:
                     _system2_record = {k: ready_meta.get(k) for k in (
                         "system2_job", "system2_slot", "system2_trace_id",
@@ -98367,9 +98484,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             _sr["model_call"] = _written
                         if _system2_record:
                             _sr["system2"] = _system2_record
-                    script_ledger_commit(
+                    _pl_block = await asyncio.to_thread(
+                        script_ledger_commit,
                         _round_sid, _script_rows, _script_round_kind,
-                        source=str(source or ""))
+                        str(source or ""))
                 except Exception:  # noqa: BLE001
                     # A round must never fail to air because the document
                     # could not be written.
@@ -98391,16 +98509,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # nothing, and cannot be the head.
                 _pl_key = playout_round_key(_entries, _round_occurrence)
                 try:
-                    _pl_block = 0
-                    try:
-                        _pl_order = script_ledger_order()
-                        for _e5 in _entries:
-                            _pl_got = _pl_order.get(str(_e5.get("id") or ""))
-                            if _pl_got:
-                                _pl_block = int(_pl_got[0])
-                                break
-                    except Exception:  # noqa: BLE001
-                        _pl_block = 0
                     # The measured cue map's own body, where the production
                     # road made this round. A map that cannot say how long
                     # its body is has already been refused upstream
@@ -98661,10 +98769,25 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     admission_withdraw(
                         _round_occurrence,
                         "neither the page nor the box took the clip")
-                if ready_takes is not None and not (page_delivery or (to_box and played_ok)):
+                # [#1300] ...AND SO DO THE FEED ROWS. #1341 dropped the
+                # `ready_takes is not None` condition from the admission
+                # withdrawal one line above and left it on this one, on
+                # the stated ground that the feed withdrawal "is a rule
+                # about the FEED". But a LIVE round's rows are appended
+                # `prepared` exactly like a prepared round's, so the
+                # condition was not protecting them - it was abandoning
+                # them, and the round then set played_any and walked on
+                # as if the burst had gone out. The `return []` stays
+                # gated, so a live conversation still runs into its next
+                # burst (#767); only the record changes. The return is
+                # nested under the withdrawal on purpose: the reason is
+                # then written on every road out of this door, and a
+                # reader can see that it is.
+                if not (page_delivery or (to_box and played_ok)):
                     _burst_withdraw(_entries, "neither the page nor the box took the clip")   # 2026-09-14
-                    _sfx_cadence_release(_sfx_meta.values())
-                    return []
+                    if ready_takes is not None:
+                        _sfx_cadence_release(_sfx_meta.values())
+                        return []
                 played_any = True
                 if call_miss_at is not None:
                     pipeline_log(
@@ -98716,6 +98839,19 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if ready_takes is not None:
         # A missing input, refused route or failed concatenation leaves the
         # original shelf row available. Never synthesize a dry substitute.
+        # [#1300] ...AND IT SAYS SO. This was the last exit on this
+        # road that returned [] with no reason written anywhere: no
+        # withdrawn_why on a row, no line in the book, nothing for
+        # _shelf_no to quote back as "the booth did not put it out:
+        # ...". `_round_entries` is empty when the round never
+        # reached the feed, which is the ordinary case here, and
+        # _burst_withdraw then records the refusal without moving
+        # anything.
+        _burst_withdraw(
+            _round_entries,
+            "the round could not be assembled - a missing input, a refused "
+            "route or a failed concatenation - and nothing of it reached a "
+            "transport")
         for pending in premade:
             if not pending.done():
                 pending.cancel()
@@ -99247,6 +99383,7 @@ async def _banter_beats(context: str, sheet: str, lines: int,
 
 
 BANTER_BOOTSTRAP_LINES = 8
+BANTER_BOOTSTRAP_READY = 2
 
 
 def banter_bank_plan(lines: int, bank: bool, system2_job: bool = False,
@@ -99263,7 +99400,7 @@ def banter_bank_plan(lines: int, bank: bool, system2_job: bool = False,
     bootstrap = False
     if bank and not system2_job and bootstrap_ok:
         try:
-            bootstrap = int(larder_stock_count() or 0) == 0
+            bootstrap = int(larder_ready_count() or 0) < BANTER_BOOTSTRAP_READY
         except Exception:  # noqa: BLE001
             bootstrap = False
     judged = min(requested, BANTER_BOOTSTRAP_LINES) if bootstrap else requested
@@ -100505,6 +100642,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 # #842: the banked one-call override keeps its wide context;
                 # live writing keeps the operator's num_ctx untouched.
                 num_ctx=(32768 if _bank_rich else 0),
+                mark=({"kind": "caller"} if caller_name else None),
+                result_contract=("structured_turns" if caller_name
+                                 else "spoken"),
             )
     except Exception as exc:
         # #805: this `except` was SILENT, and the ledger showed what
@@ -100707,6 +100847,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                           max(4200, 500 * min(lines, 11))),
                 spice=0.25,
                 num_ctx=16384,
+                mark=({"kind": "caller rewrite"} if caller_name else None),
+                result_contract=("structured_turns" if caller_name
+                                 else "spoken"),
             )
             if caller_name:
                 # #977: judged by the parser that will actually air it,
@@ -105623,6 +105766,31 @@ TINT_MARK_LINES = "HOW THAT WRITER WRITES"
 TINT_MARK_FLAVOUR = "HOW THAT WORLD ACTUALLY TALKS"
 
 
+def structured_turns_within(text: Any, limit: int) -> str:
+    """Complete labelled turns that fit, one turn per preserved line.
+
+    Character slicing ordinary prose is tolerable only because
+    whole_sentences can find its last boundary. A call is a protocol:
+    flattening it destroys the speaker boundaries, and a final complete
+    sentence can still be half a call. Stop before the first incomplete or
+    over-budget turn so the call contract receives intact turns or invokes
+    its deterministic complete-call fallback.
+    """
+    out: list[str] = []
+    used = 0
+    for marker, said in banter_turns(str(text or "")):
+        clean = " ".join(str(said or "").split())
+        if not clean or not _SENTENCE_END.search(clean):
+            break
+        line = "%s: %s" % (marker, clean)
+        cost = len(line) + (1 if out else 0)
+        if used + cost > max(1, int(limit or 0)):
+            break
+        out.append(line)
+        used += cost
+    return "\n".join(out)
+
+
 async def ask_model(prompt: str, limit: int = 300,
                     spice: float = 0.0, num_ctx: int = 0,
                     mark: dict[str, Any] | None = None,
@@ -105632,7 +105800,8 @@ async def ask_model(prompt: str, limit: int = 300,
     an internal prompt through generate_answer makes it look like something
     the user asked, which is how "ACKNOWLEDGE THIS REQUEST…" ended up on the
     Pine Box screen."""
-    if result_contract not in {"spoken", "track_reception", "transcript_repair"}:
+    if result_contract not in {"spoken", "structured_turns",
+                               "track_reception", "transcript_repair"}:
         raise ValueError("Unknown model result contract")
     settings = load_settings()
     _is_tint = str((mark or {}).get("kind") or "").startswith("tint")
@@ -105824,7 +105993,10 @@ async def ask_model(prompt: str, limit: int = 300,
     # A finished rap response may use bars or numbered lines without a
     # sentence-ending full stop. Preserve its shape for the crystal parser
     # and grader instead of throwing away unpunctuated bars as prose scraps.
-    kept = answer.strip() if _is_tint or control_answer else whole_sentences(" ".join(answer.split())[:limit])
+    structured_answer = result_contract == "structured_turns" and not _is_tint
+    kept = (answer.strip() if _is_tint or control_answer else
+            structured_turns_within(answer, limit) if structured_answer else
+            whole_sentences(" ".join(answer.split())[:limit]))
     if _is_tint and (len(kept) > limit or result.get("done_reason") == "length"):
         line_review_capture("tint_output", str((mark or {}).get("tint_before") or ""), kept,
             reasons=["the model exhausted its token budget" if result.get("done_reason") == "length"
@@ -105833,7 +106005,18 @@ async def ask_model(prompt: str, limit: int = 300,
                      "prompt": prompt, "model": settings["model"], "finish_reason": result.get("done_reason")},
             technical=True, disposition="rewrite_rejected")
         kept = ""  # An incomplete/over-budget response is retained, never silently clipped into a passing bar.
-    if not _is_tint and " ".join(answer.split()) != kept and answer.strip():
+    if (structured_answer
+            and " ".join(answer.split()) != " ".join(kept.split())
+            and answer.strip()):
+        reason = ("structured dialogue exceeded the character limit or "
+                  "ended inside a labelled turn")
+        line_review_permits(
+            "draft_trimming", answer, kept, [reason],
+            {"kind": "model_draft", "who": "", "limit": limit,
+             "script": answer, "retained": kept,
+             "model": str(settings.get("model") or "")},
+            record=True, disposition="trimmed")
+    elif not _is_tint and " ".join(answer.split()) != kept and answer.strip():
         reason = "draft exceeded the character limit or ended with an unfinished sentence"
         context = {"kind": "model_draft", "who": "", "limit": limit,
                    "script": answer, "retained": kept,
@@ -123470,11 +123653,13 @@ def phrase_ban_row_blocked(kind: str, row: Any) -> bool:
         key = phrase_ban_key()
         if not key or not isinstance(row, dict):
             return False
-        got = row.get("phrase_ban")
+        canonical = dialogue_entry(row) or row
+        got = canonical.get("phrase_ban")
         if isinstance(got, dict) and str(got.get("key") or "") == key:
             return bool(got.get("hit"))
-        hit = phrase_ban_hit(phrase_row_spoken(row), str(kind))
-        row["phrase_ban"] = {"key": key, "hit": hit, "at": round(time.time())}
+        hit = phrase_ban_hit(phrase_row_spoken(canonical), str(kind))
+        canonical["phrase_ban"] = {
+            "key": key, "hit": hit, "at": round(time.time())}
         return bool(hit)
     except Exception:  # noqa: BLE001
         return False
@@ -139757,7 +139942,16 @@ async def dj_topics_add(
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Give them something")
-    return add_bombshell(text, str(payload.get("kind") or "topic"))
+    row = await asyncio.to_thread(
+        add_bombshell, text, str(payload.get("kind") or "topic"))
+    if not row:
+        raise HTTPException(status_code=503,
+                            detail="The topic bank could not be written")
+    if not bool(payload.get("next")):
+        return row
+    queued = await asyncio.to_thread(queue_bombshell, row)
+    return {**row, **{k: queued.get(k) for k in
+                      ("queued", "queue_position", "queue_id")}}
 
 
 @app.delete("/api/dj/topics/{topic_id}")
@@ -150013,7 +150207,7 @@ def air_is_starving() -> bool:
     a busy hour; a quiet minute on its own is ordinary during a record.
     """
     try:
-        if int(larder_stock_count() or 0) > 1:
+        if int(larder_ready_count() or 0) > 1:
             return False
     except Exception:  # noqa: BLE001
         return False
@@ -150043,9 +150237,21 @@ def bank_health() -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     try:
-        out["banked"] = int(larder_stock_count() or 0)
+        viable = int(larder_stock_count() or 0)
+        ready = int(larder_ready_count() or 0)
+        awaiting_voice = sum(
+            1 for row in _LARDER
+            if dialogue_row_viable("banter", row)
+            and not dialogue_audio_ready("banter", row))
+        unheard_ready = sum(
+            1 for row in _LARDER
+            if row_unaired(row) and dialogue_row_ready("banter", row))
+        out.update({"banked": ready, "viable": viable,
+                    "ready_now": ready, "awaiting_voice": awaiting_voice,
+                    "unheard_ready": unheard_ready})
     except Exception:  # noqa: BLE001
-        out["banked"] = None
+        out.update({"banked": None, "viable": None, "ready_now": None,
+                    "awaiting_voice": None, "unheard_ready": None})
     try:
         out["wanted"] = int(dj_settings().get("dialogue_reserve_target") or 4)
     except Exception:  # noqa: BLE001
@@ -160224,10 +160430,91 @@ def airlog_read_all(path: Path | None = None) -> dict[str, dict[str, Any]]:
     return rows
 
 
+def airlog_boot_withdraw(rows: dict[str, dict[str, Any]]) -> int:
+    """[#1301] A ROUND THAT DIED WITH ITS PLAYER SAYS SO.
+
+    Measured 2026-09-23 over 48 h: 1,798 feed rows standing at
+    `prepared`, in 229 rounds, every one of them rendered - and 162 of
+    those rounds join to an admission occurrence the resume sweep
+    withdrew as "the process restarted before this occurrence was
+    handed to a transport". The station restarted 116 times in 30 h
+    and a round waits a median 182 s (p90 793 s) at the #1146 pacing
+    wait, so the thing in flight when a player ends is almost always a
+    finished round that had not reached its air moment yet.
+
+    Nothing could write that down from inside the round: the coroutine
+    went with the process. So the NEXT player writes it. This runs in
+    `airlog_load_index`, once, in a thread, before the keeper has
+    written a row of its own - which is why a `prepared` row seen here
+    can only belong to a player that no longer exists.
+
+    Only `prepared` is touched. A row that reached a transport reads
+    `published`, `stream`, `both`, `box` or `held` and is never at
+    risk. `air_at` goes with the withdrawal, as #1218 requires: a
+    round that never aired has no air time."""
+    try:
+        if str(os.getenv("PINE_BOOT_WITHDRAW", "1")).strip().lower() in (
+                "0", "off", "no", "false"):
+            return 0
+    except Exception:  # noqa: BLE001
+        pass
+    why = ("the process restarted before this round reached the air - it was "
+           "written, rendered and committed, and the player that owned it "
+           "ended while it waited for its air moment")
+    stuck = [row for row in (rows or {}).values()
+             if isinstance(row, dict)
+             and str(row.get("aired") or "") == "prepared"]
+    if not stuck:
+        return 0
+    now = time.time()
+    by_round: dict[str, list[dict[str, Any]]] = {}
+    for row in stuck:
+        row["aired"] = "withdrawn"
+        row["withdrawn_why"] = why[:240]
+        row["withdrawn_at"] = now
+        row.pop("air_at", None)
+        row.pop("air_at_by", None)
+        by_round.setdefault(str(row.get("sid") or ""), []).append(row)
+    try:
+        airlog_write_rows([dict(row) for row in stuck])
+    except Exception:  # noqa: BLE001
+        pass                    # a forgetful book never stops the air
+    for sid, group in by_round.items():
+        try:
+            withdrawn_book_write({
+                "at": round(now, 3), "sid": sid,
+                "kind": str(group[0].get("kind") or ""),
+                "rows": len(group), "why": why, "shelf": -1,
+                "boot": True, "system2": False,
+                "ids": [str(r.get("id") or "") for r in group][:12],
+                "texts": [" ".join(str(r.get("text") or "").split())[:120]
+                          for r in group][:12],
+                "seconds": round(sum(float(r.get("seconds") or 0)
+                                     for r in group), 2),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        pipeline_log("drop", "the last player left %d line(s) of %d round(s) "
+                             "written, rendered and never aired - they are "
+                             "withdrawn now and the book says why (#1301)"
+                     % (len(stuck), len(by_round)))
+    except Exception:  # noqa: BLE001
+        pass
+    return len(stuck)
+
+
 def airlog_load_index() -> int:
     """Warm the in-memory index off the file once per process (thread)."""
     try:
         got = airlog_read_all()
+        # [#1301] WHAT THE LAST PLAYER LEFT IN THE AIR. This is the
+        # one moment in the process where a `prepared` row can only
+        # belong to a player that no longer exists, so it is the
+        # one moment the sentence can be written. It mutates the
+        # rows in `got` before they warm the index, so the index,
+        # the file and the book all agree from the first tick.
+        airlog_boot_withdraw(got)
         with _AIRLOG_LOCK:
             for key, row in got.items():
                 _AIRLOG_INDEX.setdefault(key, row)
@@ -161083,6 +161370,8 @@ _SCRIPT_LEDGER_MEMO: dict[str, Any] = {"at": 0.0, "rows": []}
 SCRIPT_LEDGER_MEMO_S = 5.0              # the screenplay asks on every compose
 SCRIPT_LEDGER_KEEP_S = AIRLOG_KEEP_S    # two days, like every ledger here
 SCRIPT_LEDGER_MAX_BYTES = 8 * 1024 * 1024
+SCRIPT_LEDGER_PRUNE_EVERY = 3600.0
+_SCRIPT_LEDGER_PRUNED = [0.0]
 
 
 def _script_ledger_prune() -> None:
@@ -161090,13 +161379,20 @@ def _script_ledger_prune() -> None:
     try:
         floor = time.time() - SCRIPT_LEDGER_KEEP_S
         keep: list[str] = []
+        rows: list[dict[str, Any]] = []
         for line in SCRIPT_LEDGER_PATH.read_text().splitlines():
             try:
-                if float(json.loads(line).get("at") or 0) >= floor:
+                row = json.loads(line)
+                if float(row.get("at") or 0) >= floor:
                     keep.append(line)
+                    rows.append(row)
             except Exception:  # noqa: BLE001
                 continue
         SCRIPT_LEDGER_PATH.write_text("\n".join(keep) + "\n")
+        rows.sort(key=lambda r: (int(r.get("block") or 0),
+                                 int(r.get("ord") or 0)))
+        _SCRIPT_LEDGER_MEMO.update({"at": time.time(), "rows": rows})
+        _SCRIPT_LEDGER_PRUNED[0] = time.time()
     except Exception:  # noqa: BLE001
         pass
 
@@ -161231,8 +161527,17 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
             SCRIPT_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
             with SCRIPT_LEDGER_PATH.open("a") as handle:
                 handle.write("\n".join(out) + "\n")
-            _SCRIPT_LEDGER_MEMO["at"] = 0.0
-            if SCRIPT_LEDGER_PATH.stat().st_size > SCRIPT_LEDGER_MAX_BYTES:
+            # If the snapshot is warm, these are the only new rows and their
+            # block is monotone. Keep it warm instead of forcing the caller to
+            # reread and sort the entire multi-megabyte ledger.
+            if float(_SCRIPT_LEDGER_MEMO.get("at") or 0) > 0:
+                held = list(_SCRIPT_LEDGER_MEMO.get("rows") or [])
+                held.extend(json.loads(line) for line in out)
+                _SCRIPT_LEDGER_MEMO.update({"at": time.time(), "rows": held})
+            if (time.time() - _SCRIPT_LEDGER_PRUNED[0]
+                    >= SCRIPT_LEDGER_PRUNE_EVERY
+                    and SCRIPT_LEDGER_PATH.stat().st_size
+                    > SCRIPT_LEDGER_MAX_BYTES):
                 _script_ledger_prune()
     except Exception:  # noqa: BLE001
         return 0
@@ -161242,11 +161547,11 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
 def script_ledger_rows() -> list[dict[str, Any]]:
     """The script as written, in its own order.
 
-    Memoised for five seconds: the screenplay asks on every compose and
-    json holds the GIL (#1156)."""
+    The writer updates a warm snapshot append-by-append. The screenplay asks
+    on every compose and JSON holds the GIL (#1156), so the disk is read once
+    after startup or explicit invalidation, never on a polling TTL."""
     with _SCRIPT_LEDGER_LOCK:
-        if (time.time() - float(_SCRIPT_LEDGER_MEMO.get("at") or 0)
-                < SCRIPT_LEDGER_MEMO_S):
+        if float(_SCRIPT_LEDGER_MEMO.get("at") or 0) > 0:
             return list(_SCRIPT_LEDGER_MEMO.get("rows") or [])
         rows: list[dict[str, Any]] = []
         try:
@@ -162188,6 +162493,31 @@ def _screenplay_disk(since: float, until: float) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         d["chunks"] = {}
     return d
+
+
+def screenplay_overlay_live(d: dict[str, Any],
+                            live_rows: list[dict[str, Any]]) -> None:
+    """Bring the durable hour up to the live ring's latest line state.
+
+    The air-log keeper deliberately writes off-loop, so its copy can trail
+    the player by one keeper interval.  A forced screenplay read is the
+    page asking about a line it can hear now; answering it from that older
+    copy leaves the sounding block classified as prepared and moves the
+    document around the reader.  Overlay only matching ids already inside
+    this hour.  The durable row still owns history and the ring only lends
+    the mutable playout facts it knows more recently.
+    """
+    by_id = {str(r.get("id") or ""): r for r in (live_rows or [])
+             if isinstance(r, dict) and r.get("id")}
+    for row in (d.get("air") or []):
+        live = by_id.get(str(row.get("id") or ""))
+        if not live:
+            continue
+        for key in ("aired", "air_at", HEARD_STAMP, HEARD_STAMP_BY,
+                    "clip_from", "clip_until", "clip_tail", "seconds",
+                    "media", "clip_media", "url", "sfx"):
+            if live.get(key) is not None:
+                row[key] = live[key]
 
 
 def screenplay_parenthetical(row: dict[str, Any],
@@ -163191,8 +163521,12 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         # is cued by its own character line, which is how a script has
         # always written somebody cutting in.
         cuts_in = str(row.get("kind") or "") == "interject"
+        _blk_here = _blk_at[_ev_ix] if _ev_ix < len(_blk_at) else -1
+        _block_change = (_blk_here >= 0 and scene_block >= 0
+                         and _blk_here != scene_block)
         _want = (scene_round is None or round_kind != scene_round
-                 or (gap and gap > SCREENPLAY_GAP_SCENE))
+                 or (gap and gap > SCREENPLAY_GAP_SCENE)
+                 or _block_change)
         if (cuts_in and scene_round is not None
                 and not (gap and gap > SCREENPLAY_GAP_SCENE)):
             _want = False               # it happens INSIDE this scene
@@ -163200,7 +163534,6 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         # both sides of it, and so does the conversation itself once
         # its scene is standing - otherwise the turn AFTER an advert
         # opens a second heading for the exchange it is continuing.
-        _blk_here = _blk_at[_ev_ix] if _ev_ix < len(_blk_at) else -1
         if scene_round is not None and (
                 _ev_ix in _inside
                 or (_blk_here >= 0 and _blk_here == scene_block)):
@@ -163211,7 +163544,7 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             label = (" ".join(str(rnd.get("label") or "").split())
                      or SCREENPLAY_ROUND_WORDS.get(round_kind,
                                                    round_kind or "the air"))
-            if (slug, label) == scene_mark:
+            if (slug, label) == scene_mark and not _block_change:
                 _want = False           # the heading already standing
         if _want:
             scene_round = round_kind
@@ -163397,9 +163730,12 @@ async def screenplay_hour(since: float, until: float,
         got = _screenplay_cache_get(hour_key)
         if got is not None:
             return got
+    live_rows = ([dict(row) for row in (_RADIO.get("chat") or [])
+                  if isinstance(row, dict)] if live else [])
 
     def _work() -> dict[str, Any]:
         d = _screenplay_disk(since, until)
+        screenplay_overlay_live(d, live_rows)
         notes = list((screenplay_notes_read().get(hour_key) or []))
         script = screenplay_compose(since, until, d, notes)
         script["provenance"] = {
