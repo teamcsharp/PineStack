@@ -84278,6 +84278,56 @@ def segment_overrun(deadline: float, road: str = "") -> float:
         return 0.0
 
 
+def _ready_runway_no(kind: str) -> str:                               # [#1281]
+    """Why the RUNWAY refused this round, before anything was rendered.
+
+    #1281, measured 2026-09-23 off data/air_log.jsonl (48 h, one row per
+    id) and data/playout/events.jsonl:
+
+      * 1,592 feed rows stand at aired = "prepared" - written, RENDERED
+        (every one carries clip_media) and never put out: 2.7 hours of
+        finished speech, 163 whole rounds, median 7 lines. None carries
+        cut_why, withdrawn_why or bound, so these are NOT the record
+        binding gate's cut/withdrawn track intros (#1237); they are a
+        separate population on gallery (24.9% of the road's rows),
+        manager (25.8%) and news (22.1%). They are what the operator's
+        captures call "prepared xN; the mark steps over them and that
+        step is the jump".
+      * the selection door and the hand-off do not measure the same
+        runway. _ready_round_fits reads _PAGE_AIR_UNTIL, the air this
+        process has SOLD. _speak_turns_floorless folds playout_floor()
+        into _pstart and sleeps on it - the sequencer's reservation on
+        top of that, a median of 182 s and a p90 of 793 s over 2,515
+        asks, 34.3% of them past five minutes. Chosen against the short
+        number, rendered, paged as `prepared`, refused against the long
+        one when its entry has closed underneath it.
+      * and the timers do not forgive it: HELD_STALE_S is 240 s and 248
+        of the 552 rounds the sequencer has held - 45% - were evicted
+        stale after a median 242 s wait.
+
+    Returns "" whenever the runway is not the thing refusing, including
+    every `off`/`shadow` mode, where playout_floor() is 0.0 by contract
+    and this reading is inert."""
+    try:
+        floor = float(playout_floor() or 0.0)
+    except Exception:  # noqa: BLE001
+        return ""
+    now = time.time()
+    if floor <= now:
+        return ""
+    try:
+        window = _ready_slot_window(kind) or {}
+        deadline = float(window.get("deadline") or 0)
+    except Exception:  # noqa: BLE001
+        return ""
+    if deadline <= 0 or floor <= deadline:
+        return ""
+    return ("the air is sold %ds ahead and this entry closes in %ds - "
+            "rendering it now would stand a prepared line on the page "
+            "that never reaches the floor (#1281)"
+            % (int(floor - now), int(max(0.0, deadline - now))))
+
+
 def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                       window: dict[str, Any] | None = None, *,
                       seconds: float | None = None,
@@ -84329,6 +84379,26 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                     or len(_BOX_HOLD) >= 6)
         if page_carries_live(vto, vto in ("box", "both"), box_down):
             begins = max(begins, float(_PAGE_AIR_UNTIL[0] or 0))
+            # [#1281] ...AND THE FLOOR THE HAND-OFF WILL ACTUALLY WAIT FOR.
+            # _PAGE_AIR_UNTIL is the air this process has SOLD; it is not
+            # the air the sequencer has RESERVED. _speak_turns_floorless
+            # folds playout_floor() into _pstart and then sleeps on it -
+            # a median of 182 s and a p90 of 793 s over 2,515 asks - so a
+            # round admitted here against the shorter number is rendered,
+            # appended to the feed as `prepared`, and refused when its
+            # entry has closed underneath it. 1,592 such rows in 48 h.
+            #
+            # ONLY on the pre-render call. Every hand-off caller passes
+            # `seconds` - its measured joined length - and has already had
+            # its own reservation excluded by _pstart's exclude_key;
+            # charging it again here would refuse a round standing at the
+            # door with its clip welded. In `off` and `shadow`
+            # playout_floor() is 0.0 and this changes nothing.
+            if seconds is None:
+                try:
+                    begins = max(begins, float(playout_floor() or 0.0))
+                except Exception:  # noqa: BLE001
+                    pass
         if start_at is not None:
             begins = max(begins, float(start_at))
         # #1166: a finished segment may run past the fold rather than not
@@ -84502,9 +84572,10 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
         return _shelf_no(kind, "the round has no takes - there is no "
                                "finished audio behind it")
     if not free and not _ready_round_fits(kind, takes, window):
-        return _shelf_no(kind, "the running order is standing on somebody "
-                               "else's slot and this round may not air "
-                               "out of turn")
+        return _shelf_no(kind, _ready_runway_no(kind)                 # [#1281]
+                         or "the running order is standing on somebody "
+                            "else's slot and this round may not air "
+                            "out of turn")
     if free and not rescue:
         try:
             pipeline_log(
@@ -84619,8 +84690,9 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
             return _shelf_no(kind, "its takes went while we waited for "
                                    "the floor")
         if not free and not _ready_round_fits(kind, takes, window):
-            return _shelf_no(kind, "the slot moved on while we waited for "
-                                   "the floor")
+            return _shelf_no(kind, _ready_runway_no(kind)             # [#1281]
+                             or "the slot moved on while we waited for "
+                                "the floor")
         entry = _ready_air_entry(kind, row)
         entry["_ready_slot"] = window
         # 2026-09-14: THE RESCUE WAS REFUSED ONE DOOR LATER. `free` (dead air,
@@ -162386,15 +162458,40 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     try:
         _blk_states: dict[int, set[str]] = {}
         for _e in events:
-            if _e.get("what") != "line":
-                continue
             _r = _e.get("row") or {}
-            _got = _ord_early.get(str(_r.get("id") or ""))
+            # [#1284] EVERY ROW THE LEDGER PLACED, NOT ONLY THE SPOKEN ONES.
+            #
+            # This asked `what == "line"` and looked the block up with a
+            # bare `.get()` on the line id. A board sting is an ACTION
+            # event and its air row carries the sample id, not the
+            # ledger's (#1133) - so it missed twice, and a block whose
+            # ledgered rows are all stings could never be counted heard.
+            # The spine forty lines below admits exactly such a row
+            # (`_blocksize >= 2`), which left it pinned at tier 1 below
+            # every heard block in the hour: measured on the live hour,
+            # 27 sting blocks holding 67 rows, every one `aired: 'page'`,
+            # standing under a hundred rows of banked dialogue they
+            # preceded on air. Every poll that crossed the tier line
+            # shoved that whole 268-row tail down past the mark - 63% of
+            # the document reindexing three times a minute.
+            #
+            # `_ord_of` is the same resolver the spine uses, so a row
+            # that can REACH the spine can now also be counted as having
+            # aired. The test is still `screenplay_was_heard`, so a block
+            # nobody heard still trails.
+            _got = _ord_of(_ord_early, _r)
             if not _got:
                 continue
             _b = int(_got[0])
             if screenplay_was_heard(_r):
                 _heard_blocks.add(_b)
+            if _e.get("what") != "line":
+                continue
+            # [#1284] ...AND THE WITHDRAWAL RULE IS LEFT ALONE. Its test
+            # is `_states <= {"withdrawn"}`; an action row carrying no
+            # state at all would widen that set and quietly stop a
+            # refused round from sinking. This patch moves rows UP into
+            # the order they aired in and must move nothing down.
             _blk_states.setdefault(_b, set()).add(str(_r.get("aired") or ""))
         for _b, _states in _blk_states.items():
             if _b not in _heard_blocks and _states and _states <= {"withdrawn"}:
