@@ -61,7 +61,10 @@ def _audio(raw, omissions):
     out = _fields(raw, ('source', 'file'),
                   ('position_start_s', 'position_end_s', 'position_s', 'duration_s',
                    'observed_at_ms', 'age_ms', 'volume', 'ready_state', 'network_state',
-                   'buffered_end_s'), ('paused', 'muted', 'player_state_available'), omissions)
+                   'buffered_end_s'),
+                  ('paused', 'muted', 'player_state_available',
+                   'from_decision'),   # [#1282] the offset came from the standing decision
+                  omissions)
     for key in ('volume', 'muted', 'ready_state', 'network_state', 'buffered_end_s'):
         if key in _mapping(raw) and raw[key] is None:
             out[key] = None
@@ -499,12 +502,38 @@ def analyze_capture(view, server_context=None):
                 and (not placed or placed == 'air')
                 and (_count(event.get('samples')) > 1 or _span_ms(event) >= 500)):
             finding('highlight_active_mismatch', index)
-        if placed == 'air' and not observed:
+        # [#1282] AND IT MUST OUTLIVE ONE PAINT, for the same reason
+        # highlight_active_mismatch must. All three occurrences in the whole
+        # book are one 500ms sample (span 0ms, samples 1) with road 'file-tail'
+        # - the playhead past the last cue window of its own file, which is the
+        # instant the player ends between the resolver's read and the recorder's.
+        # The resolver cannot place ON AIR without a read playhead; a mark that
+        # really stood on an estimate would stand for more than one sample.
+        if (placed == 'air' and not observed
+                and (_count(event.get('samples')) > 1 or _span_ms(event) >= 500)):
             finding('mark_without_evidence', index)
         if previous:
             same_id = bool(event.get('highlight_id')) and event.get('highlight_id') == previous.get('highlight_id')
             if same_id:
-                if (event.get('element_index') is not None and previous.get('element_index') is not None
+                # [#1282] THE SCRIPT'S OWN ORDER KEY IS THE DISCRIMINATOR, not the
+                # document revision. A revision guard was written here first, and it
+                # is an OFF SWITCH rather than a filter: revision() hashes every
+                # element, so it changes on every poll, and a reindex is only ever
+                # observable when the page repaints - which is exactly when a poll
+                # landed. Measured on the captures: 53 of 53 position changes also
+                # changed revision, so that test suppresses every one of them and
+                # silences the commonest real fault this book reports.
+                # (block, ord) is the ledger's reading order. If it did NOT move
+                # while the row's position did, the script did not advance and the
+                # page reordered underneath the mark: 13 of 13 such pairs moved by
+                # up to 324 rows with the key unchanged, 7 of them UPWARD while the
+                # document grew - which growth cannot do - and 9 threw the mark off
+                # the top of the pane, worst -1070px. Cause: #1284.
+                _key_now = (event.get('block'), event.get('ord'))
+                _key_was = (previous.get('block'), previous.get('ord'))
+                _order_held = (_key_now == _key_was) if _key_now[0] is not None else True
+                if (_order_held
+                        and event.get('element_index') is not None and previous.get('element_index') is not None
                         and event['element_index'] != previous['element_index']):
                     finding('same_line_dom_reindex', index)
             elif event.get('highlight_id') and previous.get('highlight_id'):
@@ -521,7 +550,13 @@ def analyze_capture(view, server_context=None):
             if same_file:
                 before, after = old_audio.get('position_end_s'), audio.get('position_start_s')
                 if before is not None and after is not None and after + .15 < before:
-                    finding('observed_position_regression', index)
+                    # [#1282] A FILE THAT BEGINS AGAIN AT ITS HEAD PLAYED TWICE; it did
+                    # not seek backward. Both occurrences in the book are a board sting
+                    # restarting: 13.340 -> 0.011 and 4.738 -> 0.001, each with
+                    # audio_discontinuity already set. Worth saying - it is a repeat -
+                    # but not as a player fault the operator should go hunting for.
+                    finding('observed_file_restart' if after <= 0.5
+                            else 'observed_position_regression', index)
                 old_row = rows.get(previous.get('active_id'), {})
                 same_revision = (event.get('document_revision')
                                  and event.get('document_revision') == previous.get('document_revision'))
@@ -541,6 +576,7 @@ def analyze_capture(view, server_context=None):
         'highlight_active_mismatch': 'The highlighted identity differs from the client active-line identity.',
         'observed_file_mismatch': 'The observed player file differs from the active row media identity; path aliases require review.',
         'observed_position_regression': 'The observed position moved backward within the same player file.',
+        'observed_file_restart': 'The same clip sounded again from its start; this is a repeat of that clip, not a backward seek.',   # [#1282]
         'same_file_line_regression': 'Active-line observations moved backward across cue windows within the same observed file.',
         'same_file_line_observation_gap': 'Active-line observations passed over a captured cue window; sampling gaps do not prove skipped audio.',
         'mark_without_evidence': 'The view marked a line ON AIR while its position was estimated, not read from a player; the mark must come from evidence.',   # [#1189]

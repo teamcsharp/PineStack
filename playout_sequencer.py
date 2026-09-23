@@ -668,13 +668,31 @@ class LinearSequencer:
         with self.lock:
             now = float(now if now is not None else self.clock())
             n = 0
+            # [#1283] A ROUND WAITING FOR THE AIR IS NOT A ROUND WHOSE
+            # MAKER DIED. This is a liveness test - "its task died or is
+            # wedged" - but a flat timeout cannot tell a dead maker from a
+            # healthy round whose slot has not come round yet. In `shadow`
+            # that never showed; `linear` made the queue real, and the
+            # queue is long (median wait 182s, p90 793s against this 240s
+            # floor). Measured live: two rendered rounds, one of them 37
+            # lines, both due to be dropped ~950s BEFORE the air they were
+            # queued for frees. So the round is only judged once its turn
+            # has actually arrived and nobody took it.
+            free_at = self._air_free_at(now, ROUTE_PAGE)
+            air_free_for = now - free_at          # >0 once the slot passed
             for key, row in list(self._held.items()):
-                if now - float(row.get("ready_at") or now) > self.held_stale_s:
-                    self._held.pop(key, None)
-                    n += 1
-                    self._count("held_stale")
-                    self._event("held_stale", key=key, road=row.get("road"),
-                                held_for_s=round(now - float(row.get("ready_at") or now), 1))
+                held_for = now - float(row.get("ready_at") or now)
+                if held_for <= self.held_stale_s:
+                    continue
+                if air_free_for < 0:
+                    # Its slot is still ahead of it. Waiting, not wedged.
+                    continue
+                self._held.pop(key, None)
+                n += 1
+                self._count("held_stale")
+                self._event("held_stale", key=key, road=row.get("road"),
+                            held_for_s=round(held_for, 1),
+                            air_was_free_for_s=round(air_free_for, 1))
             for key, row in list(self._making.items()):
                 if now - float(row.get("since") or now) > self.making_stale_s:
                     self._making.pop(key, None)

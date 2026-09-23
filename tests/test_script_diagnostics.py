@@ -7,10 +7,11 @@ from script_diagnostics import (EVENT_LIMIT, ROW_LIMIT, TEXT_LIMIT, analyze_capt
 
 
 def event(identity='a', index=5, start=0, end=1, *, file='round.wav', source='bridge',
-          first=1000, last=2000, samples=5, revision='doc-one'):
+          first=1000, last=2000, samples=5, revision='doc-one', ord0=None):
     return {'first_ms': first, 'last_ms': last, 'samples': samples,
             'highlight_id': identity, 'active_id': identity, 'element_index': index,
-            'document_revision': revision, 'block': 12, 'ord': index,
+            'document_revision': revision, 'block': 12,
+            'ord': index if ord0 is None else ord0,
             'audio': {'source': source, 'file': file,
                       'position_start_s': start, 'position_end_s': end}}
 
@@ -37,17 +38,55 @@ class CaptureAnalysisTests(unittest.TestCase):
         self.assertEqual(result['findings'], [])
 
     def test_same_identity_dom_changes_are_classified_separately(self):
-        capture = view([event(index=45), event(index=2, start=1, end=2, revision='doc-two'),
-                        event(index=8, start=2, end=3, revision='doc-three')])
+        # [#1282] THE SCRIPT ORDER HELD WHILE THE PAGE MOVED THE ROW.
+        # A revision guard was tried here first and it is an OFF SWITCH,
+        # not a filter: revision() hashes every element, so it changes on
+        # every poll, and a reindex is only observable when the page
+        # repaints - which is exactly when a poll landed. 53 of 53 real
+        # position changes also changed revision. What separates growth
+        # from reordering is (block, ord): 13 of 13 captured pairs moved
+        # by up to 324 rows with that key UNCHANGED, 7 of them UPWARD
+        # while the document grew, which growth cannot do, and 9 threw
+        # the mark off the top of the pane, worst -1070px. Cause: #1284.
+        capture = view([event(index=45, ord0=7), event(index=2, ord0=7, start=1, end=2),
+                        event(index=8, ord0=7, start=2, end=3)])
         result = analyze_capture(capture)
         self.assertEqual(self.codes(capture), {'same_line_dom_reindex'})
         self.assertEqual(result['counts']['same_line_dom_reindex'], 2)
         self.assertNotIn('highlight_identity_changes', result['counts'])
 
+    def test_a_row_whose_script_order_moved_is_not_a_reindex(self):
+        # [#1282] the other side of the same law: if (block, ord) moved,
+        # the script itself advanced and the page followed it. Not a fault.
+        capture = view([event(index=45, ord0=7), event(index=67, ord0=9, start=1, end=2)])
+        self.assertNotIn('same_line_dom_reindex', self.codes(capture))
+
     def test_observed_same_file_backwards_line_and_position(self):
-        capture = view([event('c', start=4, end=5), event('a', start=.2, end=1)])
+        # [#1282] 1.2s, not 0.2s: a backward move INSIDE one play. A step that
+        # lands on the head of the file is the file playing again - see below.
+        capture = view([event('c', start=4, end=5), event('a', start=1.2, end=2)])
         self.assertEqual(self.codes(capture),
                          {'same_file_line_regression', 'observed_position_regression'})
+
+    def test_a_clip_beginning_again_is_a_repeat_not_a_backward_seek(self):
+        # [#1282] both occurrences in the operator's book are a board sting
+        # restarting at its head: 13.340 -> 0.011 and 4.738 -> 0.001.
+        codes = self.codes(view([event('c', start=4, end=5), event('a', start=.011, end=1)]))
+        self.assertIn('observed_file_restart', codes)
+        self.assertNotIn('observed_position_regression', codes)
+
+    def test_one_sample_of_air_beside_an_estimate_is_the_paint_not_a_placement(self):
+        # [#1282] every occurrence of 'marked ON AIR while its position was
+        # estimated' in the captures is one 500ms sample at the end of a clip,
+        # where the player ends between the resolver's read and the recorder's.
+        flicker = event('a', source='estimated', file='', samples=1, first=1000, last=1000)
+        flicker['mark'] = 'air'
+        self.assertNotIn('mark_without_evidence', self.codes(view([flicker])))
+
+    def test_a_mark_that_stands_on_an_estimate_is_still_reported(self):
+        standing = event('a', source='estimated', file='', samples=6, first=1000, last=3500)
+        standing['mark'] = 'air'
+        self.assertIn('mark_without_evidence', self.codes(view([standing])))
 
     def test_forward_missing_observation_is_not_declared_skipped_audio(self):
         result = analyze_capture(view([event('a'), event('c', start=4, end=5)]))
