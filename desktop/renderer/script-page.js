@@ -6031,11 +6031,38 @@
     if (!pane || !rec) return;
     var lit = pane.querySelector('.sp-el.sp-now');
     var idx = diagnosticIndices.has(lit) ? diagnosticIndices.get(lit) : -1;
-    var audio = root.PineScriptDiagnostics.readAudio(bridgeHead(), soundingPlayer(), streamAt());
     /* [#1189] THE RESOLVER'S OWN ANSWER, not a second computation. The
        recorder used to call activeRow() itself; the highlight was placed
        by another timer from another call. */
     var decision = lastDecision || {};
+    var audio = root.PineScriptDiagnostics.readAudio(bridgeHead(), soundingPlayer(), streamAt());
+    /* [#1282] THE MARK AND ITS EVIDENCE ARE ONE READ.
+
+       readAudio() above is a SECOND read of the player, milliseconds after
+       the one inside evidence() that placed the mark. At the end of a clip
+       the element ends between them, streamAt() falls back to the station
+       clock, and the sample was written down as `mark: "air"` beside
+       `source: "estimated"` - a fault the view never committed. Every
+       occurrence of "marked ON AIR while its position was estimated" in the
+       captures is exactly that: one 500ms sample, road `file-tail`, which is
+       the last instant of the file. Measured at that sample: the resolver
+       read 32.41s off the player, the clock said 29.38s.
+
+       The decision already carries the evidence that placed it - source,
+       file, offset and the ms it was read. When the fresh read has nothing
+       and the decision was read off a player, that is what the sample
+       records. An estimate is never written beside a placed mark, and
+       selectMappings() below gets a real filename again, so the capture
+       keeps the cue rows of the clip that was sounding. */
+    if ((audio.source === 'estimated' || audio.source === 'unavailable')
+        && (decision.source === 'bridge' || decision.source === 'local')
+        && decision.t !== null && decision.t !== undefined && isFinite(Number(decision.t))) {
+      audio = {source: String(decision.source), file: String(decision.file || ''),
+        position_s: Number(decision.t),
+        observed_at_ms: isFinite(Number(decision.at_ms)) ? Number(decision.at_ms) : null,
+        from_decision: true, player_state_available: false, volume: null,
+        muted: null, ready_state: null, network_state: null, buffered_end_s: null};
+    }
     var active = decision.mark === 'air' ? {id: String(decision.line_id || '')} : {};
     var feed = [];
     try { feed = root.PineStationFeed.rows() || []; } catch (e) { /* no feed */ }
