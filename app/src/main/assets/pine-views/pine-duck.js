@@ -87,8 +87,10 @@
         if (!got) {
           got = {node: node, was: node.volume, set: 0};
           lowered.push(got);
-        } else if (Math.abs(node.volume - got.set) > 0.001 && node.volume > got.set) {
-          /* somebody raised it while we held it: that is their new level */
+        } else if (Math.abs(node.volume - got.set) > 0.001) {
+          /* Somebody moved the canonical level while this hold stood. Both
+             raises and cuts are authoritative; release must restore the new
+             value, never the number captured when the sheet opened. */
           got.was = node.volume;
         }
         got.set = Math.min(got.was, lvl);
@@ -113,11 +115,21 @@
       current = 1;
       restore();
       if (sweeper) { clearInterval(sweeper); sweeper = null; }
+      try {
+        if (root.pineLevels && typeof root.pineLevels.refresh === 'function') {
+          root.pineLevels.refresh('video');
+        }
+      } catch (err) { /* no native wall on this surface */ }
       return;
     }
     current = lvl;
     apply(lvl);
     if (!sweeper) sweeper = setInterval(sweep, SWEEP_MS);
+    try {
+      if (root.pineLevels && typeof root.pineLevels.refresh === 'function') {
+        root.pineLevels.refresh('video');
+      }
+    } catch (err) { /* no native wall on this surface */ }
   }
 
   /* Twice a second while anything is held: drop holds whose element has
@@ -235,7 +247,8 @@
        without closing still ends the quiet. */
     reporting: reporting,
     watch: watch,
+    refresh: function () { if (current < 1) apply(current); return current; },
     REPORT: 0.10,       /* a report, an inbox, a diagnostic: the broadcast at 10% */
-    DICTATION: 0.02     /* the dot listening: 2% */
+    DICTATION: 0        /* dictation owns the microphone: complete silence */
   };
 })(typeof window !== 'undefined' ? window : globalThis);

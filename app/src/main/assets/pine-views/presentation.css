@@ -286,6 +286,16 @@
    shape comes up. object-fit contain, because a video wall that crops the
    station's own work is showing the wrong thing. */
 .pv-video { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #000; display: block; cursor: pointer; }
+.pv-video[hidden], .pv-wallposter[hidden] { display: none; }
+.pv-wallposter {
+  position: absolute; top: 50%; left: 50%; width: 96px; height: 96px;
+  max-width: 25%; max-height: 75%; object-fit: contain;
+  transform: translate(-50%, -50%); pointer-events: none;
+}
+.pv-wallposter.actual {
+  top: 0; left: 0; width: 100%; height: 100%; max-width: none;
+  max-height: none; transform: none;
+}
 .pv-wallsay {
   position: absolute;
   left: 0; right: 0; bottom: 0;

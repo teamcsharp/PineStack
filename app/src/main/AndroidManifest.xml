@@ -138,12 +138,11 @@
          unreadable and the "why is the panel blank" banner cannot say
          "no network" as opposed to "station down". -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <!-- The talk dot. This terminal has NO speech recognizer of its own -
-         measured: `cmd package query-services -a
-         android.speech.RecognitionService` returns "No services found" on
-         this GApps-less GSI - so the clip is recorded here and the STATION
-         hears it, through /api/listen/transcribe to wyoming-whisper. -->
+    <!-- Local speech entry points use this permission to capture a clip. The
+         station transcribes it through /api/listen/transcribe. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <!-- No Play Services on this device, and nothing here wants a camera,
          a SIM or a touchscreen stylus. Declared so a future Play listing
@@ -163,6 +162,30 @@
         android:theme="@style/Theme.PineBoxKiosk"
         android:networkSecurityConfig="@xml/network_security_config"
         tools:targetApi="34">
+
+        <service
+            android:name=".audio.PineRecognitionService"
+            android:label="Pine Box speech recognition"
+            android:exported="true"
+            android:permission="android.permission.BIND_SPEECH_RECOGNITION">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+            </intent-filter>
+            <meta-data android:name="android.speech"
+                android:resource="@xml/pine_recognition_service" />
+        </service>
+
+        <service
+            android:name=".audio.PineVoiceImeService"
+            android:label="@string/pine_voice_ime"
+            android:exported="true"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data android:name="android.view.im"
+                android:resource="@xml/pine_voice_ime" />
+        </service>
 
         <!-- EVERY ORIENTATION. screenOrientation was sensorLandscape, which
              was right while the tablet was only ever going on a wall; the

@@ -851,9 +851,16 @@
     const print = state.file + ":" + state.revision;
     if (print === wallPrint) return;
     wallPrint = print;
+    if (screen.pineResetFrame) screen.pineResetFrame();
     if (!state.ready) {
+      screen.style.visibility = "hidden";
+      screen.hidden = false;
       screen.removeAttribute("src");
       if (still) { still.removeAttribute("src"); still.hidden = true; }
+      const poster = el("pvWallPoster");
+      poster.classList.remove("actual");
+      poster.src = absolute("/spark/asset/pinebox.png");
+      poster.hidden = false;
       return;
     }
     if (state.still) {
@@ -862,10 +869,17 @@
       screen.pause();
       screen.removeAttribute("src");
       screen.hidden = true;
+      el("pvWallPoster").hidden = true;
       if (still) { still.src = state.clip.src; still.hidden = false; }
       return;
     }
     if (still) { still.removeAttribute("src"); still.hidden = true; }
+    screen.style.visibility = "hidden";
+    const poster = el("pvWallPoster");
+    poster.hidden = false;
+    const posterUrl = state.poster_url || (state.clip && state.clip.poster_url);
+    poster.classList.toggle("actual", !!posterUrl);
+    poster.src = absolute(posterUrl || "/spark/asset/pinebox.png");
     screen.hidden = false;
     screen.src = state.clip.src;
     screen.play().catch(() => { /* an autoplay refusal is not a fault here */ });
@@ -975,6 +989,7 @@
       + '<span id="pvWallCount" class="pv-dim"></span></h3>'
       + '<div class="pv-wallbox">'
       + '<video id="pvWall" class="pv-video" muted playsinline></video>'
+      + '<img id="pvWallPoster" class="pv-wallposter" alt="">'
       /* THE STILL SHARES THE BOX. The wall falls back to stills whenever
        * the station has no clips - measured: 40 gallery entries, zero of
        * them video - and a <video> cannot show a .png. Two elements, one
@@ -995,6 +1010,13 @@
       + '</div><div id="pvNote" class="pv-note"></div>';
 
     const screen = el("pvWall");
+    const wallPoster = el("pvWallPoster");
+    wallPoster.src = absolute("/spark/asset/pinebox.png");
+    wallPoster.addEventListener("error", () => {
+      const fallback = absolute("/spark/asset/pinebox.png");
+      wallPoster.classList.remove("actual");
+      if (wallPoster.getAttribute("src") !== fallback) wallPoster.src = fallback;
+    });
     /* The clip ENDS and the wall moves on. This is an element event, not
      * a timer - the module's own cap is only the backstop for a file that
      * never finishes. */
@@ -1018,19 +1040,62 @@
         if (screen.readyState < 2) transition.start();
       });
     }
-    const showWaiting = () => {
+    let frameGeneration = 0;
+    let firstTime = NaN;
+    let framePending = false;
+    let frameShown = false;
+    const frameReady = () => screen.readyState >= 2
+      && screen.videoWidth > 0 && screen.videoHeight > 0;
+    const hideFrame = () => {
+      frameGeneration += 1;
+      firstTime = NaN;
+      framePending = false;
+      frameShown = false;
       screen.style.visibility = "hidden";
+    };
+    screen.pineResetFrame = hideFrame;
+    const showWaiting = () => {
+      hideFrame();
+      if (screen.hidden) {
+        wallPoster.hidden = true;
+        if (transition) transition.stop();
+        return;
+      }
+      wallPoster.hidden = false;
       if (transition) transition.start();
     };
     const showClip = () => {
+      if (frameShown || !frameReady()) return;
+      frameShown = true;
       screen.style.visibility = "visible";
+      wallPoster.hidden = true;
       if (transition) transition.stop();
+    };
+    const armFrame = () => {
+      if (!frameReady()) return;
+      if (!Number.isFinite(firstTime)) firstTime = Number(screen.currentTime) || 0;
+      if (typeof screen.requestVideoFrameCallback !== "function" || framePending) return;
+      framePending = true;
+      const token = frameGeneration;
+      try {
+        screen.requestVideoFrameCallback(() => {
+          if (token !== frameGeneration) return;
+          framePending = false;
+          showClip();
+        });
+      } catch (err) { framePending = false; /* playback progress remains the fallback */ }
     };
     screen.addEventListener("loadstart", showWaiting);
     screen.addEventListener("emptied", showWaiting);
     screen.addEventListener("waiting", showWaiting);
-    screen.addEventListener("loadeddata", showClip);
-    screen.addEventListener("playing", showClip);
+    screen.addEventListener("loadeddata", armFrame);
+    screen.addEventListener("playing", armFrame);
+    screen.addEventListener("seeked", () => { if (!screen.seeking) showClip(); });
+    screen.addEventListener("timeupdate", () => {
+      if (!Number.isFinite(firstTime)) { armFrame(); return; }
+      if (Number.isFinite(firstTime)
+        && Number(screen.currentTime) > firstTime + 0.04) showClip();
+    });
     showWaiting();
 
     /* TAP THE PICTURE TO CHANGE WHAT IT SHOWS.
@@ -1100,7 +1165,11 @@
     source = root.PinePresentationSource.create({
       get: (route) => api().get(route),
       post: (route, body) => api().post(route, body),
-      subscribe: root.PineStationFeed ? root.PineStationFeed.subscribe : null
+      subscribe: root.PineStationFeed ? (fn) => {
+        return root.PineStationFeed.subscribeView
+          ? root.PineStationFeed.subscribeView(target, fn)
+          : root.PineStationFeed.subscribe(fn);
+      } : null
     });
     wall = root.PineVideoWall.create({
       /* Through the gate, not around it - so the wall and the gallery

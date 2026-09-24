@@ -74,7 +74,14 @@
         }
       }
     }
-    const live = current || station.speaking_now;
+    const reported = station.speaking_now;
+    /* stream_now is the accurate clock but its rows carry only id/from/until.
+     * Merge the same-ID speaking report before falling back to chat so a
+     * restart or a short chat ring can never erase words the station is
+     * explicitly reporting as audible. */
+    const live = current
+      ? {...((reported && String(reported.id) === String(current.id)) ? reported : {}), ...current}
+      : reported;
     if (live?.id) {
       const before = rows.get(String(live.id)) || {};
       /* [#1386] THE SPEAKING LINE STAYS WHERE THE SCRIPT PUT IT.

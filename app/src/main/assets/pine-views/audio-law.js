@@ -726,9 +726,10 @@
   /* ================================================================== */
 
   var LEVEL_KINDS = ['voice', 'music', 'sfx', 'video'];
-  /* Video and SFX land on real element volumes and stop at 1. Dialogue and
-     music have real gain stages and retain the panel's full 600% range. */
-  var LEVEL_CEIL = {voice: 6, music: 6, sfx: 1, video: 1};
+  /* One public contract on every surface. Values above unity are carried by
+     the page's gain stages and, for the native wall, Android's loudness
+     stage. No control may advertise travel that its output silently clips. */
+  var LEVEL_CEIL = {voice: 2, music: 2, sfx: 2, video: 2};
   var LEVEL_KEY = 'pineListenerLevels';
   var LEGACY_LEVEL_KEY = 'pineMixer';
 
@@ -737,6 +738,14 @@
   var lvlWatchers = [];
   var lvlShellSeen = {at: 0, is: false};
   var lvlWallSent = null;       /* the last value the native wall was told */
+  /* Keep the low-level mixer as an implementation detail. Once the public
+     compatibility methods below are installed, every old pineMixer.set()
+     call must enter the canonical store without making our own apply path
+     recurse back into itself. */
+  var lvlMixerSetRaw = root.pineMixer && typeof root.pineMixer.set === 'function'
+    ? root.pineMixer.set.bind(root.pineMixer) : null;
+  var lvlMixerApplyRaw = root.pineMixer && typeof root.pineMixer.apply === 'function'
+    ? root.pineMixer.apply.bind(root.pineMixer) : null;
 
   function lvlNum(kind, value) {
     var n = Number(value);
@@ -837,8 +846,8 @@
       }
     }
     try {
-      if (root.pineMixer && typeof root.pineMixer.set === 'function') {
-        root.pineMixer.set(mixer);
+      if (lvlMixerSetRaw) {
+        lvlMixerSetRaw(mixer);
         touched = true;
       }
     } catch (err) { /* the element writes below still stand */ }
@@ -852,6 +861,28 @@
       try { input.dispatchEvent(new Event('change', {bubbles: true})); }
       catch (err3) { /* as above */ }
       touched = true;
+    }
+    /* Keep the source at unity for positive levels; zero is a transport
+       stop, including when a station poll tries to play the record again. */
+    if (typeof m.music === 'number') {
+      try {
+        var player = document.getElementById('musicPlayer');
+        if (player) {
+          if (!player.__pineLevelPlayGuard) {
+            player.__pineLevelPlayGuard = true;
+            player.addEventListener('play', function () {
+              if (levelsGet().music <= 0) player.pause();
+            });
+          }
+          if (m.music <= 0) {
+            if (!player.paused) player.pause();
+          } else {
+            if (Math.abs(Number(player.volume) - 1) > 0.001) player.volume = 1;
+            if (player.muted) player.muted = false;
+          }
+          touched = true;
+        }
+      } catch (err5) { /* no panel player in this document */ }
     }
     try { if (Object.keys(gains).length && typeof root.djApplyGain === 'function') root.djApplyGain(); }
     catch (err4) { /* the event normally owns this */ }
@@ -872,7 +903,7 @@
       try {
         var list = document.querySelectorAll('.sfx-tv-tube video, .sfx-tv-screen video');
         for (var i = 0; i < list.length; i += 1) {
-          list[i].volume = v;
+          list[i].volume = Math.min(1, v);
           if (v > 0 && list[i].muted) list[i].muted = false;
           touched = true;
         }
@@ -891,6 +922,13 @@
      bridge calls for one drag. */
   function lvlWall(v) {
     var want = lvlNum('video', v);
+    /* The native wall is outside the DOM, so PineDuck cannot lower it by
+       walking media elements. Apply the same temporary hold here. */
+    try {
+      if (root.PineDuck && typeof root.PineDuck.level === 'function') {
+        want *= Math.max(0, Math.min(1, Number(root.PineDuck.level()) || 0));
+      }
+    } catch (err0) { /* the persisted level still applies */ }
     try {
       if (typeof root.pineWallLevel === 'function') return !!root.pineWallLevel(want);
     } catch (err) { /* the direct road below */ }
@@ -925,7 +963,7 @@
          its own television and every webview through applyAppVolume, and
          there is no native wall in that window, which is why roads() says
          'shell' and nothing else. */
-      try { if (root.pineMixer && root.pineMixer.set) root.pineMixer.set(want); }
+      try { if (lvlMixerSetRaw) lvlMixerSetRaw(want); }
       catch (err) { /* the drawer label already moved */ }
       return;
     }
@@ -948,7 +986,7 @@
    *   pineLevels.apply('video', 0.3)
    *
    * `kind` is one of voice | music | sfx | video; `value` is a fraction
-   * where 1 is unity (video/SFX stop at 1, voice/music reach 6). Returns the
+   * where 1 is unity and every stream reaches 2. Returns the
    * roads taken, synchronously, so a label can be honest in the same frame:
    * 'local', 'shell', 'wall', or '' when there is nothing here to move.
    */
@@ -1012,6 +1050,37 @@
     };
   }
 
+  /* Reassert persisted state after a temporary owner (dictation/report
+     duck, focus change, player rebuild) releases it. This does not invent a
+     second value: it rereads the one canonical record and forces only the
+     output latches to move. */
+  function levelsRefresh(kind) {
+    var all = levelsGet();
+    var values = {};
+    if (LEVEL_CEIL[kind] !== undefined) values[kind] = all[kind];
+    else values = all;
+    if (kind === 'video' || !kind) lvlWallSent = null;
+    var roads = [];
+    if (lvlShellDoc()) {
+      try { if (lvlMixerSetRaw) lvlMixerSetRaw(values); roads.push('shell'); }
+      catch (err) { /* a later frame will retry */ }
+    } else {
+      if (lvlLocalNow(values)) roads.push('local');
+      if ((typeof values.video === 'number')
+          && root.pineDesktop && typeof root.pineDesktop.videoWall === 'function') {
+        lvlWall(values.video);
+        roads.push('wall');
+      }
+      try {
+        if (root.PineDuck && typeof root.PineDuck.refresh === 'function') {
+          root.PineDuck.refresh();
+        }
+      } catch (err2) { /* no temporary hold */ }
+    }
+    lvlTell(all, roads);
+    return roads.join('+');
+  }
+
   /* Named `pineLevels`, lower case, beside window.pineMixer and
      window.pineDesktop, because it is a bus and not a view.  PineLevels
      (capital P, pine-levels.js #1222) is the tablet's levels SHEET and is a
@@ -1023,12 +1092,31 @@
       get: levelsGet,
       apply: levelsApply,
       applyAll: levelsApplyAll,
+      refresh: levelsRefresh,
       roads: levelsRoads,
       onApply: levelsWatch,
       /* For a level set somewhere else that must land here too - the shell
          crossing into a panel, a future postMessage.  Same arithmetic, no
          store write of its own beyond the merge. */
       take: function (values) { return levelsApplyAll(values); }
+    };
+  }
+  /* Compatibility is an alias, not a second state. Several older views and
+     the self-heal path still speak pineMixer; make those writes canonical so
+     they can never temporarily override a setting and then snap back. The
+     raw functions captured above remain the bus's private output stage. */
+  if (root.pineMixer) {
+    root.pineMixer.get = levelsGet;
+    root.pineMixer.set = function (values) {
+      levelsApplyAll(values || {});
+      return levelsGet();
+    };
+    root.pineMixer.apply = function () {
+      levelsApplyAll(levelsGet());
+      if (lvlMixerApplyRaw) {
+        try { lvlMixerApplyRaw(); } catch (err) { /* canonical apply already ran */ }
+      }
+      return levelsGet();
     };
   }
   /* Apply the migrated or persisted law once the panel has mounted. Every

@@ -48,7 +48,25 @@
       const offset = (clock() / 1000) - Number(stream.at);
       if (offset >= 0 && offset <= Number(stream.length || 0) + 4) {
         for (const row of stream.rows || []) {
-          if (Number(row.from) <= offset && offset < Number(row.until)) return row;
+          if (Number(row.from) <= offset && offset < Number(row.until)) {
+            /* stream_now is the accurate clock, but its rows are usually
+             * only {id, from, until}. speaking_now carries words yet is a
+             * four-second snapshot, so around every short-line boundary it
+             * can still describe the previous turn. Enrich the clock-selected
+             * id from the already-fetched full feed instead of either showing
+             * a blank strip or borrowing the stale line's words. */
+            const id = String(row.id || "");
+            const reported = station.speaking_now;
+            const rich = rows.find((item) => String((item || {}).id || "") === id)
+              || (station.chat || []).find((item) => String((item || {}).id || "") === id)
+              || null;
+            const exact = reported && String(reported.id || "") === id
+              ? reported : null;
+            const merged = {...(rich || {}), ...(exact || {}), ...row};
+            merged.text = String((exact && exact.text)
+              || (rich && rich.text) || row.text || "");
+            return merged;
+          }
         }
       }
     }
@@ -70,8 +88,9 @@
     try { console.error("[station-feed] a subscriber threw: " + why, err); } catch (e) {}
   }
 
-  function emit(kind) {
-    const payload = { kind, station, rows, now: speakingNow(), at: clock() };
+  function emit(kind, error) {
+    const payload = { kind, station, rows, now: speakingNow(), at: clock(),
+      error: error ? String((error && error.message) || error) : "" };
     for (const fn of [...listeners]) {
       try { fn(payload); } catch (err) { said(err); }
     }
@@ -91,7 +110,7 @@
         emit("poll");
       }
     } catch (err) {
-      emit("error");
+      emit("error", err);
     } finally {
       inFlight = false;
     }
@@ -170,6 +189,67 @@
     rafId = null;
   }
 
+  /* A mounted view remains in the document after the operator changes tabs.
+   * Keeping its subscription is useful - it must not start another poll when
+   * the tab comes back - but repainting a hidden screenplay, sampler and
+   * presentation wall four times a second is pure main-thread work. Hold the
+   * newest beat while the host is hidden, then deliver exactly that beat as
+   * soon as the host becomes visible again. The ordinary subscribe() remains
+   * available for hardware producers and overlays which really do work while
+   * their panel is closed. */
+  function hostIsActive(host) {
+    if (!host) return true;
+    const doc = root.document;
+    if (doc && doc.hidden) return false;
+    if (host.hidden) return false;
+    if (host.classList && (host.classList.contains("active")
+        || host.classList.contains("open"))) return true;
+    /* offsetParent is the final authority for the desktop's display:none
+     * views. It is absent in small DOM shims, where the class test above is
+     * the only useful signal. */
+    return typeof host.offsetParent !== "undefined" && host.offsetParent !== null;
+  }
+
+  function subscribeView(host, fn) {
+    if (typeof fn !== "function") return () => {};
+    let latest = null;
+    let delivered = null;
+    let observer = null;
+    let gone = false;
+
+    function deliver(payload) {
+      latest = payload;
+      if (gone || !hostIsActive(host)) return;
+      delivered = payload;
+      try { fn(payload); } catch (err) { said(err); }
+    }
+
+    function wake() {
+      if (!latest || latest === delivered || !hostIsActive(host)) return;
+      delivered = latest;
+      try { fn(latest); } catch (err) { said(err); }
+    }
+
+    const leave = root.PineStationFeed.subscribe(deliver);
+    const doc = root.document;
+    if (doc && typeof doc.addEventListener === "function") {
+      doc.addEventListener("visibilitychange", wake);
+    }
+    if (host && typeof root.MutationObserver === "function") {
+      observer = new root.MutationObserver(wake);
+      try { observer.observe(host, { attributes: true, attributeFilter: ["class", "hidden"] }); }
+      catch (err) { observer = null; }
+    }
+    return () => {
+      gone = true;
+      leave();
+      if (observer) observer.disconnect();
+      if (doc && typeof doc.removeEventListener === "function") {
+        doc.removeEventListener("visibilitychange", wake);
+      }
+    };
+  }
+
   root.PineStationFeed = {
     subscribe(fn) {
       if (typeof fn !== "function") return () => {};
@@ -186,6 +266,7 @@
         if (!listeners.size) stop();
       };
     },
+    subscribeView,
     refresh: poll,
     state() { return station; },
     rows() { return rows; },

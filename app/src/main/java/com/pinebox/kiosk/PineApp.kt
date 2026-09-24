@@ -1,6 +1,9 @@
 package com.pinebox.kiosk
 
 import android.app.Application
+import android.content.ComponentName
+import android.provider.Settings
+import android.util.Log
 import android.webkit.WebView
 import com.pinebox.kiosk.config.ConfigStore
 import com.pinebox.kiosk.feed.StationFeed
@@ -57,6 +60,16 @@ class PineApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+
+        val key = "voice_recognition_service"
+        if (Settings.Secure.getString(contentResolver, key).isNullOrBlank()) {
+            val component = ComponentName(this, com.pinebox.kiosk.audio.PineRecognitionService::class.java)
+            try {
+                Settings.Secure.putString(contentResolver, key, component.flattenToString())
+            } catch (err: SecurityException) {
+                Log.w("PineRecognition", "cannot select default recognizer", err)
+            }
+        }
 
         /* HERE, NOT IN THE ACTIVITY. The wallpaper's whole point is to be
          * right when the app is NOT the thing on screen - a locked tablet

@@ -3,6 +3,7 @@ package com.pinebox.kiosk.net
 import com.pinebox.kiosk.config.Config
 import com.pinebox.kiosk.config.ConfigStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
@@ -19,7 +20,6 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlin.coroutines.suspendCoroutine
 
 /** What the station said when it refused. Carries the HTTP code so a caller
  *  can tell "wrong key" from "the box is down". */
@@ -92,6 +92,16 @@ class StationClient(private val configStore: ConfigStore) {
          * exactly that kind of client. */
         .connectionPool(okhttp3.ConnectionPool(4, 5, TimeUnit.MINUTES))
         .retryOnConnectionFailure(true)
+        .build()
+
+    /* The endless wall must never spend the length of its runway waiting for
+     * one optional clip. Media offered to that wall is small, local-LAN
+     * material; a miss is answered by its on-device larder. */
+    private val media: OkHttpClient = http.newBuilder()
+        .connectTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
         .build()
 
     /* THE SLOW ROADS GET THEIR OWN CLIENT.
@@ -278,6 +288,42 @@ class StationClient(private val configStore: ConfigStore) {
         }
     }
 
+    /** Stream a signed gallery export without placing a video or ZIP on the WebView heap. */
+    suspend fun getGalleryExport(route: String, target: File): Pair<Long, String> {
+        if (!route.startsWith("/api/gallery/export/file?")) {
+            throw StationException(400, "that is not a gallery export route")
+        }
+        val cfg = configStore.read()
+        val builder = Request.Builder().url(Reach.base(cfg) + route).get()
+        if (cfg.apiKey.isNotBlank()) builder.header("Authorization", "Bearer " + cfg.apiKey)
+        return withContext(Dispatchers.IO) {
+            upload.newCall(builder.build()).execute().use { answer ->
+                if (!answer.isSuccessful) throw StationException(answer.code, "the station said " + answer.code)
+                val body = answer.body ?: throw StationException(502, "no gallery file came back")
+                val limit = 1024L * 1024 * 1024
+                if (body.contentLength() > limit) throw StationException(413, "gallery export exceeds 1 GiB")
+                val kind = answer.header("Content-Type")?.substringBefore(';') ?: "application/octet-stream"
+                var written = 0L
+                try {
+                    body.byteStream().use { input -> target.outputStream().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            written += count
+                            if (written > limit) throw StationException(413, "gallery export exceeds 1 GiB")
+                            output.write(buffer, 0, count)
+                        }
+                    } }
+                    if (written == 0L || (body.contentLength() >= 0 && written != body.contentLength())) {
+                        throw StationException(502, "gallery export download was incomplete")
+                    }
+                    Pair(written, kind)
+                } catch (err: Exception) { target.delete(); throw err }
+            }
+        }
+    }
+
     /**
      * GET raw bytes - a clip, not JSON.
      *
@@ -290,6 +336,33 @@ class StationClient(private val configStore: ConfigStore) {
      * @return the bytes and the content type the station declared.
      */
     suspend fun getBytes(route: String): Pair<ByteArray, String> {
+        return getBytesWith(route, patient)
+    }
+
+    /** A bounded fetch for optional playback media with an offline fallback. */
+    suspend fun getMediaBytes(route: String): Pair<ByteArray, String> {
+        return getBytesWith(route, media)
+    }
+
+    /** A bounded JSON read used by the native video's replenishment loop. */
+    suspend fun getMediaText(route: String): String {
+        val cfg = configStore.read()
+        val url = if (route.startsWith("http://") || route.startsWith("https://")) {
+            route
+        } else {
+            Reach.base(cfg) + (if (route.startsWith("/")) route else "/$route")
+        }
+        val builder = Request.Builder().url(url).get().header("Accept", "application/json")
+        if (cfg.apiKey.isNotBlank()) builder.header("Authorization", "Bearer " + cfg.apiKey)
+        val (code, text) = call(builder.build(), media)
+        if (code !in 200..299) throw StationException(code, detailOf(text, code))
+        return text
+    }
+
+    private suspend fun getBytesWith(
+        route: String,
+        using: OkHttpClient,
+    ): Pair<ByteArray, String> {
         val cfg = configStore.read()
         val url = if (route.startsWith("http")) route else {
             Reach.base(cfg) + (if (route.startsWith("/")) route else "/" + route)
@@ -297,7 +370,7 @@ class StationClient(private val configStore: ConfigStore) {
         val builder = Request.Builder().url(url).get()
         if (cfg.apiKey.isNotBlank()) builder.header("Authorization", "Bearer " + cfg.apiKey)
         return withContext(Dispatchers.IO) {
-            patient.newCall(builder.build()).execute().use { answer ->
+            using.newCall(builder.build()).execute().use { answer ->
                 if (!answer.isSuccessful) {
                     throw StationException(answer.code, "the station said " + answer.code)
                 }
@@ -371,8 +444,10 @@ class StationClient(private val configStore: ConfigStore) {
         using: OkHttpClient = http,
     ): Pair<Int, String> =
         withContext(Dispatchers.IO) {
-            suspendCoroutine { cont ->
-                using.newCall(request).enqueue(object : Callback {
+            suspendCancellableCoroutine { cont ->
+                val call = using.newCall(request)
+                cont.invokeOnCancellation { call.cancel() }
+                call.enqueue(object : Callback {
                     override fun onFailure(call: Call, e: IOException) {
                         cont.resumeWithException(e)
                     }

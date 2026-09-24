@@ -76,7 +76,8 @@
 
   /* HOW OFTEN IT ASKS, AND WHY THAT NUMBER.
    *
-   * Five seconds, and NOTHING AT ALL while it is shut.
+   * Five seconds while the glass is open. The persistent recovery indicator
+   * has its own slower watch below, including while the glass is shut.
    *
    * The reasoning is not "five feels live". It is that the register on the
    * server is the memory: orch_turn/orch_step keep a 240-deep tail of every
@@ -90,8 +91,7 @@
    * behind six permanently full HTTP/1.1 sockets, and a 650-byte
    * /api/radio/clock 21 s; that queue is what the operator feels as "the
    * popup is slow". So it is one route, one request, five seconds, and the
-   * timer is cleared on close rather than left running against a hidden
-   * box - a closed pop-up asks for nothing. */
+   * timer is cleared on close rather than left running against a hidden box. */
   var EVERY_MS = 5000;
 
   /* The avatar's own clock. Six frames a second is enough for a blink and a
@@ -1240,11 +1240,10 @@
   var OFFERS_SAID = null;       /* what the host said about the last press */
   var OFFERS_TIMER = 0;
 
-  /* The only POST this panel makes. get() above is the read road and is
-     used by the five-second poll; this is reached only by a human pressing
-     a button twice, which is why a write door is acceptable on a surface
-     whose whole rule is that a panel read may never become a station
-     action. */
+  /* Station writes from this panel are explicit operator presses. get()
+   * above and the recovery watch below never call either write door. Tier
+   * offers require two presses; restoring an operator pause requires a tap
+   * on the plainly labelled mascot or its control in the glass. */
   function post(path) {
     try {
       if (root.pineDesktop && root.pineDesktop.post) return root.pineDesktop.post(path, {});
@@ -2735,6 +2734,18 @@
     });
     node.appendChild(say);
 
+    var recovery = el('button', 'og-recovery');
+    recovery.setAttribute('type', 'button');
+    recovery.setAttribute('title', 'Open recovery control');
+    recovery.appendChild(el('span', 'og-recovery-state', 'Recovery status unavailable'));
+    recovery.appendChild(el('span', 'og-recovery-step', ''));
+    recovery.appendChild(el('span', 'og-recovery-note', ''));
+    recovery.addEventListener('click', function (ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      openRecovery();
+    });
+    node.appendChild(recovery);
+
     /* [#1186] the one line that admits the panel is holding something back. */
     var held = el('div', 'og-held', '');
     held.hidden = true;
@@ -2863,6 +2874,8 @@
     recall();
     recallMini();          /* [#1213] he left it folded, it comes back folded */
     box = build();
+    paintRecovery();
+    startRecoveryWatch();
     applyMini();           /* [#1213] */
     frame = 0;
     sayAt = 0;
@@ -2899,6 +2912,7 @@
     holding = false;
     if (box && box.parentNode) box.parentNode.removeChild(box);
     box = null;
+    stopRecoveryWatch();
     pressed = false;
     /* [#1186] every clock back to zero, or the next open inherits a hold
        nobody is standing in. */
@@ -2918,13 +2932,152 @@
    * (#980's glyphyDot): a small draggable face that sits out of the way,
    * remembers where it was put, and opens the glass when it is pressed.
    *
-   * IT POLLS NOTHING. The dot's face is a fixed frame - no timer, no
-   * request - because "a closed pop-up must ask for nothing at all" has to
-   * include the thing that opens it. The face only starts moving, and the
-   * station is only asked anything, once the glass is actually up. */
+   * The face stays fixed, but its status now follows the broadcast watch.
+   * The recovery poll is bounded and independent of the detailed glass. */
   var dotNode = null;
   var DOT_PLACE = 'pineOrchDotAt';
   var DOT_SHUT = 'pineOrchDotShut';
+  var RECOVERY_MS = 10000;
+  var recoveryTimer = null;
+  var recoveryPending = false;
+  var restorePending = false;
+  var recoveryEpoch = 0;
+  var recovery = {kind: 'unknown', headline: 'Checking station', step: '', note: ''};
+
+  function recoveryValue(watch, health, consoleState) {
+    if (!watch && !health && !consoleState) {
+      return {kind: 'unknown', headline: 'Station unreachable', step: '', note: ''};
+    }
+    var off = !!((watch && watch.on === false) || (consoleState && consoleState.on === false));
+    var paused = !!((watch && watch.paused) || (health && health.paused)
+      || (consoleState && consoleState.paused));
+    if (paused || off) {
+      return {kind: paused ? 'paused' : 'offair',
+        headline: paused ? 'Station paused' : 'Off air',
+        step: paused ? 'Tap to resume' : 'Tap to put FM on',
+        note: (health && health.say) || ''};
+    }
+    var working = !!((watch && watch.working) || (consoleState && consoleState.watch_working));
+    var rung = watch && typeof watch.rung === 'string' ? watch.rung : '';
+    var ladder = watch && Array.isArray(watch.ladder) ? watch.ladder : [];
+    var index = -1;
+    for (var i = 0; i < ladder.length; i += 1) {
+      if (ladder[i] && ladder[i].step === rung) { index = i; break; }
+    }
+    if (working) {
+      var number = index >= 0 ? ' ' + (index + 1) + '/' + ladder.length : '';
+      return {kind: 'working', headline: 'Recovering' + number,
+        step: rung || (consoleState && consoleState.watch_road) || 'Step in progress',
+        note: (watch && watch.say) || (consoleState && consoleState.watch) || ''};
+    }
+    if ((health && health.stuck) || (consoleState && (consoleState.stuck || consoleState.dead_air_parked))) {
+      return {kind: 'attention', headline: 'Recovery needed',
+        step: (health && health.say) || (consoleState && consoleState.why) || 'Open recovery control',
+        note: (consoleState && consoleState.watch) || ''};
+    }
+    return {kind: 'idle', headline: 'Watching station', step: '', note: ''};
+  }
+
+  function paintRecovery() {
+    if (dotNode) {
+      dotNode.setAttribute('data-recovery', recovery.kind);
+      dotNode.setAttribute('aria-label', recovery.headline + (recovery.step ? ': ' + recovery.step : '')
+        + (recovery.note ? '. ' + recovery.note : '')
+        + (recovery.kind === 'working' || recovery.kind === 'attention' ? '. Open recovery control'
+          : recovery.kind === 'paused' ? '. Resume the station'
+            : recovery.kind === 'offair' ? '. Put FM on' : '. Open orchestrator'));
+      dotNode.setAttribute('title', dotNode.getAttribute('aria-label'));
+      var dotState = dotNode.querySelector('.og-dot-state');
+      var dotStep = dotNode.querySelector('.og-dot-step');
+      if (dotState) dotState.textContent = recovery.headline;
+      if (dotStep) dotStep.textContent = recovery.step;
+    }
+    if (box) {
+      var control = box.querySelector('.og-recovery');
+      if (control) {
+        control.setAttribute('data-recovery', recovery.kind);
+        control.setAttribute('aria-label', recovery.headline + (recovery.step ? ': ' + recovery.step : '')
+          + (recovery.kind === 'paused' || recovery.kind === 'offair' ? '' : '. Open recovery control'));
+        control.setAttribute('title', recovery.kind === 'paused' ? 'Resume the paused station'
+          : recovery.kind === 'offair' ? 'Put FM back on' : 'Open recovery control');
+        var state = control.querySelector('.og-recovery-state');
+        var step = control.querySelector('.og-recovery-step');
+        var note = control.querySelector('.og-recovery-note');
+        if (state) state.textContent = recovery.headline;
+        if (step) step.textContent = recovery.step;
+        if (note) note.textContent = recovery.note;
+      }
+    }
+  }
+
+  function openRecovery() {
+    if (recovery.kind === 'paused' || recovery.kind === 'offair') {
+      if (restorePending) return;
+      restorePending = true;
+      var wasPaused = recovery.kind === 'paused';
+      var action;
+      try {
+        action = wasPaused ? postBody('/api/radio/pause', {paused: false})
+          : postBody('/api/dj/start', {station: 'all'});
+      } catch (err) { action = Promise.reject(err); }
+      Promise.resolve(action).then(function (got) {
+        if (!got || got.ok === false) return;
+        try {
+          if (wasPaused && typeof root.airPauseState === 'function') root.airPauseState();
+          if (!wasPaused && typeof root.setFmUi === 'function') root.setFmUi(true);
+        } catch (err) { /* the server state remains authoritative */ }
+      }).catch(function () { /* the next watch shows the unchanged state */ }).then(function () {
+        restorePending = false;
+        pullRecovery();
+      });
+      return;
+    }
+    if (root.PineRevive && typeof root.PineRevive.open === 'function') {
+      root.PineRevive.open();
+      return;
+    }
+    show();
+  }
+
+  function pullRecovery() {
+    if (recoveryPending || (!dotNode && !box)) return;
+    if (dotNode && root.document && root.document.body
+        && !root.document.body.contains(dotNode) && !box) {
+      dotNode = null;
+      stopRecoveryWatch();
+      return;
+    }
+    recoveryPending = true;
+    var epoch = recoveryEpoch;
+    function probe(path) { return Promise.resolve().then(function () { return get(path); })
+      .catch(function () { return null; }); }
+    Promise.all([probe('/api/broadcast/watch'), probe('/api/broadcast/health'),
+      probe('/api/broadcast/console')]).then(function (answers) {
+      if (epoch !== recoveryEpoch) return;
+      recovery = recoveryValue(answers[0], answers[1], answers[2]);
+      paintRecovery();
+    }).catch(function () {
+      if (epoch !== recoveryEpoch) return;
+      recovery = {kind: 'unknown', headline: 'Station unreachable', step: '', note: ''};
+      paintRecovery();
+    }).then(function () { if (epoch === recoveryEpoch) recoveryPending = false; });
+  }
+
+  function startRecoveryWatch() {
+    if (recoveryTimer) return;
+    pullRecovery();
+    recoveryTimer = root.setInterval(pullRecovery, RECOVERY_MS);
+    try { if (recoveryTimer && recoveryTimer.unref) recoveryTimer.unref(); }
+    catch (err) { /* browser timer */ }
+  }
+
+  function stopRecoveryWatch() {
+    if (dotNode || box) return;
+    if (recoveryTimer) root.clearInterval(recoveryTimer);
+    recoveryTimer = null;
+    recoveryEpoch += 1;
+    recoveryPending = false;
+  }
 
   function dot() {
     if (dotNode) return dotNode;
@@ -2938,6 +3091,8 @@
     node.setAttribute('aria-label', 'The orchestrator');
     var pre = el('pre', 'og-face', faceRows('watching', 0));
     node.appendChild(pre);
+    node.appendChild(el('span', 'og-dot-state', recovery.headline));
+    node.appendChild(el('span', 'og-dot-step', recovery.step));
     var left = 0, top = 0;
     try {
       var saved = JSON.parse(root.localStorage.getItem(DOT_PLACE) || 'null');
@@ -2979,7 +3134,12 @@
       if (!from) return;
       from = null;
       try { node.releasePointerCapture(ev.pointerId); } catch (err) { /* fine */ }
-      if (!moved) { toggle(); return; }
+      if (!moved) {
+        if (recovery.kind === 'working' || recovery.kind === 'attention'
+            || recovery.kind === 'paused' || recovery.kind === 'offair') openRecovery();
+        else toggle();
+        return;
+      }
       try {
         root.localStorage.setItem(DOT_PLACE, JSON.stringify({
           left: parseInt(node.style.left, 10) || 0,
@@ -2992,9 +3152,12 @@
       try { root.localStorage.setItem(DOT_SHUT, '1'); } catch (err) { /* fine */ }
       if (node.parentNode) node.parentNode.removeChild(node);
       dotNode = null;
+      stopRecoveryWatch();
     });
     root.document.body.appendChild(node);
     dotNode = node;
+    paintRecovery();
+    startRecoveryWatch();
     return node;
   }
 
@@ -3025,6 +3188,8 @@
     asks: function () { return asks; },
     /* The payload, as last received. Read-only by convention. */
     state: function () { return last; },
+    recoveryState: function () { return recovery; },
+    refreshRecovery: pullRecovery,
     EVERY_MS: EVERY_MS,
     /* #1202: the reading rules, exposed so a test can assert the zero rule
        directly rather than by scraping the drawn panel. told() is the whole

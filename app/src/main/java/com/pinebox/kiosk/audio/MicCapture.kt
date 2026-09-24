@@ -64,7 +64,10 @@ import kotlin.math.sqrt
  * bridge), and deciding what a sentence MEANS is the caller's - which is
  * what lets one ear serve a song request, a chat line and a wake word.
  */
-class MicCapture(private val context: Context? = null) {
+class MicCapture(
+    private val context: Context? = null,
+    private val attributeToContext: Boolean = false,
+) {
 
     /** What the model wants, so it is what we ask the hardware for. */
     private val rate = 16_000
@@ -302,7 +305,20 @@ class MicCapture(private val context: Context? = null) {
         val size = minimum * 4
 
         val record = try {
-            AudioRecord(source, rate, channel, encoding, size)
+            if (attributeToContext && context != null) {
+                AudioRecord.Builder()
+                    .setContext(context)
+                    .setAudioSource(source)
+                    .setAudioFormat(AudioFormat.Builder()
+                        .setSampleRate(rate)
+                        .setEncoding(encoding)
+                        .setChannelMask(channel)
+                        .build())
+                    .setBufferSizeInBytes(size)
+                    .build()
+            } else {
+                AudioRecord(source, rate, channel, encoding, size)
+            }
         } catch (err: Exception) {
             return "the microphone could not be opened: " + (err.message ?: err.javaClass.simpleName)
         }

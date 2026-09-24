@@ -1,4 +1,5 @@
 <resources>
+    <string name="pine_voice_ime">Pine Box voice input</string>
     <string name="app_name">Pine Box</string>
     <string name="status_connecting">Reaching the station…</string>
     <string name="status_offline">The station at %1$s did not answer. Retrying…</string>
@@ -24,6 +25,8 @@
     <string name="rail_fm">FM</string>
     <string name="rail_pause">Off air</string>
     <string name="rail_resume">Back on air</string>
+    <string name="rail_endless_video">Toggle endless video</string>
+    <string name="rail_endless_checking">endless video: checking station</string>
     <string name="rail_broadcast">Broadcast</string>
     <string name="rail_streams">Streams</string>
     <string name="rail_players">Playing it</string>

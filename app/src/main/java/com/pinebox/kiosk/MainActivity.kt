@@ -33,7 +33,6 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
-import android.widget.SeekBar
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -43,7 +42,6 @@ import androidx.drawerlayout.widget.DrawerLayout
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
-import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.pinebox.kiosk.bridge.PineDesktopBridge
@@ -87,8 +85,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusPanel: View
     private lateinit var statusText: TextView
     private lateinit var statusRetry: Button
-    private lateinit var monitorBar: SeekBar
-    private lateinit var monitorValue: TextView
 
     private lateinit var bridge: PineDesktopBridge
     private var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null  // #1426
@@ -433,10 +429,9 @@ class MainActivity : AppCompatActivity() {
     private var cornerLockWas = -1
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        /* Observe the native picture without giving it ownership of input.
-         * This keeps its tap-to-edit gesture while fullscreen video remains
-         * transparent to the panel and the four navigation corners. */
-        videoWall?.observeTouch(ev)
+        /* Corners are decided first. A live corner still belongs to the page;
+         * every other point inside the native picture belongs to the wall,
+         * which handles tap, drag and bottom-right resize at UI-thread speed. */
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             cornerLockWas = -1
             val prefs = HotCorners.live
@@ -450,7 +445,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        val handled = super.dispatchTouchEvent(ev)
+        val wallHandled = if (cornerLockWas < 0) {
+            videoWall?.observeTouch(ev) ?: false
+        } else {
+            false
+        }
+        val handled = if (wallHandled) true else super.dispatchTouchEvent(ev)
         if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
             if (cornerLockWas >= 0) {
                 drawer.setDrawerLockMode(cornerLockWas, GravityCompat.START)
@@ -722,7 +722,17 @@ class MainActivity : AppCompatActivity() {
         if (live === this) live = null                       // #1182T
         timerGuard?.let { webView.removeCallbacks(it) }      // #1241
         timerGuard = null
-        if (::bridge.isInitialized) bridge.liveActivity = null
+        videoWall?.stop()
+        videoWall?.onTap = null
+        videoWall?.onLongPress = null
+        videoWall?.onClipChanged = null
+        videoWall?.onBoxChanged = null
+        videoWall?.onHoldExpired = null
+        videoWall = null
+        if (::bridge.isInitialized) {
+            bridge.videoWall = null
+            bridge.liveActivity = null
+        }
         jackWatch?.stop()
         jackWatch = null
         lockWatch?.stop()
@@ -824,17 +834,9 @@ class MainActivity : AppCompatActivity() {
         webView.isVerticalScrollBarEnabled = false
         webView.isHorizontalScrollBarEnabled = false
 
-        /* Keep the raster when the rail slides over it.
-         *
-         * OFF_SCREEN_PRERASTER tells the WebView to keep drawing the part of
-         * itself that is covered rather than discarding and re-rastering it.
-         * That is exactly the drawer case: without it, every open and close of
-         * the rail is a re-raster of a very large document, which is visible
-         * as the panel flashing back in behind the closing drawer. It costs
-         * memory, which is why android:largeHeap is already on. */
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.OFF_SCREEN_PRERASTER)) {
-            WebSettingsCompat.setOffscreenPreRaster(webView.settings, true)
-        }
+        /* The panel's offscreen film and gallery surfaces can already retain
+         * hundreds of MB. Do not also ask Chromium to pre-raster covered
+         * content: on this 4 GB tablet that pushes the renderer into LMK. */
 
         /* Never let the renderer be demoted.
          *
@@ -919,9 +921,6 @@ class MainActivity : AppCompatActivity() {
         if (isFinishing || isDestroyed) return
 
         layoutInflater.inflate(R.layout.drawer_rail, railHost, true)
-        monitorBar = railHost.findViewById(R.id.vol_monitor)
-        monitorValue = railHost.findViewById(R.id.vol_monitor_value)
-
         installBridge()
         com.pinebox.kiosk.bridge.BootAssets.install(this, webView, statusPanel)   // the opening sequence; see BootAssets.kt
         installRail()
@@ -967,6 +966,12 @@ class MainActivity : AppCompatActivity() {
             scope = lifecycleScope,
             navigate = { url -> webView.loadUrl(url) },
             runScript = { script, back -> webView.evaluateJavascript(script, back) },
+            pageLocation = { webView.url.orEmpty() },
+            restorePage = { load() },
+            repairAudioRoute = {
+                val jack = jackWatch?.refresh() ?: "jack watch is not running"
+                "$jack; output: ${outputRoute?.current() ?: "not available"}"
+            },
         )
         rail = built
         built.bind()
@@ -1011,22 +1016,6 @@ class MainActivity : AppCompatActivity() {
             },
         ).also { it.start() }
 
-        /* The monitor slider. It drives the PANEL's own <audio> element rather
-         * than anything on the station - see MONITOR_SET and the note on
-         * pineMusicVolume in drawer_rail.xml. Posted on release only: every
-         * volumechange writes localStorage, so a drag would be a write per
-         * pixel. */
-        monitorBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
-                monitorValue.text = "$value%"
-            }
-
-            override fun onStartTrackingTouch(bar: SeekBar) = Unit
-
-            override fun onStopTrackingTouch(bar: SeekBar) {
-                webView.evaluateJavascript(monitorSet(bar.progress / 100.0), null)
-            }
-        })
     }
 
     /**
@@ -1099,6 +1088,30 @@ class MainActivity : AppCompatActivity() {
         wall.onTap = { x, y ->
             val js = ("try{window.PineSfxTv&&PineSfxTv.tapPicture&&"
                 + "PineSfxTv.tapPicture(" + x.toInt() + "," + y.toInt() + ")}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
+        wall.onLongPress = { x, y ->
+            val js = ("try{window.PineSfxTv&&PineSfxTv.holdPicture&&"
+                + "PineSfxTv.holdPicture(" + x.toInt() + "," + y.toInt() + ")}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
+        wall.onClipChanged = { id ->
+            val quoted = org.json.JSONObject.quote(id)
+            val js = ("try{window.PineSfxTv&&PineSfxTv.wallClip&&"
+                + "PineSfxTv.wallClip($quoted)}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
+        /* The hot gesture stays native; only the settled rectangle crosses
+         * into JavaScript so the next launch inherits it without flooding the
+         * WebView with one evaluateJavascript call per MotionEvent. */
+        wall.onBoxChanged = { x, y, w, h ->
+            val js = ("try{window.PineSfxTv&&PineSfxTv.wallBoxChanged&&"
+                + "PineSfxTv.wallBoxChanged($x,$y,$w,$h)}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
+        wall.onHoldExpired = {
+            val js = ("try{window.PineSfxTv&&PineSfxTv.releaseHold&&"
+                + "PineSfxTv.releaseHold()}catch(e){}")
             webView.post { webView.evaluateJavascript(js, null) }
         }
         videoWall = wall
@@ -1427,6 +1440,19 @@ class MainActivity : AppCompatActivity() {
         override fun onPageFinished(view: WebView, url: String) {
             super.onPageFinished(view, url)
             if (mainFrameFailed) return
+            if (url.startsWith("about:blank")) {
+                Log.w(TAG, "panel fell back to $url; reopening the station")
+                showStatus("Reconnecting to the station...", retry = false)
+                if (!retryScheduled) {
+                    retryScheduled = true
+                    view.postDelayed({
+                        retryScheduled = false
+                        if (!isFinishing && !isDestroyed &&
+                            webView.url.orEmpty().startsWith("about:blank")) load()
+                    }, RETRY_MS)
+                }
+                return
+            }
             hideStatus()
 
             /* THE MEASUREMENT, kept in the app rather than in a notebook.
@@ -1441,20 +1467,6 @@ class MainActivity : AppCompatActivity() {
              * outright. Cheap, idempotent, and it fails loudly in the log
              * rather than silently serving the phone layout. */
             view.evaluateJavascript(WIDTH_GUARD, null)
-
-            /* THE SILENT TABLET. Not autoplay, not the station, not Android:
-             * the panel's own player was at volume 0 because
-             * musicVolumeRemember (app.py:142170) persists every volumechange
-             * into localStorage, and this WebView is a fresh browser profile
-             * whose pineMusicVolume happened to be "0". A new install, a
-             * cleared profile or the next tablet would be silent again for
-             * exactly the same reason, and it looks like broken audio.
-             * Healed here, on every load, and ONLY the absent-or-zero case -
-             * an operator who deliberately set 30% keeps 30%. */
-            view.evaluateJavascript(AUDIO_HEAL) { got ->
-                Log.i(TAG, "monitor level: $got")
-                readMonitorInto(got)
-            }
 
             /* The Sampler, shipped in the APK's assets and EVALUATED rather
              * than linked: the panel is an http:// origin and the assets are
@@ -1528,15 +1540,6 @@ class MainActivity : AppCompatActivity() {
                 }, RETRY_MS)
             }
         }
-    }
-
-    /** Put the page's actual level on the rail's slider. */
-    private fun readMonitorInto(result: String?) {
-        val value = result?.trim()?.trim('"')?.toDoubleOrNull() ?: return
-        if (value < 0.0 || value > 1.0) return
-        val percent = Math.round(value * 100.0).toInt()
-        monitorBar.progress = percent
-        monitorValue.text = "$percent%"
     }
 
     private inner class PanelChrome : WebChromeClient() {
@@ -1722,15 +1725,6 @@ class MainActivity : AppCompatActivity() {
                 "Chrome/120.0.0.0 Safari/537.36"
 
         /**
-         * Set the panel's monitor level and make it stick.
-         *
-         * `volumechange` has to be dispatched explicitly: the listener
-         * musicVolumeRemember installs is what writes localStorage, and
-         * assigning `.volume` from script fires the event in Chrome - but the
-         * panel may not have bound the listener yet on a very early call, so
-         * the keys are written here too. Belt and braces, and both are cheap.
-         */
-        /**
          * #1182T: CARRY AN AUDIO-FOCUS DUCK INTO THE PAGE.
          *
          * PineDuck IS THE ONE ROAD, and this deliberately uses nothing else.
@@ -1762,50 +1756,6 @@ class MainActivity : AppCompatActivity() {
                 if (lvl >= 0.999) { window.PineDuck.release("androidFocus"); return "released"; }
                 window.PineDuck.hold("androidFocus", lvl);
                 return "held at " + lvl;
-              } catch (err) { return "failed:" + err; }
-            })();
-        """.trimIndent()
-
-        private fun monitorSet(level: Double): String = """
-            (function () {
-              try {
-                var v = $level;
-                document.querySelectorAll("audio, video").forEach(function (el) {
-                  el.volume = v;
-                  if (v > 0) el.muted = false;
-                });
-                localStorage.setItem("pineMusicVolume", String(v));
-                localStorage.setItem("pineMusicMuted", v > 0 ? "0" : "1");
-                return v;
-              } catch (err) { return "failed:" + err; }
-            })();
-        """.trimIndent()
-
-        /**
-         * The silent-tablet cure. Returns the level the page is now at, so the
-         * rail's slider can show the truth rather than a default.
-         */
-        private val AUDIO_HEAL = """
-            (function () {
-              try {
-                var raw = localStorage.getItem("pineMusicVolume");
-                var now = raw === null ? null : Number(raw);
-                var muted = localStorage.getItem("pineMusicMuted") === "1";
-                /* Absent or zero (or muted) only. A deliberate 30% is a
-                 * decision and must survive a restart - that is the whole
-                 * point of musicVolumeRemember. */
-                if (now === null || !isFinite(now) || now <= 0 || muted) {
-                  document.querySelectorAll("audio, video").forEach(function (el) {
-                    el.volume = 1;
-                    el.muted = false;
-                  });
-                  localStorage.setItem("pineMusicVolume", "1");
-                  localStorage.setItem("pineMusicMuted", "0");
-                  console.warn("[pine] the monitor was silent (" + raw
-                    + "); set to 1 - see MainActivity.AUDIO_HEAL");
-                  return 1;
-                }
-                return now;
               } catch (err) { return "failed:" + err; }
             })();
         """.trimIndent()

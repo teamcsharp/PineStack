@@ -52,6 +52,8 @@
   var scene = null;        /* the running simulation, if any */
   var openFor = null;      /* the row the popup is describing */
   var asking = false;
+  var decisionState = null;
+  var deciding = false;
 
   /* THE STRIP AND THE PIPELINE SPEAK DIFFERENT VOCABULARIES.
    *
@@ -74,12 +76,25 @@
    */
   var ROAD_OF = {
     writing: 'model',
+    draft: 'model',
     mind: 'speakbox',
+    speakerbox: 'speakbox',
+    pivots: 'speakbox',
     voicing: 'voice',
+    tts: 'voice',
     recasting: 'voice',
     speaking: 'air',
+    publish: 'air',
+    received: 'air',
+    canplay: 'air',
+    playing: 'air',
+    ended: 'air',
     sting: 'air',
     held: 'air',
+    schedule: 'lookahead',
+    pantry: 'lookahead',
+    watchdog: 'repair',
+    error: 'drop',
     action: 'action'
   };
 
@@ -132,16 +147,23 @@
     scene = null;
     openFor = null;
     if (box) box.hidden = true;
+    try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (e) { /* no wall */ }
   }
 
   function build() {
     if (box) return box;
     box = make('div', 'ct-box');
     box.hidden = true;
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Audit event details');
+    box.setAttribute('data-pine-drag', '');
     box.innerHTML =
-      '<div class="ct-head">'
+      '<div class="ct-head" data-pine-drag-handle>'
       + '<b class="ct-stage"></b>'
       + '<span class="ct-detail"></span>'
+      + '<button class="ct-decide" type="button" hidden '
+      + 'title="Let the orchestrator answer every waiting question">'
+      + 'Let the orchestrator decide</button>'
       + '<button class="ct-close" type="button" aria-label="close" title="close">×</button>'
       + '</div>'
       + '<div class="ct-road"><canvas class="ct-canvas"></canvas>'
@@ -152,6 +174,37 @@
     box.querySelector('.ct-close').addEventListener('click', function (event) {
       event.stopPropagation();
       close();
+    });
+    box.querySelector('.ct-decide').addEventListener('click', function (event) {
+      event.stopPropagation();
+      if (deciding || !decisionState) return;
+      var ids = (decisionState.items || []).map(function (row) {
+        return String(row.id || '');
+      }).filter(Boolean);
+      if (!ids.length) return;
+      deciding = true;
+      var button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = 'The orchestrator is deciding…';
+      api().post('/api/retire/decide-model', {ids: ids, most: ids.length})
+        .then(function (got) {
+          decisionState.result = got || {};
+          decisionState.items = [];
+          decisionState.pending = Number(got && got.remaining) || 0;
+          button.textContent = decisionState.pending
+            ? decisionState.pending + ' still need a decision'
+            : 'Every waiting item was decided';
+          var body = box && box.querySelector('.ct-body');
+          if (body) body.prepend(decisionPanel(decisionState));
+        }, function (err) {
+          button.textContent = 'Decision failed - tap to retry';
+          var body = box && box.querySelector('.ct-body');
+          if (body) body.prepend(make('p', 'ct-decision-error',
+            'The orchestrator refused: ' + ((err && err.message) || err)));
+        }).then(function () {
+          deciding = false;
+          button.disabled = false;
+        });
     });
     /* Tap away closes it, like every other panel on this terminal. */
     if (root.PineDismiss) {
@@ -170,6 +223,54 @@
     wrap.appendChild(make('h4', '', title));
     wrap.appendChild(body);
     into.appendChild(wrap);
+  }
+
+  function isDecisionRow(row) {
+    var words = String(((row || {}).stage || '') + ' '
+      + ((row || {}).detail || '')).toLowerCase();
+    return /\baction\b|wait for your decision|leaving the cup|retirement/.test(words);
+  }
+
+  function decisionPanel(state) {
+    var wrap = make('section', 'ct-decision');
+    wrap.appendChild(make('b', 'ct-decision-question', String(
+      (state && state.question) || 'What should happen to the waiting rounds?')));
+    wrap.appendChild(make('p', 'ct-wait', String(
+      (state && state.say) || 'The station is reading the unresolved items.')));
+    var result = state && state.result;
+    if (result && (result.decisions || []).length) {
+      var results = make('ol', 'ct-decision-list');
+      (result.decisions || []).forEach(function (row) {
+        var li = make('li', 'ct-decision-result');
+        li.appendChild(make('b', '', String(row.verdict || 'held')
+          + ' → ' + String(row.action || 'keep')));
+        li.appendChild(make('span', '', String(row.why || '')));
+        results.appendChild(li);
+      });
+      wrap.appendChild(results);
+      return wrap;
+    }
+    var rows = (state && state.items) || [];
+    if (!rows.length) {
+      wrap.appendChild(make('p', 'ct-wait', 'No unanswered cupboard item remains.'));
+      return wrap;
+    }
+    var list = make('ol', 'ct-decision-list');
+    rows.forEach(function (row) {
+      var li = make('li', 'ct-decision-item');
+      li.appendChild(make('b', '', String(row.label || row.kind || 'round')));
+      li.appendChild(make('span', 'ct-decision-ask', String(row.question || '')));
+      if (row.text) li.appendChild(make('q', '', String(row.text)));
+      li.appendChild(make('i', '', String(row.asked_because || '')
+        + ' · ' + (row.ready ? 'ready to air' : 'still needs recording')
+        + ' · ' + Number(row.airings || 0) + ' airing(s)'));
+      if ((row.reasons || []).length) {
+        li.appendChild(make('pre', 'ct-pre', row.reasons.join('\n')));
+      }
+      list.appendChild(li);
+    });
+    wrap.appendChild(list);
+    return wrap;
   }
 
   /* EVERY STEP OPENS.
@@ -643,9 +744,15 @@
     close();
     openFor = row || null;
     box.hidden = false;
+    try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (e) { /* no wall */ }
 
     box.querySelector('.ct-stage').textContent = String((row && row.stage) || 'the console');
     box.querySelector('.ct-detail').textContent = String((row && row.detail) || '');
+    decisionState = null;
+    var decide = box.querySelector('.ct-decide');
+    decide.hidden = !isDecisionRow(row);
+    decide.disabled = false;
+    decide.textContent = 'Let the orchestrator decide';
     var body = box.querySelector('.ct-body');
     body.replaceChildren();
     body.appendChild(make('p', 'ct-wait', 'asking the station what this was…'));
@@ -664,10 +771,17 @@
     var q = '/api/pipeline/detail?kind=' + encodeURIComponent(roadFor(row && row.stage))
       + (at ? '&at=' + encodeURIComponent(String(at)) : '');
 
-    api().get(q).then(function (detail) {
+    var detailAsk = api().get(q);
+    var questionAsk = isDecisionRow(row)
+      ? api().get('/api/retire/questions?most=50').then(function (got) {
+          decisionState = got || {};
+          return decisionState;
+        }, function () { return null; })
+      : Promise.resolve(null);
+    Promise.all([detailAsk, questionAsk]).then(function (answers) {
       asking = false;
       if (box.hidden) return;
-      paint(detail || {});
+      paint(answers[0] || {});
     }, function (err) {
       asking = false;
       body.replaceChildren();
@@ -679,6 +793,13 @@
   function paint(detail) {
     var body = box.querySelector('.ct-body');
     body.replaceChildren();
+
+    if (decisionState) body.appendChild(decisionPanel(decisionState));
+
+    if (openFor && openFor._flow) {
+      section(body, 'this exact journal event',
+        make('pre', 'ct-pre', JSON.stringify(openFor._flow, null, 2)));
+    }
 
     var road = detail.road || {};
     var why = [];

@@ -26,3 +26,8 @@ keys/
 *.jks
 *.keystore
 *.p12
+
+# Root-level deployment screenshots and Android diagnostics are local QA
+# evidence. Source fixtures live below app/src and tests instead.
+/*.png
+/tablet-anr-*.zip

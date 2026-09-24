@@ -220,10 +220,11 @@
  * every view makes - so it costs no request, no timer and no socket. */
 .pine-console {
   position: fixed;
-  left: 0; right: 0; bottom: 0;
+  left: 0; right: 28px; bottom: 0;
+  width: auto;
   z-index: 2147483002;
   display: flex; align-items: center; gap: 8px;
-  padding: 4px 12px;
+  padding: 3px 6px 3px 9px;
   min-height: 22px;
   background: rgba(10, 14, 18, .92);
   border-top: 1px solid #35414c;
@@ -237,18 +238,60 @@
   flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%;
   background: #54d18b; opacity: .55;
 }
+.pine-console-audit {
+  flex: 0 1 50%; min-width: 0; height: 20px;
+  display: flex; align-items: center; gap: 7px;
+  padding: 0 9px 0 0; overflow: hidden;
+  border: 0; border-right: 1px solid #35414c; border-radius: 0;
+  background: transparent; color: inherit; font: inherit; text-align: left;
+}
+.pine-console-audit em {
+  flex: 0 0 auto; color: #65c7da; font-size: 9px; font-style: normal;
+  letter-spacing: 0;
+}
+.pine-console-audit span {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .pine-console.pulse .pine-console-dot { animation: pineConsolePulse 1.1s ease-out; }
 @keyframes pineConsolePulse {
   0% { opacity: 1; transform: scale(1.6); }
   100% { opacity: .55; transform: scale(1); }
 }
-.pine-console-stage {
-  flex: 0 0 auto; color: #edf3f5; font-weight: 600;
-  text-transform: lowercase;
+.pine-console-viewport {
+  flex: 0 1 50%; min-width: 0; overflow: hidden;
+  touch-action: pan-y; cursor: ew-resize;
+  contain: paint;
 }
-.pine-console-detail {
-  flex: 1 1 auto; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis;
+.pine-console-track {
+  display: flex; align-items: center; width: max-content;
+  will-change: transform; backface-visibility: hidden;
+  transform: translate3d(0, 0, 0);
+}
+.pine-console-track.running { animation: pineConsoleMarquee 70s linear infinite; }
+.pine-console-viewport:active .pine-console-track { animation-play-state: running; }
+.pine-console-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  max-width: 440px;
+  padding: 1px 14px 1px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.pine-console-entry time { color: #667985; font-variant-numeric: tabular-nums; }
+.pine-console-entry b { color: #edf3f5; font-weight: 600; text-transform: lowercase; }
+.pine-console-entry span { overflow: hidden; text-overflow: ellipsis; }
+@keyframes pineConsoleMarquee {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(-50%, 0, 0); }
+}
+@media (max-width: 720px) {
+  .pine-console { left: 0; right: 24px; width: auto; }
+  .pine-console-entry { max-width: 72vw; }
 }
 /* Give every view room for it, so nothing is hidden under the strip. */
 .pine-view-host, #sampler { padding-bottom: 26px; }

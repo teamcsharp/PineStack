@@ -23,11 +23,16 @@
   position: fixed;
   z-index: 2147483060;
   left: 50%;
-  bottom: 24px;
-  transform: translateX(-50%);
-  width: min(92vw, 560px);
-  max-height: 72vh;
-  overflow-y: auto;
+  top: 50%;
+  bottom: auto;
+  transform: translate(-50%, -50%);
+  width: min(560px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  max-height: min(760px, calc(100vh - 24px));
+  max-height: min(760px, calc(100dvh - 24px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   padding: 14px 14px 12px;
   border: 1px solid var(--line, #35414c);
   border-radius: 14px;
@@ -174,6 +179,14 @@
 .la-vote-say.bad { color: #ffcdbc; }
 
 .la-list { display: grid; gap: 8px; }
+.la-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 3px;
+}
 /* The mark itself. Sized here, in the sheet's own units, because more than
    one host stylesheet sizes .pi-icon globally and each says something
    different. */
@@ -251,6 +264,7 @@
 }
 .la-note.bad { color: #e9a08f; }
 .la-close {
+  flex: 0 0 auto;
   width: 100%; margin-top: 12px; padding: 10px;
   height: auto;
   min-height: 44px;
@@ -258,6 +272,13 @@
   border-radius: 10px;
   background: transparent; color: var(--muted, #8fa0ad);
   font: inherit; font-size: 14px; cursor: pointer;
+}
+
+@media (max-height: 620px) {
+  .la-sheet { padding: 10px; }
+  .la-said { margin-bottom: 8px; }
+  .la-choice { min-height: 40px; padding-block: 7px; }
+  .la-close { min-height: 40px; margin-top: 8px; }
 }
 
 /* ------------------------------------------------ the deep examination */
@@ -849,15 +870,26 @@
 }
 
 /* 2026-09-14: the admin options section of the line inspector */
-.ld-admin-list { max-height: 42vh; overflow: auto; }
-.ld-admin-row { display: grid; grid-template-columns: 10px minmax(120px, 1fr) minmax(80px, 1.2fr); gap: 4px 8px; align-items: baseline; padding: 4px 0; border-bottom: 1px solid #1d2a33; }
+.ld-admin-table-wrap { max-height: 44vh; overflow: auto; border: 1px solid #273640; border-radius: 6px; }
+.ld-admin-table { width: 100%; min-width: 760px; table-layout: fixed; border-collapse: collapse; color: #dfe7ee; }
+.ld-admin-table th { position: sticky; top: 0; z-index: 1; padding: 7px 8px; background: #111a21; border-bottom: 1px solid #35414c; color: #8fa0ad; font-size: 10px; text-transform: uppercase; text-align: left; }
+.ld-admin-table th:nth-child(1) { width: 110px; }
+.ld-admin-table th:nth-child(2) { width: 180px; }
+.ld-admin-table th:nth-child(3) { width: 190px; }
+.ld-admin-row { border-bottom: 1px solid #1d2a33; cursor: pointer; }
+.ld-admin-row:hover, .ld-admin-row:focus { background: rgba(101,199,218,.08); outline: none; }
+.ld-admin-row td { padding: 7px 8px; vertical-align: top; font-size: 11px; }
 .ld-admin-row b { font-size: 12px; color: #dfe7ee; }
-.ld-admin-row span { font-size: 12px; color: #9fb3c0; word-break: break-word; }
-.ld-admin-row em { grid-column: 2 / 4; font-style: normal; font-size: 11px; color: #6f8390; }
-.ld-admin-dot { width: 8px; height: 8px; border-radius: 50%; background: #35414c; display: inline-block; margin-top: 4px; }
+.ld-admin-row span { color: #9fb3c0; }
+.ld-admin-cell-scroll { max-height: 4.5em; overflow: auto; overflow-wrap: anywhere; scrollbar-width: thin; }
+.ld-admin-state { display: block; margin-top: 2px; font-size: 9px; }
+.ld-admin-dot { width: 8px; height: 8px; border-radius: 50%; background: #35414c; display: inline-block; margin: 3px 5px 0 0; }
 .ld-admin-row.on .ld-admin-dot { background: #54d18b; }
 .ld-admin-row.off .ld-admin-dot { background: #ff5d5d; }
 .ld-admin-row.na { opacity: .65; }
+.ld-admin-detail td { padding: 10px 12px 13px; border-bottom: 1px solid #35414c; background: #101820; }
+.ld-admin-detail p { margin: 4px 0; overflow-wrap: anywhere; }
+.ld-admin-full { max-height: 190px; margin-top: 8px; overflow: auto; white-space: pre-wrap; cursor: pointer; }
 
 /* ==========================================================================
    EVERY ROAD ON THE STRIP OPENS (#1149)

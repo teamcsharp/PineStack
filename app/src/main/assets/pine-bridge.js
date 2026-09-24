@@ -338,6 +338,7 @@
      * -> {ok, where, bytes, detail}. The audio is fetched and written
      * natively; it never crosses this bridge. */
     keepClip: promised("keepClip"),
+    saveGalleryExport: promised("saveGalleryExport"),
 
     /* THE HEADPHONE JACK. `jack({on:true})` hands the broadcast to the
      * cable, `{on:false}` takes it back, and no argument reports where

@@ -89,17 +89,38 @@
   var lastOffMs = 0;                /* #1267: watched, no longer applied */
   var nowLineId = '';               /* the one line being said */
   var follow = true;                /* keep it on screen */
+  var crawlStop = null;             /* the live strip can retake the pane */
   var selfScrollUntil = 0;          /* a scroll WE started, not the operator */
   var adrift = 0;                   /* #1282: consecutive off-screen reads */
   var folded = Object.create(null);   /* #1285: seg id -> folded? */
   var byHand = Object.create(null);   /* #1285: the operator said so */
   var liveSeg = '';                   /* #1285: the segment on air */
   var planHours = [];                 /* #1289: the director's entries */
+  var bankPlan = null;                 /* read-ahead stock for the next two hours */
+  var bankFetchedAt = 0;
   var planAt = 0;                     /* when we last read them */
   var planning = false;
   var planWay = 'below';              /* #1289: 'below' | 'beside' */
   var PLAN_REST_MS = 30000;           /* a running order is not news */
   var beat = 0;
+  var rejectionItems = [];
+  var rejectionFirstPage = [];
+  var rejectionCursor = null;
+  var rejectionHasMore = true;
+  var rejectionLoading = false;
+  var rejectionCount = 0;
+  var rejectionHeadAt = 0;
+  var rejectionLastStep = 0;
+  var rejectionSelection = null;
+  var rejectionDetail = null;
+  var rejectionRequest = 0;
+  var rejectionBusy = false;
+  var rejectionLoadEpoch = 0;
+  var rejectionPageRetryAt = 0;
+  var rejectionPolicy = null;
+  var rejectionTintState = null;
+  var rejectionTintAt = 0;
+  var rejectionTintPending = null;
 
   /* ------------------------------------------- THE ADMITTED CUE MAP
    *
@@ -170,6 +191,798 @@
     return n;
   }
 
+  var REJECTION_PAGE = 24;
+  var REJECTION_REFRESH_MS = 120000;
+
+  function rejectionLabel(item) {
+    var kind = String((item && (item.kind || item.gate)) || 'script').replace(/_/g, ' ');
+    var reason = item && Array.isArray(item.reasons) && item.reasons.length
+      ? String(item.reasons[0]) : 'Review needed';
+    return kind + ': ' + reason;
+  }
+
+  function rejectionGlyph(item) {
+    var kind = String((item && item.kind) || '').toLowerCase();
+    if (kind.indexOf('call') >= 0) return '🎙️';
+    if (kind.indexOf('music') >= 0) return '🎵';
+    if (kind.indexOf('video') >= 0) return '🎬';
+    if (kind.indexOf('news') >= 0) return '📰';
+    return '📝';
+  }
+
+  function rejectionError(err) {
+    return String((err && (err.message || err.detail)) || err || 'Request failed').slice(0, 180);
+  }
+
+  function rejectionPageItems(got) {
+    if (!got || !Array.isArray(got.items)) throw new Error('Invalid review queue');
+    return got.items.filter(function (item) {
+      return item && item.id && item.review_status === 'pending';
+    });
+  }
+
+  function rejectionListUrl(cursor) {
+    return '/api/orchestrator/rejections?status=pending&limit=' + REJECTION_PAGE
+      + (cursor ? '&before=' + encodeURIComponent(cursor) : '');
+  }
+
+  function rejectionBody(record, item, action, note) {
+    var body = {note: note, expected_revision: record.revision,
+      expected_event_seq: record.event_seq || record.latest_seq || item.event_seq};
+    if (action !== 'note') body.action = action;
+    return body;
+  }
+
+  function rejectionPolicyBody(policy) {
+    var body = {enabled: policy.enabled === false};
+    if (policy.revision != null) body.expected_revision = policy.revision;
+    return body;
+  }
+
+  function contentGateBody(policy, gate, enabled) {
+    var body = {expected_revision: policy.revision};
+    if (gate === 'master') {
+      body.master_enabled = enabled;
+      body.gates = Object.fromEntries(Object.keys(policy.gates || {}).map(function (name) {
+        return [name, false];
+      }));
+    }
+    else body.gates = {[gate]: enabled};
+    if (enabled) body.approval = 'enable';
+    return body;
+  }
+
+  function contentGateEffective(policy, gate) {
+    return !!(policy && policy.master_enabled && policy.gates
+      && policy.gates[gate] === true);
+  }
+
+  function rejectionDirectorBody(item, record, note) {
+    return {kind: String((record && record.context && record.context.kind) || '').trim(),
+      text: String(note || '').trim(), scope: 'next', who: 'operator'};
+  }
+
+  function rejectionAppendWords(draft, words) {
+    var addition = String(words || '').trim();
+    var prior = String(draft || '').replace(/\s+$/, '');
+    return addition ? prior + (prior ? ' ' : '') + addition : prior;
+  }
+
+  function rejectionTintSummary(state) {
+    if (!state) return 'Current tint: checking station settings…';
+    var known = state.crystals_on !== null && state.tint_share !== null;
+    if (known && state.crystals_on === 0 && state.tint_share === 0) {
+      return 'Current tint: off for new scripts · 0 active crystals · orchestrator share 0% · two-pass '
+        + (state.two_pass === false ? 'off' : state.two_pass === true ? 'on' : 'unknown');
+    }
+    var parts = [];
+    if (state.crystals_on !== null) parts.push(state.crystals_on + ' active crystal(s)');
+    if (state.tint_share !== null) parts.push('orchestrator share ' + Math.round(state.tint_share * 100) + '%');
+    if (state.two_pass !== null) parts.push('two-pass ' + (state.two_pass ? 'on' : 'off'));
+    return 'Current tint: ' + (parts.length ? parts.join(' · ') : 'settings unavailable')
+      + (known ? '' : ' · status incomplete');
+  }
+
+  function rejectionTintRead() {
+    if (rejectionTintState && Date.now() - rejectionTintAt < 15000) return Promise.resolve(rejectionTintState);
+    if (rejectionTintPending) return rejectionTintPending;
+    rejectionTintPending = Promise.all([
+      Promise.resolve(api().get('/api/tint')).catch(function () { return null; }),
+      Promise.resolve(api().get('/api/orchestrator/logic')).catch(function () { return null; })
+    ]).then(function (parts) {
+      var tint = parts[0], logic = parts[1];
+      var share = logic && logic.policy && logic.policy.tint_share;
+      share = share && typeof share === 'object' ? share.value : share;
+      share = share === undefined || share === null ? null : Number(share);
+      rejectionTintState = {
+        crystals_on: tint && Array.isArray(tint.crystals_on) ? tint.crystals_on.length : null,
+        two_pass: tint && typeof tint.two_pass === 'boolean' ? tint.two_pass : null,
+        tint_share: Number.isFinite(share) ? share : null,
+        checked_at: new Date().toLocaleString(),
+        sources: ['/api/tint', '/api/orchestrator/logic']
+      };
+      rejectionTintAt = Date.now();
+      return rejectionTintState;
+    }).finally(function () { rejectionTintPending = null; });
+    return rejectionTintPending;
+  }
+
+  function rejectionTintPaint() {
+    var summary = el('spReviewTintSummary');
+    if (summary) summary.textContent = rejectionTintSummary(rejectionTintState);
+    var evidence = el('spReviewTintEvidence');
+    if (evidence) evidence.textContent = rejectionTintState
+      ? JSON.stringify(rejectionTintState, null, 2) : 'Checking current station settings…';
+  }
+
+  function rejectionSay(message) {
+    var node = el('spRejectCount');
+    if (node) node.textContent = message;
+  }
+
+  function rejectionMarker(item) {
+    var button = make('button', 'sp-reject-marker', rejectionGlyph(item));
+    button.type = 'button';
+    button.dataset.id = String(item.id);
+    button.title = rejectionLabel(item);
+    button.setAttribute('aria-label', 'Review ' + rejectionLabel(item));
+    button.addEventListener('click', function () { rejectionOpen(item, button); });
+    button.addEventListener('keydown', function (event) {
+      if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
+      var peer = event.key === 'ArrowRight' ? button.nextElementSibling : button.previousElementSibling;
+      if (peer) { event.preventDefault(); peer.focus(); }
+    });
+    return button;
+  }
+
+  function rejectionFill() {
+    var track = el('spRejectTrack');
+    if (!track) return;
+    var viewport = el('spRejectViewport');
+    var target = Math.min(64, Math.max(18, Math.ceil(((viewport && viewport.clientWidth) || 600) / 40) + 10));
+    while (track.children.length < target && rejectionItems.length) {
+      track.appendChild(rejectionMarker(rejectionItems.shift()));
+    }
+    if (rejectionItems.length < 8 && rejectionHasMore) rejectionLoad(false);
+    if (!rejectionHasMore && !rejectionItems.length && rejectionFirstPage.length) {
+      rejectionItems = rejectionFirstPage.slice();
+    }
+  }
+
+  function rejectionLoad(head) {
+    if (rejectionLoading || !mounted || !api().get) return;
+    if (!head && !rejectionHasMore) return;
+    if (!head && Date.now() < rejectionPageRetryAt) return;
+    rejectionLoading = true;
+    if (head) rejectionHeadAt = Date.now();
+    var epoch = ++rejectionLoadEpoch;
+    var url = rejectionListUrl(head ? null : rejectionCursor);
+    Promise.resolve(api().get(url)).then(function (got) {
+      if (!mounted || epoch !== rejectionLoadEpoch) return;
+      var items = rejectionPageItems(got);
+      if (head) {
+        rejectionHeadAt = Date.now();
+        rejectionFirstPage = items.slice();
+        rejectionItems = items.slice();
+        var track = el('spRejectTrack');
+        if (track) track.replaceChildren();
+        var viewport = el('spRejectViewport');
+        if (viewport) viewport.scrollLeft = 0;
+      } else {
+        rejectionItems.push.apply(rejectionItems, items);
+      }
+      rejectionCursor = got.next_before || null;
+      rejectionHasMore = !!got.has_more && !!rejectionCursor && items.length > 0;
+      rejectionPageRetryAt = 0;
+      rejectionCount = Number(got.unreviewed != null ? got.unreviewed : got.total) || 0;
+      rejectionSay(rejectionCount ? rejectionCount + ' to review' : 'No pending reviews');
+      rejectionFill();
+    }).catch(function (err) {
+      if (mounted && epoch === rejectionLoadEpoch) {
+        rejectionPageRetryAt = Date.now() + 30000;
+        rejectionSay('Review queue unavailable: ' + rejectionError(err));
+      }
+    }).finally(function () { if (epoch === rejectionLoadEpoch) rejectionLoading = false; });
+  }
+
+  function rejectionStep() {
+    var viewport = el('spRejectViewport');
+    var track = el('spRejectTrack');
+    if (!viewport || !track) return;
+    rejectionFill();
+    if (!track.firstElementChild || rejectionSelection
+        || (root.matchMedia && root.matchMedia('(hover: hover)').matches && viewport.matches(':hover'))
+        || viewport.contains(document.activeElement)
+        || (root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+      rejectionLastStep = Date.now();
+      return;
+    }
+    var now = Date.now();
+    if (!rejectionLastStep) { rejectionLastStep = now; return; }
+    viewport.scrollLeft += Math.min(now - rejectionLastStep, 500) * 0.025;
+    rejectionLastStep = now;
+    var first = track.firstElementChild;
+    if (track.children.length > 1 && first.offsetLeft + first.offsetWidth <= viewport.scrollLeft) {
+      var width = first.offsetWidth + 6;
+      first.remove();
+      viewport.scrollLeft = Math.max(0, viewport.scrollLeft - width);
+      rejectionFill();
+    }
+  }
+
+  function buildRejectionStrip() {
+    var strip = make('div', 'sp-reject-strip');
+    strip.setAttribute('aria-label', 'Pending script reviews');
+    var count = make('span', 'sp-reject-count', 'Reviews');
+    count.id = 'spRejectCount';
+    count.setAttribute('role', 'status');
+    strip.appendChild(count);
+    var viewport = make('div', 'sp-reject-viewport');
+    viewport.id = 'spRejectViewport';
+    viewport.setAttribute('role', 'group');
+    viewport.setAttribute('aria-label', 'Script issues, scroll horizontally');
+    var track = make('div', 'sp-reject-track');
+    track.id = 'spRejectTrack';
+    viewport.appendChild(track);
+    strip.appendChild(viewport);
+    var controls = make('button', 'sp-reject-controls', 'Review all / controls');
+    controls.type = 'button';
+    controls.title = 'Open all rejected lines and editorial controls';
+    controls.addEventListener('click', rejectionControlsOpen);
+    strip.appendChild(controls);
+    return strip;
+  }
+
+  function rejectionPolicyOpen() {
+    var overlay = el('spRejectionDetail');
+    if (!overlay) return;
+    rejectionRequest += 1;
+    var selected = {controls: true};
+    rejectionSelection = selected;
+    rejectionDetail = null;
+    overlay.hidden = false;
+    overlay.parentElement.classList.add('sp-reviewing');
+    overlay.replaceChildren();
+    var back = make('button', 'sp-review-back', '← Live script');
+    back.type = 'button';
+    back.addEventListener('click', rejectionClose);
+    overlay.appendChild(back);
+    overlay.appendChild(make('h2', '', 'Content gates'));
+    var feedback = make('p', 'sp-review-feedback', 'Loading gate policy...');
+    feedback.id = 'spReviewPolicyFeedback';
+    feedback.setAttribute('role', 'status');
+    overlay.appendChild(feedback);
+    var scroll = make('div', 'sp-review-scroll sp-gates-scroll');
+    scroll.id = 'spContentGates';
+    overlay.appendChild(scroll);
+    back.focus();
+    Promise.resolve(api().get('/api/orchestrator/content-gates')).then(function (got) {
+      if (rejectionSelection !== selected) return;
+      rejectionPolicy = got;
+      rejectionPolicyRender();
+    }).catch(function (err) { if (feedback.isConnected) feedback.textContent = 'Gate policy unavailable: ' + rejectionError(err); });
+  }
+
+  function rejectionPolicyRender(message) {
+    var overlay = el('spRejectionDetail');
+    if (!overlay || !rejectionSelection || !rejectionSelection.controls || !rejectionPolicy) return;
+    var feedback = el('spReviewPolicyFeedback');
+    var area = el('spContentGates');
+    if (!area) return;
+    var policy = rejectionPolicy;
+    if (!policy.gates || !policy.inventory) {
+      feedback.textContent = 'Gate policy response is incomplete.';
+      return;
+    }
+    feedback.textContent = message || (policy.master_enabled
+      ? 'Master gate enabled. Only individually enabled gates can reject content.'
+      : 'Content gates off. Technical media checks still require repair.');
+    area.replaceChildren();
+    var all = make('button', 'sp-review-action sp-gates-all', 'Review all rejected lines');
+    all.type = 'button';
+    all.addEventListener('click', function () {
+      var full = root.PineRejectionReview;
+      if (full && typeof full.open === 'function') {
+        rejectionClose();
+        full.open(null);
+        return;
+      }
+      var badge = document.querySelector('#desktopRejectionNotices > button.badge');
+      if (badge) { rejectionClose(); badge.click(); return; }
+      var first = document.querySelector('.sp-reject-marker');
+      if (first) { rejectionClose(); first.click(); }
+    });
+    area.appendChild(all);
+    area.appendChild(contentGateButton('master', 'Master content gate',
+      'All editorial gates are bypassed while this is off.', policy.master_enabled));
+    area.appendChild(make('p', 'sp-review-muted',
+      'Technical checks are not editorial approvals. Missing or empty audio remains repair-only.'));
+    var list = make('div', 'sp-gates-list');
+    Object.keys(policy.inventory).forEach(function (gate) {
+      var row = make('div', 'sp-gate-row');
+      var info = make('div', 'sp-gate-info');
+      info.appendChild(make('b', '', gate.replace(/_/g, ' ')));
+      info.appendChild(make('span', '', String(policy.inventory[gate] || '')));
+      var events = (policy.evidence || []).filter(function (entry) { return entry.gate === gate; });
+      if (events.length) {
+        var latest = events[events.length - 1];
+        info.appendChild(make('small', '', 'Recent bypass: ' + String(latest.reason || '')
+          + (latest.source ? ' (' + String(latest.source) + ')' : '')));
+      }
+      row.appendChild(info);
+      row.appendChild(contentGateButton(gate, gate.replace(/_/g, ' '),
+        'Explicitly enable this one editorial gate', policy.gates[gate] === true));
+      row.appendChild(make('i', 'sp-gate-effective',
+        contentGateEffective(policy, gate) ? 'active' : 'bypassed'));
+      list.appendChild(row);
+    });
+    area.appendChild(list);
+    var technical = make('div', 'sp-review-section');
+    technical.appendChild(make('h3', '', 'Technical checks stay active'));
+    technical.appendChild(make('p', 'sp-review-muted', (policy.technical_checks || []).join(' · ')));
+    area.appendChild(technical);
+  }
+
+  function contentGateButton(gate, label, reason, on) {
+    var button = make('button', 'sp-review-action sp-gate-toggle', on ? 'On' : 'Off');
+    button.type = 'button';
+    button.setAttribute('role', 'switch');
+    button.setAttribute('aria-checked', String(on));
+    button.setAttribute('aria-label', label + ': ' + (on ? 'on' : 'off'));
+    button.title = reason;
+    button.addEventListener('click', function () {
+      if (!rejectionPolicy || button.disabled) return;
+      if (!on && !button.dataset.confirm) {
+        button.dataset.confirm = '1';
+        button.textContent = 'Enable?';
+        button.title = 'Press again to explicitly enable ' + label;
+        return;
+      }
+      button.disabled = true;
+      var selected = rejectionSelection;
+      var feedback = el('spReviewPolicyFeedback');
+      if (feedback) feedback.textContent = 'Saving ' + label + '...';
+      var bridge = api();
+      var write = bridge.patch || bridge.post;
+      if (!write) {
+        if (feedback) feedback.textContent = 'Station bridge cannot update gates.';
+        button.disabled = false;
+        return;
+      }
+      Promise.resolve(write.call(bridge, '/api/orchestrator/content-gates',
+        contentGateBody(rejectionPolicy, gate, !on))).then(function (got) {
+        if (!got || !got.gates || got.revision == null) throw new Error('Gate update was not confirmed');
+        if (rejectionSelection !== selected) return;
+        rejectionPolicy = got;
+        rejectionPolicyRender(label + ' ' + (!on ? 'enabled' : 'disabled') + '.');
+      }).catch(function (err) {
+        if (feedback && feedback.isConnected) feedback.textContent = 'Gate unchanged: ' + rejectionError(err);
+        button.disabled = false;
+        button.textContent = on ? 'On' : 'Off';
+        delete button.dataset.confirm;
+      });
+    });
+    return button;
+  }
+
+  function rejectionControlsOpen() {
+    rejectionPolicyOpen();
+  }
+
+  function rejectionEvidence(record) {
+    return [
+      ['Evaluation at rejection (historical)', record && record.evaluation],
+      ['Technical flag at rejection (historical)', record && record.technical],
+      ['System path at rejection (historical)', record && record.system_path]
+    ];
+  }
+
+  function rejectionProfileView(record) {
+    var check = record && record.profile_check;
+    var stored = record && record.context && record.context.entry && record.context.entry.profile;
+    if (!check || typeof check !== 'object') {
+      return {compatible: null, stored: stored || null, current: null,
+        compared: [], differences: [], ignored: [], impact: ''};
+    }
+    return {compatible: typeof check.compatible === 'boolean' ? check.compatible : null,
+      stored: check.stored === undefined ? stored || null : check.stored,
+      current: check.current === undefined ? null : check.current,
+      compared: Array.isArray(check.compared_fields) ? check.compared_fields : [],
+      differences: Array.isArray(check.differences) ? check.differences : [],
+      ignored: Array.isArray(check.ignored_fields) ? check.ignored_fields : [],
+      impact: String(check.impact || '')};
+  }
+
+  function rejectionProfileSection(record) {
+    var profile = rejectionProfileView(record);
+    var section = make('section', 'sp-review-section sp-review-profile');
+    section.appendChild(make('h3', '', 'Writing profile comparison'));
+    var status = make('p', 'sp-review-profile-status', profile.compatible === true
+      ? 'Compatible with the current writing profile'
+      : profile.compatible === false ? 'Writing profile differs from current settings'
+        : 'Current profile comparison unavailable');
+    status.dataset.compatible = String(profile.compatible);
+    section.appendChild(status);
+    var fields = make('dl', 'sp-review-profile-fields');
+    [['Compared fields', profile.compared], ['Different fields', profile.differences],
+      ['Ignored fields', profile.ignored]].forEach(function (part) {
+      fields.appendChild(make('dt', '', part[0]));
+      fields.appendChild(make('dd', '', part[1].length ? part[1].join(', ') : 'None reported'));
+    });
+    section.appendChild(fields);
+    if (profile.impact) section.appendChild(make('p', 'sp-review-muted', profile.impact));
+    var profiles = make('div', 'sp-review-columns');
+    rejectionText(profiles, 'Stored writing profile', profile.stored);
+    rejectionText(profiles, 'Current writing profile', profile.current);
+    section.appendChild(profiles);
+    return section;
+  }
+
+  function rejectionText(parent, label, value) {
+    var box = make('section', 'sp-review-section');
+    box.appendChild(make('h3', '', label));
+    box.appendChild(make('pre', 'sp-review-text', value === undefined || value === null || value === ''
+      ? 'Not available' : typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)));
+    parent.appendChild(box);
+  }
+
+  function rejectionHistory(parent, label, rows) {
+    var section = make('section', 'sp-review-section');
+    section.appendChild(make('h3', '', label));
+    if (!Array.isArray(rows) || !rows.length) {
+      section.appendChild(make('p', 'sp-review-muted', 'No entries yet'));
+    } else {
+      var list = make('ol', 'sp-review-list');
+      rows.forEach(function (row) {
+        var at = row && (row.at || row.created_at || row.decided_at || row.time);
+        var date = at ? new Date(typeof at === 'number' ? at * 1000 : at) : null;
+        var when = date && !isNaN(date.getTime()) ? date.toLocaleString() : (at ? String(at) : '');
+        var status = row && (row.action || row.status || row.review_status || row.event
+          || row.kind || row.disposition || row.gate);
+        var note = row && (row.note || row.reason || row.text || '');
+        list.appendChild(make('li', '', [when, status, note].filter(Boolean).join(' · ')));
+      });
+      section.appendChild(list);
+    }
+    parent.appendChild(section);
+  }
+
+  function rejectionClose() {
+    rejectionRequest += 1;
+    if (rejectionSelection && rejectionSelection.micHoldTimer) {
+      root.clearTimeout(rejectionSelection.micHoldTimer);
+      rejectionSelection.micHoldTimer = null;
+    }
+    if (rejectionSelection && rejectionSelection.dictating && root.PineTalkDot
+        && typeof root.PineTalkDot.cancelCapture === 'function') {
+      root.PineTalkDot.cancelCapture();
+    }
+    var overlay = el('spRejectionDetail');
+    if (overlay) overlay.hidden = true;
+    var pane = overlay && overlay.parentElement;
+    if (pane) pane.classList.remove('sp-reviewing');
+    var marker = rejectionSelection && rejectionSelection.marker;
+    rejectionSelection = null;
+    rejectionDetail = null;
+    rejectionPolicy = null;
+    if (marker && marker.isConnected) marker.focus();
+  }
+
+  function rejectionRender() {
+    var overlay = el('spRejectionDetail');
+    var record = rejectionDetail;
+    if (!overlay || !record) return;
+    var previousScroll = overlay.querySelector('.sp-review-scroll');
+    var scrollTop = previousScroll ? previousScroll.scrollTop : 0;
+    var editing = document.activeElement && document.activeElement.id === 'spReviewNote';
+    var selected = rejectionSelection;
+    if (selected && selected.micHoldTimer) {
+      root.clearTimeout(selected.micHoldTimer);
+      selected.micHoldTimer = null;
+    }
+    var item = rejectionSelection && rejectionSelection.item || {};
+    overlay.replaceChildren();
+    var head = make('div', 'sp-review-head');
+    var back = make('button', 'sp-review-back', '← Live script');
+    back.type = 'button';
+    back.addEventListener('click', rejectionClose);
+    head.appendChild(back);
+    head.appendChild(make('h2', '', 'Script review'));
+    head.appendChild(make('span', 'sp-review-status', String(record.review_status || 'pending')));
+    overlay.appendChild(head);
+    var scroll = make('div', 'sp-review-scroll');
+    scroll.appendChild(make('p', 'sp-review-meta', [item.kind, record.gate, record.disposition,
+      record.occurrences && record.occurrences + ' occurrences'].filter(Boolean).join(' · ')));
+    var tintSummary = make('p', 'sp-review-tint', rejectionTintSummary(rejectionTintState));
+    tintSummary.id = 'spReviewTintSummary';
+    scroll.appendChild(tintSummary);
+    var reasons = make('section', 'sp-review-section');
+    reasons.appendChild(make('h3', '', 'Why it was held then (historical)'));
+    var reasonList = make('ul', 'sp-review-list');
+    (Array.isArray(record.reasons) ? record.reasons : []).forEach(function (reason) {
+      reasonList.appendChild(make('li', '', String(reason)));
+    });
+    if (!reasonList.children.length) reasonList.appendChild(make('li', '', 'No reason supplied'));
+    reasons.appendChild(reasonList);
+    scroll.appendChild(reasons);
+    if (record.technical) scroll.appendChild(make('p', 'sp-review-warning',
+      'Technical failure: repair the source or missing media. Editorial approval cannot make it playable.'));
+    var texts = make('div', 'sp-review-columns');
+    rejectionText(texts, 'Candidate', record.candidate || item.candidate_preview);
+    rejectionText(texts, 'Source', record.source || item.source_preview);
+    scroll.appendChild(texts);
+    rejectionHistory(scroll, 'Notes', Array.isArray(record.notes) && record.notes.length
+      ? record.notes : record.operator_notes || record.notes);
+    rejectionHistory(scroll, 'History', record.history);
+    rejectionHistory(scroll, 'Review decisions', Array.isArray(record.decisions)
+      ? record.decisions.filter(function (entry) { return entry.action !== 'note'; }) : []);
+    var evidence = make('details', 'sp-review-evidence');
+    evidence.appendChild(make('summary', '', 'Checks and evidence'));
+    var current = make('section', 'sp-review-section');
+    current.appendChild(make('h3', '', 'Current tint settings'));
+    var currentText = make('pre', 'sp-review-text', rejectionTintState
+      ? JSON.stringify(rejectionTintState, null, 2) : 'Checking current station settings…');
+    currentText.id = 'spReviewTintEvidence';
+    current.appendChild(currentText);
+    evidence.appendChild(current);
+    evidence.appendChild(rejectionProfileSection(record));
+    rejectionEvidence(record).forEach(function (part) {
+      var section = make('section', 'sp-review-section');
+      section.appendChild(make('h3', '', part[0]));
+      var value = part[1];
+      section.appendChild(make('pre', 'sp-review-text', value === undefined || value === null
+        ? 'Not available for this cut' : typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)));
+      evidence.appendChild(section);
+    });
+    scroll.appendChild(evidence);
+    var editor = make('section', 'sp-review-section sp-review-editor');
+    var composeHead = make('div', 'sp-review-compose-head');
+    var label = make('label', '', 'Note or next-script direction');
+    label.htmlFor = 'spReviewNote';
+    composeHead.appendChild(label);
+    var mic = make('button', 'sp-review-mic', '');
+    mic.type = 'button';
+    mic.title = 'Tap to dictate or stop; hold to send reply';
+    mic.setAttribute('aria-label', mic.title);
+    mic.setAttribute('aria-pressed', rejectionSelection.dictating ? 'true' : 'false');
+    mic.innerHTML = folderIcon('c:microphone', '');
+    mic.disabled = rejectionBusy;
+    var held = false;
+    var holdTimer = null;
+    mic.addEventListener('pointerdown', function () {
+      held = false;
+      holdTimer = selected.micHoldTimer = root.setTimeout(function () {
+        if (selected !== rejectionSelection) return;
+        selected.micHoldTimer = null;
+        held = true;
+        if (selected.dictating) {
+          selected.sendAfterDictation = true;
+          root.PineTalkDot.finish();
+        } else rejectionDirectNext();
+      }, 450);
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (type) {
+      mic.addEventListener(type, function () {
+        if (holdTimer) root.clearTimeout(holdTimer);
+        holdTimer = null;
+        selected.micHoldTimer = null;
+      });
+    });
+    mic.addEventListener('contextmenu', function (event) { event.preventDefault(); });
+    mic.addEventListener('click', function () {
+      if (held) { held = false; return; }
+      var selected = rejectionSelection;
+      var dot = root.PineTalkDot;
+      if (!selected || !dot || typeof dot.captureNext !== 'function') {
+        if (selected) { selected.message = 'Microphone unavailable'; rejectionRender(); }
+        return;
+      }
+      if (selected.dictating) {
+        dot.finish();
+        selected.message = 'Transcribing...';
+        el('spReviewFeedback').textContent = selected.message;
+        return;
+      }
+      selected.dictating = true;
+      mic.setAttribute('aria-pressed', 'true');
+      selected.message = 'Listening...';
+      el('spReviewFeedback').textContent = selected.message;
+      try {
+        var pending = dot.captureNext(function (words) {
+          selected.dictating = false;
+          if (selected !== rejectionSelection) return;
+          selected.draft = rejectionAppendWords(selected.draft, words);
+          var current = el('spReviewNote');
+          if (current) {
+            current.value = selected.draft;
+            current.dispatchEvent(new Event('input', {bubbles: true}));
+          }
+          mic.setAttribute('aria-pressed', 'false');
+          selected.message = words ? 'Dictation added' : 'No words heard';
+          el('spReviewFeedback').textContent = selected.message;
+          if (selected.sendAfterDictation) {
+            selected.sendAfterDictation = false;
+            rejectionDirectNext();
+          }
+        });
+        if (pending && typeof pending.catch === 'function') pending.catch(function (err) {
+          if (selected !== rejectionSelection) return;
+          selected.dictating = false;
+          selected.message = 'Microphone failed: ' + rejectionError(err);
+          rejectionRender();
+        });
+      } catch (err) {
+        selected.dictating = false;
+        selected.message = 'Microphone failed: ' + rejectionError(err);
+        rejectionRender();
+      }
+    });
+    composeHead.appendChild(mic);
+    editor.appendChild(composeHead);
+    var input = make('textarea', 'sp-review-note');
+    input.id = 'spReviewNote';
+    input.rows = 3;
+    input.maxLength = 2000;
+    input.value = rejectionSelection.draft || '';
+    input.addEventListener('input', function () {
+      if (selected === rejectionSelection) selected.draft = input.value;
+    });
+    editor.appendChild(input);
+    var actions = make('div', 'sp-review-actions');
+    var save = make('button', 'sp-review-action', 'Save note');
+    save.type = 'button';
+    save.disabled = rejectionBusy;
+    save.addEventListener('click', function () { rejectionAct('note'); });
+    actions.appendChild(save);
+    var direct = make('button', 'sp-review-action sp-review-direct', 'Send reply');
+    direct.type = 'button';
+    direct.disabled = rejectionBusy || !rejectionDirectorBody(item, record, '').kind
+      || !String(rejectionSelection.draft || '').trim();
+    direct.title = 'Keep this reply on the review and direct the next script of this kind';
+    direct.addEventListener('click', rejectionDirectNext);
+    input.addEventListener('input', function () {
+      direct.disabled = rejectionBusy || !rejectionDirectorBody(item, record, '').kind
+        || !String(input.value || '').trim();
+    });
+    actions.appendChild(direct);
+    var allow = make('button', 'sp-review-action sp-review-allow', 'Allow');
+    allow.type = 'button';
+    allow.disabled = rejectionBusy || record.review_status !== 'pending'
+      || !!record.read_only || !!record.technical;
+    if (record.technical) allow.title = 'Technical failures cannot be approved as playable content';
+    allow.addEventListener('click', function () { rejectionAct('allow'); });
+    actions.appendChild(allow);
+    var keep = make('button', 'sp-review-action sp-review-keep', 'Keep rejected');
+    keep.type = 'button';
+    keep.disabled = rejectionBusy || record.review_status !== 'pending' || !!record.read_only;
+    keep.addEventListener('click', function () { rejectionAct('keep'); });
+    actions.appendChild(keep);
+    editor.appendChild(actions);
+    var feedback = make('p', 'sp-review-feedback', rejectionSelection.message || '');
+    feedback.setAttribute('role', 'status');
+    editor.appendChild(feedback);
+    scroll.appendChild(editor);
+    overlay.appendChild(scroll);
+    scroll.scrollTop = scrollTop;
+    if (editing) input.focus();
+    else if (!previousScroll) back.focus();
+  }
+
+  function rejectionFetch() {
+    var selected = rejectionSelection;
+    if (!selected) return Promise.resolve();
+    var request = ++rejectionRequest;
+    var seq = selected.item.event_seq || selected.item.seq;
+    var url = '/api/orchestrator/rejections/' + encodeURIComponent(selected.item.id);
+    return Promise.resolve(api().get(url)).then(function (got) {
+      if (request !== rejectionRequest || selected !== rejectionSelection) return;
+      if (!got || !got.id) throw new Error('Review detail unavailable');
+      if (seq && Number(seq) !== Number(got.latest_seq)) {
+        return Promise.resolve(api().get(url + '?event_seq=' + encodeURIComponent(seq)))
+          .then(function (occurrence) {
+            if (request !== rejectionRequest || selected !== rejectionSelection) return;
+            if (!occurrence || !occurrence.id) throw new Error('This occurrence is no longer available');
+            rejectionDetail = Object.assign({}, got, occurrence, {
+              history: got.history, decisions: got.decisions,
+              notes: got.notes, operator_notes: got.operator_notes,
+              read_only: true, latest_seq: got.latest_seq
+            });
+            rejectionSelection.message = 'A newer occurrence exists. Return to live to review it.';
+            rejectionRender();
+          });
+      }
+      rejectionDetail = got;
+      rejectionRender();
+    }).catch(function (err) {
+      if (request === rejectionRequest && selected === rejectionSelection) {
+        rejectionSelection.message = rejectionError(err);
+        var message = el('spReviewLoading');
+        if (message) message.textContent = rejectionSelection.message;
+        else if (rejectionDetail) rejectionRender();
+      }
+    });
+  }
+
+  function rejectionOpen(item, marker) {
+    var overlay = el('spRejectionDetail');
+    if (!overlay) return;
+    if (rejectionSelection) rejectionClose();
+    rejectionSelection = {item: item, marker: marker, draft: '', message: ''};
+    rejectionDetail = null;
+    overlay.hidden = false;
+    overlay.parentElement.classList.add('sp-reviewing');
+    overlay.replaceChildren();
+    var back = make('button', 'sp-review-back', '← Live script');
+    back.addEventListener('click', rejectionClose);
+    overlay.appendChild(back);
+    var loading = make('p', '', 'Loading review…');
+    loading.id = 'spReviewLoading';
+    overlay.appendChild(loading);
+    back.focus();
+    var selected = rejectionSelection;
+    rejectionTintRead().then(function () {
+      if (selected === rejectionSelection) rejectionTintPaint();
+    });
+    rejectionFetch();
+  }
+
+  function rejectionAct(action) {
+    if (!rejectionSelection || !rejectionDetail || rejectionBusy) return;
+    var selected = rejectionSelection;
+    var note = String(selected.draft || '').trim();
+    if (action === 'note' && !note) { selected.message = 'Enter a note first'; rejectionRender(); return; }
+    if (!api().post) { selected.message = 'Station bridge unavailable'; rejectionRender(); return; }
+    rejectionBusy = true;
+    rejectionRender();
+    var record = rejectionDetail;
+    var url = '/api/orchestrator/rejections/' + encodeURIComponent(record.id);
+    var body = rejectionBody(record, selected.item, action, note);
+    if (action === 'note') url += '/note';
+    else body.action = action;
+    Promise.resolve(api().post(url, body)).then(function (got) {
+      if (!got || got.ok === false) throw new Error((got && (got.detail || got.say)) || 'Station refused review');
+      if (selected !== rejectionSelection) return;
+      selected.draft = '';
+      selected.message = action === 'note' ? 'Note saved' : 'Decision saved';
+      rejectionHeadAt = 0;
+      rejectionLoad(true);
+      return rejectionFetch();
+    }).catch(function (err) {
+      if (selected !== rejectionSelection) return;
+      selected.message = rejectionError(err);
+      return rejectionFetch();
+    }).finally(function () {
+      rejectionBusy = false;
+      if (selected === rejectionSelection && rejectionDetail) rejectionRender();
+    });
+  }
+
+  function rejectionDirectNext() {
+    if (!rejectionSelection || !rejectionDetail || rejectionBusy) return;
+    var selected = rejectionSelection;
+    var body = rejectionDirectorBody(selected.item, rejectionDetail, selected.draft);
+    if (!body.text) { selected.message = 'Enter a direction first'; rejectionRender(); return; }
+    if (!body.kind) { selected.message = 'Segment kind unavailable'; rejectionRender(); return; }
+    if (!api().post) { selected.message = 'Station bridge unavailable'; rejectionRender(); return; }
+    rejectionBusy = true;
+    rejectionRender();
+    var record = rejectionDetail;
+    var url = '/api/orchestrator/rejections/' + encodeURIComponent(record.id) + '/reply';
+    Promise.resolve(api().post(url, rejectionBody(record, selected.item, 'note', body.text))).then(function (got) {
+      if (!got || got.ok === false) throw new Error((got && (got.detail || got.say)) || 'Direction not accepted');
+      if (selected === rejectionSelection) {
+        selected.draft = '';
+        selected.message = 'Reply saved; next ' + body.kind + ' script directed';
+        rejectionFetch();
+      }
+    }).catch(function (err) {
+      if (selected === rejectionSelection) selected.message = 'Direction not sent: ' + rejectionError(err);
+    }).finally(function () {
+      rejectionBusy = false;
+      if (selected === rejectionSelection && rejectionDetail) rejectionRender();
+    });
+  }
+
   /* ------------------------------------------------------------ 1, 2, 3 */
 
   function buildBar() {
@@ -202,6 +1015,22 @@
       if (tab) tab.click();
       else if (root.PineViewChrome) root.PineViewChrome.show(pick.value);
       pick.value = '';
+    });
+
+    var topic = make('button', 'sp-btn sp-topics', '');
+    topic.title = 'Queue a scenario for the next banter round';
+    topic.setAttribute('aria-label', 'Queue a scenario for the next banter round');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        topic.innerHTML = root.pineIcon('c:add', 'Queue a scenario');
+      }
+    } catch (err) { /* the title still names it */ }
+    if (!topic.innerHTML) topic.textContent = '+';
+    topic.addEventListener('click', function () {
+      var segments = root.PineSegments;
+      if (segments && typeof segments.topicWindow === 'function') {
+        segments.topicWindow();
+      }
     });
 
     /* 3 - reload / re-fit. Re-reads the script and re-measures the layout,
@@ -317,6 +1146,7 @@
 
     bar.appendChild(back);
     bar.appendChild(pick);
+    bar.appendChild(topic);
     bar.appendChild(reel);                                   /* #1303 */
     bar.appendChild(loop);                                   /* #1385 */
     bar.appendChild(find);                                   /* #1385 */
@@ -336,11 +1166,14 @@
   function buildSaying() {
     var box = make('div', 'sp-saying');
     box.id = 'spSaying';
+    box.setAttribute('role', 'button');
+    box.setAttribute('tabindex', '0');
     var body = make('div', 'sp-saying-body');
     var who = make('div', 'sp-saying-who', '');
     who.id = 'spSayingWho';
     var text = make('div', 'sp-saying-text', '');
     text.id = 'spSayingText';
+    text.setAttribute('data-dialogue-text', '');
     /* [#1219] "Show a timeline at the bottom while the animation or the
        sound clip is playing." The label row carries the clock (0:12 / 0:22)
        and the strip rides the card's bottom edge: a fill driven by the
@@ -370,54 +1203,21 @@
     marks.id = 'spSayingTlMarks';
     strip.appendChild(marks);
     box.appendChild(strip);
-    /* #1303b: TAP JUMPS, HOLD OPENS.
-     *
-     * A tap takes the reader to the line the strip is quoting; a hold
-     * opens that line's own detail panel - the same one the script's
-     * elements open, so "manage this clip, inspect it" is the surface
-     * that already exists rather than a second one that would drift
-     * from it.
-     *
-     * Told apart by time AND by movement, because on a tablet every
-     * tap begins as a touch that might become a scroll: 500ms without
-     * wandering more than a few pixels is a hold, a drag cancels
-     * both, and the click that follows a fired hold is swallowed. */
-    var holdTimer = 0;
-    var heldAt = null;
-    var holdFired = false;
-
-    function holdOff() {
-      if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
-      heldAt = null;
-    }
-
-    box.addEventListener('pointerdown', function (ev) {
-      holdFired = false;
-      heldAt = {x: ev.clientX, y: ev.clientY};
-      if (holdTimer) clearTimeout(holdTimer);
-      holdTimer = setTimeout(function () {
-        holdTimer = 0;
-        holdFired = true;
-        openSaying();
-      }, 500);
+    /* PineLineActions owns the hold on data-line; a tap still follows air. */
+    box.addEventListener('click', function () {
+      resumeAirFollow('live strip', sayingLineId);
     });
-    box.addEventListener('pointermove', function (ev) {
-      if (!heldAt) return;
-      if (Math.abs(ev.clientX - heldAt.x) > 8
-          || Math.abs(ev.clientY - heldAt.y) > 8) holdOff();
-    });
-    box.addEventListener('pointerup', holdOff);
-    box.addEventListener('pointercancel', function () {
-      holdOff(); holdFired = false;
-    });
-    box.addEventListener('click', function (ev) {
-      if (holdFired) {                 /* the hold already answered */
-        holdFired = false;
+    box.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') {
         ev.preventDefault();
-        ev.stopPropagation();
-        return;
+        resumeAirFollow('live strip', sayingLineId);
+      } else if ((ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
+        var actions = root.PineLineActions;
+        if (sayingLineId && actions && actions.open) {
+          ev.preventDefault();
+          actions.open({id: sayingLineId, said: text.textContent, node: box});
+        }
       }
-      if (nowLineId) jumpToLine(nowLineId);
     });
     return box;
   }
@@ -428,10 +1228,11 @@
    * what the line says NOW rather than what it said when its node was
    * first built. */
   function openSaying() {
-    if (!nowLineId) return;
-    var node = document.querySelector('.sp-el[data-line="' + nowLineId + '"]');
+    var id = String(sayingLineId || nowLineId || '');
+    if (!id) return;
+    var node = document.querySelector('.sp-el[data-line="' + id + '"]');
     if (!node || !node.pineItem) return;
-    jumpToLine(nowLineId);
+    jumpToLine(id);
     openLine(node.pineItem, node);
   }
 
@@ -449,36 +1250,134 @@
   }
 
   var sayingSaid = '';
+  var sayingLineId = '';
+
+  function sayingSource(row, node) {
+    if (node && node.pineItem) return node.pineItem;
+    var id = String((row && row.id) || '');
+    if (!id) return row || null;
+    for (var i = 0; i < elements.length; i += 1) {
+      if (String(elements[i] && (elements[i].line || elements[i].id) || '') === id) {
+        return elements[i];
+      }
+    }
+    try {
+      var rows = (root.PineStationFeed && root.PineStationFeed.rows
+        ? root.PineStationFeed.rows() : []) || [];
+      for (var j = rows.length - 1; j >= 0; j -= 1) {
+        if (String(rows[j] && (rows[j].id || rows[j].line) || '') === id) return rows[j];
+      }
+    } catch (err) { /* the mounted screenplay remains the first source */ }
+    return row || null;
+  }
+
+  function currentFeedSaying(row, station) {
+    if (!row || !row.id || !station || station.paused || stationPaused) return false;
+    var feed = root.PineStationFeed;
+    var clock = feed && typeof feed.clock === 'function' ? Number(feed.clock()) : Date.now();
+    if (Number(station.server_ms) && clock - Number(station.server_ms) > 12000) return false;
+    var stream = station.stream_now;
+    var rows = stream && stream.rows || [];
+    if (Number(stream && stream.at) > 0 && rows.some(function (item) {
+      return String(item.id || '') === String(row.id);
+    })) {
+      var offset = clock / 1000 - Number(stream.at);
+      var active = rows.find(function (item) {
+        return Number(item.from) <= offset && offset < Number(item.until);
+      });
+      return !!active && String(active.id) === String(row.id);
+    }
+    return !!(station.speaking_now
+      && String(station.speaking_now.id || '') === String(row.id));
+  }
+
+  function sayingCrawl(into, words, seconds) {
+    var body = String(words || '').replace(/\s+/g, ' ').trim();
+    into.textContent = body;
+    into.scrollTop = 0;
+  }
 
   function paintSaying(row) {
     var who = el('spSayingWho');
     var text = el('spSayingText');
     if (!who || !text) return;
-    /* #1311: an answer the operator asked for outranks the line for a
-       few seconds - see say(). */
-    if (sayUntil && Date.now() < sayUntil) return;
-    var node = (row && row.id)
-      ? document.querySelector('.sp-el[data-line="' + row.id + '"]')
+    var shown = row;
+    var feedNow = null;
+    try {
+      feedNow = root.PineStationFeed && root.PineStationFeed.now
+        ? root.PineStationFeed.now() : null;
+    } catch (err) { feedNow = null; }
+    var station = null;
+    try { station = root.PineStationFeed && root.PineStationFeed.state
+      ? root.PineStationFeed.state() : null; } catch (err) { station = null; }
+    /* A resolved line drives both the strip and the script mark. Feed words
+       may enrich that same id, but its clock must not replace a different
+       line selected from playback evidence. When there is no resolved line,
+       the guarded feed fallback in sayingFallbackMark() can still mark the
+       line displayed here without calling a clock guess cue-sheet proof. */
+    if (feedNow && currentFeedSaying(feedNow, station) && (!shown || !shown.id)) {
+      shown = feedNow;
+    } else if (feedNow && shown && String(feedNow.id) === String(shown.id)) {
+      shown = Object.assign({}, feedNow, shown, {
+        text: shown.text || feedNow.text,
+        name: shown.name || feedNow.name,
+        who: shown.who || feedNow.who,
+        kind: shown.kind || feedNow.kind
+      });
+    }
+    /* Feedback from a control can occupy this strip only while no evidenced
+       line is on air. Consult the station feed first: previously this early
+       return hid real speech whenever exact screenplay timing was absent. */
+    if ((!shown || !shown.id) && sayUntil && Date.now() < sayUntil) return null;
+    var node = (shown && shown.id)
+      ? document.querySelector('.sp-el[data-line="' + shown.id + '"]')
       : null;
-    var body = node ? String(node.textContent || '').trim() : '';
+    var source = sayingSource(shown, node) || {};
+    var body = String((shown && shown.text) || '').trim() || (node
+      ? String(node.textContent || '').trim()
+      : String(source.text || source.said || source.detail || source.line_text || '').trim());
     var name = '';
-    if (node && /sp-dialogue/.test(node.className)) {
+    if (shown && shown.road === 'playout' && shown.speaker) {
+      name = String(shown.speaker);
+    } else if (node && /sp-dialogue/.test(node.className)) {
       name = sayingWho(node);
     } else if (node) {
       /* An action line IS the clip - "A sting off the board: 344 clip
          (0:35)" - so it is labelled as one rather than attributed. */
       name = 'CLIP';
+    } else if (body) {
+      name = String(source.name || source.who || source.speaker || source.tag || 'ON AIR');
     }
-    if (!body) {
-      name = '';
-      body = soundingPlayer() ? 'sounding' : 'the room is quiet';
+    if (!body && station && station.playing && station.now && station.now.title) {
+      name = 'RECORD';
+      body = String(station.now.title)
+        + (station.now.artist ? ' / ' + String(station.now.artist) : '');
+    } else if (!body) {
+      name = station && station.paused ? 'PAUSED' : '';
+      body = station && station.paused
+        ? 'The station is paused while the rooms prepare the next broadcast.'
+        : (soundingPlayer() ? 'Audio is playing; its line is not mapped yet.' : 'The room is quiet.');
+    }
+    sayingLineId = String((shown && shown.id) || '');
+    var sayingBox = el('spSaying');
+    if (sayingBox) {
+      if (sayingLineId) sayingBox.dataset.line = sayingLineId;
+      else delete sayingBox.dataset.line;
+      var voice = node ? /sp-dialogue/.test(node.className || '')
+        : !!(shown && !/^(sfx|music|ad|record)$/.test(String(shown.kind || ''))
+          && (shown.speaker || /^(dj|host|cohost|third)$/i.test(String(shown.who || ''))));
+      sayingBox.dataset.spoken = String(!!voice);
+      sayingBox.title = sayingLineId
+        ? 'Tap to jump to this exact line in the script; hold for line actions'
+        : 'What the station is playing now';
     }
     var print = name + '\u0001' + body;
-    if (print === sayingSaid) return;         /* no needless repaint */
+    if (print === sayingSaid) return shown;  /* no needless repaint */
     sayingSaid = print;
     who.textContent = name;
-    text.textContent = body;
-    host.classList.toggle('sp-saying-idle', !node);
+    sayingCrawl(text, body, shown && (Number(shown.until) - Number(shown.from)));
+    if (sayingBox) sayingBox.classList.toggle('sp-saying-idle', !body);
+    return shown;
   }
 
   /* THE SPECTRUM, OFF THE PANEL'S OWN ANALYSER.
@@ -1045,6 +1944,126 @@
     return 'for the next ' + (n === 1 ? 'hour' : n + ' hours');
   }
 
+  function folderRatioControls(top, bridge) {
+    var defaults = {ads_share: 0, video_share: 80};
+    var saved = {ads_share: 0, video_share: 80};
+    var draft = {ads_share: 0, video_share: 80};
+    var saving = false;
+    var pendingSave = false;
+    var sliders = {};
+    var status = make('div', 'sp-folder-note', 'Loading mix ratios...');
+    status.id = 'spSfxRatioStatus';
+    status.setAttribute('role', 'status');
+    status.style.cssText = 'padding:0;color:#8ea0ad;font-size:11px';
+
+    function value(n, fallback) {
+      n = Number(n);
+      return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : fallback;
+    }
+    function paint(key, n) {
+      var slider = sliders[key];
+      slider.input.value = String(value(n, defaults[key]));
+      slider.output.textContent = slider.input.value + '%';
+    }
+    function truth(answer) {
+      if (!answer || answer.ok === false) throw new Error('Station did not return mix ratios');
+      Object.keys(sliders).forEach(function (key) {
+        saved[key] = value(answer[key], defaults[key]);
+        draft[key] = saved[key];
+        paint(key, saved[key]);
+        sliders[key].input.disabled = false;
+      });
+      return answer.effective_video_share !== undefined
+        && value(answer.effective_video_share, saved.video_share) !== saved.video_share
+        ? 'Endless video mode currently overrides the MP4 share' : '';
+    }
+    function saveRatios() {
+      if (saving) { pendingSave = true; return; }
+      saving = true;
+      var sent = {ads_share: draft.ads_share, video_share: draft.video_share};
+      status.textContent = 'Saving mix ratios...';
+      Promise.resolve().then(function () {
+        return bridge.post('/api/sfx/ratios', sent);
+      }).then(function (answer) {
+        if (!answer || answer.ok === false) throw new Error('Station rejected the ratios');
+        Object.keys(sliders).forEach(function (key) {
+          saved[key] = value(answer[key], sent[key]);
+          if (draft[key] === sent[key]) {
+            draft[key] = saved[key];
+            paint(key, saved[key]);
+          }
+        });
+        saving = false;
+        if (pendingSave) {
+          pendingSave = false;
+          saveRatios();
+        } else {
+          status.textContent = draft.ads_share === saved.ads_share
+            && draft.video_share === saved.video_share
+            ? 'Mix ratios saved' : 'Release slider to save mix ratio';
+        }
+      }).catch(function (err) {
+        pendingSave = false;
+        Promise.resolve().then(function () {
+          return bridge.get('/api/sfx/ratios');
+        }).then(truth).catch(function () {
+          Object.keys(sliders).forEach(function (key) {
+            draft[key] = saved[key];
+            paint(key, saved[key]);
+          });
+        }).finally(function () {
+          saving = false;
+          status.textContent = 'Could not save mix ratios: '
+            + String((err && err.message) || err);
+        });
+      });
+    }
+    [
+      {key: 'ads_share', name: 'Generated ads vs general SFX', id: 'spSfxAdsShare'},
+      {key: 'video_share', name: 'MP4 clips vs audio', id: 'spSfxVideoShare'}
+    ].forEach(function (spec) {
+      var row = make('label', 'sp-folder-ratio-row');
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;min-height:40px;'
+        + 'flex-wrap:wrap;color:#dfe7ee';
+      var name = make('span', 'sp-folder-ratio-name', spec.name);
+      name.style.cssText = 'flex:0 1 190px;min-width:135px;font-size:12px';
+      var input = make('input', 'sp-folder-ratio-dial');
+      input.id = spec.id;
+      input.type = 'range'; input.min = '0'; input.max = '100';
+      input.step = '1'; input.value = String(defaults[spec.key]);
+      input.disabled = true;
+      input.style.cssText = 'flex:1 1 120px;min-width:80px;min-height:36px;'
+        + 'margin:0;accent-color:#65c7da';
+      input.setAttribute('aria-label', spec.name);
+      var output = make('output', 'sp-folder-ratio-value', input.value + '%');
+      output.style.cssText = 'width:42px;text-align:right;font-variant-numeric:tabular-nums';
+      sliders[spec.key] = {input: input, output: output};
+      input.addEventListener('input', function () {
+        draft[spec.key] = value(input.value, saved[spec.key]);
+        output.textContent = draft[spec.key] + '%';
+        if (!saving) status.textContent = 'Release slider to save mix ratio';
+      });
+      input.addEventListener('change', function () {
+        draft[spec.key] = value(input.value, saved[spec.key]);
+        saveRatios();
+      });
+      row.appendChild(name);
+      row.appendChild(input);
+      row.appendChild(output);
+      top.appendChild(row);
+    });
+    top.appendChild(status);
+    return Promise.resolve().then(function () {
+      return bridge.get('/api/sfx/ratios');
+    }).then(function (answer) {
+      status.textContent = truth(answer);
+      return answer;
+    }).catch(function (err) {
+      status.textContent = 'Could not load mix ratios: ' + String((err && err.message) || err);
+      return null;
+    });
+  }
+
   function folderOpen() {
     if (!api() || !api().get) return;
     folderClose();
@@ -1077,6 +2096,7 @@
     hoursRow.appendChild(hoursLabel);
     hoursRow.appendChild(hours);
     top.appendChild(hoursRow);
+    folderRatioControls(top, api());
     var pinRow = make('div', 'sp-folder-pin-row');
     var pinLine = make('div', 'sp-folder-pin', 'asking the station\u2026');
     pinLine.id = 'spFolderPin';
@@ -1314,6 +2334,51 @@
     if (tri) tri.setAttribute('aria-expanded', 'true');
   }
 
+  function videoFirstFrame(video, reveal, hide) {
+    var generation = 0, start = NaN, pending = false, shown = false;
+    function ready() {
+      return video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
+    }
+    function commit() {
+      if (shown || !ready()) return;
+      shown = true;
+      reveal();
+    }
+    function reset() {
+      generation += 1;
+      start = NaN;
+      pending = false;
+      shown = false;
+      if (hide) hide();
+    }
+    video.addEventListener('loadstart', reset);
+    video.addEventListener('emptied', reset);
+    function armFrame() {
+      if (!ready()) return;
+      if (!Number.isFinite(start)) start = Number(video.currentTime) || 0;
+      if (typeof video.requestVideoFrameCallback !== 'function' || pending) return;
+      pending = true;
+      var token = generation;
+      try {
+        video.requestVideoFrameCallback(function () {
+          if (token !== generation) return;
+          pending = false;
+          commit();
+        });
+      } catch (err) { pending = false; /* playback progress remains the fallback */ }
+    }
+    video.addEventListener('loadeddata', armFrame);
+    video.addEventListener('playing', armFrame);
+    video.addEventListener('seeked', function () {
+      if (!video.seeking) commit();
+    });
+    video.addEventListener('timeupdate', function () {
+      if (!Number.isFinite(start)) { armFrame(); return; }
+      if (Number.isFinite(start) && Number(video.currentTime) > start + 0.04) commit();
+    });
+    return reset;
+  }
+
   function folderSample(s) {
     s = s || {};
     var item = make('div', 'sp-folder-sample');
@@ -1337,7 +2402,53 @@
       media.setAttribute('playsinline', '');
       media.muted = true;
       media.setAttribute('muted', '');
-      media.style.maxHeight = '120px';
+      var frame = make('div', 'sp-folder-video-frame');
+      frame.style.cssText = 'position:relative;width:100%;max-width:420px;height:120px;'
+        + 'margin:2px 0 0;background:#000;overflow:hidden;border-radius:6px';
+      var icon = document.createElement('img');
+      icon.alt = '';
+      icon.src = stationUrl('/spark/asset/pinebox.png');
+      icon.style.cssText = 'position:absolute;width:64px;height:64px;max-width:30%;'
+        + 'max-height:70%;object-fit:contain;left:50%;top:50%;'
+        + 'transform:translate(-50%,-50%)';
+      frame.appendChild(icon);
+      if (s.poster_url || s.poster) {
+        var poster = document.createElement('img');
+        poster.alt = '';
+        poster.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;'
+          + 'object-fit:contain';
+        poster.addEventListener('load', function () { icon.hidden = true; });
+        poster.addEventListener('error', function () { poster.remove(); icon.hidden = false; });
+        poster.src = stationUrl(s.poster_url || s.poster);
+        frame.appendChild(poster);
+      }
+      var play = make('button', 'sp-folder-video-play');
+      play.type = 'button';
+      play.title = 'Play video preview';
+      play.setAttribute('aria-label', 'Play video preview');
+      play.innerHTML = folderIcon('c:play--filled', 'Play video preview') || 'Play';
+      play.style.cssText = 'position:absolute;right:8px;bottom:8px;width:36px;'
+        + 'height:36px;display:grid;place-items:center;z-index:1;'
+        + 'background:#17232b;color:#edf3f5;border:1px solid #354853;'
+        + 'border-radius:4px';
+      play.addEventListener('click', function () {
+        media.play().catch(function () { play.title = 'Video preview could not play'; });
+      });
+      frame.appendChild(play);
+      media.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;'
+        + 'max-width:none;max-height:none;margin:0;object-fit:contain;'
+        + 'visibility:hidden;background:transparent';
+      videoFirstFrame(media, function () {
+        media.style.visibility = 'visible';
+        play.style.display = 'none';
+        icon.hidden = true;
+        if (poster) poster.hidden = true;
+      }, function () {
+        media.style.visibility = 'hidden';
+        play.style.display = 'grid';
+        icon.hidden = !!(poster && poster.complete && poster.naturalWidth);
+        if (poster) poster.hidden = false;
+      });
     } else {
       media = document.createElement('audio');
     }
@@ -1345,7 +2456,8 @@
     media.preload = 'none';
     media.className = 'sp-folder-media';
     media.src = stationUrl(s.url);
-    item.appendChild(media);
+    if (s.video) { frame.appendChild(media); item.appendChild(frame); }
+    else item.appendChild(media);
     return item;
   }
 
@@ -2027,7 +3139,9 @@
 
   /* One heading, on one line. */
   function headerText(node) {
-    return String((node && node.textContent) || '')
+    return String((node && node.dataset && node.dataset.heading)
+      || (node && node.pineItem && node.pineItem.text)
+      || (node && node.textContent) || '')
       .replace(/\s+/g, ' ').trim().slice(0, HEADER_TEXT_CAP);
   }
 
@@ -3215,27 +4329,16 @@
   function segSheetAtFinger(x, y) {
     var sheet = document.querySelector('.la-sheet');
     if (!sheet) return;
-    var place = function () {
-      var w = sheet.offsetWidth || 0;
-      var h = sheet.offsetHeight || 0;
-      var vw = root.innerWidth || 0;
-      var vh = root.innerHeight || 0;
-      if (!w || !h || !vw || !vh) return;
-      var left = Math.round((Number(x) || (vw / 2)) - (w / 2));
-      var top = Math.round((Number(y) || (vh / 2)) + 16);
-      left = Math.max(8, Math.min(vw - w - 8, left));
-      top = Math.max(8, Math.min(vh - h - 8, top));
-      sheet.classList.add('sp-at-finger');
-      sheet.style.left = left + 'px';
-      sheet.style.top = top + 'px';
-      sheet.style.right = 'auto';
-      sheet.style.bottom = 'auto';
-      sheet.style.transform = 'none';
-    };
-    place();
-    try {
-      if (root.requestAnimationFrame) root.requestAnimationFrame(place);
-    } catch (err) { /* one measurement is better than none */ }
+    /* The action sheet is a modal, not a context menu. Finger-relative
+       placement could leave its bottom outside Android's visual viewport,
+       especially after the status/navigation bars were inset. The shared
+       sheet now owns one safe, centred layout on every dialogue surface. */
+    sheet.classList.add('sp-at-finger');
+    sheet.style.removeProperty('left');
+    sheet.style.removeProperty('top');
+    sheet.style.removeProperty('right');
+    sheet.style.removeProperty('bottom');
+    sheet.style.removeProperty('transform');
   }
 
   /* ------------------------------------- #1194: the gestures on one row */
@@ -3348,8 +4451,19 @@
 
   function itineraryClose() { var n = el(ITIN_ID); if (n) n.remove(); }
 
-  function itineraryOpen() {
-    var sheet = sheetShell(ITIN_ID, 'sp-itin', 'The itinerary');
+  function activeSegment(row) {
+    var id = String((row && row.id) || nowLineId || '');
+    var node = id ? lineNode(id) : null;
+    while (node && !/(^|\s)sp-scene(\s|$)/.test(String(node.className || ''))) {
+      node = node.previousElementSibling;
+    }
+    return node ? segIdentity(node) : null;
+  }
+
+  function itineraryOpen(target) {
+    var current = activeSegment(activeRow());
+    var sheet = sheetShell(ITIN_ID, 'sp-itin', current && current.heading
+      ? 'On air: ' + current.heading : 'The station calendar');
     /* A diagnostic surface: the broadcast ducks while it is open and lets
        go by itself when the sheet leaves the page. */
     if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
@@ -3358,8 +4472,40 @@
     var name = el('spScriptHead');
     sheet.box.appendChild(make('div', 'sp-itin-what',
       name ? headerText(name) : 'the broadcast'));
+    var tools = make('div', 'sp-itin-tools');
+    var views = make('div', 'sp-itin-views');
     var list = make('div', 'sp-itin-list');
+    function tab(label, mode) {
+      var button = make('button', 'sp-itin-tab', label);
+      button.type = 'button';
+      button.addEventListener('click', function () {
+        Array.prototype.forEach.call(views.querySelectorAll('.sp-itin-tab'), function (one) {
+          one.classList.toggle('on', one === button);
+        });
+        if (mode === 'hour') itineraryHour(list, sheet);
+        else itineraryCalendar(list, sheet, mode);
+      });
+      views.appendChild(button);
+      return button;
+    }
+    var hourTab = tab('Hour', 'hour');
+    tab('Day', 'day'); tab('Week', 'week'); tab('Month', 'month');
+    hourTab.classList.add('on');
+    tools.appendChild(views);
+    var add = make('button', 'sp-itin-add', '+ Segment');
+    add.type = 'button';
+    add.addEventListener('click', function () { itineraryAdd(list, sheet); });
+    tools.appendChild(add);
+    sheet.box.appendChild(tools);
     sheet.box.appendChild(list);
+    sheet.revealLive = true;
+    sheet.revealEntry = target && typeof target === 'object' ? target : null;
+    itineraryHour(list, sheet);
+    return sheet;
+  }
+
+  function itineraryHour(list, sheet) {
+    list.replaceChildren();
     list.appendChild(make('div', 'sp-itin-wait',
       'asking the station for the running order…'));
     if (!api() || !api().get) {
@@ -3386,12 +4532,150 @@
         return;
       }
       itineraryPaint(list, hours, sheet);
+      if (sheet.revealEntry) {
+        var wanted = sheet.revealEntry;
+        sheet.revealEntry = null;
+        var match = Array.prototype.find.call(list.querySelectorAll('.sp-itin-row'),
+          function (row) {
+            return wanted.occurrence
+              ? row.dataset.occurrence === String(wanted.occurrence)
+              : row.dataset.slot === String(wanted.slot_id || '');
+          });
+        if (match && typeof match.__pineOpen === 'function') {
+          match.__pineOpen(true);
+          match.scrollIntoView({block: 'center'});
+          sheet.revealLive = false;
+        } else {
+          sheet.revealLive = false;
+          sheet.say('That segment is no longer in the current running order.', true);
+        }
+      }
+      if (sheet.revealLive) {
+        sheet.revealLive = false;
+        itineraryRevealLive(list);
+      }
       if (!fresh.length) {
         sheet.say('The station did not answer just now - this is the running'
           + ' order as it last stood here.', true);
       }
     });
-    return sheet;
+  }
+
+  function itinPresetSelect(names, value, onChange) {
+    var pick = document.createElement('select');
+    pick.className = 'sp-itin-preset';
+    (names || []).forEach(function (name) {
+      var option = make('option', '', String(name));
+      option.value = String(name);
+      option.selected = String(name) === String(value || '');
+      pick.appendChild(option);
+    });
+    pick.addEventListener('change', function () { onChange(pick.value, pick); });
+    return pick;
+  }
+
+  function itineraryCalendar(list, sheet, mode) {
+    list.replaceChildren(make('div', 'sp-itin-wait', 'reading the calendar…'));
+    var many = mode === 'week' ? 7 : mode === 'month' ? 31 : 0;
+    var reads = [api().get('/api/schedule')];
+    if (many) {
+      var today = new Date();
+      var key = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0')
+        + '-' + String(today.getDate()).padStart(2, '0');
+      reads.push(api().get('/api/schedule/month?from=' + key + '&days=' + many));
+    }
+    Promise.all(reads).then(function (got) {
+      if (!el(ITIN_ID)) return;
+      var state = got[0] || {};
+      var names = state.presets || [];
+      list.replaceChildren();
+      if (mode === 'day') {
+        list.appendChild(make('div', 'sp-itin-calendar-head',
+          'Every hour · changes apply on the next initialization of that hour'));
+        for (var hour = 0; hour < 24; hour += 1) {
+          (function (h) {
+            var row = make('div', 'sp-itin-calendar-row');
+            row.appendChild(make('b', '', String(h).padStart(2, '0') + ':00'));
+            row.appendChild(itinPresetSelect(names, (state.day || {})[String(h)],
+              function (value, pick) {
+                pick.disabled = true;
+                var hours = {}; hours[String(h)] = value;
+                api().post('/api/schedule/day', {hours: hours}).then(function () {
+                  sheet.say(String(h).padStart(2, '0') + ':00 now runs ' + value);
+                  pick.disabled = false;
+                }, function (err) {
+                  pick.disabled = false; sheet.say((err && err.message) || err, true);
+                });
+              }));
+            list.appendChild(row);
+          })(hour);
+        }
+        return;
+      }
+      var plan = got[1] || {};
+      list.appendChild(make('div', 'sp-itin-calendar-head',
+        (mode === 'week' ? 'Seven days' : 'Thirty-one days')
+        + ' · auto means the day inherits the hourly plan'));
+      (plan.month || []).forEach(function (day) {
+        var row = make('div', 'sp-itin-calendar-row');
+        var stamp = make('b', '', String(day.date || ''));
+        if (day.auto) stamp.appendChild(make('i', '', ' auto'));
+        row.appendChild(stamp);
+        row.appendChild(itinPresetSelect(names, day.preset, function (value, pick) {
+          pick.disabled = true;
+          var days = {}; days[String(day.date || '')] = value;
+          api().post('/api/schedule/month', {days: days}).then(function () {
+            stamp.classList.add('saved');
+            sheet.say(String(day.date || '') + ' now runs ' + value);
+            pick.disabled = false;
+          }, function (err) {
+            pick.disabled = false; sheet.say((err && err.message) || err, true);
+          });
+        }));
+        list.appendChild(row);
+      });
+    }, function (err) {
+      list.replaceChildren(make('div', 'sp-segrow-why',
+        'The calendar did not answer: ' + ((err && err.message) || err)));
+    });
+  }
+
+  function itineraryAdd(list, sheet) {
+    list.replaceChildren(make('div', 'sp-itin-wait', 'reading the active schedule…'));
+    api().get('/api/schedule').then(function (state) {
+      list.replaceChildren();
+      var form = make('form', 'sp-itin-new');
+      form.appendChild(make('b', '', 'Add a segment to ' + String(state.active || 'the schedule')));
+      var kind = document.createElement('select');
+      (state.kinds || []).forEach(function (row) {
+        var option = make('option', '', String(row.label || row.kind));
+        option.value = String(row.kind || ''); kind.appendChild(option);
+      });
+      var label = document.createElement('input');
+      label.placeholder = 'segment name'; label.required = true;
+      var minutes = document.createElement('input');
+      minutes.type = 'number'; minutes.min = '.25'; minutes.max = '60';
+      minutes.step = '.25'; minutes.value = '3';
+      var save = make('button', '', 'Add to the running order'); save.type = 'submit';
+      form.appendChild(kind); form.appendChild(label); form.appendChild(minutes); form.appendChild(save);
+      form.addEventListener('submit', function (event) {
+        event.preventDefault(); save.disabled = true;
+        var slots = (state.slots || []).slice();
+        slots.push({id: '', kind: kind.value, label: label.value,
+          minutes: Number(minutes.value) || 3, enabled: true});
+        api().post('/api/schedule/slots', {preset: state.active, slots: slots})
+          .then(function () {
+            sheet.say('Added ' + label.value + ' to ' + state.active);
+            itineraryHour(list, sheet);
+          }, function (err) {
+            save.disabled = false; sheet.say((err && err.message) || err, true);
+          });
+      });
+      list.appendChild(form);
+    }, function (err) {
+      list.replaceChildren(make('div', 'sp-segrow-why',
+        'The schedule did not answer: ' + ((err && err.message) || err)));
+    });
   }
 
   function itinClock(ts) {
@@ -3458,6 +4742,570 @@
       + (secs ? '  ·  ' + segSecs(secs) : '');
   }
 
+  var itinPortraits = {promise: null, bySeat: Object.create(null),
+    used: Object.create(null), posters: Object.create(null),
+    live: Object.create(null), waiting: Object.create(null)};
+
+  function itinStationUrl(path) {
+    var value = String(path || '');
+    if (/^https?:/i.test(value)) return value;
+    var base = '';
+    try {
+      base = /^https?:$/i.test(location.protocol) ? location.origin
+        : (typeof root.pineStationBase === 'function' ? root.pineStationBase() : '');
+    } catch (err) { base = ''; }
+    return String(base || '').replace(/\/$/, '') + value;
+  }
+
+  function itinPortraitPool() {
+    if (itinPortraits.promise) return itinPortraits.promise;
+    itinPortraits.promise = Promise.all([
+      Promise.resolve(api().get('/api/slideshow?limit=200')).then(null, function () { return {}; }),
+      Promise.resolve(api().get('/api/sfx/video/profiles?limit=12')).then(null, function () { return {}; })
+    ]).then(function (got) {
+        var pictures = ((got[0] && got[0].rows) || []).filter(function (row) {
+          return /\.(png|jpe?g|webp|gif)$/i.test(String((row || {}).file || ''))
+            && String((row || {}).url || '');
+        });
+        var motion = ((got[1] && got[1].clips) || []).filter(function (row) {
+          return String((row || {}).url || '') && /\.mp4$/i.test(String((row || {}).file || ''));
+        }).map(function (row) { return Object.assign({}, row, {motion: true}); });
+        return pictures.concat(motion);
+      }, function () { return []; });
+    return itinPortraits.promise;
+  }
+
+  function itinPortraitSeat(turn) {
+    var kind = String((turn && turn.kind) || '').toLowerCase();
+    var seat = String((turn && turn.seat) || '').toLowerCase();
+    if (kind === 'sfx' || kind === 'sfxguy' || seat === 'board' || seat === 'drop') {
+      return 'the-sfx-guy';
+    }
+    return String((turn && (turn.who || turn.seat)) || 'speaker').toLowerCase();
+  }
+
+  function itinPortraitAssign(avatar, turn) {
+    var key = itinPortraitSeat(turn);
+    itinPortraitPool().then(function (pool) {
+      if (!pool.length || !avatar || !avatar.isConnected) return;
+      var picked = itinPortraits.bySeat[key];
+      if (!picked) {
+        var start = Math.floor(Math.random() * pool.length);
+        for (var i = 0; i < pool.length; i += 1) {
+          var candidate = pool[(start + i) % pool.length];
+          if (!itinPortraits.used[candidate.file] || i === pool.length - 1) {
+            picked = candidate;
+            break;
+          }
+        }
+        itinPortraits.bySeat[key] = picked;
+        if (picked) itinPortraits.used[picked.file] = true;
+      }
+      if (!picked) return;
+      if (picked.motion) {
+        var poster = itinPortraits.posters[key];
+        if (poster) {
+          var still = document.createElement('img');
+          still.alt = ''; still.src = poster;
+          avatar.appendChild(still); avatar.classList.add('has-picture');
+          return;
+        }
+        if (itinPortraits.live[key]) {
+          (itinPortraits.waiting[key] || (itinPortraits.waiting[key] = [])).push(avatar);
+          return;
+        }
+        var video = document.createElement('video');
+        video.style.visibility = 'hidden';
+        video.muted = true; video.defaultMuted = true; video.volume = 0;
+        video.autoplay = true; video.loop = true; video.playsInline = true;
+        video.preload = 'metadata'; video.setAttribute('muted', '');
+        video.setAttribute('playsinline', ''); video.setAttribute('aria-hidden', 'true');
+        itinPortraits.live[key] = video;
+        videoFirstFrame(video, function () {
+          video.style.visibility = 'visible';
+          avatar.classList.add('has-picture');
+          try {
+            var canvas = document.createElement('canvas');
+            canvas.width = 96; canvas.height = 96;
+            var context = canvas.getContext('2d');
+            if (context) {
+              var sw = video.videoWidth || 96, sh = video.videoHeight || 96;
+              var side = Math.min(sw, sh);
+              context.drawImage(video, (sw - side) / 2, (sh - side) / 2,
+                side, side, 0, 0, 96, 96);
+              itinPortraits.posters[key] = canvas.toDataURL('image/jpeg', 0.78);
+            }
+          } catch (err) { /* the muted live frame remains a valid portrait */ }
+          var waiting = itinPortraits.waiting[key] || [];
+          waiting.forEach(function (seat) {
+            if (!seat || !seat.isConnected || !itinPortraits.posters[key]) return;
+            var image = document.createElement('img'); image.alt = '';
+            image.src = itinPortraits.posters[key]; seat.appendChild(image);
+            seat.classList.add('has-picture');
+          });
+          itinPortraits.waiting[key] = [];
+        }, function () {
+          video.style.visibility = 'hidden';
+          avatar.classList.remove('has-picture');
+        });
+        video.addEventListener('error', function () {
+          delete itinPortraits.live[key]; video.remove();
+        });
+        video.src = itinStationUrl(picked.url);
+        avatar.appendChild(video);
+        Promise.resolve(video.play()).catch(function () {});
+        return;
+      }
+      var image = document.createElement('img');
+      image.alt = '';
+      image.loading = 'lazy';
+      image.addEventListener('load', function () { avatar.classList.add('has-picture'); });
+      image.addEventListener('error', function () { image.remove(); });
+      image.src = itinStationUrl(picked.url);
+      avatar.appendChild(image);
+    });
+  }
+
+  function itinAvatar(turn) {
+    var who = String((turn && (turn.who || turn.seat)) || 'speaker');
+    var initials = who.split(/\s+/).filter(Boolean).slice(0, 2)
+      .map(function (word) { return word.charAt(0).toUpperCase(); }).join('') || '?';
+    var avatar = make('span', 'sp-itin-avatar', initials);
+    avatar.setAttribute('aria-hidden', 'true');
+    itinPortraitAssign(avatar, turn);
+    return avatar;
+  }
+
+  function itinConversationTurns(entry, variant) {
+    var script = (entry && entry.script) || {};
+    var bound = script.turns || [];
+    var prepared = variant ? (variant.turns || [])
+      : (bound.length ? bound : (script.draft_turns || []));
+    var aired = (entry && entry.aired) || [];
+    var turns = [];
+    var seen = Object.create(null);
+    function words(value) { return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+    aired.forEach(function (row) {
+      var text = String((row || {}).text || '').trim();
+      if (!text) return;
+      var kind = String(row.kind || '').toLowerCase();
+      var seat = String(row.who || '');
+      var who = String(row.name || seat || 'speaker');
+      if (kind === 'sfx') who = 'The SFX Guy - stinger';
+      else if (kind === 'sfxguy' || seat === 'drop') who = 'The SFX Guy';
+      turns.push({seat: seat, who: who, text: text, kind: kind,
+        line: String(row.line || ''), at: row.at, aired: true});
+      seen[words(text)] = true;
+    });
+    prepared.forEach(function (turn, index) {
+      var text = String((turn || {}).text || '').trim();
+      if (!text || seen[words(text)]) return;
+      turns.push(Object.assign({}, turn, {text: text, prepared_index: index,
+        draft: !!variant || !bound.length,
+        candidate: String((variant && variant.id) || turn.candidate || script.candidate || ''),
+        previous: index > 0 ? String((prepared[index - 1] || {}).text || '') : ''}));
+      seen[words(text)] = true;
+    });
+    var cues = (variant && variant.sfx_plan) || script.sfx_plan || [];
+    cues.forEach(function (cue) {
+      var after = Math.max(0, Math.min(turns.length, Number(cue.after) + 1));
+      turns.splice(after, 0, Object.assign({}, cue, {
+        planned_sfx: true, draft: !!variant || !bound.length,
+        candidate: String((variant && variant.id) || script.candidate || '')}));
+    });
+    return turns;
+  }
+
+  function itinFact(table, label, value) {
+    if (value === undefined || value === null || value === '') return;
+    var tr = document.createElement('tr');
+    tr.appendChild(make('th', '', label));
+    tr.appendChild(make('td', '', typeof value === 'string'
+      ? value : JSON.stringify(value, null, 2)));
+    table.appendChild(tr);
+  }
+
+  var itinThreePromise = null;
+  function itinThree() {
+    if (root.THREE) return Promise.resolve(root.THREE);
+    if (itinThreePromise) return itinThreePromise;
+    itinThreePromise = new Promise(function (resolve, reject) {
+      var tag = document.createElement('script');
+      tag.src = techUrl('/vendor/three.min.js');
+      tag.addEventListener('load', function () { resolve(root.THREE); });
+      tag.addEventListener('error', function () { reject(new Error('three.js unavailable')); });
+      document.head.appendChild(tag);
+    });
+    return itinThreePromise;
+  }
+
+  function itinTurnFlow(canvas) {
+    itinThree().then(function (THREE) {
+      if (!canvas || !canvas.isConnected || !THREE) return;
+      var renderer = new THREE.WebGLRenderer({canvas: canvas, alpha: true, antialias: true});
+      renderer.setPixelRatio(Math.min(2, root.devicePixelRatio || 1));
+      var width = Math.max(280, canvas.clientWidth || 640);
+      var height = Math.max(150, canvas.clientHeight || 180);
+      renderer.setSize(width, height, false);
+      var scene = new THREE.Scene();
+      var camera = new THREE.PerspectiveCamera(38, width / height, .1, 50);
+      camera.position.set(0, 0, 11);
+      var material = new THREE.MeshBasicMaterial({color: 0x65c7da});
+      var lastMaterial = new THREE.MeshBasicMaterial({color: 0xe3be63});
+      var geometry = new THREE.BoxGeometry(.72, .72, .72);
+      var points = [-3, -1, 1, 3].map(function (x, index) {
+        var node = new THREE.Mesh(geometry, index === 3 ? lastMaterial : material);
+        node.position.set(x, 0, index * .12 - .2); scene.add(node); return node;
+      });
+      var pathData = new Float32Array(18);
+      var pathGeometry = new THREE.BufferGeometry();
+      pathGeometry.setAttribute('position', new THREE.BufferAttribute(pathData, 3));
+      var pathMaterial = new THREE.LineBasicMaterial({color: 0x4f7f88, transparent: true, opacity: .8});
+      var path = new THREE.LineSegments(pathGeometry, pathMaterial); scene.add(path);
+      var pulse = new THREE.Mesh(new THREE.SphereGeometry(.13, 10, 8),
+        new THREE.MeshBasicMaterial({color: 0xffffff})); scene.add(pulse);
+      var started = performance.now();
+      function frame(now) {
+        if (!canvas.isConnected) {
+          geometry.dispose(); pathGeometry.dispose(); material.dispose();
+          lastMaterial.dispose(); pathMaterial.dispose(); renderer.dispose(); return;
+        }
+        var seconds = (now - started) / 1000;
+        points.forEach(function (node, index) {
+          node.position.y = Math.sin(seconds * 1.25 + index * .8) * .28;
+          node.rotation.x = seconds * .18 + index; node.rotation.y = seconds * .24;
+        });
+        for (var i = 0; i < 3; i += 1) {
+          var at = i * 6;
+          pathData[at] = points[i].position.x; pathData[at + 1] = points[i].position.y;
+          pathData[at + 2] = points[i].position.z;
+          pathData[at + 3] = points[i + 1].position.x; pathData[at + 4] = points[i + 1].position.y;
+          pathData[at + 5] = points[i + 1].position.z;
+        }
+        pathGeometry.attributes.position.needsUpdate = true;
+        var travel = (seconds * .36) % 1;
+        var segment = Math.min(2, Math.floor(travel * 3));
+        var local = travel * 3 - segment;
+        pulse.position.lerpVectors(points[segment].position, points[segment + 1].position, local);
+        renderer.render(scene, camera);
+        root.requestAnimationFrame(frame);
+      }
+      root.requestAnimationFrame(frame);
+    }, function () {
+      if (canvas) canvas.classList.add('sp-itin-flow-unavailable');
+    });
+  }
+
+  function itinTurnOpen(entry, turn, index, refresh) {
+    var script = (entry && entry.script) || {};
+    var aired = !!turn.aired;
+    var draft = !aired && (!((script.turns || []).length) || !!turn.draft);
+    var detail = sheetShell('spItinTurn', 'sp-itin-turn',
+      String(turn.who || turn.seat || 'Prepared line'));
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-spItinTurn', root.PineDuck.REPORT, detail.back);
+    }
+    var editor = document.createElement('textarea');
+    editor.className = 'sp-itin-turn-edit';
+    editor.value = String(turn.text || '');
+    editor.readOnly = aired || !!turn.planned_sfx;
+    editor.setAttribute('aria-label', aired ? 'Aired line'
+      : (draft ? 'Draft line' : 'Edit prepared line'));
+    detail.box.appendChild(editor);
+
+    var flow = make('section', 'sp-itin-flow');
+    flow.appendChild(make('b', 'sp-itin-flow-title', 'How this line was generated'));
+    var canvas = document.createElement('canvas');
+    canvas.className = 'sp-itin-flow-canvas';
+    canvas.setAttribute('aria-label', 'Animated source flow from seed through topic and prior line to this line');
+    flow.appendChild(canvas);
+    var legend = make('div', 'sp-itin-flow-legend');
+    ['seed and sources', 'active topic', 'previous line', 'this line'].forEach(function (label) {
+      legend.appendChild(make('span', '', label));
+    });
+    flow.appendChild(legend);
+    detail.box.appendChild(flow);
+    itinTurnFlow(canvas);
+
+    var variant = (script.draft_variants || []).find(function (item) {
+      return String(item.id || '') === String(turn.candidate || '');
+    }) || {};
+
+    var table = make('table', 'sp-itin-turn-table');
+    itinFact(table, 'Segment', entry.label || entry.kind);
+    itinFact(table, 'Scheduled', itinClock(entry.start));
+    itinFact(table, 'Slot', entry.slot_id);
+    itinFact(table, 'Occurrence', entry.occurrence);
+    itinFact(table, 'Road', entry.kind);
+    itinFact(table, 'Seat', turn.seat);
+    itinFact(table, 'Kind', turn.kind);
+    itinFact(table, 'Line', turn.line);
+    itinFact(table, 'Aired at', turn.at ? itinClock(turn.at) : '');
+    itinFact(table, 'Prepared state', script.state);
+    itinFact(table, 'Candidate', script.candidate);
+    itinFact(table, 'Draft candidate', turn.candidate);
+    itinFact(table, 'Source', script.source);
+    itinFact(table, 'Source evidence', variant.source || script.source_evidence);
+    itinFact(table, 'Active topic', variant.topic || script.topic);
+    itinFact(table, 'Topic continuity', variant.topic_review || script.topic_review);
+    itinFact(table, 'Prompt and scheduling setup', entry.prompt);
+    itinFact(table, 'Direction', entry.direction);
+    itinFact(table, 'Beats', entry.beats);
+    itinFact(table, 'Tint', script.tint);
+    itinFact(table, 'Review', entry.review);
+    detail.box.appendChild(table);
+
+    var actions = make('div', 'sp-itin-turn-actions');
+    if (aired) {
+      if (turn.line) {
+        var inspect = make('button', 'sp-itin-turn-save', 'Inspect full provenance');
+        inspect.type = 'button';
+        inspect.addEventListener('click', function () {
+          technicalTrace(String(turn.line || ''), String(turn.text || ''));
+        });
+        actions.appendChild(inspect);
+      } else {
+        actions.appendChild(make('span', 'sp-itin-turn-draft',
+          'This aired event has no retained line id to trace.'));
+      }
+    } else if (!turn.planned_sfx) {
+      var save = make('button', 'sp-itin-turn-save',
+        draft ? 'Save draft rewrite' : 'Save and re-record this line');
+      save.type = 'button';
+      save.addEventListener('click', function () {
+        var said = String(editor.value || '').trim();
+        if (!said) { detail.say('A blank line would be a deletion.', true); return; }
+        save.disabled = true;
+        api().post('/api/director/segment/' + encodeURIComponent(entry.occurrence) + '/turn', {
+          index: index, text: said, was: String(turn.text || ''),
+          candidate: String(turn.candidate || '')
+        }).then(function (got) {
+          turn.text = said;
+          detail.say(String((got && got.say) || 'Saved.'));
+          if (typeof refresh === 'function') refresh();
+          setTimeout(detail.close, 900);
+        }, function (err) {
+          save.disabled = false;
+          detail.say(String((err && err.message) || err), true);
+        });
+      });
+      actions.appendChild(save);
+    } else {
+      actions.appendChild(make('span', 'sp-itin-turn-draft',
+        'This is an assembly cue; the exact clip is chosen when the segment goes to air.'));
+    }
+    detail.box.appendChild(actions);
+
+    if (!turn.planned_sfx) {
+      var feedback = make('section', 'sp-itin-feedback');
+      feedback.appendChild(make('b', 'sp-itin-feedback-title', 'Tell the orchestrator what to fix'));
+      var quick = make('div', 'sp-itin-feedback-quick');
+      function sendFeedback(action, note, button) {
+        Array.prototype.forEach.call(feedback.querySelectorAll('button'), function (one) {
+          one.disabled = true;
+        });
+        api().post('/api/director/segment/' + encodeURIComponent(entry.occurrence) + '/feedback', {
+          action: action, kind: String(entry.kind || ''), slot_id: String(entry.slot_id || ''),
+          candidate: String(turn.candidate || script.candidate || ''), index: index,
+          line: String(turn.text || ''), previous: String(turn.previous || ''),
+          topic: String(variant.topic || script.topic || ''), note: String(note || '')
+        }).then(function (got) {
+          detail.say(String((got && got.say) || 'The note is with the orchestrator.'));
+          if (button) button.classList.add('on');
+          if (typeof refresh === 'function') setTimeout(refresh, 700);
+        }, function (err) {
+          Array.prototype.forEach.call(feedback.querySelectorAll('button'), function (one) {
+            one.disabled = false;
+          });
+          detail.say(String((err && err.message) || err), true);
+        });
+      }
+      [['Off topic', 'off_topic'], ['Does not make sense', 'doesnt_make_sense'],
+       ['Rewrite', 'rewrite'], ['Refer to previous text', 'refer_to_previous']]
+        .forEach(function (pair) {
+          var button = make('button', 'sp-itin-feedback-button', pair[0]);
+          button.type = 'button';
+          button.addEventListener('click', function () { sendFeedback(pair[1], '', button); });
+          quick.appendChild(button);
+        });
+      feedback.appendChild(quick);
+      var discuss = make('div', 'sp-itin-feedback-discuss');
+      var subject = document.createElement('input');
+      subject.placeholder = 'What should they discuss instead?';
+      subject.setAttribute('aria-label', 'Replacement subject');
+      var discussButton = make('button', 'sp-itin-feedback-button', 'Discuss this instead');
+      discussButton.type = 'button';
+      discussButton.addEventListener('click', function () {
+        var note = String(subject.value || '').trim();
+        if (!note) { detail.say('Name the subject you want this line to discuss.', true); return; }
+        sendFeedback('discuss_instead', note, discussButton);
+      });
+      discuss.appendChild(subject); discuss.appendChild(discussButton);
+      feedback.appendChild(discuss);
+      detail.box.appendChild(feedback);
+    }
+    return detail;
+  }
+
+  function itinConversation(entry, sheet, refresh) {
+    var script = (entry && entry.script) || {};
+    var bound = script.turns || [];
+    var variants = script.draft_variants || [];
+    var selectedId = String(script.selected_candidate || '');
+    var variant = variants.find(function (item) { return String(item.id) === selectedId; })
+      || variants[0] || null;
+    var turns = itinConversationTurns(entry, variant);
+    var wrap = make('section', 'sp-itin-conversation');
+    wrap.addEventListener('click', function (event) { event.stopPropagation(); });
+    wrap.addEventListener('keydown', function (event) { event.stopPropagation(); });
+    var tools = make('div', 'sp-itin-conversation-tools');
+    var views = make('div', 'sp-itin-conversation-views');
+    var stage = make('div', 'sp-itin-conversation-body');
+    var mode = 'chat';
+
+    function selectVariant(next) {
+      variant = next || null;
+      turns = itinConversationTurns(entry, variant);
+      render();
+    }
+
+    function render() {
+      stage.replaceChildren();
+      stage.setAttribute('data-view', mode);
+      if (!turns.length) {
+        stage.appendChild(make('p', 'sp-itin-empty',
+          'No dialogue is bound to this slot yet. The preparation brief below is what the orchestrator is working from.'));
+        if (entry.prompt) stage.appendChild(make('pre', 'sp-itin-setup', String(entry.prompt)));
+        return;
+      }
+      turns.forEach(function (turn, index) {
+        var line = make('button', 'sp-itin-message', '');
+        line.type = 'button';
+        var dialogueId = String(turn.line || '') || ('draft:'
+          + String(entry.occurrence || entry.slot_id || entry.kind || 'segment')
+          + ':' + String(turn.candidate || script.candidate || 'prepared')
+          + ':' + String(turn.prepared_index === undefined ? index : turn.prepared_index));
+        line.setAttribute('data-dialogue-id', dialogueId);
+        if (turn.line) line.setAttribute('data-line', String(turn.line));
+        line.setAttribute('data-kind', String(turn.kind || 'dialogue'));
+        line.classList.toggle('sp-itin-message-even', index % 2 === 0);
+        line.appendChild(itinAvatar(turn));
+        var bubble = make('span', 'sp-itin-message-bubble');
+        bubble.appendChild(make('b', 'sp-itin-message-who',
+          String(turn.who || turn.seat || 'speaker')));
+        var messageText = make('span', 'sp-itin-message-text', String(turn.text || ''));
+        messageText.setAttribute('data-dialogue-text', 'true');
+        bubble.appendChild(messageText);
+        line.appendChild(bubble);
+        line.title = turn.aired ? 'Inspect this aired line and its provenance'
+          : (bound.length ? 'Inspect, edit and trace this prepared line'
+            : 'Inspect this draft line and its preparation setup');
+        line.addEventListener('click', function () {
+          itinTurnOpen(entry, turn,
+            turn.prepared_index === undefined ? index : turn.prepared_index, refresh);
+        });
+        stage.appendChild(line);
+      });
+    }
+
+    [['Chat', 'chat'], ['Transcript', 'transcript'], ['Screenplay', 'screenplay']]
+      .forEach(function (pair) {
+        var button = make('button', 'sp-itin-conversation-tab', pair[0]);
+        button.type = 'button';
+        button.addEventListener('click', function () {
+          mode = pair[1];
+          Array.prototype.forEach.call(views.children, function (one) {
+            one.classList.toggle('on', one === button);
+          });
+          render();
+        });
+        if (pair[1] === mode) button.classList.add('on');
+        views.appendChild(button);
+      });
+    tools.appendChild(views);
+    if (variants.length) {
+      var variantsBar = make('div', 'sp-itin-variants');
+      variants.forEach(function (item, index) {
+        var pick = make('button', 'sp-itin-variant', 'Draft ' + (index + 1));
+        pick.type = 'button';
+        pick.classList.toggle('on', item === variant);
+        pick.title = String((item.topic_review && item.topic_review.ok === false)
+          ? 'Topic continuity needs attention' : 'Review this draft');
+        pick.addEventListener('click', function () {
+          Array.prototype.forEach.call(variantsBar.querySelectorAll('.sp-itin-variant'),
+            function (one) { one.classList.toggle('on', one === pick); });
+          selectVariant(item);
+        });
+        variantsBar.appendChild(pick);
+      });
+      var winner = make('button', 'sp-itin-winner', 'Select winner');
+      winner.type = 'button';
+      winner.addEventListener('click', function () {
+        if (!variant) return;
+        winner.disabled = true;
+        api().post('/api/director/segment/' + encodeURIComponent(entry.occurrence) + '/winner', {
+          kind: String(entry.kind || ''), candidate: String(variant.id || ''),
+          candidates: variants.map(function (item) { return String(item.id || ''); })
+        }).then(function (got) {
+          selectedId = String(variant.id || '');
+          winner.textContent = 'Winner selected';
+          sheet.say(String((got && got.say) || 'Winner selected.'));
+          if (typeof refresh === 'function') setTimeout(refresh, 500);
+        }, function (err) {
+          winner.disabled = false; sheet.say(String((err && err.message) || err), true);
+        });
+      });
+      variantsBar.appendChild(winner);
+      tools.appendChild(variantsBar);
+    }
+    var prepare = make('button', 'sp-itin-prepare',
+      turns.length ? 'Prepare another' : 'Prepare now');
+    prepare.type = 'button';
+    prepare.disabled = String(entry.kind || '') === 'record';
+    prepare.addEventListener('click', function () {
+      prepare.disabled = true;
+      api().post('/api/pantry/commission', {
+        kind: String(entry.kind || ''), count: 1
+      }).then(function (got) {
+        prepare.textContent = 'Queued ' + String((got && got.label) || entry.kind || 'segment');
+        sheet.say('The orchestrator is preparing this road now.');
+        setTimeout(function () {
+          if (typeof refresh === 'function') refresh();
+        }, 2200);
+      }, function (err) {
+        prepare.disabled = false;
+        sheet.say(String((err && err.message) || err), true);
+      });
+    });
+    tools.appendChild(prepare);
+    if (bound.length && entry.occurrence) {
+      var approved = !!(entry.review && entry.review.approved);
+      var approve = make('button', 'sp-itin-prepare sp-itin-approve',
+        approved ? 'Script approved' : 'Approve script');
+      approve.type = 'button';
+      approve.disabled = approved;
+      approve.addEventListener('click', function () {
+        approve.disabled = true;
+        api().post('/api/director/segment/'
+          + encodeURIComponent(entry.occurrence) + '/approve',
+          {who: 'operator'}).then(function (got) {
+          approve.textContent = 'Script approved';
+          sheet.say(String((got && got.say) || 'Script approved.'));
+          loadPlan(true);
+          if (typeof refresh === 'function') setTimeout(refresh, 500);
+        }, function (err) {
+          approve.disabled = false;
+          sheet.say(String((err && err.message) || err), true);
+        });
+      });
+      tools.appendChild(approve);
+    }
+    wrap.appendChild(tools);
+    wrap.appendChild(stage);
+    render();
+    return wrap;
+  }
+
   function itineraryPaint(list, hours, sheet) {
     for (var h = 0; h < hours.length; h += 1) {
       var page = hours[h] || {};
@@ -3490,10 +5338,35 @@
     }
   }
 
+  function itineraryRevealLive(list) {
+    var live = list.querySelector('.sp-itin-row[data-state="on air"]');
+    if (!live) {
+      var now = Date.now() / 1000;
+      Array.prototype.some.call(list.querySelectorAll('.sp-itin-row'), function (row) {
+        var start = Number(row.dataset.start) || 0;
+        var end = Number(row.dataset.deadline) || 0;
+        if (start && start <= now && (!end || now < end)) { live = row; return true; }
+        return false;
+      });
+    }
+    if (!live) return;
+    if (typeof live.__pineOpen === 'function') live.__pineOpen(true);
+    root.requestAnimationFrame(function () {
+      try { live.scrollIntoView({block: 'center', behavior: 'smooth'}); }
+      catch (err) { try { live.scrollIntoView(); } catch (ignore) {} }
+      live.classList.add('sp-itin-arrive');
+      setTimeout(function () { live.classList.remove('sp-itin-arrive'); }, 1400);
+    });
+  }
+
   function itinRow(entry, until, sheet) {
     var state = String(entry.state || '');
     var row = make('div', 'sp-itin-row');
     row.setAttribute('data-state', state);
+    row.dataset.start = String(Number(entry.start) || 0);
+    row.dataset.deadline = String(Number(entry.deadline) || 0);
+    row.dataset.occurrence = String(entry.occurrence || '');
+    row.dataset.slot = String(entry.slot_id || '');
     if (state === 'on air') row.classList.add('sp-itin-live');
     else if (state === 'aired' || state.indexOf('went by') === 0) row.classList.add('sp-itin-past');
     row.appendChild(make('span', 'sp-itin-when', itinClock(entry.start) || '--:--'));
@@ -3513,26 +5386,57 @@
 
     var found = itinFirstLine(entry, until);
     var lid = found ? String(found.line || '') : '';
-    if (!lid) {
-      row.classList.add('sp-itin-nogo');
-      row.title = 'The script on this page holds no line inside this'
-        + ' entry’s window, so there is nothing to jump to yet.';
-      return row;
-    }
-    row.classList.add('sp-itin-go');
+    row.classList.add(lid ? 'sp-itin-go' : 'sp-itin-nogo');
     row.setAttribute('role', 'button');
     row.setAttribute('tabindex', '0');
-    row.title = 'Jump the script to the first line of this entry';
-    var go = function (ev) {
+    row.title = 'Open this segment’s script, prompt, provenance and broadcast controls';
+    var controls = make('div', 'sp-itin-actions');
+    var node = lid ? document.querySelector('.sp-el[data-line="' + segTame(lid) + '"]') : null;
+    var scene = node;
+    while (scene && !/(^|\s)sp-scene(\s|$)/.test(String(scene.className || ''))) {
+      scene = scene.previousElementSibling;
+    }
+    var ident = scene ? segIdentity(scene) : null;
+    function act(label, run, disabled) {
+      var button = make('button', 'sp-itin-action', label);
+      button.type = 'button'; button.disabled = !!disabled;
+      button.addEventListener('click', function (ev) {
+        ev.stopPropagation(); run(button);
+      });
+      controls.appendChild(button);
+    }
+    act('Jump to script', function () {
+      itineraryClose(); resumeAirFollow('segment navigator'); jumpToLine(lid);
+    }, !lid);
+    act('Inspect', function () { if (ident) segInspectOpen(ident); }, !ident);
+    act('Prompt', function () { if (ident) segPromptOpen(ident); }, !ident);
+    act('Download', function () { if (ident) segExportRun(ident, 'welded'); }, !ident);
+    act('Run next', function (button) {
+      button.disabled = true;
+      api().post('/api/dj/segments/interject', {
+        slot_id: String(entry.slot_id || ''), kind: String(entry.kind || '')
+      }).then(function (got) {
+        button.textContent = got && got.ok ? 'Queued next' : String((got && got.why) || 'refused');
+        sheet.say(String((got && (got.label || got.why)) || 'segment queued'));
+      }, function (err) {
+        button.disabled = false; sheet.say((err && err.message) || err, true);
+      });
+    }, false);
+    controls.hidden = true;
+    mid.appendChild(controls);
+    var conversation = itinConversation(entry, sheet, function () {
+      var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+      if (list) itineraryHour(list, sheet);
+    });
+    conversation.hidden = true;
+    row.appendChild(conversation);
+    var go = function (ev, force) {
       if (ev) ev.preventDefault();
-      var node = document.querySelector('.sp-el[data-line="' + segTame(lid) + '"]');
-      if (!node) {
-        if (sheet && sheet.say) sheet.say('That line has left the page.', true);
-        return;
-      }
-      itineraryClose();
-      jumpToLine(lid);
+      conversation.hidden = force ? false : !conversation.hidden;
+      controls.hidden = conversation.hidden;
+      row.setAttribute('aria-expanded', conversation.hidden ? 'false' : 'true');
     };
+    row.__pineOpen = function (force) { go(null, force); };
     row.addEventListener('click', go);
     row.addEventListener('keydown', function (ev) {
       if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
@@ -5946,7 +7850,9 @@
    * full line identities and audio coordinates. The tap submits immediately;
    * a screenshot and ten seconds of subsequent evidence finish the report.
    * Recording never scrolls the view or changes playback. */
-  var MOTION_MS = 250;
+  /* Two samples a second preserves a useful pre-incident history without
+     forcing layout on a thousand-row screenplay four times a second. */
+  var MOTION_MS = 500;
   var motionTimer = 0;
   var diagnosticRecorder = null;
   var diagnosticNodes = [];
@@ -5954,6 +7860,8 @@
   var diagnosticLines = Object.create(null);
   var diagnosticRevision = '';
   var diagnosticSnapshot = null;
+  var diagnosticHiddenCount = 0;
+  var diagnosticTransitionCount = 0;
   function recorder() {
     if (!diagnosticRecorder && root.PineScriptDiagnostics) diagnosticRecorder = root.PineScriptDiagnostics.createRecorder();
     return diagnosticRecorder;
@@ -5962,9 +7870,13 @@
     diagnosticNodes = Array.prototype.slice.call(box.querySelectorAll('.sp-el'));
     diagnosticIndices = new Map();
     diagnosticLines = Object.create(null);
+    diagnosticHiddenCount = 0;
+    diagnosticTransitionCount = 0;
     diagnosticNodes.forEach(function (n, i) {
       diagnosticIndices.set(n, i);
       if (n.pineItem && n.pineItem.line) diagnosticLines[String(n.pineItem.line)] = {item: n.pineItem, index: i};
+      if (n.hidden) diagnosticHiddenCount += 1;
+      if (n.classList.contains('sp-fx')) diagnosticTransitionCount += 1;
     });
     if (root.PineScriptDiagnostics) diagnosticRevision = root.PineScriptDiagnostics.revision(elements);
   }
@@ -6022,12 +7934,40 @@
     var rec = recorder();
     if (!pane || !rec) return;
     var lit = pane.querySelector('.sp-el.sp-now');
+    var feedMark = !!(lit && lit.classList.contains('sp-feed-now'));
     var idx = diagnosticIndices.has(lit) ? diagnosticIndices.get(lit) : -1;
-    var audio = root.PineScriptDiagnostics.readAudio(bridgeHead(), soundingPlayer(), streamAt());
     /* [#1189] THE RESOLVER'S OWN ANSWER, not a second computation. The
        recorder used to call activeRow() itself; the highlight was placed
        by another timer from another call. */
     var decision = lastDecision || {};
+    var audio = root.PineScriptDiagnostics.readAudio(bridgeHead(), soundingPlayer(), streamAt());
+    /* [#1282] THE MARK AND ITS EVIDENCE ARE ONE READ.
+
+       readAudio() above is a SECOND read of the player, milliseconds after
+       the one inside evidence() that placed the mark. At the end of a clip
+       the element ends between them, streamAt() falls back to the station
+       clock, and the sample was written down as `mark: "air"` beside
+       `source: "estimated"` - a fault the view never committed. Every
+       occurrence of "marked ON AIR while its position was estimated" in the
+       captures is exactly that: one 500ms sample, road `file-tail`, which is
+       the last instant of the file. Measured at that sample: the resolver
+       read 32.41s off the player, the clock said 29.38s.
+
+       The decision already carries the evidence that placed it - source,
+       file, offset and the ms it was read. When the fresh read has nothing
+       and the decision was read off a player, that is what the sample
+       records. An estimate is never written beside a placed mark, and
+       selectMappings() below gets a real filename again, so the capture
+       keeps the cue rows of the clip that was sounding. */
+    if ((audio.source === 'estimated' || audio.source === 'unavailable')
+        && (decision.source === 'bridge' || decision.source === 'local')
+        && decision.t !== null && decision.t !== undefined && isFinite(Number(decision.t))) {
+      audio = {source: String(decision.source), file: String(decision.file || ''),
+        position_s: Number(decision.t),
+        observed_at_ms: isFinite(Number(decision.at_ms)) ? Number(decision.at_ms) : null,
+        from_decision: true, player_state_available: false, volume: null,
+        muted: null, ready_state: null, network_state: null, buffered_end_s: null};
+    }
     var active = decision.mark === 'air' ? {id: String(decision.line_id || '')} : {};
     var feed = [];
     try { feed = root.PineStationFeed.rows() || []; } catch (e) { /* no feed */ }
@@ -6035,11 +7975,10 @@
     feed.forEach(function (r) { if (r.id) byId[String(r.id)] = r; });
     var rect = pane.getBoundingClientRect(), visible = -1;
     var knownActive = diagnosticLines[String(active.id || '')];
-    if (idx < 0 && !knownActive) {
-      for (var v = 0; v < diagnosticNodes.length; v += 1) {
-        var box = diagnosticNodes[v].getBoundingClientRect();
-        if (box.height > 0 && box.bottom > rect.top && box.top < rect.bottom) { visible = v; break; }
-      }
+    if (idx < 0 && !knownActive && document.elementFromPoint) {
+      var hit = document.elementFromPoint(rect.left + Math.min(24, rect.width / 2), rect.top + 2);
+      var visibleNode = hit && hit.closest ? hit.closest('.sp-el') : null;
+      visible = diagnosticIndices.has(visibleNode) ? diagnosticIndices.get(visibleNode) : -1;
     }
     var contextAt = root.PineScriptDiagnostics.contextIndex(idx, knownActive ? knownActive.index : -1, visible, diagnosticNodes.length);
     var from = contextAt < 0 ? 0 : Math.max(0, contextAt - 20);
@@ -6071,14 +8010,12 @@
         }
     });
     var top = lit ? Math.round(lit.getBoundingClientRect().top - rect.top) : null;
-    var hiddenCount = 0, transitionCount = 0;
-    for (var d = 0; d < diagnosticNodes.length; d += 1) {
-      if (diagnosticNodes[d].hidden) hiddenCount += 1;
-      if (diagnosticNodes[d].classList.contains('sp-fx')) transitionCount += 1;
-    }
+    var hiddenCount = diagnosticHiddenCount;
+    var transitionCount = diagnosticTransitionCount;
     diagnosticSnapshot = {
       recorder_version: 2, capture_source: 'script-page',
       highlight_id: lit ? String(lit.dataset.line || '') : '', active_id: String(active.id || ''),
+      highlight_basis: feedMark ? 'feed-voice' : String(decision.road || 'none'),
       document_revision: diagnosticRevision, script_age_ms: fetchedAt ? Date.now() - fetchedAt : null,
       speaking_id: String((speakingNow && speakingNow.id) || ''), audio: audio,
       nearby: nearby, context_index: contextAt,
@@ -6124,7 +8061,8 @@
       document_revision: diagnosticRevision, element_index: idx, block: lit && lit.dataset.block,
       ord: lit && lit.dataset.ord, scroll_top_px: Math.round(pane.scrollTop), lit_top_px: top,
       audio: audio, follow: follow, paused: stationPaused, snapshot: diagnosticSnapshot,
-      mark: String(decision.mark || ''), road: String(decision.road || ''),       /* [#1189] */
+      mark: feedMark ? 'feed-inferred' : String(decision.mark || ''),
+      road: feedMark ? 'feed-voice' : String(decision.road || ''),
       sync: String(decision.sync || ''), expected_id: String(decision.expected_id || ''),
       carried_id: String(decision.carried_id || ''),
       /* #1277: enough layout provenance to distinguish a server reindex from
@@ -6355,7 +8293,7 @@
     if (!line) return;
     sayUntil = Date.now() + 4000;
     sayingSaid = '__pine_never_said__'; /* never equal to a real print */
-    line.textContent = String(text || '');
+    sayingCrawl(line, text, 7);
   }
 
   /* ---------------------------------------------------------------- 4 */
@@ -6423,13 +8361,18 @@
 
   /* ---------------------------------------------------------------- 5 */
 
+  var playerTrack = {};
+  var playerVotes = null;
+
   function buildPlayer() {
     var box = make('div', 'sp-player');
     box.innerHTML =
       '<img id="spArt" class="sp-art" alt="">'
       + '<div class="sp-playmid">'
-      + '<div id="spTitle" class="sp-title"></div>'
-      + '<div id="spWho" class="sp-who"></div>'
+      + '<div class="sp-titleline"><div id="spTitle" class="sp-title"></div>'
+      + '<div id="spVotes" class="sp-votes"></div></div>'
+      + '<div id="spWho" class="sp-who"><span id="spArtist" class="sp-artist"></span>'
+      + '<span id="spAlbum" class="sp-album"></span></div>'
       + '<canvas id="spSpectrum" class="sp-spectrum"></canvas>'
       + '<canvas id="spVoice" class="sp-voicemeter"></canvas>'
       /* [#1198] the readout that only exists while a level is moving */
@@ -6695,6 +8638,26 @@
     var next = el('spNext');
     if (prev) prev.addEventListener('click', function () { api().post('/api/dj/prev', {}); });
     if (next) next.addEventListener('click', function () { api().post('/api/dj/next', {}); });
+    var art = el('spArt');
+    if (art) {
+      art.setAttribute('role', 'button');
+      art.setAttribute('tabindex', '0');
+      art.title = 'Open this album, its tracks, player, DJ files, analysis and queue controls';
+      var album = function () {
+        if (root.PineAlbum && typeof root.PineAlbum.open === 'function') {
+          root.PineAlbum.open(playerTrack);
+        }
+      };
+      art.addEventListener('click', album);
+      art.addEventListener('keydown', function (event) {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault(); album();
+      });
+    }
+    var voteSeat = el('spVotes');
+    if (voteSeat && root.PineVote && typeof root.PineVote.mount === 'function') {
+      playerVotes = root.PineVote.mount(voteSeat, function () { return playerTrack; }, say);
+    }
 
     /* The meters and the playhead ride requestAnimationFrame - numbers the
      * browser already has, no request of any kind. */
@@ -6747,23 +8710,19 @@
    *  of them individually and have it retain these settings and remember
    *  it next time."
    *
-   * The levels are multipliers (0-100%) on top of whatever the station and
-   * the shell already set, kept in this device's localStorage under
-   * `pineMixer` and applied through window.pineMixer - the panel's on the
-   * tablet (the view is injected into that page), the shell's on the
-   * desktop (the view runs in the shell there and the panel is a webview
-   * the shell levels). Either way one call, one name. */
+   * The levels are the same canonical listener values exposed in the native
+   * drawer, Listen, and the global Levels sheet. */
   var MIXER_ROWS = [
     ['voice', 'Voices'], ['music', 'Music'], ['sfx', 'SFX'], ['video', 'Videos']
   ];
   function mixerRead() {
     var m = null;
-    try { if (root.pineMixer && root.pineMixer.get) m = root.pineMixer.get(); } catch (err) { m = null; }
-    if (!m) { try { m = JSON.parse(root.localStorage.getItem('pineMixer') || '{}'); } catch (err) { m = {}; } }
+    try { if (root.pineLevels && root.pineLevels.get) m = root.pineLevels.get(); } catch (err) { m = null; }
+    if (!m) { try { m = JSON.parse(root.localStorage.getItem('pineListenerLevels') || '{}'); } catch (err) { m = {}; } }
     var out = {};
     MIXER_ROWS.forEach(function (row) {
       var v = Number(m && m[row[0]]);
-      out[row[0]] = isFinite(v) ? Math.max(0, Math.min(1.5, v)) : 1;
+      out[row[0]] = isFinite(v) ? Math.max(0, Math.min(2, v)) : 1;
     });
     return out;
   }
@@ -6808,7 +8767,9 @@
       var line = make('label', 'sp-mix-row');
       line.appendChild(make('span', 'sp-mix-name', row[1]));
       var range = document.createElement('input');
-      range.type = 'range'; range.min = '0'; range.max = '100'; range.step = '1';
+      range.type = 'range'; range.min = '0';
+      range.max = '200';
+      range.step = '1';
       range.value = String(Math.round(levels[row[0]] * 100));
       range.className = 'sp-mix-range';
       var val = make('span', 'sp-mix-val', range.value + '%');
@@ -6853,6 +8814,8 @@
 
   function paintPlayer(state) {
     var now = (state && state.now) || {};
+    playerTrack = now;
+    if (playerVotes && typeof playerVotes.paint === 'function') playerVotes.paint();
     var art = el('spArt');
     if (art) {
       var want = now.art || '';
@@ -6865,10 +8828,10 @@
     }
     var title = el('spTitle');
     if (title) title.textContent = now.title || 'the station';
-    var who = el('spWho');
-    if (who) {
-      who.textContent = [now.artist, now.album].filter(Boolean).join(' · ');
-    }
+    var artist = el('spArtist');
+    var album = el('spAlbum');
+    if (artist) artist.textContent = now.artist || 'Unknown artist';
+    if (album) album.textContent = now.album || '';
   }
 
   /* ---------------------------------------------------------------- 6 */
@@ -6956,7 +8919,19 @@
       var key = 'ev' + (ev && ev.at) + String((ev && ev.stage) || '');
       if (!ev || seen[key]) continue;
       seen[key] = true;
-      box.appendChild(eventRow(ev));
+      /* A voicing event names a line but historically carries no cast
+         identity. Join it to the chat row before painting so the portrait,
+         recipient and operation context describe the person whose line is
+         actually being rendered. The event's own stage/detail/text win. */
+      var subject = null;
+      if (ev.line) {
+        for (var m = rows.length - 1; m >= 0; m -= 1) {
+          if (String((rows[m] || {}).id || '') === String(ev.line)) {
+            subject = rows[m]; break;
+          }
+        }
+      }
+      box.appendChild(eventRow(Object.assign({}, subject || {}, ev)));
       added += 1;
     }
     /* #1287: THE TRIM STOPS EVICTING ROWS IT STILL WANTS.
@@ -7001,19 +8976,152 @@
     if (feedStick) box.scrollTop = box.scrollHeight;
   }
 
+  var FEED_OPERATIONS = {
+    ad: "Sponsor's Copy", analysis: 'Analysis', banter: 'Studio Banter',
+    caller: 'Phone Line', caller2: 'Second Phone Line', cover: 'Cover Story',
+    gallery: 'Gallery Wall', gold: 'Gold Segment', image_analysis: 'Image Analysis',
+    interject: 'Studio Interjection', manager: 'Memo From Upstairs',
+    marker: 'Broadcast Marker', music: 'Turntable', news: 'News Desk',
+    reply: 'Studio Reply', sfx: 'SFX Cue', sfxguy: 'SFX Desk',
+    station_id: 'Station Ident', sting: 'SFX Cue', track_talk: 'Turntable',
+    voicing: 'Voice Rendering', writing: 'Script Writing', action: 'Station Operation'
+  };
+
+  function feedHuman(value) {
+    var key = String(value || '').trim().toLowerCase();
+    if (FEED_OPERATIONS[key]) return FEED_OPERATIONS[key];
+    if (!key) return 'Broadcast Operation';
+    return key.replace(/[_-]+/g, ' ').replace(/(^|\s)([a-z])/g,
+      function (_, gap, letter) { return gap + letter.toUpperCase(); });
+  }
+
+  function feedWords(row) {
+    return String((row && (row.text || row.detail || row.analysis)) || '')
+      .replace(/\s+/g, ' ').trim();
+  }
+
+  function feedSpeaker(row) {
+    return String((row && (row.name || row.speaker || row.who)) || '').trim();
+  }
+
+  function feedOperation(row) {
+    row = row || {};
+    var stage = String(row.stage || '').toLowerCase();
+    var kind = String(row.kind || '').toLowerCase();
+    var round = String(row.round || '').toLowerCase();
+    if (stage) return feedHuman(stage);
+    if (kind === 'interject' || kind === 'image_analysis' || kind === 'sfx') {
+      return feedHuman(kind);
+    }
+    return feedHuman(round || kind || 'dialogue');
+  }
+
+  function feedOrchestrated(row) {
+    row = row || {};
+    if (row.orchestrator === true || row.orchestrated === true) return true;
+    var trace = row.trace || {};
+    if (trace.written && Object.keys(trace.written).length) return true;
+    var proof = [row.producer, row.actor, row.by, row.source, row.detail]
+      .map(function (value) { return String(value || '').toLowerCase(); }).join(' ');
+    return /\borchestrator\b/.test(proof);
+  }
+
+  function feedPurpose(row) {
+    row = row || {};
+    var explicit = row.purpose || row.for || ((row.trace || {}).written || {}).for;
+    if (explicit) return String(explicit).replace(/\s+/g, ' ').trim();
+    var speaker = feedSpeaker(row);
+    var stage = String(row.stage || '').toLowerCase();
+    if (stage === 'voicing') {
+      return speaker ? 'rendering a line for ' + speaker : 'rendering the next broadcast line';
+    }
+    if (stage === 'writing') return 'preparing dialogue for a scheduled segment';
+    if (stage === 'action') return 'coordinating the broadcast and its prepared material';
+    if (String(row.kind || '').toLowerCase() === 'sfx') {
+      return speaker ? 'punctuating ' + speaker + "'s segment" : 'punctuating the live segment';
+    }
+    return speaker ? 'line for ' + speaker : 'broadcast activity';
+  }
+
+  function feedAvatar(row) {
+    var speaker = feedSpeaker(row) || (feedOrchestrated(row) ? 'Orchestrator' : 'Booth');
+    var avatar = itinAvatar({who: speaker, seat: row && row.who,
+      kind: row && (row.kind || row.stage)});
+    avatar.classList.add('sp-msg-avatar');
+    avatar.title = speaker;
+    avatar.dataset.speaker = speaker;
+    return avatar;
+  }
+
+  function feedCrawl(words) {
+    var viewport = make('span', 'sp-msg-text sp-msg-marquee');
+    viewport.appendChild(make('span', 'sp-msg-marquee-track'));
+    feedCrawlDress(viewport, words);
+    return viewport;
+  }
+
+  function feedCrawlDress(viewport, words) {
+    if (!viewport) return;
+    var body = String(words || '').replace(/\s+/g, ' ').trim() || 'No details were recorded.';
+    var track = viewport.querySelector('.sp-msg-marquee-track');
+    if (!track) {
+      track = make('span', 'sp-msg-marquee-track');
+      viewport.replaceChildren(track);
+    }
+    if (viewport.dataset.words !== body) {
+      viewport.dataset.words = body;
+      track.replaceChildren();
+      var first = make('span', '', body);
+      first.setAttribute('data-dialogue-text', 'true');
+      track.appendChild(first);
+      var again = make('span', '', body);
+      again.setAttribute('aria-hidden', 'true');
+      track.appendChild(again);
+      viewport.setAttribute('aria-label', body);
+      track.style.setProperty('--sp-feed-crawl',
+        Math.max(12, Math.min(58, body.length / 7.5)) + 's');
+    }
+    /* A short line stays put. Measure after placement as well, since a
+       sentence that fits on the desktop may need to move on the tablet. */
+    viewport.classList.toggle('is-moving', body.length > 34);
+    root.requestAnimationFrame(function () {
+      if (!viewport.isConnected) return;
+      var first = track.firstElementChild;
+      viewport.classList.toggle('is-moving',
+        !!first && first.scrollWidth > viewport.clientWidth - 4);
+    });
+  }
+
+  function feedFrame(row, extraClass) {
+    var line = make('div', 'sp-msg' + (extraClass ? ' ' + extraClass : ''));
+    line.setAttribute('role', 'button');
+    line.setAttribute('tabindex', '0');
+    line.appendChild(feedAvatar(row));
+    var context = make('span', 'sp-msg-context');
+    context.appendChild(make('b', 'sp-msg-who sp-msg-operation', feedOperation(row)));
+    var purpose = make('span', 'sp-msg-purpose');
+    purpose.appendChild(make('span', 'sp-msg-purpose-text', feedPurpose(row)));
+    context.appendChild(purpose);
+    line.appendChild(context);
+    line.appendChild(feedCrawl(feedWords(row)));
+    return line;
+  }
+
   function feedRow(row) {
-    var who = String(row.who || 'dj');
     /* #1279: NOT from `row.aired === "airing"`. That is spelled right
        and is unreachable - `airing` is attached only to speaking_now /
        stream_now, never to a chat row (measured: 0 of 317 across 16
        polls), so this pane has never once marked the line being said.
        markFeedLive() does it from the live pointer, every tick. */
-    var line = make('div', 'sp-msg');
+    var line = feedFrame(row);
     line.dataset.line = String(row.id || '');
-    line.appendChild(make('b', 'sp-msg-who', row.name || who));
-    line.appendChild(make('span', 'sp-msg-text', ''));
+    line.pineRow = row;
     feedDress(line, row);
-    line.addEventListener('click', function () { jumpToLine(String(row.id || '')); });
+    line.addEventListener('click', function () { feedDetailOpen(line.pineRow || row); });
+    line.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault(); feedDetailOpen(line.pineRow || row);
+    });
     return line;
   }
 
@@ -7021,12 +9129,23 @@
      drawn once and never touched again, so one drawn while it was
      `prepared` still read `prepared` long after it had aired. */
   function feedDress(line, row) {
-    var head = line.firstChild;
-    var body = line.lastChild;
-    var name = String(row.name || row.who || 'dj');
-    var text = String(row.text || '').trim();
-    if (head && head.textContent !== name) head.textContent = name;
-    if (body && body.textContent !== text) body.textContent = text;
+    line.pineRow = row;
+    var head = line.querySelector('.sp-msg-operation');
+    var purpose = line.querySelector('.sp-msg-purpose');
+    var purposeText = line.querySelector('.sp-msg-purpose-text');
+    var body = line.querySelector('.sp-msg-marquee');
+    var operation = feedOperation(row);
+    var why = feedPurpose(row);
+    if (head && head.textContent !== operation) head.textContent = operation;
+    if (purposeText && purposeText.textContent !== why) purposeText.textContent = why;
+    var orchestrated = feedOrchestrated(row);
+    var badge = purpose && purpose.querySelector('.sp-msg-orchestrator');
+    if (orchestrated && !badge) {
+      badge = make('em', 'sp-msg-orchestrator', 'Orchestrator');
+      badge.title = 'Prepared or carried out by the orchestrator';
+      purpose.appendChild(badge);
+    } else if (!orchestrated && badge) badge.remove();
+    feedCrawlDress(body, feedWords(row));
     /* [#1200] a clip deleted from the library reads as gone in the feed. */
     if (line.pineDeleted !== !!row.deleted) {
       line.pineDeleted = !!row.deleted;
@@ -7053,10 +9172,216 @@
   }
 
   function eventRow(ev) {
-    var line = make('div', 'sp-msg sp-msg-ev');
-    line.appendChild(make('b', 'sp-msg-who', String(ev.stage || 'station')));
-    line.appendChild(make('span', 'sp-msg-text', String(ev.detail || '')));
+    var line = feedFrame(ev, 'sp-msg-ev');
+    line.pineEvent = ev;
+    if (ev.line) line.dataset.line = String(ev.line);
+    var stage = String(ev.stage || 'station');
+    line.title = 'Open details for this ' + stage + ' event';
+    line.addEventListener('click', function () { feedDetailOpen(line.pineEvent || ev); });
+    line.addEventListener('keydown', function (key) {
+      if (key.key !== 'Enter' && key.key !== ' ') return;
+      key.preventDefault(); feedDetailOpen(line.pineEvent || ev);
+    });
     return line;
+  }
+
+  function feedDetailActions(detail, row, stage, words) {
+    var actions = make('div', 'sp-feed-detail-actions');
+    var lineId = String(row.line || row.id || '');
+    if (lineId) {
+      var jump = make('button', '', 'Jump to this line');
+      jump.type = 'button';
+      jump.addEventListener('click', function () {
+        detail.close(); resumeAirFollow('feed detail'); jumpToLine(lineId);
+      });
+      actions.appendChild(jump);
+    }
+    var trace = make('button', '', 'Inspect the pipeline');
+    trace.type = 'button';
+    trace.addEventListener('click', function () {
+      if (root.PineConsoleTrace && root.PineConsoleTrace.open) {
+        root.PineConsoleTrace.open({stage: stage, detail: String(row.detail || words),
+          text: String(row.text || ''), line: lineId, at: Number(row.at || row.air_at) || 0,
+          _flow: row._flow || null});
+      }
+    });
+    actions.appendChild(trace);
+    detail.box.appendChild(actions);
+  }
+
+  function feedAnalysisHeading(text) {
+    return make('h3', 'sp-analysis-heading', text);
+  }
+
+  function feedAnalysisRender(mount, detail, row, data) {
+    while (mount.firstChild) mount.removeChild(mount.firstChild);
+    var dossier = make('article', 'sp-analysis-dossier');
+    var status = make('div', 'sp-analysis-status', String(data.status ||
+      'The station did not return a generation status for this analysis.'));
+    dossier.appendChild(status);
+
+    var top = make('div', 'sp-analysis-top');
+    var picture = (data && data.image) || {};
+    var figure = make('figure', 'sp-analysis-figure');
+    if (picture.url) {
+      var image = document.createElement('img');
+      image.alt = 'Image analyzed by the station: ' + String(picture.name || 'gallery image');
+      image.loading = 'eager';
+      image.src = stationUrl(picture.url);
+      image.addEventListener('error', function () {
+        image.hidden = true;
+        figure.classList.add('is-missing');
+      });
+      figure.appendChild(image);
+    } else figure.classList.add('is-missing');
+    var caption = make('figcaption', '', String(picture.name || row.image || 'Analyzed image'));
+    figure.appendChild(caption);
+    top.appendChild(figure);
+
+    var reading = make('section', 'sp-analysis-reading');
+    reading.appendChild(feedAnalysisHeading('What the vision model interpreted'));
+    reading.appendChild(make('p', 'sp-analysis-copy', String(data.analysis || row.analysis ||
+      'No interpretation was retained for this image.')));
+    var model = [];
+    if (data.model) model.push(String(data.model));
+    if (Number(data.ms)) model.push((Number(data.ms) / 1000).toFixed(1) + ' seconds');
+    if (model.length) reading.appendChild(make('div', 'sp-analysis-meta', model.join(' / ')));
+    top.appendChild(reading);
+    dossier.appendChild(top);
+
+    dossier.appendChild(feedAnalysisHeading('Dialogue generated from this analysis'));
+    var sections = Array.isArray(data.sections) ? data.sections : [];
+    if (!sections.length) {
+      dossier.appendChild(make('p', 'sp-analysis-empty',
+        'No linked script is banked yet. This view will show it here as soon as the writing room stores it.'));
+    }
+    sections.forEach(function (section) {
+      var group = make('section', 'sp-analysis-dialogue');
+      var head = make('div', 'sp-analysis-dialogue-head');
+      head.appendChild(make('b', '', String(section.title || 'Gallery dialogue')));
+      var state = String(section.state || 'prepared');
+      head.appendChild(make('span', 'sp-analysis-state ' + state, state));
+      group.appendChild(head);
+      var provenance = String(section.connection || 'linked image analysis');
+      if (section.inferred) provenance += ' / recovered from an older image-bound segment';
+      group.appendChild(make('p', 'sp-analysis-connection',
+        provenance + ' / ' + Number((section.lines || []).length) + ' line(s)'));
+      (section.lines || []).forEach(function (line) {
+        var canJump = line.id && !/^prepared:/.test(String(line.id));
+        var turn = make(canJump ? 'button' : 'div', 'sp-analysis-turn');
+        if (canJump) {
+          turn.type = 'button';
+          turn.title = 'Jump to this dialogue in the script';
+          turn.addEventListener('click', function () {
+            detail.close(); resumeAirFollow('image analysis dialogue'); jumpToLine(String(line.id));
+          });
+        }
+        turn.appendChild(itinAvatar({who: line.name || line.who, seat: line.who}));
+        var body = make('span', 'sp-analysis-turn-body');
+        body.appendChild(make('b', '', String(line.name || line.who || 'Speaker')));
+        body.appendChild(make('span', '', String(line.text || '')));
+        turn.appendChild(body);
+        if (line.recorded) {
+          var ready = make('em', 'sp-analysis-ready', 'recorded');
+          ready.title = 'Finished voice media is already in the cupboard';
+          turn.appendChild(ready);
+        }
+        group.appendChild(turn);
+      });
+      dossier.appendChild(group);
+    });
+
+    dossier.appendChild(feedAnalysisHeading('Generation trail'));
+    var trail = make('ol', 'sp-analysis-trail');
+    (data.trail || []).forEach(function (step) {
+      var item = make('li', 'sp-analysis-step ' + String(step.state || 'waiting'));
+      item.appendChild(make('b', '', String(step.label || 'Pipeline step')));
+      item.appendChild(make('span', '', String(step.detail || '')));
+      trail.appendChild(item);
+    });
+    dossier.appendChild(trail);
+
+    var made = picture.made || {};
+    var source = make('details', 'sp-analysis-source');
+    source.appendChild(make('summary', '', 'Prompts, source image, and model details'));
+    var table = make('table', 'sp-feed-detail-table sp-analysis-table');
+    itinFact(table, 'Image generation request', made.request);
+    itinFact(table, 'Image model', made.model);
+    itinFact(table, 'Image render time', made.seconds ? String(made.seconds) + ' seconds' : '');
+    itinFact(table, 'Vision prompt', data.prompt);
+    itinFact(table, 'Vision model', data.model);
+    itinFact(table, 'Analysis id', data.id || row.id);
+    itinFact(table, 'Analyzed at', data.at ? sceneClock({at: data.at}) : '');
+    itinFact(table, 'Recovered from ledger', data.from_ledger ? 'yes' : 'no');
+    source.appendChild(table);
+    dossier.appendChild(source);
+    mount.appendChild(dossier);
+    feedDetailActions(detail, row, 'image_analysis', String(row.text || ''));
+  }
+
+  function feedAnalysisOpen(detail, row) {
+    var mount = make('div', 'sp-analysis-mount');
+    mount.appendChild(make('div', 'sp-analysis-loading', 'Following the image through the writing room...'));
+    detail.box.appendChild(mount);
+    var lineId = String(row.line || row.id || '');
+    if (!lineId || !api() || !api().get) {
+      feedAnalysisRender(mount, detail, row, {
+        id: lineId, image: {}, analysis: row.analysis || '', sections: [], trail: [],
+        status: 'This analysis has no retained identity, so its generated script cannot be followed.'
+      });
+      return;
+    }
+    var path = '/api/dj/image-analysis/' + encodeURIComponent(lineId)
+      + '?text=' + encodeURIComponent(String(row.text || ''))
+      + '&at=' + encodeURIComponent(String(Number(row.air_at || row.at || row.ts) || 0));
+    api().get(path).then(function (data) {
+      if (!detail.back.isConnected) return;
+      feedAnalysisRender(mount, detail, row, data || {});
+    }).catch(function (err) {
+      if (!detail.back.isConnected) return;
+      feedAnalysisRender(mount, detail, row, {
+        id: lineId, image: {}, analysis: row.analysis || '', sections: [], trail: [],
+        status: 'The generation trail could not be loaded: ' + String((err && err.message) || err || 'unknown error')
+      });
+    });
+  }
+
+  function feedDetailOpen(row) {
+    row = row || {};
+    var isEvent = !row.id && (row.stage || row.detail);
+    var stage = String(row.stage || row.kind || (isEvent ? 'station' : 'dialogue'));
+    var words = String(row.text || row.detail || '').trim();
+    var title = stage === 'image_analysis'
+      ? 'Image analysis: ' + String(row.image || words.replace(/^Image analysis complete:\s*/i, '') || 'gallery image')
+      : stage === 'voicing' && words
+      ? 'Voicing: ' + words.split(/\s+/).slice(0, 9).join(' ')
+      : (isEvent ? stage : String(row.name || row.who || 'Dialogue'));
+    var detail = sheetShell('spFeedDetail', 'sp-feed-detail', title);
+    if (root.PineDuck && root.PineDuck.hold) {
+      root.PineDuck.hold('sp-spFeedDetail', root.PineDuck.REPORT, detail.back);
+    }
+    if (stage === 'image_analysis') {
+      feedAnalysisOpen(detail, row);
+      return detail;
+    }
+    if (words) detail.box.appendChild(make('p', 'sp-feed-detail-line', words));
+    var table = make('table', 'sp-feed-detail-table');
+    itinFact(table, 'Operation', feedOperation(row));
+    itinFact(table, 'Purpose', feedPurpose(row));
+    itinFact(table, 'Performed by', feedOrchestrated(row) ? 'Orchestrator' : 'Station');
+    itinFact(table, 'Activity', stage);
+    itinFact(table, 'What is happening', row.detail);
+    itinFact(table, 'Dialogue', row.text);
+    itinFact(table, 'Speaker', row.name || row.who);
+    itinFact(table, 'Voice', row.voice);
+    itinFact(table, 'Engine', row.engine);
+    itinFact(table, 'State', row.aired || row.status);
+    itinFact(table, 'Line id', row.line || row.id);
+    itinFact(table, 'Scheduled for air', row.air_at || row.at);
+    itinFact(table, 'Media', row.media || row.clip_media || row.url);
+    detail.box.appendChild(table);
+    feedDetailActions(detail, row, stage, words);
+    return detail;
   }
 
   /* ---------------------------------------------------------------- 7 */
@@ -7139,8 +9464,9 @@
         }
         return out;
       }
-      elements = stamp(both.was && both.was.elements, both.wasKey)
-        .concat(stamp(page.elements, both.nowKey));
+      elements = screenplayOrder(stamp(both.was && both.was.elements, both.wasKey),
+        stamp(page.elements, both.nowKey));
+      scriptAsOf = Number(page.at) || (Date.now() / 1000);
       fetchedAt = Date.now();
       fetching = false;
       paintScript(page, both.was);
@@ -7152,6 +9478,73 @@
           'The script could not be read: ' + ((err && err.message) || err)));
       }
     });
+  }
+
+  var scriptAsOf = 0;
+
+  var SCENE_NAMES = {
+    ad: "Sponsor's Copy", aside: 'Studio Aside', banter: 'Studio Banter',
+    caller: 'Phone Line', caller2: 'Second Phone Line', cover: 'Cover Story',
+    gallery: 'Gallery Wall', gold: 'Gold Segment', manager: 'Memo From Upstairs',
+    news: 'News Desk', reply: 'Studio Reply', sfxguy: 'SFX Desk',
+    station_id: 'Station Ident', track_talk: 'Turntable'
+  };
+
+  function sceneClock(item) {
+    var raw = String((item && item.text) || '');
+    var written = raw.match(/(?:^|\s-\s)(\d{1,2}:\d{2}\s*(?:AM|PM))\s*$/i);
+    if (written) return written[1].replace(/\s+/g, ' ').toUpperCase();
+    var stamp = Number(item && (item.at || item.air_at));
+    if (!isFinite(stamp) || stamp <= 0) return '--:--';
+    try {
+      return new Date(stamp * 1000).toLocaleTimeString([], {
+        hour: 'numeric', minute: '2-digit'
+      });
+    } catch (err) { return '--:--'; }
+  }
+
+  function sceneName(item) {
+    var raw = String((item && item.text) || '').trim();
+    var bits = raw.split(/\s+-\s+/);
+    var named = '';
+    if (bits.length >= 3 && /BOOTH/i.test(bits[1])) {
+      var middle = bits.slice(2);
+      if (middle.length && /^\d{1,2}:\d{2}\s*(?:AM|PM)$/i.test(middle[middle.length - 1])) {
+        middle.pop();
+      }
+      named = middle.join(' - ').replace(/^THE\s+/i, '').trim();
+    }
+    if (!named) named = SCENE_NAMES[String((item && item.round) || '').toLowerCase()] || '';
+    if (!named) {
+      named = String((item && item.round) || 'Broadcast Segment')
+        .replace(/[_-]+/g, ' ');
+    }
+    named = named.toLowerCase().replace(/(^|\s)([a-z])/g, function (_, gap, letter) {
+      return gap + letter.toUpperCase();
+    });
+    return named.replace(/\bSfx\b/g, 'SFX').replace(/\bFm\b/g, 'FM');
+  }
+
+  function dressScene(node, item) {
+    if (!node || !item) return;
+    node.dataset.heading = String(item.text || '');
+    node.dataset.at = String(Number(item.at || item.air_at) || '');
+    node.dataset.round = String(item.round || '');
+    node.replaceChildren();
+    node.appendChild(make('time', 'sp-segment-time', sceneClock(item)));
+    var words = make('span', 'sp-segment-words');
+    words.appendChild(make('b', 'sp-segment-name', sceneName(item)));
+    words.appendChild(make('small', 'sp-segment-place', 'Pine Box FM / The Booth'));
+    node.appendChild(words);
+    node.appendChild(make('span', 'sp-segment-count', ''));
+    node.appendChild(make('span', 'sp-segment-state', ''));
+  }
+
+  /* The screenplay API has already placed each line against the ledger and
+   * pinned unscripted feed events between cues. A scene's clock can run
+   * backward after a recovered line, so it cannot sort this document. */
+  function screenplayOrder(before, current) {
+    return (before || []).concat(current || []);
   }
 
   /* Hollywood layout: each element type is its own block, and the CSS does
@@ -7166,7 +9559,7 @@
          because that is what the reader can scroll through. */
       var lines = (page.counts && page.counts.lines) || 0;
       var back = (before && before.counts && before.counts.lines) || 0;
-      head.textContent = (page.title || 'the broadcast')
+      head.textContent = 'Pine Box FM / The Booth / ' + (page.title || 'the broadcast')
         + '  ·  ' + (lines + back) + ' lines'
         + (back ? '  (with the hour before)' : '')
         + (page.live ? '  ·  live' : '');
@@ -7207,6 +9600,7 @@
          in place is re-dressed rather than rebuilt. */
       var print = String(item.text || '') + SEP + String(item.type || '')
         + SEP + String(item.aired || '') + SEP + (item.tinted ? '1' : '0')
+        + SEP + String(item.round || '') + SEP + String(item.at || '')
         + SEP + (item.deleted ? 'D' : '');                        /* [#1200] */
       var node = scriptNodes.get(key);
       if (node && node.pinePrint !== print) {
@@ -7218,6 +9612,7 @@
           + (item.tinted ? ' tinted' : '')
           + (lit ? ' sp-now' : '') + (picked ? ' picked' : '');
         if (item.deleted) node.classList.add('sp-deleted');        /* [#1200] */
+        if (String(item.type || '') === 'scene') dressScene(node, item);
         node.pinePrint = print;
       }
       if (!node) {
@@ -7232,7 +9627,7 @@
          what this line says now. */
       node.pineItem = item;
       // Keep evidence attributes in step with a keyed node's current item.
-      ['line', 'seg', 'block', 'ord'].forEach(function (field) {
+      ['line', 'seg', 'block', 'ord', 'round', 'at'].forEach(function (field) {
         if (item[field] !== undefined && item[field] !== null) node.dataset[field] = String(item[field]);
         else delete node.dataset[field];
       });
@@ -7440,6 +9835,23 @@
     if (!box) return;
     var all = box.querySelectorAll('.sp-el');
     var moving = [], shutting = [], opening = [];      /* #1300 */
+    var sceneOrder = [], sceneSeen = Object.create(null), displaySeg = '';
+    for (var s = 0; s < all.length; s += 1) {
+      if (!/(^|\s)sp-scene(\s|$)/.test(String(all[s].className || ''))) continue;
+      var sid = all[s].getAttribute('data-seg') || '';
+      if (!sid || sceneSeen[sid]) continue;
+      sceneSeen[sid] = 1;
+      sceneOrder.push(sid);
+      var sat = Number(all[s].getAttribute('data-at') || 0);
+      if (sat > 0 && sat <= scriptAsOf) displaySeg = sid;
+    }
+    if (liveSeg && sceneSeen[liveSeg]) displaySeg = liveSeg;
+    var phase = Object.create(null), activeAt = sceneOrder.indexOf(displaySeg);
+    for (var so = 0; so < sceneOrder.length; so += 1) {
+      phase[sceneOrder[so]] = activeAt < 0 ? ''
+        : so < activeAt ? 'past'
+        : so === activeAt ? (liveSeg ? 'live' : 'current') : 'future';
+    }
     /* #1294: EVERYTHING BEHIND THE AIR IS SHUT, NOT ONLY THE SEGMENT
      * IT JUST LEFT.
      *
@@ -7453,20 +9865,11 @@
      * list), so "behind" is "before the first element of the live
      * segment". A hand still outranks this, and with nothing on air
      * nothing is folded. */
-    if (liveSeg) {
-      var seen = Object.create(null);
-      var reached = false;
-      for (var p = 0; p < all.length; p += 1) {
-        var mark = all[p].getAttribute('data-seg') || '';
-        if (!mark) continue;                     /* plan rows, spacers */
-        if (mark === liveSeg) { reached = true; break; }
-        seen[mark] = 1;
+    if (displaySeg) {
+      for (var key in phase) {
+        if (phase[key] === 'past' && !byHand[key]) folded[key] = true;
       }
-      if (reached) {
-        for (var key in seen) {
-          if (!byHand[key]) folded[key] = true;
-        }
-      }
+      folded[displaySeg] = false;
     }
     /* #1300b: WHICH SEGMENTS CHANGED, SETTLED BEFORE ANYTHING IS
      * WRITTEN.
@@ -7486,7 +9889,7 @@
     for (var q = 0; q < all.length; q += 1) {
       var qseg = all[q].getAttribute('data-seg') || '';
       if (!qseg || segsNow[qseg] !== undefined) continue;
-      var qshut = !!(folded[qseg] && qseg !== liveSeg);
+      var qshut = !!(folded[qseg] && qseg !== displaySeg);
       segsNow[qseg] = qshut;
       if (segWas[qseg] !== undefined && segWas[qseg] !== qshut) {
         changed[qseg] = 1;
@@ -7497,7 +9900,14 @@
       var node = all[i];
       var seg = node.getAttribute('data-seg') || '';
       var head = /sp-scene/.test(node.className);
-      var shut = !!(seg && folded[seg] && seg !== liveSeg);
+      var shut = !!(seg && folded[seg] && seg !== displaySeg);
+      var stage = phase[seg] || '';
+      node.classList.toggle('sp-segment-past', stage === 'past');
+      node.classList.toggle('sp-segment-live', stage === 'live');
+      node.classList.toggle('sp-segment-current', stage === 'current');
+      node.classList.toggle('sp-segment-future', stage === 'future');
+      node.classList.toggle('sp-segment-next', stage === 'future'
+        && activeAt >= 0 && sceneOrder[activeAt + 1] === seg);
       /* The heading is how a folded segment is reopened, so it is the
          one thing that must never be hidden by its own fold. */
       /* #1300: and when this segment has just CHANGED state, it is
@@ -7520,6 +9930,7 @@
       node.hidden = shut && !head;
       if (head) {
         node.classList.toggle('sp-shut', shut);
+        node.setAttribute('aria-expanded', shut ? 'false' : 'true');
         /* #1285b: what is inside, so a closed segment can be chosen
            without opening it. On an attribute and shown through
            ::after - the reconciler re-dresses a changed element with
@@ -7541,6 +9952,20 @@
         if (node.getAttribute('data-inside') !== inside) {
           node.setAttribute('data-inside', inside);
         }
+        var summary = segCount(seg);
+        var summaryText = summary
+          ? (summary.lines + (summary.lines === 1 ? ' line' : ' lines')
+             + (summary.seconds >= 1 ? ' / ' + Math.round(summary.seconds) + 's' : ''))
+          : '';
+        var count = node.querySelector('.sp-segment-count');
+        if (count && count.textContent !== summaryText) count.textContent = summaryText;
+        var state = node.querySelector('.sp-segment-state');
+        var stateText = stage === 'live' ? 'ON AIR'
+          : stage === 'current' ? 'CURRENT'
+          : stage === 'past' ? 'AIRED'
+          : node.classList.contains('sp-segment-next') ? 'UP NEXT'
+          : stage === 'future' ? 'SCHEDULED' : '';
+        if (state && state.textContent !== stateText) state.textContent = stateText;
       }
     }
     /* #1300b: and only now, once every element has been able to read
@@ -7664,14 +10089,16 @@
     folded[seg] = false;
     /* #1300: the hand-off the operator asked to SEE - the finished
        script shutting and the next one opening out. */
-    foldGuardStart();                                        /* [#1189] */
+    var guard = foldGuardStart();                            /* [#1189] */
     segApply(true);
     foldSave();                                              /* #1294 */
     /* [#1189] the fold commits `hidden` at the end of its animation
        (segSettle); the reader's place is restored there, and the lit
        line is brought back if the reflow moved it out of view. */
-    root.setTimeout(function () {
-      foldGuardEnd('follow');
+    if (foldGuardTimer) root.clearTimeout(foldGuardTimer);
+    foldGuardTimer = root.setTimeout(function () {
+      foldGuardTimer = 0;
+      foldGuardEnd('follow', guard);
       keepLitInView('fold');
     }, FOLD_FX_MS + 60);
   }
@@ -7686,16 +10113,22 @@
       .then(null, function () { return null; })];
     want.push(api().get('/api/director?hour=1')
       .then(null, function () { return null; }));
+    want.push(api().get('/api/bank?minutes=120')
+      .then(null, function () { return null; }));
     Promise.all(want).then(function (got) {
-      var fresh = got.filter(Boolean);
+      var fresh = got.slice(0, 2).filter(Boolean);
       planning = false;
       /* #1289b: a failed read must not WIPE the running order. Both
          fetches swallow their own errors and return null, so a blip
          used to hand back an empty list, paintPlan cleared the node,
          and the hour ahead vanished until the next poll. Keep what we
          have unless something better arrived. */
-      if (!fresh.length) return;
-      planHours = fresh;
+      if (!fresh.length && !got[2]) return;
+      if (fresh.length) planHours = fresh;
+      if (got[2] && Array.isArray(got[2].slots)) {
+        bankPlan = got[2];
+        bankFetchedAt = Date.now();
+      }
       planAt = Date.now();
       paintPlan();
     }, function () { planning = false; });
@@ -7730,16 +10163,139 @@
     return node;
   }
 
+  function bankSlotFor(entry, bank, used) {
+    if (!bank || !Array.isArray(bank.slots) || !entry || !entry.slot_id) return null;
+    var id = String(entry.slot_id);
+    var kind = String(entry.kind || '');
+    var sameRoad = function (value) {
+      var road = String(value || '');
+      return (road === 'banter_caller' ? 'caller'
+        : road === 'bombshell' ? 'ad' : road) === kind;
+    };
+    var start = Number(entry.start) || 0;
+    var best = null, distance = Infinity;
+    bank.slots.forEach(function (slot, index) {
+      if (used && used[index]) return;
+      var commit = String(slot.commit_id || '');
+      var slotId = commit.indexOf('current:') === 0
+        ? commit.slice(commit.indexOf(':', 8) + 1)
+        : commit.split('@')[0];
+      if (slotId !== id || !sameRoad(slot.kind)) return;
+      var gap = Math.abs((Number(bank.at) || 0)
+        + (Number(slot.in_seconds) || 0) - start);
+      if (start && gap > 300 && !(slot.current && entry.state === 'on air')) return;
+      if (gap < distance) { best = {slot: slot, index: index}; distance = gap; }
+    });
+    return best;
+  }
+
+  function bankSlotText(slot) {
+    return 'BANK  |  ' + (Number(slot.ready_seconds) || 0).toFixed(1)
+      + 's rendered  |  ' + (Number(slot.written_only_seconds) || 0).toFixed(1)
+      + 's written only  |  ' + (Number(slot.short_seconds) || 0).toFixed(1)
+      + 's missing  |  ' + ((slot.items || []).length) + ' stock item(s)';
+  }
+
+  function planReviewLabel(entry) {
+    var script = entry.script || {};
+    if (!(script.turns || []).length && !(script.draft_turns || []).length) {
+      return 'No script allocated to this slot';
+    }
+    var review = entry.review || {};
+    if (review.approved) return 'Script approved';
+    if (review.seen) return 'Seen, awaiting approval';
+    return 'Script needs review';
+  }
+
+  function planCommand(key, label, title, run) {
+    var button = planNodes.get(key);
+    if (!button) {
+      button = make('button', 'sp-planact', label);
+      button.type = 'button';
+      planNodes.set(key, button);
+    }
+    if (button.textContent !== label && !button.disabled) button.textContent = label;
+    button.title = title;
+    button.pineKey = key;
+    button.onclick = run;
+    return button;
+  }
+
+  function planPrepare(button) {
+    button.disabled = true;
+    button.textContent = 'Queuing...';
+    api().post('/api/pantry/commission', {
+      kind: String(button.dataset.kind || ''), count: 1
+    }).then(function () {
+      button.textContent = 'Queued';
+      setTimeout(function () {
+        button.disabled = false;
+        loadPlan(true);
+      }, 2200);
+    }, function (err) {
+      button.disabled = false;
+      button.textContent = 'Retry preparation';
+      button.title = String((err && err.message) || err);
+    });
+  }
+
+  function openBankReview(slot) {
+    var sheet = sheetShell('spBankReview', 'sp-bankreview',
+      String(slot.label || slot.kind || 'Advance preparation'));
+    sheet.box.appendChild(make('p', 'sp-bank-summary', bankSlotText(slot)));
+    (slot.items || []).forEach(function (item, index) {
+      var section = make('section', 'sp-bank-item');
+      var name = String(item.kind || slot.kind || 'stock') + ' ' + (index + 1);
+      section.appendChild(make('h4', '', name + ' / ' + String(item.state || 'unknown')));
+      var lines = make('div', 'sp-bank-lines');
+      (item.lines || []).forEach(function (line) {
+        var row = make('div', 'sp-bank-line');
+        row.dataset.state = String(line.state || '');
+        row.appendChild(make('b', '', String(line.who || '')));
+        row.appendChild(make('span', '', String(line.text || '(not written)')));
+        lines.appendChild(row);
+      });
+      section.appendChild(lines);
+      if (item.round && item.sid) {
+        var full = make('button', 'sp-planact', 'Read full script');
+        full.type = 'button';
+        full.addEventListener('click', function () {
+          full.disabled = true;
+          api().get('/api/director/script/' + encodeURIComponent(item.sid))
+            .then(function (script) {
+              lines.replaceChildren();
+              (script.turns || []).forEach(function (turn) {
+                var row = make('div', 'sp-bank-line');
+                row.appendChild(make('b', '', String(turn.who || turn.seat || '')));
+                row.appendChild(make('span', '', String(turn.text || '')));
+                lines.appendChild(row);
+              });
+              full.textContent = 'Full script loaded';
+            }, function (err) {
+              full.disabled = false;
+              sheet.say(String((err && err.message) || err), true);
+            });
+        });
+        section.appendChild(full);
+      }
+      sheet.box.appendChild(section);
+    });
+    return sheet;
+  }
+
   function paintPlan() {
     var box = el('spPlan');
     if (!box) return;
     if (planIn !== box) { planNodes.clear(); planIn = box; }
-    if (!planHours.length) {
+    var bankView = bankPlan && Date.now() - bankFetchedAt < 180000
+      ? bankPlan : null;
+    if (!planHours.length && !bankView) {
       if (planNodes.size) { box.replaceChildren(); planNodes.clear(); }
       return;
     }
     var order = [];
     var wanted = Object.create(null);
+    var usedBank = Object.create(null);
     for (var h = 0; h < planHours.length; h += 1) {
       var page = planHours[h] || {};
       var rows = page.entries || [];
@@ -7771,27 +10327,106 @@
       order.push(when);
       for (var k = 0; k < ahead.length; k += 1) {
         var e = ahead[k];
+        var bankHit = bankSlotFor(e, bankView, usedBank);
+        var bankSlot = bankHit && bankHit.slot;
+        if (bankHit) usedBank[bankHit.index] = 1;
         var sc = e.script || {};
-        var turns = sc.turns || [];
+        var boundTurns = sc.turns || [];
+        var turns = boundTurns.length ? boundTurns : (sc.draft_turns || []);
+        var draftOnly = !boundTurns.length && turns.length;
         var mark = String(e.state || '');
         var clock = e.start
           ? new Date(Number(e.start) * 1000).toTimeString().slice(0, 5) : '';
         var segKey = 'p:' + h + ':' + String(e.slot_id || e.ordinal || k);
         var head = planKeep(segKey, 'sp-el sp-planseg'
           + (mark === 'on air' ? ' sp-planlive' : '')
-          + (turns.length ? '' : ' sp-planbare'),
+          + (turns.length ? (draftOnly ? ' sp-plandraft' : '')
+            : (bankSlot && (bankSlot.items || []).length ? '' : ' sp-planbare'))
+          + ((e.orchestration && e.orchestration.status
+              && e.orchestration.status !== 'ready') ? ' sp-planshort' : ''),
           (clock ? clock + '  ' : '')
           + String(e.label || e.kind || 'segment').toUpperCase()
-          + '   ' + (e.minutes ? e.minutes + ' MIN' : ''));
+          + '   ' + (e.minutes ? e.minutes + ' MIN' : '')
+          + (draftOnly ? '   DRAFT READY' : ''));
         head.setAttribute('data-plan', String(e.slot_id || e.ordinal || k));
         head.setAttribute('data-state', mark);
         wanted[segKey] = 1;
         order.push(head);
+        var orch = e.orchestration || {};
+        if (orch && (orch.say || orch.status)) {
+          var have = orch.have || {};
+          var target = orch.target || {};
+          var needs = Array.isArray(orch.needs) ? orch.needs : [];
+          var status = String(orch.status || 'unknown').replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
+          var orchKey = segKey + ':orch';
+          var orchText = String(orch.say || '')
+            + (needs.length ? '  ·  ' + needs.slice(0, 3).join(' · ') : '');
+          var orchNode = planKeep(orchKey, 'sp-el sp-planorch sp-planorch-' + status,
+            orchText + '  |  ' + planReviewLabel(e));
+          orchNode.title = [
+            'Written: ' + (orch.stages && orch.stages.written ? 'yes' : 'no'),
+            'Reviewed: ' + (orch.stages && orch.stages.reviewed ? 'yes' : 'no'),
+            'Recorded: ' + (orch.stages && orch.stages.recorded ? 'yes' : 'no'),
+            'Scheduled: ' + (orch.stages && orch.stages.scheduled ? 'yes' : 'no'),
+            'Lines: ' + (have.lines || 0) + '/' + (target.lines || 0),
+            'Events: ' + (have.events || 0) + '/' + (target.events || 0)
+          ].join('\n');
+          wanted[orchKey] = 1;
+          order.push(orchNode);
+        }
+        if (bankSlot) {
+          var bankKey = segKey + ':bank';
+          var bankNode = planKeep(bankKey, 'sp-el sp-planbank', bankSlotText(bankSlot));
+          wanted[bankKey] = 1;
+          order.push(bankNode);
+        }
+        var actionKey = segKey + ':actions';
+        var actions = planKeep(actionKey, 'sp-plan-actions', '');
+        wanted[actionKey] = 1;
+        if (orch.preparable) {
+          var prepareKey = segKey + ':prepare';
+          var prepare = planCommand(prepareKey,
+            orch.status === 'ready' ? 'Prepare another' : 'Prepare segment',
+            'Ask the orchestrator to prepare this road', function () {
+              planPrepare(this);
+            });
+          prepare.dataset.kind = String(e.kind || '');
+          if (prepare.parentNode !== actions) actions.appendChild(prepare);
+          wanted[prepareKey] = 1;
+        }
+        if (turns.length) {
+          var reviewKey = segKey + ':review';
+          var review = planCommand(reviewKey, 'Review script',
+            'Open the prepared lines, revisions and approval for this segment',
+            function () {
+              itineraryOpen({occurrence: this.dataset.occurrence,
+                slot_id: this.dataset.slot});
+            });
+          review.dataset.occurrence = String(e.occurrence || '');
+          review.dataset.slot = String(e.slot_id || '');
+          if (review.parentNode !== actions) actions.appendChild(review);
+          wanted[reviewKey] = 1;
+        }
+        if (bankSlot && (bankSlot.items || []).length) {
+          var bankReviewKey = segKey + ':bank-review';
+          var bankReview = planCommand(bankReviewKey, 'Review banked lines',
+            'Read the stock and recording state committed to this slot',
+            function () { openBankReview(this.pineBankSlot); });
+          bankReview.pineBankSlot = bankSlot;
+          if (bankReview.parentNode !== actions) actions.appendChild(bankReview);
+          wanted[bankReviewKey] = 1;
+        }
+        Array.prototype.slice.call(actions.children).forEach(function (button) {
+          if (!wanted[button.pineKey]) button.remove();
+        });
+        if (actions.children.length) order.push(actions);
         if (!turns.length) {
           /* A hole is shown, not hidden: an operator who sees it before
              the slot arrives can still do something about it. */
           var bare = planKeep(segKey + ':why', 'sp-el sp-planwhy',
-            mark || 'nothing behind it');
+            bankSlot && (bankSlot.items || []).length
+              ? 'No System2 script allocated; banked stock is shown above.'
+              : (mark || 'No System2 script allocated to this slot.'));
           wanted[segKey + ':why'] = 1;
           order.push(bare);
           continue;
@@ -7802,16 +10437,82 @@
           var lineKey = segKey + ':l' + t2;
           order.push(planKeep(cueKey, 'sp-el sp-character sp-plancue',
             String(turn.who || turn.seat || '').toUpperCase()));
-          order.push(planKeep(lineKey, 'sp-el sp-dialogue sp-planline',
-            String(turn.text || '')));
+          var planLine = planKeep(lineKey, 'sp-el sp-dialogue sp-planline'
+            + (draftOnly ? ' sp-plandraftline' : ''), String(turn.text || ''));
+          planLine.pineItem = Object.assign({}, turn, {
+            id: String(turn.id || turn.line || lineKey),
+            line: String(turn.id || turn.line || lineKey),
+            text: String(turn.text || ''),
+            aired: 'prepared',
+            candidate: String(turn.candidate || sc.selected_candidate || sc.candidate || ''),
+            segment: String(e.slot_id || e.ordinal || k)
+          });
+          if (!planLine.__lineOpen) {
+            planLine.__lineOpen = 1;
+            planLine.setAttribute('role', 'button');
+            planLine.setAttribute('tabindex', '0');
+            planLine.addEventListener('click', function () {
+              openLine(this.pineItem || {}, this);
+            });
+            planLine.addEventListener('keydown', function (event) {
+              if (event.key !== 'Enter' && event.key !== ' ') return;
+              event.preventDefault();
+              openLine(this.pineItem || {}, this);
+            });
+          }
+          order.push(planLine);
           wanted[cueKey] = 1;
           wanted[lineKey] = 1;
         }
       }
     }
+    if (bankView && Array.isArray(bankView.slots)) {
+      var unlinked = bankView.slots.filter(function (slot, index) {
+        return !usedBank[index];
+      });
+      if (unlinked.length) {
+        var bankHead = planKeep('bank:head', 'sp-el sp-planhour',
+          'ADVANCE PREPARATION / BANKED STOCK');
+        wanted['bank:head'] = 1;
+        order.push(bankHead);
+        unlinked.forEach(function (slot, index) {
+          var key = 'bank:slot:' + String(slot.commit_id || index);
+          var when = Number(slot.in_seconds) || 0;
+          var name = planKeep(key, 'sp-el sp-planseg',
+            (when ? Math.round(when / 60) + ' MIN AHEAD  ' : 'NOW  ')
+            + String(slot.label || slot.kind || 'segment').toUpperCase());
+          wanted[key] = 1;
+          order.push(name);
+          var statusKey = key + ':status';
+          order.push(planKeep(statusKey, 'sp-el sp-planbank', bankSlotText(slot)));
+          wanted[statusKey] = 1;
+          var actKey = key + ':actions';
+          var act = planKeep(actKey, 'sp-plan-actions', '');
+          wanted[actKey] = 1;
+          var prepareKey = key + ':prepare';
+          var prepare = planCommand(prepareKey, 'Prepare segment',
+            'Ask the orchestrator to prepare this road', function () {
+              planPrepare(this);
+            });
+          prepare.dataset.kind = String(slot.road || slot.kind || '');
+          if (prepare.parentNode !== act) act.appendChild(prepare);
+          wanted[prepareKey] = 1;
+          if ((slot.items || []).length) {
+            var reviewKey = key + ':review';
+            var review = planCommand(reviewKey, 'Review banked lines',
+              'Read the stock and recording state committed to this slot',
+              function () { openBankReview(this.pineBankSlot); });
+            review.pineBankSlot = slot;
+            if (review.parentNode !== act) act.appendChild(review);
+            wanted[reviewKey] = 1;
+          }
+          order.push(act);
+        });
+      }
+    }
     planNodes.forEach(function (held, key) {
       if (wanted[key]) return;
-      if (held.parentNode === box) held.remove();
+      if (held.parentNode) held.remove();
       planNodes.delete(key);
     });
     stitchScript(box, order);
@@ -7843,6 +10544,10 @@
     if (type === 'scene') {
       /* #1285: the heading is the fold's handle. */
       node.classList.add('sp-fold');
+      dressScene(node, item);
+      node.setAttribute('role', 'button');
+      node.setAttribute('tabindex', '0');
+      node.setAttribute('aria-expanded', 'true');
       node.addEventListener('click', function (ev) {
         ev.stopPropagation();        /* not a pane gesture (#1272) */
         /* #1168: "whenever i tap and hold on a segment's header, I want
@@ -7853,6 +10558,12 @@
            button asks of its own hold. */
         if (node.pineHeld) return;
         segToggle(String(item.seg || item.id || ''));
+      });
+      node.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+        ev.preventDefault();
+        segToggle(String((node.pineItem && (node.pineItem.seg || node.pineItem.id))
+          || item.seg || item.id || ''));
       });
       /* #1168: the fifth thing in this file on holdOpen() - half a
          second, eight pixels of travel cancels it, and the desk's
@@ -7893,7 +10604,7 @@
       node.dataset.ord = String(item.ord);
     }
     if (type === 'dialogue' || type === 'action') {
-      node.addEventListener('click', function () { openLine(item, node); });
+      node.addEventListener('click', function () { openLine(node.pineItem || item, node); });
     }
     return node;
   }
@@ -8719,6 +11430,31 @@
       : null;
     var d = PineScriptResolver.resolve(look, {map: admitMap, index: feedIndex()},
                                        {airLast: airLast, lastGood: lastGood});
+    /* The linear playout controller is the station's final word. Local media
+       evidence normally arrives faster, but when the two disagree a fresh
+       line id from /api/playout names the occurrence that is actually
+       sounding and must drive both the strip and the highlight. */
+    var verdict = playoutNow;
+    if (verdict && verdict.line_id
+        && Date.now() - Number(verdict.at_ms || 0) <= PLAYOUT_MS * 3) {
+      d = Object.assign({}, d, {
+        mark: 'air',
+        line_id: String(verdict.line_id),
+        occurrence_id: String(verdict.occurrence_id || d.occurrence_id || ''),
+        block: verdict.block,
+        ord: verdict.ord,
+        t: verdict.offset_s === null ? d.t : verdict.offset_s,
+        from: verdict.line_from === null ? d.from : verdict.line_from,
+        until: verdict.line_until === null ? d.until : verdict.line_until,
+        source: 'playout',
+        road: 'playout',
+        sync: 'locked',
+        trustworthy: true,
+        at_ms: Date.now(),
+        why: 'the station playout controller names this exact sounding line',
+        refused: d.refused || []
+      });
+    }
     if (d.mark === 'air') {
       airLast = {line_id: d.line_id, key: d.key, t: d.t, from: d.from, until: d.until,
                  block: d.block, ord: d.ord, at_ms: d.at_ms};
@@ -8747,7 +11483,9 @@
     return {id: d.line_id, from: Number(d.from || 0), until: Number(d.until || 0),
       at: Number(d.t || 0), index: d.index, of: d.of, occurrence_id: d.occurrence_id,
       position: d.position, sync: d.sync, carried: false,
-      admitted: d.road === PineScriptResolver.ROADS.CUE, road: d.road};
+      admitted: d.road === PineScriptResolver.ROADS.CUE, road: d.road,
+      text: d.road === 'playout' ? String(verdict.text || '') : '',
+      speaker: d.road === 'playout' ? String(verdict.speaker || '') : ''};
   }
 
   /* The decision, compact, for the incident capture. */
@@ -8801,10 +11539,39 @@
     if (node) node.classList.add(cls);
   }
 
-  function placeMarks(d) {
+  function sayingFallbackMark(row, shown) {
+    if (row && row.id) return null;
+    if (!shown || !shown.id || shown.aired !== 'airing' || stationPaused
+        || !PineScriptResolver.isLineId(shown.id)) return null;
+    var node = lineNode(String(shown.id));
+    if (!node || !node.classList.contains('sp-dialogue')) return null;
+    var feed = root.PineStationFeed;
+    var station = feed && typeof feed.state === 'function' ? feed.state() : null;
+    if (!currentFeedSaying(shown, station)) return null;
+    var head = bridgeHead();
+    var voice = !!(head && /djVoiceAudio/i.test(String(head.id || '')) && head.file);
+    if (!voice) {
+      var audios = document.querySelectorAll('audio');
+      for (var i = 0; i < audios.length; i += 1) {
+        var audio = audios[i];
+        if (/djVoiceAudio/i.test(String(audio.id || '')) && !audio.paused && !audio.ended
+            && (Number(audio.currentTime) > 0 || Number(audio.readyState) >= 2)) {
+          voice = true;
+          break;
+        }
+      }
+    }
+    return voice ? {id: String(shown.id), inferred: true} : null;
+  }
+
+  function placeMarks(d, fallback) {
     d = d || lastDecision || {};
-    var air = d.mark === 'air' ? String(d.line_id || '') : '';
+    var inferred = d.mark !== 'air' && fallback && fallback.id;
+    var air = d.mark === 'air' ? String(d.line_id || '')
+      : inferred ? String(fallback.id) : '';
     markNow(air);
+    var liveNode = lineNode(air);
+    if (liveNode) liveNode.classList.toggle('sp-feed-now', !!inferred);
     dress('sp-expect', (!air && d.expected_id && d.expected_id !== d.carried_id) ? d.expected_id : '');
     dress('sp-last', (!air && d.carried_id) ? d.carried_id : '');
   }
@@ -8838,9 +11605,13 @@
      on screen (that is what they are reading), else on the first visible
      element, and restored by the drift once the fold has committed. */
   var foldHold = null;
+  var foldGuardSerial = 0;
+  var foldGuardTimer = 0;
   function foldGuardStart() {
+    foldGuardSerial += 1;
+    var serial = foldGuardSerial;
     var box = el('spScript');
-    if (!box) { foldHold = null; return; }
+    if (!box) { foldHold = null; return serial; }
     var node = lineNode(nowLineId);
     var pane = box.getBoundingClientRect();
     if (node && !node.hidden) {
@@ -8849,15 +11620,24 @@
     } else node = null;
     if (!node) {
       var anchor = scriptAnchor(box);
-      foldHold = anchor && anchor.node ? {node: anchor.node, was: anchor.was} : null;
-      return;
+      foldHold = anchor && anchor.node
+        ? {node: anchor.node, was: anchor.was, line: String(nowLineId || ''), serial: serial}
+        : null;
+      return serial;
     }
-    foldHold = {node: node, was: node.getBoundingClientRect().top};
+    foldHold = {node: node, was: node.getBoundingClientRect().top,
+      line: String(nowLineId || ''), serial: serial};
+    return serial;
   }
-  function foldGuardEnd(reason) {
+  function foldGuardEnd(reason, serial) {
     var hold = foldHold;
+    if (serial !== foldGuardSerial || !hold || hold.serial !== serial) return;
     foldHold = null;
     var box = el('spScript');
+    /* A delayed fold callback belongs to the line that opened it. The
+       next line's follow has already seated the reader correctly; applying
+       the old anchor to the new line is the measured 1,300px snap. */
+    if (hold.line !== String(nowLineId || '')) return;
     if (!hold || !box || !hold.node || hold.node.parentNode !== box || hold.node.hidden) return;
     var drift = hold.node.getBoundingClientRect().top - hold.was;
     if (Math.abs(drift) > 0.5) {
@@ -8877,7 +11657,7 @@
   var playoutState = 'unknown';
   var playoutAt = 0;
   var playoutBusy = false;
-  var PLAYOUT_MS = 4000;
+  var PLAYOUT_MS = 800;
   var PLAYOUT_RETRY_MS = 600000;
 
   function playoutRead(got) {
@@ -8895,6 +11675,11 @@
       ord: (s.ord === undefined || s.ord === null) ? null : Number(s.ord),
       file: PineScriptCues.key(s.file || s.media || ''),
       offset_s: (off === undefined || off === null || !isFinite(Number(off))) ? null : Number(off),
+      line_from: isFinite(Number(s.line_from)) && s.line_from != null ? Number(s.line_from) : null,
+      line_until: isFinite(Number(s.line_until)) && s.line_until != null ? Number(s.line_until) : null,
+      speaker: String(s.speaker || ''), text: String(s.text || ''),
+      position_basis: String(s.position_basis || ''),
+      last_heard_at: Number(s.last_heard_at) || 0,
       next: got.next && typeof got.next === 'object'
         ? {occurrence_id: String(got.next.occurrence_id || ''), line_id: String(got.next.line_id || ''),
            block: got.next.block === undefined ? null : got.next.block,
@@ -8914,7 +11699,7 @@
     playoutBusy = true;
     playoutAt = now;
     var ask;
-    try { ask = Promise.resolve(bridge.get('/api/playout')); }
+    try { ask = Promise.resolve(bridge.get('/api/playout?limit=1&lean=1')); }
     catch (err) { playoutBusy = false; playoutState = 'absent'; playoutNow = null; return; }
     ask.then(function (got) {
       playoutBusy = false;
@@ -9158,13 +11943,41 @@
    * get walked four times a second. */
   var chasedFor = Object.create(null);           /* [#1189] id -> last chase */
 
+  function chaseStalePage(id, node) {
+    /* The resolver only calls markNow with a line read from the sounding
+       file.  If that same line is still `prepared` in the screenplay, the
+       durable air-log copy is behind the live feed.  Ask for one fresh
+       composition now instead of waiting twenty seconds while the page
+       unfolds a prepared block around the mark. */
+    if (!node || !node.classList.contains('pending')
+        || !PineScriptResolver.isLineId(id)) return false;
+    var t = Date.now();
+    if (t - chasedAt <= 3000 || t - Number(chasedFor[id] || 0) <= 20000) {
+      return false;
+    }
+    chasedAt = t; chasedFor[id] = t;
+    loadScreenplay(true);
+    return true;
+  }
+
   function markNow(id) {
     if (id === nowLineId) {
       /* [#1189] RE-ASSERTED ON THE KEYED NODE. A repaint may have rebuilt
          the node without its mark; the id being unchanged is not the mark
          being present. */
       var same = id ? lineNode(id) : null;
-      if (same && !same.classList.contains('sp-now')) same.classList.add('sp-now');
+      var oldMarks = document.querySelectorAll('.sp-el.sp-now');
+      for (var m = 0; m < oldMarks.length; m += 1) {
+        if (oldMarks[m] === same) continue;
+        oldMarks[m].classList.remove('sp-now');
+        oldMarks[m].classList.remove('sp-feed-now');
+        oldMarks[m].removeAttribute('aria-current');
+      }
+      if (same) {
+        if (!same.classList.contains('sp-now')) same.classList.add('sp-now');
+        same.setAttribute('aria-current', 'true');
+      }
+      chaseStalePage(id, same);
       return;
     }
     /* #1263: CLEAR EVERY MARK, not the one we remember.
@@ -9182,7 +11995,11 @@
      * Asking the document rather than trusting a remembered id makes
      * that true by construction, whatever else clears what. */
     var lit = document.querySelectorAll('.sp-el.sp-now');
-    for (var i = 0; i < lit.length; i += 1) lit[i].classList.remove('sp-now');
+    for (var i = 0; i < lit.length; i += 1) {
+      lit[i].classList.remove('sp-now');
+      lit[i].classList.remove('sp-feed-now');
+      lit[i].removeAttribute('aria-current');
+    }
     /* #1270: A MARK THAT DID NOT HAPPEN IS NOT REMEMBERED.
      *
      * This used to write `nowLineId = id` and only THEN look for the
@@ -9239,6 +12056,8 @@
     nowLineId = id || '';
     if (!node) return;
     node.classList.add('sp-now');
+    node.setAttribute('aria-current', 'true');
+    chaseStalePage(id, node);
     segFollow(node.getAttribute('data-seg') || '');          /* #1285 */
     if (follow) {
       /* Move only when needed, by one measured delta. Smooth animations
@@ -9420,12 +12239,149 @@
     if (i && i.__text !== why) { i.__text = why; i.textContent = why; }
   }
 
-  function paintStatus() {
+  function scheduledNow() {
+    var now = Date.now() / 1000;
+    var fallback = null;
+    for (var h = 0; h < planHours.length; h += 1) {
+      var entries = (planHours[h] && planHours[h].entries) || [];
+      for (var i = 0; i < entries.length; i += 1) {
+        var entry = entries[i] || {};
+        if (String(entry.state || '') === 'on air') return entry;
+        var start = Number(entry.start) || 0;
+        var end = Number(entry.deadline) || (start
+          + Math.max(15, (Number(entry.minutes) || 1) * 60));
+        if (start && start <= now && now < end) fallback = entry;
+      }
+    }
+    return fallback;
+  }
+
+  function scheduledAfter(current) {
+    var rows = [];
+    planHours.forEach(function (page) {
+      rows = rows.concat((page && page.entries) || []);
+    });
+    rows.sort(function (a, b) { return (Number(a.start) || 0) - (Number(b.start) || 0); });
+    var after = current ? Number(current.deadline) || Number(current.start) || 0
+      : Date.now() / 1000;
+    for (var i = 0; i < rows.length; i += 1) {
+      if (rows[i] === current) continue;
+      if ((Number(rows[i].start) || 0) >= after - 1
+          && String(rows[i].state || '') !== 'aired') return rows[i];
+    }
+    return null;
+  }
+
+  function monitorMessage(stage, detail, state, flow) {
+    return {stage: stage, detail: detail, status: state || '',
+      at: Date.now() / 1000, _flow: flow || null};
+  }
+
+  var monitorPrint = '';
+  function paintOrchestratorMonitor(line, current) {
+    var track = line.querySelector('.sp-now-orch-track');
+    if (!track) return;
+    var next = scheduledAfter(current);
+    var messages = [];
+    if (next) {
+      var script = next.script || {};
+      var turns = (script.turns || []).length;
+      var drafts = Number(script.drafts) || 0;
+      if (turns) messages.push(monitorMessage('ready', 'Next line ready: '
+        + String(next.label || next.kind || 'segment') + ' - ' + turns
+        + (turns === 1 ? ' line banked' : ' lines banked'), 'ready', next));
+      else if (drafts) messages.push(monitorMessage('drafts', drafts
+        + (drafts === 1 ? ' draft waiting for ' : ' drafts waiting for ')
+        + String(next.label || next.kind || 'the next segment'), 'waiting', next));
+      else messages.push(monitorMessage('issue', String(next.label || next.kind
+        || 'the next segment') + ' has no prepared dialogue yet', 'behind', next));
+    }
+    if (current) {
+      var deadline = Number(current.deadline) || 0;
+      var remaining = deadline ? deadline - Date.now() / 1000 : 0;
+      messages.push(monitorMessage(remaining < -2 ? 'behind' : 'timing',
+        remaining < -2 ? 'The broadcast has run past this segment window'
+          : 'The broadcast is running on time', remaining < -2 ? 'behind' : 'on time', current));
+    }
+    try {
+      var history = root.PineConsoleLine && root.PineConsoleLine.history
+        ? root.PineConsoleLine.history().slice(0, 4) : [];
+      history.forEach(function (item) { messages.push(item); });
+    } catch (err) { /* readiness remains useful on its own */ }
+    if (!messages.length) messages.push(monitorMessage('orchestrator',
+      'Waiting for the running order', 'waiting'));
+    var key = messages.map(function (item) {
+      return String(item.stage || '') + ':' + String(item.detail || '');
+    }).join('|');
+    if (key === monitorPrint) return;
+    monitorPrint = key;
+    track.replaceChildren();
+    messages.concat(messages).forEach(function (item) {
+      var button = make('button', 'sp-now-orch-message', '');
+      button.type = 'button';
+      button.dataset.status = String(item.status || '');
+      button.appendChild(make('b', '', String(item.stage || 'orchestrator')));
+      button.appendChild(make('span', '', String(item.detail || '')));
+      button.addEventListener('click', function (event) {
+        event.stopPropagation();
+        if (root.PineConsoleTrace && root.PineConsoleTrace.open) {
+          root.PineConsoleTrace.open(item);
+        }
+      });
+      track.appendChild(button);
+    });
+    line.style.setProperty('--sp-monitor-time', Math.max(24,
+      Math.min(80, key.length / 7)) + 's');
+  }
+
+  function paintStatus(row) {
     var line = el('spNow');
     if (!line) return;
     var got = status();
+    var scheduled = scheduledNow();
+    var segment = activeSegment(row);
+    var name = scheduled ? String(scheduled.label || scheduled.kind || 'segment')
+      : (segment && segment.heading ? String(segment.heading) : 'Active broadcast');
+    var start = Number(scheduled && scheduled.start) || Number(row && row.from) || 0;
+    var end = Number(scheduled && scheduled.deadline) || Number(row && row.until) || 0;
+    var span = end - start;
+    var now = Date.now() / 1000;
+    var progress = span > 0 ? Math.max(0, Math.min(1, (now - start) / span)) : 0;
+    var left = span > 0 ? Math.max(0, Math.ceil(end - now)) : 0;
+    var leftText = span > 0 ? (left >= 60
+      ? Math.floor(left / 60) + ':' + ('0' + (left % 60)).slice(-2)
+      : left + 's') : '';
+    var nameNode = line.querySelector('.sp-now-segment-name');
+    var leftNode = line.querySelector('.sp-now-segment-left');
+    var cueNode = line.querySelector('.sp-now-cue');
+    if (nameNode && nameNode.textContent !== name) nameNode.textContent = name;
+    if (leftNode) {
+      var statusText = leftText ? leftText + ' left' : got.text;
+      if (leftNode.textContent !== statusText) leftNode.textContent = statusText;
+    }
+    if (cueNode) {
+      var active = row && row.id ? lineNode(String(row.id)) : null;
+      var item = active && active.pineItem;
+      var cueText = active && item
+        ? 'ON AIR  ' + lineWho(String(row.id)) + String(item.text || '')
+        : got.text;
+      if (cueNode.textContent !== cueText) cueNode.textContent = cueText;
+      cueNode.disabled = !active;
+      cueNode.dataset.line = active ? String(row.id) : '';
+      cueNode.title = active ? 'Return to the cue currently playing' : got.text;
+    }
+    line.style.setProperty('--sp-segment-run', Math.round(progress * 100) + '%');
+    if (scheduled || (segment && segment.heading)) {
+      line.dataset.segment = String((scheduled && (scheduled.slot_id || scheduled.ordinal))
+        || (segment && (segment.seg || segment.block)) || '');
+      line.title = 'Active segment: ' + name
+        + '. Tap for the hour and station calendar.';
+    } else {
+      delete line.dataset.segment;
+      line.title = 'Tap for the hour and station calendar.';
+    }
     if (line.dataset.state !== got.state) line.dataset.state = got.state;
-    if (line.__text !== got.text) { line.__text = got.text; line.textContent = got.text; }
+    paintOrchestratorMonitor(line, scheduled);
   }
 
   /* The 250 ms heartbeat: move the mark, move the readout. Nothing here
@@ -9477,7 +12433,20 @@
     }
   }
 
+  function scriptVisible(node, hidden) {
+    if (hidden || !node) return false;
+    if (node.classList && node.classList.contains('pine-view-host')) {
+      return node.classList.contains('open');
+    }
+    return node.offsetParent !== null;
+  }
+
   function tick() {
+    if (!scriptVisible(host, document.hidden)) return;
+    rejectionStep();
+    if (!rejectionSelection && Date.now() - rejectionHeadAt > REJECTION_REFRESH_MS) {
+      rejectionLoad(true);
+    }
     var row = activeRow();
     /* The bounded ring of what the mark did and why - the incident report
        carries it, so a backward movement can be told apart from a document
@@ -9493,10 +12462,11 @@
       syncRing.push(mine);
       if (syncRing.length > SYNC_RING_MAX) syncRing.shift();
     }
-    placeMarks(lastDecision);                                /* [#1189] */
+    var shown = paintSaying(row);                             /* #1298 */
+    var fallback = sayingFallbackMark(row, shown);
+    placeMarks(lastDecision, fallback);                       /* [#1189] */
     markRun(row);                                            /* #1295 */
-    paintSaying(row);                                        /* #1298 */
-    markFeedLive(row ? row.id : '');            /* #1279 */
+    markFeedLive(row ? row.id : (fallback && fallback.id) || ''); /* #1279 */
     /* #1286: say when the room is quiet, instead of leaving a page full
        of `pending` and `tinted` marks to be read as though one of them
        were live. */
@@ -9508,7 +12478,7 @@
          element that knows. */
       host.classList.toggle('sp-quiet', !soundingPlayer() && !(row && row.id));
     } catch (err) { /* the mark still stands on its own */ }
-    paintStatus();
+    paintStatus(row);
     paintSync(row);
     /* [#1189] ONE TIMER. The recorder used to sample on its own 250ms
        interval, a quarter-phase away from this one, so every line change
@@ -9584,6 +12554,64 @@
     });
     node.classList.add('flash');
     setTimeout(function () { node.classList.remove('flash'); }, 1200);
+  }
+
+  /* A PRESS ON WHAT IS PLAYING MEANS FOLLOW THE AIR AGAIN.
+   *
+   * The live strip used to call jumpToLine(), which moved once but left
+   * `follow` false after a hand scroll or crawl. The next spoken line
+   * therefore advanced without the reader, making the strip look dead.
+   * This is one command shared by the strip and the status line: stop the
+   * competing crawl, reopen the live segment, center the current admitted
+   * line, and leave following armed for every line after it. */
+  function resumeAirFollow(reason, preferredId) {
+    if (crawlStop) crawlStop();
+    follow = true;
+    adrift = 0;
+    keptAt = 0;
+    var chip = el('spNow');
+    if (chip) chip.classList.remove('adrift');
+
+    var row = activeRow();
+    var feedId = '';
+    try {
+      var feedRow = root.PineStationFeed && root.PineStationFeed.now
+        ? root.PineStationFeed.now() : null;
+      feedId = String((feedRow && feedRow.id) || '');
+    } catch (err) { feedId = ''; }
+    var id = String(preferredId || (row && row.id)
+      || feedId
+      || (lastDecision && lastDecision.mark === 'air' && lastDecision.line_id)
+      || nowLineId || '');
+    if (!id) return false;
+    var node = lineNode(id);
+    if (!node) {
+      /* The station may have admitted a line since the last document
+       * read. Collect the fresh page now; markNow will seat it on the
+       * first tick after paint. */
+      nowLineId = '';
+      loadScreenplay(true);
+      return false;
+    }
+
+    var seg = String(node.getAttribute('data-seg') || '');
+    if (seg) {
+      folded[seg] = false;
+      delete byHand[seg];
+      if (liveSeg !== seg) segFollow(seg);
+      else segApply(false);
+    }
+    nowLineId = '';
+    markNow(id);
+    moveScript('jump-to-air:' + (reason || 'control'), function (pane) {
+      var lip = pane.getBoundingClientRect();
+      var seat = node.getBoundingClientRect();
+      pane.scrollTop = Math.max(0, pane.scrollTop + seat.top - lip.top
+        - Math.max(0, (lip.height - seat.height) / 2));
+    });
+    node.classList.add('flash');
+    setTimeout(function () { node.classList.remove('flash'); }, 1200);
+    return true;
   }
 
   /* Tap a line: what it is, and what can be done with it. */
@@ -9703,6 +12731,7 @@
     host.replaceChildren();
 
     var left = make('div', 'sp-left');
+    left.appendChild(buildRejectionStrip());
     left.appendChild(buildBar());            /* 1 2 3 */
     var treeRow = make('div', 'sp-treerow');
     treeRow.appendChild(buildTree());        /* 4 */
@@ -9792,6 +12821,22 @@
     var now = make('div', 'sp-now-line');
     now.id = 'spNow';
     now.dataset.state = 'idle';
+    var segmentMonitor = make('div', 'sp-now-segment');
+    segmentMonitor.appendChild(make('b', 'sp-now-segment-name', 'Active broadcast'));
+    segmentMonitor.appendChild(make('span', 'sp-now-segment-left', 'waiting for timing'));
+    var cue = make('button', 'sp-now-cue', 'Waiting for the next cue');
+    cue.type = 'button';
+    cue.disabled = true;
+    cue.addEventListener('click', function (event) {
+      event.stopPropagation();
+      resumeAirFollow('current cue', cue.dataset.line || nowLineId);
+    });
+    segmentMonitor.appendChild(cue);
+    var orchestratorMonitor = make('div', 'sp-now-orch');
+    orchestratorMonitor.setAttribute('aria-label', 'Orchestrator status');
+    orchestratorMonitor.appendChild(make('div', 'sp-now-orch-track'));
+    now.appendChild(segmentMonitor);
+    now.appendChild(orchestratorMonitor);
     right.appendChild(now);
     /* THE SYNCHRONIZATION STATE, said out loud.
        A held mark and a live mark must not look the same. */
@@ -9974,6 +13019,7 @@
         requestAnimationFrame(crawlStep);
       }
     }
+    crawlStop = function () { crawlSet(false); };
     function crawlStep(ts) {
       if (!crawl) return;
       var box = el('spScript');
@@ -10003,17 +13049,21 @@
     });
 
     now.addEventListener('click', function () {
-      crawlSet(false);       /* back to the air stands the crawl down */
-      follow = true;
-      now.classList.remove('adrift');
-      nowLineId = '';        /* force markNow to re-seat and scroll */
-      tick();
+      itineraryOpen();
     });
 
     var detail = make('div', 'sp-detail');
     detail.id = 'spDetail';
     detail.hidden = true;
     right.appendChild(detail);
+
+    var review = make('div', 'sp-rejection-detail');
+    review.id = 'spRejectionDetail';
+    review.hidden = true;
+    review.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') { event.preventDefault(); rejectionClose(); }
+    });
+    right.appendChild(review);
 
     host.appendChild(left);
     host.appendChild(right);
@@ -10027,6 +13077,7 @@
     retryReports();
     wirePlayer();
     mounted = true;
+    rejectionLoad(true);
     foldLoad();                                              /* #1294 */
     if (!scopeFrame) paintScope();                           /* #1298 */
 
@@ -10037,7 +13088,10 @@
         var wasAt = liveStream && liveStream.at;
         liveStream = state.stream_now || null;
         if (!liveStream || liveStream.at !== wasAt) lastOffMs = 0;
-        speakingNow = state.speaking_now || null;
+        /* payload.now is interpolated from stream_now every 250 ms. Reading
+           only the four-second station snapshot made both the highlight and
+           this strip lag behind the audio by several lines. */
+        speakingNow = (payload && payload.now) || state.speaking_now || null;
         flow = state.dialogue_flow || null;
         /* talk_next_in rides at the top of the payload, not inside
            dialogue_flow; fold it in so status() has one place to read. */
@@ -10084,6 +13138,18 @@
        tests/test_script_admission_view_2026_09_15.cjs. It is pure, so the
        test holds the real code rather than a copy of it. */
     cues: PineScriptCues,
+    view: {screenplayOrder: screenplayOrder, bankSlotFor: bankSlotFor,
+      folderRatioControls: folderRatioControls, folderSample: folderSample,
+      bankSlotText: bankSlotText, planReviewLabel: planReviewLabel,
+      rejectionLabel: rejectionLabel, rejectionGlyph: rejectionGlyph,
+      rejectionPageItems: rejectionPageItems, rejectionListUrl: rejectionListUrl,
+      rejectionBody: rejectionBody, rejectionEvidence: rejectionEvidence,
+      rejectionPolicyBody: rejectionPolicyBody, rejectionDirectorBody: rejectionDirectorBody,
+      rejectionAppendWords: rejectionAppendWords,
+      rejectionTintSummary: rejectionTintSummary, rejectionProfileView: rejectionProfileView,
+      scriptVisible: scriptVisible, playoutRead: playoutRead, paintSaying: paintSaying,
+      sayingFallbackMark: sayingFallbackMark, placeMarks: placeMarks,
+      contentGateBody: contentGateBody, contentGateEffective: contentGateEffective},
     /* #1168: the segment menu's own roads, exported the same way and
        for the same reason - a stub-DOM smoke test can then hold the
        REAL hold, the real three windows and the real sidebar rather
@@ -10118,12 +13184,24 @@
     resolver: PineScriptResolver,
     marks: {place: placeMarks, keepLitInView: keepLitInView, stitch: stitchScript,
             anchor: scriptAnchor, restore: scriptRestore, nodes: scriptNodes,
+            follow: resumeAirFollow,
             decision: function () { return lastDecision; },
             reset: function () { lastDecision = null; airLast = null; lastGood = null;
                                  resolverRing.length = 0; nowLineId = ''; dressed = Object.create(null); },
             active: activeRow, playoutRead: playoutRead},
     isMounted: function () { return mounted; },
     close: function () {
+      rejectionClose();
+      rejectionItems = [];
+      rejectionFirstPage = [];
+      rejectionCursor = null;
+      rejectionHasMore = true;
+      rejectionHeadAt = 0;
+      rejectionLastStep = 0;
+      rejectionPageRetryAt = 0;
+      rejectionLoadEpoch += 1;
+      rejectionLoading = false;
+      mounted = false;
       folderClose();                                  /* 2026-09-14 */
       reasonClose();
       inboxClose();

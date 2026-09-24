@@ -39,7 +39,7 @@
     if (/^https?:$/.test(location.protocol)) return '/vendor/three.min.js';
     return 'http://127.0.0.1:8096/vendor/three.min.js';
   }
-  var POINTS = 260;          /* enough to read a mark, few enough to fly */
+  var POINTS = 360;          /* a full star field that still stays light on the tablet */
   var CEILING_MS = 7000;     /* it is gone by then, whatever happened */
 
   var threeLoad = null;
@@ -232,42 +232,67 @@
     var camera = new THREE.PerspectiveCamera(45, w / h, 0.1, 100);
     camera.position.set(0, 0, 15);
 
-    /* One geometry and one material for every point: 260 spheres each with
-     * their own would be 260 draw setups on a tablet that has to keep a
-     * radio station running behind this. */
-    var geo = new THREE.SphereGeometry(0.075, 8, 6);
-    var mat = new THREE.MeshBasicMaterial({color: 0x65c7da, transparent: true,
-      opacity: 0.95});
-    var group = new THREE.Group();
-    scene.add(group);
+    /* TWO VIEWS OF ONE SET OF STARS. Points supply the heads; line segments
+     * supply velocity trails. Both buffers are allocated once and updated
+     * in place, so the very first rendered frame is a deep star field and
+     * no intermediate plane or edge-on logo can ever be exposed. */
+    var stars = [];
+    var pointPos = new Float32Array(targets.length * 3);
+    var streakPos = new Float32Array(targets.length * 6);
+    var pointGeo = new THREE.BufferGeometry();
+    var pointAttr = new THREE.BufferAttribute(pointPos, 3);
+    if (pointAttr.setUsage && THREE.DynamicDrawUsage) pointAttr.setUsage(THREE.DynamicDrawUsage);
+    pointGeo.setAttribute('position', pointAttr);
+    var pointMat = new THREE.PointsMaterial({
+      color: 0x8de8ee, size: 0.095, sizeAttenuation: true,
+      transparent: true, opacity: 0.98, depthWrite: false
+    });
+    var points = new THREE.Points(pointGeo, pointMat);
+    scene.add(points);
 
-    var dots = [];
-    for (var i = 0; i < targets.length; i += 1) {
-      var dot = new THREE.Mesh(geo, mat);
-      dot.position.set((Math.random() - 0.5) * 16, (Math.random() - 0.5) * 10,
-        (Math.random() - 0.5) * 8);
-      dot.userData = {
-        target: targets[i],
-        drift: new THREE.Vector3((Math.random() - 0.5) * 0.03,
-          (Math.random() - 0.5) * 0.025, (Math.random() - 0.5) * 0.02)
-      };
-      group.add(dot);
-      dots.push(dot);
-    }
+    var streakGeo = new THREE.BufferGeometry();
+    var streakAttr = new THREE.BufferAttribute(streakPos, 3);
+    if (streakAttr.setUsage && THREE.DynamicDrawUsage) streakAttr.setUsage(THREE.DynamicDrawUsage);
+    streakGeo.setAttribute('position', streakAttr);
+    var streakMat = new THREE.LineBasicMaterial({
+      color: 0x65c7da, transparent: true, opacity: 0.74,
+      depthWrite: false, blending: THREE.AdditiveBlending
+    });
+    var streaks = new THREE.LineSegments(streakGeo, streakMat);
+    scene.add(streaks);
 
-    /* The plexus lines, one buffer reused - the same discipline the wall
-     * learned: geometry allocated per frame is how a plexus becomes a
-     * memory leak. */
-    var linkMax = dots.length * 3;
+    /* A sparse plexus appears only after the rush has slowed. This is the
+     * graceful hand-off from flight to the station's familiar undulating
+     * pattern, never a rotating sheet. */
+    var linkMax = targets.length * 2;
     var linkPos = new Float32Array(linkMax * 6);
     var linkGeo = new THREE.BufferGeometry();
-    linkGeo.setAttribute('position', new THREE.BufferAttribute(linkPos, 3));
-    var links = new THREE.LineSegments(linkGeo,
-      new THREE.LineBasicMaterial({color: 0x65c7da, transparent: true,
-        opacity: 0.3}));
-    group.add(links);
+    var linkAttr = new THREE.BufferAttribute(linkPos, 3);
+    if (linkAttr.setUsage && THREE.DynamicDrawUsage) linkAttr.setUsage(THREE.DynamicDrawUsage);
+    linkGeo.setAttribute('position', linkAttr);
+    var linkMat = new THREE.LineBasicMaterial({
+      color: 0x65c7da, transparent: true, opacity: 0, depthWrite: false
+    });
+    var links = new THREE.LineSegments(linkGeo, linkMat);
+    scene.add(links);
 
-    var NEAR = 2.2 * 2.2;
+    var fieldX = 12.5;
+    var fieldY = Math.max(6.2, fieldX * h / Math.max(1, w));
+    for (var i = 0; i < targets.length; i += 1) {
+      var z = -7 + Math.random() * 13;
+      var depthSpeed = 0.78 + (z + 7) / 13 * 0.7;
+      stars.push({
+        x: (Math.random() * 2 - 1) * fieldX,
+        y: (Math.random() * 2 - 1) * fieldY,
+        z: z,
+        vx: (4.8 + Math.random() * 4.2) * depthSpeed,
+        vy: -(3.2 + Math.random() * 3.6) * depthSpeed,
+        phase: Math.random() * Math.PI * 2,
+        target: targets[i]
+      });
+    }
+
+    var NEAR = 1.42 * 1.42;
     var t0 = performance.now();
     var raf = 0;
     var stopped = false;
@@ -277,36 +302,54 @@
       raf = requestAnimationFrame(frame);
       var t = (performance.now() - t0) / 1000;
 
-      /* 0 -> 1 across the assembly, eased so the points arrive rather than
-       * stop dead. */
-      var pull = t < 1.1 ? 0 : Math.min(1, (t - 1.1) / 1.7);
+      /* Rush hard toward the lower right, then bleed that speed into a
+       * smooth attraction. The smoothstep starts before velocity reaches
+       * zero, so there is no frozen or flattened intermediate frame. */
+      var brake = Math.max(0, Math.min(1, t / 1.75));
+      var brakeEase = brake * brake * (3 - 2 * brake);
+      var pull = Math.max(0, Math.min(1, (t - 0.82) / 2.35));
       var eased = pull * pull * (3 - 2 * pull);
+      var dt = 1 / 60;
 
-      for (var i = 0; i < dots.length; i += 1) {
-        var d = dots[i];
-        var want = d.userData.target;
-        if (eased <= 0) {
-          var p = d.position;
-          var v = d.userData.drift;
-          p.add(v);
-          if (Math.abs(p.x) > 8) v.x = -v.x;
-          if (Math.abs(p.y) > 5) v.y = -v.y;
-          if (Math.abs(p.z) > 4) v.z = -v.z;
-        } else {
-          d.position.x += (want.x - d.position.x) * 0.06 * (0.4 + eased);
-          d.position.y += (want.y - d.position.y) * 0.06 * (0.4 + eased);
-          d.position.z += (want.z - d.position.z) * 0.06 * (0.4 + eased);
+      for (var i = 0; i < stars.length; i += 1) {
+        var star = stars[i];
+        var speed = 1 - brakeEase;
+        star.x += star.vx * speed * dt;
+        star.y += star.vy * speed * dt;
+        if (pull < 0.36) {
+          if (star.x > fieldX + 1.5) star.x = -fieldX - Math.random() * 2;
+          if (star.y < -fieldY - 1.5) star.y = fieldY + Math.random() * 2;
         }
+        var breathe = Math.sin(t * 1.65 + star.phase) * (0.16 - eased * 0.09);
+        var wantX = star.target.x + breathe;
+        var wantY = star.target.y + Math.cos(t * 1.35 + star.phase) * (0.12 - eased * 0.06);
+        var wantZ = star.target.z + Math.sin(t * 1.1 + star.phase) * 0.16;
+        var catchUp = 0.018 + eased * 0.105;
+        star.x += (wantX - star.x) * catchUp;
+        star.y += (wantY - star.y) * catchUp;
+        star.z += (wantZ - star.z) * catchUp;
+
+        var p3 = i * 3;
+        pointPos[p3] = star.x; pointPos[p3 + 1] = star.y; pointPos[p3 + 2] = star.z;
+        var p6 = i * 6;
+        var trail = (0.25 + speed * 1.55) * (0.76 + (star.z + 7) / 18);
+        streakPos[p6] = star.x; streakPos[p6 + 1] = star.y; streakPos[p6 + 2] = star.z;
+        streakPos[p6 + 3] = star.x - star.vx * trail * 0.18;
+        streakPos[p6 + 4] = star.y - star.vy * trail * 0.18;
+        streakPos[p6 + 5] = star.z - trail * 0.14;
       }
+      pointAttr.needsUpdate = true;
+      streakAttr.needsUpdate = true;
+      streakMat.opacity = 0.74 * (1 - eased) + 0.08 * (1 - Math.min(1, pull * 1.4));
 
       /* Lines only while it is still a cloud and while it is coming
        * together - once it IS the mark they clutter it. */
       var n = 0;
-      if (eased < 0.92) {
-        for (var a = 0; a < dots.length && n < linkMax; a += 1) {
-          for (var b = a + 1; b < dots.length && n < linkMax; b += 1) {
-            var pa = dots[a].position;
-            var pb = dots[b].position;
+      if (pull > 0.28 && eased < 0.99) {
+        for (var a = 0; a < stars.length && n < linkMax; a += 1) {
+          for (var b = a + 1; b < stars.length && n < linkMax; b += 1) {
+            var pa = stars[a];
+            var pb = stars[b];
             var dx = pa.x - pb.x, dy = pa.y - pb.y, dz = pa.z - pb.z;
             if (dx * dx + dy * dy + dz * dz > NEAR) continue;
             var o = n * 6;
@@ -317,32 +360,31 @@
         }
       }
       linkGeo.setDrawRange(0, n * 2);
-      linkGeo.attributes.position.needsUpdate = true;
-      links.material.opacity = 0.3 * (1 - eased);
-
-      /* ROTATING THROUGHOUT, settling square to the camera as it solidifies
-       * so the finished mark is not left at an angle. */
-      group.rotation.y = Math.sin(t * 0.7) * 0.9 * (1 - eased) + (1 - eased) * 0.5;
-      group.rotation.x = Math.cos(t * 0.5) * 0.35 * (1 - eased);
+      linkAttr.needsUpdate = true;
+      linkMat.opacity = Math.min(0.34, Math.max(0, (pull - 0.28) * 0.58)) * (1 - eased * 0.45);
 
       /* THE FLASH, then the colour. */
-      if (t > 2.9) {
-        var flash = Math.min(1, (t - 2.9) / 0.32);
-        mat.color.setRGB(0.4 + 0.6 * flash, 0.78 + 0.22 * flash, 0.85 + 0.15 * flash);
-        var bloom = 1 + flash * 0.5;
-        group.scale.setScalar(bloom > 1.3 ? 1.3 : bloom);
+      if (t > 3.25) {
+        var flash = Math.min(1, (t - 3.25) / 0.34);
+        pointMat.color.setRGB(0.56 + 0.44 * flash, 0.91 + 0.09 * flash, 0.93 + 0.07 * flash);
+        pointMat.size = 0.095 + flash * 0.07;
       }
-      if (t > 3.15 && !logo.classList.contains('lit')) {
+      if (t > 3.5 && !logo.classList.contains('lit')) {
         logo.src = image.src;
         logo.classList.add('lit');
       }
-      if (t > 3.3) {
-        mat.opacity = Math.max(0, 0.95 - (t - 3.3) * 2.4);
+      if (t > 3.68) {
+        pointMat.opacity = Math.max(0, 0.98 - (t - 3.68) * 1.75);
+        streakMat.opacity *= Math.max(0, 1 - (t - 3.68) * 2.2);
+        linkMat.opacity *= Math.max(0, 1 - (t - 3.68) * 2.2);
       }
-      if (t > 4.3) {
+      if (t > 4.55) {
         stopped = true;
         cancelAnimationFrame(raf);
-        try { renderer.dispose(); } catch (err) { /* gone */ }
+        try {
+          pointGeo.dispose(); streakGeo.dispose(); linkGeo.dispose();
+          pointMat.dispose(); streakMat.dispose(); linkMat.dispose(); renderer.dispose();
+        } catch (err) { /* gone */ }
         finish();
         return;
       }

@@ -1,6 +1,8 @@
 package com.pinebox.kiosk.video
 
 import android.content.Context
+import android.media.AudioManager
+import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Looper
 import android.util.Log
@@ -21,9 +23,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.log10
+import kotlin.math.roundToInt
 
 /**
  * THE ENDLESS SET, PLAYED BY THE DEVICE, AS ONE PLAYLIST.
@@ -94,7 +99,11 @@ class PineVideoWall(
 
     private var player: ExoPlayer? = null
     private val running = AtomicBoolean(false)
+    /** The page's requested veil. A menu has its own temporary compositor
+     *  retirement and must not overwrite this ownership state. */
     @Volatile private var veiled = false
+    @Volatile private var menuHidden = false
+    @Volatile private var fullScreen = false
     /* [#1386] HELD, because the operator is deciding what to do with THIS
      * clip. "if i bring up the menu, keep the video up so i can decide
      * what to do with it. Dont cycle to the next video while the popup is
@@ -108,7 +117,14 @@ class PineVideoWall(
      * is the watchdog doing its job, and would have made the menu look
      * broken for no reason anybody could see. */
     @Volatile private var held = false
+    @Volatile private var holdUntil = 0L
     private var pump: Job? = null
+    /** At most one network refill. The local larder never waits behind it. */
+    private var fresh: Job? = null
+    /** Operator shuffle owns the runway until its requested batch lands. */
+    @Volatile private var reshuffling = false
+
+    private var windowed = WallRect(0, 0, 0, 0)
 
     /** What is in the playlist, in the player's own index order. */
     private val listed = ArrayList<Clip>()
@@ -119,9 +135,15 @@ class PineVideoWall(
     @Volatile private var showing: String = ""
     @Volatile private var made: Int = 0
 
-    /* [#1192]: this terminal's own video level, 0..1. Survives every rebuild
+    /** The WebView follows the exact native transition without waiting for a
+     * station poll. Called on the main thread and intentionally carries only
+     * the stable clip id. */
+    @Volatile var onClipChanged: ((String) -> Unit)? = null
+
+    /* [#1192]: this terminal's own video level, 0..2. Survives every rebuild
      * the watchdog below does, because build() reads it. */
     @Volatile private var wallLevel: Float = 1f
+    private var wallBoost: LoudnessEnhancer? = null
 
     /* #1440: THE WATCHDOG. 2026-09-21 15:31 the operator: "the clips are
      * frozen on the pine tab". Measured: the wall's SurfaceView had posted
@@ -173,10 +195,29 @@ class PineVideoWall(
     /** Where the operator's press lands, handed over as a screen point. */
     @Volatile var onTap: ((Float, Float) -> Unit)? = null
 
+    /** A settled hold uses the page's radial clip menu, including in Listen. */
+    @Volatile var onLongPress: ((Float, Float) -> Unit)? = null
+
+    /** Final native geometry after a drag/resize, in device pixels. */
+    @Volatile var onBoxChanged: ((Int, Int, Int, Int) -> Unit)? = null
+
+    /** Lets the page remove an abandoned sheet when the native safety hold expires. */
+    @Volatile var onHoldExpired: (() -> Unit)? = null
+
     private var downX = 0f
     private var downY = 0f
     private var downAt = 0L
     private var trackingTap = false
+    private var moving = false
+    private var longPressFired = false
+    private var resizing = false
+    private var gestureStart = WallRect(0, 0, 0, 0)
+    private val longPressTrigger = Runnable {
+        if (!trackingTap || moving || longPressFired) return@Runnable
+        longPressFired = true
+        try { onLongPress?.invoke(downX, downY) }
+        catch (err: Throwable) { Log.w(TAG, "long press: ${err.message}") }
+    }
 
     /**
      * [#1441] A PRESS AND A RELEASE INSIDE THE SLOP IS A TAP; anything
@@ -184,10 +225,13 @@ class PineVideoWall(
      * Consumed either way: this surface is the picture, and a press on it
      * was never meant for whatever the box happens to be lying over.
      */
-    fun observeTouch(press: android.view.MotionEvent) {
-        if (!running.get() || veiled || visibility != View.VISIBLE) {
+    fun observeTouch(press: android.view.MotionEvent): Boolean {
+        if (!running.get() || veiled || menuHidden || visibility != View.VISIBLE) {
+            removeCallbacks(longPressTrigger)
             trackingTap = false
-            return
+            moving = false
+            longPressFired = false
+            return false
         }
         val here = IntArray(2)
         getLocationOnScreen(here)
@@ -195,26 +239,88 @@ class PineVideoWall(
             press.rawY >= here[1] && press.rawY < here[1] + height
         when (press.actionMasked) {
             android.view.MotionEvent.ACTION_DOWN -> {
+                /* Keep the left bezel for the native drawer even when the
+                 * picture is full-screen. Every other point on the picture
+                 * belongs to the picture, never to a control hidden behind it. */
+                if (press.rawX <= EDGE_PASS_PX * resources.displayMetrics.density) {
+                    trackingTap = false
+                    return false
+                }
                 trackingTap = inside
-                if (!inside) return
+                moving = false
+                longPressFired = false
+                if (!inside) return false
                 downX = press.rawX
                 downY = press.rawY
                 downAt = android.os.SystemClock.uptimeMillis()
+                val lp = layoutParams as? LayoutParams
+                gestureStart = WallRect(
+                    lp?.leftMargin ?: here[0], lp?.topMargin ?: here[1],
+                    width.coerceAtLeast(1), height.coerceAtLeast(1))
+                resizing = !fullScreen &&
+                    press.rawX >= here[0] + width - RESIZE_HANDLE_PX * resources.displayMetrics.density &&
+                    press.rawY >= here[1] + height - RESIZE_HANDLE_PX * resources.displayMetrics.density
+                removeCallbacks(longPressTrigger)
+                postDelayed(longPressTrigger, TAP_HOLD_MS)
+                return true
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                if (!trackingTap) return false
+                val dx = (press.rawX - downX).toInt()
+                val dy = (press.rawY - downY).toInt()
+                if (!moving && Math.hypot(dx.toDouble(), dy.toDouble()) > TAP_SLOP_PX) {
+                    moving = true
+                    removeCallbacks(longPressTrigger)
+                }
+                if (moving && !fullScreen) {
+                    val bounds = wallBounds()
+                    val rect = if (resizing) {
+                        VideoWallGeometry.resize(gestureStart, dx, dy,
+                            bounds.first, bounds.second, minWallWidth(), minWallHeight())
+                    } else {
+                        VideoWallGeometry.move(gestureStart, dx, dy,
+                            bounds.first, bounds.second, minWallWidth(), minWallHeight())
+                    }
+                    applyBox(rect)
+                }
+                return true
             }
             android.view.MotionEvent.ACTION_UP -> {
-                if (!trackingTap || !inside) { trackingTap = false; return }
+                if (!trackingTap) return false
                 val moved = Math.hypot(
                     (press.rawX - downX).toDouble(), (press.rawY - downY).toDouble())
-                val held = android.os.SystemClock.uptimeMillis() - downAt
+                val pressedFor = android.os.SystemClock.uptimeMillis() - downAt
+                val wasMoving = moving
+                val wasLongPress = longPressFired
+                removeCallbacks(longPressTrigger)
                 trackingTap = false
-                if (moved <= TAP_SLOP_PX && held <= TAP_HOLD_MS) {
+                moving = false
+                longPressFired = false
+                if (wasMoving) {
+                    val lp = layoutParams as? LayoutParams
+                    if (lp != null && lp.width > 0 && lp.height > 0) {
+                        windowed = WallRect(lp.leftMargin, lp.topMargin, lp.width, lp.height)
+                        try { onBoxChanged?.invoke(windowed.x, windowed.y,
+                            windowed.width, windowed.height) }
+                        catch (err: Throwable) { Log.w(TAG, "box changed: ${err.message}") }
+                    }
+                } else if (!wasLongPress && inside && moved <= TAP_SLOP_PX && pressedFor <= TAP_HOLD_MS) {
                     Log.i(TAG, "tap at ${press.rawX.toInt()},${press.rawY.toInt()}")
                     try { onTap?.invoke(press.rawX, press.rawY) }
                     catch (err: Throwable) { Log.w(TAG, "tap: ${err.message}") }
                 }
+                return true
             }
-            android.view.MotionEvent.ACTION_CANCEL -> trackingTap = false
+            android.view.MotionEvent.ACTION_CANCEL -> {
+                val was = trackingTap
+                removeCallbacks(longPressTrigger)
+                trackingTap = false
+                moving = false
+                longPressFired = false
+                return was
+            }
         }
+        return trackingTap
     }
 
     @Suppress("ClickableViewAccessibility")
@@ -228,7 +334,7 @@ class PineVideoWall(
     fun start() {
         if (!running.compareAndSet(false, true)) return
         onMain {
-            if (!veiled) visibility = View.VISIBLE
+            refreshVisibility()
             build()
         }
         pump = scope.launch { feed() }
@@ -239,13 +345,17 @@ class PineVideoWall(
         if (!running.compareAndSet(true, false)) return
         pump?.cancel()
         pump = null
+        fresh?.cancel()
+        fresh = null
         onMain {
             removeCallbacks(watchdog)  // #1440
+            releaseWallBoost()
             try { player?.release() } catch (err: Throwable) { }
             player = null
             listed.clear()
             showing = ""
             playback = "off"
+            held = false; holdUntil = 0L; menuHidden = false
             atIndex = -1; atCount = 0; atPos = -1L; atDuration = -1L
             visibility = View.GONE
         }
@@ -264,9 +374,35 @@ class PineVideoWall(
      */
     fun veil(on: Boolean) {
         veiled = on
-        onMain {
-            visibility = if (running.get() && !veiled) View.VISIBLE else View.GONE
-        }
+        onMain { refreshVisibility() }
+    }
+
+    private fun refreshVisibility() {
+        visibility = if (running.get() && !veiled && !menuHidden) View.VISIBLE else View.GONE
+    }
+
+    private fun wallBounds(): Pair<Int, Int> {
+        val parentView = parent as? View
+        val w = parentView?.width?.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        val h = parentView?.height?.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        return Pair(w.coerceAtLeast(1), h.coerceAtLeast(1))
+    }
+
+    private fun minWallWidth(): Int =
+        (MIN_WIDTH_DP * resources.displayMetrics.density).toInt().coerceAtLeast(1)
+
+    private fun minWallHeight(): Int =
+        (MIN_HEIGHT_DP * resources.displayMetrics.density).toInt().coerceAtLeast(1)
+
+    /** Main thread only. */
+    private fun applyBox(rect: WallRect) {
+        val lp = layoutParams as? LayoutParams ?: return
+        lp.width = rect.width
+        lp.height = rect.height
+        lp.leftMargin = rect.x
+        lp.topMargin = rect.y
+        lp.gravity = android.view.Gravity.TOP or android.view.Gravity.START
+        layoutParams = lp
     }
 
     /** Put the wall where the operator dragged the set to, in DEVICE pixels. */
@@ -274,18 +410,49 @@ class PineVideoWall(
         onMain {
             val lp = layoutParams as? LayoutParams ?: return@onMain
             if (width <= 0 || height <= 0) {
+                if (!fullScreen && lp.width > 0 && lp.height > 0) {
+                    windowed = WallRect(lp.leftMargin, lp.topMargin, lp.width, lp.height)
+                }
                 lp.width = LayoutParams.MATCH_PARENT
                 lp.height = LayoutParams.MATCH_PARENT
                 lp.leftMargin = 0
                 lp.topMargin = 0
+                lp.gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                layoutParams = lp
+                fullScreen = true
             } else {
-                lp.width = width
-                lp.height = height
-                lp.leftMargin = left.coerceAtLeast(0)
-                lp.topMargin = top.coerceAtLeast(0)
+                val bounds = wallBounds()
+                windowed = VideoWallGeometry.fit(WallRect(left, top, width, height),
+                    bounds.first, bounds.second, minWallWidth(), minWallHeight())
+                applyBox(windowed)
+                fullScreen = false
             }
+        }
+    }
+
+    /** Fill the physical glass and release any inspection hold atomically. */
+    fun showFullScreen() {
+        onMain {
+            val lp = layoutParams as? LayoutParams ?: return@onMain
+            if (!fullScreen && lp.width > 0 && lp.height > 0) {
+                windowed = WallRect(lp.leftMargin, lp.topMargin, lp.width, lp.height)
+            }
+            lp.width = LayoutParams.MATCH_PARENT
+            lp.height = LayoutParams.MATCH_PARENT
+            lp.leftMargin = 0; lp.topMargin = 0
             lp.gravity = android.view.Gravity.TOP or android.view.Gravity.START
             layoutParams = lp
+            fullScreen = true
+            releaseMenuNow()
+        }
+    }
+
+    /** Return to the last measured window and resume the endless set. */
+    fun showWindowed() {
+        onMain {
+            if (windowed.width > 0 && windowed.height > 0) applyBox(windowed)
+            fullScreen = false
+            releaseMenuNow()
         }
     }
 
@@ -306,10 +473,11 @@ class PineVideoWall(
      * repair he never saw.  build() reads this field.
      */
     fun setLevel(value: Double) {
-        val v = value.coerceIn(0.0, 1.0).toFloat()
+        val v = value.coerceIn(0.0, 2.0).toFloat()
         wallLevel = v
         onMain {
-            try { player?.volume = v } catch (err: Throwable) { Log.w(TAG, "level: ${err.message}") }
+            try { player?.let { applyWallLevel(it) } }
+            catch (err: Throwable) { Log.w(TAG, "level: ${err.message}") }
         }
     }
 
@@ -319,6 +487,8 @@ class PineVideoWall(
     fun state(): JSONObject = JSONObject()
         .put("on", running.get())
         .put("held", held)                          // [#1386]
+        .put("menu_hidden", menuHidden)
+        .put("fullscreen", fullScreen)
         /* [#1386] WHERE THE PICTURE ACTUALLY IS, in device pixels.
          * The page cannot lay a menu over this surface - it is
          * composited above an opaque WebView - so the only way to
@@ -334,6 +504,7 @@ class PineVideoWall(
         .put("playing", showing)
         .put("made", made)
         .put("level", wallLevel.toDouble())          // [#1192]
+        .put("boost_mb", if (wallLevel > 1f) (2000.0 * log10(wallLevel.toDouble())).roundToInt() else 0)
         .put("cached", den.listFiles()?.size ?: 0)
         /* #1440: what the watchdog saw on its last tick - readable from any
          * thread, and the only honest answer to "is it frozen?". */
@@ -378,26 +549,73 @@ class PineVideoWall(
      * run again. The picture is untouched either way.
      */
     fun hold(on: Boolean) {
-        held = on
+        onMain { setHoldNow(on) }
+    }
+
+    /** Restart the active playlist item and retire any menu in one main-thread turn. */
+    fun replay() {
         onMain {
             val p = player ?: return@onMain
-            p.playWhenReady = !on
-            /* So the watchdog's "still" clock starts from now rather than
-             * counting the held time as a stall the moment we let go. */
-            stillSince = 0L
+            try {
+                releaseMenuNow()
+                val index = p.currentMediaItemIndex
+                if (index >= 0) p.seekTo(index, 0L) else p.seekTo(0L)
+                p.playWhenReady = true
+                if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                stillSince = 0L
+            } catch (err: Throwable) {
+                lastError = "${stamp()} replay: ${err.message}"
+                Log.w(TAG, "replay: ${err.message}")
+            }
         }
     }
 
     fun isHeld(): Boolean = held
 
+    /** The HTML menu cannot paint over a SurfaceView. Temporarily retire the
+     *  surface while preserving the page-requested veil, and bound the hold
+     *  so an abandoned sheet can never stop an endless station forever. */
+    fun menu(on: Boolean) {
+        onMain {
+            menuHidden = on
+            setHoldNow(on)
+            refreshVisibility()
+        }
+    }
+
+    private fun setHoldNow(on: Boolean) {
+        held = on
+        holdUntil = if (on) android.os.SystemClock.elapsedRealtime() + MENU_HOLD_MAX_MS else 0L
+        try { player?.playWhenReady = !on } catch (err: Throwable) {
+            Log.w(TAG, "hold: ${err.message}")
+        }
+        stillSince = 0L
+    }
+
+    private fun releaseMenuNow() {
+        menuHidden = false
+        setHoldNow(false)
+        refreshVisibility()
+    }
+
     private fun watch() {
         val p = player ?: return
         if (!running.get()) return
-        /* A held wall is standing still ON PURPOSE. Every rung below reads
-         * "not moving" as a fault, and every one of them would be wrong
-         * here. */
-        if (held) { stillSince = 0L; return }
         val now = android.os.SystemClock.elapsedRealtime()
+        /* A held wall is standing still ON PURPOSE, but not indefinitely.
+         * The main-thread watchdog owns this deadline because WebView timers
+         * are exactly what become unreliable when the tablet is under load. */
+        if (held) {
+            if (holdUntil > 0L && now >= holdUntil) {
+                Log.w(TAG, "inspection hold expired; resuming the endless set")
+                releaseMenuNow()
+                try { onHoldExpired?.invoke() }
+                catch (err: Throwable) { Log.w(TAG, "hold expiry: ${err.message}") }
+            } else {
+                stillSince = 0L
+                return
+            }
+        }
         val idx = p.currentMediaItemIndex
         val pos = p.currentPosition
         val st = p.playbackState
@@ -441,6 +659,7 @@ class PineVideoWall(
         val old = player ?: return
         val keep = ArrayList(listed)
         val from = atIndex.coerceAtLeast(0)
+        releaseWallBoost()
         try { old.release() } catch (err: Throwable) { }
         player = null
         listed.clear()
@@ -482,15 +701,27 @@ class PineVideoWall(
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
         val p = ExoPlayer.Builder(context).setLoadControl(control).build()
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val audioSession = audioManager?.generateAudioSessionId() ?: AudioManager.ERROR
+        if (audioSession != AudioManager.ERROR) {
+            try {
+                p.setAudioSessionId(audioSession)
+                wallBoost = LoudnessEnhancer(audioSession)
+            } catch (err: Throwable) {
+                releaseWallBoost()
+                Log.w(TAG, "video boost unavailable: ${err.message}")
+            }
+        }
         p.setVideoSurfaceView(screen)
         p.repeatMode = Player.REPEAT_MODE_OFF
         p.playWhenReady = true
-        p.volume = wallLevel                                     // [#1192]
+        applyWallLevel(p)                                        // [#1192]
         p.addListener(object : Player.Listener {
             override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
                 val at = p.currentMediaItemIndex
                 showing = listed.getOrNull(at)?.id ?: ""
                 Log.i(TAG, "now showing $showing (item $at of ${p.mediaItemCount})")
+                if (showing.isNotEmpty()) onClipChanged?.invoke(showing)
                 /* [#1212] NOT ON THE FRAME OF THE JOIN.
                  * Measured over thirteen transitions: four of them went
                  * BUFFERING one millisecond after this line and stayed
@@ -555,11 +786,13 @@ class PineVideoWall(
         onMain {
             val p = player ?: return@onMain
             try {
+                if (listed.any { it.id == clip.id }) return@onMain
                 p.addMediaItem(MediaItem.fromUri(Uri.fromFile(clip.file)))
                 listed.add(clip)
                 made += 1
                 if (showing.isEmpty()) {
                     showing = listed.getOrNull(p.currentMediaItemIndex)?.id ?: clip.id
+                    onClipChanged?.invoke(showing)
                 }
                 if (p.playbackState == Player.STATE_IDLE) p.prepare()
                 /* #1440: a playlist that had ENDED does not start again just
@@ -575,11 +808,172 @@ class PineVideoWall(
         }
     }
 
+    /** Element volume carries 0..100%; LoudnessEnhancer carries 100..200%. */
+    private fun applyWallLevel(p: ExoPlayer) {
+        val wanted = wallLevel.coerceIn(0f, 2f)
+        p.volume = wanted.coerceAtMost(1f)
+        val effect = wallBoost ?: return
+        if (wanted > 1f) {
+            effect.setTargetGain((2000.0 * log10(wanted.toDouble())).roundToInt())
+            effect.enabled = true
+        } else {
+            effect.enabled = false
+            effect.setTargetGain(0)
+        }
+    }
+
+    private fun releaseWallBoost() {
+        try { wallBoost?.enabled = false } catch (err: Throwable) { }
+        try { wallBoost?.release() } catch (err: Throwable) { }
+        wallBoost = null
+    }
+
+    /**
+     * Drop every prefetched choice and replace it with the server's freshly
+     * admitted batch. The current picture may run while the first whole file
+     * is cached; once it lands, it becomes current and the rest form the new
+     * runway in the exact order the server returned.
+     */
+    fun shuffleQueue(rows: JSONArray? = null) {
+        fresh?.cancel()
+        fresh = null
+        reshuffling = true
+        val shuffledAt = System.currentTimeMillis()
+        val requested = HashSet<String>()
+        if (rows != null) {
+            for (i in 0 until rows.length()) {
+                rows.optJSONObject(i)?.optString("id")?.takeIf { it.isNotBlank() }
+                    ?.let { requested.add(it) }
+            }
+        }
+        onMain {
+            val p = player ?: return@onMain
+            val at = p.currentMediaItemIndex.coerceAtLeast(0)
+            try {
+                if (p.mediaItemCount > at + 1) p.removeMediaItems(at + 1, p.mediaItemCount)
+                while (listed.size > at + 1) listed.removeAt(listed.lastIndex)
+                retally()
+                lastKick = "${stamp()} operator rebuilt the clip queue"
+            } catch (err: Throwable) {
+                lastError = "${stamp()} shuffle: ${err.message}"
+                Log.w(TAG, "shuffle: ${err.message}")
+            }
+            val keep = listed.map { it.id }.toHashSet().apply { addAll(requested) }
+            scope.launch(Dispatchers.IO) {
+                try {
+                    den.listFiles()?.forEach { file ->
+                        /* A replacement may finish downloading after this
+                         * coroutine starts. Never erase a file created by
+                         * the shuffle we are servicing. */
+                        if (file.isFile && file.lastModified() < shuffledAt
+                            && file.nameWithoutExtension !in keep) file.delete()
+                    }
+                } catch (err: Throwable) { Log.w(TAG, "shuffle cache: ${err.message}") }
+            }
+        }
+
+        scope.launch {
+            var inserted = 0
+            try {
+                if (rows != null) {
+                    for (i in 0 until rows.length()) {
+                        val row = rows.optJSONObject(i) ?: continue
+                        val id = row.optString("id")
+                        val url = row.optString("url")
+                        if (id.isBlank() || url.isBlank()) continue
+                        val seconds = row.optDouble("seconds", row.optDouble("length", 0.0))
+                        val clip = withContext(Dispatchers.IO) {
+                            val base = client.config().base.trimEnd('/')
+                            val absolute = if (url.startsWith("http://") || url.startsWith("https://")) {
+                                url
+                            } else {
+                                "$base/${url.trimStart('/')}"
+                            }
+                            val file = pull(absolute, id) ?: return@withContext null
+                            remember(id)
+                            Clip(id, file, seconds)
+                        } ?: continue
+                        withContext(Dispatchers.Main.immediate) {
+                            val p = player ?: return@withContext
+                            try {
+                                val place = if (inserted == 0) {
+                                    (p.currentMediaItemIndex + 1).coerceIn(0, p.mediaItemCount)
+                                } else {
+                                    p.mediaItemCount
+                                }
+                                p.addMediaItem(place, MediaItem.fromUri(Uri.fromFile(clip.file)))
+                                listed.add(place.coerceAtMost(listed.size), clip)
+                                made += 1
+                                if (inserted == 0) {
+                                    releaseMenuNow()
+                                    p.seekTo(place, 0L)
+                                    p.playWhenReady = true
+                                    if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                                }
+                                inserted += 1
+                                retally()
+                            } catch (err: Throwable) {
+                                lastError = "${stamp()} shuffle insert: ${err.message}"
+                            }
+                        }
+                    }
+                }
+            } finally {
+                reshuffling = false
+            }
+        }
+    }
+
+    /** Put an explicitly selected neighbour on next, without waiting behind
+     *  the prefetched runway. The bytes are still pulled whole off the UI
+     *  thread; only the playlist insertion and seek touch ExoPlayer. */
+    fun playNow(id: String, url: String, seconds: Double) {
+        if (id.isBlank() || url.isBlank()) return
+        scope.launch {
+            val clip = withContext(Dispatchers.IO) {
+                val base = client.config().base.trimEnd('/')
+                val absolute = if (url.startsWith("http://") || url.startsWith("https://")) {
+                    url
+                } else {
+                    "$base/${url.trimStart('/')}"
+                }
+                val file = pull(absolute, id) ?: return@withContext null
+                remember(id)
+                Clip(id, file, seconds)
+            }
+            if (clip == null) {
+                lastError = "${stamp()} selected clip $id could not be cached"
+                return@launch
+            }
+            onMain {
+                val p = player ?: return@onMain
+                try {
+                    val at = (p.currentMediaItemIndex + 1).coerceIn(0, p.mediaItemCount)
+                    p.addMediaItem(at, MediaItem.fromUri(Uri.fromFile(clip.file)))
+                    listed.add(at.coerceAtMost(listed.size), clip)
+                    made += 1
+                    releaseMenuNow()
+                    p.seekTo(at, 0L)
+                    p.playWhenReady = true
+                    if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                    retally()
+                } catch (err: Throwable) {
+                    lastError = "${stamp()} selected clip $id: ${err.message}"
+                    Log.w(TAG, "play selected $id: ${err.message}")
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------ the pump
 
     private suspend fun feed() {
         while (scope.isActive && running.get()) {
             try {
+                if (reshuffling) {
+                    delay(250)
+                    continue
+                }
                 /* [#1212] THE RUNWAY IS PICTURE, NOT ROWS. Three clips is
                  * eighteen seconds on a six-second library and two point two
                  * on the short end of this one, and a wall that runs out
@@ -588,12 +982,26 @@ class PineVideoWall(
                  * ROWS_MOST rows however short the clips are. */
                 val thin = aheadMs() < AHEAD_MS || aheadRows() < KEEP_AHEAD
                 if (thin && aheadRows() < ROWS_MOST) {
-                    val got = nextClip()
+                    /* The station's ring is the full-library shuffled deck;
+                     * the larder is only continuity insurance. Taking disk
+                     * first made a healthy wall rotate its small local cache
+                     * while thousands of unplayed server choices waited.
+                     * With 24 seconds of runway the ring has time to answer;
+                     * if it cannot, the least-recent local file still keeps
+                     * the picture moving. */
+                    val got = nextRingClip()
                     if (got != null) {
                         offer(got)
+                        launchFresh()
                         delay(120)          // let the main thread's tally land
                     } else {
-                        delay(1_200)
+                        val cached = withContext(Dispatchers.IO) { fromLarder() }
+                        if (cached != null) {
+                            offer(cached)
+                            delay(120)
+                        } else {
+                            delay(1_200)
+                        }
                     }
                 } else {
                     delay(500)
@@ -603,6 +1011,22 @@ class PineVideoWall(
             } catch (err: Throwable) {
                 Log.w(TAG, "pump: ${err.javaClass.simpleName}: ${err.message}")
                 delay(2_000)
+            }
+        }
+    }
+
+    private fun launchFresh() {
+        if (fresh?.isActive == true || !running.get() || reshuffling) return
+        fresh = scope.launch {
+            try {
+                val got = nextRingClip()
+                if (got != null && running.get()) offer(got)
+            } catch (err: kotlinx.coroutines.CancellationException) {
+                throw err
+            } catch (err: Throwable) {
+                Log.w(TAG, "fresh: ${err.javaClass.simpleName}: ${err.message}")
+            } finally {
+                fresh = null
             }
         }
     }
@@ -649,14 +1073,14 @@ class PineVideoWall(
 
     private fun aheadRows(): Int = aheadRowsTally
 
-    /** The next clip off the ring, or one out of the larder. */
-    private suspend fun nextClip(): Clip? = withContext(Dispatchers.IO) {
+    /** The next fresh clip off the ring. The caller owns the larder fallback. */
+    private suspend fun nextRingClip(): Clip? = withContext(Dispatchers.IO) {
         val base = client.config().base
         val text = try {
-            client.request("GET", "$base/api/dj/video", null)
+            client.getMediaText("$base/api/dj/video")
         } catch (err: Throwable) {
             Log.w(TAG, "ring: ${err.message}")
-            return@withContext fromLarder()
+            return@withContext null
         }
         val rows = JSONObject(text).optJSONArray("clips")
         if (rows != null) {
@@ -676,7 +1100,7 @@ class PineVideoWall(
                 return@withContext Clip(id, file, secs)     // [#1212]
             }
         }
-        fromLarder()
+        null
     }
 
     /**
@@ -695,6 +1119,7 @@ class PineVideoWall(
             den.listFiles()?.filter {
                 it.isFile && it.length() > MIN_BYTES && it.name.endsWith(".mp4")
                     && it.nameWithoutExtension != now
+                    && !rung.contains(it.nameWithoutExtension)
                     && listed.none { c -> c.id == it.nameWithoutExtension }
             }
         } catch (err: Throwable) {
@@ -719,7 +1144,7 @@ class PineVideoWall(
         val out = File(den, "$id.mp4")
         if (out.isFile && out.length() > MIN_BYTES) return out
         return try {
-            val bytes = client.getBytes(url).first
+            val bytes = client.getMediaBytes(url).first
             if (bytes.size < MIN_BYTES) return null
             val part = File(den, "$id.part")
             part.writeBytes(bytes)
@@ -751,9 +1176,17 @@ class PineVideoWall(
     companion object {
         private const val TAG = "PineVideoWall"
         private const val CACHE_DIR = "pine-wall"
+        /** Left bezel remains the drawer's gesture even over full-screen video. */
+        private const val EDGE_PASS_PX = 28f
+        /** A one-finger drag from this corner resizes; elsewhere it moves. */
+        private const val RESIZE_HANDLE_PX = 72f
+        private const val MIN_WIDTH_DP = 220f
+        private const val MIN_HEIGHT_DP = 132f
         /** [#1441] a press that moves further than this was a drag, not a tap. */
         private const val TAP_SLOP_PX = 24.0
         private const val TAP_HOLD_MS = 700L
+        /** An abandoned options sheet must never freeze a perpetual wall. */
+        private const val MENU_HOLD_MAX_MS = 90_000L
         /** How many clips to keep queued past the one playing. */
         private const val KEEP_AHEAD = 3
         /* [#1212] ...and what actually governs the pump now: SECONDS of

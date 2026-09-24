@@ -1735,17 +1735,79 @@
     var applied = rows.filter(function (r) { return r.applied === true; });
     wrap.appendChild(make('p', 'ld-dim', applied.length
       + ' of ' + rows.length + ' options can be seen in this line\'s paperwork; the rest govern the station without a trace on one line'));
-    var list = make('ul', 'ld-facts ld-admin-list');
-    rows.forEach(function (r) {
-      var li = make('li', 'ld-admin-row ' + (r.applied === true ? 'on' : r.applied === false ? 'off' : 'na'));
-      var dot = make('i', 'ld-admin-dot', '');
-      var name = make('b', '', String(r.label || r.key || ''));
-      var val = make('span', '', String(r.value || ''));
-      var how = make('em', 'ld-admin-how', String(r.governs || '') + (r.how ? ' \u00b7 ' + r.how : ''));
-      li.appendChild(dot); li.appendChild(name); li.appendChild(val); li.appendChild(how);
-      list.appendChild(li);
+    var viewport = make('div', 'ld-admin-table-wrap');
+    var table = make('table', 'ld-admin-table');
+    var thead = document.createElement('thead');
+    var headings = document.createElement('tr');
+    ['Status', 'Option', 'Current value', 'Governs and evidence'].forEach(function (word) {
+      headings.appendChild(make('th', '', word));
     });
-    wrap.appendChild(list);
+    thead.appendChild(headings);
+    table.appendChild(thead);
+    var list = document.createElement('tbody');
+    rows.forEach(function (r) {
+      var state = r.applied === true ? 'on' : r.applied === false ? 'off' : 'na';
+      var tr = document.createElement('tr');
+      tr.className = 'ld-admin-row ' + state;
+      tr.setAttribute('tabindex', '0');
+      tr.setAttribute('role', 'button');
+      tr.setAttribute('aria-expanded', 'false');
+      var status = document.createElement('td');
+      status.appendChild(make('i', 'ld-admin-dot', ''));
+      status.appendChild(make('span', 'ld-admin-state',
+        state === 'on' ? 'reached' : state === 'off' ? 'did not reach' : 'station-wide'));
+      var name = document.createElement('td');
+      name.appendChild(make('b', '', String(r.label || r.key || '')));
+      var val = document.createElement('td');
+      val.appendChild(make('div', 'ld-admin-cell-scroll',
+        r.value === undefined || r.value === null ? '' : String(r.value)));
+      var how = document.createElement('td');
+      how.appendChild(make('div', 'ld-admin-cell-scroll',
+        String(r.governs || '') + (r.how ? ' \u00b7 ' + r.how : '')));
+      tr.appendChild(status); tr.appendChild(name); tr.appendChild(val); tr.appendChild(how);
+
+      var detailRow = document.createElement('tr');
+      detailRow.className = 'ld-admin-detail';
+      detailRow.hidden = true;
+      var detail = document.createElement('td');
+      detail.colSpan = 4;
+      var meta = r.edit || {};
+      detail.appendChild(make('b', '', String(r.label || r.key || '')));
+      detail.appendChild(make('p', 'ld-dim',
+        'key: ' + String(r.key || '(not recorded)') + ' · '
+        + (r.applied === true ? 'this value reached this line'
+          : r.applied === false ? 'this value did not reach this line'
+          : 'this governs the station but is not traceable on one line')));
+      if (r.governs) detail.appendChild(make('p', '', String(r.governs)));
+      if (r.how) detail.appendChild(make('p', 'ld-dim', String(r.how)));
+      var full = make('pre', 'ld-pre ld-admin-full',
+        meta.value === undefined || meta.value === null
+          ? (r.value === undefined || r.value === null ? '' : String(r.value))
+          : String(meta.value));
+      detail.appendChild(editable(full, meta.scope ? {
+        scope: String(meta.scope), key: String(meta.key || r.key || ''),
+        label: String(meta.label || r.label || r.key || 'option'),
+        how: String(meta.how || r.governs || ''),
+        applies: meta.applies || ['future'],
+        lineId: openFor ? String(openFor.id || '') : ''
+      } : {scope: '', why: String(meta.why || READING_ONLY)}));
+      detailRow.appendChild(detail);
+
+      var toggle = function (ev) {
+        if (ev && ev.type === 'keydown'
+            && ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+        if (ev) ev.preventDefault();
+        detailRow.hidden = !detailRow.hidden;
+        tr.setAttribute('aria-expanded', detailRow.hidden ? 'false' : 'true');
+      };
+      tr.addEventListener('click', toggle);
+      tr.addEventListener('keydown', toggle);
+      list.appendChild(tr);
+      list.appendChild(detailRow);
+    });
+    table.appendChild(list);
+    viewport.appendChild(table);
+    wrap.appendChild(viewport);
     return wrap;
   }
 

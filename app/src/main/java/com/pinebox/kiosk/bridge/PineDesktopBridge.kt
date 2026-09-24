@@ -129,7 +129,7 @@ class PineDesktopBridge(
              * the terminal stays on the air. */
             "cameraOpen", "cameraClose", "cameraTune", "cameraRange",
             /* Keeping a line: to the tablet, or to the working folder. */
-            "keepClip", "jack", "wallpaper", "saveText", "saveBytes",
+            "keepClip", "saveGalleryExport", "jack", "wallpaper", "saveText", "saveBytes",
             /* #1317: the terminal bringing itself round when the
              * WebView's own network has died under it. */
             "revive",
@@ -456,7 +456,9 @@ class PineDesktopBridge(
                 if (opts.has("stereo")) mic.stereo = opts.optBoolean("stereo", false)
                 if (opts.has("backMic")) mic.preferBackMic = opts.optBoolean("backMic", true)
             }
-            val why = mic.start()
+            val leased = com.pinebox.kiosk.audio.MicLease.acquire(this)
+            val why = if (leased) mic.start() else "the microphone is in use by Android voice input"
+            if (why != null && !mic.isRunning) com.pinebox.kiosk.audio.MicLease.release(this)
             BridgeEnvelope.ok(id, JSONObject()
                 .put("ok", why == null)
                 .put("rate", com.pinebox.kiosk.audio.MicCapture.RATE)
@@ -590,6 +592,33 @@ class PineDesktopBridge(
                 watch.now()
             } else watch.lastSaid
             BridgeEnvelope.ok(id, watch.state().put("ok", true).put("say", said).toString())
+        }
+
+        "saveGalleryExport" -> {
+            val opts = args.optJSONObject(0) ?: JSONObject()
+            val route = opts.optString("route", "")
+            val name = opts.optString("name", "")
+            val kept = try {
+                if (name.isBlank() || name.contains('/') || name.contains('\\')) {
+                    throw IllegalArgumentException("a gallery filename is required")
+                }
+                val temp = File.createTempFile("gallery-export-", ".part", context.cacheDir)
+                try {
+                    val (_, mime) = client.getGalleryExport(route, temp)
+                    withContext(Dispatchers.IO) {
+                        com.pinebox.kiosk.audio.ClipSaver.keepFile(
+                            context, temp, name, "Pine Box", mime)
+                    }
+                } finally { temp.delete() }
+            } catch (err: Exception) {
+                com.pinebox.kiosk.audio.ClipSaver.Kept(
+                    false, "", 0, err.message ?: err.javaClass.simpleName)
+            }
+            BridgeEnvelope.ok(id, JSONObject()
+                .put("ok", kept.ok)
+                .put("where", kept.where)
+                .put("bytes", kept.bytes)
+                .put("detail", kept.detail).toString())
         }
 
         /* A KIT FILE, WRITTEN WHERE THE OPERATOR CAN FIND IT.
@@ -749,6 +778,7 @@ class PineDesktopBridge(
 
         "micCancel" -> {
             mic.cancel()
+            com.pinebox.kiosk.audio.MicLease.release(this)
             heldTake = null
             BridgeEnvelope.ok(id, JSONObject().put("ok", true).toString())
         }
@@ -1322,13 +1352,27 @@ class PineDesktopBridge(
                      * it: the picture must stay exactly where it is and
                      * the playlist must not move on underneath him. */
                     "hold" -> wall.hold(true)
-                    "free" -> wall.hold(false)
+                    /* `menu` also retires the SurfaceView so the WebView's
+                     * controls can occupy the video's own rectangle. */
+                    "menu" -> wall.menu(true)
+                    "free" -> wall.menu(false)
                     /* [#1386] "I need to be able to have the video show up
                      * as full screen if I choose it in the option."
                      * setBox reads a zero size as MATCH_PARENT, which is
                      * the whole glass; `window` hands it back the rect the
                      * page last reported. */
-                    "full" -> wall.setBox(0, 0, 0, 0)
+                    "full" -> wall.showFullScreen()
+                    "window" -> wall.showWindowed()
+                    /* A selected neighbour belongs next, ahead of the warmed
+                     * runway, and resumes the wall as soon as it is cached. */
+                    "play" -> {
+                        val clip = args.optJSONObject(1) ?: JSONObject()
+                        wall.playNow(clip.optString("id"), clip.optString("url"),
+                            clip.optDouble("seconds", clip.optDouble("length", 0.0)))
+                    }
+                    "replay" -> wall.replay()
+                    "shuffle" -> wall.shuffleQueue(
+                        args.optJSONObject(1)?.optJSONArray("clips"))
                     /* [#1192]: "Offer a slider for setting the volume of
                      * videos that play as well."  The set is an ExoPlayer on
                      * a SurfaceView, so it is not in the page and no walk of
@@ -1382,6 +1426,7 @@ class PineDesktopBridge(
             val died = mic.lastError
             val wall = mic.wallSeconds.toDouble()
             val wav = mic.stop()
+            com.pinebox.kiosk.audio.MicLease.release(this)
             heldTake = wav
             BridgeEnvelope.ok(id, JSONObject()
                 .put("ok", wav != null)
@@ -1556,6 +1601,7 @@ class PineDesktopBridge(
          * it. */
         val wall = mic.wallSeconds.toDouble()
         val wav = mic.stop()
+        com.pinebox.kiosk.audio.MicLease.release(this)
 
         if (wav == null) {
             /* Three different nothings, and the operator can act on only

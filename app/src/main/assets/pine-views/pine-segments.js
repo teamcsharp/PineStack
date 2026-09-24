@@ -255,10 +255,15 @@
 
   /* ----------------------------------------------------------- the topics + */
 
-  function topicsBlock() {
+  function topicsBlock(options) {
+    options = options || {};
+    var next = !!options.next;
+    var history = !!options.history;
+    var microphone = !!options.microphone;
     var wrap = el('div', 'pseg-kind pseg-topics');
     var head_ = el('div', 'pseg-kind-head pseg-static');
-    head_.appendChild(el('span', 'pseg-kind-name', 'Topics for the banter'));
+    head_.appendChild(el('span', 'pseg-kind-name',
+      next ? 'Next banter scenario' : 'Topics for the banter'));
     var sum = el('span', 'pseg-kind-sum', 'counting...');
     head_.appendChild(sum);
     wrap.appendChild(head_);
@@ -266,23 +271,105 @@
     var row = el('div', 'pseg-topic-row');
     var input = el('input', 'pseg-topic-in');
     input.type = 'text';
-    input.placeholder = 'Something for them to get into...';
-    input.setAttribute('aria-label', 'A new topic for the banter');
-    var plus = el('button', 'pseg-plus', '+');
+    input.placeholder = next ? 'Describe the scenario...' : 'Something for them to get into...';
+    input.setAttribute('aria-label', next
+      ? 'The scenario for the next banter round' : 'A new topic for the banter');
+    var plus = el('button', 'pseg-plus' + (next ? ' pseg-next' : ''),
+      next ? 'Queue next' : '+');
     plus.setAttribute('type', 'button');
-    plus.setAttribute('title', 'Add this to the banter bank');
+    plus.setAttribute('title', next
+      ? 'Save this scenario and queue it for the next banter round'
+      : 'Add this to the banter bank');
+
+    var mic = null;
+    var dictating = false;
+    var dictationTap = null;
+    var dictationSafety = 0;
+    var dictationWatch = 0;
+
+    function dictationRelease(cancel) {
+      if (!dictating) return;
+      dictating = false;
+      if (dictationTap) root.removeEventListener('pointerdown', dictationTap, true);
+      dictationTap = null;
+      root.clearTimeout(dictationSafety);
+      root.clearInterval(dictationWatch);
+      dictationSafety = 0;
+      dictationWatch = 0;
+      if (root.PineDuck) root.PineDuck.release('pseg-topic-dictation');
+      if (mic) {
+        mic.classList.remove('recording');
+        mic.classList.remove('processing');
+        mic.disabled = false;
+      }
+      if (cancel) {
+        try {
+          if (root.PineTalkDot && typeof root.PineTalkDot.cancelCapture === 'function') {
+            root.PineTalkDot.cancelCapture();
+          } else if (root.PineTalkDot && root.PineTalkDot.state() === 'listening') {
+            root.PineTalkDot.cancel();
+          }
+        } catch (err) { /* already stopped */ }
+      }
+    }
+
+    function dictate() {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') {
+        note(wrap, 'no microphone is available on this surface');
+        return;
+      }
+      dictationRelease(true);
+      dictating = true;
+      if (mic) { mic.classList.add('recording'); mic.disabled = true; }
+      if (root.PineDuck) root.PineDuck.hold('pseg-topic-dictation', 0, wrap);
+      note(wrap, 'listening - tap anywhere to finish');
+      dictationTap = function (ev) {
+        if (!dictating) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (mic) { mic.classList.remove('recording'); mic.classList.add('processing'); }
+        note(wrap, 'turning that into editable text...');
+        if (root.PineDuck) root.PineDuck.release('pseg-topic-dictation');
+        root.removeEventListener('pointerdown', dictationTap, true);
+        dictationTap = null;
+        try { dot.finish(); } catch (err) { dictationRelease(false); }
+      };
+      root.addEventListener('pointerdown', dictationTap, true);
+      dictationSafety = root.setTimeout(function () { dictationRelease(true); }, 45000);
+      try {
+        var pending = dot.captureNext(function (words) {
+          input.value = String(words || '').trim();
+          dictationRelease(false);
+          input.focus();
+          note(wrap, input.value ? 'ready to edit or queue' : 'no words were heard');
+        });
+        if (pending && typeof pending['catch'] === 'function') {
+          pending['catch'](function () {
+            dictationRelease(false);
+            note(wrap, 'the microphone could not start');
+          });
+        }
+      } catch (err) {
+        dictationRelease(false);
+        note(wrap, 'the microphone could not start');
+      }
+    }
 
     function add() {
       var text = String(input.value || '').trim();
       if (!text) return;
       plus.disabled = true;
-      send('POST', '/api/dj/topics', {text: text, kind: 'topic'})
+      send('POST', '/api/dj/topics', {text: text, kind: 'topic', next: next})
         .then(function (ok) {
           plus.disabled = false;
           if (!ok) { note(wrap, 'the station refused it'); return; }
           input.value = '';
-          note(wrap, 'in the bank - it can come up in the banter from here on');
+          note(wrap, next && ok.queued
+            ? 'saved and queued for the next banter round'
+            : 'in the bank - it can come up in the banter from here on');
           count();
+          if (history) loadHistory();
         })['catch'](function () { plus.disabled = false; note(wrap, 'could not reach the station'); });
     }
     plus.addEventListener('click', add);
@@ -290,8 +377,92 @@
       if (ev && ev.key === 'Enter') { ev.preventDefault(); add(); }
     });
     row.appendChild(input);
+    if (microphone) {
+      mic = el('button', 'pseg-mic');
+      mic.type = 'button';
+      mic.title = 'Dictate a scenario';
+      mic.setAttribute('aria-label', 'Dictate a scenario');
+      try {
+        mic.innerHTML = typeof root.pineIcon === 'function'
+          ? root.pineIcon('c:microphone', 'Dictate a scenario') : '';
+      } catch (err) { mic.innerHTML = ''; }
+      if (!mic.innerHTML) mic.textContent = 'mic';
+      mic.addEventListener('click', dictate);
+      row.appendChild(mic);
+    }
     row.appendChild(plus);
     wrap.appendChild(row);
+
+    var prior = null;
+
+    function iconButton(cls, icon, label) {
+      var b = el('button', cls);
+      b.type = 'button';
+      b.title = label;
+      b.setAttribute('aria-label', label);
+      try {
+        b.innerHTML = typeof root.pineIcon === 'function' ? root.pineIcon(icon, label) : '';
+      } catch (err) { b.innerHTML = ''; }
+      if (!b.innerHTML) b.textContent = label;
+      return b;
+    }
+
+    function actOn(saved, verb, button) {
+      if (!saved || !saved.id) return;
+      button.disabled = true;
+      send('POST', '/api/dj/topics/' + encodeURIComponent(saved.id) + '/' + verb, {})
+        .then(function (got) {
+          button.disabled = false;
+          if (!got) { note(wrap, 'the station refused that scenario'); return; }
+          note(wrap, verb === 'drop'
+            ? 'the scenario is being written into the current broadcast'
+            : 'that scenario is next in the banter queue');
+          loadHistory();
+        })['catch'](function () {
+          button.disabled = false;
+          note(wrap, 'could not reach the station');
+        });
+    }
+
+    function paintHistory(rows) {
+      if (!prior) return;
+      prior.replaceChildren();
+      rows.forEach(function (saved) {
+        var item = el('div', 'pseg-topic-item');
+        var words = el('button', 'pseg-topic-words', saved.text || 'Untitled scenario');
+        words.type = 'button';
+        words.title = 'Put this scenario in the editor';
+        words.addEventListener('click', function () {
+          input.value = String(saved.text || '');
+          input.focus();
+        });
+        var meta = el('span', 'pseg-topic-meta', String(Number(saved.used) || 0) + ' uses');
+        var queue = iconButton('pseg-topic-action', 'c:add', 'Queue this scenario next');
+        var now = iconButton('pseg-topic-action', 'c:play--filled-alt', 'Use this scenario now');
+        queue.addEventListener('click', function () { actOn(saved, 'queue', queue); });
+        now.addEventListener('click', function () { actOn(saved, 'drop', now); });
+        item.appendChild(words);
+        item.appendChild(meta);
+        item.appendChild(queue);
+        item.appendChild(now);
+        prior.appendChild(item);
+      });
+    }
+
+    function loadHistory() {
+      if (!prior) return Promise.resolve();
+      return get('/api/dj/topics').then(function (got) {
+        var rows = (got && (got.topics || got.rows)) || [];
+        sum.textContent = rows.length + ' in the bank';
+        paintHistory(rows.slice(0, 150));
+      })['catch'](function () { note(wrap, 'the saved scenarios could not be read'); });
+    }
+
+    if (history) {
+      wrap.appendChild(el('div', 'pseg-topic-prior-title', 'Previous topics'));
+      prior = el('div', 'pseg-topic-list');
+      wrap.appendChild(prior);
+    }
 
     function count() {
       get('/api/dj/topics').then(function (got) {
@@ -299,8 +470,44 @@
         sum.textContent = rows.length + ' in the bank';
       })['catch'](function () { sum.textContent = 'could not be counted'; });
     }
-    count();
+    if (history) loadHistory(); else count();
+    wrap.__stopDictation = dictationRelease;
     return wrap;
+  }
+
+  var topicSheet = null;
+
+  function topicShut() {
+    try {
+      var block = topicSheet && topicSheet.querySelector('.pseg-topics');
+      if (block && block.__stopDictation) block.__stopDictation(true);
+    } catch (err) { /* the sheet is already gone */ }
+    if (topicSheet && topicSheet.parentNode) topicSheet.parentNode.removeChild(topicSheet);
+    topicSheet = null;
+    try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (err) { /* no wall */ }
+  }
+
+  function topicWindow() {
+    if (topicSheet && topicSheet.parentNode) return topicSheet;
+    var node = el('div', 'pseg-sheet pseg-topic-sheet');
+    node.setAttribute('role', 'dialog');
+    node.setAttribute('aria-modal', 'false');
+    node.setAttribute('data-pine-drag', '');
+    var top = el('div', 'pseg-sheet-top');
+    top.setAttribute('data-pine-drag-handle', '');
+    top.appendChild(el('span', 'pseg-sheet-t', 'Things to spring on them'));
+    var x = el('button', 'pseg-x', 'x');
+    x.setAttribute('type', 'button');
+    x.setAttribute('aria-label', 'Close');
+    x.addEventListener('click', topicShut);
+    top.appendChild(x);
+    node.appendChild(top);
+    node.appendChild(topicsBlock({next: true, history: true, microphone: true}));
+    root.document.body.appendChild(node);
+    topicSheet = node;
+    try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (err) { /* no wall */ }
+    try { node.querySelector('.pseg-topic-in').focus(); } catch (err) { /* optional */ }
+    return node;
   }
 
   /* ------------------------------------------- a markdown becomes a plotline */
@@ -352,8 +559,11 @@
   function plotWindow(parsed) {
     if (plotSheet && plotSheet.parentNode) plotSheet.parentNode.removeChild(plotSheet);
     var node = el('div', 'pseg-sheet');
+    node.setAttribute('role', 'dialog');
+    node.setAttribute('data-pine-drag', '');
 
     var top = el('div', 'pseg-sheet-top');
+    top.setAttribute('data-pine-drag-handle', '');
     top.appendChild(el('span', 'pseg-sheet-t', 'Put this on the air as a plotline'));
     var x = el('button', 'pseg-x', 'x');
     x.setAttribute('type', 'button');
@@ -439,6 +649,7 @@
   function shut() {
     if (plotSheet && plotSheet.parentNode) plotSheet.parentNode.removeChild(plotSheet);
     plotSheet = null;
+    topicShut();
   }
 
   /* A document dropped anywhere on the given node becomes the window above.
@@ -472,6 +683,7 @@
   root.PineSegments = {
     pane: pane,
     topics: topicsBlock,
+    topicWindow: topicWindow,
     acceptDrops: acceptDrops,
     plotWindow: plotWindow,
     read: readMarkdown,

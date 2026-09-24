@@ -200,8 +200,23 @@
                     style="@style/PineChip"
                     android:layout_height="@dimen/tap"
                     android:layout_weight="2"
-                    android:layout_marginEnd="0dp"
+                    android:layout_marginEnd="6dp"
                     android:text="@string/rail_pause" />
+
+                <!-- One station-owned endless-video switch. The infinity
+                     mark is an icon rather than another word competing with
+                     FM and the air state; contentDescription carries the
+                     full command for accessibility. -->
+                <Button
+                    android:id="@+id/endlessVideo"
+                    style="@style/PineChip"
+                    android:layout_width="@dimen/tap"
+                    android:layout_height="@dimen/tap"
+                    android:layout_weight="0"
+                    android:layout_marginEnd="0dp"
+                    android:contentDescription="@string/rail_endless_video"
+                    android:text="&#8734;"
+                    android:textSize="20sp" />
             </LinearLayout>
 
             <TextView
@@ -212,6 +227,15 @@
                 android:textColor="@color/pine_dim"
                 android:textSize="11sp"
                 tools:text="on air - 418m banked" />
+
+            <TextView
+                android:id="@+id/endlessNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="@string/rail_endless_checking"
+                android:textColor="@color/pine_dim"
+                android:textSize="11sp" />
         </LinearLayout>
 
         <!-- The preset. It moves music, DJs and replies together; the three
@@ -366,7 +390,7 @@
                 android:layout_width="0dp"
                 android:layout_height="@dimen/tap"
                 android:layout_weight="1"
-                android:max="600"
+                android:max="200"
                 android:progress="100" />
 
             <TextView
@@ -440,7 +464,7 @@
                 android:layout_width="0dp"
                 android:layout_height="@dimen/tap"
                 android:layout_weight="1"
-                android:max="600"
+                android:max="200"
                 android:progress="100" />
 
             <TextView
@@ -521,7 +545,7 @@
                 android:layout_width="0dp"
                 android:layout_height="@dimen/tap"
                 android:layout_weight="1"
-                android:max="100"
+                android:max="200"
                 android:progress="100" />
 
             <TextView
@@ -555,7 +579,7 @@
                 android:layout_width="0dp"
                 android:layout_height="@dimen/tap"
                 android:layout_weight="1"
-                android:max="100"
+                android:max="200"
                 android:progress="100" />
 
             <TextView
@@ -569,21 +593,17 @@
         </LinearLayout>
     </LinearLayout>
 
-        <!-- THE ONE THAT MADE THE TABLET LOOK BROKEN.
-             2026-09-10: every route was set to "here", the panel's
-             <audio id="musicPlayer" data-pine-live="music"> was playing
-             (paused:false, readyState:4, muted:false) - and its volume was 0,
-             so the terminal sat in silence with a healthy-looking station.
-             Nothing was wrong with the station or with autoplay.
-             musicVolumeRemember (app.py:142170) persists every volumechange
-             into localStorage under `pineMusicVolume`, and the WebView is a
-             fresh browser profile whose copy of that key was "0". Per-client,
-             per-browser, invisible from the station.
-             MainActivity heals absent-or-zero on load; this slider is how the
-             operator moves it afterwards without a keyboard or a devtools
-             socket, which is what "self-service" has to mean on a wall
-             tablet. -->
-        <LinearLayout style="@style/PineCard">
+        <!-- RETIRED: the four shared stream controls above are the audio law.
+             This old whole-page monitor wrote one number over every audio
+             and video element, so touching it silently defeated the four
+             persisted values. Kept gone for layout/resource compatibility
+             with older installed builds while the Kotlin writer is removed.
+
+             The canonical bus now heals a stale zero source underneath a
+             non-zero music setting without changing any chosen level. -->
+        <LinearLayout
+            style="@style/PineCard"
+            android:visibility="gone">
 
             <LinearLayout
                 android:layout_width="match_parent"

@@ -3,14 +3,14 @@
  * "Tap a row in the live feed; the right pane reconstructs how that moment
  * came to be. Then note it, edit it, and send it back to the writer room."
  *
- * THIS IS STAGE 1, AND IT SAYS SO ON ITS FACE. Everything here is served
+ * Provenance is stage 1. Everything in that pane is served
  * by GET /api/dj/provenance/{id} (app.py:95141) with no server change at
  * all: the prompt as sent, the script that came back, model/temp/context,
  * the render engine and what it fell back from, the crystal shards with
  * their in_prompt flags, the vector searches, the source documents, the
- * schedule slot, the armed system prompt, and shelf-vs-live. What stage 1
- * cannot do - the tint, the grader's verdict, the return path into the
- * writer room, and any line older than the booth ring - is drawn as a gap
+ * schedule slot, the armed system prompt, and shelf-vs-live. What provenance
+ * cannot do - the tint, the grader's verdict, and any line older than the
+ * booth ring - is drawn as a gap
  * with the reason in it, never as an empty box. See script-lineage.js,
  * which holds every one of those judgements and is where the tests are.
  *
@@ -44,6 +44,8 @@
   "use strict";
 
   const NOTES_KEY = "pineScriptNotes";
+  const POLICY_NOTE_CAP = 160;    /* operator_lesson_clause keeps 160 per road */
+  const SCREENPLAY_NOTE_CAP = 4000;
   const MODES = [
     ["script", "Script", "The prompt as sent, the script that came back, and every system that fed them"],
     ["transcript", "Transcript", "The welded round this line was spoken inside, turn by turn"],
@@ -74,41 +76,10 @@
 
   /* ---------------------------------------------------------- the notes */
 
-  /* KEPT ON THIS TERMINAL, AND LABELLED AS SUCH.
-   *
-   * The station has two excellent return paths and stage 1 can reach
-   * neither of them from an AIRED line:
-   *
-   *   POST /api/orchestrator/rejections/{review_id}/accept
-   *     (rejection_workbench.py:315) - takes {candidate, instruction},
-   *     grades it for the record only, whitelists the fingerprint, and
-   *     triggers the recovery loop to re-write AND re-record. It needs a
-   *     review_id, which exists only if the line was CUT before air.
-   *
-   *   POST /api/director/script/{sid}/revise (app.py) - literally "send it
-   *     back to the writer room", the operator's note outranking the
-   *     script, standing by default so every future round of that road
-   *     carries it. It needs an sid, which exists only while the round is
-   *     on the shelf.
-   *
-   * A line tapped in the live feed has aired, so it has neither.
-   *
-   * TODO(stage 2), in the order that unblocks the most:
-   *   1. Stamp the round's sid and turn index onto the chat entry in
-   *      speak_turns / _speak_turns_floorless, and onto airlog_row_from.
-   *      Everything else here depends on it. It is a field stamp, not
-   *      logic - but it is the live air path, so it lands alone.
-   *   2. A line_id -> review_id lookup (a ?line_id= filter on
-   *      /api/orchestrator/rejections, built on line_review.find_occurrence)
-   *      so an aired line can reach /accept.
-   *   3. Then this box posts instead of remembering, and this comment goes.
-   *
-   * Also worth knowing before stage 2 is designed: an operator annotation
-   * store keyed by line id ALREADY EXISTS -
-   * POST /api/screenplay/{hour_key}/note takes {kind, target_id, text, who}
-   * and the notes feed script_lessons() into learning. It needs an hour
-   * key, which /api/screenplay hands out. That is a much shorter road than
-   * a new store. */
+  /* The screenplay stores a note against ln-{aired line id}. Its notes do
+   * not feed script_lessons() or the writer prompt. The orchestrator's
+   * operator_notes policy does. Source "s:YYMMDDHH:noteid" joins its
+   * directive to the screenplay note without needing a pre-air sid. */
   function loadNotes() {
     try {
       const raw = localStorage.getItem(NOTES_KEY);
@@ -125,6 +96,116 @@
 
   function noteFor(id) {
     return notes[id] || {note: "", edit: "", at: 0};
+  }
+
+  function directionFor(draft, said) {
+    const noteText = String(draft.note || "").trim();
+    const edit = String(draft.edit || "").trim();
+    const aired = String(said || "").trim();
+    const changed = !!edit && edit !== aired;
+    if (!noteText && !changed) throw new Error("Write a direction or change the line first.");
+    const policy = [noteText, changed ? "Prefer this wording: " + edit : ""]
+      .filter(Boolean).join("\n");
+    if (policy.length > POLICY_NOTE_CAP) {
+      throw new Error("The writer prompt can carry 160 characters for this direction. Shorten the note or edit; your draft is kept.");
+    }
+    const screenplay = [noteText ? "Direction: " + noteText : "",
+      "Aired: " + aired, changed ? "Edit: " + edit : ""].filter(Boolean).join("\n");
+    if (screenplay.length > SCREENPLAY_NOTE_CAP) {
+      throw new Error("The line note exceeds 4000 characters. Shorten it; your draft is kept.");
+    }
+    return {policy, screenplay};
+  }
+
+  async function screenplayHourFor(id, line) {
+    const index = await api().get("/api/screenplay");
+    const hours = Array.isArray(index && index.hours) ? index.hours : [];
+    const at = Number(line.air_at || line.ts || 0);
+    const near = hours.filter((h) => at >= Number(h.since) - 3600
+      && at < Number(h.until) + 3600);
+    const candidates = [...new Map([...near.slice(0, 5), ...hours.slice(0, 5)]
+      .filter((h) => h && h.key).map((h) => [h.key, h])).values()].slice(0, 10);
+    for (const hour of candidates) {
+      if (!hour.key) continue;
+      try {
+        const found = await api().get("/api/screenplay/"
+          + encodeURIComponent(hour.key) + "/line/" + encodeURIComponent(id));
+        if (found && found.line === id && found.hour_key === hour.key) return hour.key;
+      } catch (err) {
+        if (!/No such line in that hour|404 Not Found/.test(String(err && err.message || err))) {
+          throw err;
+        }
+      }
+    }
+    throw new Error("The aired line was not found in the screenplay ledger. The draft is still on this terminal; retry when the ledger catches up.");
+  }
+
+  function saveDelivery(id, draftKey, delivery) {
+    const current = notes[id];
+    if (!current || JSON.stringify([current.note, current.edit, current.said]) !== draftKey) return false;
+    current.delivery = {...delivery};
+    saveNotes();
+    return true;
+  }
+
+  async function sendDraft(id, said, line) {
+    const current = notes[id] || {};
+    const draftKey = JSON.stringify([current.note, current.edit, current.said]);
+    const words = directionFor(current, said);
+    const delivery = current.delivery && current.delivery.key === draftKey
+      ? {...current.delivery}
+      : {key: draftKey, who: "Script view " + Math.random().toString(36).slice(2, 14),
+         screenplay: words.screenplay, policy: words.policy};
+    if (delivery.sent) return {sent: true, already: true};
+    saveDelivery(id, draftKey, delivery);
+
+    if (!delivery.hour) {
+      delivery.hour = await screenplayHourFor(id, line || {});
+      saveDelivery(id, draftKey, delivery);
+    }
+    const route = "/api/screenplay/" + encodeURIComponent(delivery.hour);
+    const target = "ln-" + id;
+    if (!delivery.noteId) {
+      const page = await api().get(route);
+      const saved = (page.notes || []).find((row) => row.target_id === target
+        && row.who === delivery.who && row.text === delivery.screenplay);
+      if (saved) delivery.noteId = saved.id;
+      else {
+        const out = await api().post(route + "/note", {
+          kind: "note", target_id: target, text: delivery.screenplay,
+          who: delivery.who});
+        const row = out && out.note;
+        if (!out || out.ok !== true || !row || !row.id
+            || row.target_id !== target || row.text !== delivery.screenplay) {
+          throw new Error("The screenplay did not acknowledge this line note. Retry to check before sending again.");
+        }
+        delivery.noteId = row.id;
+      }
+      saveDelivery(id, draftKey, delivery);
+    }
+
+    const source = "s:" + delivery.hour.slice(2).replace(/[^0-9]/g, "")
+      + ":" + delivery.noteId;
+    if (source.length > 20) throw new Error("The writer-room link is too long. Draft kept.");
+    const accepted = (book) => Array.isArray(book && book.notes)
+      && book.notes.some((row) => row.source === source
+        && row.text === delivery.policy);
+    let book = await api().get("/api/orchestrator/notes");
+    if (!accepted(book)) {
+      const out = await api().post("/api/orchestrator/notes", {
+        text: delivery.policy, road: "", source});
+      if (!out || out.ok !== true) {
+        throw new Error("The writer room did not acknowledge the direction. Retry to check again.");
+      }
+      book = await api().get("/api/orchestrator/notes");
+      if (!accepted(book)) {
+        throw new Error("The direction is not visible in the writer-room policy book yet. Retry to check again.");
+      }
+    }
+    delivery.sent = true;
+    saveDelivery(id, draftKey, delivery);
+    return {sent: true, stale: JSON.stringify([
+      (notes[id] || {}).note, (notes[id] || {}).edit, (notes[id] || {}).said]) !== draftKey};
   }
 
   /* --------------------------------------------------------- the fetch */
@@ -431,17 +512,20 @@
     editField.value = kept.edit || got.said || "";
 
     const keep = () => {
+      const previous = notes[id] || {};
       notes[id] = {note: noteField.value, edit: editField.value,
         at: Date.now(), said: got.said,
-        who: String((got.line || {}).name || (got.line || {}).who || "")};
+        who: String((got.line || {}).name || (got.line || {}).who || ""),
+        delivery: previous.delivery};
       if (!noteField.value && !editField.value) delete notes[id];
       saveNotes();
       feedPrint = "";                 /* so the ✎ mark appears on the row */
       paintFeed(feedRows);
       paintFeedSelection();
+      updateSend();
     };
-    noteField.addEventListener("change", keep);
-    editField.addEventListener("change", keep);
+    noteField.addEventListener("input", keep);
+    editField.addEventListener("input", keep);
 
     box.appendChild(noteField);
     box.appendChild(editField);
@@ -466,26 +550,48 @@
     });
     bar.appendChild(copy);
 
-    /* Present, visibly disabled, and honest about why. Hiding it would
-     * leave the operator wondering whether he had missed the button; a
-     * live button that silently did nothing would be worse still. */
     const send = document.createElement("button");
-    send.className = "sc-btn off";
+    send.className = "sc-btn";
     send.textContent = "Send back to the writer room";
-    send.disabled = true;
-    send.title = "Stage 2. The return paths exist and are good — "
-      + "/api/orchestrator/rejections/{review_id}/accept re-writes AND "
-      + "re-records, and /api/director/script/{sid}/revise makes the note "
-      + "standing for that road — but both are pre-air: one needs a "
-      + "review_id (which exists only if the line was cut) and the other "
-      + "an sid (which exists only while the round is on the shelf). An "
-      + "aired line has neither until the sid join is stamped onto the "
-      + "chat entry.";
+    send.title = "Save this aired line on the screenplay and direct future writing";
     bar.appendChild(send);
 
     const why = document.createElement("span");
     why.className = "sc-foot";
-    why.textContent = "Notes are kept on this terminal only.";
+    let busy = false;
+    const updateSend = () => {
+      const draft = noteFor(id);
+      const key = JSON.stringify([draft.note, draft.edit, draft.said]);
+      const delivery = draft.delivery && draft.delivery.key === key
+        ? draft.delivery : null;
+      send.disabled = busy || !!(delivery && delivery.sent);
+      send.textContent = busy ? "Sending..." : delivery && delivery.sent
+        ? "Sent to the writer room" : delivery && delivery.noteId
+          ? "Retry sending" : "Send back to the writer room";
+      why.textContent = delivery && delivery.sent
+        ? "Sent to the script and writer room. Draft kept here."
+        : delivery && delivery.noteId
+          ? "Line note saved on the script; writer-room direction pending. Retry."
+          : "Draft kept on this terminal until the writer room acknowledges it.";
+    };
+    updateSend();
+    send.addEventListener("click", async () => {
+      keep();
+      busy = true;
+      updateSend();
+      try {
+        const result = await sendDraft(id, got.said,
+          feedRows.find((row) => row.id === id) || got.line || {});
+        note(result.stale
+          ? "Earlier version sent; your newer edits are still a draft."
+          : "Direction acknowledged by the writer room.");
+      } catch (err) {
+        note(String(err && err.message || err), true);
+      } finally {
+        busy = false;
+        updateSend();
+      }
+    });
     bar.appendChild(why);
 
     box.appendChild(bar);
@@ -624,10 +730,9 @@
     const foot = document.createElement("div");
     foot.className = "sc-note-bar";
     foot.innerHTML = '<span id="scNote" class="sc-note"></span>'
-      + '<span class="sc-stagelabel" title="Stage 1: provenance for lines '
-      + 'still in the booth ring, with no server change. Stage 2 is the sid '
-      + 'join, durable provenance, the tint and the verdict, and the '
-      + 'aired-line return path.">stage 1 — lines still in the booth</span>';
+      + '<span class="sc-stagelabel" title="Provenance reads the booth ring. '
+      + 'Post-air notes reach the screenplay and writer-room policy book; '
+      + 'tint and verdict still need their own lineage.">booth-ring provenance</span>';
     right.appendChild(foot);
 
     host.appendChild(left);
@@ -653,10 +758,13 @@
     try { stage().preload(config && config.baseUrl); } catch (err) { /* on demand */ }
 
     if (!unsubscribe) {
-      unsubscribe = root.PineStationFeed.subscribe((payload) => {
+      const receive = (payload) => {
         paintFeed(payload.rows);
         paintFeedSelection();
-      });
+      };
+      unsubscribe = root.PineStationFeed.subscribeView
+        ? root.PineStationFeed.subscribeView(host, receive)
+        : root.PineStationFeed.subscribe(receive);
     }
     mounted = true;
   }
@@ -707,6 +815,7 @@
     mode: () => mode,
     setMode: (next) => { mode = next; paintModes(); paintPane(); },
     notes: () => notes,
+    sendDraft,
     /* The cache, for anything that wants to know what has been asked
      * without asking again. */
     asked: () => [...answers.keys()]

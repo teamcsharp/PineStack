@@ -12,6 +12,8 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * PINE APP RECORDER - the terminal records itself, as a service.
@@ -54,6 +56,29 @@ class PineAppRecorder : Service() {
 
     private var replay: ScreenReplay? = null
     private var eyes: BroadcastReceiver? = null
+
+    /* THE REPLAY NEVER RUNS ON ANDROID'S LIFECYCLE THREAD.
+     *
+     * The two ANRs that exposed this were exact opposites:
+     *
+     *   2026-09-22 09:45  SCREEN_OFF was in MediaMuxer.writeSampleData()
+     *   2026-09-23 07:08  service creation was in
+     *                     MediaExtractor.readSampleData()
+     *
+     * Saving and restoring the replay ring are honest disk/media work. A
+     * BroadcastReceiver and Service.onCreate both run on the app's main
+     * thread, where Android gives a focus/input event only five seconds to
+     * complete. The WebView and native player kept rendering on their own
+     * threads, so the station visibly worked while Android repeatedly said
+     * that Pine Box was not responding.
+     *
+     * One worker preserves screen-on/screen-off order. A pool could let a
+     * late save overtake a restore and put the recorder in the wrong state.
+     */
+    private val replayWorker = Executors.newSingleThreadExecutor { work ->
+        Thread(work, "pine-recorder-io").apply { isDaemon = true }
+    }
+    @Volatile private var closing = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -134,13 +159,18 @@ class PineAppRecorder : Service() {
          * terminal booting with a dark screen would hold nothing while a
          * perfectly good history sat on disk beside it. Priming costs no
          * encoder and is what makes "pull from it at any time" true. */
-        replay?.prime()
-
         /* Catch up with whatever the screen is doing right now rather than
          * waiting for it to change - a service started at boot would
-         * otherwise record nothing until somebody pressed the power key. */
+         * otherwise record nothing until somebody pressed the power key.
+         * Prime and the resulting state change share the replay worker: the
+         * history is restored before an encoder can append to it, without
+         * holding Android's service/focus thread while MediaExtractor reads. */
         val power = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-        if (power.isInteractive) wake() else rest()
+        val interactive = power.isInteractive
+        replayWork("initial restore") {
+            replay?.prime()
+            if (interactive) wakeNow() else restNow()
+        }
 
         Log.i(TAG, "Pine App Recorder on duty")
     }
@@ -152,7 +182,9 @@ class PineAppRecorder : Service() {
         return START_STICKY
     }
 
-    private fun wake() {
+    private fun wake() = replayWork("screen on") { wakeNow() }
+
+    private fun wakeNow() {
         /* #1182T: THE GLASS LIT UP, SO THE TERMINAL IS NOT IN STANDBY.
          *
          * This is one of the four unconditional roads back, and it is here
@@ -178,7 +210,9 @@ class PineAppRecorder : Service() {
      * minutes before the tablet was put down are still in memory when it
      * wakes, and now also on disk if the process does not survive.
      */
-    private fun rest() {
+    private fun rest() = replayWork("screen off") { restNow() }
+
+    private fun restNow() {
         /* [#1225] THE SOUND DOES NOT GO OFF WITH THE SCREEN.
          *
          * This called stop(), which stopped the audio capture as well as
@@ -201,9 +235,35 @@ class PineAppRecorder : Service() {
         eyes?.let { try { unregisterReceiver(it) } catch (err: Exception) { /* gone */ } }
         eyes = null
         /* Stop both encoders and release the loopback policy before caching.
-         * A destroyed service must not leave audio capture or retries alive. */
-        try { replay?.stop() } catch (err: Exception) { Log.w(TAG, "recorder stop: " + err.message) }
+         * A destroyed service must not leave audio capture or retries alive.
+         * Queue the stop behind every accepted screen transition and return
+         * immediately; stop() joins an encoder and can mux 90 MB to disk. */
+        closing = true
+        try {
+            replayWorker.execute {
+                try { replay?.stop() }
+                catch (err: Exception) { Log.w(TAG, "recorder stop: " + err.message) }
+            }
+            replayWorker.shutdown()
+        } catch (err: RejectedExecutionException) {
+            Log.w(TAG, "recorder worker had already stopped")
+        }
         super.onDestroy()
+    }
+
+    /** Submit media/disk work without ever borrowing the caller's thread. */
+    private fun replayWork(label: String, work: () -> Unit) {
+        if (closing) return
+        try {
+            replayWorker.execute {
+                try { work() }
+                catch (err: Throwable) {
+                    Log.w(TAG, "$label failed without stopping the station", err)
+                }
+            }
+        } catch (err: RejectedExecutionException) {
+            Log.w(TAG, "$label arrived after the recorder stopped")
+        }
     }
 
     private fun note(): Notification {

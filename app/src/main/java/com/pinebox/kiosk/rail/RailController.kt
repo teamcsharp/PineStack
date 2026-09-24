@@ -53,6 +53,9 @@ class RailController(
     private val navigate: (String) -> Unit,
     /** Run JavaScript in the page already loaded, with the result. */
     private val runScript: (String, (String) -> Unit) -> Unit,
+    private val pageLocation: () -> String,
+    private val restorePage: () -> Unit,
+    private val repairAudioRoute: () -> String,
 ) {
 
     private val conn: TextView = rail.findViewById(R.id.railConn)
@@ -60,6 +63,8 @@ class RailController(
     private val fmSwitch: Button = rail.findViewById(R.id.fmSwitch)
     private val airPause: Button = rail.findViewById(R.id.airPause)
     private val airNote: TextView = rail.findViewById(R.id.airNote)
+    private val endlessVideo: Button = rail.findViewById(R.id.endlessVideo)
+    private val endlessNote: TextView = rail.findViewById(R.id.endlessNote)
     private val routeNote: TextView = rail.findViewById(R.id.routeNote)
     private val jumpList: ViewGroup = rail.findViewById(R.id.jumpList)
     private val logsFull: Button = rail.findViewById(R.id.logsFull)
@@ -165,6 +170,13 @@ class RailController(
 
     /** The last snapshot, painted or not. */
     private var state = RailState()
+
+    /** The mode is read when the drawer opens and after every write. It is
+     *  deliberately not guessed from local playback: every terminal shares
+     *  this one station setting. */
+    private var endlessOn = false
+    private var endlessKnown = false
+    private var endlessBanking = false
 
     /** Who is on the broadcast, from the last time the drawer was opened. */
     private var roster = AirOwners.Roster()
@@ -273,6 +285,9 @@ class RailController(
             }
         }
 
+        endlessVideo.setOnClickListener { toggleEndlessVideo() }
+        paintEndlessVideo()
+
         /* A TOGGLE, not a refresh button. Lit, the pane holds the pipeline log
          * the operator asked for and the feed is not allowed to paint over it
          * on the next change; unlit, it goes back to the free activity rows
@@ -313,6 +328,7 @@ class RailController(
                 /* banked_seconds is on /api/radio/pause and nowhere else - one
                  * request, on the open, never on a clock. */
                 call(null) { JSONObject(client.get("/api/radio/pause")) }
+                readEndlessVideo()
                 readPlayers()
                 readListenerLevels()
                 startPower()
@@ -725,9 +741,17 @@ class RailController(
         scope.launch {
             try {
                 say("looking…")
+                say("audio route: " + repairAudioRoute())
+                val address = pageLocation()
+                if (!address.startsWith("http://") && !address.startsWith("https://")) {
+                    say("the station page is gone ($address) - reopening it")
+                    restorePage()
+                    delay(4000)
+                    say("page: " + pageLocation())
+                }
                 var health = JSONObject(client.get("/api/broadcast/health"))
-                if (heardWithin(health, 25.0)) {
-                    say("the broadcast is being heard right now - nothing to do")
+                if (broadcastHealthy(health, 25.0)) {
+                    say("the broadcast is being heard; the jack and page have been checked")
                     return@launch
                 }
 
@@ -825,7 +849,7 @@ class RailController(
                 say("listening for eight seconds…")
                 delay(8000)
                 health = JSONObject(client.get("/api/broadcast/health"))
-                if (heardWithin(health, 12.0)) {
+                if (broadcastHealthy(health, 12.0)) {
                     say("sound is back - stopping here")
                     return@launch
                 }
@@ -887,7 +911,7 @@ class RailController(
                 }
 
                 health = JSONObject(client.get("/api/broadcast/health"))
-                if (heardWithin(health, 15.0)) {
+                if (broadcastHealthy(health, 15.0)) {
                     say("sound is back")
                     return@launch
                 }
@@ -910,8 +934,23 @@ class RailController(
                     say("  could not ask: " + (err.message ?: ""))
                 }
 
-                say("9 restarting the station - about twenty seconds")
-                client.post("/api/broadcast/fix/restart", "{}")
+                say("9 repairing the live feed without restarting the station")
+                client.post("/api/broadcast/fix/floor", "{}")
+                client.post("/api/broadcast/fix/handover", "{}")
+                client.post("/api/broadcast/fix/repair", "{}")
+                val talkCeiling = if ((localLevel["music"] ?: 100) <= 0) 30.0 else 180.0
+                if (health.optDouble("dialogue_quiet", 0.0) >= talkCeiling) {
+                    say("  DJs have been quiet; sending a finished round")
+                    client.post("/api/broadcast/fix/stock", "{}")
+                }
+                delay(5000)
+                health = JSONObject(client.get("/api/broadcast/health"))
+                if (broadcastHealthy(health, 15.0)) {
+                    say("sound is back - the station stayed up")
+                } else {
+                    say("the station answers, but playback is still not confirmed")
+                    say("the server was left running; check the page and output route above")
+                }
             } catch (err: Exception) {
                 Log.w(TAG, "reinitialise failed", err)
                 say("the station would not answer: "
@@ -931,8 +970,76 @@ class RailController(
         return health.optDouble("heard_seconds_ago", 1.0e9) <= within
     }
 
+    private fun broadcastHealthy(health: JSONObject, within: Double): Boolean {
+        if (!heardWithin(health, within)) return false
+        return (localLevel["music"] ?: 100) > 0
+            || health.optDouble("dialogue_quiet", 1.0e9) < maxOf(30.0, within)
+    }
+
     private fun send(note: String?, body: () -> String) {
         call(note) { JSONObject(client.post("/api/dj/output", body())) }
+    }
+
+    /* ------------------------------------------------------ endless video */
+
+    /** Read only while the drawer is visible; the native video wall and the
+     *  web controls use this same server-owned mode. */
+    private fun readEndlessVideo() {
+        scope.launch {
+            try {
+                adoptEndless(JSONObject(client.get("/api/sfx/video/mode")))
+            } catch (err: Exception) {
+                endlessKnown = false
+                paintEndlessVideo(err.message ?: "station did not answer")
+            }
+        }
+    }
+
+    private fun toggleEndlessVideo() {
+        if (!endlessKnown) {
+            readEndlessVideo()
+            return
+        }
+        val want = !endlessOn
+        endlessVideo.isEnabled = false
+        endlessNote.text = if (want) "turning endless video on..." else "turning endless video off..."
+        scope.launch {
+            try {
+                val body = JSONObject().put("on", want).toString()
+                adoptEndless(JSONObject(client.post("/api/sfx/video/mode", body)))
+            } catch (err: Exception) {
+                paintEndlessVideo(err.message ?: "station did not answer")
+            }
+        }
+    }
+
+    private fun adoptEndless(answer: JSONObject) {
+        endlessOn = answer.optBoolean("on", false)
+        endlessBanking = answer.optBoolean("banking", false)
+        endlessKnown = true
+        paintEndlessVideo()
+    }
+
+    private fun paintEndlessVideo(error: String? = null) {
+        endlessVideo.isActivated = endlessKnown && endlessOn
+        endlessVideo.isEnabled = true
+        endlessVideo.alpha = if (endlessKnown || error != null) 1f else 0.55f
+        endlessVideo.contentDescription = when {
+            !endlessKnown -> "Read endless video mode"
+            endlessOn -> "Turn endless video off"
+            else -> "Turn endless video on"
+        }
+        endlessVideo.tooltipText = endlessVideo.contentDescription
+        endlessNote.text = when {
+            error != null -> "endless video: could not read it - $error"
+            !endlessKnown -> rail.resources.getString(R.string.rail_endless_checking)
+            endlessOn && endlessBanking -> "endless video: on - banking clips while off air"
+            endlessOn -> "endless video: on - one clip after another"
+            else -> "endless video: off"
+        }
+        endlessNote.setTextColor(rail.resources.getColor(
+            if (error == null) R.color.pine_dim else R.color.pine_bad, null,
+        ))
     }
 
     /**

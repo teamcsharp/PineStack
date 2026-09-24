@@ -579,10 +579,21 @@
   }
 
   function musicLevels() {
+    var legacy = null;
     if (typeof root.djLevels === 'function') {
-      try { return root.djLevels(); } catch (err) { /* fall through */ }
+      try { legacy = root.djLevels(); } catch (err) { /* fall through */ }
     }
-    return {music: 1, voice: 1.6, duck: 0.7};
+    if (!legacy) legacy = {music: 1, voice: 1.6, duck: 0.7};
+    /* The listener slider is the final music level. The old panel slider is
+     * only a fallback; restoring a clip duck from it can revive a record
+     * the operator explicitly set to zero. */
+    if (root.pineLevels && typeof root.pineLevels.get === 'function') {
+      try {
+        var shared = Number((root.pineLevels.get() || {}).music);
+        if (isFinite(shared)) return {music: Math.max(0, shared), duck: legacy.duck};
+      } catch (err) { /* an old host still has its panel slider */ }
+    }
+    return legacy;
   }
 
   /* Set the record's gain, with the panel's own ramp - a step is a click. */

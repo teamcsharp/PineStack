@@ -3,6 +3,7 @@ package com.pinebox.kiosk.audio
 import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -90,6 +91,7 @@ class JackWatch(
      * against a terminal that is silently routed to nothing.
      */
     @Volatile private var announced: Boolean? = null
+    @Volatile private var lastRepairAtMs = 0L
 
     @Volatile var lastSaid: String = "not started"
         private set
@@ -115,8 +117,18 @@ class JackWatch(
         return lastSaid
     }
 
-    /** Whether the terminal currently believes the jack is carrying it. */
-    fun handedOver(): Boolean = announced == true
+    /** Reconcile the framework with the physical socket on operator demand. */
+    fun refresh(): String {
+        val read = switchState()
+        if (read < 0) return "jack detection unavailable; kept the operator's route: $lastSaid"
+        announce(read == 1)
+        return if (read == 1 && headphoneVisible() != true)
+            "$lastSaid; headphone output is still not visible"
+        else lastSaid
+    }
+
+    /** Do not report a cached announcement as a live route. */
+    fun handedOver(): Boolean = announced == true && headphoneVisible() == true
 
     fun start() {
         if (running) return
@@ -135,25 +147,9 @@ class JackWatch(
     /**
      * #1182T: PUT THE POLL DOWN WITHOUT TOUCHING THE ROUTE.
      *
-     * Standby's `deep` wants the two-second `dumpsys input` poll off the CPU
-     * while another app has the glass. stop() would do that, and one other
-     * thing: it announces the jack OFF, deliberately, because a terminal
-     * shutting down while holding the audio on a cable nobody is listening to
-     * is worse than one that hands it back.
-     *
-     * That is right for a shutdown and catastrophic here. The announcement
-     * lives in the FRAMEWORK and not in this object - see the note on
-     * `announced` above, where a reinstall was measured leaving mMainType=0x1
-     * behind with no cable in the socket - so calling stop() to save a poll
-     * would move the operator's sound out of their headphones and onto the
-     * tablet's speaker the moment a browser came to the front. The owner's
-     * rule is that the radio does not stop; a radio that jumps to the built-in
-     * speaker in the middle of a show has broken that rule by a different door
-     * than the one everybody was watching.
-     *
-     * So this stops the THREAD and says nothing to anybody. `announced` is
-     * untouched, so when the poll wakes it agrees with the framework exactly as
-     * it did before, and a cable that was carrying the show still is.
+     * Standby's `deep` wants the two-second input poll off the CPU while
+     * another app has the glass. This stops only that thread. The framework
+     * keeps the route; the next start checks it against the physical switch.
      */
     fun rest() {
         if (!running) return
@@ -167,10 +163,9 @@ class JackWatch(
         running = false
         ticker?.interrupt()
         ticker = null
-        /* Leave the route as we found it: a terminal that shuts down
-         * holding the audio on a cable nobody is listening to is worse
-         * than one that gives it back. */
-        if (announced == true) announce(false)
+        /* Activity replacement can destroy the old watch after the new one
+         * announces the cable. Do not let that teardown disconnect live air.
+         * An explicit force(false), or a subsequent unplug poll, still does. */
     }
 
     private fun step() {
@@ -183,8 +178,25 @@ class JackWatch(
         /* `announced` is null on the first pass through, so this never
          * matches and the first reading is always passed on - see the field
          * for why that matters more than the wasted call. */
-        if (inNow == announced) return
+        if (inNow == announced) {
+            if (shouldRepairJack(inNow, announced, headphoneVisible(),
+                    SystemClock.elapsedRealtime(), lastRepairAtMs, REPAIR_MS)) {
+                Log.w(TAG, "jack is inserted but headphone output vanished; re-announcing")
+                announce(true)
+            }
+            return
+        }
         announce(inNow)
+    }
+
+    /** Null means the framework could not be queried, not that it lost the jack. */
+    private fun headphoneVisible(): Boolean? {
+        val manager = audio ?: return null
+        return runCatching {
+            manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+            }
+        }.getOrNull()
     }
 
     /**
@@ -201,37 +213,35 @@ class JackWatch(
             lastSaid = "there is no audio service to tell"
             return
         }
+        if (on) lastRepairAtMs = SystemClock.elapsedRealtime()
+        /* This hidden method takes AudioSystem DEVICE_OUT_* bitmasks, not
+         * AudioDeviceInfo.TYPE_* enum values. TYPE_WIRED_HEADPHONES happens
+         * to be 4, but 4 in AudioSystem means WIRED_HEADSET; a plain aux
+         * cable is WIRED_HEADPHONE (8). The old call consequently opened the
+         * wrong HAL path while every framework screen claimed it was routed.
+         * Remove that legacy route first so an update repairs a cable that
+         * was already plugged in before this process started. */
+        if (on) {
+            callWired(manager, DEVICE_OUT_WIRED_HEADSET, 0, "Pine Box legacy headset")
+        }
         val state = if (on) 1 else 0
-        val type = AudioDeviceInfo.TYPE_WIRED_HEADPHONES
-
-        val four = runCatching {
-            AudioManager::class.java.getMethod(
-                "setWiredDeviceConnectionState",
-                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
-                String::class.java, String::class.java
-            ).invoke(manager, type, state, "", "Pine Box jack")
+        val primary = callWired(
+            manager, DEVICE_OUT_WIRED_HEADPHONE, state, "Pine Box headphones"
+        )
+        if (!on) {
+            /* A previous build may have left 0x4 available in audio policy.
+             * Unplug means neither analogue route is allowed to survive. */
+            callWired(manager, DEVICE_OUT_WIRED_HEADSET, 0, "Pine Box legacy headset")
         }
-        if (four.isSuccess) {
-            settled(on, "announced (4-arg)")
-            return
-        }
-
-        val three = runCatching {
-            AudioManager::class.java.getMethod(
-                "setWiredDeviceConnectionState",
-                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
-                String::class.java
-            ).invoke(manager, type, state, "Pine Box jack")
-        }
-        if (three.isSuccess) {
-            settled(on, "announced (3-arg)")
+        if (primary.isSuccess) {
+            settled(on, "announced (${primary.getOrNull()})")
             return
         }
 
         /* Say WHICH refusal: a missing method and a refused permission are
          * different problems with different cures, and "it did not work"
          * has cost this project a day already. */
-        val why = (four.exceptionOrNull() ?: three.exceptionOrNull())
+        val why = primary.exceptionOrNull()
         lastSaid = when {
             why is NoSuchMethodException ->
                 "this build has no setWiredDeviceConnectionState to call"
@@ -241,6 +251,33 @@ class JackWatch(
             else -> "the call failed: " + (why?.cause?.message ?: why?.message ?: "unknown")
         }
         Log.w(TAG, lastSaid)
+    }
+
+    /** Call whichever setWiredDeviceConnectionState shape this build owns. */
+    private fun callWired(
+        manager: AudioManager,
+        device: Int,
+        state: Int,
+        name: String,
+    ): Result<String> {
+        val four = runCatching {
+            AudioManager::class.java.getMethod(
+                "setWiredDeviceConnectionState",
+                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+                String::class.java, String::class.java
+            ).invoke(manager, device, state, "", name)
+            "4-arg, device 0x${device.toString(16)}"
+        }
+        if (four.isSuccess) return four
+
+        return runCatching {
+            AudioManager::class.java.getMethod(
+                "setWiredDeviceConnectionState",
+                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+                String::class.java
+            ).invoke(manager, device, state, name)
+            "3-arg, device 0x${device.toString(16)}"
+        }.recoverCatching { throw (four.exceptionOrNull() ?: it) }
     }
 
     private fun settled(on: Boolean, how: String) {
@@ -375,10 +412,21 @@ class JackWatch(
     private companion object {
         const val TAG = "PineJack"
         const val POLL_MS = 2000L
+        const val REPAIR_MS = 10000L
         /** InputDevice.SOURCE_ANY, and "ask every device". */
         const val ANY_DEVICE = -1
         const val SOURCE_ANY = -256
         /** linux/input-event-codes.h: SW_HEADPHONE_INSERT. */
         const val SW_HEADPHONE_INSERT = 2
+        /** AudioSystem.DEVICE_OUT_WIRED_HEADSET (four-pole, with microphone). */
+        const val DEVICE_OUT_WIRED_HEADSET = 0x4
+        /** AudioSystem.DEVICE_OUT_WIRED_HEADPHONE (three-pole aux/headphones). */
+        const val DEVICE_OUT_WIRED_HEADPHONE = 0x8
     }
 }
+
+internal fun shouldRepairJack(
+    plugged: Boolean, announced: Boolean?, headphoneVisible: Boolean?,
+    nowMs: Long, lastAttemptMs: Long, intervalMs: Long,
+): Boolean = plugged && announced == true && headphoneVisible == false &&
+    (lastAttemptMs == 0L || nowMs - lastAttemptMs >= intervalMs)

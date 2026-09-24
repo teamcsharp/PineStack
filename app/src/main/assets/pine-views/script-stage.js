@@ -310,10 +310,12 @@
     let t = 0;
     const tick = () => {
       if (!live) return;
-      /* A hidden tab still fires rAF in Electron with backgroundThrottling
-       * off (main.js:701 sets it for the LCD producer), so the check is
-       * real work saved, not a formality. */
-      if (!document.hidden) {
+      /* A hidden tab and a mounted-but-inactive view still fire rAF in
+       * Electron with backgroundThrottling off (main.js:701 sets it for the
+       * LCD producer). offsetParent is null when the shell or rail has put
+       * the Script host behind another view, so neither case spends a frame
+       * animating and rendering an invisible WebGL scene. */
+      if (!document.hidden && host.offsetParent !== null) {
         t += 0.016;
         for (let i = 0; i < links.length; i += 1) {
           const link = links[i];

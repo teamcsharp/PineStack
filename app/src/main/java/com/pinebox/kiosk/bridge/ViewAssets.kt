@@ -53,6 +53,7 @@ object ViewAssets {
         "pine-duck.js",
         "talk-dot.js",            // the dot you speak commands into
         "vote-arrows.js",         // love it or not, on every player
+        "album-popup.js",         // sleeve -> album, tracks, analysis, queue
         "listen-model.js",        // the arithmetic Listen and Music share
         "pine-meters.js",         // real levels off the real audio
         "script-lineage.js",      // reads one provenance payload

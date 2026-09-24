@@ -67,6 +67,47 @@ say() { printf '\n== %s\n' "$1"; }
 
 [ -f "$KEY" ] || { echo "no platform key at $KEY - the jack cannot work without it"; exit 1; }
 
+# The renderer is the official copy of every shared tablet view. The APK
+# carries the video controller twice because the panel and sampler are
+# separate injected pages; silently building any stale view recreates bugs
+# already fixed on the desktop. Sync when the canonical workspace is mounted,
+# then refuse an internal video split on every machine.
+VIEW_CANON=${PINE_VIEW_CANON:-//10.89.1.246/ehm_eckx/pinevoice-stack/spark-agent/desktop/renderer}
+VIEW_PANEL="$HERE/app/src/main/assets/pine-views"
+VIEW_SAMPLER="$HERE/app/src/main/assets/pine-sampler"
+if [ -f "$VIEW_CANON/sfx-tv.js" ]; then
+  say "syncing canonical shared views"
+  # Every file already carried by pine-views is a declared injection asset.
+  # Sync the intersection instead of maintaining a second hand-written list:
+  # that list omitted boot-splash.js and line-actions.js and quietly shipped
+  # stale startup and dialogue behavior in otherwise current APKs.
+  for target in "$VIEW_PANEL"/*; do
+    [ -f "$target" ] || continue
+    asset=${target##*/}
+    # Android owns the field microphone's focus/append handling here. A
+    # renderer sync would replace it just before packaging the APK.
+    [ "$asset" = talk-dot.js ] && continue
+    [ -f "$VIEW_CANON/$asset" ] && cp "$VIEW_CANON/$asset" "$target"
+  done
+  for asset in sfx-tv.js sfx-tv.css; do
+    [ -f "$VIEW_CANON/$asset" ] && cp "$VIEW_CANON/$asset" "$VIEW_SAMPLER/$asset"
+  done
+  for asset in sampler-air.js sampler-feed.js sampler.js; do
+    [ -f "$VIEW_CANON/$asset" ] && [ -f "$VIEW_SAMPLER/$asset" ] && \
+      cp "$VIEW_CANON/$asset" "$VIEW_SAMPLER/$asset"
+  done
+fi
+cmp -s "$VIEW_PANEL/sfx-tv.js" "$VIEW_SAMPLER/sfx-tv.js" || {
+  echo "REFUSING: the panel and sampler have different sfx-tv.js copies."
+  echo "Run with PINE_VIEW_CANON pointing at desktop/renderer."
+  exit 1
+}
+cmp -s "$VIEW_PANEL/sfx-tv.css" "$VIEW_SAMPLER/sfx-tv.css" || {
+  echo "REFUSING: the panel and sampler have different sfx-tv.css copies."
+  echo "Run with PINE_VIEW_CANON pointing at desktop/renderer."
+  exit 1
+}
+
 if [ "${1:-}" != "--no-build" ]; then
   say "building"
   # There is NO gradle wrapper in this project - the distribution at
@@ -124,22 +165,33 @@ echo "framework key   : ${WANT:-<could not read>}"
   exit 1; }
 
 say "installing"
-if ! "$ADB" -s "$DEV" install -r "$SIGNED" 2>&1 | tee /dev/stderr | grep -q Success; then
-  # A signature change cannot be installed over the top; the old one has to go
-  # first. Done only on that failure, because an uninstall loses the app's own
-  # settings and the device-owner grant with it.
-  say "signature differs from what is installed - removing the old one first"
-  "$ADB" -s "$DEV" uninstall "$PKG" || true
-  "$ADB" -s "$DEV" install "$SIGNED"
-  # An uninstall takes the RUNTIME grants with it, and the talk dot is silently
-  # useless without RECORD_AUDIO - it records, gets zeros, and the station
-  # transcribes nothing. There is no prompt to fall back on in a kiosk that
-  # owns HOME, so it is granted here.
-  "$ADB" -s "$DEV" shell pm grant "$PKG" android.permission.RECORD_AUDIO || true
-  # Looking through the tablet's camera from the desktop. Runtime, so an
-  # uninstall takes it with it, same as the microphone above.
-  "$ADB" -s "$DEV" shell pm grant "$PKG" android.permission.CAMERA || true
+# Never turn a failed update into an uninstall. The old path assumed every
+# install error was a signature mismatch, removed the live kiosk, and could
+# then be interrupted before its second install. A transient ADB/storage/link
+# failure consequently left the tablet with no PineBox package at all.
+# Signature migration is an explicit maintenance operation; ordinary deploys
+# either update the known package in place or leave the working copy intact.
+INSTALL_RC=0
+if INSTALL_OUT=$("$ADB" -s "$DEV" install -r "$SIGNED" 2>&1); then
+  INSTALL_RC=0
+else
+  INSTALL_RC=$?
 fi
+printf '%s\n' "$INSTALL_OUT"
+if [ "$INSTALL_RC" -ne 0 ] || ! printf '%s\n' "$INSTALL_OUT" | grep -q '^Success'; then
+  echo "DEPLOY FAILED - the installed PineBox app was left untouched." >&2
+  if printf '%s\n' "$INSTALL_OUT" | grep -q 'INSTALL_FAILED_UPDATE_INCOMPATIBLE'; then
+    echo "The installed signer differs. Verify both signers and perform the" >&2
+    echo "one-time uninstall/reinstall deliberately; this script will not" >&2
+    echo "remove the kiosk automatically." >&2
+  fi
+  exit 1
+fi
+
+# These survive an in-place update. Reasserting them is harmless and also
+# repairs a package restored with Android's install-existing machinery.
+"$ADB" -s "$DEV" shell pm grant "$PKG" android.permission.RECORD_AUDIO || true
+"$ADB" -s "$DEV" shell pm grant "$PKG" android.permission.CAMERA || true
 
 say "what the tablet granted"
 "$ADB" -s "$DEV" shell dumpsys package "$PKG" \

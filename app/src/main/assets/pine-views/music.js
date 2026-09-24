@@ -846,7 +846,11 @@
     build(host);
     wire();
     mounted = true;
-    if (!unsubscribe) unsubscribe = root.PineStationFeed.subscribe(paint);
+    if (!unsubscribe) {
+      unsubscribe = root.PineStationFeed.subscribeView
+        ? root.PineStationFeed.subscribeView(host, paint)
+        : root.PineStationFeed.subscribe(paint);
+    }
     /* IN SERIES. Three parallel opens is three more things in flight at
      * the moment the operator is most likely to also be asking the
      * station for a clip, and 38 in flight is a measured 46-second media

@@ -157,6 +157,39 @@
    is the thing that steps through saying / because / the brief. */
 .og-say { cursor: pointer; }
 
+.og-recovery {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 8px;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-bottom: 1px solid #303b43;
+  padding: 6px 12px;
+  background: #172129;
+  color: #a8c3cc;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.og-recovery:hover { background: #20313a; }
+.og-recovery-state { flex: 0 0 auto; font-weight: 700; }
+.og-recovery-step { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.og-recovery-note { grid-column: 1 / -1; min-width: 0; overflow-wrap: anywhere; font-size: 10px; }
+.og-recovery-note:empty { display: none; }
+.og-recovery[data-recovery="working"] { background: #392a17; color: #f2c975; border-color: #9c7235; }
+.og-recovery[data-recovery="attention"] { background: #3b2021; color: #f2a39e; border-color: #ac514d; }
+.og-recovery[data-recovery="paused"], .og-recovery[data-recovery="offair"] {
+  background: #1a3033;
+  color: #a8e0dc;
+  border-color: #538986;
+}
+.og-recovery[data-recovery="unknown"] { color: #c3a5a5; }
+.og.og-min .og-recovery { padding: 4px 12px 8px; }
+.og.og-min .og-recovery-note { display: none; }
+
 /* [#1186] "paused while you read - N updates waiting".
    A LINE, NOT A TOAST. The complaint was that things moved while he read;
    answering it with something that appears over the reading would be the same
@@ -473,25 +506,73 @@
   word-break: break-word;
 }
 
-/* THE WAY IN. A small face parked out of the way, dragged where the
-   operator wants it, right-clicked (or long-pressed) to put it away. It has
-   no clock and makes no request - "a closed pop-up must ask for nothing at
-   all" has to include the thing that opens it. */
+/* The persistent face carries the watch state even with the glass closed. */
 .og-dot {
   position: fixed;
   z-index: 2147483004;
   background: rgba(10, 14, 18, .9);
   border: 1px solid #2b353f;
-  border-radius: 10px;
-  padding: 4px 6px;
+  border-radius: 8px;
+  padding: 5px 7px 6px;
   cursor: pointer;
   color: #9fd6e8;
   box-shadow: 0 8px 22px rgba(0, 0, 0, .45);
   touch-action: none;
-  line-height: 0;
+  line-height: 1.15;
+  width: 144px;
+  min-height: 80px;
+  max-width: calc(100vw - 16px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  overflow: hidden;
 }
 .og-dot:hover { border-color: #4a5a68; }
 .og-dot:active { transform: translateY(1px); }
+.og-dot-state, .og-dot-step {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font: 700 10px/1.2 Inter, "Segoe UI", system-ui, sans-serif;
+}
+.og-dot-step {
+  font-weight: 500;
+  font-size: 9px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.og-dot[data-recovery="working"] {
+  border: 2px solid #e2a84d;
+  background: #2c2418;
+  color: #ffd18a;
+  box-shadow: 0 0 0 3px rgba(226, 168, 77, .24), 0 8px 22px rgba(0, 0, 0, .45);
+  animation: og-recovery-pulse 1.5s ease-in-out infinite;
+}
+.og-dot[data-recovery="attention"] {
+  border: 2px solid #db6d65;
+  background: #311c1c;
+  color: #ffd0cc;
+  box-shadow: 0 0 0 3px rgba(219, 109, 101, .24), 0 8px 22px rgba(0, 0, 0, .45);
+}
+.og-dot[data-recovery="paused"], .og-dot[data-recovery="offair"] {
+  border: 2px solid #6aaba5;
+  background: #193033;
+  color: #b9eae3;
+}
+.og-dot[data-recovery="unknown"] { border-color: #906767; color: #e0b3b0; }
+@keyframes og-recovery-pulse {
+  50% { box-shadow: 0 0 0 6px rgba(226, 168, 77, .07), 0 8px 22px rgba(0, 0, 0, .45); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .og-dot[data-recovery="working"] { animation: none; }
+}
 
 /* THE TABLET. The kiosk runs this file byte-identical, on a narrower screen
    and under a thumb rather than a pointer, so the touch targets grow and the
